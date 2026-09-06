@@ -42,6 +42,8 @@ PLATFORM_PUBLICATION_REQUEST_ROOT = PLATFORM_PUBLICATION_ROOT / "requests"
 PLATFORM_PUBLICATION_ATTEMPT_ROOT = PLATFORM_PUBLICATION_ROOT / "attempts"
 PLATFORM_PUBLICATION_RECEIPT_ROOT = PLATFORM_PUBLICATION_ROOT / "receipts"
 PLATFORM_PUBLICATION_RESOLUTION_ROOT = PLATFORM_PUBLICATION_ROOT / "resolutions"
+PLATFORM_RETIREMENT_OBSERVATION_ROOT = PLATFORM_PUBLICATION_ROOT / "retirement-observations"
+PLATFORM_RETIREMENT_RESOLUTION_ROOT = PLATFORM_PUBLICATION_ROOT / "retirement-resolutions"
 PLATFORM_PUBLICATION_CURRENT_PATH = PLATFORM_PUBLICATION_ROOT / "current.json"
 BLUE_GREEN_RECEIPT_ROOT = (
     Path.home() / ".local/state/grabowski/blue-green-deployment-receipts"
@@ -50,6 +52,8 @@ PLATFORM_PUBLICATION_REQUEST_KIND = "grabowski_platform_publication_request"
 PLATFORM_PUBLICATION_ATTEMPT_KIND = "grabowski_platform_publication_attempt"
 PLATFORM_PUBLICATION_RECEIPT_KIND = "grabowski_platform_publication_convergence_receipt"
 PLATFORM_PUBLICATION_RESOLUTION_KIND = "grabowski_platform_publication_resolution"
+PLATFORM_RETIREMENT_OBSERVATION_KIND = "grabowski_platform_retirement_surface_observation"
+PLATFORM_RETIREMENT_RESOLUTION_KIND = "grabowski_platform_retirement_surface_resolution"
 PLATFORM_PUBLICATION_CURRENT_KIND = "grabowski_platform_publication_current"
 PLATFORM_PUBLICATION_ACTION = "refresh_or_republish_chatgpt_connector_catalog"
 PLATFORM_OBSERVATION_SCOPES = frozenset(
@@ -78,6 +82,12 @@ PLATFORM_PUBLICATION_ACTIVATED_STATES = frozenset(
 )
 PLATFORM_PUBLICATION_ATTEMPT_OUTCOMES = frozenset(
     {"submitted", "outcome_unknown", "failed"}
+)
+REPOSKOP_RETIREMENT_QUERY = "reposkop"
+REPOSKOP_RETIREMENT_SURFACES = frozenset({"grabowski", "der_kleine_maulwurf"})
+REPOSKOP_RETIREMENT_SOURCE_PREFIX = "chatgpt-tool-discovery:"
+REPOSKOP_RETIREMENT_FORBIDDEN_TOOLS = frozenset(
+    {"grabowski_reposkop_context", "grabowski_reposkop_effectiveness"}
 )
 AUTO_REFRESH_CLIENT_ID = "grabowski-tunnel-watchdog-observer-v1"
 OBSERVATION_SCOPE_EXTERNAL_CLIENT = "external_client_declared"
@@ -1671,6 +1681,26 @@ def _publication_resolution_path(request_id: str) -> Path:
     return PLATFORM_PUBLICATION_RESOLUTION_ROOT / f"{request_id}.json"
 
 
+def _retirement_observation_path(
+    request_id: str, surface_id: str, observation_id: str
+) -> Path:
+    request_id = _validate_identifier(request_id, label="retirement request id")
+    surface_id = _validate_identifier(surface_id, label="retirement surface id")
+    observation_id = _validate_identifier(
+        observation_id, label="retirement observation id"
+    )
+    token = hashlib.sha256(observation_id.encode("utf-8")).hexdigest()[:24]
+    return PLATFORM_RETIREMENT_OBSERVATION_ROOT / (
+        f"{request_id}--{surface_id}--{token}.json"
+    )
+
+
+def _retirement_resolution_path(request_id: str, surface_id: str) -> Path:
+    request_id = _validate_identifier(request_id, label="retirement request id")
+    surface_id = _validate_identifier(surface_id, label="retirement surface id")
+    return PLATFORM_RETIREMENT_RESOLUTION_ROOT / f"{request_id}--{surface_id}.json"
+
+
 def _read_publication_current() -> dict[str, Any] | None:
     try:
         value = _read_private_json(PLATFORM_PUBLICATION_CURRENT_PATH)
@@ -2023,6 +2053,167 @@ def _persist_publication_resolution(
     }
     _create_private_json(_publication_resolution_path(request_id), resolution)
     return resolution
+
+
+def record_platform_retirement_surface_observation(
+    *,
+    request_id: str,
+    surface_id: str,
+    observation_id: str,
+    query: str,
+    matched_tool_names: list[str],
+    source_reference: str,
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    """Persist one narrow ChatGPT tool-discovery observation for retirement.
+
+    This path never mutates generic platform publication state and never claims
+    complete-schema publication. It only answers whether a fixed forbidden
+    Reposkop tool set was absent from one exact ChatGPT tool-discovery query.
+    """
+
+    timestamp = int(time.time()) if now_unix is None else now_unix
+    if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0:
+        raise ClientSnapshotError("retirement surface observation time is invalid")
+    request_id = _validate_identifier(
+        request_id, label="retirement publication request id"
+    )
+    surface_id = _validate_identifier(surface_id, label="retirement surface id")
+    observation_id = _validate_identifier(
+        observation_id, label="retirement observation id"
+    )
+    source_reference = _validate_platform_source_reference(source_reference)
+    if surface_id not in REPOSKOP_RETIREMENT_SURFACES:
+        raise ClientSnapshotError("retirement surface id is not an allowed ChatGPT connector")
+    if not source_reference.startswith(REPOSKOP_RETIREMENT_SOURCE_PREFIX):
+        raise ClientSnapshotError("retirement source reference is not ChatGPT tool-discovery evidence")
+    if query != REPOSKOP_RETIREMENT_QUERY:
+        raise ClientSnapshotError(
+            "retirement surface query must be the exact reposkop query"
+        )
+    if not isinstance(matched_tool_names, list):
+        raise ClientSnapshotError("retirement matched tool names must be a list")
+    normalized_names: list[str] = []
+    for value in matched_tool_names:
+        normalized_name = _validate_identifier(
+            value, label="retirement matched tool name"
+        )
+        if REPOSKOP_RETIREMENT_QUERY not in normalized_name:
+            raise ClientSnapshotError(
+                "retirement matched tool name does not match the exact reposkop query"
+            )
+        normalized_names.append(normalized_name)
+    if len(set(normalized_names)) != len(normalized_names):
+        raise ClientSnapshotError("retirement matched tool names contain duplicates")
+    normalized_names = sorted(normalized_names)
+
+    with _state_lock():
+        current = _read_publication_current()
+        if current is None or current["request_id"] != request_id:
+            raise ClientSnapshotError(
+                "retirement surface observation targets a non-current publication request"
+            )
+        if current["state"] not in PLATFORM_PUBLICATION_ACTIVATED_STATES:
+            raise ClientSnapshotError(
+                "retirement surface observation requires an activated publication request"
+            )
+        request = _read_publication_request(request_id)
+        contract_sha256 = request["expected_contract"]["tool_contract_sha256"]
+        if current["contract_sha256"] != contract_sha256:
+            raise ClientSnapshotError(
+                "retirement surface observation request/current contract mismatch"
+            )
+        forbidden_present = sorted(
+            REPOSKOP_RETIREMENT_FORBIDDEN_TOOLS.intersection(normalized_names)
+        )
+        material = {
+            "schema_version": 1,
+            "kind": PLATFORM_RETIREMENT_OBSERVATION_KIND,
+            "request_id": request_id,
+            "request_sha256": request["request_sha256"],
+            "contract_sha256": contract_sha256,
+            "surface_id": surface_id,
+            "observation_id": observation_id,
+            "observation_authority": "trusted_chatgpt_operator_tool_discovery",
+            "query": query,
+            "matched_tool_names": normalized_names,
+            "forbidden_tool_names": sorted(REPOSKOP_RETIREMENT_FORBIDDEN_TOOLS),
+            "forbidden_tool_names_present": forbidden_present,
+            "source_reference": source_reference,
+            "generic_platform_publication_state": current["state"],
+            "observed_at_unix": timestamp,
+        }
+        observation = {
+            **material,
+            "observation_sha256": _sha256_json(material),
+        }
+        observation_path = _retirement_observation_path(
+            request_id, surface_id, observation_id
+        )
+        try:
+            existing_observation = _read_private_json(observation_path)
+        except FileNotFoundError:
+            existing_observation = None
+        if existing_observation is None:
+            _create_private_json(observation_path, observation)
+        elif existing_observation != observation:
+            raise ClientSnapshotError(
+                "retirement surface observation id already binds different evidence"
+            )
+
+        nonclaims = [
+            "complete_platform_tool_schema_publication",
+            "platform_origin_cryptographic_attestation",
+            "platform_converged",
+            "consumer_zero_outside_the_observed_chatgpt_surface",
+        ]
+        if forbidden_present:
+            return {
+                "state": "retirement_surface_blocked",
+                "request_id": request_id,
+                "surface_id": surface_id,
+                "observation_sha256": observation["observation_sha256"],
+                "forbidden_tool_names_present": forbidden_present,
+                "generic_platform_publication_state": current["state"],
+                "does_not_establish": nonclaims,
+            }
+
+        resolution_material = {
+            "schema_version": 1,
+            "kind": PLATFORM_RETIREMENT_RESOLUTION_KIND,
+            "request_id": request_id,
+            "request_sha256": request["request_sha256"],
+            "contract_sha256": contract_sha256,
+            "surface_id": surface_id,
+            "observation_sha256": observation["observation_sha256"],
+            "criterion": "exact_forbidden_tool_names_absent",
+            "forbidden_tool_names": sorted(REPOSKOP_RETIREMENT_FORBIDDEN_TOOLS),
+            "resolved_at_unix": timestamp,
+        }
+        resolution = {
+            **resolution_material,
+            "resolution_sha256": _sha256_json(resolution_material),
+        }
+        resolution_path = _retirement_resolution_path(request_id, surface_id)
+        try:
+            existing_resolution = _read_private_json(resolution_path)
+        except FileNotFoundError:
+            existing_resolution = None
+        if existing_resolution is None:
+            _create_private_json(resolution_path, resolution)
+        elif existing_resolution != resolution:
+            raise ClientSnapshotError(
+                "retirement surface resolution already binds different evidence"
+            )
+        return {
+            "state": "retirement_surface_converged",
+            "request_id": request_id,
+            "surface_id": surface_id,
+            "observation_sha256": observation["observation_sha256"],
+            "resolution_sha256": resolution["resolution_sha256"],
+            "generic_platform_publication_state": current["state"],
+            "does_not_establish": nonclaims,
+        }
 
 
 def _persist_publication_receipt(
@@ -5661,6 +5852,18 @@ def _auto_refresh_parser() -> argparse.ArgumentParser:
         "--outcome", choices=sorted(PLATFORM_PUBLICATION_ATTEMPT_OUTCOMES), required=True
     )
     attempt.add_argument("--reference", required=True)
+    retirement = subparsers.add_parser(
+        "record-retirement-surface-observation",
+        help=(
+            "Persist one request-bound ChatGPT tool-discovery observation for a narrow retirement gate without claiming generic platform convergence."
+        ),
+    )
+    retirement.add_argument("--request-id", required=True)
+    retirement.add_argument("--surface-id", required=True)
+    retirement.add_argument("--observation-id", required=True)
+    retirement.add_argument("--query", required=True)
+    retirement.add_argument("--matched-tool-name", action="append", default=[])
+    retirement.add_argument("--source-reference", required=True)
     probe = subparsers.add_parser(
         "probe-runtime",
         help="Read one fixed loopback runtime and emit bounded green readiness evidence.",
@@ -5741,6 +5944,19 @@ def main(argv: list[str] | None = None) -> int:
                 attempt_id=args.attempt_id,
                 outcome=args.outcome,
                 reference=args.reference,
+            )
+        elif args.command == "record-retirement-surface-observation":
+            if os.geteuid() == 0:
+                raise ClientSnapshotError(
+                    "retirement surface observation must run as the runtime user, not root"
+                )
+            result = record_platform_retirement_surface_observation(
+                request_id=args.request_id,
+                surface_id=args.surface_id,
+                observation_id=args.observation_id,
+                query=args.query,
+                matched_tool_names=args.matched_tool_name,
+                source_reference=args.source_reference,
             )
         elif args.command == "probe-runtime":
             result = probe_runtime_readiness(

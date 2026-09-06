@@ -40,6 +40,16 @@ class PlatformConnectorCaptureTests(unittest.TestCase):
                 snapshot, "PLATFORM_PUBLICATION_RESOLUTION_ROOT", self.publication_root / "resolutions"
             ),
             mock.patch.object(
+                snapshot,
+                "PLATFORM_RETIREMENT_OBSERVATION_ROOT",
+                self.publication_root / "retirement-observations",
+            ),
+            mock.patch.object(
+                snapshot,
+                "PLATFORM_RETIREMENT_RESOLUTION_ROOT",
+                self.publication_root / "retirement-resolutions",
+            ),
+            mock.patch.object(
                 snapshot, "PLATFORM_PUBLICATION_CURRENT_PATH", self.publication_root / "current.json"
             ),
         )
@@ -1296,6 +1306,87 @@ class PlatformConnectorCaptureTests(unittest.TestCase):
                 source_reference="chatgpt:connector-catalog:test",
                 observation_scope="chat_session_catalog",
                 observation_id="session-parent-test",
+            )
+
+    def test_retirement_surface_zero_is_request_bound_without_generic_convergence(self) -> None:
+        artifact = self.complete_artifact()
+        prepared = self.prepare_request(artifact, now_unix=1_000)
+        request_id = str(prepared["request_id"])
+        snapshot.activate_platform_publication_request(
+            request_id=request_id, now_unix=1_001
+        )
+        before = snapshot._read_publication_current()
+
+        result = snapshot.record_platform_retirement_surface_observation(
+            request_id=request_id,
+            surface_id="grabowski",
+            observation_id="chatgpt-thread-1",
+            query="reposkop",
+            matched_tool_names=[],
+            source_reference="chatgpt-tool-discovery:thread-1:grabowski",
+            now_unix=1_002,
+        )
+
+        self.assertEqual(result["state"], "retirement_surface_converged")
+        self.assertEqual(result["generic_platform_publication_state"], "publication_pending")
+        self.assertIn("platform_converged", result["does_not_establish"])
+        self.assertIn(
+            "platform_origin_cryptographic_attestation", result["does_not_establish"]
+        )
+        self.assertEqual(snapshot._read_publication_current(), before)
+        resolution_path = snapshot._retirement_resolution_path(request_id, "grabowski")
+        resolution = snapshot._read_private_json(resolution_path)
+        self.assertEqual(resolution["criterion"], "exact_forbidden_tool_names_absent")
+        self.assertEqual(
+            resolution["request_sha256"],
+            snapshot._read_publication_request(request_id)["request_sha256"],
+        )
+
+    def test_retirement_surface_forbidden_tool_blocks_resolution(self) -> None:
+        artifact = self.complete_artifact()
+        prepared = self.prepare_request(artifact, now_unix=1_000)
+        request_id = str(prepared["request_id"])
+        snapshot.activate_platform_publication_request(
+            request_id=request_id, now_unix=1_001
+        )
+
+        result = snapshot.record_platform_retirement_surface_observation(
+            request_id=request_id,
+            surface_id="grabowski",
+            observation_id="chatgpt-thread-stale",
+            query="reposkop",
+            matched_tool_names=["grabowski_reposkop_context"],
+            source_reference="chatgpt-tool-discovery:thread-stale:grabowski",
+            now_unix=1_002,
+        )
+
+        self.assertEqual(result["state"], "retirement_surface_blocked")
+        self.assertEqual(
+            result["forbidden_tool_names_present"], ["grabowski_reposkop_context"]
+        )
+        self.assertFalse(
+            snapshot._retirement_resolution_path(request_id, "grabowski").exists()
+        )
+
+    def test_retirement_surface_rejects_noncanonical_query(self) -> None:
+        artifact = self.complete_artifact()
+        prepared = self.prepare_request(artifact, now_unix=1_000)
+        request_id = str(prepared["request_id"])
+        snapshot.activate_platform_publication_request(
+            request_id=request_id, now_unix=1_001
+        )
+
+        with self.assertRaisesRegex(
+            snapshot.ClientSnapshotError, "exact reposkop query"
+        ):
+            snapshot.record_platform_retirement_surface_observation(
+                request_id=request_id,
+                surface_id="grabowski",
+                observation_id="chatgpt-thread-wrong-query",
+                query="repo",
+                matched_tool_names=[],
+                source_reference="chatgpt-tool-discovery:thread-wrong:grabowski",
+                now_unix=1_002,
             )
 
 
