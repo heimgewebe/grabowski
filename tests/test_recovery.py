@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -409,6 +411,42 @@ class RecoveryToolTests(unittest.TestCase):
         self.assertEqual(argv[4], "a" * 64)
         self.assertIn("--verify", argv)
 
+    def test_local_recovery_repository_operation_lock_rejects_busy_peer(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            state = Path(raw)
+            descriptor = os.open(state, os.O_RDONLY)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with patch.object(recovery, "LOCAL_RECOVERY_OPERATION_STATE", state):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "local recovery repository operation is busy"
+                    ):
+                        with recovery._local_recovery_repository_operation_lock():
+                            self.fail("busy repository operation lock was acquired")
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
+
+    def test_local_probe_holds_external_repository_operation_lock(self) -> None:
+        target_info = {
+            "kind": "local_backup_disk",
+            "backup_uuid": "249180DA265E8DE0",
+            "repository_name": "heim-pc",
+        }
+        expected = {"ok": True}
+        with patch.object(
+            recovery,
+            "_local_recovery_repository_operation_lock",
+            return_value=nullcontext(),
+        ) as lock, patch.object(
+            recovery, "_local_recovery_probe_locked", return_value=expected
+        ) as probe:
+            result = recovery._local_recovery_probe(target_info)
+
+        self.assertEqual(result, expected)
+        lock.assert_called_once_with()
+        probe.assert_called_once_with(target_info)
+
     def test_local_probe_checks_repository_without_cache_or_lock_writes(self) -> None:
         snapshot_id = "a" * 64
         durability = {
@@ -467,7 +505,7 @@ class RecoveryToolTests(unittest.TestCase):
         ), patch.object(
             recovery, "_canonical_server_marker", return_value=canonical
         ), patch.object(recovery.base, "_append_audit"):
-            result = recovery._local_recovery_probe(
+            result = recovery._local_recovery_probe_locked(
                 {
                     "kind": "local_backup_disk",
                     "backup_uuid": "249180DA265E8DE0",
