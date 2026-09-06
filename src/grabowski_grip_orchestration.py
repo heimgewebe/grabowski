@@ -1109,10 +1109,33 @@ def _validate_grip_result(
 def _child_semantically_ready(
     plan: dict[str, Any], planned: Mapping[str, Any], child_output: Mapping[str, Any]
 ) -> bool:
-    if (
-        plan.get("saga_kind") != "pr-settlement"
-        or planned.get("action") != "pr-check-readiness"
-    ):
+    if plan.get("saga_kind") != "pr-settlement":
+        return True
+
+    action = planned.get("action")
+    if action == "bureau-pickup-status":
+        coordination = child_output.get("coordination")
+        execution_binding = child_output.get("execution_binding")
+        if (
+            child_output.get("kind") != "grabowski_bureau_pickup_status"
+            or not isinstance(coordination, Mapping)
+            or not isinstance(execution_binding, Mapping)
+        ):
+            return False
+        run = coordination.get("run")
+        lease = coordination.get("lease")
+        return (
+            coordination.get("status") == "coordinated"
+            and coordination.get("blocking") is False
+            and isinstance(run, Mapping)
+            and run.get("state") in {"assigned", "running", "verifying"}
+            and isinstance(lease, Mapping)
+            and lease.get("status") == "active-bound"
+            and execution_binding.get("classification") == "actively_bound"
+            and execution_binding.get("actively_bound") is True
+        )
+
+    if action != "pr-check-readiness":
         return True
     blocking_reasons = child_output.get("blocking_reasons")
     return (
