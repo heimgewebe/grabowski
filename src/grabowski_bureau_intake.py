@@ -109,7 +109,7 @@ def _prepare_registry_root(
         )
     if mutation:
         operator._require_operator_mutation(
-            "terminal_execute", path=str(resolved)
+            "bureau_mutation", path=str(resolved)
         )
     if resolved == control_root:
         if refresh:
@@ -1241,7 +1241,7 @@ def grabowski_bureau_candidate_record(
     request: BureauCandidateRecordRequest | BureauCandidateCloseRequest,
 ) -> dict[str, Any]:
     """Record one source-bound Bureau candidate through the canonical typed intake contract."""
-    operator._require_operator_mutation("terminal_execute")
+    operator._require_operator_mutation("bureau_mutation")
     if not isinstance(request, dict):
         raise ValueError("request must be an object")
     try:
@@ -1460,7 +1460,7 @@ def grabowski_bureau_task_propose(
 ) -> dict[str, Any]:
     """Create an immutable Bureau task proposal artifact without changing Registry or Queue truth."""
     operator._require_operator_mutation(
-        "terminal_execute",
+        "bureau_mutation",
         path=str(Path(registry_root).expanduser().resolve()),
     )
     resolved_root = _prepare_registry_root(
@@ -1571,7 +1571,7 @@ def grabowski_bureau_task_review(
 ) -> dict[str, Any]:
     """Review one exact Bureau proposal digest without changing Registry, Queue or publication truth."""
     operator._require_operator_mutation(
-        "terminal_execute",
+        "bureau_mutation",
         path=str(Path(registry_root).expanduser().resolve()),
     )
     resolved_root = _prepare_registry_root(
@@ -1721,7 +1721,7 @@ def grabowski_bureau_task_publish(
 ) -> dict[str, Any]:
     """Publish one reviewed task through the preview-selected Git or StateStore contract."""
     operator._require_operator_mutation(
-        "terminal_execute",
+        "bureau_mutation",
         path=str(Path(registry_root).expanduser().resolve()),
     )
     resolved_root = _prepare_registry_root(

@@ -1454,7 +1454,7 @@ class BureauIntakeAdapterTests(unittest.TestCase):
             )
         self.assertEqual(resolved, str(control.resolve()))
         self.assertEqual(order, ["policy", "refresh"])
-        policy.assert_called_once_with("terminal_execute", path=str(control.resolve()))
+        policy.assert_called_once_with("bureau_mutation", path=str(control.resolve()))
         refresh.assert_called_once_with()
 
     def test_task_propose_is_adapter_idempotent(self) -> None:
