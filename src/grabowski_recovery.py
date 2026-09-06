@@ -1244,6 +1244,8 @@ def _local_recovery_restore_probe(
             [
                 RESTIC_BIN,
                 "restore",
+                "--no-cache",
+                "--no-lock",
                 snapshot_id,
                 "--target",
                 str(target),
@@ -1298,7 +1300,13 @@ def _local_recovery_probe(target_info: dict[str, Any]) -> dict[str, Any]:
         log_path=log_path,
     )
     _run_logged(
-        [RESTIC_BIN, "check", f"--read-data-subset={SERVER_RECOVERY_CHECK_SUBSET}"],
+        [
+            RESTIC_BIN,
+            "check",
+            "--no-cache",
+            "--no-lock",
+            f"--read-data-subset={SERVER_RECOVERY_CHECK_SUBSET}",
+        ],
         env=restic_env,
         log=log_path,
         timeout_seconds=SERVER_RECOVERY_TIMEOUT_SECONDS,

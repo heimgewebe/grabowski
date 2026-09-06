@@ -402,8 +402,91 @@ class RecoveryToolTests(unittest.TestCase):
         self.assertEqual(result["inventory_sha256"], inventory_sha256)
         self.assertEqual(result["file_count"], 1)
         argv = run.call_args.args[0]
-        self.assertEqual(argv[0:3], [recovery.RESTIC_BIN, "restore", "a" * 64])
+        self.assertEqual(
+            argv[0:4],
+            [recovery.RESTIC_BIN, "restore", "--no-cache", "--no-lock"],
+        )
+        self.assertEqual(argv[4], "a" * 64)
         self.assertIn("--verify", argv)
+
+    def test_local_probe_checks_repository_without_cache_or_lock_writes(self) -> None:
+        snapshot_id = "a" * 64
+        durability = {
+            "snapshot_id": snapshot_id,
+            "verified_at_unix": 190,
+            "receipt_digest": "b" * 64,
+            "inventory_sha256": "c" * 64,
+            "file_count": 1,
+            "total_bytes": 4,
+        }
+        snapshot = {
+            "snapshot_id": snapshot_id,
+            "hostname": "heim-pc",
+            "tags": ["daily"],
+            "paths": [],
+            "time": "1970-01-01T00:03:00+00:00",
+            "time_unix": 180,
+        }
+        restore = {
+            "inventory_sha256": durability["inventory_sha256"],
+            "file_count": 1,
+            "total_bytes": 4,
+        }
+        canonical = {
+            "valid": True,
+            "source_record_sha256": "d" * 64,
+            "record_sha256": "e" * 64,
+            "snapshot_id": snapshot_id[:8],
+        }
+        with tempfile.TemporaryDirectory() as raw, patch.object(
+            recovery.time, "time", return_value=200
+        ), patch.object(
+            recovery.operator, "STATE_DIR", Path(raw)
+        ), patch.object(
+            recovery, "_local_recovery_durability_evidence", return_value=durability
+        ), patch.object(
+            recovery,
+            "_local_recovery_repository",
+            return_value=(Path("/mnt/backup/restic/heim-pc"), {}, "/dev/sda1"),
+        ), patch.object(
+            recovery, "_local_recovery_snapshot_metadata", return_value=snapshot
+        ), patch.object(
+            recovery, "_local_recovery_restore_probe", return_value=restore
+        ), patch.object(
+            recovery, "_run_logged", return_value=types.SimpleNamespace(stdout="", stderr="", returncode=0)
+        ) as run, patch.object(
+            recovery,
+            "_write_server_marker",
+            return_value={"source_record_sha256": "d" * 64, "generated_at_unix": 200},
+        ), patch.object(
+            recovery.privileged,
+            "publish_recovery_marker_reference",
+            return_value={"success": True},
+        ), patch.object(
+            recovery, "_server_source_marker", return_value={"valid": True}
+        ), patch.object(
+            recovery, "_canonical_server_marker", return_value=canonical
+        ), patch.object(recovery.base, "_append_audit"):
+            result = recovery._local_recovery_probe(
+                {
+                    "kind": "local_backup_disk",
+                    "backup_uuid": "249180DA265E8DE0",
+                    "repository_name": "heim-pc",
+                }
+            )
+
+        argv = run.call_args.args[0]
+        self.assertEqual(
+            argv,
+            [
+                recovery.RESTIC_BIN,
+                "check",
+                "--no-cache",
+                "--no-lock",
+                f"--read-data-subset={recovery.SERVER_RECOVERY_CHECK_SUBSET}",
+            ],
+        )
+        self.assertTrue(result["repository_check_valid"])
 
     def test_server_recovery_probe_dispatches_local_backend_without_server_secret(self) -> None:
         target_info = {
