@@ -237,6 +237,7 @@ class WorkAcquireTests(unittest.TestCase):
 
     def test_public_work_acquire_signature_does_not_change_in_p4(self) -> None:
         parameters = inspect.signature(work_acquire.grabowski_work_acquire).parameters
+        self.assertIsNone(parameters["scoped_writer_runtime_seconds"].default)
         self.assertEqual(
             list(parameters),
             [
@@ -2615,6 +2616,30 @@ class WorkAcquireTests(unittest.TestCase):
             }
         )
         return params
+
+    def test_scoped_writer_runtime_defaults_are_source_aware(self) -> None:
+        direct = self.parameters()
+        direct["scoped_writer_argv"] = ["writer", "--once"]
+        normalized_direct = work_acquire._normalize(direct)
+        self.assertEqual(
+            work_acquire.DEFAULT_SCOPED_WRITER_RUNTIME_SECONDS,
+            normalized_direct["scoped_writer_command"]["runtime_seconds"],
+        )
+
+        bureau = self.bureau_run_parameters()
+        bureau.pop("scoped_writer_runtime_seconds")
+        normalized_bureau = work_acquire._normalize(bureau)
+        self.assertEqual(
+            work_acquire.BUREAU_RUN_DEFAULT_SCOPED_WRITER_RUNTIME_SECONDS,
+            normalized_bureau["scoped_writer_command"]["runtime_seconds"],
+        )
+
+        explicit = self.bureau_run_parameters()
+        explicit["scoped_writer_runtime_seconds"] = 1800
+        normalized_explicit = work_acquire._normalize(explicit)
+        self.assertEqual(
+            1800, normalized_explicit["scoped_writer_command"]["runtime_seconds"]
+        )
 
     @staticmethod
     def delegated_parent_receipt() -> dict[str, object]:
