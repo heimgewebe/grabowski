@@ -5045,7 +5045,7 @@ globalThis.fetch = async () => ({
         self.assertTrue(bounded["requires_element"])
         self.assertFalse(bounded["requires_navigation_target"])
         self.assertFalse(bounded["requires_bound_navigation_target"])
-        self.assertEqual(bounded["admission"], "implemented")
+        self.assertEqual(bounded["admission"], "fail_closed")
         self.assertEqual(
             bounded["fixed_server_payload_sha256"],
             workers.BROWSER_MAULWURFX_E2E_PROMPT_SHA256,
@@ -5475,6 +5475,43 @@ globalThis.fetch = async () => ({
             "perform_authoritative_readback_then_form_a_new_explicit_intent",
         )
 
+    def test_browser_semantic_maulwurfx_submit_stays_fail_closed_until_contract_promotion(self) -> None:
+        worker = self._running_browser(port=9395)
+        textbox = {
+            "backend_node_id": "101",
+            "role": "textbox",
+            "name": workers.BROWSER_MAULWURFX_E2E_TEXTBOX_NAME,
+            "navigation_target_sha256": None,
+        }
+        payload = self._semantic_state_payload(
+            origin=workers.BROWSER_MAULWURFX_E2E_ORIGIN, elements=[textbox]
+        )
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=payload
+        ):
+            observation = workers.browser_semantic_observe(worker["worker_id"])
+
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=payload
+        ) as run:
+            outcome = workers.browser_semantic_act(
+                worker["worker_id"],
+                observation["snapshot_id"],
+                "submit_maulwurfx_proposal_e2e",
+                element_id=observation["elements"][0]["element_id"],
+            )
+
+        self.assertFalse(outcome["ok"])
+        self.assertEqual(outcome["effect_class"], "bounded_external_submit")
+        self.assertEqual(outcome["result_code"], "effect_not_implemented")
+        self.assertEqual(outcome["effect_state"], "not_started")
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[1]["op"], "read_state")
+
     def test_browser_semantic_maulwurfx_submit_is_fixed_bounded_and_ambiguous(self) -> None:
         worker = self._running_browser(port=9396)
         textbox = {
@@ -5494,6 +5531,10 @@ globalThis.fetch = async () => ({
             observation = workers.browser_semantic_observe(worker["worker_id"])
 
         with patch.object(
+            workers,
+            "BROWSER_EFFECT_CLASSES_IMPLEMENTED",
+            frozenset({*workers.BROWSER_EFFECT_CLASSES_IMPLEMENTED, "bounded_external_submit"}),
+        ), patch.object(
             workers, "_observe", return_value=self._running_observation()
         ), patch.object(
             workers, "_run_node_browser_semantic", side_effect=[payload, payload]
@@ -5604,10 +5645,11 @@ globalThis.fetch = async () => ({
             section.index("current.trim() !== ''"),
             section.index("Input.insertText"),
         )
-        self.assertLess(
-            section.index("Input.insertText"),
-            section.index("Input.dispatchKeyEvent"),
-        )
+        insert_index = section.index("Input.insertText")
+        focus_recheck_index = section.index("document.activeElement === this", insert_index)
+        dispatch_index = section.index("Input.dispatchKeyEvent")
+        self.assertLess(insert_index, focus_recheck_index)
+        self.assertLess(focus_recheck_index, dispatch_index)
         self.assertIn("verifyElementImmediately(expectedElement)", section)
         self.assertNotIn("querySelector", section)
 

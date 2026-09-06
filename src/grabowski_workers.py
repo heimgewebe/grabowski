@@ -2413,7 +2413,7 @@ BROWSER_EFFECT_CONTRACTS: dict[str, dict[str, Any]] = {
         },
     },
     "bounded_external_submit": {
-        "admission": "implemented",
+        "admission": "fail_closed",
         "requires_operator_mutation": True,
         "ambiguous_outcome": {
             "retry_authorized": False,
@@ -3981,6 +3981,28 @@ try {
         awaitPromise: false,
       });
       if (inserted.exceptionDetails || !inserted.result || inserted.result.value !== true) {
+        throw new Error('protocol');
+      }
+      const stillTargeted = await call('Runtime.callFunctionOn', {
+        objectId,
+        functionDeclaration: `function (expected) {
+          if (!this || !this.isConnected) return false;
+          const tag = String(this.localName || '').toLowerCase();
+          const type = tag === 'input'
+            ? String(this.getAttribute('type') || '').toLowerCase() : '';
+          const editable = tag === 'textarea' ||
+            (tag === 'input' && ['', 'text', 'search'].includes(type)) ||
+            this.isContentEditable === true;
+          const current = typeof this.value === 'string'
+            ? this.value : String(this.textContent || '');
+          return editable && current === expected && document.activeElement === this;
+        }`,
+        arguments: [{value: fixedText}],
+        returnByValue: true,
+        awaitPromise: false,
+      });
+      if (stillTargeted.exceptionDetails || !stillTargeted.result ||
+          stillTargeted.result.value !== true) {
         throw new Error('protocol');
       }
       await call('Input.dispatchKeyEvent', {
