@@ -238,7 +238,13 @@ class ReleaseLifecycleConsistencyTests(unittest.TestCase):
         self.assertEqual(browser["semantic_gateway"]["operations"], ["observe", "act"])
         self.assertEqual(
             browser["semantic_gateway"]["supported_intents"],
-            ["read_state", "navigate", "scroll_into_view", "activate"],
+            [
+                "read_state",
+                "navigate",
+                "scroll_into_view",
+                "activate",
+                "submit_maulwurfx_proposal_e2e",
+            ],
         )
         self.assertEqual(browser["semantic_gateway"]["uncovered_intents"], {})
         self.assertEqual(
@@ -247,7 +253,7 @@ class ReleaseLifecycleConsistencyTests(unittest.TestCase):
         )
         self.assertEqual(
             browser["semantic_gateway"]["implemented_effect_classes"],
-            ["read", "local_ui", "network_navigation"],
+            ["read", "local_ui", "network_navigation", "bounded_external_submit"],
         )
         self.assertEqual(
             browser["semantic_gateway"]["fail_closed_effect_classes"],
@@ -284,16 +290,66 @@ class ReleaseLifecycleConsistencyTests(unittest.TestCase):
         ]
         self.assertEqual(
             semantic["supported_intents"],
-            ["read_state", "navigate", "scroll_into_view", "activate"],
+            [
+                "read_state",
+                "navigate",
+                "scroll_into_view",
+                "activate",
+                "submit_maulwurfx_proposal_e2e",
+            ],
         )
-        semantic["supported_intents"] = [
-            "read_state",
-            "navigate",
-            "scroll_into_view",
-        ]
+        for compatible in (
+            ["read_state", "navigate", "scroll_into_view"],
+            ["read_state", "navigate", "scroll_into_view", "activate"],
+        ):
+            with self.subTest(compatible=compatible):
+                compatible_manifest = self.staged.manifest()
+                compatible_semantic = compatible_manifest["entrypoint_contract"][
+                    "browser_operator_default"
+                ]["semantic_gateway"]
+                compatible_semantic["supported_intents"] = compatible
+                compatible_semantic["implemented_effect_classes"] = [
+                    "read", "local_ui", "network_navigation"
+                ]
+                self.assertEqual(
+                    deploy_runtime.validate_manifest_schema(compatible_manifest), []
+                )
+                self.assertTrue(
+                    grabowski_mcp._manifest_schema_valid(compatible_manifest)
+                )
 
-        self.assertEqual(deploy_runtime.validate_manifest_schema(manifest), [])
-        self.assertTrue(grabowski_mcp._manifest_schema_valid(manifest))
+        for mismatched_intents, mismatched_effects in (
+            (
+                ["read_state", "navigate", "scroll_into_view", "activate"],
+                [
+                    "read", "local_ui", "network_navigation",
+                    "bounded_external_submit",
+                ],
+            ),
+            (
+                [
+                    "read_state", "navigate", "scroll_into_view", "activate",
+                    "submit_maulwurfx_proposal_e2e",
+                ],
+                ["read", "local_ui", "network_navigation"],
+            ),
+        ):
+            with self.subTest(
+                mismatched_intents=mismatched_intents,
+                mismatched_effects=mismatched_effects,
+            ):
+                mismatched_manifest = self.staged.manifest()
+                mismatched_semantic = mismatched_manifest["entrypoint_contract"][
+                    "browser_operator_default"
+                ]["semantic_gateway"]
+                mismatched_semantic["supported_intents"] = mismatched_intents
+                mismatched_semantic["implemented_effect_classes"] = mismatched_effects
+                self.assertNotEqual(
+                    deploy_runtime.validate_manifest_schema(mismatched_manifest), []
+                )
+                self.assertFalse(
+                    grabowski_mcp._manifest_schema_valid(mismatched_manifest)
+                )
 
     def test_deployed_release_ships_the_canonical_validator(self) -> None:
         """The runtime cannot validate itself unless the schema travels with it."""

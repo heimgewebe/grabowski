@@ -5038,6 +5038,18 @@ globalThis.fetch = async () => ({
         self.assertFalse(activate["requires_navigation_target"])
         self.assertTrue(activate["requires_bound_navigation_target"])
         self.assertEqual(activate["admission"], "implemented")
+        bounded = result_payload["semantic_catalog"]["intents"][
+            "submit_maulwurfx_proposal_e2e"
+        ]
+        self.assertEqual(bounded["effect_class"], "bounded_external_submit")
+        self.assertTrue(bounded["requires_element"])
+        self.assertFalse(bounded["requires_navigation_target"])
+        self.assertFalse(bounded["requires_bound_navigation_target"])
+        self.assertEqual(bounded["admission"], "implemented")
+        self.assertEqual(
+            bounded["fixed_server_payload_sha256"],
+            workers.BROWSER_MAULWURFX_E2E_PROMPT_SHA256,
+        )
         self.assertEqual(
             result_payload["semantic_catalog"]["intents"]["navigate"][
                 "effect_class"
@@ -5462,6 +5474,142 @@ globalThis.fetch = async () => ({
             outcome["retry_readback"]["next_action_after_ambiguous_effect"],
             "perform_authoritative_readback_then_form_a_new_explicit_intent",
         )
+
+    def test_browser_semantic_maulwurfx_submit_is_fixed_bounded_and_ambiguous(self) -> None:
+        worker = self._running_browser(port=9396)
+        textbox = {
+            "backend_node_id": "101",
+            "role": "textbox",
+            "name": workers.BROWSER_MAULWURFX_E2E_TEXTBOX_NAME,
+            "navigation_target_sha256": None,
+        }
+        payload = self._semantic_state_payload(
+            origin=workers.BROWSER_MAULWURFX_E2E_ORIGIN, elements=[textbox]
+        )
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=payload
+        ):
+            observation = workers.browser_semantic_observe(worker["worker_id"])
+
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", side_effect=[payload, payload]
+        ) as run:
+            outcome = workers.browser_semantic_act(
+                worker["worker_id"],
+                observation["snapshot_id"],
+                "submit_maulwurfx_proposal_e2e",
+                element_id=observation["elements"][0]["element_id"],
+            )
+
+        self.assertFalse(outcome["ok"])
+        self.assertEqual(outcome["effect_class"], "bounded_external_submit")
+        self.assertEqual(outcome["result_code"], "outcome_unknown")
+        self.assertEqual(outcome["effect_state"], "unknown")
+        self.assertEqual(len(run.call_args_list), 2)
+        request = run.call_args_list[1].args[1]
+        self.assertEqual(request["op"], "submit_maulwurfx_proposal_e2e")
+        self.assertEqual(request["fixed_text"], workers.BROWSER_MAULWURFX_E2E_PROMPT)
+        self.assertEqual(
+            request["fixed_text_sha256"],
+            workers.BROWSER_MAULWURFX_E2E_PROMPT_SHA256,
+        )
+        self.assertNotIn("prompt", workers._browser_intent(
+            "submit_maulwurfx_proposal_e2e",
+            element_id=observation["elements"][0]["element_id"],
+            navigation_target=None,
+        ))
+
+    def test_browser_semantic_maulwurfx_submit_rejects_wrong_origin_before_effect(self) -> None:
+        worker = self._running_browser(port=9397)
+        textbox = {
+            "backend_node_id": "101",
+            "role": "textbox",
+            "name": workers.BROWSER_MAULWURFX_E2E_TEXTBOX_NAME,
+            "navigation_target_sha256": None,
+        }
+        payload = self._semantic_state_payload(
+            origin="https://example.invalid", elements=[textbox]
+        )
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=payload
+        ):
+            observation = workers.browser_semantic_observe(worker["worker_id"])
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=payload
+        ) as run:
+            outcome = workers.browser_semantic_act(
+                worker["worker_id"],
+                observation["snapshot_id"],
+                "submit_maulwurfx_proposal_e2e",
+                element_id=observation["elements"][0]["element_id"],
+            )
+        self.assertFalse(outcome["ok"])
+        self.assertEqual(outcome["result_code"], "element_contract")
+        self.assertEqual(outcome["effect_state"], "not_started")
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[1]["op"], "read_state")
+
+    def test_browser_semantic_maulwurfx_submit_rejects_wrong_textbox_name_before_effect(self) -> None:
+        worker = self._running_browser(port=9398)
+        textbox = {
+            "backend_node_id": "101",
+            "role": "textbox",
+            "name": "Search",
+            "navigation_target_sha256": None,
+        }
+        payload = self._semantic_state_payload(
+            origin=workers.BROWSER_MAULWURFX_E2E_ORIGIN, elements=[textbox]
+        )
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=payload
+        ):
+            observation = workers.browser_semantic_observe(worker["worker_id"])
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=payload
+        ) as run:
+            outcome = workers.browser_semantic_act(
+                worker["worker_id"],
+                observation["snapshot_id"],
+                "submit_maulwurfx_proposal_e2e",
+                element_id=observation["elements"][0]["element_id"],
+            )
+        self.assertFalse(outcome["ok"])
+        self.assertEqual(outcome["result_code"], "element_contract")
+        self.assertEqual(outcome["effect_state"], "not_started")
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[1]["op"], "read_state")
+
+    def test_browser_semantic_maulwurfx_node_guards_empty_textbox_before_submit(self) -> None:
+        source = workers.BROWSER_SEMANTIC_NODE_SOURCE
+        start = source.index("request.op === 'submit_maulwurfx_proposal_e2e'")
+        end = source.index("} else {\n    throw new Error('unsupported-op');", start)
+        section = source[start:end]
+        self.assertLess(
+            section.index("before.origin !== request.required_origin"),
+            section.index("Input.insertText"),
+        )
+        self.assertLess(
+            section.index("current.trim() !== ''"),
+            section.index("Input.insertText"),
+        )
+        self.assertLess(
+            section.index("Input.insertText"),
+            section.index("Input.dispatchKeyEvent"),
+        )
+        self.assertIn("verifyElementImmediately(expectedElement)", section)
+        self.assertNotIn("querySelector", section)
 
     def test_browser_semantic_contract_does_not_change_stored_form_action_safety(self) -> None:
         worker = self._running_browser(port=9366)
