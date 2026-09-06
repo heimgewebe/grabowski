@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "connector_id": "maulwurf-x",
   "mode": "allowlist",
   "read_only_only": true,
@@ -10,5 +10,8 @@
     "grabowski_contract_drift",
     "grabowski_systemkatalog_query",
     "grabowski_audit_projection"
+  ],
+  "gateway_tools": [
+    "maulwurfx_propose_finding"
   ]
 }
