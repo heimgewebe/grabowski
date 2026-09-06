@@ -260,7 +260,13 @@ def _backup_storage_operation_plan(
         "privileged_action": spec["action"],
         "target": spec["target"],
         "effect": spec["effect"],
-        "rollback": "none; read-only diagnostics have no rollback and NTFS repair is separately operator-gated",
+        "rollback": (
+            "none; a successful stale-mount unmount is intentionally not reversed; "
+            "the UUID-bound automount may remount on next access, and any failed or "
+            "uncertain outcome must be read back before another reconcile intent"
+            if operation == BACKUP_MOUNT_RECONCILE_OPERATION
+            else "none; read-only diagnostics have no rollback and NTFS repair is separately operator-gated"
+        ),
     }
 
 

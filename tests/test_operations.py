@@ -692,6 +692,8 @@ class BackupMountRecoveryOperationTests(unittest.TestCase):
         self.assertEqual(mount["privileged_action"], "local_backup_mount_reconcile")
         self.assertEqual(mount["target"], "reconcile")
         self.assertEqual(mount["effect"], "mount_reconcile_write")
+        self.assertIn("successful stale-mount unmount", mount["rollback"])
+        self.assertIn("read back before another reconcile intent", mount["rollback"])
         self.assertEqual(refresh["effect"], "authority_contract_refresh")
         with self.assertRaisesRegex(ValueError, "full SHA-1"):
             operations._rootbroker_authority_refresh_plan({"expected_head": "main"})
