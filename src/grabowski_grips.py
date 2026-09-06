@@ -12749,6 +12749,46 @@ def _run_captain_pr_merge(
                 }
             )
             return execution_result
+        if (
+            merge_info["returncode"] == 0
+            and base_update_guard_mode == "exact_base_git_cas"
+            and isinstance(github_runner, grabowski_merge_guard.CaptainMergeGuardRunner)
+        ):
+            reconciliation, reconciliation_errors = (
+                github_runner.reconcile_exact_base_git_cas_closed_pr(
+                    viewed=viewed,
+                    verify_errors=verify_errors,
+                    queue_errors=queue_errors,
+                    repo_slug=repo_slug,
+                    pr_number=int(pr_number),
+                    expected_head=expected_head,
+                    expected_base=expected_base,
+                    expected_base_sha=expected_base_sha,
+                )
+            )
+            execution_result["exact_base_git_cas_closed_pr_reconciliation"] = {
+                "status": (
+                    reconciliation.get("status")
+                    if isinstance(reconciliation, dict)
+                    else "rejected"
+                ),
+                "errors": list(reconciliation_errors),
+            }
+            if reconciliation is not None and not reconciliation_errors:
+                execution_result.update(
+                    {
+                        "remote_mutation_observed": True,
+                        "verification_passed": True,
+                        "merge_completion_verified": True,
+                        "duplicate_dispatch_prevented": True,
+                        "verified_pr": viewed,
+                        "merge_reconciliation": (
+                            "exact_base_git_cas_base_readback_after_closed_pr_metadata"
+                        ),
+                        "post_merge_reconciliation": reconciliation,
+                    }
+                )
+                return execution_result
     if merge_info["returncode"] != 0:
         if verify_errors:
             execution_result["post_verify_errors"] = ["merge_command_failed", *verify_errors]
