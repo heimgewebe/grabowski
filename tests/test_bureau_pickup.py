@@ -5455,11 +5455,23 @@ class BureauPickupTests(unittest.TestCase):
             observed_authority = []
 
             def rebind_after_authority(*args, **kwargs):
-                proof_paths = list(
-                    run_dir.glob("lease-repair-registry-successor-proof-*.json")
+                intent_path = pickup._lease_repair_successor_proof_intent_path(
+                    run_dir, intent
                 )
-                self.assertEqual(1, len(proof_paths))
-                authority = json.loads(proof_paths[0].read_text(encoding="utf-8"))
+                self.assertTrue(intent_path.exists())
+                authority = json.loads(intent_path.read_text(encoding="utf-8"))
+                content_paths = [
+                    path
+                    for path in run_dir.glob(
+                        "lease-repair-registry-successor-proof-*.json"
+                    )
+                    if path != intent_path
+                ]
+                self.assertEqual(1, len(content_paths))
+                self.assertEqual(
+                    authority,
+                    json.loads(content_paths[0].read_text(encoding="utf-8")),
+                )
                 self.assertEqual(successor_proof, authority["successor_proof"])
                 self.assertEqual(
                     pickup._sha256(successor_proof),
@@ -5677,6 +5689,118 @@ class BureauPickupTests(unittest.TestCase):
         )
         self.assertEqual(
             acquisition["acquisition_sha256"], result["acquisition_sha256"]
+        )
+
+    def test_existing_assignment_retry_recovers_pre_effect_successor_proof_without_repair_receipt(self) -> None:
+        request = self.request()
+        normalized = pickup._normalize_request(request)
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        run_dir, acquisition = self.create_acquisition_journal(intent, lease)
+        self.write_registry_bound_request(run_dir, normalized)
+        pickup._write_bound_json(run_dir / "intent.json", intent)
+        journal_identity = pickup._journal_run_identity(run_dir, intent)
+        task, initiative, _unused_intent = self.orphan_recovery_documents()
+        historical_binding = self.orphan_recovery_binding(
+            self.root / "interrupted-historical-successor-snapshot",
+            "2" * 40,
+            task,
+            initiative,
+        )
+        current_binding = self.orphan_recovery_binding(
+            self.root / "interrupted-advanced-runtime-snapshot",
+            "4" * 40,
+            task,
+            initiative,
+        )
+        successor_proof = {
+            "legacy_registry_root": self.default_registry_binding["identity"][
+                "registry_root"
+            ],
+            "legacy_registry_binding_sha256": self.default_registry_binding[
+                "identity"
+            ]["binding_sha256"],
+            "canonical_registry_root": historical_binding["identity"][
+                "registry_root"
+            ],
+            "canonical_registry_binding_sha256": historical_binding["identity"][
+                "binding_sha256"
+            ],
+            "canonical_registry_binding_identity": dict(
+                historical_binding["identity"]
+            ),
+            "canonical_source_commit": "2" * 40,
+            "control_head": "3" * 40,
+            "control_branch": "ops/bureau-control-main",
+            "control_upstream": "origin/main",
+            "ancestor_proven": True,
+        }
+        with mock.patch.object(
+            pickup.bureau_leases,
+            "BUREAU_CONTROL_ROOT",
+            Path(successor_proof["legacy_registry_root"]),
+        ):
+            proof_obligation = (
+                pickup._persist_lease_repair_successor_proof_obligation(
+                    run_dir, intent, journal_identity, successor_proof
+                )
+            )
+            self.assertIsNone(
+                pickup._read_existing_assignment_lease_repair_obligation(
+                    run_dir, intent, normalized, acquisition
+                )
+            )
+        existing = {
+            "status": "existing-assignment",
+            "run": {"run_id": intent["run_id"], "state": "assigned"},
+            "envelope": {"claim_intent": intent},
+        }
+        coordinated = self.coordinated_status(intent)
+        with (
+            mock.patch.object(
+                pickup.bureau_leases,
+                "BUREAU_CONTROL_ROOT",
+                Path(successor_proof["legacy_registry_root"]),
+            ),
+            mock.patch.object(
+                pickup, "_recover_orphaned_journal_before_claim", return_value=None
+            ),
+            mock.patch.object(pickup.bureau, "_invoke_bureau", return_value=existing),
+            mock.patch.object(
+                pickup, "_canonical_registry_binding", return_value=current_binding
+            ) as current_runtime,
+            mock.patch.object(
+                pickup, "_coordination_status", return_value=coordinated
+            ) as read_status,
+            mock.patch.object(
+                pickup,
+                "_existing_assignment_repair_revision_binding",
+                side_effect=AssertionError(
+                    "interrupted repair must recover the historical successor proof"
+                ),
+            ) as legacy_reproof,
+        ):
+            result = pickup.grabowski_bureau_pickup_execute(request)
+        current_runtime.assert_called_once()
+        read_status.assert_called_once()
+        legacy_reproof.assert_not_called()
+        self.assertNotEqual(
+            historical_binding["identity"]["binding_sha256"],
+            current_binding["identity"]["binding_sha256"],
+        )
+        self.assertEqual(
+            historical_binding["identity"]["binding_sha256"],
+            result["registry_binding_sha256"],
+        )
+        self.assertEqual(
+            "existing-assignment-repair-canonical-successor",
+            result["registry_binding_source"],
+        )
+        self.assertEqual(successor_proof, result["registry_successor_proof"])
+        self.assertEqual(
+            proof_obligation["receipt_sha256"],
+            result["registry_successor_proof_receipt_sha256"],
         )
 
     def test_existing_assignment_repair_obligation_replay_uses_proven_binding(self) -> None:

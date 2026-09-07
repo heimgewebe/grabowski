@@ -4683,6 +4683,41 @@ def _validated_lease_repair_successor_proof_obligation(
     return {**receipt, "successor_proof": proof}
 
 
+def _lease_repair_successor_proof_intent_path(
+    run_dir: Path, intent: dict[str, Any]
+) -> Path:
+    intent_sha256 = intent.get("intent_sha256")
+    if not isinstance(intent_sha256, str) or SHA256_RE.fullmatch(intent_sha256) is None:
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-successor-proof-receipt-invalid",
+            details={"field": "intent_sha256"},
+        )
+    return run_dir / (
+        "lease-repair-registry-successor-proof-intent-"
+        f"{intent_sha256}.json"
+    )
+
+
+def _lease_repair_successor_proof_obligation_from_intent(
+    run_dir: Path, intent: dict[str, Any]
+) -> dict[str, Any] | None:
+    path = _lease_repair_successor_proof_intent_path(run_dir, intent)
+    label = "lease-repair-registry-successor-proof-intent"
+    try:
+        receipt = _read_bound_json(path, label=label)
+    except BureauPickupError as exc:
+        if exc.code == f"{label}-missing":
+            return None
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-successor-proof-receipt-invalid",
+            details={"cause_code": exc.code},
+        ) from exc
+    journal_identity = _journal_run_identity(run_dir, intent)
+    return _validated_lease_repair_successor_proof_obligation(
+        run_dir, intent, journal_identity, receipt
+    )
+
+
 def _persist_lease_repair_successor_proof_obligation(
     run_dir: Path,
     intent: dict[str, Any],
@@ -4710,17 +4745,32 @@ def _persist_lease_repair_successor_proof_obligation(
         "lease-repair-registry-successor-proof-"
         f"{receipt['receipt_sha256']}.json"
     )
+    intent_path = _lease_repair_successor_proof_intent_path(run_dir, intent)
+    _write_bound_json(intent_path, receipt)
     _write_bound_json(run_dir / filename, receipt)
+    intent_persisted = _read_bound_json(
+        intent_path, label="lease-repair-registry-successor-proof-intent"
+    )
     persisted = _read_bound_json(
         run_dir / filename, label="lease-repair-registry-successor-proof"
     )
-    if persisted != receipt:
+    if intent_persisted != receipt or persisted != receipt:
         raise BureauPickupError(
             "existing-assignment-lease-repair-successor-proof-receipt-drift"
         )
-    return _validated_lease_repair_successor_proof_obligation(
+    validated = _validated_lease_repair_successor_proof_obligation(
         run_dir, intent, journal_identity, persisted
     )
+    if (
+        _validated_lease_repair_successor_proof_obligation(
+            run_dir, intent, journal_identity, intent_persisted
+        )
+        != validated
+    ):
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-successor-proof-receipt-drift"
+        )
+    return validated
 
 
 def _lease_repair_successor_proof_obligation_from_receipt(
@@ -6294,15 +6344,30 @@ def grabowski_bureau_pickup_execute(
             run_dir, intent, normalized, acquisition
         )
         result_registry_binding = registry_binding
-        result_successor_proof_obligation = None
+        result_successor_proof_obligation = (
+            _lease_repair_successor_proof_obligation_from_intent(run_dir, intent)
+        )
         if repair_obligation is not None:
             receipt, journal_identity, external = repair_obligation
             activity_id = _lease_repair_activity_id(receipt["receipt_sha256"])
-            result_successor_proof_obligation = (
+            receipt_successor_proof_obligation = (
                 _lease_repair_successor_proof_obligation_from_receipt(
                     run_dir, intent, receipt
                 )
             )
+            if receipt_successor_proof_obligation is not None:
+                if (
+                    result_successor_proof_obligation is not None
+                    and result_successor_proof_obligation
+                    != receipt_successor_proof_obligation
+                ):
+                    raise BureauPickupError(
+                        "existing-assignment-lease-repair-successor-proof-receipt-invalid",
+                        details={"reason": "intent-reference-conflict"},
+                    )
+                result_successor_proof_obligation = (
+                    receipt_successor_proof_obligation
+                )
             if result_successor_proof_obligation is not None:
                 repair_binding = _canonical_registry_binding()
                 repair_identity = _validate_registry_binding_identity(
@@ -6370,8 +6435,21 @@ def grabowski_bureau_pickup_execute(
                 (
                     coordination,
                     result_registry_binding,
-                    result_successor_proof_obligation,
+                    repaired_successor_proof_obligation,
                 ) = repaired
+                if repaired_successor_proof_obligation is not None:
+                    if (
+                        result_successor_proof_obligation is not None
+                        and result_successor_proof_obligation
+                        != repaired_successor_proof_obligation
+                    ):
+                        raise BureauPickupError(
+                            "existing-assignment-lease-repair-successor-proof-receipt-invalid",
+                            details={"reason": "recovered-proof-conflict"},
+                        )
+                    result_successor_proof_obligation = (
+                        repaired_successor_proof_obligation
+                    )
                 _validate_claim_readback(coordination, intent, acquisition)
         result_registry_binding_sha256 = result_registry_binding["identity"][
             "binding_sha256"
