@@ -7984,66 +7984,78 @@ class MidCutoverResumeRuntime:
                 phase="midcutover-snapshot-rebind",
                 details={"observation_scope": scope},
             )
-        result = client_snapshot.rebind_snapshot_for_midcutover_recovery(
-            cutover_id=self.cutover_id,
-            cutover_generation=self.cutover_generation,
-            # The predecessor identity the rebind must match is the one the
-            # persisted snapshot actually carries, not a reconstruction of it.
-            current_release_id=str(self.resume_binding["blue_release_id"]),
-            current_repo_head=self.blue_repo_head,
-            green_release_id=self.green_binding["release_id"],
-            green_repo_head=self.green_binding["repo_head"],
-            registered_tool_count=len(self.contract.expected_tools),
-            registered_names_sha256=self.green_binding["registered_names_sha256"],
-            agent_instructions_sha256=self.green_binding[
-                "agent_instructions_sha256"
-            ],
-            green_readiness=self.green_readiness,
-            observation_scope=str(scope),
-            source_snapshot_receipt_sha256=str(
-                self.resume_binding["source_snapshot_receipt_sha256"]
-            ),
-            source_client_declaration_sha256=str(
-                self.resume_binding["source_client_declaration_sha256"]
-            ),
-            classified_snapshot_receipt_sha256=str(
-                self.resume_binding["classified_snapshot_receipt_sha256"]
-            ),
-            receipt_root=self.receipt_root,
-        )
+        def retain_rebind(result: dict[str, Any]) -> dict[str, Any]:
+            summary: dict[str, Any] = {
+                "rebound": True,
+                "readback_state": None,
+                "readback_receipt_sha256": None,
+                "receipt_sha256": result.get("receipt_sha256"),
+                "source_snapshot_receipt_sha256": result.get(
+                    "source_snapshot_receipt_sha256"
+                ),
+                "source_client_declaration_sha256": result.get(
+                    "source_client_declaration_sha256"
+                ),
+                "classified_snapshot_receipt_sha256": result.get(
+                    "classified_snapshot_receipt_sha256"
+                ),
+                "source_release_id": result.get("source_release_id"),
+                "source_repo_head": result.get("source_repo_head"),
+                "target_release_id": result.get("target_release_id"),
+                "target_repo_head": result.get("target_repo_head"),
+                "schema_changed": result.get("schema_changed"),
+                "publication_schema_transition": result.get(
+                    "publication_schema_transition"
+                ),
+                "publication_schema_transition_sha256": (
+                    result.get("publication_schema_transition") or {}
+                ).get("transition_sha256"),
+                "observation_scope": result.get("observation_scope"),
+                "durable_rebind": result,
+            }
+            self.snapshot_rebind = summary
+            return summary
+
+        try:
+            result = client_snapshot.rebind_snapshot_for_midcutover_recovery(
+                cutover_id=self.cutover_id,
+                cutover_generation=self.cutover_generation,
+                # The predecessor identity the rebind must match is the one the
+                # persisted snapshot actually carries, not a reconstruction of it.
+                current_release_id=str(self.resume_binding["blue_release_id"]),
+                current_repo_head=self.blue_repo_head,
+                green_release_id=self.green_binding["release_id"],
+                green_repo_head=self.green_binding["repo_head"],
+                registered_tool_count=len(self.contract.expected_tools),
+                registered_names_sha256=self.green_binding["registered_names_sha256"],
+                agent_instructions_sha256=self.green_binding[
+                    "agent_instructions_sha256"
+                ],
+                green_readiness=self.green_readiness,
+                observation_scope=str(scope),
+                source_snapshot_receipt_sha256=str(
+                    self.resume_binding["source_snapshot_receipt_sha256"]
+                ),
+                source_client_declaration_sha256=str(
+                    self.resume_binding["source_client_declaration_sha256"]
+                ),
+                classified_snapshot_receipt_sha256=str(
+                    self.resume_binding["classified_snapshot_receipt_sha256"]
+                ),
+                receipt_root=self.receipt_root,
+            )
+        except client_snapshot.SnapshotRebindReadbackError as exc:
+            retain_rebind(exc.durable_rebind)
+            core.fail(
+                "Snapshot rebind post-write readback is outcome-unknown",
+                phase="midcutover-snapshot-rebind",
+                details={"receipt_sha256": exc.durable_rebind.get("receipt_sha256")},
+            )
         # Preserve the full immutable S0 lineage immediately after the effect
         # returns. The following readback may fail after the snapshot was already
         # durably written; an outcome_unknown receipt must still carry enough
         # evidence for a later recovery process to prove what happened.
-        summary: dict[str, Any] = {
-            "rebound": True,
-            "readback_state": None,
-            "readback_receipt_sha256": None,
-            "receipt_sha256": result.get("receipt_sha256"),
-            "source_snapshot_receipt_sha256": result.get(
-                "source_snapshot_receipt_sha256"
-            ),
-            "source_client_declaration_sha256": result.get(
-                "source_client_declaration_sha256"
-            ),
-            "classified_snapshot_receipt_sha256": result.get(
-                "classified_snapshot_receipt_sha256"
-            ),
-            "source_release_id": result.get("source_release_id"),
-            "source_repo_head": result.get("source_repo_head"),
-            "target_release_id": result.get("target_release_id"),
-            "target_repo_head": result.get("target_repo_head"),
-            "schema_changed": result.get("schema_changed"),
-            "publication_schema_transition": result.get(
-                "publication_schema_transition"
-            ),
-            "publication_schema_transition_sha256": (
-                result.get("publication_schema_transition") or {}
-            ).get("transition_sha256"),
-            "observation_scope": result.get("observation_scope"),
-            "durable_rebind": result,
-        }
-        self.snapshot_rebind = summary
+        summary = retain_rebind(result)
         # Read the effect back before this run relies on it. A rebind that
         # returned but did not persist would otherwise let S1 proceed on a
         # snapshot that still names the predecessor.

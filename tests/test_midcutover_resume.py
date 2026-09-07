@@ -3682,6 +3682,38 @@ class SuccessorSnapshotRuntimeBindingTests(unittest.TestCase):
             self.assertEqual(summary["durable_rebind"], durable)
 
 
+    def test_helper_post_write_readback_failure_retains_full_durable_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            runtime = self._runtime(root)
+            runtime.green_readiness = GREEN_READINESS
+            durable = durable_rebind_evidence()
+            error = dual.client_snapshot.SnapshotRebindReadbackError(
+                "simulated helper post-write readback failure",
+                durable_rebind=durable,
+            )
+            with mock.patch.object(
+                dual.client_snapshot,
+                "rebind_snapshot_for_midcutover_recovery",
+                side_effect=error,
+            ), mock.patch.object(
+                midcutover,
+                "observe_client_snapshot_binding",
+            ) as second_readback:
+                with self.assertRaisesRegex(
+                    dual.core.DeployError, "post-write readback is outcome-unknown"
+                ):
+                    runtime.rebind_snapshot()
+            second_readback.assert_not_called()
+            summary = runtime.snapshot_rebind
+            self.assertIsInstance(summary, dict)
+            assert isinstance(summary, dict)
+            self.assertTrue(summary["rebound"])
+            self.assertEqual(summary["receipt_sha256"], durable["receipt_sha256"])
+            self.assertEqual(summary["durable_rebind"], durable)
+
+
 class GreenProofBeforeEffectTests(unittest.TestCase):
     """Nothing irreversible happens before green is proven authoritatively."""
 

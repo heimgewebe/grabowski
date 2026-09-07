@@ -370,6 +370,73 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
         client_snapshot._write_private_json(self.snapshot_path, receipt)
         return receipt
 
+    def test_rebind_write_failure_never_surfaces_durable_lineage(self) -> None:
+        prepared = self._prepare_publication(
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA
+        )
+        original_write = client_snapshot._write_private_json
+
+        def fail_snapshot_write(path: Path, payload: dict[str, object]) -> None:
+            if path == self.snapshot_path:
+                raise OSError("simulated snapshot write failure")
+            original_write(path, payload)
+
+        with mock.patch.object(
+            client_snapshot,
+            "_write_private_json",
+            side_effect=fail_snapshot_write,
+        ):
+            with self.assertRaisesRegex(OSError, "snapshot write failure"):
+                self._rebind(
+                    schema_by_tool=BLUE_SCHEMA_BY_TOOL,
+                    complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+                    source_evidence_time=self.now_unix,
+                    publication_request_id=prepared["request_id"],
+                    now_unix=5_000,
+                )
+        self._assert_snapshot_untouched()
+
+    def test_rebind_surfaces_durable_lineage_when_post_write_readback_fails(self) -> None:
+        prepared = self._prepare_publication(
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA
+        )
+        original_read = client_snapshot._read_private_json
+        snapshot_reads = 0
+
+        def fail_second_snapshot_read(path: Path):
+            nonlocal snapshot_reads
+            if path == self.snapshot_path:
+                snapshot_reads += 1
+                if snapshot_reads == 2:
+                    raise OSError("simulated post-write snapshot readback failure")
+            return original_read(path)
+
+        with mock.patch.object(
+            client_snapshot,
+            "_read_private_json",
+            side_effect=fail_second_snapshot_read,
+        ):
+            with self.assertRaisesRegex(
+                client_snapshot.SnapshotRebindReadbackError,
+                "post-write readback failed",
+            ) as caught:
+                self._rebind(
+                    schema_by_tool=BLUE_SCHEMA_BY_TOOL,
+                    complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+                    source_evidence_time=self.now_unix,
+                    publication_request_id=prepared["request_id"],
+                    now_unix=5_000,
+                )
+        durable = caught.exception.durable_rebind
+        written = json.loads(self.snapshot_path.read_text(encoding="utf-8"))
+        self.assertEqual(snapshot_reads, 2)
+        self.assertTrue(durable["cutover_rebind"])
+        self.assertEqual(durable["receipt_sha256"], written["receipt_sha256"])
+        self.assertEqual(
+            durable["source_snapshot_receipt_sha256"], self.source["receipt_sha256"]
+        )
+        self.assertEqual(durable["target_repo_head"], HEAD_GREEN)
+
     # ---- 1: unchanged schema keeps working -------------------------------
 
     def test_unchanged_schema_rebinds_without_publication_authorization(self) -> None:

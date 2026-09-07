@@ -139,6 +139,14 @@ class ClientSnapshotError(RuntimeError):
     """Raised when a connector snapshot receipt cannot be trusted."""
 
 
+class SnapshotRebindReadbackError(ClientSnapshotError):
+    """Raised after S0 was written but its immediate readback stayed unknown."""
+
+    def __init__(self, message: str, *, durable_rebind: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.durable_rebind = durable_rebind
+
+
 def _canonical_bytes(value: Any) -> bytes:
     return json.dumps(
         value,
@@ -1502,50 +1510,57 @@ def _rebind_snapshot_for_cutover(
             "does_not_establish": nonclaims,
         }
         receipt["receipt_sha256"] = _sha256_json(receipt)
+        durable_rebind = {
+            "schema_version": 1,
+            "state": "matched",
+            "verified": True,
+            "cutover_rebind": True,
+            "observation_scope": observation_scope,
+            "client_declaration_sha256": source_declaration_sha256,
+            "source_receipt_sha256": source_receipt_sha256,
+            "source_snapshot_receipt_sha256": source_receipt_sha256,
+            "source_client_declaration_sha256": source_declaration_sha256,
+            "classified_snapshot_receipt_sha256": source_receipt_sha256,
+            "source_release_id": current_release,
+            "source_repo_head": current_repo_head,
+            "target_release_id": green_release,
+            "target_repo_head": green_repo_head,
+            "receipt_sha256": receipt["receipt_sha256"],
+            "cutover_binding": cutover_binding,
+            "cutover_transition": transition,
+            "verification_model": receipt["verification_model"],
+            # A changed schema means the preserved observation describes the
+            # predecessor surface. Reporting a contract match here would be the
+            # false claim this transition exists to avoid.
+            "schema_contract_matches": not surface_changed,
+            "schema_changed": schema_changed,
+            "surface_changed": surface_changed,
+            "instructions_changed": instructions_changed,
+            "agent_instructions_transition": instruction_transition,
+            "publication_schema_transition": schema_transition,
+            "recommended_next_action": (
+                "capture a fresh client observation of the changed green agent instructions"
+                if instructions_changed
+                else (
+                    "capture a fresh client observation of the changed green surface"
+                    if surface_changed
+                    else recommended_next_action
+                )
+            ),
+            "does_not_establish": list(receipt["does_not_establish"]),
+        }
         _write_private_json(SNAPSHOT_PATH, receipt)
-        readback = _read_private_json(SNAPSHOT_PATH)
-        _validate_receipt(readback)
-        if readback.get("receipt_sha256") != receipt["receipt_sha256"]:
-            raise ClientSnapshotError("cutover snapshot rebind readback mismatch")
-    return {
-        "schema_version": 1,
-        "state": "matched",
-        "verified": True,
-        "cutover_rebind": True,
-        "observation_scope": observation_scope,
-        "client_declaration_sha256": source_declaration_sha256,
-        "source_receipt_sha256": source_receipt_sha256,
-        "source_snapshot_receipt_sha256": source_receipt_sha256,
-        "source_client_declaration_sha256": source_declaration_sha256,
-        "classified_snapshot_receipt_sha256": source_receipt_sha256,
-        "source_release_id": current_release,
-        "source_repo_head": current_repo_head,
-        "target_release_id": green_release,
-        "target_repo_head": green_repo_head,
-        "receipt_sha256": receipt["receipt_sha256"],
-        "cutover_binding": cutover_binding,
-        "cutover_transition": transition,
-        "verification_model": receipt["verification_model"],
-        # A changed schema means the preserved observation describes the
-        # predecessor surface. Reporting a contract match here would be the
-        # false claim this transition exists to avoid.
-        "schema_contract_matches": not surface_changed,
-        "schema_changed": schema_changed,
-        "surface_changed": surface_changed,
-        "instructions_changed": instructions_changed,
-        "agent_instructions_transition": instruction_transition,
-        "publication_schema_transition": schema_transition,
-        "recommended_next_action": (
-            "capture a fresh client observation of the changed green agent instructions"
-            if instructions_changed
-            else (
-                "capture a fresh client observation of the changed green surface"
-                if surface_changed
-                else recommended_next_action
-            )
-        ),
-        "does_not_establish": list(receipt["does_not_establish"]),
-    }
+        try:
+            readback = _read_private_json(SNAPSHOT_PATH)
+            _validate_receipt(readback)
+            if readback.get("receipt_sha256") != receipt["receipt_sha256"]:
+                raise ClientSnapshotError("cutover snapshot rebind readback mismatch")
+        except Exception as exc:
+            raise SnapshotRebindReadbackError(
+                "cutover snapshot rebind post-write readback failed",
+                durable_rebind=durable_rebind,
+            ) from exc
+    return durable_rebind
 
 
 def _platform_publication_contract(
