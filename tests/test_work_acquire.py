@@ -2690,6 +2690,16 @@ class WorkAcquireTests(unittest.TestCase):
             normalized["delegated_write_resource_keys"],
         )
 
+        overlapping_required = self.bureau_run_parameters()
+        overlapping_required["branch"] = "bureau/scope/../test-parent-run"
+        overlapping_required["resource_keys"] = [
+            f"repo:{self.repo}:branch:{overlapping_required['branch']}"
+        ]
+        with self.assertRaisesRegex(
+            ValueError, "may not duplicate parent-derived scope"
+        ):
+            work_acquire._normalize(overlapping_required)
+
         forged = self.bureau_run_parameters()
         forged["parent_delegation"] = {"receipt_sha256": "0" * 64}
         with self.assertRaisesRegex(ValueError, "server-derived"):

@@ -6349,6 +6349,8 @@ def _delegation_live_lease_generation(
                 "observed": [item["resource_key"] for item in snapshots],
             },
         )
+    if not expected_keys:
+        raise BureauPickupError("scoped-writer-delegation-parent-resource-scope-empty")
     if any(item["owner_id"] != parent_owner for item in snapshots):
         raise BureauPickupError("scoped-writer-delegation-foreign-live-owner")
     now = int(time.time())

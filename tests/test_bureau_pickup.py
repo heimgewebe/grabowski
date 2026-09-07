@@ -9165,6 +9165,26 @@ class BureauPickupTests(unittest.TestCase):
             "scoped-writer-delegation-physical-checkout-drift", raised.exception.code
         )
 
+    def test_scoped_writer_delegation_live_lease_generation_rejects_empty_parent_scope(self) -> None:
+        coordination = {
+            "lease": {
+                "status": "active-bound",
+                "binding": {
+                    "resource_db_schema_version": pickup.resources.RESOURCE_CURRENT_SCHEMA_VERSION,
+                    "lease_snapshots": [],
+                },
+            }
+        }
+
+        with self.assertRaises(pickup.BureauPickupError) as raised:
+            pickup._delegation_live_lease_generation(
+                coordination, parent_owner="bureau-run:empty-scope", expected_keys=[]
+            )
+        self.assertEqual(
+            "scoped-writer-delegation-parent-resource-scope-empty",
+            raised.exception.code,
+        )
+
     def test_scoped_writer_delegation_live_lease_generation_rejects_expiry_and_schema_drift(self) -> None:
         import copy
 

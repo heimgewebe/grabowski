@@ -1092,7 +1092,8 @@ def _normalize(
         independent_resource_keys = (
             resources.normalize_resource_keys(requested) if requested else []
         )
-        parent_derived_keys = set(delegated_write_resource_keys) | set(required)
+        normalized_required = resources.normalize_resource_keys(required)
+        parent_derived_keys = set(delegated_write_resource_keys) | set(normalized_required)
         overlap = sorted(parent_derived_keys.intersection(independent_resource_keys))
         if overlap:
             raise ValueError(
