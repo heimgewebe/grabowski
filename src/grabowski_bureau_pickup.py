@@ -4329,6 +4329,7 @@ def _legacy_control_registry_successor_proof(
         "legacy_registry_binding_sha256": stored["binding_sha256"],
         "canonical_registry_root": current["registry_root"],
         "canonical_registry_binding_sha256": current["binding_sha256"],
+        "canonical_registry_binding_identity": dict(current),
         "canonical_source_commit": deployed_source,
         "control_head": control_head,
         "control_branch": control["branch"],
@@ -4337,17 +4338,28 @@ def _legacy_control_registry_successor_proof(
     }
 
 
+def _existing_assignment_repair_revision_authority(
+    registry_binding: RegistryBinding,
+) -> tuple[RegistryBinding, dict[str, Any] | None]:
+    identity = _validate_registry_binding_identity(registry_binding["identity"])
+    if identity.get("kind") != "explicit-registry-root":
+        return registry_binding, None
+    if identity["registry_root"] != str(bureau_leases.BUREAU_CONTROL_ROOT):
+        return registry_binding, None
+    current_binding = _canonical_registry_binding()
+    successor_proof = _legacy_control_registry_successor_proof(
+        registry_binding, current_binding
+    )
+    return current_binding, successor_proof
+
+
 def _existing_assignment_repair_revision_binding(
     registry_binding: RegistryBinding,
 ) -> RegistryBinding:
-    identity = _validate_registry_binding_identity(registry_binding["identity"])
-    if identity.get("kind") != "explicit-registry-root":
-        return registry_binding
-    if identity["registry_root"] != str(bureau_leases.BUREAU_CONTROL_ROOT):
-        return registry_binding
-    current_binding = _canonical_registry_binding()
-    _legacy_control_registry_successor_proof(registry_binding, current_binding)
-    return current_binding
+    binding, _successor_proof = _existing_assignment_repair_revision_authority(
+        registry_binding
+    )
+    return binding
 
 
 def _existing_assignment_repair_effective_request(
@@ -4368,7 +4380,7 @@ def _existing_assignment_repair_authority(
     registry_binding: RegistryBinding,
     *,
     coordination_root: str,
-) -> tuple[dict[str, Any], dict[str, Any], RegistryBinding]:
+) -> tuple[dict[str, Any], dict[str, Any], RegistryBinding, dict[str, Any] | None]:
     if coordination.get("status") != "coordinated":
         raise BureauPickupError(
             "existing-assignment-lease-repair-not-coordinated",
@@ -4448,7 +4460,9 @@ def _existing_assignment_repair_authority(
             },
         )
     external = _existing_assignment_repair_external_binding(run)
-    revision_binding = _existing_assignment_repair_revision_binding(registry_binding)
+    revision_binding, successor_proof = _existing_assignment_repair_revision_authority(
+        registry_binding
+    )
     _bound_bureau_call(
         revision_binding,
         lambda: _current_registry_revision_proof(
@@ -4457,7 +4471,7 @@ def _existing_assignment_repair_authority(
             coordination_root=coordination_root,
         ),
     )
-    return journal_identity, external, revision_binding
+    return journal_identity, external, revision_binding, successor_proof
 
 
 def _lease_repair_receipt_sha256(receipt: dict[str, Any]) -> str:
@@ -4471,6 +4485,269 @@ def _lease_repair_receipt_sha256(receipt: dict[str, Any]) -> str:
     ):
         raise BureauPickupError("existing-assignment-lease-repair-receipt-invalid")
     return claimed
+
+
+_LEGACY_CONTROL_REGISTRY_SUCCESSOR_PROOF_FIELDS = frozenset(
+    {
+        "legacy_registry_root",
+        "legacy_registry_binding_sha256",
+        "canonical_registry_root",
+        "canonical_registry_binding_sha256",
+        "canonical_registry_binding_identity",
+        "canonical_source_commit",
+        "control_head",
+        "control_branch",
+        "control_upstream",
+        "ancestor_proven",
+    }
+)
+
+
+def _validated_legacy_control_registry_successor_proof(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != _LEGACY_CONTROL_REGISTRY_SUCCESSOR_PROOF_FIELDS:
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-successor-proof-invalid"
+        )
+    for key in (
+        "legacy_registry_root",
+        "canonical_registry_root",
+        "control_branch",
+        "control_upstream",
+    ):
+        item = value.get(key)
+        if not isinstance(item, str) or not item or item != item.strip() or "\x00" in item:
+            raise BureauPickupError(
+                "existing-assignment-lease-repair-successor-proof-invalid",
+                details={"field": key},
+            )
+    for key in (
+        "legacy_registry_binding_sha256",
+        "canonical_registry_binding_sha256",
+    ):
+        item = value.get(key)
+        if not isinstance(item, str) or SHA256_RE.fullmatch(item) is None:
+            raise BureauPickupError(
+                "existing-assignment-lease-repair-successor-proof-invalid",
+                details={"field": key},
+            )
+    if (
+        value["legacy_registry_root"] != str(bureau_leases.BUREAU_CONTROL_ROOT)
+        or value["control_branch"] != bureau_leases.BUREAU_CONTROL_BRANCH
+        or value["control_upstream"] != bureau_leases.BUREAU_CONTROL_UPSTREAM
+    ):
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-successor-proof-invalid",
+            details={"reason": "control-binding-mismatch"},
+        )
+    for key in ("canonical_source_commit", "control_head"):
+        item = value.get(key)
+        if not isinstance(item, str) or re.fullmatch(r"[0-9a-f]{40}", item) is None:
+            raise BureauPickupError(
+                "existing-assignment-lease-repair-successor-proof-invalid",
+                details={"field": key},
+            )
+    canonical_identity = value.get("canonical_registry_binding_identity")
+    canonical_fields = {
+        "schema_version",
+        "kind",
+        "registry_root",
+        "source_commit",
+        "registry_tree_sha256",
+        "launcher_sha256",
+        "manifest_sha256",
+        "inventory_path",
+        "inventory_sha256",
+        "binding_sha256",
+    }
+    if not isinstance(canonical_identity, dict) or set(canonical_identity) != canonical_fields:
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-successor-proof-invalid",
+            details={"field": "canonical_registry_binding_identity"},
+        )
+    canonical_payload = dict(canonical_identity)
+    canonical_claimed = canonical_payload.pop("binding_sha256", None)
+    if (
+        canonical_identity.get("schema_version") != SCHEMA_VERSION
+        or canonical_identity.get("kind") != "canonical-registry-binding"
+        or not isinstance(canonical_claimed, str)
+        or SHA256_RE.fullmatch(canonical_claimed) is None
+        or _sha256(canonical_payload) != canonical_claimed
+        or canonical_claimed != value["canonical_registry_binding_sha256"]
+        or canonical_identity.get("registry_root") != value["canonical_registry_root"]
+        or canonical_identity.get("source_commit") != value["canonical_source_commit"]
+    ):
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-successor-proof-invalid",
+            details={"field": "canonical_registry_binding_identity"},
+        )
+    for field in (
+        "registry_tree_sha256",
+        "launcher_sha256",
+        "manifest_sha256",
+        "inventory_sha256",
+    ):
+        item = canonical_identity.get(field)
+        if not isinstance(item, str) or SHA256_RE.fullmatch(item) is None:
+            raise BureauPickupError(
+                "existing-assignment-lease-repair-successor-proof-invalid",
+                details={"field": f"canonical_registry_binding_identity.{field}"},
+            )
+    inventory_path = canonical_identity.get("inventory_path")
+    if (
+        not isinstance(inventory_path, str)
+        or inventory_path
+        != str(Path(value["canonical_registry_root"]) / ".bureau-runtime-snapshot.json")
+    ):
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-successor-proof-invalid",
+            details={"field": "canonical_registry_binding_identity.inventory_path"},
+        )
+    if value.get("ancestor_proven") is not True:
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-successor-proof-invalid",
+            details={"field": "ancestor_proven"},
+        )
+    return dict(value)
+
+
+def _validated_lease_repair_successor_proof_obligation(
+    run_dir: Path,
+    intent: dict[str, Any],
+    journal_identity: dict[str, Any],
+    receipt: dict[str, Any],
+) -> dict[str, Any]:
+    _lease_repair_receipt_sha256(receipt)
+    expected_fields = {
+        "schema_version",
+        "kind",
+        "run_id",
+        "task_id",
+        "worker_id",
+        "task_sha256",
+        "plan_sha256",
+        "envelope_sha256",
+        "claim_intent_sha256",
+        "successor_proof",
+        "successor_proof_sha256",
+        "receipt_sha256",
+    }
+    if set(receipt) != expected_fields:
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-successor-proof-receipt-invalid",
+            details={
+                "expected_fields": sorted(expected_fields),
+                "observed_fields": sorted(receipt),
+            },
+        )
+    expected_binding = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "grabowski_bureau_pickup_registry_successor_proof",
+        "run_id": intent["run_id"],
+        "task_id": intent["task_id"],
+        "worker_id": intent["worker_id"],
+        "task_sha256": intent["task_sha256"],
+        "plan_sha256": intent["plan_sha256"],
+        "envelope_sha256": journal_identity["envelope_sha256"],
+        "claim_intent_sha256": intent["intent_sha256"],
+    }
+    mismatches = {
+        key: {"expected": expected, "observed": receipt.get(key)}
+        for key, expected in expected_binding.items()
+        if receipt.get(key) != expected
+    }
+    if mismatches:
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-successor-proof-receipt-invalid",
+            details={"mismatches": mismatches},
+        )
+    proof = _validated_legacy_control_registry_successor_proof(
+        receipt["successor_proof"]
+    )
+    if receipt.get("successor_proof_sha256") != _sha256(proof):
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-successor-proof-receipt-invalid",
+            details={"reason": "proof-digest-mismatch"},
+        )
+    journal_registry_identity = _validate_registry_binding_identity(
+        _read_bound_json(run_dir / "registry-binding.json", label="registry-binding")
+    )
+    if (
+        proof["legacy_registry_binding_sha256"]
+        != journal_registry_identity["binding_sha256"]
+        or proof["legacy_registry_root"] != journal_registry_identity["registry_root"]
+    ):
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-successor-proof-receipt-invalid",
+            details={"reason": "legacy-registry-binding-mismatch"},
+        )
+    return {**receipt, "successor_proof": proof}
+
+
+def _persist_lease_repair_successor_proof_obligation(
+    run_dir: Path,
+    intent: dict[str, Any],
+    journal_identity: dict[str, Any],
+    successor_proof: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if successor_proof is None:
+        return None
+    proof = _validated_legacy_control_registry_successor_proof(successor_proof)
+    receipt = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "grabowski_bureau_pickup_registry_successor_proof",
+        "run_id": intent["run_id"],
+        "task_id": intent["task_id"],
+        "worker_id": intent["worker_id"],
+        "task_sha256": intent["task_sha256"],
+        "plan_sha256": intent["plan_sha256"],
+        "envelope_sha256": journal_identity["envelope_sha256"],
+        "claim_intent_sha256": intent["intent_sha256"],
+        "successor_proof": proof,
+        "successor_proof_sha256": _sha256(proof),
+    }
+    receipt["receipt_sha256"] = _sha256(receipt)
+    filename = (
+        "lease-repair-registry-successor-proof-"
+        f"{receipt['receipt_sha256']}.json"
+    )
+    _write_bound_json(run_dir / filename, receipt)
+    persisted = _read_bound_json(
+        run_dir / filename, label="lease-repair-registry-successor-proof"
+    )
+    if persisted != receipt:
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-successor-proof-receipt-drift"
+        )
+    return _validated_lease_repair_successor_proof_obligation(
+        run_dir, intent, journal_identity, persisted
+    )
+
+
+def _lease_repair_successor_proof_obligation_from_receipt(
+    run_dir: Path,
+    intent: dict[str, Any],
+    receipt: dict[str, Any],
+) -> dict[str, Any] | None:
+    receipt_sha256 = receipt.get("registry_successor_proof_receipt_sha256")
+    if receipt_sha256 is None:
+        return None
+    if not isinstance(receipt_sha256, str) or SHA256_RE.fullmatch(receipt_sha256) is None:
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-successor-proof-receipt-invalid"
+        )
+    filename = f"lease-repair-registry-successor-proof-{receipt_sha256}.json"
+    proof_receipt = _read_bound_json(
+        run_dir / filename, label="lease-repair-registry-successor-proof"
+    )
+    if proof_receipt.get("receipt_sha256") != receipt_sha256:
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-successor-proof-receipt-invalid",
+            details={"reason": "receipt-digest-reference-mismatch"},
+        )
+    journal_identity = _journal_run_identity(run_dir, intent)
+    return _validated_lease_repair_successor_proof_obligation(
+        run_dir, intent, journal_identity, proof_receipt
+    )
 
 
 def _validated_lease_repair_receipt(
@@ -4717,6 +4994,8 @@ def _validate_existing_assignment_lease_repair_receipt(
         "lease_generation_sha256",
         "receipt_sha256",
     }
+    if "registry_successor_proof_receipt_sha256" in receipt:
+        common_fields.add("registry_successor_proof_receipt_sha256")
     expected_fields = common_fields | (
         {"groups"}
         if observed_kind == "grabowski_bureau_pickup_lease_reacquire"
@@ -4754,6 +5033,9 @@ def _validate_existing_assignment_lease_repair_receipt(
         )
     external = _validated_persisted_lease_repair_external_binding(
         receipt["external_binding"]
+    )
+    _lease_repair_successor_proof_obligation_from_receipt(
+        run_dir, intent, receipt
     )
     if not _valid_lease_repair_resource_keys(receipt["resource_keys"]):
         raise BureauPickupError(
@@ -5392,7 +5674,11 @@ def _repair_existing_assignment_lease_binding(
     registry_binding: RegistryBinding,
     *,
     return_binding: bool = False,
-) -> dict[str, Any] | bool | tuple[dict[str, Any], RegistryBinding]:
+) -> (
+    dict[str, Any]
+    | bool
+    | tuple[dict[str, Any], RegistryBinding, dict[str, Any] | None]
+):
     lease_state = coordination.get("lease")
     lease_error = lease_state.get("error") if isinstance(lease_state, dict) else None
     error_code = lease_error.get("code") if isinstance(lease_error, dict) else None
@@ -5407,7 +5693,12 @@ def _repair_existing_assignment_lease_binding(
         }
     ):
         return False
-    journal_identity, external, repair_binding = _existing_assignment_repair_authority(
+    (
+        journal_identity,
+        external,
+        repair_binding,
+        successor_proof,
+    ) = _existing_assignment_repair_authority(
         coordination,
         intent,
         acquisition,
@@ -5421,9 +5712,29 @@ def _repair_existing_assignment_lease_binding(
     operator._require_operator_mutation(
         "bureau_mutation", path=repair_request["registry_root"]
     )
+    successor_proof_obligation: dict[str, Any] | None = None
 
-    def bound_result(value: dict[str, Any]) -> dict[str, Any] | tuple[dict[str, Any], RegistryBinding]:
-        return (value, repair_binding) if return_binding else value
+    def ensure_successor_proof_obligation() -> dict[str, Any] | None:
+        nonlocal successor_proof_obligation
+        if successor_proof_obligation is None and successor_proof is not None:
+            successor_proof_obligation = (
+                _persist_lease_repair_successor_proof_obligation(
+                    run_dir, intent, journal_identity, successor_proof
+                )
+            )
+        return successor_proof_obligation
+
+    def bound_result(
+        value: dict[str, Any],
+    ) -> (
+        dict[str, Any]
+        | tuple[dict[str, Any], RegistryBinding, dict[str, Any] | None]
+    ):
+        return (
+            (value, repair_binding, successor_proof_obligation)
+            if return_binding
+            else value
+        )
 
     original_by_key = {
         item["resource_key"]: item
@@ -5519,6 +5830,7 @@ def _repair_existing_assignment_lease_binding(
                 if not expired_keys:
                     continue
                 rebound_group = {**group, "resource_keys": expired_keys}
+                ensure_successor_proof_obligation()
                 result = resources.rebind_same_owner_resources(
                     intent["lease_owner_id"],
                     expired_keys,
@@ -5605,6 +5917,10 @@ def _repair_existing_assignment_lease_binding(
         lease_generation = _current_lease_repair_generation(intent, required=True)
         receipt["lease_generation"] = lease_generation
         receipt["lease_generation_sha256"] = _sha256(lease_generation)
+        if successor_proof_obligation is not None:
+            receipt["registry_successor_proof_receipt_sha256"] = (
+                successor_proof_obligation["receipt_sha256"]
+            )
         receipt["receipt_sha256"] = _sha256(receipt)
         receipt = _persist_lease_repair_receipt(
             run_dir, "lease-reacquire.json", receipt
@@ -5650,6 +5966,7 @@ def _repair_existing_assignment_lease_binding(
                         )
                 if not missing_before:
                     continue
+                ensure_successor_proof_obligation()
                 result = resources.acquire_resources(
                     intent["lease_owner_id"],
                     keys,
@@ -5734,6 +6051,10 @@ def _repair_existing_assignment_lease_binding(
         lease_generation = _current_lease_repair_generation(intent, required=True)
         receipt["lease_generation"] = lease_generation
         receipt["lease_generation_sha256"] = _sha256(lease_generation)
+        if successor_proof_obligation is not None:
+            receipt["registry_successor_proof_receipt_sha256"] = (
+                successor_proof_obligation["receipt_sha256"]
+            )
         receipt["receipt_sha256"] = _sha256(receipt)
         receipt = _persist_lease_repair_receipt(
             run_dir, "lease-reacquire.json", receipt
@@ -5774,6 +6095,7 @@ def _repair_existing_assignment_lease_binding(
         for key in keys
     ):
         return False
+    ensure_successor_proof_obligation()
     result = resources.rebind_same_owner_resources(
         intent["lease_owner_id"],
         keys,
@@ -5813,6 +6135,10 @@ def _repair_existing_assignment_lease_binding(
     lease_generation = _current_lease_repair_generation(intent, required=True)
     receipt["lease_generation"] = lease_generation
     receipt["lease_generation_sha256"] = _sha256(lease_generation)
+    if successor_proof_obligation is not None:
+        receipt["registry_successor_proof_receipt_sha256"] = (
+            successor_proof_obligation["receipt_sha256"]
+        )
     receipt["receipt_sha256"] = _sha256(receipt)
     receipt = _persist_lease_repair_receipt(run_dir, "lease-rebind.json", receipt)
     return bound_result(
@@ -5968,12 +6294,28 @@ def grabowski_bureau_pickup_execute(
             run_dir, intent, normalized, acquisition
         )
         result_registry_binding = registry_binding
+        result_successor_proof_obligation = None
         if repair_obligation is not None:
             receipt, journal_identity, external = repair_obligation
             activity_id = _lease_repair_activity_id(receipt["receipt_sha256"])
-            repair_binding = _existing_assignment_repair_revision_binding(
-                registry_binding
+            result_successor_proof_obligation = (
+                _lease_repair_successor_proof_obligation_from_receipt(
+                    run_dir, intent, receipt
+                )
             )
+            if result_successor_proof_obligation is not None:
+                repair_binding = _canonical_registry_binding()
+                repair_identity = _validate_registry_binding_identity(
+                    repair_binding["identity"]
+                )
+                if repair_identity.get("kind") != "canonical-registry-binding":
+                    raise BureauPickupError(
+                        "existing-assignment-lease-repair-current-registry-not-canonical"
+                    )
+            else:
+                repair_binding = _existing_assignment_repair_revision_binding(
+                    registry_binding
+                )
             result_registry_binding = repair_binding
             repair_request = _existing_assignment_repair_effective_request(
                 normalized, repair_binding
@@ -6025,18 +6367,37 @@ def grabowski_bureau_pickup_execute(
                 )
                 if not repaired:
                     raise
-                coordination, result_registry_binding = repaired
+                (
+                    coordination,
+                    result_registry_binding,
+                    result_successor_proof_obligation,
+                ) = repaired
                 _validate_claim_readback(coordination, intent, acquisition)
+        result_registry_binding_sha256 = result_registry_binding["identity"][
+            "binding_sha256"
+        ]
+        result_registry_binding_kind = result_registry_binding["identity"]["kind"]
+        if result_successor_proof_obligation is not None:
+            historical_successor_proof = result_successor_proof_obligation[
+                "successor_proof"
+            ]
+            result_registry_binding_sha256 = historical_successor_proof[
+                "canonical_registry_binding_sha256"
+            ]
+            result_registry_binding_kind = "canonical-registry-binding"
         result = {
             "schema_version": SCHEMA_VERSION,
             "kind": "grabowski_bureau_pickup",
             "status": intent_payload["status"],
             "request_sha256": request_sha256,
-            "registry_binding_sha256": result_registry_binding["identity"]["binding_sha256"],
-            "registry_binding_kind": result_registry_binding["identity"]["kind"],
+            "registry_binding_sha256": result_registry_binding_sha256,
+            "registry_binding_kind": result_registry_binding_kind,
             "registry_binding_source": (
                 "existing-assignment-repair-canonical-successor"
-                if result_registry_binding["identity"] != registry_binding["identity"]
+                if (
+                    result_successor_proof_obligation is not None
+                    or result_registry_binding["identity"] != registry_binding["identity"]
+                )
                 else (
                     "legacy-journal-explicit-registry-root"
                     if registry_binding["legacy"]
@@ -6059,6 +6420,16 @@ def grabowski_bureau_pickup_execute(
                 "automatic lease release",
             ],
         }
+        if result_successor_proof_obligation is not None:
+            result["registry_successor_proof"] = result_successor_proof_obligation[
+                "successor_proof"
+            ]
+            result["registry_successor_proof_sha256"] = (
+                result_successor_proof_obligation["successor_proof_sha256"]
+            )
+            result["registry_successor_proof_receipt_sha256"] = (
+                result_successor_proof_obligation["receipt_sha256"]
+            )
         bureau._audit(
             "bureau-pickup-retry",
             result,
