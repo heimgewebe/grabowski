@@ -93,6 +93,7 @@ class ConvergenceCoverageContractTests(unittest.TestCase):
         expected = {
             "tool:grabowski_git": "effect_only",
             "grip:branch-publish": "effect_only",
+            "grip:pr-base-converge": "effect_only",
             "grip:pr-create-or-update": "effect_only",
             "tool:grabowski_bureau_task_publish": "effect_only",
             "tool:grabowski_text_artifact_publish": "preflight_or_evidence",

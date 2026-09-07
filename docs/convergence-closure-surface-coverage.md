@@ -39,7 +39,7 @@ Der Consumer funktioniert, ist aber derzeit kein zentraler technischer Vorgänge
 | `runtime-refresh-lease-release`, `grabowski_runtime_refresh_lease_release` | geben exakt fünf unveränderte Runtime-Refresh-Pfadleasing-Zeilen frei | prüfen private Observation-, Intent-, Start- und Result-Receipts; behaupten keinen Systemabschluss | **außerhalb des Scopes** |
 | `task-attention-decision` | klassifiziert einen terminalen Taskausgang | darf keinen systemischen Abschluss behaupten | **außerhalb des Scopes** |
 | `grabowski_runtime_deploy_schedule` | startet einen Deployment-Effekt | erzeugt erst Evidenz für eine spätere Verifikation | **vor dem Abschluss** |
-| `grabowski_git` mit Push, `branch-publish`, `pr-create-or-update`, `grabowski_bureau_task_publish` | erzeugen Branch- oder PR-Veröffentlichungseffekte | Wirkung noch nicht verifiziert | **vor dem Abschluss** |
+| `grabowski_git` mit Push, `branch-publish`, `pr-base-converge`, `pr-create-or-update`, `grabowski_bureau_task_publish` | erzeugen Branch- oder PR-Veröffentlichungseffekte | Wirkung noch nicht verifiziert | **vor dem Abschluss** |
 | `grabowski_text_artifact_publish` | publiziert unveränderliche Textevidenz | liefert Belegmaterial, keinen Systemabschluss | **Evidenzfläche** |
 | `pr-check-readiness`, `grabowski_bureau_task_publish_preview`, `grabowski_github_pr_view` | beobachten PR- oder Publikationszustand | read-only, keine Abschlussmutation | **außerhalb des Scopes** |
 | Task-Reconcile und Prozess-Terminalisierung | aktualisieren Prozesszustand | Prozessende ist kein Systemabschluss | **außerhalb des Scopes** |

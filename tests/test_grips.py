@@ -669,6 +669,83 @@ class FakeGh:
         return {"returncode": 1, "stdout": "", "stderr": f"unexpected gh command: {argv}"}
 
 
+class FakePrBaseConvergeGh:
+    def __init__(
+        self,
+        *,
+        base_sha: str = "e" * 40,
+        head_sha: str = "a" * 40,
+        new_head_sha: str = "b" * 40,
+        apply_update: bool = True,
+        update_returncode: int = 0,
+        state: str = "OPEN",
+        cross_repository: bool = False,
+        mergeable: str = "MERGEABLE",
+    ):
+        self.base_sha = base_sha
+        self.head_sha = head_sha
+        self.new_head_sha = new_head_sha
+        self.apply_update = apply_update
+        self.update_returncode = update_returncode
+        self.updated = False
+        self.calls = []
+        self.view = {
+            "number": 77,
+            "url": "https://github.com/heimgewebe/grabowski/pull/77",
+            "state": state,
+            "baseRefName": "main",
+            "baseRefOid": base_sha,
+            "headRefName": "feat/work",
+            "headRefOid": head_sha,
+            "isDraft": False,
+            "mergeable": mergeable,
+            "isCrossRepository": cross_repository,
+        }
+
+    def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
+        del repo
+        self.calls.append(tuple(argv))
+        if argv[:2] == ["pr", "view"]:
+            return {"returncode": 0, "stdout": json.dumps(self.view), "stderr": ""}
+        if argv[:1] == ["api"]:
+            endpoint = next(
+                (
+                    item
+                    for item in argv
+                    if "/compare/" in item or "/update-branch" in item
+                ),
+                "",
+            )
+            if "/compare/" in endpoint:
+                compared_head = endpoint.rsplit("...", 1)[-1]
+                status = (
+                    "ahead"
+                    if compared_head == self.new_head_sha and self.updated
+                    else "diverged"
+                )
+                return {"returncode": 0, "stdout": status + "\n", "stderr": ""}
+            if "/update-branch" in endpoint:
+                if self.update_returncode:
+                    return {
+                        "returncode": self.update_returncode,
+                        "stdout": "",
+                        "stderr": "update rejected",
+                    }
+                self.updated = True
+                if self.apply_update:
+                    self.view["headRefOid"] = self.new_head_sha
+                return {
+                    "returncode": 0,
+                    "stdout": json.dumps({"message": "Updating pull request branch."}),
+                    "stderr": "",
+                }
+        return {
+            "returncode": 1,
+            "stdout": "",
+            "stderr": f"unexpected gh command: {argv}",
+        }
+
+
 class GripParserTests(unittest.TestCase):
     def test_parse_worktree_porcelain(self) -> None:
         parsed = grips._parse_worktree_porcelain(
@@ -1229,6 +1306,7 @@ class GripFoundationTests(unittest.TestCase):
                 "operator-obligation-status",
                 "post-merge-sync",
                 "pr-check-readiness",
+                "pr-base-converge",
                 "pr-create-or-update",
                 "repo-orient",
                 "runtime-deploy-check",
@@ -1268,6 +1346,14 @@ class GripFoundationTests(unittest.TestCase):
                 specs["pr-create-or-update"]["operation_effect_class"],
                 specs["pr-create-or-update"]["operation_class"],
                 specs["pr-create-or-update"]["operation_lease_parallelism"],
+            ),
+        )
+        self.assertEqual(
+            ("publication", "pr-publication", "merge-disjointness-eligible"),
+            (
+                specs["pr-base-converge"]["operation_effect_class"],
+                specs["pr-base-converge"]["operation_class"],
+                specs["pr-base-converge"]["operation_lease_parallelism"],
             ),
         )
         for name in (
@@ -7617,6 +7703,179 @@ class GripFoundationTests(unittest.TestCase):
         self.assertIn("expected_head mismatch", result["output"]["error"])
         checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
         self.assertEqual("fail", checks["expected_head"])
+
+    def test_pr_base_converge_updates_existing_pr_with_expected_head_cas(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(
+                grips, "PR_BASE_CONVERGE_VERIFY_DELAYS_SECONDS", (0.0, 0.0, 0.0)
+            ),
+        ):
+            gh = FakePrBaseConvergeGh()
+            result = grips.run_grip(
+                "pr-base-converge",
+                {
+                    "repo": tmp,
+                    "pr_number": 77,
+                    "base": "main",
+                    "expected_head": "a" * 40,
+                    "expected_base_sha": "e" * 40,
+                },
+                allow_mutation=True,
+                github_runner=gh,
+            )
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("updated", result["output"]["action"])
+        self.assertEqual(77, result["output"]["pr_number"])
+        self.assertEqual("a" * 40, result["output"]["old_head"])
+        self.assertEqual("b" * 40, result["output"]["new_head"])
+        update_calls = [
+            call for call in gh.calls if any("/update-branch" in item for item in call)
+        ]
+        self.assertEqual(1, len(update_calls))
+        self.assertIn(f"expected_head_sha={'a' * 40}", update_calls[0])
+        self.assertFalse(any(call[:2] == ("pr", "create") for call in gh.calls))
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("pass", checks["same_pr_preserved"])
+        self.assertEqual("pass", checks["base_contained_after"])
+
+    def test_pr_base_converge_is_noop_when_head_already_contains_base(self) -> None:
+        class AlreadyCurrent(FakePrBaseConvergeGh):
+            def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
+                if argv[:1] == ["api"] and any("/compare/" in item for item in argv):
+                    self.calls.append(tuple(argv))
+                    return {"returncode": 0, "stdout": "ahead\n", "stderr": ""}
+                return super().__call__(repo, argv)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            gh = AlreadyCurrent()
+            result = grips.run_grip(
+                "pr-base-converge",
+                {
+                    "repo": tmp,
+                    "pr_number": 77,
+                    "base": "main",
+                    "expected_head": "a" * 40,
+                    "expected_base_sha": "e" * 40,
+                },
+                allow_mutation=True,
+                github_runner=gh,
+            )
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("unchanged", result["output"]["action"])
+        self.assertFalse(
+            any(any("/update-branch" in item for item in call) for call in gh.calls)
+        )
+
+    def test_pr_base_converge_blocks_stale_head_before_update(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            gh = FakePrBaseConvergeGh(head_sha="c" * 40)
+            result = grips.run_grip(
+                "pr-base-converge",
+                {
+                    "repo": tmp,
+                    "pr_number": 77,
+                    "base": "main",
+                    "expected_head": "a" * 40,
+                    "expected_base_sha": "e" * 40,
+                },
+                allow_mutation=True,
+                github_runner=gh,
+            )
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("expected_head", result["output"]["error"])
+        self.assertFalse(
+            any(any("/update-branch" in item for item in call) for call in gh.calls)
+        )
+
+    def test_pr_base_converge_does_not_replay_ambiguous_accepted_update(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(
+                grips, "PR_BASE_CONVERGE_VERIFY_DELAYS_SECONDS", (0.0, 0.0, 0.0)
+            ),
+        ):
+            gh = FakePrBaseConvergeGh(apply_update=False)
+            result = grips.run_grip(
+                "pr-base-converge",
+                {
+                    "repo": tmp,
+                    "pr_number": 77,
+                    "base": "main",
+                    "expected_head": "a" * 40,
+                    "expected_base_sha": "e" * 40,
+                },
+                allow_mutation=True,
+                github_runner=gh,
+            )
+        self.assertEqual("failed", result["receipt"]["status"])
+        self.assertIn("exact readback", result["output"]["error"])
+        update_calls = [
+            call for call in gh.calls if any("/update-branch" in item for item in call)
+        ]
+        self.assertEqual(1, len(update_calls))
+        self.assertFalse(any(call[:2] == ("pr", "create") for call in gh.calls))
+
+    def test_pr_base_converge_blocks_merge_conflict_before_update(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            gh = FakePrBaseConvergeGh(mergeable="CONFLICTING")
+            result = grips.run_grip(
+                "pr-base-converge",
+                {
+                    "repo": tmp,
+                    "pr_number": 77,
+                    "base": "main",
+                    "expected_head": "a" * 40,
+                    "expected_base_sha": "e" * 40,
+                },
+                allow_mutation=True,
+                github_runner=gh,
+            )
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("merge conflict", result["output"]["error"])
+        self.assertFalse(any(any("/compare/" in item for item in call) for call in gh.calls))
+        self.assertFalse(any(any("/update-branch" in item for item in call) for call in gh.calls))
+
+    def test_pr_base_converge_provider_cas_rejection_never_creates_successor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            gh = FakePrBaseConvergeGh(update_returncode=1)
+            result = grips.run_grip(
+                "pr-base-converge",
+                {
+                    "repo": tmp,
+                    "pr_number": 77,
+                    "base": "main",
+                    "expected_head": "a" * 40,
+                    "expected_base_sha": "e" * 40,
+                },
+                allow_mutation=True,
+                github_runner=gh,
+            )
+        self.assertEqual("failed", result["receipt"]["status"])
+        update_calls = [call for call in gh.calls if any("/update-branch" in item for item in call)]
+        self.assertEqual(1, len(update_calls))
+        self.assertFalse(any(call[:2] == ("pr", "create") for call in gh.calls))
+
+    def test_pr_base_converge_refuses_cross_repository_pr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            gh = FakePrBaseConvergeGh(cross_repository=True)
+            result = grips.run_grip(
+                "pr-base-converge",
+                {
+                    "repo": tmp,
+                    "pr_number": 77,
+                    "base": "main",
+                    "expected_head": "a" * 40,
+                    "expected_base_sha": "e" * 40,
+                },
+                allow_mutation=True,
+                github_runner=gh,
+            )
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("cross-repository", result["output"]["error"])
+        self.assertFalse(
+            any(any("/update-branch" in item for item in call) for call in gh.calls)
+        )
 
     def test_pr_create_or_update_requires_allow_mutation(self) -> None:
         result = grips.run_grip(
