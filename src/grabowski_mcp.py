@@ -77,7 +77,7 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "host-capability-resolution",
-        "Prefer native typed capability; else use grabowski_host_capability_resolve, then declared route. Re-read readiness/policy; not-ready is not not-found. Reuse before new infrastructure. No execution/setup authority; do not pin provider/model.",
+        "Use native typed capability; else use grabowski_host_capability_resolve. Only not_found permits declared route; blocked stops. Read readiness/policy; not-ready != not-found. Reuse before new infrastructure. No execution/setup authority; do not pin provider/model.",
     ),
     (
         "mutation-preconditions",

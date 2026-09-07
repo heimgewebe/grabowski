@@ -35,8 +35,9 @@ The rendered contract requires the agent to:
    read can serve as the probe;
 3. reuse existing capability infrastructure before building a parallel path: prefer
    a native typed Grabowski capability first; only when none fits, use
-   `grabowski_host_capability_resolve` for a host-local capability; if that remains
-   unresolved, follow an already declared specialized route. Re-read the selected
+   `grabowski_host_capability_resolve` for a host-local capability; only an explicit
+   `not_found` may fall through to an already declared specialized route, while
+   `blocked` stops discovery. Re-read the selected
    authority's live readiness and policy, treat not-ready as distinct from not-found,
    and exhaust this order before creating a venv, install, cache, service, worker,
    bridge, transfer path, provider integration or cloud fallback; discovery grants

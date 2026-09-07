@@ -92,9 +92,10 @@ class AgentInstructionsTests(unittest.TestCase):
         for phrase in (
             "native typed capability",
             "grabowski_host_capability_resolve",
-            "declared route",
+            "only not_found permits declared route",
+            "blocked stops",
             "readiness/policy",
-            "not-ready is not not-found",
+            "not-ready != not-found",
             "reuse before new infrastructure",
             "no execution/setup authority",
             "do not pin",

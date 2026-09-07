@@ -288,7 +288,7 @@ class AgentBootstrapTests(unittest.TestCase):
             [
                 "native_typed_surface",
                 "host_capability_locator_if_no_native_surface",
-                "declared_specialized_route_if_unresolved",
+                "declared_specialized_route_only_on_host_not_found",
                 "live_readiness_of_selected_authority",
             ],
         )
@@ -305,11 +305,13 @@ class AgentBootstrapTests(unittest.TestCase):
             "not_ready_requires_existing_authority_recovery_not_parallel_replacement",
             policy["invariants"],
         )
+        self.assertIn("host_capability_blocked_stops_discovery", policy["invariants"])
         self.assertIn(
             "do_not_duplicate_existing_control_plane",
             policy["invariants"],
         )
         self.assertIn("virtualenv", policy["creation_triggers"])
+        self.assertIn("worker", policy["creation_triggers"])
         self.assertIn("cloud_fallback", policy["creation_triggers"])
 
         module.grabowski_friction.friction_summary = lambda **_: {
