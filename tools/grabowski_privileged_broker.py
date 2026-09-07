@@ -56,6 +56,13 @@ LOCAL_BACKUP_SMART_DEVICE = Path(
 LOCAL_BACKUP_SMART_ARGV = [
     "/usr/sbin/smartctl", "-d", "sat", "-a", str(LOCAL_BACKUP_SMART_DEVICE)
 ]
+SEAGATE_BACKUP_SMART_READ_ACTION = "seagate_backup_smart_read"
+SEAGATE_BACKUP_SMART_DEVICE = Path(
+    "/dev/disk/by-id/usb-Seagate_Game_Drive_PS4_NZ0DRYBD-0:0"
+)
+SEAGATE_BACKUP_SMART_ARGV = [
+    "/usr/sbin/smartctl", "-d", "sat", "-a", str(SEAGATE_BACKUP_SMART_DEVICE)
+]
 ROOTBROKER_TIMEOUT_ROLLBACK_GRACE_SECONDS = 900
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 RUN_USER_ROOT = Path("/run/user")
@@ -1459,22 +1466,30 @@ def _communicate_after_timeout(
     return process.communicate()
 
 
-def _local_backup_smart_device_identity() -> tuple[str, int]:
-    """Resolve the fixed USB By-ID and prove it still names one block device."""
+def _fixed_smart_device_identity(device: Path, *, label: str) -> tuple[str, int]:
+    """Resolve one fixed USB By-ID and prove it still names one block device."""
     try:
-        link_metadata = LOCAL_BACKUP_SMART_DEVICE.lstat()
+        link_metadata = device.lstat()
     except OSError as exc:
-        raise PermissionError("BACKUP SMART By-ID is unavailable") from exc
+        raise PermissionError(f"{label} By-ID is unavailable") from exc
     if not stat.S_ISLNK(link_metadata.st_mode):
-        raise PermissionError("BACKUP SMART By-ID is not a symlink")
+        raise PermissionError(f"{label} By-ID is not a symlink")
     try:
-        resolved = LOCAL_BACKUP_SMART_DEVICE.resolve(strict=True)
+        resolved = device.resolve(strict=True)
         metadata = resolved.stat()
     except OSError as exc:
-        raise PermissionError("BACKUP SMART By-ID target is unavailable") from exc
+        raise PermissionError(f"{label} By-ID target is unavailable") from exc
     if not stat.S_ISBLK(metadata.st_mode):
-        raise PermissionError("BACKUP SMART By-ID target is not a block device")
+        raise PermissionError(f"{label} By-ID target is not a block device")
     return str(resolved), int(metadata.st_rdev)
+
+
+def _local_backup_smart_device_identity() -> tuple[str, int]:
+    return _fixed_smart_device_identity(LOCAL_BACKUP_SMART_DEVICE, label="BACKUP SMART")
+
+
+def _seagate_backup_smart_device_identity() -> tuple[str, int]:
+    return _fixed_smart_device_identity(SEAGATE_BACKUP_SMART_DEVICE, label="SEAGATE BACKUP SMART")
 
 
 def _assert_local_backup_smart_pre_spawn(
@@ -1482,14 +1497,23 @@ def _assert_local_backup_smart_pre_spawn(
     reference: dict[str, object],
     argv: object,
 ) -> None:
-    if reference.get("action") != LOCAL_BACKUP_SMART_READ_ACTION:
+    action = reference.get("action")
+    if action == LOCAL_BACKUP_SMART_READ_ACTION:
+        expected_argv = LOCAL_BACKUP_SMART_ARGV
+        identity = _local_backup_smart_device_identity
+        label = "BACKUP SMART"
+    elif action == SEAGATE_BACKUP_SMART_READ_ACTION:
+        expected_argv = SEAGATE_BACKUP_SMART_ARGV
+        identity = _seagate_backup_smart_device_identity
+        label = "SEAGATE BACKUP SMART"
+    else:
         return
-    if argv != LOCAL_BACKUP_SMART_ARGV:
-        raise PermissionError("BACKUP SMART argv differs from the fixed read-only contract")
-    first = _local_backup_smart_device_identity()
-    second = _local_backup_smart_device_identity()
+    if argv != expected_argv:
+        raise PermissionError(f"{label} argv differs from the fixed read-only contract")
+    first = identity()
+    second = identity()
     if second != first:
-        raise PermissionError("BACKUP SMART By-ID identity changed before spawn")
+        raise PermissionError(f"{label} By-ID identity changed before spawn")
 
 
 def _execute_broker_command(
@@ -1573,7 +1597,7 @@ def _execute_broker_command(
                 "stderr_sha256": hashlib.sha256(stderr_bytes).hexdigest(),
                 "stderr_bytes": len(stderr_bytes),
             })
-        if reference["action"] == LOCAL_BACKUP_SMART_READ_ACTION:
+        if reference["action"] in {LOCAL_BACKUP_SMART_READ_ACTION, SEAGATE_BACKUP_SMART_READ_ACTION}:
             public_stdout = stdout.encode("utf-8")
             public_stderr = stderr.encode("utf-8")
             record.update({

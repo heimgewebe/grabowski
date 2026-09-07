@@ -291,6 +291,24 @@ class OperatorFenceEnforcementTests(unittest.TestCase):
         )
         enforcement.abort_fence_before_dispatch(token2)
 
+    def test_abort_before_dispatch_requires_terminal_settlement(self) -> None:
+        token = self.begin(self.admission("grabowski_git"))
+        self.assertIsNotNone(token)
+        with mock.patch.object(
+            enforcement, "_fence_rpc", return_value={"terminal": False}
+        ):
+            with self.assertRaisesRegex(
+                enforcement.OperatorFenceEnforcementError,
+                "fence_terminal_settlement_missing",
+            ):
+                enforcement.abort_fence_before_dispatch(token)
+        state, _ = enforcement._fence_read_json(self.state_path)
+        self.assertEqual(state["pending"]["phase"], "completion_ready")
+        self.assertEqual(state["pending"]["outcome"], "effect_not_applied")
+        self.assertIsNotNone(self.store.status()["inflight"])
+        self.assertFalse(enforcement._FENCE_ENFORCEMENT_LOCK.locked())
+        self.assertFalse(token["lock_held"])
+
     def test_restart_after_dispatch_becomes_outcome_unknown_and_blocks(self) -> None:
         first = self.admission("grabowski_git")
         token = self.begin(first)
