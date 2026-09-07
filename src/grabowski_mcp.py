@@ -77,7 +77,7 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "host-capability-resolution",
-        "For a host-local capability intent, call grabowski_host_capability_resolve before choosing an implementation; follow the returned canonical authority and reread its policy at execution time, and do not pin or duplicate provider or model choices in Grabowski.",
+        "Prefer native typed capability; else use grabowski_host_capability_resolve, then declared route. Re-read readiness/policy; not-ready is not not-found. Reuse before new infrastructure. No execution/setup authority; do not pin provider/model.",
     ),
     (
         "mutation-preconditions",

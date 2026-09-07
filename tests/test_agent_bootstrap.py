@@ -276,5 +276,59 @@ class AgentBootstrapTests(unittest.TestCase):
         )
 
 
+    def test_reuse_before_build_orders_discovery_before_new_infrastructure(self) -> None:
+        module = self.load_module()
+        self.assertEqual(
+            module.ENTRY_SEQUENCE[3],
+            "discover_existing_capability_or_route",
+        )
+        policy = module.REUSE_BEFORE_BUILD
+        self.assertEqual(
+            policy["ordered_discovery"],
+            [
+                "native_typed_surface",
+                "host_capability_locator_if_no_native_surface",
+                "declared_specialized_route_if_unresolved",
+                "live_readiness_of_selected_authority",
+            ],
+        )
+        self.assertEqual(
+            policy["host_capability_tool"],
+            "grabowski_host_capability_resolve",
+        )
+        self.assertEqual(
+            policy["new_infrastructure_gate"],
+            "only_after_discovery_exhausted",
+        )
+        self.assertIn("not_ready_is_not_not_found", policy["invariants"])
+        self.assertIn(
+            "do_not_duplicate_existing_control_plane",
+            policy["invariants"],
+        )
+        self.assertIn("virtualenv", policy["creation_triggers"])
+        self.assertIn("cloud_fallback", policy["creation_triggers"])
+
+        module.grabowski_friction.friction_summary = lambda **_: {
+            "event_log_integrity": {"integrity_valid": True},
+            "decision_log": {"integrity_valid": True},
+            "fingerprint_sha256": "a" * 64,
+        }
+        module.grabowski_friction.execution_governor_summary = lambda **_: {
+            "ledger_integrity_valid": True,
+            "candidates": [],
+            "minimum_evidence": 5,
+            "decay_seconds": 604800,
+            "live_promotions": [],
+            "summary_sha256": "b" * 64,
+        }
+        capsule = module.agent_bootstrap()
+        self.assertEqual(capsule["reuse_before_build"], policy)
+        self.assertTrue(
+            capsule["call_rules"][
+                "reuse_existing_capability_before_new_infrastructure"
+            ]
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
