@@ -43,8 +43,8 @@ REUSE_BEFORE_BUILD = {
     "authority": "discovery_order_only",
     "ordered_discovery": [
         "native_typed_surface",
-        "host_capability_locator_if_no_native_surface",
-        "declared_specialized_route_only_on_host_not_found",
+        "host_capability_locator_if_host_local_and_no_native_surface",
+        "declared_specialized_route_if_non_host_or_host_not_found",
         "live_readiness_of_selected_authority",
     ],
     "host_capability_tool": "grabowski_host_capability_resolve",
@@ -52,7 +52,8 @@ REUSE_BEFORE_BUILD = {
     "invariants": [
         "not_ready_is_not_not_found",
         "not_ready_requires_existing_authority_recovery_not_parallel_replacement",
-        "host_capability_blocked_stops_discovery",
+        "host_capability_blocked_stops_host_local_discovery",
+        "non_host_intent_does_not_require_host_contract",
         "discovery_does_not_authorize_execution",
         "do_not_duplicate_existing_control_plane",
     ],

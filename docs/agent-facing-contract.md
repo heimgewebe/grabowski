@@ -34,10 +34,11 @@ The rendered contract requires the agent to:
    surfaces, without adding a connectivity-only health ping when that required
    read can serve as the probe;
 3. reuse existing capability infrastructure before building a parallel path: prefer
-   a native typed Grabowski capability first; only when none fits, use
-   `grabowski_host_capability_resolve` for a host-local capability; only an explicit
-   `not_found` may fall through to an already declared specialized route, while
-   `blocked` stops discovery. Re-read the selected
+   a native typed Grabowski capability first. For a host-local capability with no
+   native surface, use `grabowski_host_capability_resolve`; only an explicit host
+   `not_found` may fall through to an already declared specialized route, while host
+   `blocked` stops that discovery. Non-host intents do not depend on the host contract
+   and may proceed to their already declared specialized route. Re-read the selected
    authority's live readiness and policy, treat not-ready as distinct from not-found,
    and exhaust this order before creating a venv, install, cache, service, worker,
    bridge, transfer path, provider integration or cloud fallback; discovery grants

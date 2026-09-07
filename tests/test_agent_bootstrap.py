@@ -287,8 +287,8 @@ class AgentBootstrapTests(unittest.TestCase):
             policy["ordered_discovery"],
             [
                 "native_typed_surface",
-                "host_capability_locator_if_no_native_surface",
-                "declared_specialized_route_only_on_host_not_found",
+                "host_capability_locator_if_host_local_and_no_native_surface",
+                "declared_specialized_route_if_non_host_or_host_not_found",
                 "live_readiness_of_selected_authority",
             ],
         )
@@ -305,7 +305,14 @@ class AgentBootstrapTests(unittest.TestCase):
             "not_ready_requires_existing_authority_recovery_not_parallel_replacement",
             policy["invariants"],
         )
-        self.assertIn("host_capability_blocked_stops_discovery", policy["invariants"])
+        self.assertIn(
+            "host_capability_blocked_stops_host_local_discovery",
+            policy["invariants"],
+        )
+        self.assertIn(
+            "non_host_intent_does_not_require_host_contract",
+            policy["invariants"],
+        )
         self.assertIn(
             "do_not_duplicate_existing_control_plane",
             policy["invariants"],
