@@ -764,6 +764,10 @@ class RootbrokerCutoverTests(unittest.TestCase):
             observed[cutover.LOCAL_BACKUP_SMART_READ_ACTION]["argv"],
             ["/usr/sbin/smartctl", "-d", "sat", "-a", cutover.LOCAL_BACKUP_SMART_DEVICE],
         )
+        self.assertEqual(
+            observed[cutover.SEAGATE_BACKUP_SMART_READ_ACTION]["argv"],
+            ["/usr/sbin/smartctl", "-d", "sat", "-a", cutover.SEAGATE_BACKUP_SMART_DEVICE],
+        )
         drifted = json.loads(_example_config_text())
         drifted["actions"][cutover.LOCAL_BACKUP_NTFS_CHECK_ACTION]["argv"][-1] = "/dev/sda1"
         bad = FakeRunner(
@@ -853,6 +857,10 @@ class RootbrokerCutoverTests(unittest.TestCase):
         )
         self.assertIn(
             cutover.LOCAL_BACKUP_SMART_READ_ACTION,
+            attestation["action_sha256"],
+        )
+        self.assertIn(
+            cutover.SEAGATE_BACKUP_SMART_READ_ACTION,
             attestation["action_sha256"],
         )
         unsigned = dict(attestation)
