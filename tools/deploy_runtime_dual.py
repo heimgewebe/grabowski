@@ -7678,6 +7678,51 @@ class MidCutoverResumeRuntime:
     def canonical_selected(self) -> bool:
         return self.promotion_progress.canonical_selected
 
+    def successor_snapshot_rebind_evidence(self) -> dict[str, Any] | None:
+        """Re-read the immutable cutover receipt before relying on successor lineage."""
+        observation = self.classification.get("evidence", {}).get(
+            "snapshot_observation"
+        )
+        if (
+            not isinstance(observation, dict)
+            or observation.get("successor_refresh_after_cutover_rebind") is not True
+        ):
+            return None
+        expected_rebind_sha256 = observation.get(
+            "historical_rebind_receipt_sha256"
+        )
+        resumed_receipt_sha256 = self.resume_binding.get("resumed_receipt_sha256")
+        if not isinstance(expected_rebind_sha256, str) or not isinstance(
+            resumed_receipt_sha256, str
+        ):
+            core.fail(
+                "Successor snapshot lineage carries no immutable rebind identity",
+                phase="midcutover-successor-snapshot-lineage",
+            )
+        loaded = midcutover.load_receipts(self.receipt_root)
+        matches = [
+            receipt
+            for receipt in loaded["receipts"]
+            if receipt.get("cutover_id") == self.cutover_id
+            and receipt.get("receipt_sha256") == resumed_receipt_sha256
+        ]
+        if len(matches) != 1:
+            core.fail(
+                "Successor snapshot lineage cutover receipt is unavailable",
+                phase="midcutover-successor-snapshot-lineage",
+                details={"match_count": len(matches)},
+            )
+        rebind = matches[0].get("snapshot_rebind")
+        if (
+            not isinstance(rebind, dict)
+            or rebind.get("receipt_sha256") != expected_rebind_sha256
+        ):
+            core.fail(
+                "Successor snapshot lineage rebind identity changed",
+                phase="midcutover-successor-snapshot-lineage",
+            )
+        return rebind
+
     def snapshot_effect_guard(self, effect: str) -> Any:
         """Bind one recovery effect to the exact classified snapshot."""
         readiness = self.resume_binding.get("green_readiness")
@@ -7729,6 +7774,7 @@ class MidCutoverResumeRuntime:
             deployment_source_identity_sha256=str(
                 self.resume_binding["source_identity_sha256"]
             ),
+            durable_rebind=self.successor_snapshot_rebind_evidence(),
             expected_state=canonical_state,
             source_snapshot_receipt_sha256=str(
                 self.resume_binding["source_snapshot_receipt_sha256"]
@@ -8088,6 +8134,7 @@ class MidCutoverResumeRuntime:
             source_identity_sha256=str(
                 self.resume_binding["source_identity_sha256"]
             ),
+            durable_rebind=self.successor_snapshot_rebind_evidence(),
             snapshot_inspector=client_snapshot.inspect_cutover_snapshot_binding,
         )
 
