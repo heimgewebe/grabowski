@@ -859,6 +859,17 @@ class PrivilegedBrokerTests(unittest.TestCase):
                 ],
             ),
             (
+                "seagate_backup_smart_read",
+                "smart-read",
+                [
+                    "/usr/sbin/smartctl",
+                    "-d",
+                    "sat",
+                    "-a",
+                    "/dev/disk/by-id/usb-Seagate_Game_Drive_PS4_NZ0DRYBD-0:0",
+                ],
+            ),
+            (
                 "local_backup_mount_reconcile",
                 "reconcile",
                 ["/usr/local/libexec/grabowski-backup-mount-reconcile", "reconcile"],

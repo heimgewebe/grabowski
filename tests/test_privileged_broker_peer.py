@@ -1117,6 +1117,42 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
                     reference=reference, argv=list(broker_tool.LOCAL_BACKUP_SMART_ARGV)
                 )
 
+    def test_seagate_backup_smart_pre_spawn_requires_exact_argv_and_stable_device_identity(self) -> None:
+        reference = {"action": broker_tool.SEAGATE_BACKUP_SMART_READ_ACTION}
+        with mock.patch.object(
+            broker_tool, "_seagate_backup_smart_device_identity",
+            side_effect=[("/dev/sdb", 2064), ("/dev/sdb", 2064)],
+        ) as identity:
+            broker_tool._assert_local_backup_smart_pre_spawn(
+                reference=reference, argv=list(broker_tool.SEAGATE_BACKUP_SMART_ARGV)
+            )
+        self.assertEqual(identity.call_count, 2)
+        with self.assertRaisesRegex(PermissionError, "argv differs"):
+            broker_tool._assert_local_backup_smart_pre_spawn(
+                reference=reference, argv=list(broker_tool.LOCAL_BACKUP_SMART_ARGV)
+            )
+        with mock.patch.object(
+            broker_tool, "_seagate_backup_smart_device_identity",
+            side_effect=[("/dev/sdb", 2064), ("/dev/sdc", 2080)],
+        ):
+            with self.assertRaisesRegex(PermissionError, "identity changed"):
+                broker_tool._assert_local_backup_smart_pre_spawn(
+                    reference=reference, argv=list(broker_tool.SEAGATE_BACKUP_SMART_ARGV)
+                )
+
+    def test_seagate_backup_smart_device_identity_uses_exact_by_id(self) -> None:
+        by_id = mock.Mock()
+        link_meta = mock.Mock(st_mode=stat.S_IFLNK | 0o777)
+        target = mock.Mock()
+        target.__str__ = mock.Mock(return_value="/dev/sdb")
+        target.stat.return_value = mock.Mock(st_mode=stat.S_IFBLK | 0o600, st_rdev=2064)
+        by_id.lstat.return_value = link_meta
+        by_id.resolve.return_value = target
+        with mock.patch.object(broker_tool, "SEAGATE_BACKUP_SMART_DEVICE", by_id):
+            self.assertEqual(
+                broker_tool._seagate_backup_smart_device_identity(), ("/dev/sdb", 2064)
+            )
+
     def test_backup_smart_device_identity_requires_by_id_symlink_to_block_device(self) -> None:
         by_id = mock.Mock()
         link_meta = mock.Mock(st_mode=stat.S_IFLNK | 0o777)

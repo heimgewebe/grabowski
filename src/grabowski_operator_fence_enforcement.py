@@ -896,7 +896,11 @@ def abort_fence_before_dispatch(token: MutableMapping[str, Any] | None) -> None:
                 evidence_sha256=evidence,
             )
             state = _fence_set_pending(state_path, state, pending)
-            _fence_rpc(token["client"], "settle", _fence_settle_arguments(config, state, pending))
+            result = _fence_rpc(
+                token["client"], "settle", _fence_settle_arguments(config, state, pending)
+            )
+            if result.get("terminal") is not True:
+                raise OperatorFenceEnforcementError("fence_terminal_settlement_missing")
             pending["phase"] = "settled"
             state = _fence_set_pending(state_path, state, pending)
             _fence_release_or_observe(token["client"], config, state_path, state, pending)
