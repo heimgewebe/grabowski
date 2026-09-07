@@ -37,6 +37,7 @@ FLEET_MUTATION_OPERATION = "fleet-registry-mutate"
 BACKUP_NTFS_CHECK_OPERATION = "backup-ntfs-check"
 BACKUP_NTFS_CLEAR_DIRTY_OPERATION = "backup-ntfs-clear-dirty"
 BACKUP_SMART_READ_OPERATION = "backup-smart-read"
+SEAGATE_BACKUP_SMART_READ_OPERATION = "seagate-backup-smart-read"
 BACKUP_MOUNT_RECONCILE_OPERATION = "backup-mount-reconcile"
 ROOTBROKER_AUTHORITY_REFRESH_OPERATION = "rootbroker-authority-refresh"
 BLOCKADE_AUTHORITY_HARDEN_OPERATION = "blockade-authority-harden"
@@ -58,6 +59,13 @@ BACKUP_STORAGE_TYPED_OPERATIONS = {
     BACKUP_SMART_READ_OPERATION: {
         "description": "Read SMART data from the fixed configured BACKUP disk through the exact SAT/by-id rootbroker action.",
         "action": "local_backup_smart_read",
+        "target": "smart-read",
+        "effect": "read_only",
+        "parameters": (),
+    },
+    SEAGATE_BACKUP_SMART_READ_OPERATION: {
+        "description": "Read SMART data from the fixed Seagate Game Drive PS4 NZ0DRYBD through the exact SAT/by-id rootbroker action.",
+        "action": "seagate_backup_smart_read",
         "target": "smart-read",
         "effect": "read_only",
         "parameters": (),
@@ -461,7 +469,7 @@ def _root_audit_sha256(invocation: dict[str, Any]) -> str | None:
         or audit.get("peer_unit") != "grabowski-operator.service"
     ):
         return None
-    if invocation.get("action") == "local_backup_smart_read":
+    if invocation.get("action") in {"local_backup_smart_read", "seagate_backup_smart_read"}:
         stdout = response.get("stdout")
         stderr = response.get("stderr")
         if not isinstance(stdout, str) or not isinstance(stderr, str):
@@ -541,6 +549,8 @@ def _run_backup_storage_operation(
         justification = "Run the fixed ntfsfix -d repair/clear-dirty path on the exact configured BACKUP volume after an exact successful root check; no force mount."
     elif operation == BACKUP_MOUNT_RECONCILE_OPERATION:
         justification = "Remove only a vanished-device stale /mnt/backup NTFS mount after root-side UUID, stability and busy-state checks; preserve the UUID-bound automount."
+    elif operation == SEAGATE_BACKUP_SMART_READ_OPERATION:
+        justification = "Root-read-only SMART diagnostic for the exact Seagate Game Drive PS4 serial NZ0DRYBD through the fixed SAT/by-id action; no caller-selected device or flags."
     else:
         justification = "Root-read-only SMART diagnostic for the exact configured BACKUP disk through the fixed SAT/by-id action; no caller-selected device or flags."
     invocation = _invoke_mainpid_privileged_action(
