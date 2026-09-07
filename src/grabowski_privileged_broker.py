@@ -139,6 +139,7 @@ LOCAL_BACKUP_NTFS_ACTIONS = frozenset({
 LOCAL_BACKUP_STORAGE_ACTIONS = frozenset({
     *LOCAL_BACKUP_NTFS_ACTIONS,
     "local_backup_smart_read",
+    "seagate_backup_smart_read",
     "local_backup_mount_reconcile",
 })
 

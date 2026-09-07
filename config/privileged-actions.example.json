@@ -247,6 +247,23 @@
         "/usr/local/libexec/grabowski-backup-mount-reconcile",
         "reconcile"
       ]
+    },
+    "seagate_backup_smart_read": {
+      "enabled": true,
+      "mode": "template",
+      "timeout_seconds": 120,
+      "kill_switch_path": "/var/lib/grabowski/operator-blockade/operator-kill-switch",
+      "legacy_kill_switch_path": "/home/alex/.local/state/grabowski/operator-kill-switch",
+      "allowed_peer_unit": "grabowski-operator.service",
+      "allowed_peer_uid": 1000,
+      "target_pattern": "smart-read",
+      "argv": [
+        "/usr/sbin/smartctl",
+        "-d",
+        "sat",
+        "-a",
+        "/dev/disk/by-id/usb-Seagate_Game_Drive_PS4_NZ0DRYBD-0:0"
+      ]
     }
   }
 }
