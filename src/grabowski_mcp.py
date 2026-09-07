@@ -503,6 +503,7 @@ SECRET_CAPABILITIES = (
 )
 OPERATOR_CAPABILITIES = (
     "terminal_execute",
+    "bureau_mutation",
     "durable_job",
     "git_cli",
     "github_cli",
@@ -768,15 +769,15 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_gui_worker_status": ("gui_worker",),
     "grabowski_gui_worker_stop": ("gui_worker",),
     "grabowski_gui_worker_list": ("gui_worker",),
-    "grabowski_bureau_candidate_record": ("terminal_execute",),
+    "grabowski_bureau_candidate_record": ("bureau_mutation",),
     "grabowski_bureau_candidate_assess": (),
-    "grabowski_bureau_task_propose": ("terminal_execute",),
-    "grabowski_bureau_task_review": ("terminal_execute",),
+    "grabowski_bureau_task_propose": ("bureau_mutation",),
+    "grabowski_bureau_task_review": ("bureau_mutation",),
     "grabowski_bureau_task_publish_preview": (),
-    "grabowski_bureau_task_publish": ("resource_lease", "terminal_execute"),
-    "grabowski_bureau_pickup_execute": ("resource_lease", "terminal_execute"),
+    "grabowski_bureau_task_publish": ("bureau_mutation", "resource_lease"),
+    "grabowski_bureau_pickup_execute": ("bureau_mutation", "resource_lease"),
     "grabowski_bureau_pickup_status": (),
-    "grabowski_bureau_pickup_release": ("resource_lease", "terminal_execute"),
+    "grabowski_bureau_pickup_release": ("bureau_mutation", "resource_lease"),
 }
 
 OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
@@ -910,6 +911,19 @@ SECRET_USE_ENV_ALLOWLIST = {
     "TERM",
     "TZ",
 }
+FAILOVER_MUTATE_CAPABILITIES = frozenset(
+    {
+        "file_read",
+        "audit_verify",
+        "audit_read",
+        "bureau_mutation",
+        "resource_lease",
+        "process_inspect",
+        "port_inspect",
+    }
+)
+
+
 SESSION_RISK_LEVELS = ("low", "medium", "high")
 SESSION_RISK_ORDER = {name: index for index, name in enumerate(SESSION_RISK_LEVELS)}
 SESSION_ESCALATION_MAX_SECONDS = 7 * 24 * 60 * 60
@@ -1349,6 +1363,15 @@ def _validate_policy(policy: Any) -> None:
                 label=f"profile {name} capabilities",
             )
             capabilities = set(profile["capabilities"])
+            if name == "failover-mutate":
+                if profile.get("trusted_owner") is not False:
+                    raise RuntimeError(
+                        "Access profile failover-mutate must explicitly disable trusted_owner"
+                    )
+                if capabilities != FAILOVER_MUTATE_CAPABILITIES:
+                    raise RuntimeError(
+                        "Access profile failover-mutate capabilities must match the fixed G6.5 contract"
+                    )
             if capabilities & {
                 "secret_inspect",
                 "secret_reveal",

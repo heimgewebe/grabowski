@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
 import hashlib
 import logging
 from pathlib import Path
@@ -8,6 +8,7 @@ import re
 from typing import Any
 
 import grabowski_effect_receipt as receipts
+import grabowski_operator_fence_enforcement as fence_enforcement
 
 
 LOGGER = logging.getLogger(__name__)
@@ -34,6 +35,20 @@ AuditAppender = Callable[[dict[str, Any]], str | None]
 CompletionErrorHandler = Callable[[BaseException], None]
 ResourceInspector = Callable[[str], Mapping[str, Any] | None]
 LaneInputsReader = Callable[[str], Mapping[str, Any]]
+
+
+FENCE_ENFORCEMENT_CONFIG_KIND = fence_enforcement.FENCE_ENFORCEMENT_CONFIG_KIND
+FENCE_ENFORCEMENT_CONFIG_PATH = fence_enforcement.FENCE_ENFORCEMENT_CONFIG_PATH
+FENCE_ENFORCEMENT_STATE_KIND = fence_enforcement.FENCE_ENFORCEMENT_STATE_KIND
+FENCE_ENFORCEMENT_STATE_PATH = fence_enforcement.FENCE_ENFORCEMENT_STATE_PATH
+OperatorFenceEnforcementDenied = fence_enforcement.OperatorFenceEnforcementDenied
+OperatorFenceEnforcementError = fence_enforcement.OperatorFenceEnforcementError
+fence_enforcement_required = fence_enforcement.fence_enforcement_required
+begin_fence_enforcement = fence_enforcement.begin_fence_enforcement
+mark_fence_dispatching = fence_enforcement.mark_fence_dispatching
+finish_fence_success = fence_enforcement.finish_fence_success
+finish_fence_unknown = fence_enforcement.finish_fence_unknown
+abort_fence_before_dispatch = fence_enforcement.abort_fence_before_dispatch
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
@@ -339,17 +354,35 @@ def admit_mutation(
     *,
     tool_name: str,
     arguments: Any,
-    transport_evidence: Mapping[str, Any],
+    transport_evidence: Mapping[str, Any] | None,
+    runtime_sha256: str | None = None,
     context: Any = None,
     append_audit: AuditAppender | None = None,
     resource_inspector: ResourceInspector | None = None,
     lane_inputs_reader: LaneInputsReader | None = None,
 ) -> dict[str, Any]:
+    if transport_evidence is None:
+        if (
+            not isinstance(runtime_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", runtime_sha256) is None
+        ):
+            raise ValueError(
+                "untransported mutation admission requires one explicit runtime SHA-256"
+            )
+        resolved_runtime_sha256 = runtime_sha256
+        transport_receipt_sha256 = None
+    else:
+        if runtime_sha256 is not None:
+            raise ValueError(
+                "runtime_sha256 override is forbidden when transport evidence exists"
+            )
+        resolved_runtime_sha256 = _runtime_digest(transport_evidence)
+        transport_receipt_sha256 = _transport_digest(transport_evidence)
     admission = receipts.admit(
         tool=tool_name,
         arguments=arguments if arguments is not None else {},
-        runtime_sha256=_runtime_digest(transport_evidence),
-        transport_receipt_sha256=_transport_digest(transport_evidence),
+        runtime_sha256=resolved_runtime_sha256,
+        transport_receipt_sha256=transport_receipt_sha256,
         effect_class="mutating",
         lane_id=lane_id(
             arguments,
@@ -358,8 +391,33 @@ def admit_mutation(
         ),
         actor_id=actor_id(arguments, context),
         resource_keys=resource_keys(arguments),
-        append_audit=append_audit,
+        append_audit=None,
     )
+    if append_audit is not None:
+        try:
+            audit_ref = append_audit(
+                {
+                    "timestamp_unix": admission["admitted_at_unix"],
+                    "operation": "effect-admission",
+                    **{
+                        key: admission.get(key)
+                        for key in (
+                            "schema_version", "kind", "request_id", "lane_id",
+                            "actor_id", "tool", "arguments_sha256", "runtime_sha256",
+                            "resource_set_sha256", "transport_receipt_sha256",
+                            "effect_class", "admitted_at_unix", "admission_sha256",
+                        )
+                    },
+                }
+            )
+            if isinstance(audit_ref, str):
+                admission["audit_record_sha256"] = audit_ref
+        except Exception as error:
+            LOGGER.error(
+                "effect admission audit append failed: %s",
+                type(error).__name__,
+                exc_info=error,
+            )
     _shadow_observation_best_effort(
         admission=admission,
         tool_name=tool_name,
@@ -438,6 +496,98 @@ def record_exception(
         error=error,
         append_audit=append_audit,
     )
+
+
+def _completion_audit_best_effort(
+    completion: Mapping[str, Any],
+    append_audit: AuditAppender | None,
+) -> None:
+    if append_audit is None:
+        return
+    try:
+        append_audit(
+            {
+                "timestamp_unix": completion["completed_at_unix"],
+                "operation": "effect-completion",
+                **{
+                    key: completion.get(key)
+                    for key in (
+                        "schema_version", "kind", "request_id", "admission_sha256",
+                        "completion_class", "domain_receipts", "domain_receipts_sha256",
+                        "post_state_observed", "post_state_sha256", "result_sha256",
+                        "error_class", "error_sha256", "completed_at_unix",
+                        "completion_sha256",
+                    )
+                },
+            }
+        )
+    except Exception as error:
+        LOGGER.error(
+            "effect completion audit append failed after durable completion identity: %s",
+            type(error).__name__,
+            exc_info=error,
+        )
+
+
+def build_success_completion(admission: Mapping[str, Any], result: Any) -> dict[str, Any]:
+    return receipts.complete(
+        admission,
+        completion_class=success_completion_class(result),
+        result=result,
+        post_state=_post_state(result),
+        append_audit=None,
+    )
+
+
+def build_exception_completion(
+    admission: Mapping[str, Any], error: BaseException
+) -> dict[str, Any]:
+    return receipts.complete(
+        admission,
+        completion_class="outcome_unknown",
+        error=error,
+        append_audit=None,
+    )
+
+
+def record_success_enforced(
+    admission: Mapping[str, Any],
+    result: Any,
+    token: MutableMapping[str, Any],
+    *,
+    append_audit: AuditAppender | None = None,
+) -> dict[str, Any]:
+    completion = build_success_completion(admission, result)
+    _completion_audit_best_effort(completion, append_audit)
+    try:
+        finish_fence_success(token, evidence_sha256=completion["completion_sha256"])
+    except Exception as error:
+        LOGGER.error(
+            "operator-fence terminal settlement remains pending after successful domain effect: %s",
+            type(error).__name__,
+            exc_info=error,
+        )
+    return completion
+
+
+def record_exception_enforced(
+    admission: Mapping[str, Any],
+    error: BaseException,
+    token: MutableMapping[str, Any],
+    *,
+    append_audit: AuditAppender | None = None,
+) -> dict[str, Any]:
+    completion = build_exception_completion(admission, error)
+    _completion_audit_best_effort(completion, append_audit)
+    try:
+        finish_fence_unknown(token, evidence_sha256=completion["completion_sha256"])
+    except Exception as fence_error:
+        LOGGER.error(
+            "operator-fence outcome-unknown settlement remains pending: %s",
+            type(fence_error).__name__,
+            exc_info=fence_error,
+        )
+    return completion
 
 
 def _default_completion_error(error: BaseException) -> None:

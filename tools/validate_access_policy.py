@@ -45,6 +45,7 @@ known_capabilities = {
     "secret_export",
     "browser_profile_read",
     "terminal_execute",
+    "bureau_mutation",
     "durable_job",
     "git_cli",
     "github_cli",
@@ -107,6 +108,15 @@ forbidden_private_names = {
 }
 staged_profile_names = {"observe", "maintain", "mutate", "break-glass"}
 default_safe_profiles = {"observe", "maintain"}
+failover_mutate_capabilities = {
+    "file_read",
+    "audit_verify",
+    "audit_read",
+    "bureau_mutation",
+    "resource_lease",
+    "process_inspect",
+    "port_inspect",
+}
 
 
 def require_string_list(path: Path, data: dict, key: str) -> None:
@@ -270,6 +280,15 @@ def validate_policy(path: Path) -> None:
         require_capabilities(path, f"profile {name}", profile["capabilities"])
         require_home_wide_typed_roots(path, f"profile {name}", profile)
         capabilities = set(profile["capabilities"])
+        if name == "failover-mutate":
+            if profile.get("trusted_owner") is not False:
+                raise SystemExit(
+                    f"{path}: failover-mutate must explicitly disable trusted_owner."
+                )
+            if capabilities != failover_mutate_capabilities:
+                raise SystemExit(
+                    f"{path}: failover-mutate capabilities drifted from the fixed G6.5 contract."
+                )
         if secret_capabilities & capabilities:
             missing = sorted(target_secret_roots - set(profile["secret_roots"]))
             if missing:
