@@ -17,7 +17,7 @@ When Heimserver is unavailable, that explicit configuration must stay fail-close
 
 The current default follows the Rootbroker recovery authority on the locally attached BACKUP disk:
 
-- `GRABOWSKI_SERVER_RECOVERY_TARGET=local-backup-disk:UUID=249180DA265E8DE0/restic/heim-pc`
+- `GRABOWSKI_SERVER_RECOVERY_TARGET=local-backup-disk:UUID=9b626294-7913-4be0-88fa-96b314e96ee5/restic/heim-pc`
 - the local target has no recovery host; the versioned `90-recovery-target.conf` drop-in explicitly removes a stale `GRABOWSKI_SERVER_RECOVERY_HOST` assignment before Green starts
 
 The local probe binds the physical disk by filesystem UUID, the Restic repository by repository ID, and the backup by the full snapshot ID recorded in fresh durability evidence. It restores the Fundus with `restic restore --verify`, compares the restored inventory to the durability receipt, runs a repository data-subset check, then rechecks disk/repository/snapshot identity before canonical Rootbroker publication.

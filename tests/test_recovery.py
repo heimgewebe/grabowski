@@ -164,7 +164,7 @@ class RecoveryToolTests(unittest.TestCase):
         target = recovery._recovery_target_info(recovery.DEFAULT_SERVER_RECOVERY_TARGET)
         self.assertTrue(target["valid"])
         self.assertEqual(target["kind"], "local_backup_disk")
-        self.assertEqual(target["backup_uuid"], "249180DA265E8DE0")
+        self.assertEqual(target["backup_uuid"], "9b626294-7913-4be0-88fa-96b314e96ee5")
         self.assertEqual(target["repository_name"], "heim-pc")
 
     def test_publication_failure_detail_prefers_structured_reason(self) -> None:
