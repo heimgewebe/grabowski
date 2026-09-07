@@ -470,6 +470,164 @@ def load_receipts(root: Path = BLUE_GREEN_RECEIPT_ROOT) -> dict[str, Any]:
     }
 
 
+def durable_snapshot_rebind_for_cutover(
+    receipts: Iterable[dict[str, Any]], cutover: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Resolve the exact immutable S0 rebind across retry receipts.
+
+    The original cutover receipt remains primary authority.  Only when it did
+    not persist ``snapshot_rebind`` may an ``outcome_unknown`` resume receipt
+    carry the full rebind forward.  The resume receipt is already private and
+    self-hash validated; this function additionally binds its nested evidence
+    back to the exact original cutover, switch, activation and resume binding.
+    Multiple byte-distinct candidates are ambiguity and fail closed.
+    """
+    cutover = validate_cutover_receipt(cutover)
+    direct = cutover.get("snapshot_rebind")
+    if isinstance(direct, dict):
+        return direct
+    switch = _switch_evidence(cutover)
+    readiness = cutover.get("green_readiness")
+    if switch is None or not isinstance(readiness, dict):
+        return None
+    activation = activation_observation(cutover)
+    distinct: dict[str, dict[str, Any]] = {}
+    for raw in receipts:
+        if not isinstance(raw, dict) or raw.get("kind") != RESUME_RECEIPT_KIND:
+            continue
+        try:
+            receipt = validate_resume_receipt(raw)
+        except MidCutoverEvidenceError:
+            continue
+        if receipt.get("outcome") != "outcome_unknown":
+            continue
+        claims_lineage = (
+            receipt.get("resumed_cutover_id") == cutover.get("cutover_id")
+            and receipt.get("resumed_receipt_sha256")
+            == cutover.get("receipt_sha256")
+        )
+        if not claims_lineage:
+            continue
+        recovery = receipt.get("recovery")
+        if (
+            not isinstance(recovery, dict)
+            or recovery.get("snapshot_rebind_applied") is not True
+        ):
+            # An outcome_unknown before S0 may legitimately have only a partial
+            # resume binding. It is historical evidence, but not a candidate
+            # source for durable snapshot-rebind lineage.
+            continue
+        binding = _validated_resume_binding(receipt.get("resume_binding"))
+        if (
+            binding is None
+            or receipt.get("resume_binding_sha256") != binding.get("binding_sha256")
+        ):
+            raise MidCutoverEvidenceError(
+                "outcome_unknown resume claims cutover lineage with invalid binding"
+            )
+        summary = receipt.get("snapshot_rebind")
+        durable = (
+            summary.get("durable_rebind") if isinstance(summary, dict) else None
+        )
+        if (
+            not isinstance(summary, dict)
+            or summary.get("rebound") is not True
+            or not isinstance(durable, dict)
+        ):
+            raise MidCutoverEvidenceError(
+                "outcome_unknown resume claims snapshot rebind without durable lineage"
+            )
+        cutover_binding = durable.get("cutover_binding")
+        transition = durable.get("cutover_transition")
+        identity_matches = (
+            receipt.get("resumed_cutover_id") == cutover.get("cutover_id")
+            and receipt.get("resumed_receipt_sha256")
+            == cutover.get("receipt_sha256")
+            and receipt.get("expected_head") == cutover.get("expected_head")
+            and receipt.get("green_release_id")
+            == cutover.get("green_release_id")
+            and receipt.get("source_identity_sha256")
+            == cutover.get("source_identity_sha256")
+            and binding.get("cutover_id") == cutover.get("cutover_id")
+            and binding.get("resumed_receipt_sha256")
+            == cutover.get("receipt_sha256")
+            and binding.get("cutover_generation")
+            == cutover.get("cutover_generation")
+            and binding.get("blue_release_id") == cutover.get("blue_release_id")
+            and binding.get("target_head") == cutover.get("expected_head")
+            and binding.get("expected_release_id")
+            == cutover.get("green_release_id")
+            and binding.get("source_identity_sha256")
+            == cutover.get("source_identity_sha256")
+            and binding.get("switch_generation") == switch.get("generation")
+            and binding.get("switch_selector_sha256")
+            == switch.get("selector_sha256")
+            and binding.get("expected_runtime_binding_sha256")
+            == switch.get("runtime_binding_sha256")
+            and binding.get("source_evidence_time")
+            == activation.get("source_evidence_time")
+            and binding.get("activation_observation_sha256")
+            == activation.get("observation_sha256")
+            and binding.get("publication_request_id")
+            == activation.get("publication_request_id")
+            and binding.get("registered_tool_count")
+            == readiness.get("complete_schema_count")
+            and binding.get("registered_names_sha256")
+            == cutover.get("names_sha256")
+            and binding.get("agent_instructions_sha256")
+            == cutover.get("agent_instructions_sha256")
+            and binding.get("green_readiness") == readiness
+        )
+        durable_matches = (
+            isinstance(summary, dict)
+            and summary.get("rebound") is True
+            and summary.get("receipt_sha256") == durable.get("receipt_sha256")
+            and durable.get("schema_version") == 1
+            and durable.get("state") == "matched"
+            and durable.get("verified") is True
+            and durable.get("cutover_rebind") is True
+            and durable.get("source_snapshot_receipt_sha256")
+            == binding.get("source_snapshot_receipt_sha256")
+            and durable.get("source_client_declaration_sha256")
+            == binding.get("source_client_declaration_sha256")
+            and durable.get("source_release_id") == binding.get("blue_release_id")
+            and durable.get("source_repo_head") == binding.get("blue_repo_head")
+            and durable.get("target_release_id")
+            == binding.get("expected_release_id")
+            and durable.get("target_repo_head") == binding.get("target_head")
+            and isinstance(cutover_binding, dict)
+            and cutover_binding
+            == {
+                "cutover_id": cutover.get("cutover_id"),
+                "cutover_generation": cutover.get("cutover_generation"),
+                "rebind_role": "blue-green-cutover",
+            }
+            and isinstance(transition, dict)
+            and transition.get("from_release_id") == binding.get("blue_release_id")
+            and transition.get("from_repo_head") == binding.get("blue_repo_head")
+            and transition.get("to_release_id") == binding.get("expected_release_id")
+            and transition.get("to_repo_head") == binding.get("target_head")
+            and transition.get("source_evidence_time")
+            == binding.get("source_evidence_time")
+            and transition.get("green_readiness_sha256")
+            == canonical_json_sha256(readiness)
+        )
+        if not identity_matches:
+            raise MidCutoverEvidenceError(
+                "outcome_unknown resume snapshot rebind lineage identity is inconsistent"
+            )
+        if not durable_matches:
+            raise MidCutoverEvidenceError(
+                "outcome_unknown resume snapshot rebind durable evidence is inconsistent"
+            )
+        distinct[canonical_json_sha256(durable)] = durable
+    if len(distinct) > 1:
+        raise MidCutoverEvidenceError(
+            "conflicting durable snapshot rebind lineage in resume receipts"
+        )
+    return next(iter(distinct.values()), None)
+
+
 DEFAULT_SELECTOR_FILE = (
     Path.home()
     / ".local/state/grabowski/transport-connectors/operator-routing-selector.json"
@@ -858,10 +1016,8 @@ def collect_classification_inputs(
                 source_identity_sha256=str(
                     cutover.get("source_identity_sha256") or ""
                 ),
-                durable_rebind=(
-                    cutover.get("snapshot_rebind")
-                    if isinstance(cutover.get("snapshot_rebind"), dict)
-                    else None
+                durable_rebind=durable_snapshot_rebind_for_cutover(
+                    loaded["receipts"], cutover
                 ),
                 snapshot_inspector=snapshot_inspector,
                 path=client_snapshot_path,
