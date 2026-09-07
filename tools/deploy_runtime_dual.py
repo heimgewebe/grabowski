@@ -7678,6 +7678,71 @@ class MidCutoverResumeRuntime:
     def canonical_selected(self) -> bool:
         return self.promotion_progress.canonical_selected
 
+    def successor_snapshot_rebind_evidence(self) -> dict[str, Any] | None:
+        """Re-read the immutable cutover receipt before relying on successor lineage."""
+        observation = self.classification.get("evidence", {}).get(
+            "snapshot_observation"
+        )
+        if (
+            not isinstance(observation, dict)
+            or observation.get("successor_refresh_after_cutover_rebind") is not True
+        ):
+            return None
+        expected_rebind_sha256 = observation.get(
+            "historical_rebind_receipt_sha256"
+        )
+        resumed_receipt_sha256 = self.resume_binding.get("resumed_receipt_sha256")
+        if not isinstance(expected_rebind_sha256, str) or not isinstance(
+            resumed_receipt_sha256, str
+        ):
+            core.fail(
+                "Successor snapshot lineage carries no immutable rebind identity",
+                phase="midcutover-successor-snapshot-lineage",
+            )
+        loaded = midcutover.load_receipts(self.receipt_root)
+        unreadable = loaded.get("unreadable")
+        if not isinstance(unreadable, list) or unreadable:
+            core.fail(
+                "Successor snapshot lineage receipt set is unreadable",
+                phase="midcutover-successor-snapshot-lineage",
+                details={
+                    "unreadable_count": (
+                        len(unreadable) if isinstance(unreadable, list) else None
+                    )
+                },
+            )
+        matches = [
+            receipt
+            for receipt in loaded["receipts"]
+            if receipt.get("cutover_id") == self.cutover_id
+            and receipt.get("receipt_sha256") == resumed_receipt_sha256
+        ]
+        if len(matches) != 1:
+            core.fail(
+                "Successor snapshot lineage cutover receipt is unavailable",
+                phase="midcutover-successor-snapshot-lineage",
+                details={"match_count": len(matches)},
+            )
+        try:
+            rebind = midcutover.durable_snapshot_rebind_for_cutover(
+                loaded["receipts"], matches[0]
+            )
+        except midcutover.MidCutoverEvidenceError as exc:
+            core.fail(
+                "Successor snapshot lineage rebind evidence is ambiguous",
+                phase="midcutover-successor-snapshot-lineage",
+                details={"error": str(exc)},
+            )
+        if (
+            not isinstance(rebind, dict)
+            or rebind.get("receipt_sha256") != expected_rebind_sha256
+        ):
+            core.fail(
+                "Successor snapshot lineage rebind identity changed",
+                phase="midcutover-successor-snapshot-lineage",
+            )
+        return rebind
+
     def snapshot_effect_guard(self, effect: str) -> Any:
         """Bind one recovery effect to the exact classified snapshot."""
         readiness = self.resume_binding.get("green_readiness")
@@ -7729,6 +7794,7 @@ class MidCutoverResumeRuntime:
             deployment_source_identity_sha256=str(
                 self.resume_binding["source_identity_sha256"]
             ),
+            durable_rebind=self.successor_snapshot_rebind_evidence(),
             expected_state=canonical_state,
             source_snapshot_receipt_sha256=str(
                 self.resume_binding["source_snapshot_receipt_sha256"]
@@ -7918,33 +7984,78 @@ class MidCutoverResumeRuntime:
                 phase="midcutover-snapshot-rebind",
                 details={"observation_scope": scope},
             )
-        result = client_snapshot.rebind_snapshot_for_midcutover_recovery(
-            cutover_id=self.cutover_id,
-            cutover_generation=self.cutover_generation,
-            # The predecessor identity the rebind must match is the one the
-            # persisted snapshot actually carries, not a reconstruction of it.
-            current_release_id=str(self.resume_binding["blue_release_id"]),
-            current_repo_head=self.blue_repo_head,
-            green_release_id=self.green_binding["release_id"],
-            green_repo_head=self.green_binding["repo_head"],
-            registered_tool_count=len(self.contract.expected_tools),
-            registered_names_sha256=self.green_binding["registered_names_sha256"],
-            agent_instructions_sha256=self.green_binding[
-                "agent_instructions_sha256"
-            ],
-            green_readiness=self.green_readiness,
-            observation_scope=str(scope),
-            source_snapshot_receipt_sha256=str(
-                self.resume_binding["source_snapshot_receipt_sha256"]
-            ),
-            source_client_declaration_sha256=str(
-                self.resume_binding["source_client_declaration_sha256"]
-            ),
-            classified_snapshot_receipt_sha256=str(
-                self.resume_binding["classified_snapshot_receipt_sha256"]
-            ),
-            receipt_root=self.receipt_root,
-        )
+        def retain_rebind(result: dict[str, Any]) -> dict[str, Any]:
+            summary: dict[str, Any] = {
+                "rebound": True,
+                "readback_state": None,
+                "readback_receipt_sha256": None,
+                "receipt_sha256": result.get("receipt_sha256"),
+                "source_snapshot_receipt_sha256": result.get(
+                    "source_snapshot_receipt_sha256"
+                ),
+                "source_client_declaration_sha256": result.get(
+                    "source_client_declaration_sha256"
+                ),
+                "classified_snapshot_receipt_sha256": result.get(
+                    "classified_snapshot_receipt_sha256"
+                ),
+                "source_release_id": result.get("source_release_id"),
+                "source_repo_head": result.get("source_repo_head"),
+                "target_release_id": result.get("target_release_id"),
+                "target_repo_head": result.get("target_repo_head"),
+                "schema_changed": result.get("schema_changed"),
+                "publication_schema_transition": result.get(
+                    "publication_schema_transition"
+                ),
+                "publication_schema_transition_sha256": (
+                    result.get("publication_schema_transition") or {}
+                ).get("transition_sha256"),
+                "observation_scope": result.get("observation_scope"),
+                "durable_rebind": result,
+            }
+            self.snapshot_rebind = summary
+            return summary
+
+        try:
+            result = client_snapshot.rebind_snapshot_for_midcutover_recovery(
+                cutover_id=self.cutover_id,
+                cutover_generation=self.cutover_generation,
+                # The predecessor identity the rebind must match is the one the
+                # persisted snapshot actually carries, not a reconstruction of it.
+                current_release_id=str(self.resume_binding["blue_release_id"]),
+                current_repo_head=self.blue_repo_head,
+                green_release_id=self.green_binding["release_id"],
+                green_repo_head=self.green_binding["repo_head"],
+                registered_tool_count=len(self.contract.expected_tools),
+                registered_names_sha256=self.green_binding["registered_names_sha256"],
+                agent_instructions_sha256=self.green_binding[
+                    "agent_instructions_sha256"
+                ],
+                green_readiness=self.green_readiness,
+                observation_scope=str(scope),
+                source_snapshot_receipt_sha256=str(
+                    self.resume_binding["source_snapshot_receipt_sha256"]
+                ),
+                source_client_declaration_sha256=str(
+                    self.resume_binding["source_client_declaration_sha256"]
+                ),
+                classified_snapshot_receipt_sha256=str(
+                    self.resume_binding["classified_snapshot_receipt_sha256"]
+                ),
+                receipt_root=self.receipt_root,
+            )
+        except client_snapshot.SnapshotRebindReadbackError as exc:
+            retain_rebind(exc.durable_rebind)
+            core.fail(
+                "Snapshot rebind post-write readback is outcome-unknown",
+                phase="midcutover-snapshot-rebind",
+                details={"receipt_sha256": exc.durable_rebind.get("receipt_sha256")},
+            )
+        # Preserve the full immutable S0 lineage immediately after the effect
+        # returns. The following readback may fail after the snapshot was already
+        # durably written; an outcome_unknown receipt must still carry enough
+        # evidence for a later recovery process to prove what happened.
+        summary = retain_rebind(result)
         # Read the effect back before this run relies on it. A rebind that
         # returned but did not persist would otherwise let S1 proceed on a
         # snapshot that still names the predecessor.
@@ -7987,36 +8098,11 @@ class MidCutoverResumeRuntime:
                 phase="midcutover-snapshot-rebind",
                 details={"readback": readback},
             )
-        self.snapshot_rebind = result
+        summary["readback_state"] = readback.get("state")
+        summary["readback_receipt_sha256"] = readback.get("snapshot_receipt_sha256")
         self.effect_snapshot_receipt_sha256 = str(result["receipt_sha256"])
         self.effect_snapshot_state = midcutover.SNAPSHOT_BINDING_DONE
-        return {
-            "rebound": True,
-            "readback_state": readback.get("state"),
-            "readback_receipt_sha256": readback.get("snapshot_receipt_sha256"),
-            "receipt_sha256": result.get("receipt_sha256"),
-            "source_snapshot_receipt_sha256": result.get(
-                "source_snapshot_receipt_sha256"
-            ),
-            "source_client_declaration_sha256": result.get(
-                "source_client_declaration_sha256"
-            ),
-            "classified_snapshot_receipt_sha256": result.get(
-                "classified_snapshot_receipt_sha256"
-            ),
-            "source_release_id": result.get("source_release_id"),
-            "source_repo_head": result.get("source_repo_head"),
-            "target_release_id": result.get("target_release_id"),
-            "target_repo_head": result.get("target_repo_head"),
-            "schema_changed": result.get("schema_changed"),
-            "publication_schema_transition": result.get(
-                "publication_schema_transition"
-            ),
-            "publication_schema_transition_sha256": (
-                result.get("publication_schema_transition") or {}
-            ).get("transition_sha256"),
-            "observation_scope": result.get("observation_scope"),
-        }
+        return summary
 
     def adopted_snapshot_rebind(self) -> dict[str, Any] | None:
         """Rebind evidence an earlier phase of *this* lineage already produced.
@@ -8088,6 +8174,7 @@ class MidCutoverResumeRuntime:
             source_identity_sha256=str(
                 self.resume_binding["source_identity_sha256"]
             ),
+            durable_rebind=self.successor_snapshot_rebind_evidence(),
             snapshot_inspector=client_snapshot.inspect_cutover_snapshot_binding,
         )
 
@@ -9129,9 +9216,25 @@ def resume_production_blue_green_cutover(
                     "error": str(snapshot_exc),
                 }
             snapshot_state = cold_snapshot.get("state")
-            s0_applied = snapshot_state == midcutover.SNAPSHOT_BINDING_DONE
+            retained_s0_rebind = (
+                context.snapshot_rebind
+                if isinstance(context.snapshot_rebind, dict)
+                and context.snapshot_rebind.get("rebound") is True
+                and isinstance(context.snapshot_rebind.get("durable_rebind"), dict)
+                and context.snapshot_rebind["durable_rebind"].get("receipt_sha256")
+                == context.snapshot_rebind.get("receipt_sha256")
+                else None
+            )
+            # A failed cold readback cannot erase an S0 effect that this process
+            # already observed returning with its full durable lineage. Treat it
+            # conservatively as applied/ambiguous so rollback stays forbidden and
+            # the outcome_unknown receipt carries the evidence into the next run.
+            s0_applied = (
+                snapshot_state == midcutover.SNAPSHOT_BINDING_DONE
+                or retained_s0_rebind is not None
+            )
             if s0_applied and snapshot_rebind is None:
-                snapshot_rebind = {
+                snapshot_rebind = retained_s0_rebind or {
                     "rebound": True,
                     "adopted_from_durable_snapshot": True,
                     "receipt_sha256": cold_snapshot.get(
