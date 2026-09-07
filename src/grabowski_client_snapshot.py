@@ -1549,7 +1549,28 @@ def _rebind_snapshot_for_cutover(
             ),
             "does_not_establish": list(receipt["does_not_establish"]),
         }
-        _write_private_json(SNAPSHOT_PATH, receipt)
+        try:
+            _write_private_json(SNAPSHOT_PATH, receipt)
+        except Exception as write_exc:
+            # _write_private_json publishes with os.replace before its final
+            # durability/identity checks. A failure may therefore mean either
+            # "no effect" or "S0 is already public". Re-read the exact source
+            # preimage while the state lock is still held: only the unchanged
+            # source receipt proves that the write did not land.
+            try:
+                write_readback = _read_private_json(SNAPSHOT_PATH)
+                _validate_receipt(write_readback)
+            except Exception:
+                raise SnapshotRebindReadbackError(
+                    "cutover snapshot rebind write outcome is unknown",
+                    durable_rebind=durable_rebind,
+                ) from write_exc
+            if write_readback.get("receipt_sha256") == source_receipt_sha256:
+                raise
+            raise SnapshotRebindReadbackError(
+                "cutover snapshot rebind write outcome is unknown",
+                durable_rebind=durable_rebind,
+            ) from write_exc
         try:
             readback = _read_private_json(SNAPSHOT_PATH)
             _validate_receipt(readback)

@@ -409,6 +409,42 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
                 )
         self._assert_snapshot_untouched()
 
+    def test_rebind_surfaces_durable_lineage_when_write_fails_after_publish(self) -> None:
+        prepared = self._prepare_publication(
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA
+        )
+        original_write = client_snapshot._write_private_json
+
+        def publish_then_fail(path: Path, payload: dict[str, object]) -> None:
+            original_write(path, payload)
+            if path == self.snapshot_path:
+                raise OSError("simulated post-publish snapshot write failure")
+
+        with mock.patch.object(
+            client_snapshot,
+            "_write_private_json",
+            side_effect=publish_then_fail,
+        ):
+            with self.assertRaisesRegex(
+                client_snapshot.SnapshotRebindReadbackError,
+                "write outcome is unknown",
+            ) as caught:
+                self._rebind(
+                    schema_by_tool=BLUE_SCHEMA_BY_TOOL,
+                    complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+                    source_evidence_time=self.now_unix,
+                    publication_request_id=prepared["request_id"],
+                    now_unix=5_000,
+                )
+        durable = caught.exception.durable_rebind
+        written = json.loads(self.snapshot_path.read_text(encoding="utf-8"))
+        self.assertTrue(durable["cutover_rebind"])
+        self.assertEqual(durable["receipt_sha256"], written["receipt_sha256"])
+        self.assertEqual(
+            durable["source_snapshot_receipt_sha256"], self.source["receipt_sha256"]
+        )
+        self.assertEqual(durable["target_repo_head"], HEAD_GREEN)
+
     def test_rebind_surfaces_durable_lineage_when_post_write_readback_fails(self) -> None:
         prepared = self._prepare_publication(
             complete_schema_sha256=BLUE_COMPLETE_SCHEMA
