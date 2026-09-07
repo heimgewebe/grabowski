@@ -5390,7 +5390,9 @@ def _repair_existing_assignment_lease_binding(
     acquisition: dict[str, Any],
     run_dir: Path,
     registry_binding: RegistryBinding,
-) -> dict[str, Any] | bool:
+    *,
+    return_binding: bool = False,
+) -> dict[str, Any] | bool | tuple[dict[str, Any], RegistryBinding]:
     lease_state = coordination.get("lease")
     lease_error = lease_state.get("error") if isinstance(lease_state, dict) else None
     error_code = lease_error.get("code") if isinstance(lease_error, dict) else None
@@ -5416,6 +5418,13 @@ def _repair_existing_assignment_lease_binding(
     repair_request = _existing_assignment_repair_effective_request(
         request, repair_binding
     )
+    operator._require_operator_mutation(
+        "bureau_mutation", path=repair_request["registry_root"]
+    )
+
+    def bound_result(value: dict[str, Any]) -> dict[str, Any] | tuple[dict[str, Any], RegistryBinding]:
+        return (value, repair_binding) if return_binding else value
+
     original_by_key = {
         item["resource_key"]: item
         for item in acquisition.get("leases", [])
@@ -5600,14 +5609,16 @@ def _repair_existing_assignment_lease_binding(
         receipt = _persist_lease_repair_receipt(
             run_dir, "lease-reacquire.json", receipt
         )
-        return _heartbeat_lease_repair(
-            intent,
-            repair_request,
-            acquisition,
-            repair_binding,
-            journal_identity,
-            external,
-            receipt,
+        return bound_result(
+            _heartbeat_lease_repair(
+                intent,
+                repair_request,
+                acquisition,
+                repair_binding,
+                journal_identity,
+                external,
+                receipt,
+            )
         )
 
     if error_code == "lease-resources-missing":
@@ -5727,14 +5738,16 @@ def _repair_existing_assignment_lease_binding(
         receipt = _persist_lease_repair_receipt(
             run_dir, "lease-reacquire.json", receipt
         )
-        return _heartbeat_lease_repair(
-            intent,
-            repair_request,
-            acquisition,
-            repair_binding,
-            journal_identity,
-            external,
-            receipt,
+        return bound_result(
+            _heartbeat_lease_repair(
+                intent,
+                repair_request,
+                acquisition,
+                repair_binding,
+                journal_identity,
+                external,
+                receipt,
+            )
         )
 
     if len(groups) != 1:
@@ -5802,14 +5815,16 @@ def _repair_existing_assignment_lease_binding(
     receipt["lease_generation_sha256"] = _sha256(lease_generation)
     receipt["receipt_sha256"] = _sha256(receipt)
     receipt = _persist_lease_repair_receipt(run_dir, "lease-rebind.json", receipt)
-    return _heartbeat_lease_repair(
-        intent,
-        repair_request,
-        acquisition,
-        repair_binding,
-        journal_identity,
-        external,
-        receipt,
+    return bound_result(
+        _heartbeat_lease_repair(
+            intent,
+            repair_request,
+            acquisition,
+            repair_binding,
+            journal_identity,
+            external,
+            receipt,
+        )
     )
 
 
@@ -5952,14 +5967,24 @@ def grabowski_bureau_pickup_execute(
         repair_obligation = _read_existing_assignment_lease_repair_obligation(
             run_dir, intent, normalized, acquisition
         )
+        result_registry_binding = registry_binding
         if repair_obligation is not None:
             receipt, journal_identity, external = repair_obligation
             activity_id = _lease_repair_activity_id(receipt["receipt_sha256"])
             repair_binding = _existing_assignment_repair_revision_binding(
                 registry_binding
             )
+            result_registry_binding = repair_binding
             repair_request = _existing_assignment_repair_effective_request(
                 normalized, repair_binding
+            )
+            _bound_bureau_call(
+                repair_binding,
+                lambda: _current_registry_revision_proof(
+                    repair_binding,
+                    intent,
+                    coordination_root=repair_request["coordination_root"],
+                ),
             )
             coordination = _read_lease_repair_activity_status(
                 intent, repair_request, repair_binding, activity_id
@@ -5996,22 +6021,27 @@ def grabowski_bureau_pickup_execute(
                     acquisition,
                     run_dir,
                     registry_binding,
+                    return_binding=True,
                 )
                 if not repaired:
                     raise
-                coordination = repaired
+                coordination, result_registry_binding = repaired
                 _validate_claim_readback(coordination, intent, acquisition)
         result = {
             "schema_version": SCHEMA_VERSION,
             "kind": "grabowski_bureau_pickup",
             "status": intent_payload["status"],
             "request_sha256": request_sha256,
-            "registry_binding_sha256": registry_binding["identity"]["binding_sha256"],
-            "registry_binding_kind": registry_binding["identity"]["kind"],
+            "registry_binding_sha256": result_registry_binding["identity"]["binding_sha256"],
+            "registry_binding_kind": result_registry_binding["identity"]["kind"],
             "registry_binding_source": (
-                "legacy-journal-explicit-registry-root"
-                if registry_binding["legacy"]
-                else "journal-bound"
+                "existing-assignment-repair-canonical-successor"
+                if result_registry_binding["identity"] != registry_binding["identity"]
+                else (
+                    "legacy-journal-explicit-registry-root"
+                    if registry_binding["legacy"]
+                    else "journal-bound"
+                )
             ),
             "run_id": intent["run_id"],
             "task_id": intent["task_id"],
