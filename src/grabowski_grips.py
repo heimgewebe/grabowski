@@ -928,9 +928,9 @@ GRIP_SPECS: dict[str, GripSpec] = {
     ),
     "pr-base-converge": GripSpec(
         name="pr-base-converge",
-        version="1.0",
+        version="1.1",
         summary=(
-            "Converge one exact open same-repository PR onto the exact current base SHA by updating its existing head branch."
+            "Converge one exact open same-repository PR by merging only the bound base/head commits and CAS-updating the existing PR head branch."
         ),
         effect=MUTATING,
         required_parameters=(
@@ -943,6 +943,7 @@ GRIP_SPECS: dict[str, GripSpec] = {
         acceptance_ids=(
             "pr-binding-exact",
             "base-identity-exact",
+            "base-content-bound",
             "head-cas-bound",
             "same-pr-preserved",
             "prior-head-contained-after",
@@ -1088,7 +1089,7 @@ GRIP_SURFACE_RECOVERY_PATHS = {
 GRIP_RECOVERY_PATHS_BY_NAME = {
     "pr-base-converge": (
         "read back the same PR number, exact base SHA and current head before any retry; "
-        "if the provider accepted an update but the resulting head is not yet proven, never replay the update or create a successor PR from ambiguity alone"
+        "the exact-base merge plus exact-old-head Git CAS reconciles every non-successful push through remote-ref readback, and an outcome_unknown result must never be replayed or converted into a successor PR without fresh authoritative readback"
     ),
     "saga-run": (
         "inspect the nested mechanic-loop receipts; never invoke Captain from the saga runner. "
@@ -1164,7 +1165,9 @@ GRIP_CONDITIONAL_PRECONDITIONS = {
     "pr-base-converge": (
         "the PR must still be OPEN, same-repository, on the requested base branch and exact expected head/base SHA before dispatch",
         "the head branch must not be main/master; existing review, saga and Captain evidence is intentionally invalidated by any resulting head change and must be renewed",
-        "GitHub update-branch is dispatched with expected_head_sha as the provider CAS; a changed resulting head must contain both the exact prior head and exact expected base, while an ambiguous accepted outcome requires exact same-PR readback before any retry",
+        "the update is constructed only from the exact expected head and exact expected base, then the existing head branch alone is CAS-published with an exact-old-head lease; a newer base can never be substituted into the merge commit",
+        "the live base is read before and after publication; if it advances during the head update the applied head remains content-bound to the old exact base and the grip requires a fresh same-PR convergence instead of claiming currentness",
+        "a non-successful or exceptional push response is reconciled by remote branch readback before return; outcome_unknown forbids an unchanged retry",
         "this grip never closes the PR, creates a successor PR, merges or grants Captain authority",
     ),
     "agent-execution-happy-path": (
@@ -6243,7 +6246,7 @@ def _run_pr_base_converge(
     runner: CommandRunner,
     github_runner: GithubRunner,
 ) -> dict[str, Any]:
-    del spec, runner
+    del spec
     repo = _repo_path(parameters)
     raw_pr_number = parameters.get("pr_number")
     if (
@@ -6404,7 +6407,7 @@ def _run_pr_base_converge(
             raise GripPreflightError(
                 "PR head drifted during no-op base convergence verification"
             )
-        _check(receipt, "update_branch_cas", "skip", "head already contains exact base")
+        _check(receipt, "exact_base_head_cas", "skip", "head already contains exact base; no head mutation required")
         _check(receipt, "same_pr_preserved", "pass", str(pr_number))
         _check(receipt, "head_readback", "pass", expected_head)
         _check(receipt, "base_contained_after", "pass", ancestry_before)
@@ -6419,24 +6422,59 @@ def _run_pr_base_converge(
             "pr": current,
         }
     _check(receipt, "base_contained_before", "warn", ancestry_before)
-    _github(
-        repo,
-        github_runner,
-        [
-            "api",
-            "--method",
-            "PUT",
-            f"repos/{{owner}}/{{repo}}/pulls/{pr_number}/update-branch",
-            "-f",
-            f"expected_head_sha={expected_head}",
-        ],
-    )
+
+    def exact_git_runner(
+        root: Path, args: list[str], *, timeout: int = 60
+    ) -> dict[str, Any]:
+        del timeout
+        return runner(root, args)
+
+    try:
+        cas_result, cas_evidence = (
+            grabowski_merge_guard._exact_base_content_git_head_cas_update_pr_head(
+                repo,
+                base_branch=base,
+                base_sha=expected_base_sha,
+                head_sha=expected_head,
+                head_branch=head_branch,
+                pr_number=pr_number,
+                github_runner=github_runner,
+                git_runner=exact_git_runner,
+            )
+        )
+    except RuntimeError as exc:
+        _check(receipt, "exact_base_head_cas", "fail", str(exc))
+        raise GripPreflightError(
+            f"exact-base PR-head convergence preflight failed: {exc}"
+        ) from exc
+
+    cas_status = str(cas_evidence.get("status") or "")
+    cas_evidence_sha256 = sha256_json(cas_evidence)
+    if int(cas_result.get("returncode", 1)) != 0:
+        _check(
+            receipt,
+            "exact_base_head_cas",
+            "fail",
+            f"status={cas_status}; evidence_sha256={cas_evidence_sha256}",
+        )
+        if cas_status == "not_applied_proven":
+            raise GripActionError(
+                "exact-base PR-head CAS was proven not applied; fresh PR/base/head preflight is required before any retry"
+            )
+        raise GripActionError(
+            "exact-base PR-head CAS outcome is unknown after authoritative readback; do not retry unchanged or create a successor PR"
+        )
     _check(
         receipt,
-        "update_branch_cas",
+        "exact_base_head_cas",
         "pass",
-        f"accepted for expected_head={expected_head}",
+        f"status={cas_status}; merge_sha={cas_evidence.get('merge_sha')}; evidence_sha256={cas_evidence_sha256}",
     )
+    new_head = str(cas_evidence.get("merge_sha") or "").lower()
+    if len(new_head) != 40 or any(char not in "0123456789abcdef" for char in new_head):
+        _check(receipt, "head_readback", "fail", f"head={new_head!r}")
+        raise GripActionError("exact-base PR-head CAS returned an invalid merge SHA")
+
     last = before
     for attempt in range(PR_BASE_CONVERGE_VERIFY_ATTEMPTS):
         if attempt:
@@ -6455,7 +6493,7 @@ def _run_pr_base_converge(
                 "fail",
                 f"number={current.get('number')} state={current.get('state')}",
             )
-            raise GripActionError("same PR was not preserved after update-branch")
+            raise GripActionError("same PR was not preserved after exact head CAS")
         if (
             current.get("isCrossRepository") is not False
             or current.get("headRefName") != head_branch
@@ -6467,7 +6505,7 @@ def _run_pr_base_converge(
                 "repository/head branch identity changed",
             )
             raise GripActionError(
-                "same PR head branch identity changed after update-branch"
+                "same PR head branch identity changed after exact head CAS"
             )
         if (
             current.get("baseRefName") != base
@@ -6479,17 +6517,22 @@ def _run_pr_base_converge(
                 "fail",
                 f"branch={current.get('baseRefName')} sha={current.get('baseRefOid')}",
             )
-            raise GripActionError("PR base changed while update-branch was in flight")
-        new_head = str(current.get("headRefOid", "")).lower()
-        if new_head == expected_head:
-            continue
-        if len(new_head) != 40 or any(
-            char not in "0123456789abcdef" for char in new_head
-        ):
-            _check(
-                receipt, "head_readback", "fail", f"head={current.get('headRefOid')!r}"
+            raise GripActionError(
+                "PR base advanced after exact-base head CAS; the applied head contains only the bound base and requires fresh same-PR convergence"
             )
-            raise GripActionError("updated PR head is not a 40 character Git SHA")
+        observed_head = str(current.get("headRefOid", "")).lower()
+        if observed_head == expected_head:
+            continue
+        if observed_head != new_head:
+            _check(
+                receipt,
+                "head_readback",
+                "fail",
+                f"actual={observed_head} expected={new_head}",
+            )
+            raise GripActionError(
+                "PR head changed to an unbound commit after exact-base head CAS"
+            )
         base_ancestry_after = compare_status(expected_base_sha, new_head)
         if base_ancestry_after not in {"ahead", "identical"}:
             _check(receipt, "base_contained_after", "fail", base_ancestry_after)
@@ -6509,52 +6552,20 @@ def _run_pr_base_converge(
                 "updated PR head does not preserve the exact prior PR head lineage"
             )
         final = read_pr()
-        if final.get("number") != pr_number or final.get("state") != "OPEN":
-            _check(
-                receipt,
-                "same_pr_preserved",
-                "fail",
-                f"number={final.get('number')} state={final.get('state')}",
-            )
-            raise GripActionError(
-                "PR identity drifted after ancestry verification"
-            )
         if (
-            final.get("isCrossRepository") is not False
+            final.get("number") != pr_number
+            or final.get("state") != "OPEN"
+            or final.get("isCrossRepository") is not False
             or final.get("headRefName") != head_branch
-        ):
-            _check(
-                receipt,
-                "same_pr_preserved",
-                "fail",
-                "repository/head branch identity changed after ancestry verification",
-            )
-            raise GripActionError(
-                "PR head branch identity drifted after ancestry verification"
-            )
-        if (
-            final.get("baseRefName") != base
+            or final.get("baseRefName") != base
             or str(final.get("baseRefOid", "")).lower() != expected_base_sha
+            or str(final.get("headRefOid", "")).lower() != new_head
         ):
-            _check(
-                receipt,
-                "base_identity_after",
-                "fail",
-                f"branch={final.get('baseRefName')} sha={final.get('baseRefOid')}",
-            )
+            _check(receipt, "final_pr_binding", "fail", "live PR binding drift")
             raise GripActionError(
-                "PR base drifted after ancestry verification"
+                "PR identity/base/head drifted after exact-base ancestry verification"
             )
-        if str(final.get("headRefOid", "")).lower() != new_head:
-            _check(
-                receipt,
-                "head_readback",
-                "fail",
-                f"actual={final.get('headRefOid')} expected={new_head}",
-            )
-            raise GripActionError(
-                "PR head drifted after ancestry verification"
-            )
+        _check(receipt, "final_pr_binding", "pass", f"pr={pr_number}; head={new_head}")
         _check(receipt, "same_pr_preserved", "pass", str(pr_number))
         _check(receipt, "head_readback", "pass", new_head)
         _check(
@@ -6571,11 +6582,14 @@ def _run_pr_base_converge(
             "old_head": expected_head,
             "new_head": new_head,
             "head_branch": head_branch,
+            "cas_status": cas_status,
+            "cas_evidence_sha256": cas_evidence_sha256,
             "pr": final,
         }
+
     _check(receipt, "head_readback", "fail", f"still={last.get('headRefOid')}")
     raise GripActionError(
-        "GitHub accepted update-branch but the resulting same-PR head is not yet proven; exact readback is required before any retry"
+        "exact-base Git CAS was proven applied to the remote head branch but GitHub PR metadata has not converged; exact same-PR readback is required before any retry"
     )
 
 

@@ -1607,6 +1607,313 @@ def _exact_base_git_cas_commit_identity(
     return {"name": login, "email": email}, evidence, []
 
 
+def _exact_base_content_git_head_cas_update_pr_head(
+    repo_path: Path,
+    *,
+    base_branch: str,
+    base_sha: str,
+    head_sha: str,
+    head_branch: str,
+    pr_number: int,
+    github_runner: Any,
+    git_runner: Any = _merge_guard_git_command,
+    on_dispatch: Any | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Merge one exact base commit into one exact PR head and CAS-publish that head.
+
+    The merge commit is constructed only from the caller-bound base/head commits,
+    so a later base advance can never be substituted into the published content.
+    The existing head branch is updated with an exact old-head force-with-lease.
+    Base is read immediately before and after publication; a concurrent base advance
+    therefore yields a known stale-base convergence that callers must renew, not an
+    unbound merge.  Any non-successful or exceptional push response is reconciled
+    through authoritative remote-ref readback before retry safety is classified.
+    """
+
+    if _SHA40_RE.fullmatch(base_sha) is None or _SHA40_RE.fullmatch(head_sha) is None:
+        raise RuntimeError("exact PR-head convergence requires canonical commit SHAs")
+    if type(pr_number) is not int or pr_number <= 0:
+        raise RuntimeError("exact PR-head convergence pull request number is invalid")
+    if not isinstance(base_branch, str) or not base_branch.strip():
+        raise RuntimeError("exact PR-head convergence base branch is invalid")
+    if not isinstance(head_branch, str) or not head_branch.strip():
+        raise RuntimeError("exact PR-head convergence head branch is invalid")
+    if head_branch == base_branch:
+        raise RuntimeError(
+            "exact PR-head convergence requires distinct base and head branches"
+        )
+
+    base_ref = f"refs/heads/{base_branch}"
+    head_ref = f"refs/heads/{head_branch}"
+    pull_ref = f"refs/pull/{pr_number}/head"
+    for candidate_ref, label in ((base_ref, "base"), (head_ref, "head")):
+        ref_check = _merge_guard_result_info(
+            git_runner(repo_path, ["check-ref-format", candidate_ref])
+        )
+        if ref_check["returncode"] != 0:
+            raise RuntimeError(f"exact PR-head convergence {label} ref is invalid")
+
+    remote = _merge_guard_result_info(
+        git_runner(repo_path, ["remote", "get-url", "origin"])
+    )
+    if remote["returncode"] != 0 or not remote["stdout"].strip():
+        raise RuntimeError("exact PR-head convergence cannot resolve origin")
+    remote_url = remote["stdout"].strip()
+    try:
+        repo_slug = _merge_guard_github_repository_identity(remote_url)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "exact PR-head convergence origin is not canonical GitHub"
+        ) from exc
+    if not (
+        remote_url.startswith("git@github.com:")
+        or remote_url.startswith("ssh://git@github.com/")
+    ):
+        raise RuntimeError(
+            "exact PR-head convergence requires canonical SSH GitHub origin"
+        )
+
+    evidence: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "grabowski_exact_base_content_git_head_cas_pr_head_update",
+        "repository": repo_slug,
+        "base_branch": base_branch,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "head_branch": head_branch,
+        "pull_request": pr_number,
+        "remote_sha256": hashlib.sha256(remote_url.encode("utf-8")).hexdigest(),
+        "protected_base_mutation": False,
+        "base_content_bound": True,
+        "base_live_ref_cas_bound": False,
+        "head_branch_delete": False,
+        "head_update_mode": "force_with_exact_old_lease",
+        "head_ref_cas_bound": True,
+        "explicit_effects": ["head-branch-update"],
+        "stages": [],
+    }
+    commit_identity, identity_evidence, identity_errors = (
+        _exact_base_git_cas_commit_identity(repo_path, github_runner)
+    )
+    evidence["commit_identity"] = identity_evidence
+    if identity_errors or commit_identity is None:
+        raise RuntimeError(
+            "exact PR-head convergence cannot resolve provider-compatible GitHub commit identity"
+        )
+
+    def run(
+        stage: str, root: Path, args: list[str], *, timeout: int = 60
+    ) -> dict[str, Any]:
+        try:
+            raw = git_runner(root, args, timeout=timeout)
+        except Exception as exc:  # outcome ambiguity must survive as evidence
+            evidence["stages"].append(
+                {
+                    "stage": stage,
+                    "returncode": None,
+                    "exception_type": type(exc).__name__,
+                    "stdout_sha256": hashlib.sha256(b"").hexdigest(),
+                    "stderr_sha256": hashlib.sha256(b"").hexdigest(),
+                }
+            )
+            return {
+                "returncode": 125,
+                "stdout": "",
+                "stderr": "",
+                "exception_type": type(exc).__name__,
+            }
+        info = _merge_guard_result_info(raw)
+        evidence["stages"].append(
+            {
+                "stage": stage,
+                "returncode": info["returncode"],
+                "stdout_sha256": hashlib.sha256(
+                    info["stdout"].encode("utf-8")
+                ).hexdigest(),
+                "stderr_sha256": hashlib.sha256(
+                    info["stderr"].encode("utf-8")
+                ).hexdigest(),
+            }
+        )
+        return info
+
+    def remote_ref(
+        stage: str, root: Path, ref_name: str
+    ) -> tuple[str | None, dict[str, Any]]:
+        info = run(stage, root, ["ls-remote", "origin", ref_name])
+        fields = info["stdout"].strip().split() if info["returncode"] == 0 else []
+        sha = (
+            fields[0]
+            if len(fields) == 2
+            and fields[1] == ref_name
+            and _SHA40_RE.fullmatch(fields[0]) is not None
+            else None
+        )
+        return sha, info
+
+    temp_root = Path(tempfile.mkdtemp(prefix="grabowski-pr-head-converge-"))
+    try:
+        for stage, args in (
+            ("init", ["init", "--quiet"]),
+            ("disable-hooks", ["config", "core.hooksPath", "/dev/null"]),
+            ("remote-add", ["remote", "add", "origin", remote_url]),
+            (
+                "fetch-bound-refs",
+                [
+                    "fetch",
+                    "--quiet",
+                    "--no-tags",
+                    "origin",
+                    f"{base_ref}:refs/converge/base",
+                    f"{head_ref}:refs/converge/head-branch",
+                    f"{pull_ref}:refs/converge/pr-head",
+                ],
+            ),
+        ):
+            info = run(stage, temp_root, args)
+            if info["returncode"] != 0:
+                raise RuntimeError(f"exact PR-head convergence {stage} failed")
+
+        for stage, ref_name, expected in (
+            ("verify-fetched-base", "refs/converge/base^{commit}", base_sha),
+            (
+                "verify-fetched-head-branch",
+                "refs/converge/head-branch^{commit}",
+                head_sha,
+            ),
+            ("verify-fetched-pr-head", "refs/converge/pr-head^{commit}", head_sha),
+        ):
+            info = run(stage, temp_root, ["rev-parse", ref_name])
+            if info["returncode"] != 0 or info["stdout"].strip() != expected:
+                raise RuntimeError(f"exact PR-head convergence {stage} drift")
+
+        checkout = run(
+            "checkout-head",
+            temp_root,
+            ["checkout", "--quiet", "--detach", "refs/converge/pr-head"],
+        )
+        if checkout["returncode"] != 0:
+            raise RuntimeError("exact PR-head convergence checkout failed")
+        merged = run(
+            "create-merge",
+            temp_root,
+            [
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                f"user.name={commit_identity['name']}",
+                "-c",
+                f"user.email={commit_identity['email']}",
+                "merge",
+                "--no-ff",
+                "-m",
+                f"Merge exact base {base_sha[:12]} into PR #{pr_number}",
+                "refs/converge/base",
+            ],
+        )
+        if merged["returncode"] != 0:
+            raise RuntimeError("exact PR-head convergence merge construction failed")
+        parents = run(
+            "verify-merge-parents",
+            temp_root,
+            ["rev-list", "--parents", "-n", "1", "HEAD"],
+        )
+        parent_fields = (
+            parents["stdout"].strip().split() if parents["returncode"] == 0 else []
+        )
+        if len(parent_fields) != 3 or parent_fields[1:] != [head_sha, base_sha]:
+            raise RuntimeError("exact PR-head convergence parent binding failed")
+        merge_sha = parent_fields[0]
+        if _SHA40_RE.fullmatch(merge_sha) is None:
+            raise RuntimeError(
+                "exact PR-head convergence merge commit identity invalid"
+            )
+        evidence["merge_sha"] = merge_sha
+        merge_tree = run("verify-merge-tree", temp_root, ["rev-parse", "HEAD^{tree}"])
+        merge_tree_sha = (
+            merge_tree["stdout"].strip() if merge_tree["returncode"] == 0 else ""
+        )
+        if _SHA40_RE.fullmatch(merge_tree_sha) is None:
+            raise RuntimeError("exact PR-head convergence merge tree identity invalid")
+        evidence["merge_tree_sha"] = merge_tree_sha
+
+        base_before, _ = remote_ref("remote-base-pre-push", temp_root, base_ref)
+        head_before, _ = remote_ref("remote-head-pre-push", temp_root, head_ref)
+        pr_head_before, _ = remote_ref("remote-pr-head-pre-push", temp_root, pull_ref)
+        if base_before != base_sha:
+            raise RuntimeError("exact PR-head convergence base changed before dispatch")
+        if head_before != head_sha:
+            raise RuntimeError(
+                "exact PR-head convergence head branch changed before dispatch"
+            )
+        if pr_head_before != head_sha:
+            raise RuntimeError(
+                "exact PR-head convergence PR head changed before dispatch"
+            )
+
+        if on_dispatch is not None:
+            on_dispatch()
+        push = run(
+            "exact-head-cas-push",
+            temp_root,
+            [
+                "push",
+                "--porcelain",
+                f"--force-with-lease={head_ref}:{head_sha}",
+                "origin",
+                f"HEAD:{head_ref}",
+            ],
+            timeout=120,
+        )
+
+        base_after, _ = remote_ref("remote-base-post-push", temp_root, base_ref)
+        head_after, _ = remote_ref("remote-head-post-push", temp_root, head_ref)
+        pr_head_after, _ = remote_ref("remote-pr-head-post-push", temp_root, pull_ref)
+        evidence["remote_readback"] = {
+            "base_sha": base_after,
+            "head_sha": head_after,
+            "pr_head_sha": pr_head_after,
+        }
+        evidence["push_returncode"] = push["returncode"]
+        if "exception_type" in push:
+            evidence["push_exception_type"] = push["exception_type"]
+
+        if head_after == merge_sha:
+            evidence["effect_proven"] = True
+            evidence["effect_not_applied_proven"] = False
+            evidence["status"] = (
+                "pushed_and_read_back"
+                if push["returncode"] == 0
+                else "push_response_ambiguous_recovered_applied"
+            )
+            return {
+                "returncode": 0,
+                "stdout": "updated PR head via exact-base Git head CAS\n",
+                "stderr": "",
+            }, evidence
+
+        if head_after == head_sha and push["returncode"] != 0:
+            evidence["effect_proven"] = False
+            evidence["effect_not_applied_proven"] = True
+            evidence["status"] = "not_applied_proven"
+            return {
+                "returncode": 1,
+                "stdout": "",
+                "stderr": "exact-base head CAS was not applied",
+            }, evidence
+
+        evidence["effect_proven"] = False
+        evidence["effect_not_applied_proven"] = False
+        evidence["status"] = "outcome_unknown"
+        return {
+            "returncode": 2,
+            "stdout": "",
+            "stderr": "exact-base head CAS outcome is unknown after readback",
+        }, evidence
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
 def _exact_base_git_cas_merge(
     repo_path: Path,
     *,
