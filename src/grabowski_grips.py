@@ -56,6 +56,34 @@ WORKTREE_HYGIENE_CONFIRMATION = "reconcile-terminal-worktrees"
 WORKTREE_HYGIENE_MAX_ACTIONS = 8
 WORKTREE_HYGIENE_ARCHIVE_HANDOFF_SECONDS = 60
 WORKTREE_HYGIENE_MAX_CANDIDATES = 32
+REPOSKOP_RETIREMENT_SURFACE_BY_CONNECTOR_ID = {
+    "primary": "grabowski",
+    "kleiner-maulwurf": "der_kleine_maulwurf",
+}
+REPOSKOP_RETIREMENT_PUBLIC_FIELDS = frozenset(
+    {
+        "request_id",
+        "observation_id",
+        "query",
+        "matched_tool_names",
+        "source_reference",
+    }
+)
+REPOSKOP_RETIREMENT_SERVER_BINDING_FIELDS = frozenset(
+    {
+        "schema_version",
+        "connector_id",
+        "surface_id",
+        "client_scope_kind",
+        "client_scope_sha256",
+        "state_scope_sha256",
+        "runtime_binding_sha256",
+        "release_id",
+        "repo_head",
+        "registered_names_sha256",
+        "agent_instructions_sha256",
+    }
+)
 
 SITUATION_ACCEPTANCE_IDS = (
     "situation-readonly",
@@ -531,6 +559,32 @@ GRIP_SPECS: dict[str, GripSpec] = {
         ),
         runner="connector_snapshot_bind",
     ),
+    "reposkop-retirement-surface-observe": GripSpec(
+        name="reposkop-retirement-surface-observe",
+        version="1.0",
+        summary=(
+            "Persist one request-, principal-, state-scope- and runtime-bound ChatGPT "
+            "Reposkop tool-discovery observation without promoting generic platform convergence."
+        ),
+        effect=MUTATING,
+        required_parameters=(
+            "request_id",
+            "observation_id",
+            "query",
+            "matched_tool_names",
+            "source_reference",
+        ),
+        acceptance_ids=(
+            "server-principal-bound",
+            "state-store-bound",
+            "runtime-bound",
+            "request-contract-bound",
+            "surface-query-complete",
+            "generic-publication-not-promoted",
+            "private-retirement-evidence-persisted",
+        ),
+        runner="reposkop_retirement_surface_observe",
+    ),
     "n8n-workflow-edge-verify": GripSpec(
         name="n8n-workflow-edge-verify",
         version="1.0",
@@ -912,6 +966,7 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
         "browser-semantic-observe",
         "browser-semantic-act",
         "connector-snapshot-bind",
+        "reposkop-retirement-surface-observe",
         "n8n-workflow-edge-verify",
         "n8n-workflow-edge-apply",
         "forrest-server-exit-apply",
@@ -967,6 +1022,9 @@ GRIP_SURFACE_TARGETS = {
     "browser-semantic-observe": "one canonical semantic browser observation",
     "browser-semantic-act": "one snapshot-bound canonical semantic browser action",
     "connector-snapshot-bind": "one connector client snapshot receipt",
+    "reposkop-retirement-surface-observe": (
+        "one ChatGPT Reposkop retirement observation bound to server connector identity"
+    ),
     "n8n-workflow-edge-verify": "one fixed-profile n8n workflow edge readback",
     "n8n-workflow-edge-apply": "one precondition-bound fixed-profile n8n single-edge mutation",
     "transport-roundtrip": "one client-scope and runtime-bound transport roundtrip",
@@ -1110,6 +1168,12 @@ GRIP_CONDITIONAL_PRECONDITIONS = {
         "convergence_required=true requires reason=systemic plus the exact passed convergence-assess grip result with a v2 terminally_closed assessment; its receipt, output, parameters, request file, protocol head, assessment id and closure_id=operator-obligation:<obligation_id> are revalidated before the create-only close",
         "when system_convergence_plan is supplied it is recomputed by the canonical convergence module, not by obligation code; systemic plan and assessment protocol heads must match",
         "blocked and delegated outcomes may not carry closure_classification",
+    ),
+    "reposkop-retirement-surface-observe": (
+        "surface_id is never caller-supplied; the MCP wrapper derives it from the enrolled connector capability",
+        "the server injects connector scope, per-user client-snapshot state scope and current runtime binding",
+        "query must be exactly reposkop and every returned matching tool name must be supplied; any non-empty match set blocks retirement",
+        "this grip never establishes or mutates generic platform_converged state",
     ),
     "n8n-workflow-edge-verify": (
         "provider_profile must be a server-known fixed target; expected_state must be isolated or final; "
@@ -3715,6 +3779,144 @@ def _run_connector_snapshot_bind(
         output["decision"] = "blocked"
         output["blocked_reasons"] = ["connector_snapshot_mismatch"]
     return output
+
+
+def _reposkop_retirement_server_binding(parameters: dict[str, Any]) -> dict[str, Any]:
+    allowed = set(REPOSKOP_RETIREMENT_PUBLIC_FIELDS) | {"_server_retirement_binding"}
+    unknown = sorted(set(parameters) - allowed)
+    if unknown:
+        raise GripPreflightError(
+            "unknown retirement surface grip field(s): " + ", ".join(unknown)
+        )
+    binding = parameters.get("_server_retirement_binding")
+    if not isinstance(binding, dict) or set(binding) != REPOSKOP_RETIREMENT_SERVER_BINDING_FIELDS:
+        raise GripPreflightError("server retirement binding is unavailable or malformed")
+    if binding.get("schema_version") != 1:
+        raise GripPreflightError("server retirement binding schema is unsupported")
+    connector_id = binding.get("connector_id")
+    surface_id = binding.get("surface_id")
+    expected_surface = REPOSKOP_RETIREMENT_SURFACE_BY_CONNECTOR_ID.get(connector_id)
+    if expected_surface is None or surface_id != expected_surface:
+        raise GripPreflightError("server retirement surface/principal binding mismatch")
+    if binding.get("client_scope_kind") != "connector_capability":
+        raise GripPreflightError("server retirement client scope kind is invalid")
+    for field in (
+        "client_scope_sha256",
+        "state_scope_sha256",
+        "runtime_binding_sha256",
+        "registered_names_sha256",
+        "agent_instructions_sha256",
+    ):
+        if not _is_sha256_hex(binding.get(field)):
+            raise GripPreflightError(f"server retirement {field} is invalid")
+    if _normalize_40_sha(binding.get("repo_head")) is None:
+        raise GripPreflightError("server retirement repo head is invalid")
+    release_id = binding.get("release_id")
+    if (
+        not isinstance(release_id, str)
+        or not release_id
+        or release_id.strip() != release_id
+        or len(release_id.encode("utf-8")) > 512
+    ):
+        raise GripPreflightError("server retirement release id is invalid")
+    return dict(binding)
+
+
+def _run_reposkop_retirement_surface_observe(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    binding = _reposkop_retirement_server_binding(parameters)
+    _check(
+        receipt,
+        "server-principal-bound",
+        "pass",
+        f"{binding['connector_id']}:{binding['client_scope_sha256']}",
+    )
+    _check(receipt, "state-store-bound", "pass", str(binding["state_scope_sha256"]))
+    _check(receipt, "runtime-bound", "pass", str(binding["runtime_binding_sha256"]))
+    try:
+        output = grabowski_client_snapshot.record_platform_retirement_surface_observation(
+            request_id=parameters["request_id"],
+            surface_id=str(binding["surface_id"]),
+            observation_id=parameters["observation_id"],
+            query=parameters["query"],
+            matched_tool_names=parameters["matched_tool_names"],
+            source_reference=parameters["source_reference"],
+            server_binding=binding,
+        )
+    except grabowski_client_snapshot.ClientSnapshotError as exc:
+        _check(receipt, "request-contract-bound", "fail", str(exc))
+        raise GripPreflightError(str(exc)) from exc
+    except OSError as exc:
+        _check(
+            receipt,
+            "private-retirement-evidence-persisted",
+            "fail",
+            type(exc).__name__,
+        )
+        raise GripActionError("retirement surface evidence persistence failed") from exc
+
+    state = output.get("state")
+    request_matches = output.get("request_id") == parameters["request_id"]
+    surface_matches = output.get("surface_id") == binding["surface_id"]
+    _check(
+        receipt,
+        "request-contract-bound",
+        "pass" if request_matches and surface_matches else "fail",
+        str(output.get("observation_sha256") or "missing"),
+    )
+    raw_matches = parameters.get("matched_tool_names")
+    if not isinstance(raw_matches, list):
+        raise GripPreflightError("matched_tool_names must be a list")
+    expected_state = (
+        "retirement_surface_blocked"
+        if raw_matches
+        else "retirement_surface_converged"
+    )
+    state_matches_query = state == expected_state
+    _check(
+        receipt,
+        "surface-query-complete",
+        "pass" if state_matches_query else "fail",
+        f"matched={len(raw_matches)} state={state}",
+    )
+    nonclaims = output.get("does_not_establish")
+    generic_not_promoted = (
+        isinstance(nonclaims, list)
+        and "platform_converged" in nonclaims
+        and output.get("generic_platform_publication_state") != "platform_converged"
+    )
+    _check(
+        receipt,
+        "generic-publication-not-promoted",
+        "pass" if generic_not_promoted else "fail",
+        str(output.get("generic_platform_publication_state") or "missing"),
+    )
+    observation_sha = output.get("observation_sha256")
+    persisted = _is_sha256_hex(observation_sha)
+    if state == "retirement_surface_converged":
+        persisted = persisted and _is_sha256_hex(output.get("resolution_sha256"))
+    _check(
+        receipt,
+        "private-retirement-evidence-persisted",
+        "pass" if persisted else "fail",
+        str(observation_sha or "missing"),
+    )
+    if not all((request_matches, surface_matches, state_matches_query, generic_not_promoted, persisted)):
+        raise GripActionError("retirement surface observation violated its fail-closed grip contract")
+    result = {
+        **output,
+        "server_binding_sha256": sha256_json(binding),
+    }
+    if state == "retirement_surface_blocked":
+        result["receipt_status"] = "blocked"
+        result["decision"] = "blocked"
+        result["blocked_reasons"] = ["reposkop_tool_discovery_match_present"]
+    return result
 
 
 def _n8n_provider_parameters(
@@ -14224,6 +14426,7 @@ _RUNNERS = {
     "browser_semantic_observe": _run_browser_semantic_observe,
     "browser_semantic_act": _run_browser_semantic_act,
     "connector_snapshot_bind": _run_connector_snapshot_bind,
+    "reposkop_retirement_surface_observe": _run_reposkop_retirement_surface_observe,
     "n8n_workflow_edge_verify": _run_n8n_workflow_edge_verify,
     "n8n_workflow_edge_apply": _run_n8n_workflow_edge_apply,
     "forrest_server_exit_apply": _run_forrest_server_exit_apply,
