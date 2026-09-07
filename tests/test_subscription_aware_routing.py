@@ -92,6 +92,29 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
         self.assertEqual(models["gemini-3.6-flash"]["availability"], "live-listed")
         self.assertEqual(models["claude-opus-4.8"]["availability"], "compatibility-only-superseded")
 
+    def test_astra_is_attested_frontier_contrast_without_promotion(self) -> None:
+        model = self.catalog["models"]["gpt-6-astra"]
+        self.assertEqual(model["availability"], "live-verified-via-chatgpt-pro")
+        self.assertEqual(model["provider_family"], "openai")
+        self.assertEqual(model["quality_prior_class"], "S")
+        self.assertIn("gpt-6-astra", self.catalog["policy"]["quality_classes"]["S"]["models"])
+
+        routes = [route for route in self.catalog["routes"] if route.get("model") == "gpt-6-astra"]
+        self.assertEqual({route["id"] for route in routes}, {"codex-astra-high", "codex-astra-xhigh"})
+        self.assertEqual({route["effort"] for route in routes}, {"high", "xhigh"})
+        self.assertTrue(all(route.get("contrast_only") is True for route in routes))
+        self.assertEqual(self.routes["codex-astra-high"]["quota_pools"], ["openai-agentic"])
+        self.assertTrue(self.routes["codex-astra-xhigh"]["escalation_only"])
+        self.assertGreater(
+            self.routes["codex-astra-high"]["burn_weight"],
+            self.routes["codex-sol-high"]["burn_weight"],
+        )
+
+        frontier = self.catalog["policy"]["frontier_model_policy"]
+        self.assertEqual(frontier["escalation_route"], "codex-sol-xhigh")
+        self.assertEqual(frontier["top_contrast_routes"], ["codex-sol-high"])
+        self.assertNotIn("codex-astra-high", frontier["upper_review_or_contrast_routes"])
+
     def test_fable_is_never_treated_as_claude_pro_baseline(self) -> None:
         self.assertEqual(
             self.catalog["models"]["claude-fable-5"]["availability"],

@@ -402,6 +402,26 @@
       },
       "quality_prior_class": "S"
     },
+    "gpt-6-astra": {
+      "availability": "live-verified-via-chatgpt-pro",
+      "base_quality_rank": 100,
+      "evidence": "codex-cli-0.153.4-chatgpt-login-gpt-6-astra-low-smoke-2026-09-07",
+      "family": "openai-gpt-6",
+      "identity_kind": "model",
+      "name": "GPT-6 Astra",
+      "provider_family": "openai",
+      "quality": {
+        "architecture": 10,
+        "autonomy": 9,
+        "coding": 10,
+        "context": 10,
+        "debugging": 10,
+        "reliability": 10,
+        "review": 10,
+        "speed": 5
+      },
+      "quality_prior_class": "S"
+    },
     "gpt-5.6-terra": {
       "availability": "live",
       "base_quality_rank": 86,
@@ -660,7 +680,7 @@
     "provider-parity-objective",
     "Subscription inclusion never establishes permission to consume purchased credits or API pay-as-you-go."
   ],
-  "observed_at": "2026-07-29",
+  "observed_at": "2026-09-07",
   "policy": {
     "adaptive_learning": {
       "access_probes_are_not_outcomes": true,
@@ -819,6 +839,7 @@
         "description": "top models and deliberate escalation profiles",
         "models": [
           "gpt-5.6-sol",
+          "gpt-6-astra",
           "claude-fable-5"
         ]
       }
@@ -1554,6 +1575,95 @@
       "min_duration_minutes": 30,
       "model": "gpt-5.6-sol",
       "priority": 108,
+      "quality_class": "S",
+      "quota_pools": [
+        "openai-agentic"
+      ],
+      "risk_affinity": {
+        "high-risk": 10,
+        "prior-attempt-failed": 12,
+        "security-sensitive": 14
+      },
+      "task_affinity": {
+        "architecture": 16,
+        "deep-debug": 20
+      },
+      "task_classes": [
+        "architecture",
+        "deep-debug"
+      ],
+      "tier": "critical",
+      "contrast_only": true
+    },
+    {
+      "argv_prefix": [
+        "codex",
+        "--model",
+        "gpt-6-astra",
+        "-c",
+        "model_reasoning_effort=\"high\""
+      ],
+      "base_quality_rank": 100,
+      "burn_weight": 2.5,
+      "delegation_overhead_minutes": 6,
+      "effort": "high",
+      "enabled": true,
+      "harness": "codex",
+      "harness_quality": 10,
+      "id": "codex-astra-high",
+      "independence_group": "openai-gpt-6",
+      "min_duration_minutes": 20,
+      "model": "gpt-6-astra",
+      "priority": 107,
+      "quality_class": "S",
+      "quota_pools": [
+        "openai-agentic"
+      ],
+      "risk_affinity": {
+        "security-sensitive": 6,
+        "terminal-heavy": 8,
+        "tool-heavy": 8
+      },
+      "task_affinity": {
+        "architecture": 16,
+        "complex-patch": 18,
+        "deep-debug": 18,
+        "long-agent": 18,
+        "migration": 22,
+        "refactor": 8
+      },
+      "task_classes": [
+        "refactor",
+        "complex-patch",
+        "deep-debug",
+        "architecture",
+        "long-agent",
+        "migration"
+      ],
+      "tier": "critical",
+      "contrast_only": true
+    },
+    {
+      "argv_prefix": [
+        "codex",
+        "--model",
+        "gpt-6-astra",
+        "-c",
+        "model_reasoning_effort=\"xhigh\""
+      ],
+      "base_quality_rank": 100,
+      "burn_weight": 4.0,
+      "delegation_overhead_minutes": 8,
+      "effort": "xhigh",
+      "enabled": true,
+      "escalation_only": true,
+      "harness": "codex",
+      "harness_quality": 10,
+      "id": "codex-astra-xhigh",
+      "independence_group": "openai-gpt-6",
+      "min_duration_minutes": 30,
+      "model": "gpt-6-astra",
+      "priority": 107,
       "quality_class": "S",
       "quota_pools": [
         "openai-agentic"
