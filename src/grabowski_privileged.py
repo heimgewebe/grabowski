@@ -475,9 +475,13 @@ def _operator_authority_attestation_head() -> str | None:
     return expected_head
 
 
-def ensure_rootbroker_authority(expected_head: str) -> dict[str, Any]:
+def ensure_rootbroker_authority(
+    expected_head: str, *, force_refresh: bool = False
+) -> dict[str, Any]:
     """Advance root-owned operator authority to exact main without user interaction."""
     operator._require_operator_capability("privileged_reference")
+    if not isinstance(force_refresh, bool):
+        raise ValueError("force_refresh must be a boolean")
     if (
         not isinstance(expected_head, str)
         or len(expected_head) != 40
@@ -485,13 +489,14 @@ def ensure_rootbroker_authority(expected_head: str) -> dict[str, Any]:
     ):
         raise ValueError("expected_head must be one full SHA-1 commit id")
     before = _operator_authority_attestation_head()
-    if before == expected_head:
+    if before == expected_head and not force_refresh:
         return {
             "success": True,
             "outcome": "already_current",
             "expected_head": expected_head,
             "attested_head": before,
             "effect_started": False,
+            "force_refresh": False,
         }
     broker = _privileged_broker_status()
     if not broker.get("ready"):
@@ -558,6 +563,7 @@ def ensure_rootbroker_authority(expected_head: str) -> dict[str, Any]:
         "reference_sha256": reference["reference_sha256"],
         "outcome": outcome,
         "failure_reason": failure_reason,
+        "force_refresh": force_refresh,
     }
     _append_operator_audit(audit_record)
     return {
@@ -570,6 +576,7 @@ def ensure_rootbroker_authority(expected_head: str) -> dict[str, Any]:
         "reference_sha256": reference["reference_sha256"],
         "failure_reason": failure_reason,
         "broker_response": response,
+        "force_refresh": force_refresh,
     }
 
 

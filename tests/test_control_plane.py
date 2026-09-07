@@ -821,7 +821,7 @@ class PrivilegedBrokerTests(unittest.TestCase):
             with self.assertRaisesRegex(PermissionError, "kill-switch is engaged"):
                 privileged_broker.resolve_execution(config, parsed)
 
-    def test_local_backup_ntfs_actions_allow_only_typed_task_marker(self) -> None:
+    def test_local_backup_storage_actions_allow_only_typed_task_marker(self) -> None:
         marker = Path(self.tmp.name) / "operator-stop"
         marker.write_text("typed-placeholder\n", encoding="utf-8")
         legacy = Path(self.tmp.name) / "legacy-stop"
@@ -857,6 +857,11 @@ class PrivilegedBrokerTests(unittest.TestCase):
                     "-a",
                     "/dev/disk/by-id/usb-Freecom_Freecom_Mobile_Drive_XXS_3.0_93300000078D-0:0",
                 ],
+            ),
+            (
+                "local_backup_mount_reconcile",
+                "reconcile",
+                ["/usr/local/libexec/grabowski-backup-mount-reconcile", "reconcile"],
             ),
         ):
             reference = self._reference()
