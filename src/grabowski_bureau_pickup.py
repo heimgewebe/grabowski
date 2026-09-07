@@ -4350,6 +4350,16 @@ def _existing_assignment_repair_revision_binding(
     return current_binding
 
 
+def _existing_assignment_repair_effective_request(
+    request: dict[str, Any],
+    registry_binding: RegistryBinding,
+) -> dict[str, Any]:
+    identity = _validate_registry_binding_identity(registry_binding["identity"])
+    if request.get("registry_root") == identity["registry_root"]:
+        return request
+    return {**request, "registry_root": identity["registry_root"]}
+
+
 def _existing_assignment_repair_authority(
     coordination: dict[str, Any],
     intent: dict[str, Any],
@@ -4358,7 +4368,7 @@ def _existing_assignment_repair_authority(
     registry_binding: RegistryBinding,
     *,
     coordination_root: str,
-) -> tuple[dict[str, Any], dict[str, Any]]:
+) -> tuple[dict[str, Any], dict[str, Any], RegistryBinding]:
     if coordination.get("status") != "coordinated":
         raise BureauPickupError(
             "existing-assignment-lease-repair-not-coordinated",
@@ -4447,7 +4457,7 @@ def _existing_assignment_repair_authority(
             coordination_root=coordination_root,
         ),
     )
-    return journal_identity, external
+    return journal_identity, external, revision_binding
 
 
 def _lease_repair_receipt_sha256(receipt: dict[str, Any]) -> str:
@@ -5395,13 +5405,16 @@ def _repair_existing_assignment_lease_binding(
         }
     ):
         return False
-    journal_identity, external = _existing_assignment_repair_authority(
+    journal_identity, external, repair_binding = _existing_assignment_repair_authority(
         coordination,
         intent,
         acquisition,
         run_dir,
         registry_binding,
         coordination_root=request["coordination_root"],
+    )
+    repair_request = _existing_assignment_repair_effective_request(
+        request, repair_binding
     )
     original_by_key = {
         item["resource_key"]: item
@@ -5589,9 +5602,9 @@ def _repair_existing_assignment_lease_binding(
         )
         return _heartbeat_lease_repair(
             intent,
-            request,
+            repair_request,
             acquisition,
-            registry_binding,
+            repair_binding,
             journal_identity,
             external,
             receipt,
@@ -5716,9 +5729,9 @@ def _repair_existing_assignment_lease_binding(
         )
         return _heartbeat_lease_repair(
             intent,
-            request,
+            repair_request,
             acquisition,
-            registry_binding,
+            repair_binding,
             journal_identity,
             external,
             receipt,
@@ -5791,9 +5804,9 @@ def _repair_existing_assignment_lease_binding(
     receipt = _persist_lease_repair_receipt(run_dir, "lease-rebind.json", receipt)
     return _heartbeat_lease_repair(
         intent,
-        request,
+        repair_request,
         acquisition,
-        registry_binding,
+        repair_binding,
         journal_identity,
         external,
         receipt,
@@ -5942,8 +5955,14 @@ def grabowski_bureau_pickup_execute(
         if repair_obligation is not None:
             receipt, journal_identity, external = repair_obligation
             activity_id = _lease_repair_activity_id(receipt["receipt_sha256"])
+            repair_binding = _existing_assignment_repair_revision_binding(
+                registry_binding
+            )
+            repair_request = _existing_assignment_repair_effective_request(
+                normalized, repair_binding
+            )
             coordination = _read_lease_repair_activity_status(
-                intent, normalized, registry_binding, activity_id
+                intent, repair_request, repair_binding, activity_id
             )
             coordination = _validate_lease_repair_activity_status(
                 coordination,

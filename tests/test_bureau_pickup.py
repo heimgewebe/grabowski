@@ -1507,6 +1507,68 @@ class BureauPickupTests(unittest.TestCase):
             control_head,
         )
 
+    def test_existing_assignment_repair_effective_request_preserves_historical_request(self) -> None:
+        task, initiative, _intent = self.orphan_recovery_documents()
+        canonical = self.orphan_recovery_binding(
+            self.root / "effective-runtime-snapshot",
+            "2" * 40,
+            task,
+            initiative,
+        )
+        historical = {
+            "registry_root": str(self.registry_root),
+            "coordination_root": str(self.coordination_root),
+            "worker_id": "operator-test",
+        }
+        before = dict(historical)
+        effective = pickup._existing_assignment_repair_effective_request(
+            historical, canonical
+        )
+        self.assertEqual(
+            canonical["identity"]["registry_root"], effective["registry_root"]
+        )
+        self.assertEqual(before, historical)
+        self.assertEqual(
+            historical["coordination_root"], effective["coordination_root"]
+        )
+
+    def test_existing_assignment_repair_binding_drift_blocks_heartbeat_effect(self) -> None:
+        binding, _managed, _tracked = self.canonical_registry_binding_fixture()
+        intent = self.intent()
+        request = pickup._normalize_request(self.request())
+        journal_identity = {"envelope_sha256": "b" * 64}
+        external = {
+            "external_unbound": True,
+            "external_system": None,
+            "external_id": None,
+            "external_state": None,
+            "external_observed_at": None,
+        }
+        receipt = {"receipt_sha256": "a" * 64}
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_assert_managed_runtime_unchanged",
+                side_effect=RuntimeError("runtime binding rotated"),
+            ),
+            mock.patch.object(pickup.bureau, "_invoke_bureau") as invoke,
+            self.assertRaises(pickup.BureauPickupError) as raised,
+        ):
+            REAL_HEARTBEAT_LEASE_REPAIR(
+                intent,
+                request,
+                {},
+                binding,
+                journal_identity,
+                external,
+                receipt,
+            )
+        self.assertEqual(
+            "existing-assignment-lease-repair-heartbeat-outcome-unknown",
+            raised.exception.code,
+        )
+        invoke.assert_not_called()
+
     def test_existing_assignment_arbitrary_explicit_registry_stays_fail_closed(self) -> None:
         explicit = pickup._explicit_registry_binding(str(self.registry_root))
         with mock.patch.object(
@@ -5145,6 +5207,154 @@ class BureauPickupTests(unittest.TestCase):
         )
         self.assertEqual([key], receipt["resource_keys"])
         self.assertEqual("same-owner-rebind", receipt["groups"][0]["method"])
+
+    def test_existing_assignment_repair_carries_proven_binding_to_heartbeat(self) -> None:
+        request = pickup._normalize_request(self.request())
+        request_before = dict(request)
+        task, initiative, _unused_intent = self.orphan_recovery_documents()
+        canonical = self.orphan_recovery_binding(
+            self.root / "repair-runtime-snapshot",
+            "2" * 40,
+            task,
+            initiative,
+        )
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        purpose = f"Bureau coordinated pickup {intent['run_id']} group other"
+        group = pickup._acquisition_groups(intent, request)[0]
+        resource_db = self.root / "resources-proven-binding.sqlite3"
+        with mock.patch.object(pickup.resources, "RESOURCE_DB", resource_db):
+            with mock.patch.object(pickup.resources, "_now", return_value=100):
+                original = pickup.resources.acquire_resources(
+                    intent["lease_owner_id"],
+                    [key],
+                    purpose=purpose,
+                    ttl_seconds=120,
+                    metadata=group["metadata"],
+                    nonconflict_proof=None,
+                )["leases"][0]
+            run_dir, acquisition = self.create_acquisition_journal(intent, original)
+            blocking = self.bound_coordinated_status(intent, blocking=True)
+            blocking["lease"] = {
+                "status": "active-binding-drift",
+                "error": {
+                    "code": "lease-expired",
+                    "details": {
+                        "resource_key": key,
+                        "expires_at_unix": original["expires_at_unix"],
+                    },
+                },
+            }
+            with (
+                mock.patch.object(pickup.resources, "_now", return_value=221),
+                mock.patch.object(
+                    pickup,
+                    "_existing_assignment_repair_revision_binding",
+                    return_value=canonical,
+                ) as select_binding,
+                mock.patch.object(
+                    pickup, "_current_registry_revision_proof", return_value={}
+                ),
+                mock.patch.object(
+                    pickup,
+                    "_heartbeat_lease_repair",
+                    side_effect=self.lease_repair_heartbeat_readback,
+                ) as heartbeat,
+            ):
+                self.assertIsNone(pickup.resources.inspect_resource(key))
+                repaired = pickup._repair_existing_assignment_lease_binding(
+                    blocking,
+                    intent,
+                    request,
+                    acquisition,
+                    run_dir,
+                    self.default_registry_binding,
+                )
+        self.assertTrue(repaired)
+        select_binding.assert_called_once_with(self.default_registry_binding)
+        heartbeat.assert_called_once()
+        heartbeat_args = heartbeat.call_args.args
+        self.assertEqual(canonical, heartbeat_args[3])
+        self.assertEqual(
+            canonical["identity"]["registry_root"],
+            heartbeat_args[1]["registry_root"],
+        )
+        self.assertEqual(
+            request["coordination_root"],
+            heartbeat_args[1]["coordination_root"],
+        )
+        self.assertEqual(request_before, request)
+
+    def test_existing_assignment_repair_obligation_replay_uses_proven_binding(self) -> None:
+        request = self.request()
+        normalized = pickup._normalize_request(request)
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        run_dir, acquisition = self.create_acquisition_journal(intent, lease)
+        pickup._write_bound_json(run_dir / "request.json", normalized)
+        pickup._write_bound_json(run_dir / "intent.json", intent)
+        request_before = (run_dir / "request.json").read_bytes()
+        journal_identity = pickup._journal_run_identity(run_dir, intent)
+        external = {
+            "external_unbound": True,
+            "external_system": None,
+            "external_id": None,
+            "external_state": None,
+            "external_observed_at": None,
+        }
+        receipt = {"receipt_sha256": "a" * 64}
+        task, initiative, _unused_intent = self.orphan_recovery_documents()
+        canonical = self.orphan_recovery_binding(
+            self.root / "replay-runtime-snapshot",
+            "2" * 40,
+            task,
+            initiative,
+        )
+        existing = {
+            "status": "existing-assignment",
+            "run": {"run_id": intent["run_id"], "state": "assigned"},
+            "envelope": {"claim_intent": intent},
+        }
+        coordinated = self.coordinated_status(intent)
+        with (
+            mock.patch.object(
+                pickup.bureau, "_invoke_bureau", return_value=existing
+            ),
+            mock.patch.object(
+                pickup,
+                "_read_existing_assignment_lease_repair_obligation",
+                return_value=(receipt, journal_identity, external),
+            ),
+            mock.patch.object(
+                pickup,
+                "_existing_assignment_repair_revision_binding",
+                return_value=canonical,
+            ) as select_binding,
+            mock.patch.object(
+                pickup,
+                "_read_lease_repair_activity_status",
+                return_value=coordinated,
+            ) as read_status,
+            mock.patch.object(
+                pickup,
+                "_validate_lease_repair_activity_status",
+                return_value=coordinated,
+            ),
+        ):
+            result = pickup.grabowski_bureau_pickup_execute(request)
+        self.assertEqual("existing-assignment", result["status"])
+        select_binding.assert_called_once_with(self.default_registry_binding)
+        read_status.assert_called_once()
+        read_args = read_status.call_args.args
+        self.assertEqual(canonical, read_args[2])
+        self.assertEqual(
+            canonical["identity"]["registry_root"], read_args[1]["registry_root"]
+        )
+        self.assertEqual(request_before, (run_dir / "request.json").read_bytes())
+        self.assertEqual(
+            acquisition["acquisition_sha256"], result["acquisition_sha256"]
+        )
 
     def test_persisted_resource_lease_uses_stable_readonly_store(self) -> None:
         intent = self.intent()
