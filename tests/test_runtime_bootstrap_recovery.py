@@ -228,6 +228,228 @@ class RuntimeBootstrapRecoveryTests(unittest.TestCase):
             with self.assertRaisesRegex(helper.BootstrapRecoveryError, "kill switch"):
                 helper.root_execute(good)
 
+    def _typed_blockade_marker(
+        self,
+        *,
+        kind: str = "task",
+        value: str = "HEIM-PC-NIXOS-MIGRATION-V1-T006",
+        posture: str = "mutation_freeze",
+    ) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "blockade_id": "nixos-t006-freeze",
+            "posture": posture,
+            "scope": {"kind": kind, "value": value},
+            "reason": "bound scoped freeze",
+            "trigger_class": "task_authority_superseded",
+            "engaged_at": "2026-09-04T11:06:07Z",
+            "evidence_refs": ["candidate:test"],
+            "provenance": {
+                "tool": "grabowski_operator_blockade_engage",
+                "request_id": "request",
+                "session_id": "session",
+                "task_id": "HEIM-PC-NIXOS-MIGRATION-V1-T006",
+                "owner_id": "bureau-run:test",
+            },
+            "source": "typed",
+            "disarm_policy": "in_band",
+        }
+
+    def test_typed_task_and_owner_blockades_are_unrelated_to_bootstrap(self) -> None:
+        self.assertTrue(
+            helper._typed_task_or_owner_blockade_is_unrelated(
+                self._typed_blockade_marker()
+            )
+        )
+        self.assertTrue(
+            helper._typed_task_or_owner_blockade_is_unrelated(
+                self._typed_blockade_marker(kind="owner", value="bureau-run:other")
+            )
+        )
+
+    def test_non_task_owner_or_malformed_blockades_remain_blocking(self) -> None:
+        self.assertFalse(
+            helper._typed_task_or_owner_blockade_is_unrelated(
+                self._typed_blockade_marker(kind="global", value="*")
+            )
+        )
+        self.assertFalse(
+            helper._typed_task_or_owner_blockade_is_unrelated(
+                {**self._typed_blockade_marker(), "schema_version": True}
+            )
+        )
+        self.assertFalse(
+            helper._typed_task_or_owner_blockade_is_unrelated(
+                {**self._typed_blockade_marker(), "schema_version": 1.0}
+            )
+        )
+        self.assertFalse(
+            helper._typed_task_or_owner_blockade_is_unrelated(
+                {**self._typed_blockade_marker(), "evidence_refs": [{}]}
+            )
+        )
+        self.assertFalse(
+            helper._typed_task_or_owner_blockade_is_unrelated(
+                {**self._typed_blockade_marker(), "source": "legacy_file"}
+            )
+        )
+        self.assertFalse(
+            helper._typed_task_or_owner_blockade_is_unrelated(
+                {**self._typed_blockade_marker(), "unknown": True}
+            )
+        )
+
+    def test_kill_switch_gate_allows_unrelated_typed_task_marker(self) -> None:
+        marker = self._typed_blockade_marker()
+        with mock.patch.object(
+            helper,
+            "_marker_present",
+            side_effect=lambda path: path == helper.ROOT_KILL_SWITCH,
+        ), mock.patch.object(helper, "_read_canonical_blockade", return_value=marker):
+            helper._require_kill_switch_clear()
+
+    def test_canonical_blockade_parent_must_be_root_owned_and_not_writable(self) -> None:
+        safe = mock.Mock(
+            st_mode=helper.stat.S_IFDIR | 0o755,
+            st_uid=0,
+            st_nlink=2,
+        )
+        with mock.patch.object(Path, "lstat", return_value=safe):
+            helper._validate_canonical_blockade_parent()
+
+        unsafe = mock.Mock(
+            st_mode=helper.stat.S_IFDIR | 0o775,
+            st_uid=0,
+            st_nlink=2,
+        )
+        with mock.patch.object(Path, "lstat", return_value=unsafe):
+            with self.assertRaisesRegex(
+                helper.BootstrapRecoveryError,
+                "parent identity is unsafe",
+            ):
+                helper._validate_canonical_blockade_parent()
+
+    def _read_canonical_blockade_with_mocked_file(
+        self,
+        raw: bytes,
+        *,
+        before: os.stat_result | None = None,
+        after: os.stat_result | None = None,
+        linked: os.stat_result | None = None,
+    ) -> dict[str, object]:
+        default = os.stat_result(
+            (helper.stat.S_IFREG | 0o644, 101, 202, 1, 0, 0, len(raw), 0, 0, 0)
+        )
+        before = before or default
+        after = after or before
+        linked = linked or after
+        with mock.patch.object(helper, "_validate_canonical_blockade_parent"), mock.patch.object(
+            helper.os, "open", return_value=41
+        ), mock.patch.object(
+            helper.os, "fstat", side_effect=[before, after]
+        ), mock.patch.object(
+            helper.os, "read", side_effect=[raw, b""]
+        ), mock.patch.object(
+            helper.os, "close"
+        ), mock.patch.object(
+            Path, "lstat", return_value=linked
+        ):
+            return helper._read_canonical_blockade()
+
+    def test_canonical_blockade_reader_accepts_exact_root_owned_canonical_json(self) -> None:
+        marker = self._typed_blockade_marker()
+        raw = json.dumps(
+            marker,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        self.assertEqual(
+            self._read_canonical_blockade_with_mocked_file(raw),
+            marker,
+        )
+
+    def test_canonical_blockade_reader_rejects_unsafe_file_mode(self) -> None:
+        raw = b"{}"
+        unsafe = os.stat_result(
+            (helper.stat.S_IFREG | 0o664, 101, 202, 1, 0, 0, len(raw), 0, 0, 0)
+        )
+        with self.assertRaisesRegex(
+            helper.BootstrapRecoveryError,
+            "identity is unsafe",
+        ):
+            self._read_canonical_blockade_with_mocked_file(raw, before=unsafe)
+
+    def test_canonical_blockade_reader_rejects_identity_change_during_read(self) -> None:
+        raw = b"{}"
+        before = os.stat_result(
+            (helper.stat.S_IFREG | 0o644, 101, 202, 1, 0, 0, len(raw), 0, 0, 0)
+        )
+        changed = os.stat_result(
+            (helper.stat.S_IFREG | 0o644, 102, 202, 1, 0, 0, len(raw), 0, 0, 0)
+        )
+        with self.assertRaisesRegex(
+            helper.BootstrapRecoveryError,
+            "changed during read",
+        ):
+            self._read_canonical_blockade_with_mocked_file(
+                raw,
+                before=before,
+                after=changed,
+                linked=changed,
+            )
+
+    def test_canonical_blockade_reader_rejects_duplicate_and_noncanonical_json(self) -> None:
+        for raw in (b'{"a":1,"a":1}', b'{"a": 1}'):
+            with self.subTest(raw=raw):
+                with self.assertRaises(helper.BootstrapRecoveryError):
+                    self._read_canonical_blockade_with_mocked_file(raw)
+
+    def test_kill_switch_gate_keeps_global_legacy_and_unsafe_markers_closed(self) -> None:
+        global_marker = self._typed_blockade_marker(kind="global", value="*")
+        with mock.patch.object(
+            helper,
+            "_marker_present",
+            side_effect=lambda path: path == helper.ROOT_KILL_SWITCH,
+        ), mock.patch.object(
+            helper, "_read_canonical_blockade", return_value=global_marker
+        ):
+            with self.assertRaisesRegex(helper.BootstrapRecoveryError, "operator kill switch"):
+                helper._require_kill_switch_clear()
+
+        with mock.patch.object(
+            helper,
+            "_marker_present",
+            side_effect=lambda path: path == helper.LEGACY_KILL_SWITCH,
+        ):
+            with self.assertRaisesRegex(helper.BootstrapRecoveryError, "legacy"):
+                helper._require_kill_switch_clear()
+
+        with mock.patch.object(
+            helper,
+            "_marker_present",
+            side_effect=lambda path: path == helper.ROOT_KILL_SWITCH,
+        ), mock.patch.object(
+            helper,
+            "_read_canonical_blockade",
+            side_effect=helper.BootstrapRecoveryError("malformed"),
+        ):
+            with self.assertRaisesRegex(helper.BootstrapRecoveryError, "unsafe canonical"):
+                helper._require_kill_switch_clear()
+
+        with mock.patch.object(
+            helper,
+            "_marker_present",
+            side_effect=lambda path: path == helper.ROOT_KILL_SWITCH,
+        ), mock.patch.object(
+            helper,
+            "_read_canonical_blockade",
+            side_effect=ValueError("non-canonical JSON number"),
+        ):
+            with self.assertRaisesRegex(helper.BootstrapRecoveryError, "unsafe canonical"):
+                helper._require_kill_switch_clear()
+
     def test_kill_switch_observation_fails_closed_when_marker_is_unreadable(self) -> None:
         marker = Path("/unreadable-marker")
         with mock.patch.object(Path, "lstat", side_effect=PermissionError("denied")):

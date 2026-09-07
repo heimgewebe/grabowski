@@ -1954,5 +1954,29 @@ class RootbrokerCutoverTests(unittest.TestCase):
             self.assertFalse(Path(layout["receipt_root"]).exists())
 
 
+class BackupMountReconcileCutoverContractTests(unittest.TestCase):
+    def test_reconcile_action_and_helper_are_commit_bound(self) -> None:
+        observed = cutover._local_backup_ntfs_actions_from_repository(
+            ROOT, expected_head=HEAD, runner=FakeRunner()
+        )
+        action = observed[cutover.LOCAL_BACKUP_MOUNT_RECONCILE_ACTION]
+        self.assertEqual(action["target_pattern"], "reconcile")
+        self.assertEqual(
+            action["argv"],
+            [str(cutover.BACKUP_MOUNT_RECONCILE_TARGET), "reconcile"],
+        )
+        artifacts = {artifact.target: artifact for artifact in cutover.ARTIFACTS}
+        helper = artifacts[cutover.BACKUP_MOUNT_RECONCILE_TARGET]
+        self.assertEqual(
+            helper.source_relative, "tools/grabowski_backup_mount_reconcile.py"
+        )
+        self.assertEqual(helper.mode, 0o755)
+        self.assertTrue(helper.python_source)
+        self.assertIn(
+            cutover.LOCAL_BACKUP_MOUNT_RECONCILE_ACTION,
+            cutover.LOCAL_BACKUP_STORAGE_ACTIONS,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

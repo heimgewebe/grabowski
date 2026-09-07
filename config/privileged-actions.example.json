@@ -233,6 +233,20 @@
         "-a",
         "/dev/disk/by-id/usb-Freecom_Freecom_Mobile_Drive_XXS_3.0_93300000078D-0:0"
       ]
+    },
+    "local_backup_mount_reconcile": {
+      "enabled": true,
+      "mode": "template",
+      "timeout_seconds": 120,
+      "kill_switch_path": "/var/lib/grabowski/operator-blockade/operator-kill-switch",
+      "legacy_kill_switch_path": "/home/alex/.local/state/grabowski/operator-kill-switch",
+      "allowed_peer_unit": "grabowski-operator.service",
+      "allowed_peer_uid": 1000,
+      "target_pattern": "reconcile",
+      "argv": [
+        "/usr/local/libexec/grabowski-backup-mount-reconcile",
+        "reconcile"
+      ]
     }
   }
 }
