@@ -620,7 +620,7 @@ class DurableResumeRebindResolutionTests(unittest.TestCase):
                     durable,
                 )
 
-    def test_evidence_free_retry_without_prior_durable_fails_closed(self) -> None:
+    def test_evidence_free_retry_without_prior_durable_defers_to_snapshot_inspector(self) -> None:
         cutover = cutover_receipt()
         later = resume_receipt(
             outcome="outcome_unknown",
@@ -633,10 +633,9 @@ class DurableResumeRebindResolutionTests(unittest.TestCase):
         later["snapshot_rebind"] = None
         later.pop("receipt_sha256", None)
         later["receipt_sha256"] = midcutover.canonical_json_sha256(later)
-        with self.assertRaisesRegex(
-            midcutover.MidCutoverEvidenceError, "without durable lineage"
-        ):
+        self.assertIsNone(
             midcutover.durable_snapshot_rebind_for_cutover([cutover, later], cutover)
+        )
 
     def test_minimal_retry_with_foreign_summary_identity_fails_closed(self) -> None:
         cutover = cutover_receipt()
@@ -681,7 +680,7 @@ class DurableResumeRebindResolutionTests(unittest.TestCase):
                 [cutover, first, second], cutover
             )
 
-    def test_claimed_s0_without_full_durable_rebind_fails_closed(self) -> None:
+    def test_claimed_s0_without_full_durable_rebind_defers_to_snapshot_inspector(self) -> None:
         cutover = cutover_receipt()
         resume = resume_receipt(
             outcome="outcome_unknown",
@@ -693,10 +692,9 @@ class DurableResumeRebindResolutionTests(unittest.TestCase):
         recovery["snapshot_rebind_applied"] = True
         resume.pop("receipt_sha256", None)
         resume["receipt_sha256"] = midcutover.canonical_json_sha256(resume)
-        with self.assertRaisesRegex(
-            midcutover.MidCutoverEvidenceError, "without durable lineage"
-        ):
+        self.assertIsNone(
             midcutover.durable_snapshot_rebind_for_cutover([cutover, resume], cutover)
+        )
 
     def test_pre_s0_outcome_unknown_with_partial_binding_is_not_candidate(self) -> None:
         cutover = cutover_receipt()
@@ -1144,6 +1142,64 @@ class SnapshotInspectorDependencyTests(unittest.TestCase):
                 )
             self.assertEqual(len(calls), 1)
             self.assertEqual(calls[0]["durable_rebind"], durable)
+            self.assertEqual(
+                observed["snapshot_observation"]["state"],
+                midcutover.SNAPSHOT_BINDING_DONE,
+            )
+
+    def test_legacy_s0_summary_without_durable_payload_reaches_current_inspector(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            receipt_root = root / "receipts"
+            receipt_root.mkdir(mode=0o700)
+            cutover = cutover_receipt()
+            legacy = resume_receipt(
+                outcome="outcome_unknown",
+                resume_id="bgcr-legacy-s0-no-durable",
+                resume_phase=midcutover.PHASE_PROMOTE_POINTER,
+            )
+            recovery = legacy.get("recovery")
+            assert isinstance(recovery, dict)
+            recovery["snapshot_rebind_applied"] = True
+            summary = legacy.get("snapshot_rebind")
+            assert isinstance(summary, dict)
+            self.assertNotIn("durable_rebind", summary)
+            legacy.pop("receipt_sha256", None)
+            legacy["receipt_sha256"] = midcutover.canonical_json_sha256(legacy)
+            for name, receipt in (("cutover.json", cutover), ("legacy.json", legacy)):
+                path = receipt_root / name
+                path.write_text(
+                    json.dumps(
+                        receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                    ),
+                    encoding="utf-8",
+                )
+                path.chmod(0o600)
+            calls: list[dict[str, object]] = []
+
+            def inspect(**parameters):
+                calls.append(parameters)
+                return SNAPSHOT_REBOUND
+
+            with mock.patch.object(
+                midcutover, "read_routing_selector_document", return_value=selector_document()
+            ), mock.patch.object(
+                midcutover,
+                "observe_green_release",
+                side_effect=[GREEN_OBSERVATION, BLUE_OBSERVATION],
+            ), mock.patch.object(
+                midcutover, "observe_stable_pointer", return_value=POINTER_AT_BLUE
+            ):
+                observed = midcutover.collect_classification_inputs(
+                    selector_path=root / "selector.json",
+                    receipt_root=receipt_root,
+                    releases_root=root / "releases",
+                    runtime_path=root / "runtime",
+                    green_unit_observer=lambda _unit: {"active": True},
+                    snapshot_inspector=inspect,
+                )
+            self.assertEqual(len(calls), 1)
+            self.assertIsNone(calls[0]["durable_rebind"])
             self.assertEqual(
                 observed["snapshot_observation"]["state"],
                 midcutover.SNAPSHOT_BINDING_DONE,

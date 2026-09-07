@@ -494,7 +494,6 @@ def durable_snapshot_rebind_for_cutover(
         return None
     activation = activation_observation(cutover)
     distinct: dict[str, dict[str, Any]] = {}
-    claimed_without_durable = False
     for raw in receipts:
         if not isinstance(raw, dict) or raw.get("kind") != RESUME_RECEIPT_KIND:
             continue
@@ -578,7 +577,10 @@ def durable_snapshot_rebind_for_cutover(
         # not erase an earlier exact durable candidate, but it cannot establish
         # one on its own either.
         if summary is None:
-            claimed_without_durable = True
+            # Legacy outcome-unknown receipts may know that S0 happened without
+            # carrying the full durable rebind payload.  Absence is not negative
+            # proof: after the lineage/identity checks above, let the canonical
+            # current snapshot inspector classify the successor state.
             continue
         if not isinstance(summary, dict) or summary.get("rebound") is not True:
             raise MidCutoverEvidenceError(
@@ -608,7 +610,10 @@ def durable_snapshot_rebind_for_cutover(
                 raise MidCutoverEvidenceError(
                     "outcome_unknown resume snapshot rebind summary identity is inconsistent"
                 )
-            claimed_without_durable = True
+            # A sparse legacy successor summary is non-candidate evidence.
+            # Any identity fields it does carry were checked above; the exact
+            # current snapshot inspector remains authoritative when no durable
+            # payload survived.
             continue
         if not isinstance(durable, dict):
             raise MidCutoverEvidenceError(
@@ -659,10 +664,10 @@ def durable_snapshot_rebind_for_cutover(
         raise MidCutoverEvidenceError(
             "conflicting durable snapshot rebind lineage in resume receipts"
         )
-    if not distinct and claimed_without_durable:
-        raise MidCutoverEvidenceError(
-            "outcome_unknown resume claims snapshot rebind without durable lineage"
-        )
+    # No exact durable candidate is an unknown historical state, not proof that
+    # the rebind did not happen.  The caller passes ``None`` to the canonical
+    # current snapshot inspector, which must still classify the live successor
+    # snapshot before recovery can proceed.
     return next(iter(distinct.values()), None)
 
 
