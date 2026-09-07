@@ -6508,6 +6508,53 @@ def _run_pr_base_converge(
             raise GripActionError(
                 "updated PR head does not preserve the exact prior PR head lineage"
             )
+        final = read_pr()
+        if final.get("number") != pr_number or final.get("state") != "OPEN":
+            _check(
+                receipt,
+                "same_pr_preserved",
+                "fail",
+                f"number={final.get('number')} state={final.get('state')}",
+            )
+            raise GripActionError(
+                "PR identity drifted after ancestry verification"
+            )
+        if (
+            final.get("isCrossRepository") is not False
+            or final.get("headRefName") != head_branch
+        ):
+            _check(
+                receipt,
+                "same_pr_preserved",
+                "fail",
+                "repository/head branch identity changed after ancestry verification",
+            )
+            raise GripActionError(
+                "PR head branch identity drifted after ancestry verification"
+            )
+        if (
+            final.get("baseRefName") != base
+            or str(final.get("baseRefOid", "")).lower() != expected_base_sha
+        ):
+            _check(
+                receipt,
+                "base_identity_after",
+                "fail",
+                f"branch={final.get('baseRefName')} sha={final.get('baseRefOid')}",
+            )
+            raise GripActionError(
+                "PR base drifted after ancestry verification"
+            )
+        if str(final.get("headRefOid", "")).lower() != new_head:
+            _check(
+                receipt,
+                "head_readback",
+                "fail",
+                f"actual={final.get('headRefOid')} expected={new_head}",
+            )
+            raise GripActionError(
+                "PR head drifted after ancestry verification"
+            )
         _check(receipt, "same_pr_preserved", "pass", str(pr_number))
         _check(receipt, "head_readback", "pass", new_head)
         _check(
@@ -6524,7 +6571,7 @@ def _run_pr_base_converge(
             "old_head": expected_head,
             "new_head": new_head,
             "head_branch": head_branch,
-            "pr": current,
+            "pr": final,
         }
     _check(receipt, "head_readback", "fail", f"still={last.get('headRefOid')}")
     raise GripActionError(

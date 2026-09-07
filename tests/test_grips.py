@@ -7862,6 +7862,49 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("fail", checks["prior_head_contained_after"])
         self.assertFalse(any(call[:2] == ("pr", "create") for call in gh.calls))
 
+    def test_pr_base_converge_revalidates_live_head_after_ancestry_checks(self) -> None:
+        class DriftAfterAncestry(FakePrBaseConvergeGh):
+            def __init__(self) -> None:
+                super().__init__()
+                self.view_reads = 0
+                self.compare_reads = 0
+
+            def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
+                if argv[:1] == ["api"] and any("/compare/" in item for item in argv):
+                    self.compare_reads += 1
+                if argv[:2] == ["pr", "view"]:
+                    self.view_reads += 1
+                    if self.updated and self.compare_reads >= 3 and self.view_reads >= 3:
+                        self.view["headRefOid"] = "c" * 40
+                return super().__call__(repo, argv)
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(
+                grips, "PR_BASE_CONVERGE_VERIFY_DELAYS_SECONDS", (0.0, 0.0, 0.0)
+            ),
+        ):
+            gh = DriftAfterAncestry()
+            result = grips.run_grip(
+                "pr-base-converge",
+                {
+                    "repo": tmp,
+                    "pr_number": 77,
+                    "base": "main",
+                    "expected_head": "a" * 40,
+                    "expected_base_sha": "e" * 40,
+                },
+                allow_mutation=True,
+                github_runner=gh,
+            )
+
+        self.assertEqual("failed", result["receipt"]["status"])
+        self.assertIn("head drifted after ancestry verification", result["output"]["error"])
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("pass", checks["base_contained_after"])
+        self.assertEqual("fail", checks["head_readback"])
+        self.assertFalse(any(call[:2] == ("pr", "create") for call in gh.calls))
+
     def test_pr_base_converge_does_not_replay_ambiguous_accepted_update(self) -> None:
         with (
             tempfile.TemporaryDirectory() as tmp,
