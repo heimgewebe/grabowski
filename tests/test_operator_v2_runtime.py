@@ -646,6 +646,7 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             "_server_runtime",
             "_server_agent_instructions_sha256",
             "_server_observed_tools",
+            "_server_retirement_binding",
         )
         for parameter in server_parameters:
             with self.subTest(parameter=parameter):

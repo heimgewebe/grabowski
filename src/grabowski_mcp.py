@@ -187,6 +187,10 @@ _TRANSPORT_CONNECTOR_TOKEN_SUFFIX = ".token"
 _TRANSPORT_CONNECTOR_MAX_IDENTITIES = 32
 _TRANSPORT_CONNECTOR_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43,128}\Z")
 _TRANSPORT_CONNECTOR_ID_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}\Z")
+_REPOSKOP_RETIREMENT_SURFACE_BY_CONNECTOR_ID = {
+    "primary": "grabowski",
+    "kleiner-maulwurf": "der_kleine_maulwurf",
+}
 
 
 class _RetainedTransportTargetMissing(RuntimeError):
@@ -5392,6 +5396,34 @@ def _transport_connector_capability_scope(
     return grabowski_transport_roundtrip.validate_client_scope(
         {"kind": "connector_capability", "label": label}
     )
+
+def _retirement_state_scope_sha256() -> str:
+    return grabowski_client_snapshot._retirement_state_scope_sha256()
+
+
+def _reposkop_retirement_server_binding(ctx: Context | None) -> dict[str, Any]:
+    connector_id = _transport_connector_identity(ctx)
+    surface_id = _REPOSKOP_RETIREMENT_SURFACE_BY_CONNECTOR_ID.get(connector_id)
+    if surface_id is None:
+        raise RuntimeError("Reposkop retirement requires a supported enrolled connector identity")
+    scope = _transport_connector_capability_scope(ctx)
+    if scope is None or scope.get("kind") != "connector_capability":
+        raise RuntimeError("Reposkop retirement requires a connector-capability client scope")
+    runtime = _transport_roundtrip_runtime_binding()
+    return {
+        "schema_version": 1,
+        "connector_id": connector_id,
+        "surface_id": surface_id,
+        "client_scope_kind": scope["kind"],
+        "client_scope_sha256": grabowski_transport_roundtrip.client_scope_sha256(scope),
+        "state_scope_sha256": _retirement_state_scope_sha256(),
+        "runtime_binding_sha256": grabowski_transport_assertion.runtime_binding_sha256(runtime),
+        "release_id": runtime["release_id"],
+        "repo_head": runtime["repo_head"],
+        "registered_names_sha256": runtime["registered_names_sha256"],
+        "agent_instructions_sha256": runtime["agent_instructions_sha256"],
+    }
+
 
 def _transport_signed_one_call_evidence(
     ctx: Context | None,
@@ -12499,6 +12531,7 @@ def _grip_run_core(
             "_server_observed_tools",
             "_server_transport_client_scope",
             "_server_transport_runtime_binding",
+            "_server_retirement_binding",
         }.intersection(raw_parameters)
     )
     if reserved_server_parameters:
@@ -12640,6 +12673,17 @@ def _grip_run_core(
         dispatch_parameters["_server_transport_runtime_binding"] = (
             runtime_binding
         )
+    if name == "reposkop-retirement-surface-observe":
+        try:
+            dispatch_parameters["_server_retirement_binding"] = (
+                _reposkop_retirement_server_binding(ctx)
+            )
+        except (RuntimeError, TypeError, ValueError) as exc:
+            return grabowski_grips._blocked_surface_receipt(
+                name,
+                raw_parameters,
+                f"retirement binding unavailable: {type(exc).__name__}",
+            )
     if name == "connector-snapshot-bind":
         deployment = _deployment_metadata()
         tool_contract = _runtime_tool_contract_summary(deployment)

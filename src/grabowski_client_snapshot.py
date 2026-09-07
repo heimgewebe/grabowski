@@ -42,6 +42,8 @@ PLATFORM_PUBLICATION_REQUEST_ROOT = PLATFORM_PUBLICATION_ROOT / "requests"
 PLATFORM_PUBLICATION_ATTEMPT_ROOT = PLATFORM_PUBLICATION_ROOT / "attempts"
 PLATFORM_PUBLICATION_RECEIPT_ROOT = PLATFORM_PUBLICATION_ROOT / "receipts"
 PLATFORM_PUBLICATION_RESOLUTION_ROOT = PLATFORM_PUBLICATION_ROOT / "resolutions"
+PLATFORM_RETIREMENT_OBSERVATION_ROOT = PLATFORM_PUBLICATION_ROOT / "retirement-observations"
+PLATFORM_RETIREMENT_RESOLUTION_ROOT = PLATFORM_PUBLICATION_ROOT / "retirement-resolutions"
 PLATFORM_PUBLICATION_CURRENT_PATH = PLATFORM_PUBLICATION_ROOT / "current.json"
 BLUE_GREEN_RECEIPT_ROOT = (
     Path.home() / ".local/state/grabowski/blue-green-deployment-receipts"
@@ -50,6 +52,9 @@ PLATFORM_PUBLICATION_REQUEST_KIND = "grabowski_platform_publication_request"
 PLATFORM_PUBLICATION_ATTEMPT_KIND = "grabowski_platform_publication_attempt"
 PLATFORM_PUBLICATION_RECEIPT_KIND = "grabowski_platform_publication_convergence_receipt"
 PLATFORM_PUBLICATION_RESOLUTION_KIND = "grabowski_platform_publication_resolution"
+PLATFORM_RETIREMENT_OBSERVATION_KIND = "grabowski_platform_retirement_surface_observation"
+PLATFORM_RETIREMENT_RESOLUTION_KIND = "grabowski_platform_retirement_surface_resolution"
+PLATFORM_RETIREMENT_TRANSACTION_KIND = "grabowski_platform_retirement_surface_transaction"
 PLATFORM_PUBLICATION_CURRENT_KIND = "grabowski_platform_publication_current"
 PLATFORM_PUBLICATION_ACTION = "refresh_or_republish_chatgpt_connector_catalog"
 PLATFORM_OBSERVATION_SCOPES = frozenset(
@@ -78,6 +83,39 @@ PLATFORM_PUBLICATION_ACTIVATED_STATES = frozenset(
 )
 PLATFORM_PUBLICATION_ATTEMPT_OUTCOMES = frozenset(
     {"submitted", "outcome_unknown", "failed"}
+)
+REPOSKOP_RETIREMENT_QUERY = "reposkop"
+REPOSKOP_RETIREMENT_SURFACES = frozenset({"grabowski", "der_kleine_maulwurf"})
+REPOSKOP_RETIREMENT_SOURCE_PREFIX = "chatgpt-tool-discovery:"
+REPOSKOP_RETIREMENT_FORBIDDEN_TOOLS = frozenset(
+    {"grabowski_reposkop_context", "grabowski_reposkop_effectiveness"}
+)
+REPOSKOP_RETIREMENT_TTL_SECONDS = 3_600
+REPOSKOP_RETIREMENT_CLOCK_SKEW_SECONDS = 120
+REPOSKOP_RETIREMENT_SURFACE_BY_CONNECTOR_ID = {
+    "primary": "grabowski",
+    "kleiner-maulwurf": "der_kleine_maulwurf",
+}
+REPOSKOP_RETIREMENT_SERVER_BINDING_FIELDS = frozenset(
+    {
+        "schema_version",
+        "connector_id",
+        "surface_id",
+        "client_scope_kind",
+        "client_scope_sha256",
+        "state_scope_sha256",
+        "runtime_binding_sha256",
+        "release_id",
+        "repo_head",
+        "registered_names_sha256",
+        "agent_instructions_sha256",
+    }
+)
+REPOSKOP_RETIREMENT_NONCLAIMS = (
+    "complete_platform_tool_schema_publication",
+    "platform_origin_cryptographic_attestation",
+    "platform_converged",
+    "consumer_zero_outside_the_observed_chatgpt_surface",
 )
 AUTO_REFRESH_CLIENT_ID = "grabowski-tunnel-watchdog-observer-v1"
 OBSERVATION_SCOPE_EXTERNAL_CLIENT = "external_client_declared"
@@ -1607,6 +1645,17 @@ def _platform_contract_from_artifact(artifact: dict[str, Any]) -> dict[str, Any]
     )
 
 
+def _validate_private_json_size(payload: dict[str, Any], *, label: str) -> None:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        indent=2,
+    ).encode("utf-8") + b"\n"
+    if len(encoded) > MAX_SNAPSHOT_BYTES:
+        raise ClientSnapshotError(f"{label} exceeds size limit")
+
+
 def _create_private_json(path: Path, payload: dict[str, Any]) -> bool:
     _ensure_private_directory(path.parent)
     encoded = json.dumps(
@@ -1669,6 +1718,33 @@ def _publication_receipt_path(request_id: str) -> Path:
 def _publication_resolution_path(request_id: str) -> Path:
     request_id = _validate_identifier(request_id, label="publication request id")
     return PLATFORM_PUBLICATION_RESOLUTION_ROOT / f"{request_id}.json"
+
+
+def _retirement_observation_path(
+    request_id: str, surface_id: str, observation_id: str
+) -> Path:
+    request_id = _validate_identifier(request_id, label="retirement request id")
+    surface_id = _validate_identifier(surface_id, label="retirement surface id")
+    observation_id = _validate_identifier(
+        observation_id, label="retirement observation id"
+    )
+    token = hashlib.sha256(observation_id.encode("utf-8")).hexdigest()[:24]
+    return PLATFORM_RETIREMENT_OBSERVATION_ROOT / (
+        f"{request_id}--{surface_id}--{token}.json"
+    )
+
+
+def _retirement_resolution_path(request_id: str, surface_id: str) -> Path:
+    request_id = _validate_identifier(request_id, label="retirement request id")
+    surface_id = _validate_identifier(surface_id, label="retirement surface id")
+    return PLATFORM_RETIREMENT_RESOLUTION_ROOT / f"{request_id}--{surface_id}.json"
+
+
+def _retirement_transaction_path(request_id: str, surface_id: str) -> Path:
+    request_id = _validate_identifier(request_id, label="retirement request id")
+    surface_id = _validate_identifier(surface_id, label="retirement surface id")
+    root = PLATFORM_RETIREMENT_RESOLUTION_ROOT.parent / "retirement-transactions"
+    return root / f"{request_id}--{surface_id}.json"
 
 
 def _read_publication_current() -> dict[str, Any] | None:
@@ -2023,6 +2099,638 @@ def _persist_publication_resolution(
     }
     _create_private_json(_publication_resolution_path(request_id), resolution)
     return resolution
+
+
+def _retirement_state_scope_sha256() -> str:
+    material = {
+        "schema_version": 1,
+        "effective_uid": os.geteuid(),
+        "state_root": os.path.abspath(os.fspath(STATE_ROOT.expanduser())),
+    }
+    return _sha256_json(material)
+
+
+def _validate_retirement_server_binding(
+    value: Any, *, surface_id: str
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != REPOSKOP_RETIREMENT_SERVER_BINDING_FIELDS:
+        raise ClientSnapshotError("retirement server binding is unavailable or malformed")
+    if value.get("schema_version") != 1:
+        raise ClientSnapshotError("retirement server binding schema is unsupported")
+    connector_id = _validate_identifier(
+        value.get("connector_id"), label="retirement connector principal"
+    )
+    bound_surface = _validate_identifier(
+        value.get("surface_id"), label="retirement bound surface"
+    )
+    expected_surface = REPOSKOP_RETIREMENT_SURFACE_BY_CONNECTOR_ID.get(connector_id)
+    if expected_surface is None or bound_surface != expected_surface or surface_id != bound_surface:
+        raise ClientSnapshotError("retirement surface/principal binding mismatch")
+    if value.get("client_scope_kind") != "connector_capability":
+        raise ClientSnapshotError("retirement client scope is not connector-capability bound")
+    binding = dict(value)
+    for field in (
+        "client_scope_sha256",
+        "state_scope_sha256",
+        "runtime_binding_sha256",
+        "registered_names_sha256",
+        "agent_instructions_sha256",
+    ):
+        binding[field] = _validate_sha256(
+            binding.get(field), label=f"retirement {field}"
+        )
+    expected_state_scope = _retirement_state_scope_sha256()
+    if binding["state_scope_sha256"] != expected_state_scope:
+        raise ClientSnapshotError("retirement state-store scope binding mismatch")
+    binding["release_id"] = _validate_release_id(
+        binding.get("release_id"), label="retirement runtime release id"
+    )
+    repo_head = binding.get("repo_head")
+    if not isinstance(repo_head, str) or re.fullmatch(r"[0-9a-f]{40}", repo_head) is None:
+        raise ClientSnapshotError("retirement runtime repository head is invalid")
+    return binding
+
+
+def _validate_retirement_observation(value: Any) -> dict[str, Any]:
+    required = {
+        "schema_version",
+        "kind",
+        "request_id",
+        "request_sha256",
+        "contract_sha256",
+        "surface_id",
+        "observation_id",
+        "observation_authority",
+        "query",
+        "matched_tool_names",
+        "forbidden_tool_names",
+        "forbidden_tool_names_present",
+        "historical_forbidden_tool_names_present",
+        "forbidden_tool_names_sha256",
+        "source_reference",
+        "server_binding",
+        "server_binding_sha256",
+        "generic_platform_publication_state",
+        "observed_at_unix",
+        "fresh_until_unix",
+        "observation_sha256",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise ClientSnapshotError("retirement surface observation shape is invalid")
+    if (
+        value.get("schema_version") != 2
+        or value.get("kind") != PLATFORM_RETIREMENT_OBSERVATION_KIND
+    ):
+        raise ClientSnapshotError("retirement surface observation contract is unsupported")
+    material = dict(value)
+    observed_digest = material.pop("observation_sha256", None)
+    if (
+        not isinstance(observed_digest, str)
+        or _SHA256_RE.fullmatch(observed_digest) is None
+        or observed_digest != _sha256_json(material)
+    ):
+        raise ClientSnapshotError("retirement surface observation digest is invalid")
+    if value.get("server_binding_sha256") != _sha256_json(value.get("server_binding")):
+        raise ClientSnapshotError("retirement surface observation server binding digest is invalid")
+    observed_at = value.get("observed_at_unix")
+    fresh_until = value.get("fresh_until_unix")
+    if (
+        isinstance(observed_at, bool)
+        or not isinstance(observed_at, int)
+        or observed_at < 0
+        or isinstance(fresh_until, bool)
+        or not isinstance(fresh_until, int)
+        or fresh_until != observed_at + REPOSKOP_RETIREMENT_TTL_SECONDS
+    ):
+        raise ClientSnapshotError("retirement surface observation freshness binding is invalid")
+    matches = value.get("matched_tool_names")
+    present = value.get("forbidden_tool_names_present")
+    forbidden_contract = sorted(REPOSKOP_RETIREMENT_FORBIDDEN_TOOLS)
+    historical_present = sorted(REPOSKOP_RETIREMENT_FORBIDDEN_TOOLS.intersection(matches or []))
+    if (
+        not isinstance(matches, list)
+        or present != matches
+        or value.get("query") != REPOSKOP_RETIREMENT_QUERY
+        or value.get("observation_authority")
+        != "chatgpt_connector_principal_bound_tool_discovery"
+        or value.get("forbidden_tool_names") != forbidden_contract
+        or value.get("forbidden_tool_names_sha256") != _sha256_json(forbidden_contract)
+        or value.get("historical_forbidden_tool_names_present") != historical_present
+    ):
+        raise ClientSnapshotError("retirement query or forbidden-set projection is invalid")
+    return value
+
+
+def _validate_retirement_resolution(value: Any) -> dict[str, Any]:
+    required = {
+        "schema_version",
+        "kind",
+        "request_id",
+        "request_sha256",
+        "contract_sha256",
+        "surface_id",
+        "connector_id",
+        "client_scope_sha256",
+        "state_scope_sha256",
+        "runtime_binding_sha256",
+        "observation_id",
+        "observation_sha256",
+        "criterion",
+        "state",
+        "matched_tool_names",
+        "forbidden_tool_names",
+        "source_reference",
+        "observed_at_unix",
+        "fresh_until_unix",
+        "projected_at_unix",
+        "resolution_sha256",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise ClientSnapshotError("retirement surface resolution shape is invalid")
+    if (
+        value.get("schema_version") != 2
+        or value.get("kind") != PLATFORM_RETIREMENT_RESOLUTION_KIND
+    ):
+        raise ClientSnapshotError("retirement surface resolution contract is unsupported")
+    material = dict(value)
+    observed_digest = material.pop("resolution_sha256", None)
+    if (
+        not isinstance(observed_digest, str)
+        or _SHA256_RE.fullmatch(observed_digest) is None
+        or observed_digest != _sha256_json(material)
+    ):
+        raise ClientSnapshotError("retirement surface resolution digest is invalid")
+    state = value.get("state")
+    matches = value.get("matched_tool_names")
+    if not isinstance(matches, list):
+        raise ClientSnapshotError("retirement surface resolution matches are invalid")
+    expected_state = "retirement_surface_blocked" if matches else "retirement_surface_converged"
+    expected_criterion = "reposkop_query_has_matches" if matches else "reposkop_query_has_zero_matches"
+    if (
+        state != expected_state
+        or value.get("criterion") != expected_criterion
+        or value.get("forbidden_tool_names")
+        != sorted(REPOSKOP_RETIREMENT_FORBIDDEN_TOOLS)
+    ):
+        raise ClientSnapshotError(
+            "retirement surface resolution state or forbidden-set contract is inconsistent"
+        )
+    return value
+
+
+def _retirement_transaction_document(
+    *,
+    observation: dict[str, Any],
+    projection: dict[str, Any],
+    state: str,
+) -> dict[str, Any]:
+    if state not in {"pending", "complete"}:
+        raise ClientSnapshotError("retirement transaction state is invalid")
+    material = {
+        "schema_version": 1,
+        "kind": PLATFORM_RETIREMENT_TRANSACTION_KIND,
+        "request_id": observation["request_id"],
+        "surface_id": observation["surface_id"],
+        "observation_id": observation["observation_id"],
+        "state": state,
+        "observation": observation,
+        "projection": projection,
+    }
+    return {**material, "transaction_sha256": _sha256_json(material)}
+
+
+def _validate_retirement_transaction(value: Any) -> dict[str, Any]:
+    required = {
+        "schema_version",
+        "kind",
+        "request_id",
+        "surface_id",
+        "observation_id",
+        "state",
+        "observation",
+        "projection",
+        "transaction_sha256",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise ClientSnapshotError("retirement transaction shape is invalid")
+    if (
+        value.get("schema_version") != 1
+        or value.get("kind") != PLATFORM_RETIREMENT_TRANSACTION_KIND
+        or value.get("state") not in {"pending", "complete"}
+    ):
+        raise ClientSnapshotError("retirement transaction contract is unsupported")
+    material = dict(value)
+    digest = material.pop("transaction_sha256", None)
+    if (
+        not isinstance(digest, str)
+        or _SHA256_RE.fullmatch(digest) is None
+        or digest != _sha256_json(material)
+    ):
+        raise ClientSnapshotError("retirement transaction digest is invalid")
+    observation = _validate_retirement_observation(value.get("observation"))
+    projection = _validate_retirement_resolution(value.get("projection"))
+    if (
+        value.get("request_id") != observation.get("request_id")
+        or value.get("request_id") != projection.get("request_id")
+        or value.get("surface_id") != observation.get("surface_id")
+        or value.get("surface_id") != projection.get("surface_id")
+        or value.get("observation_id") != observation.get("observation_id")
+        or value.get("observation_id") != projection.get("observation_id")
+        or observation.get("observation_sha256") != projection.get("observation_sha256")
+    ):
+        raise ClientSnapshotError("retirement transaction evidence binding is invalid")
+    return value
+
+
+def _settle_retirement_transaction(
+    path: Path, transaction: dict[str, Any]
+) -> dict[str, Any]:
+    transaction = _validate_retirement_transaction(transaction)
+    observation = transaction["observation"]
+    projection = transaction["projection"]
+    complete = _retirement_transaction_document(
+        observation=observation,
+        projection=projection,
+        state="complete",
+    )
+    _validate_private_json_size(observation, label="retirement observation record")
+    _validate_private_json_size(projection, label="retirement projection record")
+    _validate_private_json_size(complete, label="retirement transaction record")
+    observation_path = _retirement_observation_path(
+        str(transaction["request_id"]),
+        str(transaction["surface_id"]),
+        str(transaction["observation_id"]),
+    )
+    projection_path = _retirement_resolution_path(
+        str(transaction["request_id"]), str(transaction["surface_id"])
+    )
+    _create_private_json(observation_path, observation)
+    _ensure_private_directory(PLATFORM_RETIREMENT_RESOLUTION_ROOT)
+    _write_private_json(projection_path, projection)
+    _ensure_private_directory(path.parent)
+    _write_private_json(path, complete)
+    return complete
+
+
+def _retirement_projection_result(
+    *,
+    projection: dict[str, Any],
+    current: dict[str, Any],
+    now_unix: int,
+    replayed_observation_sha256: str | None = None,
+) -> dict[str, Any]:
+    observed_at = int(projection["observed_at_unix"])
+    fresh_until = int(projection["fresh_until_unix"])
+    fresh = (
+        observed_at <= now_unix + REPOSKOP_RETIREMENT_CLOCK_SKEW_SECONDS
+        and now_unix <= fresh_until
+    )
+    state = projection["state"] if fresh else "retirement_surface_stale"
+    result = {
+        "state": state,
+        "projected_state": projection["state"],
+        "valid": fresh,
+        "fresh": fresh,
+        "request_id": projection["request_id"],
+        "surface_id": projection["surface_id"],
+        "connector_id": projection["connector_id"],
+        "observation_id": projection["observation_id"],
+        "observation_sha256": projection["observation_sha256"],
+        "resolution_sha256": projection["resolution_sha256"],
+        "matched_tool_names": list(projection["matched_tool_names"]),
+        "forbidden_tool_names_present": list(projection["matched_tool_names"]),
+        "observed_at_unix": observed_at,
+        "fresh_until_unix": fresh_until,
+        "generic_platform_publication_state": current["state"],
+        "does_not_establish": list(REPOSKOP_RETIREMENT_NONCLAIMS),
+    }
+    if replayed_observation_sha256 is not None:
+        result["idempotent"] = True
+        result["replayed_observation_sha256"] = replayed_observation_sha256
+        result["replay_superseded"] = (
+            replayed_observation_sha256 != projection["observation_sha256"]
+        )
+    return result
+
+
+def _retirement_surface_status_locked(
+    *,
+    request_id: str,
+    surface_id: str,
+    server_binding: dict[str, Any],
+    now_unix: int,
+) -> dict[str, Any]:
+    current = _read_publication_current()
+    if current is None or current.get("request_id") != request_id:
+        raise ClientSnapshotError("retirement surface status targets a non-current publication request")
+    if current.get("state") not in PLATFORM_PUBLICATION_ACTIVATED_STATES:
+        raise ClientSnapshotError("retirement surface status requires an activated publication request")
+    request = _read_publication_request(request_id)
+    request_sha256 = request["request_sha256"]
+    contract_sha256 = request["expected_contract"]["tool_contract_sha256"]
+    if current.get("contract_sha256") != contract_sha256:
+        raise ClientSnapshotError("retirement surface status request/current contract mismatch")
+    if (
+        server_binding["registered_names_sha256"]
+        != request["expected_contract"]["tool_names_sha256"]
+    ):
+        raise ClientSnapshotError(
+            "retirement server binding tool catalog does not match publication request"
+        )
+    transaction_path = _retirement_transaction_path(request_id, surface_id)
+    try:
+        transaction = _validate_retirement_transaction(
+            _read_private_json(transaction_path)
+        )
+    except FileNotFoundError:
+        transaction = None
+    if transaction is not None and transaction["state"] == "pending":
+        raise ClientSnapshotError(
+            "retirement surface transaction is pending recovery"
+        )
+    try:
+        projection = _validate_retirement_resolution(
+            _read_private_json(_retirement_resolution_path(request_id, surface_id))
+        )
+    except FileNotFoundError:
+        if transaction is not None:
+            raise ClientSnapshotError(
+                "retirement surface transaction references missing projection"
+            )
+        return {
+            "state": "retirement_surface_missing",
+            "valid": False,
+            "fresh": False,
+            "request_id": request_id,
+            "surface_id": surface_id,
+            "generic_platform_publication_state": current["state"],
+            "does_not_establish": list(REPOSKOP_RETIREMENT_NONCLAIMS),
+        }
+    expected_binding_fields = {
+        "connector_id": server_binding["connector_id"],
+        "client_scope_sha256": server_binding["client_scope_sha256"],
+        "state_scope_sha256": server_binding["state_scope_sha256"],
+        "runtime_binding_sha256": server_binding["runtime_binding_sha256"],
+    }
+    if (
+        projection.get("request_sha256") != request_sha256
+        or projection.get("contract_sha256") != contract_sha256
+        or projection.get("surface_id") != surface_id
+        or any(projection.get(key) != value for key, value in expected_binding_fields.items())
+    ):
+        raise ClientSnapshotError("retirement surface resolution binding mismatch")
+    try:
+        observation = _validate_retirement_observation(
+            _read_private_json(
+                _retirement_observation_path(
+                    request_id, surface_id, str(projection["observation_id"])
+                )
+            )
+        )
+    except FileNotFoundError as exc:
+        raise ClientSnapshotError(
+            "retirement surface resolution references missing observation"
+        ) from exc
+    if transaction is None or transaction["state"] != "complete":
+        raise ClientSnapshotError(
+            "retirement surface resolution lacks completed transaction evidence"
+        )
+    if (
+        transaction.get("projection") != projection
+        or transaction.get("observation") != observation
+        or observation.get("observation_sha256") != projection.get("observation_sha256")
+        or observation.get("request_sha256") != request_sha256
+        or observation.get("contract_sha256") != contract_sha256
+        or observation.get("surface_id") != surface_id
+        or observation.get("server_binding") != server_binding
+        or observation.get("matched_tool_names") != projection.get("matched_tool_names")
+        or observation.get("source_reference") != projection.get("source_reference")
+        or observation.get("observed_at_unix") != projection.get("observed_at_unix")
+        or observation.get("fresh_until_unix") != projection.get("fresh_until_unix")
+    ):
+        raise ClientSnapshotError("retirement surface observation/resolution binding mismatch")
+    return _retirement_projection_result(
+        projection=projection,
+        current=current,
+        now_unix=now_unix,
+    )
+
+
+def retirement_surface_status(
+    *,
+    request_id: str,
+    surface_id: str,
+    server_binding: dict[str, Any],
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    timestamp = int(time.time()) if now_unix is None else now_unix
+    if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0:
+        raise ClientSnapshotError("retirement surface status time is invalid")
+    request_id = _validate_identifier(request_id, label="retirement publication request id")
+    surface_id = _validate_identifier(surface_id, label="retirement surface id")
+    binding = _validate_retirement_server_binding(server_binding, surface_id=surface_id)
+    with _state_lock():
+        return _retirement_surface_status_locked(
+            request_id=request_id,
+            surface_id=surface_id,
+            server_binding=binding,
+            now_unix=timestamp,
+        )
+
+
+def record_platform_retirement_surface_observation(
+    *,
+    request_id: str,
+    surface_id: str,
+    observation_id: str,
+    query: str,
+    matched_tool_names: list[str],
+    source_reference: str,
+    server_binding: dict[str, Any],
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    """Persist one narrow principal-bound ChatGPT tool-discovery retirement observation.
+
+    Observations are immutable historical evidence. The per-request/surface resolution
+    is a latest-evidence projection: a newer non-empty ``reposkop`` result invalidates
+    an older zero-result projection. This path never mutates generic platform
+    publication state and never claims complete-schema publication.
+    """
+
+    timestamp = int(time.time()) if now_unix is None else now_unix
+    if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0:
+        raise ClientSnapshotError("retirement surface observation time is invalid")
+    request_id = _validate_identifier(request_id, label="retirement publication request id")
+    surface_id = _validate_identifier(surface_id, label="retirement surface id")
+    observation_id = _validate_identifier(observation_id, label="retirement observation id")
+    source_reference = _validate_platform_source_reference(source_reference)
+    binding = _validate_retirement_server_binding(server_binding, surface_id=surface_id)
+    if surface_id not in REPOSKOP_RETIREMENT_SURFACES:
+        raise ClientSnapshotError("retirement surface id is not an allowed ChatGPT connector")
+    if not source_reference.startswith(REPOSKOP_RETIREMENT_SOURCE_PREFIX):
+        raise ClientSnapshotError("retirement source reference is not ChatGPT tool-discovery evidence")
+    if query != REPOSKOP_RETIREMENT_QUERY:
+        raise ClientSnapshotError("retirement surface query must be the exact reposkop query")
+    if not isinstance(matched_tool_names, list):
+        raise ClientSnapshotError("retirement matched tool names must be a list")
+    normalized_names: list[str] = []
+    for value in matched_tool_names:
+        normalized_name = _validate_identifier(value, label="retirement matched tool name")
+        if REPOSKOP_RETIREMENT_QUERY not in normalized_name:
+            raise ClientSnapshotError(
+                "retirement matched tool name does not match the exact reposkop query"
+            )
+        normalized_names.append(normalized_name)
+    if len(set(normalized_names)) != len(normalized_names):
+        raise ClientSnapshotError("retirement matched tool names contain duplicates")
+    normalized_names = sorted(normalized_names)
+
+    with _state_lock():
+        current = _read_publication_current()
+        if current is None or current["request_id"] != request_id:
+            raise ClientSnapshotError(
+                "retirement surface observation targets a non-current publication request"
+            )
+        if current["state"] not in PLATFORM_PUBLICATION_ACTIVATED_STATES:
+            raise ClientSnapshotError(
+                "retirement surface observation requires an activated publication request"
+            )
+        request = _read_publication_request(request_id)
+        contract_sha256 = request["expected_contract"]["tool_contract_sha256"]
+        if current["contract_sha256"] != contract_sha256:
+            raise ClientSnapshotError(
+                "retirement surface observation request/current contract mismatch"
+            )
+        if (
+            binding["registered_names_sha256"]
+            != request["expected_contract"]["tool_names_sha256"]
+        ):
+            raise ClientSnapshotError(
+                "retirement server binding tool catalog does not match publication request"
+            )
+        historical_present = sorted(
+            REPOSKOP_RETIREMENT_FORBIDDEN_TOOLS.intersection(normalized_names)
+        )
+        forbidden_contract = sorted(REPOSKOP_RETIREMENT_FORBIDDEN_TOOLS)
+        material = {
+            "schema_version": 2,
+            "kind": PLATFORM_RETIREMENT_OBSERVATION_KIND,
+            "request_id": request_id,
+            "request_sha256": request["request_sha256"],
+            "contract_sha256": contract_sha256,
+            "surface_id": surface_id,
+            "observation_id": observation_id,
+            "observation_authority": "chatgpt_connector_principal_bound_tool_discovery",
+            "query": query,
+            "matched_tool_names": normalized_names,
+            "forbidden_tool_names": forbidden_contract,
+            "forbidden_tool_names_present": normalized_names,
+            "historical_forbidden_tool_names_present": historical_present,
+            "forbidden_tool_names_sha256": _sha256_json(forbidden_contract),
+            "source_reference": source_reference,
+            "server_binding": binding,
+            "server_binding_sha256": _sha256_json(binding),
+            "generic_platform_publication_state": current["state"],
+            "observed_at_unix": timestamp,
+            "fresh_until_unix": timestamp + REPOSKOP_RETIREMENT_TTL_SECONDS,
+        }
+        observation = {**material, "observation_sha256": _sha256_json(material)}
+        observation_path = _retirement_observation_path(request_id, surface_id, observation_id)
+        transaction_path = _retirement_transaction_path(request_id, surface_id)
+        try:
+            transaction = _validate_retirement_transaction(
+                _read_private_json(transaction_path)
+            )
+        except FileNotFoundError:
+            transaction = None
+        if transaction is not None and transaction["state"] == "pending":
+            transaction = _settle_retirement_transaction(
+                transaction_path, transaction
+            )
+        try:
+            existing_observation = _validate_retirement_observation(
+                _read_private_json(observation_path)
+            )
+        except FileNotFoundError:
+            existing_observation = None
+        if existing_observation is not None:
+            identity_fields = set(material) - {
+                "generic_platform_publication_state",
+                "observed_at_unix",
+                "fresh_until_unix",
+            }
+            if any(existing_observation.get(key) != material.get(key) for key in identity_fields):
+                raise ClientSnapshotError(
+                    "retirement surface observation id already binds different evidence"
+                )
+            result = _retirement_surface_status_locked(
+                request_id=request_id,
+                surface_id=surface_id,
+                server_binding=binding,
+                now_unix=timestamp,
+            )
+            result["idempotent"] = True
+            result["replayed_observation_sha256"] = existing_observation[
+                "observation_sha256"
+            ]
+            result["replay_superseded"] = (
+                existing_observation["observation_sha256"]
+                != result.get("observation_sha256")
+            )
+            result["generic_platform_publication_unchanged"] = (
+                _read_publication_current() == current
+            )
+            return result
+
+        blocked = bool(normalized_names)
+        projection_material = {
+            "schema_version": 2,
+            "kind": PLATFORM_RETIREMENT_RESOLUTION_KIND,
+            "request_id": request_id,
+            "request_sha256": request["request_sha256"],
+            "contract_sha256": contract_sha256,
+            "surface_id": surface_id,
+            "connector_id": binding["connector_id"],
+            "client_scope_sha256": binding["client_scope_sha256"],
+            "state_scope_sha256": binding["state_scope_sha256"],
+            "runtime_binding_sha256": binding["runtime_binding_sha256"],
+            "observation_id": observation_id,
+            "observation_sha256": observation["observation_sha256"],
+            "criterion": (
+                "reposkop_query_has_matches" if blocked else "reposkop_query_has_zero_matches"
+            ),
+            "state": (
+                "retirement_surface_blocked" if blocked else "retirement_surface_converged"
+            ),
+            "matched_tool_names": normalized_names,
+            "forbidden_tool_names": forbidden_contract,
+            "source_reference": source_reference,
+            "observed_at_unix": timestamp,
+            "fresh_until_unix": timestamp + REPOSKOP_RETIREMENT_TTL_SECONDS,
+            "projected_at_unix": timestamp,
+        }
+        projection = {
+            **projection_material,
+            "resolution_sha256": _sha256_json(projection_material),
+        }
+        pending = _retirement_transaction_document(
+            observation=observation,
+            projection=projection,
+            state="pending",
+        )
+        _ensure_private_directory(transaction_path.parent)
+        _write_private_json(transaction_path, pending)
+        _settle_retirement_transaction(transaction_path, pending)
+        result = _retirement_surface_status_locked(
+            request_id=request_id,
+            surface_id=surface_id,
+            server_binding=binding,
+            now_unix=timestamp,
+        )
+        result["generic_platform_publication_unchanged"] = (
+            _read_publication_current() == current
+        )
+        return result
 
 
 def _persist_publication_receipt(
