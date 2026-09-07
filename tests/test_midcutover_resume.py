@@ -439,6 +439,151 @@ def resume_receipt(
     return {**material, "receipt_sha256": midcutover.canonical_json_sha256(material)}
 
 
+def durable_rebind_evidence(
+    *, receipt_sha256: str = "ab" * 32, marker: str | None = None
+) -> dict[str, object]:
+    transition: dict[str, object] = {
+        "source_receipt_sha256": SOURCE_SNAPSHOT_RECEIPT_SHA256,
+        "source_client_declaration_sha256": SOURCE_CLIENT_DECLARATION_SHA256,
+        "from_release_id": BLUE_RELEASE,
+        "from_repo_head": HEAD_BLUE,
+        "to_release_id": GREEN_RELEASE,
+        "to_repo_head": HEAD_GREEN,
+        "source_evidence_time": ACTIVATION_TIME,
+        "source_created_at_unix": ACTIVATION_TIME - 1,
+        "source_expires_at_unix": ACTIVATION_TIME + 100,
+        "schema_identity_sha256": "81" * 32,
+        "complete_schema_sha256": "82" * 32,
+        "target_schema_identity_sha256": "81" * 32,
+        "target_complete_schema_sha256": "82" * 32,
+        "schema_changed": False,
+        "surface_changed": False,
+        "instructions_changed": False,
+        "agent_instructions_transition": None,
+        "surface_continuity_sha256": "83" * 32,
+        "green_readiness_sha256": midcutover.canonical_json_sha256(GREEN_READINESS),
+        "publication_schema_transition": None,
+    }
+    evidence: dict[str, object] = {
+        "schema_version": 1,
+        "state": "matched",
+        "verified": True,
+        "cutover_rebind": True,
+        "observation_scope": "server_loopback_watchdog",
+        "client_declaration_sha256": SOURCE_CLIENT_DECLARATION_SHA256,
+        "source_receipt_sha256": SOURCE_SNAPSHOT_RECEIPT_SHA256,
+        "source_snapshot_receipt_sha256": SOURCE_SNAPSHOT_RECEIPT_SHA256,
+        "source_client_declaration_sha256": SOURCE_CLIENT_DECLARATION_SHA256,
+        "classified_snapshot_receipt_sha256": SOURCE_SNAPSHOT_RECEIPT_SHA256,
+        "source_release_id": BLUE_RELEASE,
+        "source_repo_head": HEAD_BLUE,
+        "target_release_id": GREEN_RELEASE,
+        "target_repo_head": HEAD_GREEN,
+        "receipt_sha256": receipt_sha256,
+        "cutover_binding": {
+            "cutover_id": CUTOVER_ID,
+            "cutover_generation": CUTOVER_GENERATION,
+            "rebind_role": "blue-green-cutover",
+        },
+        "cutover_transition": transition,
+        "verification_model": "test-unchanged-rebind",
+        "schema_contract_matches": True,
+        "schema_changed": False,
+        "surface_changed": False,
+        "instructions_changed": False,
+        "agent_instructions_transition": None,
+        "publication_schema_transition": None,
+        "recommended_next_action": "refresh client",
+        "does_not_establish": [],
+    }
+    if marker is not None:
+        evidence["test_marker"] = marker
+    return evidence
+
+
+def outcome_unknown_resume_with_durable_rebind(
+    *, durable: dict[str, object] | None = None, resume_id: str = "bgcr-durable00000001"
+) -> dict[str, object]:
+    receipt = resume_receipt(
+        outcome="outcome_unknown",
+        resume_id=resume_id,
+        resume_phase=midcutover.PHASE_REBIND_SNAPSHOT,
+    )
+    rebind = receipt["snapshot_rebind"]
+    assert isinstance(rebind, dict)
+    full = durable or durable_rebind_evidence()
+    rebind["receipt_sha256"] = full["receipt_sha256"]
+    rebind["durable_rebind"] = full
+    recovery = receipt.get("recovery")
+    assert isinstance(recovery, dict)
+    recovery["snapshot_rebind_applied"] = True
+    receipt.pop("receipt_sha256", None)
+    receipt["receipt_sha256"] = midcutover.canonical_json_sha256(receipt)
+    return receipt
+
+
+class DurableResumeRebindResolutionTests(unittest.TestCase):
+    def test_outcome_unknown_resume_can_carry_exact_durable_rebind(self) -> None:
+        cutover = cutover_receipt()
+        durable = durable_rebind_evidence()
+        resume = outcome_unknown_resume_with_durable_rebind(durable=durable)
+        self.assertEqual(
+            midcutover.durable_snapshot_rebind_for_cutover(
+                [cutover, resume], cutover
+            ),
+            durable,
+        )
+
+    def test_conflicting_durable_resume_rebinds_fail_closed(self) -> None:
+        cutover = cutover_receipt()
+        first = outcome_unknown_resume_with_durable_rebind(
+            durable=durable_rebind_evidence(marker="first"),
+            resume_id="bgcr-durable00000002",
+        )
+        second = outcome_unknown_resume_with_durable_rebind(
+            durable=durable_rebind_evidence(marker="second"),
+            resume_id="bgcr-durable00000003",
+        )
+        with self.assertRaisesRegex(
+            midcutover.MidCutoverEvidenceError, "conflicting durable snapshot rebind"
+        ):
+            midcutover.durable_snapshot_rebind_for_cutover(
+                [cutover, first, second], cutover
+            )
+
+    def test_claimed_s0_without_full_durable_rebind_fails_closed(self) -> None:
+        cutover = cutover_receipt()
+        resume = resume_receipt(
+            outcome="outcome_unknown",
+            resume_id="bgcr-durable00000004",
+            resume_phase=midcutover.PHASE_REBIND_SNAPSHOT,
+        )
+        recovery = resume.get("recovery")
+        assert isinstance(recovery, dict)
+        recovery["snapshot_rebind_applied"] = True
+        resume.pop("receipt_sha256", None)
+        resume["receipt_sha256"] = midcutover.canonical_json_sha256(resume)
+        with self.assertRaisesRegex(
+            midcutover.MidCutoverEvidenceError, "without durable lineage"
+        ):
+            midcutover.durable_snapshot_rebind_for_cutover([cutover, resume], cutover)
+
+    def test_pre_s0_outcome_unknown_with_partial_binding_is_not_candidate(self) -> None:
+        cutover = cutover_receipt()
+        resume = resume_receipt(
+            outcome="outcome_unknown",
+            resume_id="bgcr-durable00000005",
+            resume_phase=midcutover.PHASE_REBIND_SNAPSHOT,
+        )
+        resume["resume_binding"] = {}
+        resume["resume_binding_sha256"] = "00" * 32
+        resume.pop("receipt_sha256", None)
+        resume["receipt_sha256"] = midcutover.canonical_json_sha256(resume)
+        self.assertIsNone(
+            midcutover.durable_snapshot_rebind_for_cutover([cutover, resume], cutover)
+        )
+
+
 GREEN_OBSERVATION = {
     "release_id": GREEN_RELEASE,
     "repo_head": HEAD_GREEN,
@@ -826,6 +971,53 @@ class SnapshotInspectorDependencyTests(unittest.TestCase):
         )
         self.assertEqual(observed["state"], midcutover.SNAPSHOT_BINDING_UNREADABLE)
         self.assertEqual(observed["transition_sha256"], "a" * 64)
+
+    def test_collect_inputs_recovers_durable_rebind_from_prior_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            receipt_root = root / "receipts"
+            receipt_root.mkdir(mode=0o700)
+            cutover = cutover_receipt()
+            durable = durable_rebind_evidence()
+            resume = outcome_unknown_resume_with_durable_rebind(durable=durable)
+            for name, receipt in (("cutover.json", cutover), ("resume.json", resume)):
+                path = receipt_root / name
+                path.write_text(
+                    json.dumps(
+                        receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                    ),
+                    encoding="utf-8",
+                )
+                path.chmod(0o600)
+            calls: list[dict[str, object]] = []
+
+            def inspect(**parameters):
+                calls.append(parameters)
+                return SNAPSHOT_REBOUND
+
+            with mock.patch.object(
+                midcutover, "read_routing_selector_document", return_value=selector_document()
+            ), mock.patch.object(
+                midcutover,
+                "observe_green_release",
+                side_effect=[GREEN_OBSERVATION, BLUE_OBSERVATION],
+            ), mock.patch.object(
+                midcutover, "observe_stable_pointer", return_value=POINTER_AT_BLUE
+            ):
+                observed = midcutover.collect_classification_inputs(
+                    selector_path=root / "selector.json",
+                    receipt_root=receipt_root,
+                    releases_root=root / "releases",
+                    runtime_path=root / "runtime",
+                    green_unit_observer=lambda _unit: {"active": True},
+                    snapshot_inspector=inspect,
+                )
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0]["durable_rebind"], durable)
+            self.assertEqual(
+                observed["snapshot_observation"]["state"],
+                midcutover.SNAPSHOT_BINDING_DONE,
+            )
 
     def test_missing_snapshot_inspector_fails_closed(self) -> None:
         with self.assertRaisesRegex(
@@ -3244,6 +3436,81 @@ class SuccessorSnapshotRuntimeBindingTests(unittest.TestCase):
             runtime = self._runtime(root)
             with self.assertRaises(dual.core.DeployError):
                 runtime.successor_snapshot_rebind_evidence()
+
+
+    def test_effect_guard_resolves_durable_rebind_from_prior_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            cutover = cutover_receipt()
+            durable = durable_rebind_evidence()
+            resume = outcome_unknown_resume_with_durable_rebind(durable=durable)
+            for name, receipt in (("cutover.json", cutover), ("resume.json", resume)):
+                path = root / name
+                path.write_text(
+                    json.dumps(
+                        receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                    ),
+                    encoding="utf-8",
+                )
+                path.chmod(0o600)
+            runtime = self._runtime(root)
+            runtime.resume_binding["resumed_receipt_sha256"] = cutover["receipt_sha256"]
+            self.assertEqual(runtime.successor_snapshot_rebind_evidence(), durable)
+
+    def test_rebind_snapshot_summary_persists_full_durable_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            runtime = self._runtime(root)
+            runtime.green_readiness = GREEN_READINESS
+            durable = durable_rebind_evidence()
+            rebound_readback = {
+                **SNAPSHOT_REBOUND,
+                "snapshot_receipt_sha256": durable["receipt_sha256"],
+            }
+            with mock.patch.object(
+                dual.client_snapshot,
+                "rebind_snapshot_for_midcutover_recovery",
+                return_value=durable,
+            ), mock.patch.object(
+                midcutover,
+                "observe_client_snapshot_binding",
+                return_value=rebound_readback,
+            ):
+                summary = runtime.rebind_snapshot()
+            self.assertEqual(summary["durable_rebind"], durable)
+            self.assertEqual(runtime.snapshot_rebind, summary)
+
+    def test_rebind_readback_failure_retains_full_durable_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            runtime = self._runtime(root)
+            runtime.green_readiness = GREEN_READINESS
+            durable = durable_rebind_evidence()
+            with mock.patch.object(
+                dual.client_snapshot,
+                "rebind_snapshot_for_midcutover_recovery",
+                return_value=durable,
+            ), mock.patch.object(
+                midcutover,
+                "observe_client_snapshot_binding",
+                return_value={
+                    "state": midcutover.SNAPSHOT_BINDING_UNREADABLE,
+                    "snapshot_receipt_sha256": None,
+                },
+            ):
+                with self.assertRaisesRegex(
+                    dual.core.DeployError, "Snapshot rebind readback"
+                ):
+                    runtime.rebind_snapshot()
+            summary = runtime.snapshot_rebind
+            self.assertIsInstance(summary, dict)
+            assert isinstance(summary, dict)
+            self.assertTrue(summary["rebound"])
+            self.assertEqual(summary["receipt_sha256"], durable["receipt_sha256"])
+            self.assertEqual(summary["durable_rebind"], durable)
 
 
 class GreenProofBeforeEffectTests(unittest.TestCase):
