@@ -662,12 +662,43 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertEqual(policy["read_roots"], ["${HOME}"])
         self.assertEqual(
             set(policy["profiles"]),
-            {"observe", "maintain", "mutate", "break-glass"},
+            {"observe", "maintain", "mutate", "failover-mutate", "break-glass"},
         )
         self.assertIn(
             "terminal_execute",
             policy["profiles"]["break-glass"]["capabilities"],
         )
+        self.assertIn("bureau_mutation", policy["capability_definitions"])
+        self.assertIn("bureau_mutation", policy["profiles"]["mutate"]["capabilities"])
+        self.assertIn("bureau_mutation", policy["profiles"]["break-glass"]["capabilities"])
+        failover = policy["profiles"]["failover-mutate"]
+        self.assertEqual(
+            set(failover["capabilities"]),
+            {
+                "file_read", "audit_verify", "audit_read", "bureau_mutation",
+                "resource_lease", "process_inspect", "port_inspect",
+            },
+        )
+        self.assertEqual(
+            set(failover["write_roots"]),
+            {
+                "${HOME}/repos",
+                "${HOME}/.local/state/grabowski",
+                "${HOME}/.local/state/bureau",
+            },
+        )
+        self.assertNotIn("${HOME}", failover["write_roots"])
+        self.assertIs(failover["trusted_owner"], False)
+        for forbidden in (
+            "terminal_execute", "durable_job", "file_write", "rollback_text",
+            "artifact_transfer", "git_cli", "github_cli",
+            "user_service_control", "user_service_logs_read",
+            "browser_worker", "gui_worker", "secret_inspect", "secret_reveal",
+            "secret_use", "secret_export", "browser_profile_read",
+            "process_signal", "privileged_reference", "power_execute",
+            "file_delete", "file_destroy",
+        ):
+            self.assertNotIn(forbidden, failover["capabilities"])
         self.assertIn("privileged_reference", policy["capability_definitions"])
         self.assertIn("secret_use", policy["capability_definitions"])
         self.assertIn("browser_profile_read", policy["capability_definitions"])

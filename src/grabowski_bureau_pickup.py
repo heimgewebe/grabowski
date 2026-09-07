@@ -2568,12 +2568,16 @@ def _registry_successor_proof(
 
 
 def _authoritative_task_spec_for_recovery(
-    registry_task: dict[str, Any],
+    registry_task: dict[str, Any] | None,
     *,
     task_id: str,
     coordination_root: str | None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if coordination_root is None:
+        if registry_task is None:
+            raise BureauPickupError(
+                "orphan-recovery-task-missing", details={"task_id": task_id}
+            )
         return registry_task, {"kind": "legacy-git-bootstrap", "revision": None}
     state_root = Path(coordination_root)
     state_db = state_root / "bureau.sqlite3"
@@ -2604,6 +2608,10 @@ def _authoritative_task_spec_for_recovery(
                 raise BureauPickupError("orphan-recovery-task-spec-schema-drift")
             count = int(connection.execute("SELECT COUNT(*) FROM task_specs").fetchone()[0])
             if count == 0:
+                if registry_task is None:
+                    raise BureauPickupError(
+                        "orphan-recovery-task-missing", details={"task_id": task_id}
+                    )
                 return registry_task, {
                     "kind": "legacy-git-bootstrap",
                     "revision": None,
@@ -2674,14 +2682,17 @@ def _current_registry_revision_proof(
         raise BureauPickupError("orphan-recovery-requires-canonical-registry")
     task_id = intent["task_id"]
     root = Path(identity["registry_root"])
-    task = _registry_json(
-        root / "registry" / "tasks" / f"{task_id}.json",
-        label="orphan-recovery-task",
-    )
-    if task.get("id") != task_id:
-        raise BureauPickupError("orphan-recovery-task-id-drift")
+    task_path = root / "registry" / "tasks" / f"{task_id}.json"
+    registry_task = None
+    if os.path.lexists(task_path):
+        registry_task = _registry_json(
+            task_path,
+            label="orphan-recovery-task",
+        )
+        if registry_task.get("id") != task_id:
+            raise BureauPickupError("orphan-recovery-task-id-drift")
     task, task_authority = _authoritative_task_spec_for_recovery(
-        task, task_id=task_id, coordination_root=coordination_root
+        registry_task, task_id=task_id, coordination_root=coordination_root
     )
     revision = json.loads(json.dumps(task))
     revision.pop("state", None)
@@ -4254,6 +4265,101 @@ def _validated_existing_assignment_repair_acquisition(
     return leases_by_key
 
 
+def _legacy_control_registry_successor_proof(
+    stored_binding: RegistryBinding,
+    current_binding: RegistryBinding,
+) -> dict[str, Any]:
+    """Prove that a legacy explicit control-root journal belongs to current Bureau truth."""
+
+    stored = _validate_registry_binding_identity(stored_binding["identity"])
+    current = _validate_registry_binding_identity(current_binding["identity"])
+    if stored.get("kind") != "explicit-registry-root":
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-legacy-registry-kind-invalid"
+        )
+    if current.get("kind") != "canonical-registry-binding":
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-current-registry-not-canonical"
+        )
+    if stored["registry_root"] != str(bureau_leases.BUREAU_CONTROL_ROOT):
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-explicit-registry-not-control-root",
+            details={"registry_root": stored["registry_root"]},
+        )
+    try:
+        control = bureau_leases.inspect_bureau_control_checkout(require_current=True)
+    except bureau_leases.BureauLeaseContractError as exc:
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-control-registry-unavailable",
+            details={"cause_code": exc.code},
+        ) from exc
+    if (
+        control.get("status") != "current"
+        or control.get("control_root") != stored["registry_root"]
+        or control.get("branch") != bureau_leases.BUREAU_CONTROL_BRANCH
+        or control.get("upstream") != bureau_leases.BUREAU_CONTROL_UPSTREAM
+    ):
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-control-registry-drift"
+        )
+    deployed_source = current["source_commit"]
+    control_head = control.get("head")
+    if not isinstance(control_head, str) or re.fullmatch(r"[0-9a-f]{40}", control_head) is None:
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-control-head-invalid"
+        )
+    if deployed_source != control_head:
+        lines = bureau._git_identity_lines(
+            bureau_leases.BUREAU_REPOSITORY_ROOT,
+            "merge-base",
+            "--is-ancestor",
+            deployed_source,
+            control_head,
+        )
+        if lines is None:
+            raise BureauPickupError(
+                "existing-assignment-lease-repair-canonical-source-not-ancestor",
+                details={
+                    "canonical_source_commit": deployed_source,
+                    "control_head": control_head,
+                },
+            )
+    return {
+        "legacy_registry_root": stored["registry_root"],
+        "legacy_registry_binding_sha256": stored["binding_sha256"],
+        "canonical_registry_root": current["registry_root"],
+        "canonical_registry_binding_sha256": current["binding_sha256"],
+        "canonical_source_commit": deployed_source,
+        "control_head": control_head,
+        "control_branch": control["branch"],
+        "control_upstream": control["upstream"],
+        "ancestor_proven": True,
+    }
+
+
+def _existing_assignment_repair_revision_binding(
+    registry_binding: RegistryBinding,
+) -> RegistryBinding:
+    identity = _validate_registry_binding_identity(registry_binding["identity"])
+    if identity.get("kind") != "explicit-registry-root":
+        return registry_binding
+    if identity["registry_root"] != str(bureau_leases.BUREAU_CONTROL_ROOT):
+        return registry_binding
+    current_binding = _canonical_registry_binding()
+    _legacy_control_registry_successor_proof(registry_binding, current_binding)
+    return current_binding
+
+
+def _existing_assignment_repair_effective_request(
+    request: dict[str, Any],
+    registry_binding: RegistryBinding,
+) -> dict[str, Any]:
+    identity = _validate_registry_binding_identity(registry_binding["identity"])
+    if request.get("registry_root") == identity["registry_root"]:
+        return request
+    return {**request, "registry_root": identity["registry_root"]}
+
+
 def _existing_assignment_repair_authority(
     coordination: dict[str, Any],
     intent: dict[str, Any],
@@ -4262,7 +4368,7 @@ def _existing_assignment_repair_authority(
     registry_binding: RegistryBinding,
     *,
     coordination_root: str,
-) -> tuple[dict[str, Any], dict[str, Any]]:
+) -> tuple[dict[str, Any], dict[str, Any], RegistryBinding]:
     if coordination.get("status") != "coordinated":
         raise BureauPickupError(
             "existing-assignment-lease-repair-not-coordinated",
@@ -4342,15 +4448,16 @@ def _existing_assignment_repair_authority(
             },
         )
     external = _existing_assignment_repair_external_binding(run)
+    revision_binding = _existing_assignment_repair_revision_binding(registry_binding)
     _bound_bureau_call(
-        registry_binding,
+        revision_binding,
         lambda: _current_registry_revision_proof(
-            registry_binding,
+            revision_binding,
             intent,
             coordination_root=coordination_root,
         ),
     )
-    return journal_identity, external
+    return journal_identity, external, revision_binding
 
 
 def _lease_repair_receipt_sha256(receipt: dict[str, Any]) -> str:
@@ -5283,7 +5390,9 @@ def _repair_existing_assignment_lease_binding(
     acquisition: dict[str, Any],
     run_dir: Path,
     registry_binding: RegistryBinding,
-) -> dict[str, Any] | bool:
+    *,
+    return_binding: bool = False,
+) -> dict[str, Any] | bool | tuple[dict[str, Any], RegistryBinding]:
     lease_state = coordination.get("lease")
     lease_error = lease_state.get("error") if isinstance(lease_state, dict) else None
     error_code = lease_error.get("code") if isinstance(lease_error, dict) else None
@@ -5298,7 +5407,7 @@ def _repair_existing_assignment_lease_binding(
         }
     ):
         return False
-    journal_identity, external = _existing_assignment_repair_authority(
+    journal_identity, external, repair_binding = _existing_assignment_repair_authority(
         coordination,
         intent,
         acquisition,
@@ -5306,6 +5415,16 @@ def _repair_existing_assignment_lease_binding(
         registry_binding,
         coordination_root=request["coordination_root"],
     )
+    repair_request = _existing_assignment_repair_effective_request(
+        request, repair_binding
+    )
+    operator._require_operator_mutation(
+        "bureau_mutation", path=repair_request["registry_root"]
+    )
+
+    def bound_result(value: dict[str, Any]) -> dict[str, Any] | tuple[dict[str, Any], RegistryBinding]:
+        return (value, repair_binding) if return_binding else value
+
     original_by_key = {
         item["resource_key"]: item
         for item in acquisition.get("leases", [])
@@ -5490,14 +5609,16 @@ def _repair_existing_assignment_lease_binding(
         receipt = _persist_lease_repair_receipt(
             run_dir, "lease-reacquire.json", receipt
         )
-        return _heartbeat_lease_repair(
-            intent,
-            request,
-            acquisition,
-            registry_binding,
-            journal_identity,
-            external,
-            receipt,
+        return bound_result(
+            _heartbeat_lease_repair(
+                intent,
+                repair_request,
+                acquisition,
+                repair_binding,
+                journal_identity,
+                external,
+                receipt,
+            )
         )
 
     if error_code == "lease-resources-missing":
@@ -5617,14 +5738,16 @@ def _repair_existing_assignment_lease_binding(
         receipt = _persist_lease_repair_receipt(
             run_dir, "lease-reacquire.json", receipt
         )
-        return _heartbeat_lease_repair(
-            intent,
-            request,
-            acquisition,
-            registry_binding,
-            journal_identity,
-            external,
-            receipt,
+        return bound_result(
+            _heartbeat_lease_repair(
+                intent,
+                repair_request,
+                acquisition,
+                repair_binding,
+                journal_identity,
+                external,
+                receipt,
+            )
         )
 
     if len(groups) != 1:
@@ -5692,14 +5815,16 @@ def _repair_existing_assignment_lease_binding(
     receipt["lease_generation_sha256"] = _sha256(lease_generation)
     receipt["receipt_sha256"] = _sha256(receipt)
     receipt = _persist_lease_repair_receipt(run_dir, "lease-rebind.json", receipt)
-    return _heartbeat_lease_repair(
-        intent,
-        request,
-        acquisition,
-        registry_binding,
-        journal_identity,
-        external,
-        receipt,
+    return bound_result(
+        _heartbeat_lease_repair(
+            intent,
+            repair_request,
+            acquisition,
+            repair_binding,
+            journal_identity,
+            external,
+            receipt,
+        )
     )
 
 
@@ -5739,10 +5864,10 @@ def grabowski_bureau_pickup_execute(
     """Coordinate one Bureau claim with owner-bound Grabowski leases and recovery."""
     normalized, registry_binding = _prepare_request(request)
     operator._require_operator_mutation(
-        "terminal_execute", path=normalized["registry_root"]
+        "bureau_mutation", path=normalized["registry_root"]
     )
     operator._require_operator_mutation(
-        "terminal_execute", path=normalized["coordination_root"]
+        "bureau_mutation", path=normalized["coordination_root"]
     )
     operator._require_operator_mutation("resource_lease")
     request_sha256 = _sha256(normalized)
@@ -5842,11 +5967,27 @@ def grabowski_bureau_pickup_execute(
         repair_obligation = _read_existing_assignment_lease_repair_obligation(
             run_dir, intent, normalized, acquisition
         )
+        result_registry_binding = registry_binding
         if repair_obligation is not None:
             receipt, journal_identity, external = repair_obligation
             activity_id = _lease_repair_activity_id(receipt["receipt_sha256"])
+            repair_binding = _existing_assignment_repair_revision_binding(
+                registry_binding
+            )
+            result_registry_binding = repair_binding
+            repair_request = _existing_assignment_repair_effective_request(
+                normalized, repair_binding
+            )
+            _bound_bureau_call(
+                repair_binding,
+                lambda: _current_registry_revision_proof(
+                    repair_binding,
+                    intent,
+                    coordination_root=repair_request["coordination_root"],
+                ),
+            )
             coordination = _read_lease_repair_activity_status(
-                intent, normalized, registry_binding, activity_id
+                intent, repair_request, repair_binding, activity_id
             )
             coordination = _validate_lease_repair_activity_status(
                 coordination,
@@ -5880,22 +6021,27 @@ def grabowski_bureau_pickup_execute(
                     acquisition,
                     run_dir,
                     registry_binding,
+                    return_binding=True,
                 )
                 if not repaired:
                     raise
-                coordination = repaired
+                coordination, result_registry_binding = repaired
                 _validate_claim_readback(coordination, intent, acquisition)
         result = {
             "schema_version": SCHEMA_VERSION,
             "kind": "grabowski_bureau_pickup",
             "status": intent_payload["status"],
             "request_sha256": request_sha256,
-            "registry_binding_sha256": registry_binding["identity"]["binding_sha256"],
-            "registry_binding_kind": registry_binding["identity"]["kind"],
+            "registry_binding_sha256": result_registry_binding["identity"]["binding_sha256"],
+            "registry_binding_kind": result_registry_binding["identity"]["kind"],
             "registry_binding_source": (
-                "legacy-journal-explicit-registry-root"
-                if registry_binding["legacy"]
-                else "journal-bound"
+                "existing-assignment-repair-canonical-successor"
+                if result_registry_binding["identity"] != registry_binding["identity"]
+                else (
+                    "legacy-journal-explicit-registry-root"
+                    if registry_binding["legacy"]
+                    else "journal-bound"
+                )
             ),
             "run_id": intent["run_id"],
             "task_id": intent["task_id"],
@@ -6396,7 +6542,7 @@ def grabowski_bureau_pickup_release(run_id: str) -> dict[str, Any]:
     binding = _root_binding_for_run(normalized_run_id)
     registry_root = binding["registry_root"]
     operator._require_operator_mutation(
-        "terminal_execute", path=registry_root
+        "bureau_mutation", path=registry_root
     )
     coordination_effect_root = (
         Path(binding["coordination_root"])
@@ -6404,7 +6550,7 @@ def grabowski_bureau_pickup_release(run_id: str) -> dict[str, Any]:
         else _legacy_coordination_root()
     )
     operator._require_operator_mutation(
-        "terminal_execute", path=str(coordination_effect_root)
+        "bureau_mutation", path=str(coordination_effect_root)
     )
     operator._require_operator_mutation("resource_lease")
     run_dir = _run_directory(normalized_run_id)
@@ -6867,7 +7013,7 @@ def grabowski_bureau_pickup_orphan_reconcile(
         else _legacy_coordination_root()
     )
     operator._require_operator_mutation(
-        "terminal_execute", path=str(coordination_effect_root)
+        "bureau_mutation", path=str(coordination_effect_root)
     )
     operator._require_operator_mutation("resource_lease")
 

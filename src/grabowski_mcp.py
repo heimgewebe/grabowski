@@ -187,6 +187,10 @@ _TRANSPORT_CONNECTOR_TOKEN_SUFFIX = ".token"
 _TRANSPORT_CONNECTOR_MAX_IDENTITIES = 32
 _TRANSPORT_CONNECTOR_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43,128}\Z")
 _TRANSPORT_CONNECTOR_ID_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}\Z")
+_REPOSKOP_RETIREMENT_SURFACE_BY_CONNECTOR_ID = {
+    "primary": "grabowski",
+    "kleiner-maulwurf": "der_kleine_maulwurf",
+}
 
 
 class _RetainedTransportTargetMissing(RuntimeError):
@@ -503,6 +507,7 @@ SECRET_CAPABILITIES = (
 )
 OPERATOR_CAPABILITIES = (
     "terminal_execute",
+    "bureau_mutation",
     "durable_job",
     "git_cli",
     "github_cli",
@@ -768,15 +773,15 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_gui_worker_status": ("gui_worker",),
     "grabowski_gui_worker_stop": ("gui_worker",),
     "grabowski_gui_worker_list": ("gui_worker",),
-    "grabowski_bureau_candidate_record": ("terminal_execute",),
+    "grabowski_bureau_candidate_record": ("bureau_mutation",),
     "grabowski_bureau_candidate_assess": (),
-    "grabowski_bureau_task_propose": ("terminal_execute",),
-    "grabowski_bureau_task_review": ("terminal_execute",),
+    "grabowski_bureau_task_propose": ("bureau_mutation",),
+    "grabowski_bureau_task_review": ("bureau_mutation",),
     "grabowski_bureau_task_publish_preview": (),
-    "grabowski_bureau_task_publish": ("resource_lease", "terminal_execute"),
-    "grabowski_bureau_pickup_execute": ("resource_lease", "terminal_execute"),
+    "grabowski_bureau_task_publish": ("bureau_mutation", "resource_lease"),
+    "grabowski_bureau_pickup_execute": ("bureau_mutation", "resource_lease"),
     "grabowski_bureau_pickup_status": (),
-    "grabowski_bureau_pickup_release": ("resource_lease", "terminal_execute"),
+    "grabowski_bureau_pickup_release": ("bureau_mutation", "resource_lease"),
 }
 
 OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
@@ -910,6 +915,19 @@ SECRET_USE_ENV_ALLOWLIST = {
     "TERM",
     "TZ",
 }
+FAILOVER_MUTATE_CAPABILITIES = frozenset(
+    {
+        "file_read",
+        "audit_verify",
+        "audit_read",
+        "bureau_mutation",
+        "resource_lease",
+        "process_inspect",
+        "port_inspect",
+    }
+)
+
+
 SESSION_RISK_LEVELS = ("low", "medium", "high")
 SESSION_RISK_ORDER = {name: index for index, name in enumerate(SESSION_RISK_LEVELS)}
 SESSION_ESCALATION_MAX_SECONDS = 7 * 24 * 60 * 60
@@ -1349,6 +1367,15 @@ def _validate_policy(policy: Any) -> None:
                 label=f"profile {name} capabilities",
             )
             capabilities = set(profile["capabilities"])
+            if name == "failover-mutate":
+                if profile.get("trusted_owner") is not False:
+                    raise RuntimeError(
+                        "Access profile failover-mutate must explicitly disable trusted_owner"
+                    )
+                if capabilities != FAILOVER_MUTATE_CAPABILITIES:
+                    raise RuntimeError(
+                        "Access profile failover-mutate capabilities must match the fixed G6.5 contract"
+                    )
             if capabilities & {
                 "secret_inspect",
                 "secret_reveal",
@@ -5369,6 +5396,34 @@ def _transport_connector_capability_scope(
     return grabowski_transport_roundtrip.validate_client_scope(
         {"kind": "connector_capability", "label": label}
     )
+
+def _retirement_state_scope_sha256() -> str:
+    return grabowski_client_snapshot._retirement_state_scope_sha256()
+
+
+def _reposkop_retirement_server_binding(ctx: Context | None) -> dict[str, Any]:
+    connector_id = _transport_connector_identity(ctx)
+    surface_id = _REPOSKOP_RETIREMENT_SURFACE_BY_CONNECTOR_ID.get(connector_id)
+    if surface_id is None:
+        raise RuntimeError("Reposkop retirement requires a supported enrolled connector identity")
+    scope = _transport_connector_capability_scope(ctx)
+    if scope is None or scope.get("kind") != "connector_capability":
+        raise RuntimeError("Reposkop retirement requires a connector-capability client scope")
+    runtime = _transport_roundtrip_runtime_binding()
+    return {
+        "schema_version": 1,
+        "connector_id": connector_id,
+        "surface_id": surface_id,
+        "client_scope_kind": scope["kind"],
+        "client_scope_sha256": grabowski_transport_roundtrip.client_scope_sha256(scope),
+        "state_scope_sha256": _retirement_state_scope_sha256(),
+        "runtime_binding_sha256": grabowski_transport_assertion.runtime_binding_sha256(runtime),
+        "release_id": runtime["release_id"],
+        "repo_head": runtime["repo_head"],
+        "registered_names_sha256": runtime["registered_names_sha256"],
+        "agent_instructions_sha256": runtime["agent_instructions_sha256"],
+    }
+
 
 def _transport_signed_one_call_evidence(
     ctx: Context | None,
@@ -12476,6 +12531,7 @@ def _grip_run_core(
             "_server_observed_tools",
             "_server_transport_client_scope",
             "_server_transport_runtime_binding",
+            "_server_retirement_binding",
         }.intersection(raw_parameters)
     )
     if reserved_server_parameters:
@@ -12617,6 +12673,17 @@ def _grip_run_core(
         dispatch_parameters["_server_transport_runtime_binding"] = (
             runtime_binding
         )
+    if name == "reposkop-retirement-surface-observe":
+        try:
+            dispatch_parameters["_server_retirement_binding"] = (
+                _reposkop_retirement_server_binding(ctx)
+            )
+        except (RuntimeError, TypeError, ValueError) as exc:
+            return grabowski_grips._blocked_surface_receipt(
+                name,
+                raw_parameters,
+                f"retirement binding unavailable: {type(exc).__name__}",
+            )
     if name == "connector-snapshot-bind":
         deployment = _deployment_metadata()
         tool_contract = _runtime_tool_contract_summary(deployment)

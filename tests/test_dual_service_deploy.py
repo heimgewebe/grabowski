@@ -2051,7 +2051,7 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
         )
         self.assertIn(
             "Environment=GRABOWSKI_SERVER_RECOVERY_TARGET="
-            "local-backup-disk:UUID=249180DA265E8DE0/restic/heim-pc",
+            "local-backup-disk:UUID=9b626294-7913-4be0-88fa-96b314e96ee5/restic/heim-pc",
             content,
         )
         self.assertIn(

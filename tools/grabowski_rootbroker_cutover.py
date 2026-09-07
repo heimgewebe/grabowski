@@ -53,7 +53,7 @@ CUTOVER_LOCK = Path("/run/grabowski/rootbroker-cutover.lock")
 SOCKET_UNIT = "grabowski-privileged-broker.socket"
 OPERATOR_UNIT = "grabowski-operator.service"
 LEGACY_OPERATOR_WATCHDOG_TIMER = "grabowski-operator-watchdog.timer"
-CONFIGURED_TARGET = "local-backup-disk:UUID=249180DA265E8DE0/restic/heim-pc"
+CONFIGURED_TARGET = "local-backup-disk:UUID=9b626294-7913-4be0-88fa-96b314e96ee5/restic/heim-pc"
 LEGACY_CONFIGURED_TARGET = "heimberry:rest-server/grabowski-recovery-probe"
 CANONICAL_REPOSITORY = Path("/home/alex/repos/grabowski")
 CANONICAL_ORIGIN_URL = "git@github.com:heimgewebe/grabowski.git"
@@ -71,13 +71,16 @@ BOOTSTRAP_RECOVERY_ACTION = "runtime_bootstrap_recover"
 LOCAL_BACKUP_NTFS_CHECK_ACTION = "local_backup_ntfs_check"
 LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION = "local_backup_ntfs_clear_dirty"
 LOCAL_BACKUP_SMART_READ_ACTION = "local_backup_smart_read"
+SEAGATE_BACKUP_SMART_READ_ACTION = "seagate_backup_smart_read"
 LOCAL_BACKUP_MOUNT_RECONCILE_ACTION = "local_backup_mount_reconcile"
 LOCAL_BACKUP_NTFS_DEVICE = "/dev/disk/by-uuid/249180DA265E8DE0"
 LOCAL_BACKUP_SMART_DEVICE = "/dev/disk/by-id/usb-Freecom_Freecom_Mobile_Drive_XXS_3.0_93300000078D-0:0"
+SEAGATE_BACKUP_SMART_DEVICE = "/dev/disk/by-id/usb-Seagate_Game_Drive_PS4_NZ0DRYBD-0:0"
 LOCAL_BACKUP_STORAGE_ACTIONS = (
     LOCAL_BACKUP_NTFS_CHECK_ACTION,
     LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION,
     LOCAL_BACKUP_SMART_READ_ACTION,
+    SEAGATE_BACKUP_SMART_READ_ACTION,
     LOCAL_BACKUP_MOUNT_RECONCILE_ACTION,
 )
 AUTOMATIC_CUTOVER_BIND_PATHS = (
@@ -1579,6 +1582,10 @@ def _local_backup_ntfs_actions_from_repository(
         LOCAL_BACKUP_SMART_READ_ACTION: (
             "smart-read",
             ["/usr/sbin/smartctl", "-d", "sat", "-a", LOCAL_BACKUP_SMART_DEVICE],
+        ),
+        SEAGATE_BACKUP_SMART_READ_ACTION: (
+            "smart-read",
+            ["/usr/sbin/smartctl", "-d", "sat", "-a", SEAGATE_BACKUP_SMART_DEVICE],
         ),
         LOCAL_BACKUP_MOUNT_RECONCILE_ACTION: (
             "reconcile",

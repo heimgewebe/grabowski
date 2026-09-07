@@ -51,7 +51,7 @@ CANONICAL_RECOVERY = Path(os.environ.get(
 BACKUP_TIMER = os.environ.get("GRABOWSKI_BACKUP_TIMER", "restic-backup-1930.timer")
 MAX_AGE_SECONDS = int(os.environ.get("GRABOWSKI_RECOVERY_MAX_AGE_SECONDS", str(24 * 60 * 60)))
 DEFAULT_SERVER_RECOVERY_HOST = "heimberry"
-DEFAULT_SERVER_RECOVERY_TARGET = "local-backup-disk:UUID=249180DA265E8DE0/restic/heim-pc"
+DEFAULT_SERVER_RECOVERY_TARGET = "local-backup-disk:UUID=9b626294-7913-4be0-88fa-96b314e96ee5/restic/heim-pc"
 SERVER_RECOVERY_HOST = os.environ.get("GRABOWSKI_SERVER_RECOVERY_HOST", DEFAULT_SERVER_RECOVERY_HOST)
 SERVER_RECOVERY_REMOTE_PORT = int(os.environ.get("GRABOWSKI_SERVER_RECOVERY_REMOTE_PORT", "18081"))
 SERVER_RECOVERY_REST_USER = os.environ.get("GRABOWSKI_SERVER_RECOVERY_REST_USER", "grabowski")
@@ -68,9 +68,10 @@ SERVER_RECOVERY_REPOSITORY_PASSWORD = Path(os.environ.get(
 RESTIC_BIN = os.environ.get("GRABOWSKI_RESTIC_BIN", "/usr/bin/restic")
 SSH_BIN = os.environ.get("GRABOWSKI_SSH_BIN", "/usr/bin/ssh")
 LOCAL_RECOVERY_MOUNT = Path(os.environ.get("GRABOWSKI_LOCAL_RECOVERY_MOUNT", "/mnt/backup")).expanduser()
+LOCAL_RECOVERY_FSTYPE = os.environ.get("GRABOWSKI_LOCAL_RECOVERY_FSTYPE", "ext4")
 LOCAL_RECOVERY_REPOSITORY_ID = os.environ.get(
     "GRABOWSKI_LOCAL_RECOVERY_REPOSITORY_ID",
-    "d107caf1705b0d0a1b2b36751e7d0a5e01f8108eede760fc646c7b9f8f128f4d",
+    "85ee278eeb58f42c26745796cb7b23239d4c7c01f5f4d00f2c10e216cefa4972",
 )
 LOCAL_RECOVERY_RUN_MAX_SECONDS = int(
     os.environ.get("GRABOWSKI_LOCAL_RECOVERY_RUN_MAX_SECONDS", "7200")
@@ -1001,6 +1002,8 @@ def _local_recovery_repository(
         raise RuntimeError("local recovery target is incomplete")
     if not LOCAL_RECOVERY_MOUNT.is_absolute() or LOCAL_RECOVERY_MOUNT.is_symlink():
         raise RuntimeError("local recovery mount path is unsafe")
+    if LOCAL_RECOVERY_FSTYPE not in {"ext4", "ntfs3"}:
+        raise RuntimeError("local recovery filesystem type is invalid")
     env = dict(os.environ)
     findmnt = _run_logged(
         [
@@ -1009,7 +1012,7 @@ def _local_recovery_repository(
             "-T",
             str(LOCAL_RECOVERY_MOUNT),
             "-t",
-            "ntfs3",
+            LOCAL_RECOVERY_FSTYPE,
             "-o",
             "TARGET,SOURCE,FSTYPE",
         ],
@@ -1024,7 +1027,7 @@ def _local_recovery_repository(
     if (
         mount_target != str(LOCAL_RECOVERY_MOUNT)
         or not mount_source.startswith("/dev/")
-        or mount_fstype != "ntfs3"
+        or mount_fstype != LOCAL_RECOVERY_FSTYPE
     ):
         raise RuntimeError("local recovery mount identity mismatch")
     observed_uuid = _run_logged(
