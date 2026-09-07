@@ -70,6 +70,7 @@ class ReposkopRetirementGripTests(unittest.TestCase):
             "observation_sha256": "7" * 64,
             "resolution_sha256": "8" * 64,
             "generic_platform_publication_state": "awaiting_platform_observation",
+            "generic_platform_publication_unchanged": True,
             "does_not_establish": [
                 "complete_platform_tool_schema_publication",
                 "platform_origin_cryptographic_attestation",
@@ -107,6 +108,34 @@ class ReposkopRetirementGripTests(unittest.TestCase):
         self.assertEqual("pass", checks["generic-publication-not-promoted"])
         self.assertEqual("pass", checks["private-retirement-evidence-persisted"])
 
+    def test_independently_generic_converged_state_is_not_treated_as_promotion(self) -> None:
+        binding = server_binding()
+        low_level = {
+            "state": "retirement_surface_converged",
+            "request_id": PUBLIC_PARAMETERS["request_id"],
+            "surface_id": "grabowski",
+            "observation_sha256": "7" * 64,
+            "resolution_sha256": "8" * 64,
+            "generic_platform_publication_state": "platform_converged",
+            "generic_platform_publication_unchanged": True,
+            "does_not_establish": ["platform_converged"],
+        }
+        parameters = {**PUBLIC_PARAMETERS, "_server_retirement_binding": binding}
+        with patch.object(
+            grips.grabowski_client_snapshot,
+            "record_platform_retirement_surface_observation",
+            return_value=low_level,
+        ):
+            result = grips.run_grip(
+                "reposkop-retirement-surface-observe",
+                parameters,
+                allow_mutation=True,
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("pass", checks["generic-publication-not-promoted"])
+
     def test_blocked_surface_propagates_blocked_receipt(self) -> None:
         binding = server_binding()
         low_level = {
@@ -116,6 +145,7 @@ class ReposkopRetirementGripTests(unittest.TestCase):
             "observation_sha256": "7" * 64,
             "forbidden_tool_names_present": ["future_reposkop_diagnostic"],
             "generic_platform_publication_state": "awaiting_platform_observation",
+            "generic_platform_publication_unchanged": True,
             "does_not_establish": ["platform_converged"],
         }
         parameters = {

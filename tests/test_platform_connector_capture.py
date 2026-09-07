@@ -21,8 +21,10 @@ class PlatformConnectorCaptureTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.platform_path = self.root / "platform-current.json"
+        self.state_root = self.root / "state"
         self.publication_root = self.root / "platform-publication"
         self.patches = (
+            mock.patch.object(snapshot, "STATE_ROOT", self.state_root),
             mock.patch.object(snapshot, "PLATFORM_SNAPSHOT_PATH", self.platform_path),
             mock.patch.object(snapshot, "PLATFORM_SNAPSHOT_TRUSTED_UID", os.getuid()),
             mock.patch.object(snapshot, "LOCK_PATH", self.root / "snapshot.lock"),
@@ -174,6 +176,27 @@ class PlatformConnectorCaptureTests(unittest.TestCase):
             cutover_id=cutover_id,
             now_unix=now_unix,
         )
+
+    def retirement_binding(
+        self,
+        *,
+        connector_id: str = "primary",
+        surface_id: str = "grabowski",
+        runtime_binding_sha256: str = "3" * 64,
+    ) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "connector_id": connector_id,
+            "surface_id": surface_id,
+            "client_scope_kind": "connector_capability",
+            "client_scope_sha256": "1" * 64,
+            "state_scope_sha256": snapshot._retirement_state_scope_sha256(),
+            "runtime_binding_sha256": runtime_binding_sha256,
+            "release_id": RELEASE_ID,
+            "repo_head": REPO_HEAD,
+            "registered_names_sha256": "5" * 64,
+            "agent_instructions_sha256": INSTRUCTIONS_HASH,
+        }
 
     def test_builder_uses_runtime_manifest_binding_and_catalog_hash(self) -> None:
         artifact = self.artifact()
@@ -1324,6 +1347,7 @@ class PlatformConnectorCaptureTests(unittest.TestCase):
             query="reposkop",
             matched_tool_names=[],
             source_reference="chatgpt-tool-discovery:thread-1:grabowski",
+            server_binding=self.retirement_binding(),
             now_unix=1_002,
         )
 
@@ -1336,7 +1360,8 @@ class PlatformConnectorCaptureTests(unittest.TestCase):
         self.assertEqual(snapshot._read_publication_current(), before)
         resolution_path = snapshot._retirement_resolution_path(request_id, "grabowski")
         resolution = snapshot._read_private_json(resolution_path)
-        self.assertEqual(resolution["criterion"], "exact_forbidden_tool_names_absent")
+        self.assertEqual(resolution["criterion"], "reposkop_query_has_zero_matches")
+        self.assertEqual(resolution["state"], "retirement_surface_converged")
         self.assertEqual(
             resolution["request_sha256"],
             snapshot._read_publication_request(request_id)["request_sha256"],
@@ -1357,6 +1382,7 @@ class PlatformConnectorCaptureTests(unittest.TestCase):
             query="reposkop",
             matched_tool_names=["grabowski_reposkop_context"],
             source_reference="chatgpt-tool-discovery:thread-stale:grabowski",
+            server_binding=self.retirement_binding(),
             now_unix=1_002,
         )
 
@@ -1364,8 +1390,12 @@ class PlatformConnectorCaptureTests(unittest.TestCase):
         self.assertEqual(
             result["forbidden_tool_names_present"], ["grabowski_reposkop_context"]
         )
-        self.assertFalse(
-            snapshot._retirement_resolution_path(request_id, "grabowski").exists()
+        blocked_projection = snapshot._read_private_json(
+            snapshot._retirement_resolution_path(request_id, "grabowski")
+        )
+        self.assertEqual(blocked_projection["state"], "retirement_surface_blocked")
+        self.assertEqual(
+            blocked_projection["matched_tool_names"], ["grabowski_reposkop_context"]
         )
 
     def test_retirement_surface_rejects_noncanonical_query(self) -> None:
@@ -1386,6 +1416,7 @@ class PlatformConnectorCaptureTests(unittest.TestCase):
                 query="repo",
                 matched_tool_names=[],
                 source_reference="chatgpt-tool-discovery:thread-wrong:grabowski",
+                server_binding=self.retirement_binding(),
                 now_unix=1_002,
             )
 

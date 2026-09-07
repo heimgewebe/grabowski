@@ -14,8 +14,10 @@ class ReposkopRetirementSurfaceRegressionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
+        self.state_root = self.root / "state"
         self.publication_root = self.root / "platform-publication"
         self.patches = (
+            mock.patch.object(snapshot, "STATE_ROOT", self.state_root),
             mock.patch.object(snapshot, "LOCK_PATH", self.root / "snapshot.lock"),
             mock.patch.object(snapshot, "PLATFORM_PUBLICATION_ROOT", self.publication_root),
             mock.patch.object(
@@ -138,66 +140,292 @@ class ReposkopRetirementSurfaceRegressionTests(unittest.TestCase):
         )
         return request_id
 
-    def test_newer_forbidden_observation_invalidates_older_positive_resolution(self) -> None:
-        request_id = self._activated_request()
-        first = snapshot.record_platform_retirement_surface_observation(
+    def _binding(
+        self,
+        *,
+        connector_id: str = "primary",
+        surface_id: str = "grabowski",
+        client_scope_sha256: str = "1" * 64,
+        state_scope_sha256: str | None = None,
+        runtime_binding_sha256: str = "3" * 64,
+        repo_head: str = "4" * 40,
+    ) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "connector_id": connector_id,
+            "surface_id": surface_id,
+            "client_scope_kind": "connector_capability",
+            "client_scope_sha256": client_scope_sha256,
+            "state_scope_sha256": (
+                snapshot._retirement_state_scope_sha256()
+                if state_scope_sha256 is None
+                else state_scope_sha256
+            ),
+            "runtime_binding_sha256": runtime_binding_sha256,
+            "release_id": "release-test",
+            "repo_head": repo_head,
+            "registered_names_sha256": "5" * 64,
+            "agent_instructions_sha256": "6" * 64,
+        }
+
+    def _record(
+        self,
+        request_id: str,
+        *,
+        observation_id: str,
+        matched_tool_names: list[str],
+        now_unix: int,
+        binding: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        return snapshot.record_platform_retirement_surface_observation(
             request_id=request_id,
             surface_id="grabowski",
-            observation_id="chatgpt-zero-first",
+            observation_id=observation_id,
             query="reposkop",
+            matched_tool_names=matched_tool_names,
+            source_reference=f"chatgpt-tool-discovery:thread:grabowski:{observation_id}",
+            server_binding=self._binding() if binding is None else binding,
+            now_unix=now_unix,
+        )
+
+    def test_newer_forbidden_observation_invalidates_older_positive_resolution(self) -> None:
+        request_id = self._activated_request()
+        first = self._record(
+            request_id,
+            observation_id="chatgpt-zero-first",
             matched_tool_names=[],
-            source_reference="chatgpt-tool-discovery:thread:grabowski:zero",
             now_unix=1_002,
         )
         self.assertEqual(first["state"], "retirement_surface_converged")
-        resolution_path = snapshot._retirement_resolution_path(
-            request_id,
-            "grabowski",
-        )
-        self.assertTrue(resolution_path.exists())
+        first_resolution_sha256 = first["resolution_sha256"]
 
-        second = snapshot.record_platform_retirement_surface_observation(
-            request_id=request_id,
-            surface_id="grabowski",
+        second = self._record(
+            request_id,
             observation_id="chatgpt-forbidden-later",
-            query="reposkop",
             matched_tool_names=["grabowski_reposkop_context"],
-            source_reference="chatgpt-tool-discovery:thread:grabowski:forbidden",
             now_unix=1_003,
         )
 
         self.assertEqual(second["state"], "retirement_surface_blocked")
-        if resolution_path.exists():
-            projection = snapshot._read_private_json(resolution_path)
-            self.assertNotEqual(
-                projection.get("criterion"),
-                "exact_forbidden_tool_names_absent",
-            )
-            self.assertNotEqual(
-                projection.get("state"),
-                "retirement_surface_converged",
-            )
+        self.assertNotEqual(second["resolution_sha256"], first_resolution_sha256)
+        projection = snapshot._read_private_json(
+            snapshot._retirement_resolution_path(request_id, "grabowski")
+        )
+        self.assertEqual(projection["state"], "retirement_surface_blocked")
+        self.assertEqual(projection["criterion"], "reposkop_query_has_matches")
+        self.assertEqual(
+            projection["matched_tool_names"], ["grabowski_reposkop_context"]
+        )
 
     def test_any_tool_matching_reposkop_query_blocks_retirement(self) -> None:
         request_id = self._activated_request()
 
-        result = snapshot.record_platform_retirement_surface_observation(
-            request_id=request_id,
-            surface_id="grabowski",
+        result = self._record(
+            request_id,
             observation_id="chatgpt-novel-reposkop-match",
-            query="reposkop",
             matched_tool_names=["future_reposkop_diagnostic"],
-            source_reference="chatgpt-tool-discovery:thread:grabowski:novel",
             now_unix=1_002,
         )
 
         self.assertEqual(result["state"], "retirement_surface_blocked")
-        self.assertFalse(
-            snapshot._retirement_resolution_path(
-                request_id,
-                "grabowski",
-            ).exists()
+        self.assertEqual(
+            result["forbidden_tool_names_present"], ["future_reposkop_diagnostic"]
         )
+        projection = snapshot._read_private_json(
+            snapshot._retirement_resolution_path(request_id, "grabowski")
+        )
+        self.assertEqual(projection["state"], "retirement_surface_blocked")
+
+    def test_replay_of_old_zero_cannot_resurrect_after_newer_block(self) -> None:
+        request_id = self._activated_request()
+        first = self._record(
+            request_id,
+            observation_id="chatgpt-zero-first",
+            matched_tool_names=[],
+            now_unix=1_002,
+        )
+        blocked = self._record(
+            request_id,
+            observation_id="chatgpt-block-second",
+            matched_tool_names=["future_reposkop_diagnostic"],
+            now_unix=1_003,
+        )
+
+        replay = self._record(
+            request_id,
+            observation_id="chatgpt-zero-first",
+            matched_tool_names=[],
+            now_unix=1_004,
+        )
+
+        self.assertEqual(replay["state"], "retirement_surface_blocked")
+        self.assertTrue(replay["idempotent"])
+        self.assertTrue(replay["replay_superseded"])
+        self.assertEqual(replay["observation_sha256"], blocked["observation_sha256"])
+        self.assertEqual(
+            replay["replayed_observation_sha256"], first["observation_sha256"]
+        )
+
+    def test_same_observation_id_cannot_bind_conflicting_evidence(self) -> None:
+        request_id = self._activated_request()
+        self._record(
+            request_id,
+            observation_id="chatgpt-same-id",
+            matched_tool_names=[],
+            now_unix=1_002,
+        )
+
+        with self.assertRaisesRegex(
+            snapshot.ClientSnapshotError,
+            "already binds different evidence",
+        ):
+            self._record(
+                request_id,
+                observation_id="chatgpt-same-id",
+                matched_tool_names=["future_reposkop_diagnostic"],
+                now_unix=1_003,
+            )
+
+    def test_status_becomes_stale_after_retirement_ttl(self) -> None:
+        request_id = self._activated_request()
+        binding = self._binding()
+        result = self._record(
+            request_id,
+            observation_id="chatgpt-fresh-zero",
+            matched_tool_names=[],
+            now_unix=1_002,
+            binding=binding,
+        )
+        self.assertTrue(result["fresh"])
+
+        status = snapshot.retirement_surface_status(
+            request_id=request_id,
+            surface_id="grabowski",
+            server_binding=binding,
+            now_unix=1_002 + snapshot.REPOSKOP_RETIREMENT_TTL_SECONDS + 1,
+        )
+
+        self.assertEqual(status["state"], "retirement_surface_stale")
+        self.assertFalse(status["valid"])
+        self.assertFalse(status["fresh"])
+        self.assertEqual(status["projected_state"], "retirement_surface_converged")
+
+    def test_runtime_binding_drift_invalidates_status_consumption(self) -> None:
+        request_id = self._activated_request()
+        binding = self._binding()
+        self._record(
+            request_id,
+            observation_id="chatgpt-runtime-bound",
+            matched_tool_names=[],
+            now_unix=1_002,
+            binding=binding,
+        )
+        drifted = {**binding, "runtime_binding_sha256": "9" * 64}
+
+        with self.assertRaisesRegex(
+            snapshot.ClientSnapshotError,
+            "resolution binding mismatch",
+        ):
+            snapshot.retirement_surface_status(
+                request_id=request_id,
+                surface_id="grabowski",
+                server_binding=drifted,
+                now_unix=1_003,
+            )
+
+    def test_state_store_scope_swap_is_rejected_before_persistence(self) -> None:
+        request_id = self._activated_request()
+        binding = self._binding(state_scope_sha256="9" * 64)
+
+        with self.assertRaisesRegex(
+            snapshot.ClientSnapshotError,
+            "state-store scope binding mismatch",
+        ):
+            self._record(
+                request_id,
+                observation_id="chatgpt-wrong-store",
+                matched_tool_names=[],
+                now_unix=1_002,
+                binding=binding,
+            )
+
+    def test_primary_receipt_cannot_be_rebound_to_maulwurf_surface(self) -> None:
+        request_id = self._activated_request()
+        binding = self._binding(
+            connector_id="kleiner-maulwurf",
+            surface_id="der_kleine_maulwurf",
+        )
+
+        with self.assertRaisesRegex(
+            snapshot.ClientSnapshotError,
+            "surface/principal binding mismatch",
+        ):
+            self._record(
+                request_id,
+                observation_id="chatgpt-surface-swap",
+                matched_tool_names=[],
+                now_unix=1_002,
+                binding=binding,
+            )
+
+    def test_changed_forbidden_set_invalidates_existing_projection(self) -> None:
+        request_id = self._activated_request()
+        binding = self._binding()
+        self._record(
+            request_id,
+            observation_id="chatgpt-zero-before-forbidden-contract-change",
+            matched_tool_names=[],
+            now_unix=1_002,
+            binding=binding,
+        )
+        expanded = frozenset(
+            set(snapshot.REPOSKOP_RETIREMENT_FORBIDDEN_TOOLS)
+            | {"future_reposkop_diagnostic"}
+        )
+
+        with mock.patch.object(
+            snapshot, "REPOSKOP_RETIREMENT_FORBIDDEN_TOOLS", expanded
+        ):
+            with self.assertRaisesRegex(
+                snapshot.ClientSnapshotError,
+                "forbidden-set",
+            ):
+                snapshot.retirement_surface_status(
+                    request_id=request_id,
+                    surface_id="grabowski",
+                    server_binding=binding,
+                    now_unix=1_003,
+                )
+
+    def test_noncanonical_query_is_rejected_with_server_binding(self) -> None:
+        request_id = self._activated_request()
+
+        with self.assertRaisesRegex(snapshot.ClientSnapshotError, "exact reposkop query"):
+            snapshot.record_platform_retirement_surface_observation(
+                request_id=request_id,
+                surface_id="grabowski",
+                observation_id="chatgpt-wrong-query",
+                query="repo",
+                matched_tool_names=[],
+                source_reference="chatgpt-tool-discovery:thread:grabowski:wrong-query",
+                server_binding=self._binding(),
+                now_unix=1_002,
+            )
+
+    def test_generic_publication_projection_is_unchanged(self) -> None:
+        request_id = self._activated_request()
+        before = snapshot._read_publication_current()
+
+        result = self._record(
+            request_id,
+            observation_id="chatgpt-zero-generic-unchanged",
+            matched_tool_names=[],
+            now_unix=1_002,
+        )
+
+        self.assertTrue(result["generic_platform_publication_unchanged"])
+        self.assertEqual(snapshot._read_publication_current(), before)
+        self.assertIn("platform_converged", result["does_not_establish"])
 
 
 if __name__ == "__main__":

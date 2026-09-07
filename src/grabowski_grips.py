@@ -3888,7 +3888,7 @@ def _run_reposkop_retirement_surface_observe(
     generic_not_promoted = (
         isinstance(nonclaims, list)
         and "platform_converged" in nonclaims
-        and output.get("generic_platform_publication_state") != "platform_converged"
+        and output.get("generic_platform_publication_unchanged") is True
     )
     _check(
         receipt,

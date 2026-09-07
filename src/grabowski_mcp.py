@@ -5375,22 +5375,7 @@ def _transport_connector_capability_scope(
     )
 
 def _retirement_state_scope_sha256() -> str:
-    state_root = os.path.abspath(
-        os.fspath(grabowski_client_snapshot.STATE_ROOT.expanduser())
-    )
-    material = {
-        "schema_version": 1,
-        "effective_uid": os.geteuid(),
-        "state_root": state_root,
-    }
-    return hashlib.sha256(
-        json.dumps(
-            material,
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
+    return grabowski_client_snapshot._retirement_state_scope_sha256()
 
 
 def _reposkop_retirement_server_binding(ctx: Context | None) -> dict[str, Any]:
