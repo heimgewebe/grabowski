@@ -129,6 +129,7 @@ def observe_client_snapshot_binding(
     green_readiness: dict[str, Any],
     source_identity_sha256: str,
     snapshot_inspector: Any,
+    durable_rebind: dict[str, Any] | None = None,
     path: Path = DEFAULT_CLIENT_SNAPSHOT_PATH,
 ) -> dict[str, Any]:
     """Project canonical snapshot inspection into the recovery vocabulary.
@@ -155,6 +156,7 @@ def observe_client_snapshot_binding(
         agent_instructions_sha256=agent_instructions_sha256,
         green_readiness=green_readiness,
         deployment_source_identity_sha256=source_identity_sha256,
+        durable_rebind=durable_rebind,
         path=path,
     )
     if not isinstance(observed, dict):
@@ -855,6 +857,11 @@ def collect_classification_inputs(
                 green_readiness=readiness,
                 source_identity_sha256=str(
                     cutover.get("source_identity_sha256") or ""
+                ),
+                durable_rebind=(
+                    cutover.get("snapshot_rebind")
+                    if isinstance(cutover.get("snapshot_rebind"), dict)
+                    else None
                 ),
                 snapshot_inspector=snapshot_inspector,
                 path=client_snapshot_path,

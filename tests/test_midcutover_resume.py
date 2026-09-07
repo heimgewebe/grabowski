@@ -3152,6 +3152,100 @@ class ObjectIdContractTests(unittest.TestCase):
         self.assertIsNone(runner.HEAD_RE.fullmatch("c" * 39))
 
 
+class SuccessorSnapshotRuntimeBindingTests(unittest.TestCase):
+    def _runtime(self, receipt_root: Path) -> dual.MidCutoverResumeRuntime:
+        runtime = dual.MidCutoverResumeRuntime(
+            repo=ROOT,
+            runtime=Path("/runtime"),
+            release_path=Path("/release/green"),
+            contract=mock.Mock(module="grabowski_operator", expected_tools=["a", "b"]),
+            contract_evidence={"judged_by_checkout": False},
+            green_binding={
+                "release_id": GREEN_RELEASE,
+                "repo_head": HEAD_GREEN,
+                "registered_names_sha256": "d1" * 32,
+                "agent_instructions_sha256": "d2" * 32,
+            },
+            classification={
+                "classification_sha256": "f0" * 32,
+                "receipt": {"blue_release_id": BLUE_RELEASE},
+                "evidence": {
+                    "snapshot_observation": {
+                        **SNAPSHOT_REBOUND,
+                        "successor_refresh_after_cutover_rebind": True,
+                        "historical_rebind_receipt_sha256": "ab" * 32,
+                    }
+                },
+            },
+            resume_binding=resume_binding_for_phase(midcutover.PHASE_PROMOTE_POINTER),
+            timeout_seconds=10,
+            green_unit="grabowski-green-operator-0123456789ab.service",
+            selector_before=selector_document(),
+            cutover_generation=CUTOVER_GENERATION,
+            blue_repo_head=HEAD_BLUE,
+            receipt_root=receipt_root,
+        )
+        return runtime
+
+    def test_effect_guard_rereads_exact_durable_rebind(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            rebind = {"receipt_sha256": "ab" * 32}
+            receipt = cutover_receipt()
+            receipt.pop("receipt_sha256")
+            receipt["snapshot_rebind"] = rebind
+            receipt["receipt_sha256"] = midcutover.canonical_json_sha256(receipt)
+            path = root / f"{CUTOVER_ID}.json"
+            path.write_text(
+                json.dumps(receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            path.chmod(0o600)
+            runtime = self._runtime(root)
+            runtime.resume_binding["resumed_receipt_sha256"] = receipt["receipt_sha256"]
+            self.assertEqual(runtime.successor_snapshot_rebind_evidence(), rebind)
+            with mock.patch.object(
+                dual.client_snapshot,
+                "cutover_snapshot_effect_guard",
+                return_value=nullcontext(),
+            ) as guard:
+                with runtime.snapshot_effect_guard("test"):
+                    pass
+            self.assertEqual(guard.call_args.kwargs["durable_rebind"], rebind)
+
+    def test_effect_guard_refuses_unreadable_receipt_set(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            rebind = {"receipt_sha256": "ab" * 32}
+            receipt = cutover_receipt()
+            receipt.pop("receipt_sha256")
+            receipt["snapshot_rebind"] = rebind
+            receipt["receipt_sha256"] = midcutover.canonical_json_sha256(receipt)
+            path = root / f"{CUTOVER_ID}.json"
+            path.write_text(
+                json.dumps(receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            path.chmod(0o600)
+            unreadable = root / "foreign.json"
+            unreadable.write_text("{}", encoding="utf-8")
+            unreadable.chmod(0o600)
+            runtime = self._runtime(root)
+            runtime.resume_binding["resumed_receipt_sha256"] = receipt["receipt_sha256"]
+            with self.assertRaisesRegex(dual.core.DeployError, "receipt set is unreadable"):
+                runtime.successor_snapshot_rebind_evidence()
+
+    def test_effect_guard_refuses_replaced_durable_rebind(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            runtime = self._runtime(root)
+            with self.assertRaises(dual.core.DeployError):
+                runtime.successor_snapshot_rebind_evidence()
+
+
 class GreenProofBeforeEffectTests(unittest.TestCase):
     """Nothing irreversible happens before green is proven authoritatively."""
 
