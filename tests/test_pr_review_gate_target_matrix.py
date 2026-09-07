@@ -108,6 +108,7 @@ class PrReviewGateTargetMatrixTests(unittest.TestCase):
             "heimgewebe/hausKI-audio": ("scan",),
             "heimgewebe/hauski-audio": ("scan",),
             "Hall-of-Memory/Hall-of-Memory": ("verify",),
+            "alexdermohr/livia": ("quality",),
             "heimgewebe/metarepo": ("ci (ubuntu-latest)", "ci (macos-latest)"),
         }
         for repo_name, expected in cases.items():

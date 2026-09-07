@@ -3101,6 +3101,10 @@
         "source": "src/grabowski_effect_interceptor.py"
       },
       {
+        "module": "grabowski_operator_fence_enforcement",
+        "source": "src/grabowski_operator_fence_enforcement.py"
+      },
+      {
         "module": "grabowski_operator_fence",
         "source": "src/grabowski_operator_fence.py"
       },
@@ -3590,7 +3594,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "489c0901982d7f6b4c61ba9b1bea7994c955b3b8d5e8f43a98b21627d1ef3170"
+      "sha256": "27db499fc6cb114159d769b07ee3f135ebfd58921788be620a47ae39d5ce1bab"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
@@ -3677,6 +3681,7 @@
       "src/grabowski_operations.py": "dbefeb9b7623d5ef8e42025b9b9afe604e0c2378fcbb7dcde45eb30ef3fff232",
       "src/grabowski_operator.py": "06a361c2bcc2ccf825fd44218ebd4bc9534fc771586ee38246bb0bead8ff102f",
       "src/grabowski_operator_fence.py": "3aa93fd4bb690642526e5b263ffcb21d92f28b4d826ee3a5737df13b9b9976f5",
+      "src/grabowski_operator_fence_enforcement.py": "515cdcf1e22cb4ea920b1712f2bb0512b57ed98d6f297ab8e1bd0b06a9049e3f",
       "src/grabowski_operator_fence_rpc.py": "9e60fe4a59de4c142cf670c14646aa9d8fa54e3de55f8fca8b201c5f37f75bba",
       "src/grabowski_operator_fence_shadow.py": "2c9bc3c1e3ccc537a9009b847994cc77cfe8ebf6d76f1309e81ef7f688c9956b",
       "src/grabowski_operator_fence_shadow_refresh.py": "12ec5f560d76ac1efa00be61a097f51a81cdda331d69e24fe52be2ea95712557",

@@ -185,6 +185,7 @@ class SagaContractTests(unittest.TestCase):
         *,
         passed: bool = True,
         readiness_output: dict[str, object] | None = None,
+        bureau_output: dict[str, object] | None = None,
     ) -> dict[str, object]:
         actions = plan["mechanic_actions"]
         assert isinstance(actions, list)
@@ -194,7 +195,21 @@ class SagaContractTests(unittest.TestCase):
         for index, planned in enumerate(selected):
             assert isinstance(planned, dict)
             child_status = "passed" if passed else "blocked"
-            if planned["action"] == "pr-check-readiness" and passed:
+            if planned["action"] == "bureau-pickup-status" and passed:
+                child_output = copy.deepcopy(bureau_output) if bureau_output is not None else {
+                    "kind": "grabowski_bureau_pickup_status",
+                    "coordination": {
+                        "status": "coordinated",
+                        "blocking": False,
+                        "run": {"state": "assigned"},
+                        "lease": {"status": "active-bound"},
+                    },
+                    "execution_binding": {
+                        "classification": "actively_bound",
+                        "actively_bound": True,
+                    },
+                }
+            elif planned["action"] == "pr-check-readiness" and passed:
                 child_output = copy.deepcopy(readiness_output) if readiness_output is not None else {
                     "ready": True,
                     "verdict": "ready",
@@ -340,6 +355,38 @@ class SagaContractTests(unittest.TestCase):
                 self.assertIsNone(run["captain_handoff"])
                 self.assertEqual("blocked", run["receipt_status"])
                 self.assertEqual(run, sagas.validate_run_receipt(run, plan_value=plan))
+
+    def test_pr_prepare_requires_live_bureau_coordination_not_wrapper_pass(self) -> None:
+        plan = sagas.build_plan("pr-settlement", self.pr_target(), "bureau-semantic-readiness")
+        blocked_outputs = (
+            {},
+            {
+                "kind": "grabowski_bureau_pickup_status",
+                "coordination": {"status": "coordinated", "blocking": False, "run": {"state": "failed"}, "lease": {"status": "terminal-released-or-expired"}},
+                "execution_binding": {"classification": "stale", "actively_bound": False},
+            },
+            {
+                "kind": "grabowski_bureau_pickup_status",
+                "coordination": {"status": "coordinated", "blocking": False, "run": {"state": "assigned"}, "lease": {"status": "active-bound"}},
+                "execution_binding": {"classification": "stale", "actively_bound": False},
+            },
+            {
+                "kind": "grabowski_bureau_pickup_status",
+                "coordination": {"status": "coordinated", "blocking": True, "run": {"state": "assigned"}, "lease": {"status": "active-bound"}},
+                "execution_binding": {"classification": "actively_bound", "actively_bound": True},
+            },
+        )
+        for bureau_output in blocked_outputs:
+            with self.subTest(bureau_output=bureau_output):
+                mechanic = self.mechanic_result(plan, passed=True, bureau_output=bureau_output)
+                receipt = mechanic["receipt"]
+                assert isinstance(receipt, dict)
+                self.assertEqual("passed", receipt["status"])
+                run = sagas.build_run_receipt(plan, mechanic)
+                self.assertEqual("prepare_blocked", run["state"])
+                self.assertFalse(run["captain_ready"])
+                self.assertIsNone(run["captain_handoff"])
+                self.assertEqual("blocked", run["receipt_status"])
 
     def test_runtime_prepare_does_not_require_pr_readiness_semantics(self) -> None:
         plan = sagas.build_plan(

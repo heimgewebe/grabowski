@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime
+import fcntl
 import hashlib
 import importlib
 import json
@@ -81,6 +83,7 @@ LOCAL_RECOVERY_DURABILITY_EVIDENCE = Path(os.environ.get(
     "GRABOWSKI_LOCAL_RECOVERY_DURABILITY_EVIDENCE",
     str(operator.HOME / ".local/state/schauwerk/fundus/durability/current.json"),
 )).expanduser()
+LOCAL_RECOVERY_OPERATION_STATE = operator.HOME / ".local/state/heim-pc-priorities"
 SERVER_RECOVERY_CHECK_SUBSET = os.environ.get("GRABOWSKI_SERVER_RECOVERY_CHECK_SUBSET", "1/100")
 SERVER_RECOVERY_TIMEOUT_SECONDS = int(os.environ.get("GRABOWSKI_SERVER_RECOVERY_TIMEOUT_SECONDS", "300"))
 SERVER_RECOVERY_TUNNEL_OUTPUT_MAX_BYTES = int(os.environ.get("GRABOWSKI_SERVER_RECOVERY_TUNNEL_OUTPUT_MAX_BYTES", "4096"))
@@ -1230,6 +1233,48 @@ def _local_recovery_inventory(root: Path) -> dict[str, Any]:
     }
 
 
+@contextmanager
+def _local_recovery_repository_operation_lock():
+    path = LOCAL_RECOVERY_OPERATION_STATE
+    try:
+        path_meta = os.lstat(path)
+    except OSError as exc:
+        raise RuntimeError("local recovery repository operation lock is unavailable") from exc
+    if (
+        not stat.S_ISDIR(path_meta.st_mode)
+        or stat.S_ISLNK(path_meta.st_mode)
+        or path_meta.st_uid != os.geteuid()
+    ):
+        raise RuntimeError("local recovery repository operation lock path is unsafe")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise RuntimeError("local recovery repository operation lock cannot be opened") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or (opened.st_dev, opened.st_ino, opened.st_uid)
+            != (path_meta.st_dev, path_meta.st_ino, path_meta.st_uid)
+        ):
+            raise RuntimeError("local recovery repository operation lock path changed")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError("local recovery repository operation is busy") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
 def _local_recovery_restore_probe(
     *,
     snapshot_id: str,
@@ -1244,6 +1289,8 @@ def _local_recovery_restore_probe(
             [
                 RESTIC_BIN,
                 "restore",
+                "--no-cache",
+                "--no-lock",
                 snapshot_id,
                 "--target",
                 str(target),
@@ -1266,7 +1313,7 @@ def _local_recovery_restore_probe(
     return inventory
 
 
-def _local_recovery_probe(target_info: dict[str, Any]) -> dict[str, Any]:
+def _local_recovery_probe_locked(target_info: dict[str, Any]) -> dict[str, Any]:
     completed_at_unix = int(time.time())
     durability = _local_recovery_durability_evidence(now=completed_at_unix)
     log_dir = operator.STATE_DIR / "recovery"
@@ -1298,7 +1345,13 @@ def _local_recovery_probe(target_info: dict[str, Any]) -> dict[str, Any]:
         log_path=log_path,
     )
     _run_logged(
-        [RESTIC_BIN, "check", f"--read-data-subset={SERVER_RECOVERY_CHECK_SUBSET}"],
+        [
+            RESTIC_BIN,
+            "check",
+            "--no-cache",
+            "--no-lock",
+            f"--read-data-subset={SERVER_RECOVERY_CHECK_SUBSET}",
+        ],
         env=restic_env,
         log=log_path,
         timeout_seconds=SERVER_RECOVERY_TIMEOUT_SECONDS,
@@ -1394,6 +1447,11 @@ def _local_recovery_probe(target_info: dict[str, Any]) -> dict[str, Any]:
         "log_path": str(log_path),
         "log_sha256": log_sha256,
     }
+
+
+def _local_recovery_probe(target_info: dict[str, Any]) -> dict[str, Any]:
+    with _local_recovery_repository_operation_lock():
+        return _local_recovery_probe_locked(target_info)
 
 
 def server_recovery_probe() -> dict[str, Any]:

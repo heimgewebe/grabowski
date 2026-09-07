@@ -33,6 +33,9 @@ REQUEST_CLIENT_TARGET = Path("/usr/local/bin/grabowski-privileged-request")
 BOOTSTRAP_RECOVERY_TARGET = Path(
     "/usr/local/libexec/grabowski-runtime-bootstrap-recover"
 )
+BACKUP_MOUNT_RECONCILE_TARGET = Path(
+    "/usr/local/libexec/grabowski-backup-mount-reconcile"
+)
 CUTOVER_HELPER_TARGET = Path("/usr/local/libexec/grabowski-rootbroker-cutover")
 AUTOMATIC_STAGING_ROOT = Path("/var/lib/grabowski/rootbroker-cutover-staging")
 AUTOMATIC_HELPER_SOURCE = "tools/grabowski_rootbroker_cutover.py"
@@ -68,12 +71,14 @@ BOOTSTRAP_RECOVERY_ACTION = "runtime_bootstrap_recover"
 LOCAL_BACKUP_NTFS_CHECK_ACTION = "local_backup_ntfs_check"
 LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION = "local_backup_ntfs_clear_dirty"
 LOCAL_BACKUP_SMART_READ_ACTION = "local_backup_smart_read"
+LOCAL_BACKUP_MOUNT_RECONCILE_ACTION = "local_backup_mount_reconcile"
 LOCAL_BACKUP_NTFS_DEVICE = "/dev/disk/by-uuid/249180DA265E8DE0"
 LOCAL_BACKUP_SMART_DEVICE = "/dev/disk/by-id/usb-Freecom_Freecom_Mobile_Drive_XXS_3.0_93300000078D-0:0"
 LOCAL_BACKUP_STORAGE_ACTIONS = (
     LOCAL_BACKUP_NTFS_CHECK_ACTION,
     LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION,
     LOCAL_BACKUP_SMART_READ_ACTION,
+    LOCAL_BACKUP_MOUNT_RECONCILE_ACTION,
 )
 AUTOMATIC_CUTOVER_BIND_PATHS = (
     "/home/alex/repos/grabowski",
@@ -189,6 +194,12 @@ ARTIFACTS = (
     Artifact(
         "tools/grabowski_runtime_bootstrap_recover.py",
         BOOTSTRAP_RECOVERY_TARGET,
+        0o755,
+        True,
+    ),
+    Artifact(
+        "tools/grabowski_backup_mount_reconcile.py",
+        BACKUP_MOUNT_RECONCILE_TARGET,
         0o755,
         True,
     ),
@@ -1568,6 +1579,10 @@ def _local_backup_ntfs_actions_from_repository(
         LOCAL_BACKUP_SMART_READ_ACTION: (
             "smart-read",
             ["/usr/sbin/smartctl", "-d", "sat", "-a", LOCAL_BACKUP_SMART_DEVICE],
+        ),
+        LOCAL_BACKUP_MOUNT_RECONCILE_ACTION: (
+            "reconcile",
+            [str(BACKUP_MOUNT_RECONCILE_TARGET), "reconcile"],
         ),
     }
     result: dict[str, dict[str, Any]] = {}

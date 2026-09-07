@@ -504,14 +504,15 @@ def _validate_browser_operator_default(value: Any) -> None:
             label=f"{semantic_label}.supported_intents",
             maximum=8,
         )
-        current_supported_intents = ["read_state", "navigate", "scroll_into_view"]
-        staged_supported_intents = [*current_supported_intents, "activate"]
-        if supported_intents not in (current_supported_intents, staged_supported_intents):
-            _fail(
-                f"{semantic_label}.supported_intents must be either "
-                "['read_state', 'navigate', 'scroll_into_view'] or "
-                "['read_state', 'navigate', 'scroll_into_view', 'activate']"
-            )
+        legacy_supported_intents = ["read_state", "navigate", "scroll_into_view"]
+        current_supported_intents = [*legacy_supported_intents, "activate"]
+        staged_supported_intents = [
+            *current_supported_intents, "submit_maulwurfx_proposal_e2e"
+        ]
+        if supported_intents not in (
+            legacy_supported_intents, current_supported_intents, staged_supported_intents
+        ):
+            _fail(f"{semantic_label}.supported_intents is not a canonical supported revision")
         uncovered_intents = _require_mapping(
             semantic["uncovered_intents"],
             label=f"{semantic_label}.uncovered_intents",
@@ -539,10 +540,17 @@ def _validate_browser_operator_default(value: Any) -> None:
             label=f"{semantic_label}.implemented_effect_classes",
             maximum=8,
         )
-        if implemented != ["read", "local_ui", "network_navigation"]:
+        previous_implemented = ["read", "local_ui", "network_navigation"]
+        current_implemented = [*previous_implemented, "bounded_external_submit"]
+        expected_implemented = (
+            current_implemented
+            if supported_intents == staged_supported_intents
+            else previous_implemented
+        )
+        if implemented != expected_implemented:
             _fail(
-                f"{semantic_label}.implemented_effect_classes must remain "
-                "['read', 'local_ui', 'network_navigation']"
+                f"{semantic_label}.implemented_effect_classes must match the "
+                "selected supported_intents revision"
             )
         fail_closed = _require_list(
             semantic["fail_closed_effect_classes"],
