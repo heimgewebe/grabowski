@@ -4003,7 +4003,7 @@ class BureauPickupTests(unittest.TestCase):
         self.assertNotIn("--state-root", invoke.call_args.args[0])
         self.assertEqual("legacy-journal-implicit-state", result["root_binding_source"])
         pickup.operator._require_operator_mutation.assert_any_call(
-            "terminal_execute", path=str(pickup.LEGACY_COORDINATION_ROOT)
+            "bureau_mutation", path=str(pickup.LEGACY_COORDINATION_ROOT)
         )
 
     def test_release_requires_terminal_readback(self) -> None:

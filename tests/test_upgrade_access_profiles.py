@@ -38,10 +38,26 @@ class UpgradeAccessProfilesTests(unittest.TestCase):
             "mode": "trusted-owner",
         }
         self.template = {
+            "capability_definitions": {
+                "bureau_mutation": "Typed Bureau mutation without generic terminal."
+            },
             "profiles": {
                 "observe": {"capabilities": ["file_read"]},
                 "maintain": {"capabilities": ["file_read", "file_write"]},
-            }
+                "failover-mutate": {
+                    "trusted_owner": False,
+                    "capabilities": [
+                        "file_read", "audit_verify", "audit_read",
+                        "bureau_mutation", "resource_lease",
+                        "process_inspect", "port_inspect",
+                    ],
+                },
+                "trusted-owner": {
+                    "capabilities": [
+                        "file_read", "terminal_execute", "bureau_mutation"
+                    ]
+                },
+            },
         }
         self._write_policy(self.policy)
 
@@ -62,11 +78,20 @@ class UpgradeAccessProfilesTests(unittest.TestCase):
                 self.assertEqual(upgrader.main(), 0)
         return json.loads(output.getvalue())
 
-    def test_upgrade_adds_bounded_profiles_without_expanding_trusted_owner(self) -> None:
+    def test_upgrade_adds_failover_profile_with_only_bureau_compatibility_split(self) -> None:
         result = upgrader.upgraded(self.policy, self.template)
         self.assertEqual(result["active_profile"], "trusted-owner")
-        self.assertEqual(sorted(result["profiles"]), ["maintain", "observe", "trusted-owner"])
-        self.assertEqual(result["profiles"]["trusted-owner"], self.trusted_owner)
+        self.assertEqual(
+            sorted(result["profiles"]),
+            ["failover-mutate", "maintain", "observe", "trusted-owner"],
+        )
+        expected_trusted = copy.deepcopy(self.trusted_owner)
+        expected_trusted["capabilities"].append("bureau_mutation")
+        self.assertEqual(result["profiles"]["trusted-owner"], expected_trusted)
+        self.assertEqual(
+            result["profiles"]["failover-mutate"],
+            self.template["profiles"]["failover-mutate"],
+        )
         self.assertIsNot(result["profiles"]["trusted-owner"], self.trusted_owner)
         self.assertEqual(self.policy["profiles"], {"trusted-owner": self.trusted_owner})
 
@@ -95,8 +120,28 @@ class UpgradeAccessProfilesTests(unittest.TestCase):
             "Read bounded safe fields from the verified audit chain.",
         )
         self.assertNotIn("audit_read", result["profiles"]["trusted-owner"]["capabilities"])
+        self.assertIn("bureau_mutation", result["profiles"]["trusted-owner"]["capabilities"])
         self.assertIn("audit_read", result["profiles"]["observe"]["capabilities"])
         self.assertIn("audit_read", result["profiles"]["maintain"]["capabilities"])
+
+    def test_upgrade_rejects_unsafe_failover_template(self) -> None:
+        template = copy.deepcopy(self.template)
+        template["profiles"]["failover-mutate"]["trusted_owner"] = True
+        with self.assertRaisesRegex(ValueError, "disable trusted_owner"):
+            upgrader.upgraded(self.policy, template)
+        template = copy.deepcopy(self.template)
+        template["profiles"]["failover-mutate"]["capabilities"].append("file_write")
+        with self.assertRaisesRegex(ValueError, "fixed G6.5 contract"):
+            upgrader.upgraded(self.policy, template)
+
+    def test_bureau_compatibility_capability_requires_prior_terminal_authority(self) -> None:
+        policy = copy.deepcopy(self.policy)
+        policy["profiles"]["trusted-owner"]["capabilities"] = ["file_read"]
+        result = upgrader.upgraded(policy, self.template)
+        self.assertNotIn(
+            "bureau_mutation",
+            result["profiles"]["trusted-owner"]["capabilities"],
+        )
 
     def test_dry_run_does_not_mutate_policy(self) -> None:
         before = self.policy_path.read_bytes()
@@ -126,7 +171,10 @@ class UpgradeAccessProfilesTests(unittest.TestCase):
         value = json.loads(self.policy_path.read_text(encoding="utf-8"))
         self.assertTrue(result["applied"])
         self.assertEqual(value["active_profile"], "trusted-owner")
-        self.assertEqual(value["profiles"]["trusted-owner"], self.trusted_owner)
+        expected_trusted = copy.deepcopy(self.trusted_owner)
+        expected_trusted["capabilities"].append("bureau_mutation")
+        self.assertEqual(value["profiles"]["trusted-owner"], expected_trusted)
+        self.assertIn("failover-mutate", value["profiles"])
         self.assertEqual(stat.S_IMODE(self.policy_path.stat().st_mode), 0o600)
         self.assertNotEqual(self.policy_path.stat().st_ino, before_inode)
         self.assertEqual(hashlib.sha256(self.policy_path.read_bytes()).hexdigest(), result["after_sha256"])
@@ -150,7 +198,7 @@ class UpgradeAccessProfilesTests(unittest.TestCase):
             ({"version": 1, "profiles": {"trusted-owner": {}}}, self.template),
             ({"version": 2, "profiles": {}}, self.template),
             ({"version": 2, "profiles": {"trusted-owner": []}}, self.template),
-            (self.policy, {"profiles": {"observe": {}}}),
+            (self.policy, {"profiles": {"observe": {}, "maintain": {}}}),
             ({**self.policy, "active_profile": "removed"}, self.template),
         ]
         for policy, template in invalid_cases:
