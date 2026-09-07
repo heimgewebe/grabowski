@@ -681,12 +681,14 @@ class FakePrBaseConvergeGh:
         state: str = "OPEN",
         cross_repository: bool = False,
         mergeable: str = "MERGEABLE",
+        preserve_old_head: bool = True,
     ):
         self.base_sha = base_sha
         self.head_sha = head_sha
         self.new_head_sha = new_head_sha
         self.apply_update = apply_update
         self.update_returncode = update_returncode
+        self.preserve_old_head = preserve_old_head
         self.updated = False
         self.calls = []
         self.view = {
@@ -717,12 +719,20 @@ class FakePrBaseConvergeGh:
                 "",
             )
             if "/compare/" in endpoint:
-                compared_head = endpoint.rsplit("...", 1)[-1]
-                status = (
-                    "ahead"
-                    if compared_head == self.new_head_sha and self.updated
-                    else "diverged"
+                comparison = endpoint.rsplit("/compare/", 1)[-1]
+                compared_base, compared_head = comparison.split("...", 1)
+                contains_expected_base = (
+                    compared_base == self.base_sha
+                    and compared_head == self.new_head_sha
+                    and self.updated
                 )
+                contains_prior_head = (
+                    compared_base == self.head_sha
+                    and compared_head == self.new_head_sha
+                    and self.updated
+                    and self.preserve_old_head
+                )
+                status = "ahead" if contains_expected_base or contains_prior_head else "diverged"
                 return {"returncode": 0, "stdout": status + "\n", "stderr": ""}
             if "/update-branch" in endpoint:
                 if self.update_returncode:
@@ -7737,6 +7747,7 @@ class GripFoundationTests(unittest.TestCase):
         self.assertFalse(any(call[:2] == ("pr", "create") for call in gh.calls))
         checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
         self.assertEqual("pass", checks["same_pr_preserved"])
+        self.assertEqual("pass", checks["prior_head_contained_after"])
         self.assertEqual("pass", checks["base_contained_after"])
 
     def test_pr_base_converge_is_noop_when_head_already_contains_base(self) -> None:
@@ -7823,6 +7834,33 @@ class GripFoundationTests(unittest.TestCase):
         self.assertFalse(
             any(any("/update-branch" in item for item in call) for call in gh.calls)
         )
+
+    def test_pr_base_converge_rejects_concurrent_head_replacement_after_update(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(
+                grips, "PR_BASE_CONVERGE_VERIFY_DELAYS_SECONDS", (0.0, 0.0, 0.0)
+            ),
+        ):
+            gh = FakePrBaseConvergeGh(preserve_old_head=False)
+            result = grips.run_grip(
+                "pr-base-converge",
+                {
+                    "repo": tmp,
+                    "pr_number": 77,
+                    "base": "main",
+                    "expected_head": "a" * 40,
+                    "expected_base_sha": "e" * 40,
+                },
+                allow_mutation=True,
+                github_runner=gh,
+            )
+        self.assertEqual("failed", result["receipt"]["status"])
+        self.assertIn("prior PR head lineage", result["output"]["error"])
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("pass", checks["base_contained_after"])
+        self.assertEqual("fail", checks["prior_head_contained_after"])
+        self.assertFalse(any(call[:2] == ("pr", "create") for call in gh.calls))
 
     def test_pr_base_converge_does_not_replay_ambiguous_accepted_update(self) -> None:
         with (

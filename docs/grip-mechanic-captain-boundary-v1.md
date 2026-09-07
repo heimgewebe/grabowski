@@ -91,7 +91,7 @@ Receipts never echo the raw intent, actor or context. The top-level `execution_i
 - `pr-base-converge`
 - `pr-create-or-update`
 
-For an already open same-repository PR whose base advanced, `pr-base-converge` is the preferred normal-action path before considering a successor PR. It binds the exact PR number, current base SHA and current head SHA, uses GitHub's `expected_head_sha` update-branch CAS, preserves the PR identity, and requires all head-bound review, CI and Captain evidence to be renewed after a changed head. A merge conflict, stale head/base binding, cross-repository PR, ambiguous accepted update or provider CAS rejection stops fail-closed; none of those states authorizes closing the PR or creating a successor.
+For an already open same-repository PR whose base advanced, `pr-base-converge` is the preferred normal-action path before considering a successor PR. It binds the exact PR number, current base SHA and current head SHA, uses GitHub's `expected_head_sha` update-branch CAS, preserves the PR identity and prior-head ancestry, and requires all head-bound review, CI and Captain evidence to be renewed after a changed head. A merge conflict, stale head/base binding, cross-repository PR, ambiguous accepted update or provider CAS rejection stops fail-closed; none of those states authorizes closing the PR or creating a successor.
 
 ## Task attention decisions
 

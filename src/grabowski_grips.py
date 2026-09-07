@@ -945,6 +945,7 @@ GRIP_SPECS: dict[str, GripSpec] = {
             "base-identity-exact",
             "head-cas-bound",
             "same-pr-preserved",
+            "prior-head-contained-after",
             "base-contained-after",
         ),
         runner="pr_base_converge",
@@ -1163,7 +1164,7 @@ GRIP_CONDITIONAL_PRECONDITIONS = {
     "pr-base-converge": (
         "the PR must still be OPEN, same-repository, on the requested base branch and exact expected head/base SHA before dispatch",
         "the head branch must not be main/master; existing review, saga and Captain evidence is intentionally invalidated by any resulting head change and must be renewed",
-        "GitHub update-branch is dispatched with expected_head_sha as the provider CAS; an ambiguous accepted outcome requires exact same-PR readback before any retry",
+        "GitHub update-branch is dispatched with expected_head_sha as the provider CAS; a changed resulting head must contain both the exact prior head and exact expected base, while an ambiguous accepted outcome requires exact same-PR readback before any retry",
         "this grip never closes the PR, creates a successor PR, merges or grants Captain authority",
     ),
     "agent-execution-happy-path": (
@@ -6273,13 +6274,13 @@ def _run_pr_base_converge(
             raise GripActionError("unexpected PR view output")
         return viewed
 
-    def compare_status(head: str) -> str:
+    def compare_status(base_sha: str, head: str) -> str:
         result = _github(
             repo,
             github_runner,
             [
                 "api",
-                f"repos/{{owner}}/{{repo}}/compare/{expected_base_sha}...{head}",
+                f"repos/{{owner}}/{{repo}}/compare/{base_sha}...{head}",
                 "--jq",
                 ".status",
             ],
@@ -6353,7 +6354,7 @@ def _run_pr_base_converge(
         )
     _check(receipt, "merge_conflict", "pass", str(before.get("mergeable")))
     _check(receipt, "pr_binding", "pass", f"pr={pr_number}; branch={head_branch}")
-    ancestry_before = compare_status(expected_head)
+    ancestry_before = compare_status(expected_base_sha, expected_head)
     if ancestry_before in {"ahead", "identical"}:
         _check(receipt, "base_contained_before", "pass", ancestry_before)
         current = read_pr()
@@ -6489,15 +6490,32 @@ def _run_pr_base_converge(
                 receipt, "head_readback", "fail", f"head={current.get('headRefOid')!r}"
             )
             raise GripActionError("updated PR head is not a 40 character Git SHA")
-        ancestry_after = compare_status(new_head)
-        if ancestry_after not in {"ahead", "identical"}:
-            _check(receipt, "base_contained_after", "fail", ancestry_after)
+        base_ancestry_after = compare_status(expected_base_sha, new_head)
+        if base_ancestry_after not in {"ahead", "identical"}:
+            _check(receipt, "base_contained_after", "fail", base_ancestry_after)
             raise GripActionError(
                 "updated PR head does not contain the exact expected base"
             )
+        _check(receipt, "base_contained_after", "pass", base_ancestry_after)
+        prior_head_ancestry_after = compare_status(expected_head, new_head)
+        if prior_head_ancestry_after not in {"ahead", "identical"}:
+            _check(
+                receipt,
+                "prior_head_contained_after",
+                "fail",
+                prior_head_ancestry_after,
+            )
+            raise GripActionError(
+                "updated PR head does not preserve the exact prior PR head lineage"
+            )
         _check(receipt, "same_pr_preserved", "pass", str(pr_number))
         _check(receipt, "head_readback", "pass", new_head)
-        _check(receipt, "base_contained_after", "pass", ancestry_after)
+        _check(
+            receipt,
+            "prior_head_contained_after",
+            "pass",
+            prior_head_ancestry_after,
+        )
         return {
             "action": "updated",
             "pr_number": pr_number,
