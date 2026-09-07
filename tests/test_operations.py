@@ -106,6 +106,14 @@ class BackupNtfsOperationTests(unittest.TestCase):
                 [],
             )
             self.assertEqual(
+                result["operations"][operations.SEAGATE_BACKUP_SMART_READ_OPERATION]["effect"],
+                "read_only",
+            )
+            self.assertEqual(
+                result["operations"][operations.SEAGATE_BACKUP_SMART_READ_OPERATION]["parameters"],
+                [],
+            )
+            self.assertEqual(
                 result["operations"][operations.BLOCKADE_AUTHORITY_HARDEN_OPERATION]["effect"],
                 "authority_mode_write",
             )
@@ -152,6 +160,9 @@ class BackupNtfsOperationTests(unittest.TestCase):
         smart = operations._backup_storage_operation_plan(
             operations.BACKUP_SMART_READ_OPERATION, None
         )
+        seagate_smart = operations._backup_storage_operation_plan(
+            operations.SEAGATE_BACKUP_SMART_READ_OPERATION, None
+        )
         harden = operations._blockade_authority_harden_operation_plan(None)
         self.assertEqual(check["privileged_action"], "local_backup_ntfs_check")
         self.assertEqual(check["target"], "check")
@@ -165,6 +176,10 @@ class BackupNtfsOperationTests(unittest.TestCase):
         self.assertEqual(smart["target"], "smart-read")
         self.assertEqual(smart["parameter_names"], [])
         self.assertEqual(smart["effect"], "read_only")
+        self.assertEqual(seagate_smart["privileged_action"], "seagate_backup_smart_read")
+        self.assertEqual(seagate_smart["target"], "smart-read")
+        self.assertEqual(seagate_smart["parameter_names"], [])
+        self.assertEqual(seagate_smart["effect"], "read_only")
         self.assertEqual(harden["parameter_names"], [])
         self.assertEqual(harden["effect"], "authority_mode_write")
         self.assertEqual(
@@ -177,6 +192,10 @@ class BackupNtfsOperationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "parameter mismatch"):
             operations._backup_storage_operation_plan(
                 operations.BACKUP_SMART_READ_OPERATION, {"device": "/dev/sda"}
+            )
+        with self.assertRaisesRegex(ValueError, "parameter mismatch"):
+            operations._backup_storage_operation_plan(
+                operations.SEAGATE_BACKUP_SMART_READ_OPERATION, {"device": "/dev/sdb"}
             )
         with self.assertRaisesRegex(ValueError, "accepts no parameters"):
             operations._blockade_authority_harden_operation_plan(
@@ -576,6 +595,38 @@ class BackupNtfsOperationTests(unittest.TestCase):
         self.assertEqual(invoke.call_args.kwargs["action"], "local_backup_smart_read")
         self.assertEqual(invoke.call_args.kwargs["target"], "smart-read")
         self.assertIn("no caller-selected device or flags", invoke.call_args.kwargs["justification"])
+
+    def test_seagate_smart_read_is_exact_parameterless_and_output_audit_bound(self) -> None:
+        stdout = "SMART data for NZ0DRYBD\n"
+        stderr = ""
+        audit = {
+            **self._audit(action="seagate_backup_smart_read", returncode=0),
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "smart_stdout_sha256": hashlib.sha256(stdout.encode("utf-8")).hexdigest(),
+            "smart_stdout_bytes": len(stdout.encode("utf-8")),
+            "smart_stderr_sha256": hashlib.sha256(stderr.encode("utf-8")).hexdigest(),
+            "smart_stderr_bytes": 0,
+        }
+        invocation = {
+            "request_id": "a" * 32, "reference_sha256": "b" * 64,
+            "action": "seagate_backup_smart_read", "target": "smart-read",
+            "success": True, "outcome": "succeeded", "timed_out": False,
+            "transport_error": None,
+            "broker_response": {"returncode": 0, "stdout": stdout, "stderr": stderr, "audit": audit},
+            "response_sha256": "d" * 64,
+        }
+        self.assertRegex(operations._root_audit_sha256(invocation) or "", r"[0-9a-f]{64}")
+        with patch.object(operations.operator, "_require_operator_capability"), patch.object(
+            operations.operator, "_require_operator_mutation"
+        ), patch.object(operations, "_invoke_mainpid_privileged_action", return_value=invocation) as invoke, patch.object(operations.base, "_append_audit"):
+            result = operations._run_backup_storage_operation(
+                operations.SEAGATE_BACKUP_SMART_READ_OPERATION, None
+            )
+        self.assertTrue(result["success"])
+        self.assertEqual(result["effect"], "read_only")
+        self.assertEqual(invoke.call_args.kwargs["action"], "seagate_backup_smart_read")
+        self.assertIn("NZ0DRYBD", invoke.call_args.kwargs["justification"])
 
     def test_direct_invocation_rejects_non_backup_action_before_broker(self) -> None:
         with patch.object(operations.privileged, "_privileged_broker_status") as broker:
