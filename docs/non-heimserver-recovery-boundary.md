@@ -46,7 +46,7 @@ Configured recovery targets use one of two explicit shapes:
 - remote fallback: `<host>:rest-server/<probe>`
 - local BACKUP backend: `local-backup-disk:UUID=<uuid>/restic/<repository>`
 
-The host/probe and UUID/repository segments are bounded by strict parsers; whitespace, control characters and path-shaped escape syntax are rejected. The local backend additionally verifies that `/mnt/backup` is the exact `ntfs3` mount for the configured UUID and that the opened Restic repository has the pinned repository ID. Invalid target configuration is fail-closed and is reported separately from stale evidence.
+The host/probe and UUID/repository segments are bounded by strict parsers; whitespace, control characters and path-shaped escape syntax are rejected. The local backend additionally verifies that `/mnt/backup` is the exact filesystem mount selected by `GRABOWSKI_LOCAL_RECOVERY_FSTYPE` (default `ext4`; only `ext4` and `ntfs3` are accepted) for the configured UUID and that the opened Restic repository has the pinned repository ID. Invalid target configuration is fail-closed and is reported separately from stale evidence.
 
 ## Heimserver backend detection
 

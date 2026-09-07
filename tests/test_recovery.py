@@ -447,6 +447,96 @@ class RecoveryToolTests(unittest.TestCase):
         lock.assert_called_once_with()
         probe.assert_called_once_with(target_info)
 
+    def test_local_recovery_repository_accepts_seagate_ext4_mount(self) -> None:
+        backup_uuid = "9b626294-7913-4be0-88fa-96b314e96ee5"
+        repository_id = "85ee278eeb58f42c26745796cb7b23239d4c7c01f5f4d00f2c10e216cefa4972"
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            mount = root / "backup"
+            repository = mount / "restic" / "heim-pc"
+            repository.mkdir(parents=True)
+            password = root / "password"
+            password.write_text("test\n", encoding="utf-8")
+            password.chmod(0o600)
+            calls = []
+
+            def run(argv, *, env, log, timeout_seconds):
+                calls.append((argv, dict(env), timeout_seconds))
+                if argv[0] == "/usr/bin/findmnt":
+                    self.assertEqual(
+                        argv,
+                        [
+                            "/usr/bin/findmnt",
+                            "-rn",
+                            "-T",
+                            str(mount),
+                            "-t",
+                            "ext4",
+                            "-o",
+                            "TARGET,SOURCE,FSTYPE",
+                        ],
+                    )
+                    return types.SimpleNamespace(
+                        stdout=f"{mount} /dev/sda1 ext4\n", stderr="", returncode=0
+                    )
+                if argv[0] == "/usr/bin/lsblk":
+                    self.assertEqual(argv, ["/usr/bin/lsblk", "-ndo", "UUID", "/dev/sda1"])
+                    return types.SimpleNamespace(
+                        stdout=f"{backup_uuid}\n", stderr="", returncode=0
+                    )
+                self.assertEqual(
+                    argv,
+                    [recovery.RESTIC_BIN, "cat", "config", "--no-cache", "--no-lock"],
+                )
+                self.assertEqual(env["RESTIC_REPOSITORY"], str(repository))
+                self.assertEqual(env["RESTIC_PASSWORD_FILE"], str(password))
+                return types.SimpleNamespace(
+                    stdout=json.dumps({"id": repository_id}), stderr="", returncode=0
+                )
+
+            with patch.object(
+                recovery, "LOCAL_RECOVERY_MOUNT", mount
+            ), patch.object(
+                recovery, "LOCAL_RECOVERY_FSTYPE", "ext4"
+            ), patch.object(
+                recovery, "LOCAL_RECOVERY_PASSWORD_FILE", password
+            ), patch.object(
+                recovery, "LOCAL_RECOVERY_REPOSITORY_ID", repository_id
+            ), patch.object(
+                recovery, "_run_logged", side_effect=run
+            ):
+                result = recovery._local_recovery_repository(
+                    {
+                        "kind": "local_backup_disk",
+                        "backup_uuid": backup_uuid,
+                        "repository_name": "heim-pc",
+                    },
+                    log_path=root / "probe.log",
+                )
+
+            self.assertEqual(result[0], repository)
+            self.assertEqual(result[2], "/dev/sda1")
+            self.assertEqual(len(calls), 3)
+
+    def test_local_recovery_repository_rejects_unapproved_filesystem_type(self) -> None:
+        with tempfile.TemporaryDirectory() as raw, patch.object(
+            recovery, "LOCAL_RECOVERY_MOUNT", Path(raw)
+        ), patch.object(
+            recovery, "LOCAL_RECOVERY_FSTYPE", "xfs"
+        ), patch.object(recovery, "_run_logged") as run:
+            with self.assertRaisesRegex(
+                RuntimeError, "local recovery filesystem type is invalid"
+            ):
+                recovery._local_recovery_repository(
+                    {
+                        "kind": "local_backup_disk",
+                        "backup_uuid": "9b626294-7913-4be0-88fa-96b314e96ee5",
+                        "repository_name": "heim-pc",
+                    },
+                    log_path=Path(raw) / "probe.log",
+                )
+        run.assert_not_called()
+
     def test_local_probe_checks_repository_without_cache_or_lock_writes(self) -> None:
         snapshot_id = "a" * 64
         durability = {
