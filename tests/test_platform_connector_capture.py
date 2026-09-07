@@ -180,10 +180,12 @@ class PlatformConnectorCaptureTests(unittest.TestCase):
     def retirement_binding(
         self,
         *,
+        request_id: str,
         connector_id: str = "primary",
         surface_id: str = "grabowski",
         runtime_binding_sha256: str = "3" * 64,
     ) -> dict[str, object]:
+        request = snapshot._read_publication_request(request_id)
         return {
             "schema_version": 1,
             "connector_id": connector_id,
@@ -194,7 +196,7 @@ class PlatformConnectorCaptureTests(unittest.TestCase):
             "runtime_binding_sha256": runtime_binding_sha256,
             "release_id": RELEASE_ID,
             "repo_head": REPO_HEAD,
-            "registered_names_sha256": "5" * 64,
+            "registered_names_sha256": request["expected_contract"]["tool_names_sha256"],
             "agent_instructions_sha256": INSTRUCTIONS_HASH,
         }
 
@@ -1347,7 +1349,7 @@ class PlatformConnectorCaptureTests(unittest.TestCase):
             query="reposkop",
             matched_tool_names=[],
             source_reference="chatgpt-tool-discovery:thread-1:grabowski",
-            server_binding=self.retirement_binding(),
+            server_binding=self.retirement_binding(request_id=request_id),
             now_unix=1_002,
         )
 
@@ -1382,7 +1384,7 @@ class PlatformConnectorCaptureTests(unittest.TestCase):
             query="reposkop",
             matched_tool_names=["grabowski_reposkop_context"],
             source_reference="chatgpt-tool-discovery:thread-stale:grabowski",
-            server_binding=self.retirement_binding(),
+            server_binding=self.retirement_binding(request_id=request_id),
             now_unix=1_002,
         )
 
@@ -1416,7 +1418,7 @@ class PlatformConnectorCaptureTests(unittest.TestCase):
                 query="repo",
                 matched_tool_names=[],
                 source_reference="chatgpt-tool-discovery:thread-wrong:grabowski",
-                server_binding=self.retirement_binding(),
+                server_binding=self.retirement_binding(request_id=request_id),
                 now_unix=1_002,
             )
 

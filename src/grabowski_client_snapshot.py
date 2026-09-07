@@ -1645,6 +1645,17 @@ def _platform_contract_from_artifact(artifact: dict[str, Any]) -> dict[str, Any]
     )
 
 
+def _validate_private_json_size(payload: dict[str, Any], *, label: str) -> None:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        indent=2,
+    ).encode("utf-8") + b"\n"
+    if len(encoded) > MAX_SNAPSHOT_BYTES:
+        raise ClientSnapshotError(f"{label} exceeds size limit")
+
+
 def _create_private_json(path: Path, payload: dict[str, Any]) -> bool:
     _ensure_private_directory(path.parent)
     encoded = json.dumps(
@@ -2337,26 +2348,25 @@ def _settle_retirement_transaction(
     transaction = _validate_retirement_transaction(transaction)
     observation = transaction["observation"]
     projection = transaction["projection"]
-    _ensure_private_directory(PLATFORM_RETIREMENT_RESOLUTION_ROOT)
-    _write_private_json(
-        _retirement_resolution_path(
-            str(transaction["request_id"]), str(transaction["surface_id"])
-        ),
-        projection,
-    )
-    _create_private_json(
-        _retirement_observation_path(
-            str(transaction["request_id"]),
-            str(transaction["surface_id"]),
-            str(transaction["observation_id"]),
-        ),
-        observation,
-    )
     complete = _retirement_transaction_document(
         observation=observation,
         projection=projection,
         state="complete",
     )
+    _validate_private_json_size(observation, label="retirement observation record")
+    _validate_private_json_size(projection, label="retirement projection record")
+    _validate_private_json_size(complete, label="retirement transaction record")
+    observation_path = _retirement_observation_path(
+        str(transaction["request_id"]),
+        str(transaction["surface_id"]),
+        str(transaction["observation_id"]),
+    )
+    projection_path = _retirement_resolution_path(
+        str(transaction["request_id"]), str(transaction["surface_id"])
+    )
+    _create_private_json(observation_path, observation)
+    _ensure_private_directory(PLATFORM_RETIREMENT_RESOLUTION_ROOT)
+    _write_private_json(projection_path, projection)
     _ensure_private_directory(path.parent)
     _write_private_json(path, complete)
     return complete
@@ -2420,6 +2430,13 @@ def _retirement_surface_status_locked(
     contract_sha256 = request["expected_contract"]["tool_contract_sha256"]
     if current.get("contract_sha256") != contract_sha256:
         raise ClientSnapshotError("retirement surface status request/current contract mismatch")
+    if (
+        server_binding["registered_names_sha256"]
+        != request["expected_contract"]["tool_names_sha256"]
+    ):
+        raise ClientSnapshotError(
+            "retirement server binding tool catalog does not match publication request"
+        )
     transaction_path = _retirement_transaction_path(request_id, surface_id)
     try:
         transaction = _validate_retirement_transaction(
@@ -2583,6 +2600,13 @@ def record_platform_retirement_surface_observation(
         if current["contract_sha256"] != contract_sha256:
             raise ClientSnapshotError(
                 "retirement surface observation request/current contract mismatch"
+            )
+        if (
+            binding["registered_names_sha256"]
+            != request["expected_contract"]["tool_names_sha256"]
+        ):
+            raise ClientSnapshotError(
+                "retirement server binding tool catalog does not match publication request"
             )
         historical_present = sorted(
             REPOSKOP_RETIREMENT_FORBIDDEN_TOOLS.intersection(normalized_names)

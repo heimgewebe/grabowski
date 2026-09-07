@@ -3872,9 +3872,17 @@ def _run_reposkop_retirement_surface_observe(
     raw_matches = parameters.get("matched_tool_names")
     if not isinstance(raw_matches, list):
         raise GripPreflightError("matched_tool_names must be a list")
+    effective_matches = raw_matches
+    if output.get("replay_superseded") is True:
+        projected_matches = output.get("matched_tool_names")
+        if not isinstance(projected_matches, list):
+            raise GripActionError(
+                "superseded retirement replay lacks projected matched tool names"
+            )
+        effective_matches = projected_matches
     expected_state = (
         "retirement_surface_blocked"
-        if raw_matches
+        if effective_matches
         else "retirement_surface_converged"
     )
     state_matches_query = state == expected_state
@@ -3882,7 +3890,7 @@ def _run_reposkop_retirement_surface_observe(
         receipt,
         "surface-query-complete",
         "pass" if state_matches_query else "fail",
-        f"matched={len(raw_matches)} state={state}",
+        f"matched={len(effective_matches)} state={state}",
     )
     nonclaims = output.get("does_not_establish")
     generic_not_promoted = (

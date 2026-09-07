@@ -170,6 +170,69 @@ class ReposkopRetirementGripTests(unittest.TestCase):
             result["output"]["blocked_reasons"],
         )
 
+    def test_superseded_zero_replay_accepts_current_blocked_projection(self) -> None:
+        binding = server_binding()
+        low_level = {
+            "state": "retirement_surface_blocked",
+            "request_id": PUBLIC_PARAMETERS["request_id"],
+            "surface_id": "grabowski",
+            "observation_sha256": "7" * 64,
+            "matched_tool_names": ["future_reposkop_diagnostic"],
+            "replay_superseded": True,
+            "generic_platform_publication_state": "awaiting_platform_observation",
+            "generic_platform_publication_unchanged": True,
+            "does_not_establish": ["platform_converged"],
+        }
+        parameters = {**PUBLIC_PARAMETERS, "_server_retirement_binding": binding}
+        with patch.object(
+            grips.grabowski_client_snapshot,
+            "record_platform_retirement_surface_observation",
+            return_value=low_level,
+        ):
+            result = grips.run_grip(
+                "reposkop-retirement-surface-observe",
+                parameters,
+                allow_mutation=True,
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("pass", checks["surface-query-complete"])
+
+    def test_superseded_blocked_replay_accepts_current_zero_projection(self) -> None:
+        binding = server_binding()
+        low_level = {
+            "state": "retirement_surface_converged",
+            "request_id": PUBLIC_PARAMETERS["request_id"],
+            "surface_id": "grabowski",
+            "observation_sha256": "7" * 64,
+            "resolution_sha256": "8" * 64,
+            "matched_tool_names": [],
+            "replay_superseded": True,
+            "generic_platform_publication_state": "awaiting_platform_observation",
+            "generic_platform_publication_unchanged": True,
+            "does_not_establish": ["platform_converged"],
+        }
+        parameters = {
+            **PUBLIC_PARAMETERS,
+            "matched_tool_names": ["future_reposkop_diagnostic"],
+            "_server_retirement_binding": binding,
+        }
+        with patch.object(
+            grips.grabowski_client_snapshot,
+            "record_platform_retirement_surface_observation",
+            return_value=low_level,
+        ):
+            result = grips.run_grip(
+                "reposkop-retirement-surface-observe",
+                parameters,
+                allow_mutation=True,
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("pass", checks["surface-query-complete"])
+
     def test_caller_surface_id_is_rejected(self) -> None:
         parameters = {
             **PUBLIC_PARAMETERS,

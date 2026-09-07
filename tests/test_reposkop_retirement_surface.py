@@ -149,7 +149,12 @@ class ReposkopRetirementSurfaceRegressionTests(unittest.TestCase):
         state_scope_sha256: str | None = None,
         runtime_binding_sha256: str = "3" * 64,
         repo_head: str = "4" * 40,
+        registered_names_sha256: str | None = None,
     ) -> dict[str, object]:
+        if registered_names_sha256 is None:
+            registered_names_sha256 = connector_contract.parse_observed_artifact(
+                self._artifact()
+            )[2]["names_sha256"]
         return {
             "schema_version": 1,
             "connector_id": connector_id,
@@ -164,7 +169,7 @@ class ReposkopRetirementSurfaceRegressionTests(unittest.TestCase):
             "runtime_binding_sha256": runtime_binding_sha256,
             "release_id": "release-test",
             "repo_head": repo_head,
-            "registered_names_sha256": "5" * 64,
+            "registered_names_sha256": registered_names_sha256,
             "agent_instructions_sha256": "6" * 64,
         }
 
@@ -266,7 +271,7 @@ class ReposkopRetirementSurfaceRegressionTests(unittest.TestCase):
             replay["replayed_observation_sha256"], first["observation_sha256"]
         )
 
-    def test_crash_after_projection_before_observation_fails_closed_and_retry_repairs(self) -> None:
+    def test_observation_failure_preserves_previous_projection_and_retry_repairs(self) -> None:
         request_id = self._activated_request()
         binding = self._binding()
         self._record(
@@ -298,8 +303,8 @@ class ReposkopRetirementSurfaceRegressionTests(unittest.TestCase):
         projection = snapshot._read_private_json(
             snapshot._retirement_resolution_path(request_id, "grabowski")
         )
-        self.assertEqual(projection["state"], "retirement_surface_blocked")
-        self.assertEqual(projection["observation_id"], failed_observation_id)
+        self.assertEqual(projection["state"], "retirement_surface_converged")
+        self.assertEqual(projection["observation_id"], "chatgpt-zero-before-crash")
         self.assertFalse(failed_observation_path.exists())
         with self.assertRaisesRegex(
             snapshot.ClientSnapshotError, "pending recovery"
@@ -450,6 +455,60 @@ class ReposkopRetirementSurfaceRegressionTests(unittest.TestCase):
                 now_unix=1_004,
                 binding=first_binding,
             )
+
+    def test_runtime_tool_catalog_must_match_active_publication_request(self) -> None:
+        request_id = self._activated_request()
+        binding = self._binding(registered_names_sha256="9" * 64)
+        transaction_path = snapshot._retirement_transaction_path(
+            request_id, "grabowski"
+        )
+        projection_path = snapshot._retirement_resolution_path(
+            request_id, "grabowski"
+        )
+
+        with self.assertRaisesRegex(
+            snapshot.ClientSnapshotError, "tool catalog does not match publication request"
+        ):
+            self._record(
+                request_id,
+                observation_id="chatgpt-wrong-runtime-catalog",
+                matched_tool_names=[],
+                now_unix=1_002,
+                binding=binding,
+            )
+
+        self.assertFalse(transaction_path.exists())
+        self.assertFalse(projection_path.exists())
+
+    def test_oversized_observation_cannot_replace_previous_projection(self) -> None:
+        request_id = self._activated_request()
+        binding = self._binding()
+        self._record(
+            request_id,
+            observation_id="chatgpt-zero-before-oversize",
+            matched_tool_names=[],
+            now_unix=1_002,
+            binding=binding,
+        )
+        projection_path = snapshot._retirement_resolution_path(
+            request_id, "grabowski"
+        )
+        before = snapshot._read_private_json(projection_path)
+        large_names = [
+            f"reposkop_{index:03d}_" + "x" * 100
+            for index in range(180)
+        ]
+
+        with self.assertRaisesRegex(snapshot.ClientSnapshotError, "size limit"):
+            self._record(
+                request_id,
+                observation_id="chatgpt-oversized-observation",
+                matched_tool_names=large_names,
+                now_unix=1_003,
+                binding=binding,
+            )
+
+        self.assertEqual(before, snapshot._read_private_json(projection_path))
 
     def test_same_observation_id_cannot_bind_conflicting_evidence(self) -> None:
         request_id = self._activated_request()
