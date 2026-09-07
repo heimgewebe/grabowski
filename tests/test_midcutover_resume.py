@@ -1460,6 +1460,45 @@ class ResumeEffectSemanticsTests(unittest.TestCase):
         self.assertTrue(recovery["blue_green_state_unchanged"])
         self.assertTrue(runtime.admission_released)
 
+    def test_s0_readback_ambiguity_persists_retained_durable_rebind(self) -> None:
+        runtime = _FakeResumeRuntime(phase=midcutover.PHASE_REBIND_SNAPSHOT)
+        durable = durable_rebind_evidence()
+
+        def ambiguous_rebind():
+            runtime.calls.append("rebind_snapshot")
+            runtime.snapshot_rebind = {
+                "rebound": True,
+                "readback_state": None,
+                "readback_receipt_sha256": None,
+                "receipt_sha256": durable["receipt_sha256"],
+                "durable_rebind": durable,
+            }
+            raise RuntimeError("snapshot rebind readback failed")
+
+        runtime.rebind_snapshot = ambiguous_rebind
+        runtime.cold_snapshot_observation = lambda: {
+            "state": midcutover.SNAPSHOT_BINDING_UNREADABLE,
+            "error": "snapshot readback unavailable",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            result = self._run(runtime, Path(temporary))
+        self.assertEqual(result["outcome"], "outcome_unknown")
+        receipt = result["receipt"]
+        recovery = receipt["recovery"]
+        self.assertTrue(recovery["snapshot_rebind_applied"])
+        self.assertTrue(recovery["snapshot_rollback_forbidden"])
+        self.assertEqual(
+            recovery["next_resume_phase"], midcutover.PHASE_PROMOTE_POINTER
+        )
+        self.assertEqual(receipt["snapshot_rebind"]["durable_rebind"], durable)
+        original = cutover_receipt()
+        self.assertEqual(
+            midcutover.durable_snapshot_rebind_for_cutover(
+                [original, receipt], original
+            ),
+            durable,
+        )
+
     def test_successful_resume_persists_a_terminal_revision_bound_receipt(self) -> None:
         runtime = _FakeResumeRuntime()
         with tempfile.TemporaryDirectory() as temporary:

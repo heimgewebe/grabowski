@@ -9204,9 +9204,25 @@ def resume_production_blue_green_cutover(
                     "error": str(snapshot_exc),
                 }
             snapshot_state = cold_snapshot.get("state")
-            s0_applied = snapshot_state == midcutover.SNAPSHOT_BINDING_DONE
+            retained_s0_rebind = (
+                context.snapshot_rebind
+                if isinstance(context.snapshot_rebind, dict)
+                and context.snapshot_rebind.get("rebound") is True
+                and isinstance(context.snapshot_rebind.get("durable_rebind"), dict)
+                and context.snapshot_rebind["durable_rebind"].get("receipt_sha256")
+                == context.snapshot_rebind.get("receipt_sha256")
+                else None
+            )
+            # A failed cold readback cannot erase an S0 effect that this process
+            # already observed returning with its full durable lineage. Treat it
+            # conservatively as applied/ambiguous so rollback stays forbidden and
+            # the outcome_unknown receipt carries the evidence into the next run.
+            s0_applied = (
+                snapshot_state == midcutover.SNAPSHOT_BINDING_DONE
+                or retained_s0_rebind is not None
+            )
             if s0_applied and snapshot_rebind is None:
-                snapshot_rebind = {
+                snapshot_rebind = retained_s0_rebind or {
                     "rebound": True,
                     "adopted_from_durable_snapshot": True,
                     "receipt_sha256": cold_snapshot.get(
