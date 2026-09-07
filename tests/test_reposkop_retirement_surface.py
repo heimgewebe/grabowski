@@ -302,7 +302,7 @@ class ReposkopRetirementSurfaceRegressionTests(unittest.TestCase):
         self.assertEqual(projection["observation_id"], failed_observation_id)
         self.assertFalse(failed_observation_path.exists())
         with self.assertRaisesRegex(
-            snapshot.ClientSnapshotError, "references missing observation"
+            snapshot.ClientSnapshotError, "pending recovery"
         ):
             snapshot.retirement_surface_status(
                 request_id=request_id,
@@ -311,15 +311,115 @@ class ReposkopRetirementSurfaceRegressionTests(unittest.TestCase):
                 now_unix=1_003,
             )
 
-        repaired = self._record(
+        newer = self._record(
             request_id,
-            observation_id=failed_observation_id,
+            observation_id="chatgpt-newer-block-after-crash",
             matched_tool_names=["future_reposkop_diagnostic"],
             now_unix=1_004,
             binding=binding,
         )
-        self.assertEqual(repaired["state"], "retirement_surface_blocked")
+        self.assertEqual(newer["state"], "retirement_surface_blocked")
         self.assertTrue(failed_observation_path.exists())
+
+        replay = self._record(
+            request_id,
+            observation_id=failed_observation_id,
+            matched_tool_names=["future_reposkop_diagnostic"],
+            now_unix=1_005,
+            binding=binding,
+        )
+        self.assertEqual(replay["state"], "retirement_surface_blocked")
+        self.assertTrue(replay["idempotent"])
+        self.assertTrue(replay["replay_superseded"])
+
+    def test_interrupted_zero_cannot_overwrite_newer_block_on_retry(self) -> None:
+        request_id = self._activated_request()
+        binding = self._binding()
+        zero_id = "chatgpt-zero-interrupted-before-observation"
+        zero_path = snapshot._retirement_observation_path(
+            request_id, "grabowski", zero_id
+        )
+        with mock.patch.object(
+            snapshot,
+            "_create_private_json",
+            side_effect=OSError("simulated zero observation persistence failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "simulated zero observation persistence failure"):
+                self._record(
+                    request_id,
+                    observation_id=zero_id,
+                    matched_tool_names=[],
+                    now_unix=1_002,
+                    binding=binding,
+                )
+        self.assertFalse(zero_path.exists())
+
+        blocked = self._record(
+            request_id,
+            observation_id="chatgpt-block-after-interrupted-zero",
+            matched_tool_names=["future_reposkop_diagnostic"],
+            now_unix=1_003,
+            binding=binding,
+        )
+        self.assertEqual(blocked["state"], "retirement_surface_blocked")
+        self.assertTrue(zero_path.exists())
+
+        replay = self._record(
+            request_id,
+            observation_id=zero_id,
+            matched_tool_names=[],
+            now_unix=1_004,
+            binding=binding,
+        )
+        self.assertEqual(replay["state"], "retirement_surface_blocked")
+        self.assertTrue(replay["idempotent"])
+        self.assertTrue(replay["replay_superseded"])
+
+    def test_pending_transaction_after_observation_requires_recovery(self) -> None:
+        request_id = self._activated_request()
+        binding = self._binding()
+        transaction_path = snapshot._retirement_transaction_path(
+            request_id, "grabowski"
+        )
+        original_write = snapshot._write_private_json
+
+        def fail_complete(path: Path, payload: dict[str, object]) -> None:
+            if path == transaction_path and payload.get("state") == "complete":
+                raise OSError("simulated transaction completion failure")
+            original_write(path, payload)
+
+        with mock.patch.object(snapshot, "_write_private_json", side_effect=fail_complete):
+            with self.assertRaisesRegex(OSError, "transaction completion failure"):
+                self._record(
+                    request_id,
+                    observation_id="chatgpt-zero-before-complete-marker",
+                    matched_tool_names=[],
+                    now_unix=1_002,
+                    binding=binding,
+                )
+
+        pending = snapshot._read_private_json(transaction_path)
+        self.assertEqual(pending["state"], "pending")
+        with self.assertRaisesRegex(
+            snapshot.ClientSnapshotError, "pending recovery"
+        ):
+            snapshot.retirement_surface_status(
+                request_id=request_id,
+                surface_id="grabowski",
+                server_binding=binding,
+                now_unix=1_003,
+            )
+
+        recovered = self._record(
+            request_id,
+            observation_id="chatgpt-zero-before-complete-marker",
+            matched_tool_names=[],
+            now_unix=1_003,
+            binding=binding,
+        )
+        self.assertEqual(recovered["state"], "retirement_surface_converged")
+        completed = snapshot._read_private_json(transaction_path)
+        self.assertEqual(completed["state"], "complete")
 
     def test_replay_revalidates_current_runtime_binding(self) -> None:
         request_id = self._activated_request()

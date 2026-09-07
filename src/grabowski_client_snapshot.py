@@ -54,6 +54,7 @@ PLATFORM_PUBLICATION_RECEIPT_KIND = "grabowski_platform_publication_convergence_
 PLATFORM_PUBLICATION_RESOLUTION_KIND = "grabowski_platform_publication_resolution"
 PLATFORM_RETIREMENT_OBSERVATION_KIND = "grabowski_platform_retirement_surface_observation"
 PLATFORM_RETIREMENT_RESOLUTION_KIND = "grabowski_platform_retirement_surface_resolution"
+PLATFORM_RETIREMENT_TRANSACTION_KIND = "grabowski_platform_retirement_surface_transaction"
 PLATFORM_PUBLICATION_CURRENT_KIND = "grabowski_platform_publication_current"
 PLATFORM_PUBLICATION_ACTION = "refresh_or_republish_chatgpt_connector_catalog"
 PLATFORM_OBSERVATION_SCOPES = frozenset(
@@ -1728,6 +1729,13 @@ def _retirement_resolution_path(request_id: str, surface_id: str) -> Path:
     return PLATFORM_RETIREMENT_RESOLUTION_ROOT / f"{request_id}--{surface_id}.json"
 
 
+def _retirement_transaction_path(request_id: str, surface_id: str) -> Path:
+    request_id = _validate_identifier(request_id, label="retirement request id")
+    surface_id = _validate_identifier(surface_id, label="retirement surface id")
+    root = PLATFORM_RETIREMENT_RESOLUTION_ROOT.parent / "retirement-transactions"
+    return root / f"{request_id}--{surface_id}.json"
+
+
 def _read_publication_current() -> dict[str, Any] | None:
     try:
         value = _read_private_json(PLATFORM_PUBLICATION_CURRENT_PATH)
@@ -2259,6 +2267,101 @@ def _validate_retirement_resolution(value: Any) -> dict[str, Any]:
     return value
 
 
+def _retirement_transaction_document(
+    *,
+    observation: dict[str, Any],
+    projection: dict[str, Any],
+    state: str,
+) -> dict[str, Any]:
+    if state not in {"pending", "complete"}:
+        raise ClientSnapshotError("retirement transaction state is invalid")
+    material = {
+        "schema_version": 1,
+        "kind": PLATFORM_RETIREMENT_TRANSACTION_KIND,
+        "request_id": observation["request_id"],
+        "surface_id": observation["surface_id"],
+        "observation_id": observation["observation_id"],
+        "state": state,
+        "observation": observation,
+        "projection": projection,
+    }
+    return {**material, "transaction_sha256": _sha256_json(material)}
+
+
+def _validate_retirement_transaction(value: Any) -> dict[str, Any]:
+    required = {
+        "schema_version",
+        "kind",
+        "request_id",
+        "surface_id",
+        "observation_id",
+        "state",
+        "observation",
+        "projection",
+        "transaction_sha256",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise ClientSnapshotError("retirement transaction shape is invalid")
+    if (
+        value.get("schema_version") != 1
+        or value.get("kind") != PLATFORM_RETIREMENT_TRANSACTION_KIND
+        or value.get("state") not in {"pending", "complete"}
+    ):
+        raise ClientSnapshotError("retirement transaction contract is unsupported")
+    material = dict(value)
+    digest = material.pop("transaction_sha256", None)
+    if (
+        not isinstance(digest, str)
+        or _SHA256_RE.fullmatch(digest) is None
+        or digest != _sha256_json(material)
+    ):
+        raise ClientSnapshotError("retirement transaction digest is invalid")
+    observation = _validate_retirement_observation(value.get("observation"))
+    projection = _validate_retirement_resolution(value.get("projection"))
+    if (
+        value.get("request_id") != observation.get("request_id")
+        or value.get("request_id") != projection.get("request_id")
+        or value.get("surface_id") != observation.get("surface_id")
+        or value.get("surface_id") != projection.get("surface_id")
+        or value.get("observation_id") != observation.get("observation_id")
+        or value.get("observation_id") != projection.get("observation_id")
+        or observation.get("observation_sha256") != projection.get("observation_sha256")
+    ):
+        raise ClientSnapshotError("retirement transaction evidence binding is invalid")
+    return value
+
+
+def _settle_retirement_transaction(
+    path: Path, transaction: dict[str, Any]
+) -> dict[str, Any]:
+    transaction = _validate_retirement_transaction(transaction)
+    observation = transaction["observation"]
+    projection = transaction["projection"]
+    _ensure_private_directory(PLATFORM_RETIREMENT_RESOLUTION_ROOT)
+    _write_private_json(
+        _retirement_resolution_path(
+            str(transaction["request_id"]), str(transaction["surface_id"])
+        ),
+        projection,
+    )
+    _create_private_json(
+        _retirement_observation_path(
+            str(transaction["request_id"]),
+            str(transaction["surface_id"]),
+            str(transaction["observation_id"]),
+        ),
+        observation,
+    )
+    complete = _retirement_transaction_document(
+        observation=observation,
+        projection=projection,
+        state="complete",
+    )
+    _ensure_private_directory(path.parent)
+    _write_private_json(path, complete)
+    return complete
+
+
 def _retirement_projection_result(
     *,
     projection: dict[str, Any],
@@ -2317,11 +2420,26 @@ def _retirement_surface_status_locked(
     contract_sha256 = request["expected_contract"]["tool_contract_sha256"]
     if current.get("contract_sha256") != contract_sha256:
         raise ClientSnapshotError("retirement surface status request/current contract mismatch")
+    transaction_path = _retirement_transaction_path(request_id, surface_id)
+    try:
+        transaction = _validate_retirement_transaction(
+            _read_private_json(transaction_path)
+        )
+    except FileNotFoundError:
+        transaction = None
+    if transaction is not None and transaction["state"] == "pending":
+        raise ClientSnapshotError(
+            "retirement surface transaction is pending recovery"
+        )
     try:
         projection = _validate_retirement_resolution(
             _read_private_json(_retirement_resolution_path(request_id, surface_id))
         )
     except FileNotFoundError:
+        if transaction is not None:
+            raise ClientSnapshotError(
+                "retirement surface transaction references missing projection"
+            )
         return {
             "state": "retirement_surface_missing",
             "valid": False,
@@ -2356,8 +2474,14 @@ def _retirement_surface_status_locked(
         raise ClientSnapshotError(
             "retirement surface resolution references missing observation"
         ) from exc
+    if transaction is None or transaction["state"] != "complete":
+        raise ClientSnapshotError(
+            "retirement surface resolution lacks completed transaction evidence"
+        )
     if (
-        observation.get("observation_sha256") != projection.get("observation_sha256")
+        transaction.get("projection") != projection
+        or transaction.get("observation") != observation
+        or observation.get("observation_sha256") != projection.get("observation_sha256")
         or observation.get("request_sha256") != request_sha256
         or observation.get("contract_sha256") != contract_sha256
         or observation.get("surface_id") != surface_id
@@ -2488,6 +2612,17 @@ def record_platform_retirement_surface_observation(
         }
         observation = {**material, "observation_sha256": _sha256_json(material)}
         observation_path = _retirement_observation_path(request_id, surface_id, observation_id)
+        transaction_path = _retirement_transaction_path(request_id, surface_id)
+        try:
+            transaction = _validate_retirement_transaction(
+                _read_private_json(transaction_path)
+            )
+        except FileNotFoundError:
+            transaction = None
+        if transaction is not None and transaction["state"] == "pending":
+            transaction = _settle_retirement_transaction(
+                transaction_path, transaction
+            )
         try:
             existing_observation = _validate_retirement_observation(
                 _read_private_json(observation_path)
@@ -2554,9 +2689,14 @@ def record_platform_retirement_surface_observation(
             **projection_material,
             "resolution_sha256": _sha256_json(projection_material),
         }
-        _ensure_private_directory(PLATFORM_RETIREMENT_RESOLUTION_ROOT)
-        _write_private_json(_retirement_resolution_path(request_id, surface_id), projection)
-        _create_private_json(observation_path, observation)
+        pending = _retirement_transaction_document(
+            observation=observation,
+            projection=projection,
+            state="pending",
+        )
+        _ensure_private_directory(transaction_path.parent)
+        _write_private_json(transaction_path, pending)
+        _settle_retirement_transaction(transaction_path, pending)
         result = _retirement_surface_status_locked(
             request_id=request_id,
             surface_id=surface_id,
