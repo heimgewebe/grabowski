@@ -2344,13 +2344,18 @@ def _retirement_surface_status_locked(
         or any(projection.get(key) != value for key, value in expected_binding_fields.items())
     ):
         raise ClientSnapshotError("retirement surface resolution binding mismatch")
-    observation = _validate_retirement_observation(
-        _read_private_json(
-            _retirement_observation_path(
-                request_id, surface_id, str(projection["observation_id"])
+    try:
+        observation = _validate_retirement_observation(
+            _read_private_json(
+                _retirement_observation_path(
+                    request_id, surface_id, str(projection["observation_id"])
+                )
             )
         )
-    )
+    except FileNotFoundError as exc:
+        raise ClientSnapshotError(
+            "retirement surface resolution references missing observation"
+        ) from exc
     if (
         observation.get("observation_sha256") != projection.get("observation_sha256")
         or observation.get("request_sha256") != request_sha256
@@ -2489,10 +2494,7 @@ def record_platform_retirement_surface_observation(
             )
         except FileNotFoundError:
             existing_observation = None
-        if existing_observation is None:
-            _create_private_json(observation_path, observation)
-            effective_observation = observation
-        else:
+        if existing_observation is not None:
             identity_fields = set(material) - {
                 "generic_platform_publication_state",
                 "observed_at_unix",
@@ -2502,20 +2504,19 @@ def record_platform_retirement_surface_observation(
                 raise ClientSnapshotError(
                     "retirement surface observation id already binds different evidence"
                 )
-            effective_observation = existing_observation
-            try:
-                current_projection = _validate_retirement_resolution(
-                    _read_private_json(_retirement_resolution_path(request_id, surface_id))
-                )
-            except FileNotFoundError as exc:
-                raise ClientSnapshotError(
-                    "retirement surface replay lacks its latest-evidence projection"
-                ) from exc
-            result = _retirement_projection_result(
-                projection=current_projection,
-                current=current,
+            result = _retirement_surface_status_locked(
+                request_id=request_id,
+                surface_id=surface_id,
+                server_binding=binding,
                 now_unix=timestamp,
-                replayed_observation_sha256=effective_observation["observation_sha256"],
+            )
+            result["idempotent"] = True
+            result["replayed_observation_sha256"] = existing_observation[
+                "observation_sha256"
+            ]
+            result["replay_superseded"] = (
+                existing_observation["observation_sha256"]
+                != result.get("observation_sha256")
             )
             result["generic_platform_publication_unchanged"] = (
                 _read_publication_current() == current
@@ -2555,9 +2556,11 @@ def record_platform_retirement_surface_observation(
         }
         _ensure_private_directory(PLATFORM_RETIREMENT_RESOLUTION_ROOT)
         _write_private_json(_retirement_resolution_path(request_id, surface_id), projection)
-        result = _retirement_projection_result(
-            projection=projection,
-            current=current,
+        _create_private_json(observation_path, observation)
+        result = _retirement_surface_status_locked(
+            request_id=request_id,
+            surface_id=surface_id,
+            server_binding=binding,
             now_unix=timestamp,
         )
         result["generic_platform_publication_unchanged"] = (

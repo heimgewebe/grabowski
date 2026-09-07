@@ -266,6 +266,91 @@ class ReposkopRetirementSurfaceRegressionTests(unittest.TestCase):
             replay["replayed_observation_sha256"], first["observation_sha256"]
         )
 
+    def test_crash_after_projection_before_observation_fails_closed_and_retry_repairs(self) -> None:
+        request_id = self._activated_request()
+        binding = self._binding()
+        self._record(
+            request_id,
+            observation_id="chatgpt-zero-before-crash",
+            matched_tool_names=[],
+            now_unix=1_002,
+            binding=binding,
+        )
+        failed_observation_id = "chatgpt-block-crash-window"
+        failed_observation_path = snapshot._retirement_observation_path(
+            request_id, "grabowski", failed_observation_id
+        )
+
+        with mock.patch.object(
+            snapshot,
+            "_create_private_json",
+            side_effect=OSError("simulated observation persistence failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "simulated observation persistence failure"):
+                self._record(
+                    request_id,
+                    observation_id=failed_observation_id,
+                    matched_tool_names=["future_reposkop_diagnostic"],
+                    now_unix=1_003,
+                    binding=binding,
+                )
+
+        projection = snapshot._read_private_json(
+            snapshot._retirement_resolution_path(request_id, "grabowski")
+        )
+        self.assertEqual(projection["state"], "retirement_surface_blocked")
+        self.assertEqual(projection["observation_id"], failed_observation_id)
+        self.assertFalse(failed_observation_path.exists())
+        with self.assertRaisesRegex(
+            snapshot.ClientSnapshotError, "references missing observation"
+        ):
+            snapshot.retirement_surface_status(
+                request_id=request_id,
+                surface_id="grabowski",
+                server_binding=binding,
+                now_unix=1_003,
+            )
+
+        repaired = self._record(
+            request_id,
+            observation_id=failed_observation_id,
+            matched_tool_names=["future_reposkop_diagnostic"],
+            now_unix=1_004,
+            binding=binding,
+        )
+        self.assertEqual(repaired["state"], "retirement_surface_blocked")
+        self.assertTrue(failed_observation_path.exists())
+
+    def test_replay_revalidates_current_runtime_binding(self) -> None:
+        request_id = self._activated_request()
+        first_binding = self._binding(runtime_binding_sha256="3" * 64)
+        later_binding = self._binding(runtime_binding_sha256="9" * 64)
+        self._record(
+            request_id,
+            observation_id="chatgpt-runtime-a",
+            matched_tool_names=[],
+            now_unix=1_002,
+            binding=first_binding,
+        )
+        self._record(
+            request_id,
+            observation_id="chatgpt-runtime-b",
+            matched_tool_names=[],
+            now_unix=1_003,
+            binding=later_binding,
+        )
+
+        with self.assertRaisesRegex(
+            snapshot.ClientSnapshotError, "resolution binding mismatch"
+        ):
+            self._record(
+                request_id,
+                observation_id="chatgpt-runtime-a",
+                matched_tool_names=[],
+                now_unix=1_004,
+                binding=first_binding,
+            )
+
     def test_same_observation_id_cannot_bind_conflicting_evidence(self) -> None:
         request_id = self._activated_request()
         self._record(
