@@ -529,11 +529,6 @@ def durable_snapshot_rebind_for_cutover(
                 "outcome_unknown resume claims cutover lineage with invalid binding"
             )
         summary = receipt.get("snapshot_rebind")
-        if not isinstance(summary, dict) or summary.get("rebound") is not True:
-            raise MidCutoverEvidenceError(
-                "outcome_unknown resume claims snapshot rebind without durable lineage"
-            )
-        durable = summary.get("durable_rebind")
         identity_matches = (
             receipt.get("resumed_cutover_id") == cutover.get("cutover_id")
             and receipt.get("resumed_receipt_sha256")
@@ -577,20 +572,39 @@ def durable_snapshot_rebind_for_cutover(
             raise MidCutoverEvidenceError(
                 "outcome_unknown resume snapshot rebind lineage identity is inconsistent"
             )
-        if "durable_rebind" not in summary:
-            summary_identity_matches = (
-                summary.get("source_snapshot_receipt_sha256")
-                == binding.get("source_snapshot_receipt_sha256")
-                and summary.get("source_client_declaration_sha256")
-                == binding.get("source_client_declaration_sha256")
-                and summary.get("classified_snapshot_receipt_sha256")
-                == binding.get("classified_snapshot_receipt_sha256")
-                and summary.get("source_release_id") == binding.get("blue_release_id")
-                and summary.get("source_repo_head") == binding.get("blue_repo_head")
-                and summary.get("target_release_id") == binding.get("expected_release_id")
-                and summary.get("target_repo_head") == binding.get("target_head")
+        # A later retry may know from fresh classification that S0 is already
+        # applied without carrying another copy of the durable rebind.  Such a
+        # lineage-bound receipt is historical non-candidate evidence: it must
+        # not erase an earlier exact durable candidate, but it cannot establish
+        # one on its own either.
+        if summary is None:
+            claimed_without_durable = True
+            continue
+        if not isinstance(summary, dict) or summary.get("rebound") is not True:
+            raise MidCutoverEvidenceError(
+                "outcome_unknown resume claims snapshot rebind without durable lineage"
             )
-            if not summary_identity_matches:
+        durable = summary.get("durable_rebind")
+        if "durable_rebind" not in summary:
+            expected_summary_identity = {
+                "source_snapshot_receipt_sha256": binding.get(
+                    "source_snapshot_receipt_sha256"
+                ),
+                "source_client_declaration_sha256": binding.get(
+                    "source_client_declaration_sha256"
+                ),
+                "classified_snapshot_receipt_sha256": binding.get(
+                    "classified_snapshot_receipt_sha256"
+                ),
+                "source_release_id": binding.get("blue_release_id"),
+                "source_repo_head": binding.get("blue_repo_head"),
+                "target_release_id": binding.get("expected_release_id"),
+                "target_repo_head": binding.get("target_head"),
+            }
+            if any(
+                key in summary and summary.get(key) != expected
+                for key, expected in expected_summary_identity.items()
+            ):
                 raise MidCutoverEvidenceError(
                     "outcome_unknown resume snapshot rebind summary identity is inconsistent"
                 )

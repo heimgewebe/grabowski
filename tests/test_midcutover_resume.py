@@ -560,6 +560,84 @@ class DurableResumeRebindResolutionTests(unittest.TestCase):
                     durable,
                 )
 
+    def test_later_evidence_free_retry_preserves_prior_durable_rebind(self) -> None:
+        cutover = cutover_receipt()
+        durable = durable_rebind_evidence()
+        first = outcome_unknown_resume_with_durable_rebind(
+            durable=durable, resume_id="bgcr-durable00000010"
+        )
+        later = resume_receipt(
+            outcome="outcome_unknown",
+            resume_id="bgcr-durable00000011",
+            resume_phase=midcutover.PHASE_PROMOTE_POINTER,
+        )
+        recovery = later.get("recovery")
+        assert isinstance(recovery, dict)
+        recovery["snapshot_rebind_applied"] = True
+        later["snapshot_rebind"] = None
+        later.pop("receipt_sha256", None)
+        later["receipt_sha256"] = midcutover.canonical_json_sha256(later)
+        for label, receipts in (
+            ("full_then_evidence_free", [cutover, first, later]),
+            ("evidence_free_then_full", [cutover, later, first]),
+        ):
+            with self.subTest(order=label):
+                self.assertEqual(
+                    midcutover.durable_snapshot_rebind_for_cutover(receipts, cutover),
+                    durable,
+                )
+
+    def test_later_sparse_adopted_summary_preserves_prior_durable_rebind(self) -> None:
+        cutover = cutover_receipt()
+        durable = durable_rebind_evidence()
+        first = outcome_unknown_resume_with_durable_rebind(
+            durable=durable, resume_id="bgcr-durable00000012"
+        )
+        later = resume_receipt(
+            outcome="outcome_unknown",
+            resume_id="bgcr-durable00000013",
+            resume_phase=midcutover.PHASE_PROMOTE_POINTER,
+        )
+        recovery = later.get("recovery")
+        assert isinstance(recovery, dict)
+        recovery["snapshot_rebind_applied"] = True
+        later["snapshot_rebind"] = {
+            "rebound": True,
+            "adopted_from_durable_snapshot": True,
+            "receipt_sha256": "cd" * 32,
+            "publication_schema_transition_sha256": None,
+            "observation_scope": None,
+        }
+        later.pop("receipt_sha256", None)
+        later["receipt_sha256"] = midcutover.canonical_json_sha256(later)
+        for label, receipts in (
+            ("full_then_sparse", [cutover, first, later]),
+            ("sparse_then_full", [cutover, later, first]),
+        ):
+            with self.subTest(order=label):
+                self.assertEqual(
+                    midcutover.durable_snapshot_rebind_for_cutover(receipts, cutover),
+                    durable,
+                )
+
+    def test_evidence_free_retry_without_prior_durable_fails_closed(self) -> None:
+        cutover = cutover_receipt()
+        later = resume_receipt(
+            outcome="outcome_unknown",
+            resume_id="bgcr-durable00000014",
+            resume_phase=midcutover.PHASE_PROMOTE_POINTER,
+        )
+        recovery = later.get("recovery")
+        assert isinstance(recovery, dict)
+        recovery["snapshot_rebind_applied"] = True
+        later["snapshot_rebind"] = None
+        later.pop("receipt_sha256", None)
+        later["receipt_sha256"] = midcutover.canonical_json_sha256(later)
+        with self.assertRaisesRegex(
+            midcutover.MidCutoverEvidenceError, "without durable lineage"
+        ):
+            midcutover.durable_snapshot_rebind_for_cutover([cutover, later], cutover)
+
     def test_minimal_retry_with_foreign_summary_identity_fails_closed(self) -> None:
         cutover = cutover_receipt()
         durable = durable_rebind_evidence()
