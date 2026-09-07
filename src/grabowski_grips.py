@@ -6356,8 +6356,56 @@ def _run_pr_base_converge(
     ancestry_before = compare_status(expected_head)
     if ancestry_before in {"ahead", "identical"}:
         _check(receipt, "base_contained_before", "pass", ancestry_before)
+        current = read_pr()
+        if current.get("number") != pr_number or current.get("state") != "OPEN":
+            _check(
+                receipt,
+                "same_pr_preserved",
+                "fail",
+                f"number={current.get('number')} state={current.get('state')}",
+            )
+            raise GripPreflightError(
+                "PR identity drifted during no-op base convergence verification"
+            )
+        if (
+            current.get("isCrossRepository") is not False
+            or current.get("headRefName") != head_branch
+        ):
+            _check(
+                receipt,
+                "same_pr_preserved",
+                "fail",
+                "repository/head branch identity changed",
+            )
+            raise GripPreflightError(
+                "PR head branch identity drifted during no-op base convergence verification"
+            )
+        if (
+            current.get("baseRefName") != base
+            or str(current.get("baseRefOid", "")).lower() != expected_base_sha
+        ):
+            _check(
+                receipt,
+                "base_identity_after",
+                "fail",
+                f"branch={current.get('baseRefName')} sha={current.get('baseRefOid')}",
+            )
+            raise GripPreflightError(
+                "PR base drifted during no-op base convergence verification"
+            )
+        if str(current.get("headRefOid", "")).lower() != expected_head:
+            _check(
+                receipt,
+                "head_readback",
+                "fail",
+                f"actual={current.get('headRefOid')} expected={expected_head}",
+            )
+            raise GripPreflightError(
+                "PR head drifted during no-op base convergence verification"
+            )
         _check(receipt, "update_branch_cas", "skip", "head already contains exact base")
         _check(receipt, "same_pr_preserved", "pass", str(pr_number))
+        _check(receipt, "head_readback", "pass", expected_head)
         _check(receipt, "base_contained_after", "pass", ancestry_before)
         return {
             "action": "unchanged",
@@ -6367,7 +6415,7 @@ def _run_pr_base_converge(
             "old_head": expected_head,
             "new_head": expected_head,
             "head_branch": head_branch,
-            "pr": before,
+            "pr": current,
         }
     _check(receipt, "base_contained_before", "warn", ancestry_before)
     _github(

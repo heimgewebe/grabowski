@@ -7767,6 +7767,42 @@ class GripFoundationTests(unittest.TestCase):
             any(any("/update-branch" in item for item in call) for call in gh.calls)
         )
 
+    def test_pr_base_converge_noop_revalidates_exact_base_before_success(self) -> None:
+        class DriftedNoop(FakePrBaseConvergeGh):
+            def __init__(self) -> None:
+                super().__init__()
+                self.view_reads = 0
+
+            def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
+                if argv[:2] == ["pr", "view"]:
+                    self.view_reads += 1
+                    if self.view_reads == 2:
+                        self.view["baseRefOid"] = "f" * 40
+                if argv[:1] == ["api"] and any("/compare/" in item for item in argv):
+                    self.calls.append(tuple(argv))
+                    return {"returncode": 0, "stdout": "ahead\n", "stderr": ""}
+                return super().__call__(repo, argv)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            gh = DriftedNoop()
+            result = grips.run_grip(
+                "pr-base-converge",
+                {
+                    "repo": tmp,
+                    "pr_number": 77,
+                    "base": "main",
+                    "expected_head": "a" * 40,
+                    "expected_base_sha": "e" * 40,
+                },
+                allow_mutation=True,
+                github_runner=gh,
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("base drifted", result["output"]["error"])
+        self.assertEqual(2, gh.view_reads)
+        self.assertFalse(any(any("/update-branch" in item for item in call) for call in gh.calls))
+
     def test_pr_base_converge_blocks_stale_head_before_update(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             gh = FakePrBaseConvergeGh(head_sha="c" * 40)
