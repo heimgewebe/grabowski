@@ -16,6 +16,7 @@
     "browser_profile_read": "Read bounded browser profile metadata and text under explicit browser profile roots; binary databases are metadata-only.",
     "browser_worker": "Start and control isolated agent-owned browser workers with loopback-only debugging.",
     "bundle_registry": "Read the curated Lens/repoLens latest-complete bundle registry.",
+    "bureau_mutation": "Use only the typed Bureau candidate, proposal, review, publication and coordinated-pickup mutation surfaces without granting generic terminal execution.",
     "durable_job": "Start long-running transient user-systemd jobs with extended Trusted Owner budgets.",
     "file_delete": "Remove regular files or empty directories into quarantine for audit-backed restoration.",
     "file_destroy": "Irreversibly remove regular files or empty directories only through a separate explicit capability.",
@@ -53,6 +54,51 @@
   "max_write_bytes": 33554432,
   "mode": "trusted-owner",
   "profiles": {
+    "failover-mutate": {
+      "allowed_grips": [
+        "repo-orient",
+        "worktree-orient",
+        "situation",
+        "scout",
+        "pr-check-readiness",
+        "post-merge-sync"
+      ],
+      "browser_profile_roots": [],
+      "capabilities": [
+        "file_read",
+        "audit_verify",
+        "audit_read",
+        "bureau_mutation",
+        "resource_lease",
+        "process_inspect",
+        "port_inspect"
+      ],
+      "description": "Minimal fence-enforced mutation profile for controlled manual failover. It grants typed Bureau and resource-lease effects while excluding generic file, job, terminal, service, browser/GUI, secret, signal, power and destructive authority.",
+      "forbidden_hosts": [],
+      "max_list_entries": 500,
+      "max_read_bytes": 2000000,
+      "trusted_owner": false,
+      "max_risk_level": "medium",
+      "max_secret_use_output_bytes": 250000,
+      "max_secret_use_seconds": 30,
+      "max_write_bytes": 2000000,
+      "read_roots": [
+        "${HOME}/repos",
+        "${HOME}/grabowski-workspace",
+        "${HOME}/.local/state/grabowski",
+        "${HOME}/.local/state/bureau"
+      ],
+      "secret_export_roots": [],
+      "secret_roots": [],
+      "write_excluded_roots": [
+        "${HOME}/repos/merges"
+      ],
+      "write_roots": [
+        "${HOME}/repos",
+        "${HOME}/.local/state/grabowski",
+        "${HOME}/.local/state/bureau"
+      ]
+    },
     "maintain": {
       "allowed_grips": [
         "repo-orient",
@@ -172,6 +218,7 @@
         "secret_export",
         "browser_profile_read",
         "terminal_execute",
+        "bureau_mutation",
         "durable_job",
         "resource_lease",
         "artifact_transfer",

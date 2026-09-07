@@ -5739,10 +5739,10 @@ def grabowski_bureau_pickup_execute(
     """Coordinate one Bureau claim with owner-bound Grabowski leases and recovery."""
     normalized, registry_binding = _prepare_request(request)
     operator._require_operator_mutation(
-        "terminal_execute", path=normalized["registry_root"]
+        "bureau_mutation", path=normalized["registry_root"]
     )
     operator._require_operator_mutation(
-        "terminal_execute", path=normalized["coordination_root"]
+        "bureau_mutation", path=normalized["coordination_root"]
     )
     operator._require_operator_mutation("resource_lease")
     request_sha256 = _sha256(normalized)
@@ -6396,7 +6396,7 @@ def grabowski_bureau_pickup_release(run_id: str) -> dict[str, Any]:
     binding = _root_binding_for_run(normalized_run_id)
     registry_root = binding["registry_root"]
     operator._require_operator_mutation(
-        "terminal_execute", path=registry_root
+        "bureau_mutation", path=registry_root
     )
     coordination_effect_root = (
         Path(binding["coordination_root"])
@@ -6404,7 +6404,7 @@ def grabowski_bureau_pickup_release(run_id: str) -> dict[str, Any]:
         else _legacy_coordination_root()
     )
     operator._require_operator_mutation(
-        "terminal_execute", path=str(coordination_effect_root)
+        "bureau_mutation", path=str(coordination_effect_root)
     )
     operator._require_operator_mutation("resource_lease")
     run_dir = _run_directory(normalized_run_id)
@@ -6867,7 +6867,7 @@ def grabowski_bureau_pickup_orphan_reconcile(
         else _legacy_coordination_root()
     )
     operator._require_operator_mutation(
-        "terminal_execute", path=str(coordination_effect_root)
+        "bureau_mutation", path=str(coordination_effect_root)
     )
     operator._require_operator_mutation("resource_lease")
 
