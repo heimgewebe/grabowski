@@ -48,9 +48,10 @@ REUSE_BEFORE_BUILD = {
         "live_readiness_of_selected_authority",
     ],
     "host_capability_tool": "grabowski_host_capability_resolve",
-    "new_infrastructure_gate": "only_after_discovery_exhausted",
+    "new_infrastructure_gate": "only_when_no_existing_authority_or_declared_route_is_found",
     "invariants": [
         "not_ready_is_not_not_found",
+        "not_ready_requires_existing_authority_recovery_not_parallel_replacement",
         "discovery_does_not_authorize_execution",
         "do_not_duplicate_existing_control_plane",
     ],

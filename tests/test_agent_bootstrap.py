@@ -298,9 +298,13 @@ class AgentBootstrapTests(unittest.TestCase):
         )
         self.assertEqual(
             policy["new_infrastructure_gate"],
-            "only_after_discovery_exhausted",
+            "only_when_no_existing_authority_or_declared_route_is_found",
         )
         self.assertIn("not_ready_is_not_not_found", policy["invariants"])
+        self.assertIn(
+            "not_ready_requires_existing_authority_recovery_not_parallel_replacement",
+            policy["invariants"],
+        )
         self.assertIn(
             "do_not_duplicate_existing_control_plane",
             policy["invariants"],
