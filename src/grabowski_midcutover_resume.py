@@ -477,7 +477,9 @@ def durable_snapshot_rebind_for_cutover(
 
     The original cutover receipt remains primary authority.  Only when it did
     not persist ``snapshot_rebind`` may an ``outcome_unknown`` resume receipt
-    carry the full rebind forward.  The resume receipt is already private and
+    carry the full rebind forward. Later retries may carry only an adopted
+    summary, but they cannot erase an earlier fully validated durable candidate.
+    The resume receipt is already private and
     self-hash validated; this function additionally binds its nested evidence
     back to the exact original cutover, switch, activation and resume binding.
     Multiple byte-distinct candidates are ambiguity and fail closed.
@@ -492,6 +494,7 @@ def durable_snapshot_rebind_for_cutover(
         return None
     activation = activation_observation(cutover)
     distinct: dict[str, dict[str, Any]] = {}
+    claimed_without_durable = False
     for raw in receipts:
         if not isinstance(raw, dict) or raw.get("kind") != RESUME_RECEIPT_KIND:
             continue
@@ -526,19 +529,11 @@ def durable_snapshot_rebind_for_cutover(
                 "outcome_unknown resume claims cutover lineage with invalid binding"
             )
         summary = receipt.get("snapshot_rebind")
-        durable = (
-            summary.get("durable_rebind") if isinstance(summary, dict) else None
-        )
-        if (
-            not isinstance(summary, dict)
-            or summary.get("rebound") is not True
-            or not isinstance(durable, dict)
-        ):
+        if not isinstance(summary, dict) or summary.get("rebound") is not True:
             raise MidCutoverEvidenceError(
                 "outcome_unknown resume claims snapshot rebind without durable lineage"
             )
-        cutover_binding = durable.get("cutover_binding")
-        transition = durable.get("cutover_transition")
+        durable = summary.get("durable_rebind")
         identity_matches = (
             receipt.get("resumed_cutover_id") == cutover.get("cutover_id")
             and receipt.get("resumed_receipt_sha256")
@@ -578,6 +573,35 @@ def durable_snapshot_rebind_for_cutover(
             == cutover.get("agent_instructions_sha256")
             and binding.get("green_readiness") == readiness
         )
+        if not identity_matches:
+            raise MidCutoverEvidenceError(
+                "outcome_unknown resume snapshot rebind lineage identity is inconsistent"
+            )
+        if "durable_rebind" not in summary:
+            summary_identity_matches = (
+                summary.get("source_snapshot_receipt_sha256")
+                == binding.get("source_snapshot_receipt_sha256")
+                and summary.get("source_client_declaration_sha256")
+                == binding.get("source_client_declaration_sha256")
+                and summary.get("classified_snapshot_receipt_sha256")
+                == binding.get("classified_snapshot_receipt_sha256")
+                and summary.get("source_release_id") == binding.get("blue_release_id")
+                and summary.get("source_repo_head") == binding.get("blue_repo_head")
+                and summary.get("target_release_id") == binding.get("expected_release_id")
+                and summary.get("target_repo_head") == binding.get("target_head")
+            )
+            if not summary_identity_matches:
+                raise MidCutoverEvidenceError(
+                    "outcome_unknown resume snapshot rebind summary identity is inconsistent"
+                )
+            claimed_without_durable = True
+            continue
+        if not isinstance(durable, dict):
+            raise MidCutoverEvidenceError(
+                "outcome_unknown resume snapshot rebind durable evidence is inconsistent"
+            )
+        cutover_binding = durable.get("cutover_binding")
+        transition = durable.get("cutover_transition")
         durable_matches = (
             isinstance(summary, dict)
             and summary.get("rebound") is True
@@ -612,10 +636,6 @@ def durable_snapshot_rebind_for_cutover(
             and transition.get("green_readiness_sha256")
             == canonical_json_sha256(readiness)
         )
-        if not identity_matches:
-            raise MidCutoverEvidenceError(
-                "outcome_unknown resume snapshot rebind lineage identity is inconsistent"
-            )
         if not durable_matches:
             raise MidCutoverEvidenceError(
                 "outcome_unknown resume snapshot rebind durable evidence is inconsistent"
@@ -624,6 +644,10 @@ def durable_snapshot_rebind_for_cutover(
     if len(distinct) > 1:
         raise MidCutoverEvidenceError(
             "conflicting durable snapshot rebind lineage in resume receipts"
+        )
+    if not distinct and claimed_without_durable:
+        raise MidCutoverEvidenceError(
+            "outcome_unknown resume claims snapshot rebind without durable lineage"
         )
     return next(iter(distinct.values()), None)
 

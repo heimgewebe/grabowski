@@ -3280,6 +3280,8 @@ def _successor_refresh_after_cutover_rebind(
     ):
         raise ClientSnapshotError("green successor schema identity is invalid")
     schema_evidence = receipt.get("schema_evidence")
+    if schema_evidence is None:
+        raise ClientSnapshotError("successor snapshot schema evidence is unavailable")
     if schema_evidence is not None:
         if (
             not isinstance(schema_evidence, dict)

@@ -534,6 +534,58 @@ class DurableResumeRebindResolutionTests(unittest.TestCase):
             durable,
         )
 
+    def test_later_minimal_retry_preserves_prior_durable_rebind(self) -> None:
+        cutover = cutover_receipt()
+        durable = durable_rebind_evidence()
+        first = outcome_unknown_resume_with_durable_rebind(
+            durable=durable, resume_id="bgcr-durable00000006"
+        )
+        later = resume_receipt(
+            outcome="outcome_unknown",
+            resume_id="bgcr-durable00000007",
+            resume_phase=midcutover.PHASE_PROMOTE_POINTER,
+        )
+        recovery = later.get("recovery")
+        assert isinstance(recovery, dict)
+        recovery["snapshot_rebind_applied"] = True
+        later.pop("receipt_sha256", None)
+        later["receipt_sha256"] = midcutover.canonical_json_sha256(later)
+        for label, receipts in (
+            ("full_then_minimal", [cutover, first, later]),
+            ("minimal_then_full", [cutover, later, first]),
+        ):
+            with self.subTest(order=label):
+                self.assertEqual(
+                    midcutover.durable_snapshot_rebind_for_cutover(receipts, cutover),
+                    durable,
+                )
+
+    def test_minimal_retry_with_foreign_summary_identity_fails_closed(self) -> None:
+        cutover = cutover_receipt()
+        durable = durable_rebind_evidence()
+        first = outcome_unknown_resume_with_durable_rebind(
+            durable=durable, resume_id="bgcr-durable00000008"
+        )
+        later = resume_receipt(
+            outcome="outcome_unknown",
+            resume_id="bgcr-durable00000009",
+            resume_phase=midcutover.PHASE_PROMOTE_POINTER,
+        )
+        recovery = later.get("recovery")
+        assert isinstance(recovery, dict)
+        recovery["snapshot_rebind_applied"] = True
+        summary = later.get("snapshot_rebind")
+        assert isinstance(summary, dict)
+        summary["target_release_id"] = "foreign-release"
+        later.pop("receipt_sha256", None)
+        later["receipt_sha256"] = midcutover.canonical_json_sha256(later)
+        with self.assertRaisesRegex(
+            midcutover.MidCutoverEvidenceError, "summary identity is inconsistent"
+        ):
+            midcutover.durable_snapshot_rebind_for_cutover(
+                [cutover, first, later], cutover
+            )
+
     def test_conflicting_durable_resume_rebinds_fail_closed(self) -> None:
         cutover = cutover_receipt()
         first = outcome_unknown_resume_with_durable_rebind(
