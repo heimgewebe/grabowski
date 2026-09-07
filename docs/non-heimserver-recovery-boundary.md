@@ -17,7 +17,7 @@ When Heimserver is unavailable, that explicit configuration must stay fail-close
 
 The current default follows the Rootbroker recovery authority on the locally attached BACKUP disk:
 
-- `GRABOWSKI_SERVER_RECOVERY_TARGET=local-backup-disk:UUID=249180DA265E8DE0/restic/heim-pc`
+- `GRABOWSKI_SERVER_RECOVERY_TARGET=local-backup-disk:UUID=9b626294-7913-4be0-88fa-96b314e96ee5/restic/heim-pc`
 - the local target has no recovery host; the versioned `90-recovery-target.conf` drop-in explicitly removes a stale `GRABOWSKI_SERVER_RECOVERY_HOST` assignment before Green starts
 
 The local probe binds the physical disk by filesystem UUID, the Restic repository by repository ID, and the backup by the full snapshot ID recorded in fresh durability evidence. It restores the Fundus with `restic restore --verify`, compares the restored inventory to the durability receipt, runs a repository data-subset check, then rechecks disk/repository/snapshot identity before canonical Rootbroker publication.
@@ -46,7 +46,7 @@ Configured recovery targets use one of two explicit shapes:
 - remote fallback: `<host>:rest-server/<probe>`
 - local BACKUP backend: `local-backup-disk:UUID=<uuid>/restic/<repository>`
 
-The host/probe and UUID/repository segments are bounded by strict parsers; whitespace, control characters and path-shaped escape syntax are rejected. The local backend additionally verifies that `/mnt/backup` is the exact `ntfs3` mount for the configured UUID and that the opened Restic repository has the pinned repository ID. Invalid target configuration is fail-closed and is reported separately from stale evidence.
+The host/probe and UUID/repository segments are bounded by strict parsers; whitespace, control characters and path-shaped escape syntax are rejected. The local backend additionally verifies that `/mnt/backup` is the exact filesystem mount selected by `GRABOWSKI_LOCAL_RECOVERY_FSTYPE` (default `ext4`; only `ext4` and `ntfs3` are accepted) for the configured UUID and that the opened Restic repository has the pinned repository ID. Invalid target configuration is fail-closed and is reported separately from stale evidence.
 
 ## Heimserver backend detection
 
