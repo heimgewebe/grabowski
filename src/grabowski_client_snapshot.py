@@ -3374,6 +3374,16 @@ def _successor_refresh_after_cutover_rebind(
         or transition.get("publication_schema_transition") is not None
         or transition.get("agent_instructions_transition") is not None
         or transition.get("green_readiness_sha256") != _sha256_json(green_readiness)
+        or transition.get("surface_continuity_sha256")
+        != _sha256_json(
+            {
+                "registered_tool_count": registered_tool_count,
+                "registered_names_sha256": registered_names_sha256,
+                "agent_instructions_sha256": agent_instructions_sha256,
+                "schema_identity_sha256": target_identity,
+                "complete_schema_sha256": target_complete,
+            }
+        )
         or isinstance(source_created, bool)
         or not isinstance(source_created, int)
         or isinstance(source_expires, bool)

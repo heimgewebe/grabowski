@@ -948,6 +948,33 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
         self.assertEqual(observed["state"], client_snapshot.SNAPSHOT_BINDING_UNREADABLE)
         self.assertIn("unchanged lineage", str(observed["error"]))
 
+        tampered_continuity = json.loads(json.dumps(historical))
+        tampered_continuity["cutover_transition"]["surface_continuity_sha256"] = "ee" * 32
+        observed = client_snapshot.inspect_cutover_snapshot_binding(**parameters, durable_rebind=tampered_continuity)
+        self.assertEqual(observed["state"], client_snapshot.SNAPSHOT_BINDING_UNREADABLE)
+        self.assertIn("unchanged lineage", str(observed["error"]))
+
+    def test_successor_snapshot_refuses_stale_normal_target_refresh(self) -> None:
+        prepared = self._prepare_publication(complete_schema_sha256=BLUE_COMPLETE_SCHEMA)
+        historical = self._rebind(
+            schema_by_tool=BLUE_SCHEMA_BY_TOOL,
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+            source_evidence_time=self.now_unix,
+            publication_request_id=prepared["request_id"],
+            now_unix=5_000,
+        )
+        created_at = 5_001
+        self._normal_target_successor(now_unix=created_at)
+        parameters = self._inspection_parameters(
+            prepared["request_id"],
+            schema_by_tool=BLUE_SCHEMA_BY_TOOL,
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+            now_unix=created_at + client_snapshot.SNAPSHOT_TTL_SECONDS + 1,
+        )
+        observed = client_snapshot.inspect_cutover_snapshot_binding(**parameters, durable_rebind=historical)
+        self.assertEqual(observed["state"], client_snapshot.SNAPSHOT_BINDING_UNREADABLE)
+        self.assertIn("successor snapshot is not fresh", str(observed["error"]))
+
     def test_s0_cas_rejects_equivalent_snapshot_replacement_before_write(self) -> None:
         prepared = self._prepare_publication()
         parameters = self._inspection_parameters(prepared["request_id"])

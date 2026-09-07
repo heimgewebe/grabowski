@@ -3214,6 +3214,29 @@ class SuccessorSnapshotRuntimeBindingTests(unittest.TestCase):
                     pass
             self.assertEqual(guard.call_args.kwargs["durable_rebind"], rebind)
 
+    def test_effect_guard_refuses_unreadable_receipt_set(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            rebind = {"receipt_sha256": "ab" * 32}
+            receipt = cutover_receipt()
+            receipt.pop("receipt_sha256")
+            receipt["snapshot_rebind"] = rebind
+            receipt["receipt_sha256"] = midcutover.canonical_json_sha256(receipt)
+            path = root / f"{CUTOVER_ID}.json"
+            path.write_text(
+                json.dumps(receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            path.chmod(0o600)
+            unreadable = root / "foreign.json"
+            unreadable.write_text("{}", encoding="utf-8")
+            unreadable.chmod(0o600)
+            runtime = self._runtime(root)
+            runtime.resume_binding["resumed_receipt_sha256"] = receipt["receipt_sha256"]
+            with self.assertRaisesRegex(dual.core.DeployError, "receipt set is unreadable"):
+                runtime.successor_snapshot_rebind_evidence()
+
     def test_effect_guard_refuses_replaced_durable_rebind(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

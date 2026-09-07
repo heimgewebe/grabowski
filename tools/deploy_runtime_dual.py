@@ -7700,6 +7700,17 @@ class MidCutoverResumeRuntime:
                 phase="midcutover-successor-snapshot-lineage",
             )
         loaded = midcutover.load_receipts(self.receipt_root)
+        unreadable = loaded.get("unreadable")
+        if not isinstance(unreadable, list) or unreadable:
+            core.fail(
+                "Successor snapshot lineage receipt set is unreadable",
+                phase="midcutover-successor-snapshot-lineage",
+                details={
+                    "unreadable_count": (
+                        len(unreadable) if isinstance(unreadable, list) else None
+                    )
+                },
+            )
         matches = [
             receipt
             for receipt in loaded["receipts"]
