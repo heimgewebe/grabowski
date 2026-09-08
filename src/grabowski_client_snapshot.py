@@ -139,6 +139,14 @@ class ClientSnapshotError(RuntimeError):
     """Raised when a connector snapshot receipt cannot be trusted."""
 
 
+class SnapshotRebindReadbackError(ClientSnapshotError):
+    """Raised after S0 was written but its immediate readback stayed unknown."""
+
+    def __init__(self, message: str, *, durable_rebind: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.durable_rebind = durable_rebind
+
+
 def _canonical_bytes(value: Any) -> bytes:
     return json.dumps(
         value,
@@ -1502,50 +1510,78 @@ def _rebind_snapshot_for_cutover(
             "does_not_establish": nonclaims,
         }
         receipt["receipt_sha256"] = _sha256_json(receipt)
-        _write_private_json(SNAPSHOT_PATH, receipt)
-        readback = _read_private_json(SNAPSHOT_PATH)
-        _validate_receipt(readback)
-        if readback.get("receipt_sha256") != receipt["receipt_sha256"]:
-            raise ClientSnapshotError("cutover snapshot rebind readback mismatch")
-    return {
-        "schema_version": 1,
-        "state": "matched",
-        "verified": True,
-        "cutover_rebind": True,
-        "observation_scope": observation_scope,
-        "client_declaration_sha256": source_declaration_sha256,
-        "source_receipt_sha256": source_receipt_sha256,
-        "source_snapshot_receipt_sha256": source_receipt_sha256,
-        "source_client_declaration_sha256": source_declaration_sha256,
-        "classified_snapshot_receipt_sha256": source_receipt_sha256,
-        "source_release_id": current_release,
-        "source_repo_head": current_repo_head,
-        "target_release_id": green_release,
-        "target_repo_head": green_repo_head,
-        "receipt_sha256": receipt["receipt_sha256"],
-        "cutover_binding": cutover_binding,
-        "cutover_transition": transition,
-        "verification_model": receipt["verification_model"],
-        # A changed schema means the preserved observation describes the
-        # predecessor surface. Reporting a contract match here would be the
-        # false claim this transition exists to avoid.
-        "schema_contract_matches": not surface_changed,
-        "schema_changed": schema_changed,
-        "surface_changed": surface_changed,
-        "instructions_changed": instructions_changed,
-        "agent_instructions_transition": instruction_transition,
-        "publication_schema_transition": schema_transition,
-        "recommended_next_action": (
-            "capture a fresh client observation of the changed green agent instructions"
-            if instructions_changed
-            else (
-                "capture a fresh client observation of the changed green surface"
-                if surface_changed
-                else recommended_next_action
-            )
-        ),
-        "does_not_establish": list(receipt["does_not_establish"]),
-    }
+        durable_rebind = {
+            "schema_version": 1,
+            "state": "matched",
+            "verified": True,
+            "cutover_rebind": True,
+            "observation_scope": observation_scope,
+            "client_declaration_sha256": source_declaration_sha256,
+            "source_receipt_sha256": source_receipt_sha256,
+            "source_snapshot_receipt_sha256": source_receipt_sha256,
+            "source_client_declaration_sha256": source_declaration_sha256,
+            "classified_snapshot_receipt_sha256": source_receipt_sha256,
+            "source_release_id": current_release,
+            "source_repo_head": current_repo_head,
+            "target_release_id": green_release,
+            "target_repo_head": green_repo_head,
+            "receipt_sha256": receipt["receipt_sha256"],
+            "cutover_binding": cutover_binding,
+            "cutover_transition": transition,
+            "verification_model": receipt["verification_model"],
+            # A changed schema means the preserved observation describes the
+            # predecessor surface. Reporting a contract match here would be the
+            # false claim this transition exists to avoid.
+            "schema_contract_matches": not surface_changed,
+            "schema_changed": schema_changed,
+            "surface_changed": surface_changed,
+            "instructions_changed": instructions_changed,
+            "agent_instructions_transition": instruction_transition,
+            "publication_schema_transition": schema_transition,
+            "recommended_next_action": (
+                "capture a fresh client observation of the changed green agent instructions"
+                if instructions_changed
+                else (
+                    "capture a fresh client observation of the changed green surface"
+                    if surface_changed
+                    else recommended_next_action
+                )
+            ),
+            "does_not_establish": list(receipt["does_not_establish"]),
+        }
+        try:
+            _write_private_json(SNAPSHOT_PATH, receipt)
+        except Exception as write_exc:
+            # _write_private_json publishes with os.replace before its final
+            # durability/identity checks. A failure may therefore mean either
+            # "no effect" or "S0 is already public". Re-read the exact source
+            # preimage while the state lock is still held: only the unchanged
+            # source receipt proves that the write did not land.
+            try:
+                write_readback = _read_private_json(SNAPSHOT_PATH)
+                _validate_receipt(write_readback)
+            except Exception:
+                raise SnapshotRebindReadbackError(
+                    "cutover snapshot rebind write outcome is unknown",
+                    durable_rebind=durable_rebind,
+                ) from write_exc
+            if write_readback.get("receipt_sha256") == source_receipt_sha256:
+                raise
+            raise SnapshotRebindReadbackError(
+                "cutover snapshot rebind write outcome is unknown",
+                durable_rebind=durable_rebind,
+            ) from write_exc
+        try:
+            readback = _read_private_json(SNAPSHOT_PATH)
+            _validate_receipt(readback)
+            if readback.get("receipt_sha256") != receipt["receipt_sha256"]:
+                raise ClientSnapshotError("cutover snapshot rebind readback mismatch")
+        except Exception as exc:
+            raise SnapshotRebindReadbackError(
+                "cutover snapshot rebind post-write readback failed",
+                durable_rebind=durable_rebind,
+            ) from exc
+    return durable_rebind
 
 
 def _platform_publication_contract(
@@ -3902,6 +3938,427 @@ def _validate_receipt(receipt: dict[str, Any]) -> None:
         raise ClientSnapshotError("client snapshot declaration hash mismatch")
 
 
+def _successor_refresh_after_cutover_rebind(
+    *,
+    receipt: dict[str, Any],
+    durable_rebind: dict[str, Any] | None,
+    cutover_id: str,
+    cutover_generation: int,
+    source_release_id: str,
+    source_repo_head: str,
+    target_release_id: str,
+    target_repo_head: str,
+    source_evidence_time: int,
+    publication_request_id: str,
+    registered_tool_count: int,
+    registered_names_sha256: str,
+    agent_instructions_sha256: str,
+    green_readiness: dict[str, Any],
+    deployment_source_identity_sha256: str | None,
+    now_unix: int,
+) -> dict[str, Any] | None:
+    """Accept a fresh target snapshot only through validated durable rebind lineage.
+
+    A normal connector refresh intentionally drops ``cutover_binding`` and the
+    historical transition.  Recovery may reconstruct that history only from the
+    immutable durable rebind.  The fresh receipt must independently prove the
+    exact current Green contract.  If the cutover changed surface, schema, or
+    agent instructions, the persisted transition must also revalidate against
+    the same Publication/deployment authority used by the ordinary rebind path.
+    """
+    if durable_rebind is None:
+        return None
+    declaration = receipt.get("client_declaration")
+    binding = receipt.get("server_binding")
+    if not isinstance(declaration, dict) or not isinstance(binding, dict):
+        raise ClientSnapshotError("successor snapshot binding is invalid")
+    if (
+        binding.get("release_id") != target_release_id
+        or binding.get("repo_head") != target_repo_head
+        or declaration.get("observed_release_id") != target_release_id
+    ):
+        return None
+    if (
+        receipt.get("cutover_binding") is not None
+        or receipt.get("cutover_transition") is not None
+    ):
+        return None
+    observation_scope = declaration.get("observation_scope")
+    if (
+        receipt.get("verified") is not True
+        or receipt.get("mismatches") != []
+        or observation_scope
+        not in {
+            OBSERVATION_SCOPE_EXTERNAL_CLIENT,
+            OBSERVATION_SCOPE_SERVER_LOOPBACK,
+        }
+        or declaration.get("observed_tool_count") != registered_tool_count
+        or declaration.get("observed_names_sha256") != registered_names_sha256
+        or declaration.get("observed_agent_instructions_sha256")
+        != agent_instructions_sha256
+        or binding.get("registered_tool_count") != registered_tool_count
+        or binding.get("registered_names_sha256") != registered_names_sha256
+        or binding.get("agent_instructions_sha256") != agent_instructions_sha256
+    ):
+        raise ClientSnapshotError("successor snapshot target contract is invalid")
+    created_at = receipt.get("created_at_unix")
+    expires_at = receipt.get("expires_at_unix")
+    if (
+        isinstance(created_at, bool)
+        or not isinstance(created_at, int)
+        or isinstance(expires_at, bool)
+        or not isinstance(expires_at, int)
+        or expires_at != created_at + SNAPSHOT_TTL_SECONDS
+        or created_at < source_evidence_time
+        or created_at > now_unix + SNAPSHOT_CLOCK_SKEW_SECONDS
+        or not (created_at - SNAPSHOT_CLOCK_SKEW_SECONDS <= now_unix <= expires_at)
+    ):
+        raise ClientSnapshotError("successor snapshot is not fresh")
+
+    target_hashes, target_identity = _require_schema_identity(
+        green_readiness.get("schema_sha256_by_tool"),
+        label="green sentinel schema identity",
+    )
+    target_complete = _require_authentic_digest(
+        green_readiness.get("complete_schema_sha256"),
+        label="green complete schema identity",
+    )
+    if (
+        green_readiness.get("complete_schema_count") != registered_tool_count
+        or green_readiness.get("schema_identity_sha256") != target_identity
+    ):
+        raise ClientSnapshotError("green successor schema identity is invalid")
+    schema_evidence = receipt.get("schema_evidence")
+    if (
+        not isinstance(schema_evidence, dict)
+        or not isinstance(schema_evidence.get("probe"), dict)
+        or schema_evidence["probe"].get("matches") is not True
+        or schema_evidence["probe"].get("schema_contract_matches") is not True
+        or not isinstance(schema_evidence.get("observed_artifact"), dict)
+    ):
+        raise ClientSnapshotError("successor snapshot schema evidence is invalid")
+    observed_artifact = schema_evidence["observed_artifact"]
+    observed_hashes, observed_identity = _require_schema_identity(
+        observed_artifact.get("schema_sha256_by_tool"),
+        label="successor sentinel schema identity",
+    )
+    observed_complete = _require_authentic_digest(
+        observed_artifact.get("complete_schema_sha256"),
+        label="successor complete schema identity",
+    )
+    if (
+        observed_artifact.get("complete_schema_observable") is not True
+        or observed_artifact.get("complete_schema_count") != registered_tool_count
+        or observed_hashes != target_hashes
+        or observed_identity != target_identity
+        or observed_complete != target_complete
+    ):
+        raise ClientSnapshotError("successor snapshot schema does not match target")
+
+    if not isinstance(durable_rebind, dict):
+        raise ClientSnapshotError("durable cutover rebind is invalid")
+    historical_binding = durable_rebind.get("cutover_binding")
+    transition = durable_rebind.get("cutover_transition")
+    if not isinstance(transition, dict):
+        raise ClientSnapshotError("durable cutover rebind has no transition")
+    source_receipt_sha256 = _require_authentic_digest(
+        durable_rebind.get("source_snapshot_receipt_sha256"),
+        label="durable source snapshot receipt_sha256",
+    )
+    source_declaration_sha256 = _require_authentic_digest(
+        durable_rebind.get("source_client_declaration_sha256"),
+        label="durable source client_declaration_sha256",
+    )
+    historical_rebind_receipt_sha256 = _require_authentic_digest(
+        durable_rebind.get("receipt_sha256"),
+        label="durable rebind receipt_sha256",
+    )
+    source_identity = _require_authentic_digest(
+        transition.get("schema_identity_sha256"),
+        label="durable source schema identity",
+    )
+    source_complete = _require_authentic_digest(
+        transition.get("complete_schema_sha256"),
+        label="durable source complete schema identity",
+    )
+    schema_changed = (
+        source_identity != target_identity or source_complete != target_complete
+    )
+
+    persisted_publication = transition.get("publication_schema_transition")
+    source_tool_count = registered_tool_count
+    source_names_sha256 = registered_names_sha256
+    if isinstance(persisted_publication, dict) and "surface_changed" in persisted_publication:
+        source_tool_count = persisted_publication.get("source_tool_count")
+        if (
+            isinstance(source_tool_count, bool)
+            or not isinstance(source_tool_count, int)
+            or source_tool_count < 1
+        ):
+            raise ClientSnapshotError("durable source publication tool count is invalid")
+        source_names_sha256 = _require_authentic_digest(
+            persisted_publication.get("source_names_sha256"),
+            label="durable source publication names hash",
+        )
+    surface_changed = (
+        schema_changed
+        or source_tool_count != registered_tool_count
+        or source_names_sha256 != registered_names_sha256
+    )
+
+    current_authorization: dict[str, Any] | None = None
+    publication_transition_sha256: str | None = None
+    if surface_changed:
+        if not isinstance(persisted_publication, dict):
+            raise ClientSnapshotError(
+                "changed durable cutover lacks publication transition evidence"
+            )
+        current_authorization = _authorized_publication_schema_transition(
+            cutover_id=cutover_id,
+            source_tool_count=source_tool_count,
+            source_names_sha256=source_names_sha256,
+            registered_tool_count=registered_tool_count,
+            registered_names_sha256=registered_names_sha256,
+            green_complete_schema_count=registered_tool_count,
+            green_complete_schema_sha256=target_complete,
+            source_schema_identity_sha256=source_identity,
+            source_complete_schema_sha256=source_complete,
+            target_schema_identity_sha256=target_identity,
+            green_readiness=green_readiness,
+            schema_changed=schema_changed,
+            now_unix=now_unix,
+            expected_publication_request_id=publication_request_id,
+        )
+        stable_fields = (
+            "cutover_id",
+            "source_schema_identity_sha256",
+            "source_complete_schema_sha256",
+            "target_schema_identity_sha256",
+            "target_complete_schema_sha256",
+            "green_readiness_sha256",
+            "publication_request_id",
+            "publication_request_sha256",
+            "publication_contract_sha256",
+        )
+        if "surface_changed" in persisted_publication:
+            stable_fields += (
+                "source_tool_count",
+                "source_names_sha256",
+                "target_tool_count",
+                "target_names_sha256",
+                "surface_changed",
+                "schema_changed",
+            )
+        if any(
+            persisted_publication.get(key) != current_authorization.get(key)
+            for key in stable_fields
+        ):
+            raise ClientSnapshotError(
+                "durable publication transition is not currently authorized"
+            )
+        expected_transition_nonclaims = [
+            (
+                "that any client has observed the changed green surface"
+                if "surface_changed" in persisted_publication
+                else "that any client has observed the changed green schema"
+            ),
+            "platform connector catalog publication",
+        ]
+        authorized_at = persisted_publication.get("authorized_at_unix")
+        if (
+            persisted_publication.get("schema_version") != 1
+            or persisted_publication.get("kind")
+            != "grabowski_connector_schema_transition"
+            or (
+                persisted_publication.get(
+                    "surface_changed", persisted_publication.get("schema_changed")
+                )
+                is not True
+            )
+            or persisted_publication.get("schema_changed") is not schema_changed
+            or persisted_publication.get("publication_state")
+            not in PUBLICATION_REBIND_AUTHORIZED_STATES
+            or persisted_publication.get("publication_current_state")
+            not in (
+                PLATFORM_PUBLICATION_CURRENT_STATES
+                - PUBLICATION_REBIND_FORBIDDEN_CURRENT_STATES
+                - {"no_current"}
+            )
+            or isinstance(authorized_at, bool)
+            or not isinstance(authorized_at, int)
+            or not (
+                source_evidence_time
+                <= authorized_at
+                <= created_at + SNAPSHOT_CLOCK_SKEW_SECONDS
+            )
+            or persisted_publication.get("does_not_establish")
+            != expected_transition_nonclaims
+        ):
+            raise ClientSnapshotError(
+                "durable publication transition historical authorization is invalid"
+            )
+        declared_transition = persisted_publication.get("transition_sha256")
+        unsigned_publication = dict(persisted_publication)
+        unsigned_publication.pop("transition_sha256", None)
+        if (
+            _validate_sha256(
+                declared_transition, label="durable publication transition_sha256"
+            )
+            != _sha256_json(unsigned_publication)
+        ):
+            raise ClientSnapshotError("durable publication transition hash mismatch")
+        publication_transition_sha256 = declared_transition
+    elif persisted_publication is not None:
+        raise ClientSnapshotError(
+            "unchanged durable surface carries a publication transition"
+        )
+
+    persisted_instruction = transition.get("agent_instructions_transition")
+    if persisted_instruction is None:
+        source_instructions_sha256 = agent_instructions_sha256
+    elif isinstance(persisted_instruction, dict):
+        source_instructions_sha256 = _require_authentic_digest(
+            persisted_instruction.get("source_agent_instructions_sha256"),
+            label="durable source agent instructions hash",
+        )
+    else:
+        raise ClientSnapshotError("durable agent instructions transition is invalid")
+    instruction_transition = prepare_agent_instructions_transition_for_cutover(
+        cutover_id=cutover_id,
+        source_release_id=source_release_id,
+        source_repo_head=source_repo_head,
+        target_release_id=target_release_id,
+        target_repo_head=target_repo_head,
+        source_agent_instructions_sha256=source_instructions_sha256,
+        target_agent_instructions_sha256=agent_instructions_sha256,
+        deployment_source_identity_sha256=deployment_source_identity_sha256,
+        green_readiness=green_readiness,
+    )
+    instructions_changed = instruction_transition is not None
+    if persisted_instruction != instruction_transition:
+        raise ClientSnapshotError(
+            "durable agent instructions transition does not bind this lineage"
+        )
+    instruction_transition_sha256 = (
+        instruction_transition.get("transition_sha256")
+        if instruction_transition is not None
+        else None
+    )
+
+    expected_schema_contract_matches = not surface_changed
+    if (
+        durable_rebind.get("schema_version") != 1
+        or durable_rebind.get("state") != "matched"
+        or durable_rebind.get("verified") is not True
+        or durable_rebind.get("cutover_rebind") is not True
+        or durable_rebind.get("schema_contract_matches")
+        is not expected_schema_contract_matches
+        or durable_rebind.get("schema_changed") is not schema_changed
+        or durable_rebind.get("surface_changed") is not surface_changed
+        or durable_rebind.get("instructions_changed") is not instructions_changed
+        or durable_rebind.get("publication_schema_transition")
+        != persisted_publication
+        or durable_rebind.get("agent_instructions_transition")
+        != instruction_transition
+        or durable_rebind.get("source_receipt_sha256") != source_receipt_sha256
+        or durable_rebind.get("classified_snapshot_receipt_sha256")
+        != source_receipt_sha256
+        or durable_rebind.get("client_declaration_sha256")
+        != source_declaration_sha256
+        or durable_rebind.get("source_release_id") != source_release_id
+        or durable_rebind.get("source_repo_head") != source_repo_head
+        or durable_rebind.get("target_release_id") != target_release_id
+        or durable_rebind.get("target_repo_head") != target_repo_head
+        or not isinstance(historical_binding, dict)
+        or historical_binding
+        != {
+            "cutover_id": cutover_id,
+            "cutover_generation": cutover_generation,
+            "rebind_role": "blue-green-cutover",
+        }
+    ):
+        raise ClientSnapshotError("durable cutover rebind does not bind this lineage")
+
+    source_created = transition.get("source_created_at_unix")
+    source_expires = transition.get("source_expires_at_unix")
+    if (
+        transition.get("from_release_id") != source_release_id
+        or transition.get("from_repo_head") != source_repo_head
+        or transition.get("to_release_id") != target_release_id
+        or transition.get("to_repo_head") != target_repo_head
+        or transition.get("source_evidence_time") != source_evidence_time
+        or transition.get("source_receipt_sha256") != source_receipt_sha256
+        or transition.get("source_client_declaration_sha256")
+        != source_declaration_sha256
+        or transition.get("schema_identity_sha256") != source_identity
+        or transition.get("complete_schema_sha256") != source_complete
+        or transition.get("target_schema_identity_sha256") != target_identity
+        or transition.get("target_complete_schema_sha256") != target_complete
+        or transition.get("schema_changed") is not schema_changed
+        or transition.get("surface_changed", transition.get("schema_changed"))
+        is not surface_changed
+        or transition.get("instructions_changed", False) is not instructions_changed
+        or transition.get("publication_schema_transition")
+        != persisted_publication
+        or transition.get("agent_instructions_transition") != instruction_transition
+        or transition.get("green_readiness_sha256") != _sha256_json(green_readiness)
+        or transition.get("surface_continuity_sha256")
+        != _sha256_json(
+            {
+                "registered_tool_count": source_tool_count,
+                "registered_names_sha256": source_names_sha256,
+                "agent_instructions_sha256": source_instructions_sha256,
+                "schema_identity_sha256": source_identity,
+                "complete_schema_sha256": source_complete,
+            }
+        )
+        or isinstance(source_created, bool)
+        or not isinstance(source_created, int)
+        or isinstance(source_expires, bool)
+        or not isinstance(source_expires, int)
+        or not (
+            source_created - SNAPSHOT_CLOCK_SKEW_SECONDS
+            <= source_evidence_time
+            <= source_expires
+        )
+    ):
+        raise ClientSnapshotError("durable cutover transition does not bind this lineage")
+
+    current_receipt_sha256 = _require_authentic_digest(
+        receipt.get("receipt_sha256"), label="successor receipt_sha256"
+    )
+    if current_receipt_sha256 in {
+        source_receipt_sha256,
+        historical_rebind_receipt_sha256,
+    }:
+        raise ClientSnapshotError("successor snapshot does not advance receipt identity")
+    return {
+        "state": SNAPSHOT_BINDING_REBOUND,
+        "bound_release_id": target_release_id,
+        "bound_repo_head": target_repo_head,
+        "observation_scope": observation_scope,
+        "snapshot_receipt_sha256": current_receipt_sha256,
+        "source_receipt_sha256": source_receipt_sha256,
+        "source_snapshot_receipt_sha256": source_receipt_sha256,
+        "source_client_declaration_sha256": source_declaration_sha256,
+        "classified_snapshot_receipt_sha256": current_receipt_sha256,
+        "source_release_id": source_release_id,
+        "source_repo_head": source_repo_head,
+        "target_release_id": target_release_id,
+        "target_repo_head": target_repo_head,
+        "schema_changed": schema_changed,
+        "surface_changed": surface_changed,
+        "instructions_changed": instructions_changed,
+        "current_publication_authorized": (
+            current_authorization is not None if surface_changed else True
+        ),
+        "publication_transition_sha256": publication_transition_sha256,
+        "agent_instructions_transition_sha256": instruction_transition_sha256,
+        "successor_refresh_after_cutover_rebind": True,
+        "historical_rebind_receipt_sha256": historical_rebind_receipt_sha256,
+    }
+
+
 def inspect_cutover_snapshot_binding(
     *,
     cutover_id: str,
@@ -3917,6 +4374,7 @@ def inspect_cutover_snapshot_binding(
     agent_instructions_sha256: str,
     green_readiness: dict[str, Any],
     deployment_source_identity_sha256: str | None = None,
+    durable_rebind: dict[str, Any] | None = None,
     path: Path = SNAPSHOT_PATH,
     now_unix: int | None = None,
 ) -> dict[str, Any]:
@@ -3949,6 +4407,8 @@ def inspect_cutover_snapshot_binding(
         "agent_instructions_transition_sha256": None,
         "schema_changed": None,
         "instructions_changed": None,
+        "successor_refresh_after_cutover_rebind": False,
+        "historical_rebind_receipt_sha256": None,
         "error": None,
     }
     try:
@@ -4001,6 +4461,27 @@ def inspect_cutover_snapshot_binding(
 
         declaration = receipt["client_declaration"]
         binding = receipt["server_binding"]
+        successor = _successor_refresh_after_cutover_rebind(
+            receipt=receipt,
+            durable_rebind=durable_rebind,
+            cutover_id=cutover_id,
+            cutover_generation=cutover_generation,
+            source_release_id=source_release,
+            source_repo_head=source_repo_head,
+            target_release_id=target_release,
+            target_repo_head=target_repo_head,
+            source_evidence_time=source_evidence_time,
+            publication_request_id=publication_request_id,
+            registered_tool_count=registered_tool_count,
+            registered_names_sha256=names_sha256,
+            agent_instructions_sha256=instructions_sha256,
+            green_readiness=green_readiness,
+            deployment_source_identity_sha256=deployment_source_identity_sha256,
+            now_unix=int(time.time()) if now_unix is None else now_unix,
+        )
+        if successor is not None:
+            observation.update(successor)
+            return observation
         schema_evidence = receipt.get("schema_evidence")
         observation_scope = declaration.get("observation_scope")
         if (
@@ -4391,6 +4872,7 @@ def cutover_snapshot_effect_guard(
     agent_instructions_sha256: str,
     green_readiness: dict[str, Any],
     deployment_source_identity_sha256: str | None = None,
+    durable_rebind: dict[str, Any] | None = None,
     expected_state: str,
     source_snapshot_receipt_sha256: str,
     source_client_declaration_sha256: str,
@@ -4436,6 +4918,7 @@ def cutover_snapshot_effect_guard(
             agent_instructions_sha256=agent_instructions_sha256,
             green_readiness=green_readiness,
             deployment_source_identity_sha256=deployment_source_identity_sha256,
+            durable_rebind=durable_rebind,
             path=path,
         )
         if (
