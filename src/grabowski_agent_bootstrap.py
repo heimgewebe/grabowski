@@ -31,12 +31,45 @@ ENTRY_SEQUENCE = (
     "read_live_runtime_and_connector_snapshot",
     "read_repository_head_dirty_state_and_leases",
     "classify_one_next_operation",
+    "discover_existing_capability_or_route",
     "request_execution_shape_for_nontrivial_or_mutating_work",
     "perform_exactly_one_bounded_effect",
     "read_back_target_state",
     "record_truthful_outcome",
     "continue_only_from_observed_state",
 )
+
+REUSE_BEFORE_BUILD = {
+    "authority": "discovery_order_only",
+    "ordered_discovery": [
+        "native_typed_surface",
+        "host_capability_locator_if_host_local_and_no_native_surface",
+        "declared_specialized_route_if_non_host_or_host_not_found",
+        "live_readiness_of_selected_authority",
+    ],
+    "host_capability_tool": "grabowski_host_capability_resolve",
+    "new_infrastructure_gate": "only_when_no_existing_authority_or_declared_route_is_found",
+    "invariants": [
+        "not_ready_is_not_not_found",
+        "not_ready_requires_existing_authority_recovery_not_parallel_replacement",
+        "host_capability_blocked_stops_host_local_discovery",
+        "non_host_intent_does_not_require_host_contract",
+        "discovery_does_not_authorize_execution",
+        "do_not_duplicate_existing_control_plane",
+    ],
+    "creation_triggers": [
+        "virtualenv",
+        "package_install",
+        "model_or_download_cache",
+        "local_service",
+        "worker",
+        "browser_or_gui_replacement",
+        "device_bridge",
+        "transfer_path",
+        "provider_integration",
+        "cloud_fallback",
+    ],
+}
 
 
 def _stable_sha256(value: dict[str, Any]) -> str:
@@ -207,11 +240,13 @@ def agent_bootstrap(*, friction_limit: int = 100, outcome_limit: int = 200) -> d
         "adaptive_mode": "shadow" if adaptive_enabled else "disabled_fail_closed",
         "automatic_live_routing_enabled": False,
         "entry_sequence": list(ENTRY_SEQUENCE),
+        "reuse_before_build": REUSE_BEFORE_BUILD,
         "call_rules": {
             "one_independent_intent_per_call": True,
             "split_broad_reads": True,
             "bounded_output_required": True,
             "prefer_typed_tool_then_grip_then_durable_task": True,
+            "reuse_existing_capability_before_new_infrastructure": True,
             "one_mutation_per_attempt": True,
             "post_state_readback_after_mutation": True,
             "operator_stop_retry_limit": 0,

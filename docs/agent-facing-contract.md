@@ -33,10 +33,16 @@ The rendered contract requires the agent to:
 2. use the narrowest typed read tool that can answer the question before broader
    surfaces, without adding a connectivity-only health ping when that required
    read can serve as the probe;
-3. for a host-local capability intent, resolve the installed host contract first
-   through `grabowski_host_capability_resolve`, follow its canonical authority and
-   reread that authority's policy at execution time; Grabowski must not duplicate
-   provider or model choices from the owning host contract;
+3. reuse existing capability infrastructure before building a parallel path: prefer
+   a native typed Grabowski capability first. For a host-local capability with no
+   native surface, use `grabowski_host_capability_resolve`; only an explicit host
+   `not_found` may fall through to an already declared specialized route, while host
+   `blocked` stops that discovery. Non-host intents do not depend on the host contract
+   and may proceed to their already declared specialized route. Re-read the selected
+   authority's live readiness and policy, treat not-ready as distinct from not-found,
+   and exhaust this order before creating a venv, install, cache, service, worker,
+   bridge, transfer path, provider integration or cloud fallback; discovery grants
+   no execution or setup authority and must not duplicate provider or model choices;
 4. determine mutation target, expected result, validation, stop condition and
    rollback before changing state;
 5. verify target state after transport, platform-filter or policy failures and
@@ -76,7 +82,12 @@ The rendered contract requires the agent to:
     deploy, secret or retry authority.
 
 The executable rules in `AGENT_INSTRUCTION_RULES` are the source of truth if
-this explanatory list drifts.
+this explanatory list drifts. Native Grabowski surfaces remain first-class
+authorities rather than host-locator misses: a browser or Juno capability that is
+already published through Grabowski must not be duplicated merely because the
+host-local resolver returns `not_found`. Likewise, an existing authority that is
+currently not ready is a readiness/recovery case, not evidence that a replacement
+control plane should be created.
 
 A refusal that occurs before host dispatch cannot be observed or recorded by the
 Grabowski server itself. The client/controller must therefore keep that boundary

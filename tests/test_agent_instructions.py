@@ -90,12 +90,17 @@ class AgentInstructionsTests(unittest.TestCase):
         self.assertIn("serve as the probe", narrow)
         host_resolution = rules["host-capability-resolution"].lower()
         for phrase in (
+            "native typed first",
+            "host-local/no native",
             "grabowski_host_capability_resolve",
-            "canonical authority",
-            "policy",
-            "do not pin",
-            "provider",
-            "model",
+            "host not_found/non-host",
+            "host blocked: stop",
+            "follow selected authority",
+            "reread live policy/readiness at execution",
+            "not-ready!=not-found",
+            "reuse before new infra",
+            "no execution/setup authority",
+            "provider/model pinning",
         ):
             self.assertIn(phrase, host_resolution)
         mutation = rules["mutation-preconditions"].lower()

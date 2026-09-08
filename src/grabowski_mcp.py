@@ -73,11 +73,11 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "narrowest-typed-read-first",
-        "Use the narrowest typed read tool that can answer the question before broader surfaces; do not add a connectivity-only health ping when that required read can serve as the probe.",
+        "Use the narrowest typed read that answers the question; no connectivity-only health ping when that read can serve as the probe.",
     ),
     (
         "host-capability-resolution",
-        "For a host-local capability intent, call grabowski_host_capability_resolve before choosing an implementation; follow the returned canonical authority and reread its policy at execution time, and do not pin or duplicate provider or model choices in Grabowski.",
+        "Native typed first. Host-local/no native: grabowski_host_capability_resolve. Host not_found/non-host: declared route; host blocked: stop. Follow selected authority; reread live policy/readiness at execution; not-ready!=not-found. Reuse before new infra. No execution/setup authority or provider/model pinning.",
     ),
     (
         "mutation-preconditions",
