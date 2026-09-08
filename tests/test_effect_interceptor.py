@@ -363,6 +363,202 @@ class EffectInterceptorTests(unittest.TestCase):
             ["effect-admission", "effect-completion", "effect-completion"],
         )
 
+    def test_structured_grabowski_no_effect_is_failed_before_effect(self) -> None:
+        admission = interceptor.admit_mutation(
+            tool_name="grabowski_replace_text",
+            arguments={},
+            transport_evidence=self.transport(),
+        )
+        error_type = type(
+            "BeforeEffect",
+            (RuntimeError,),
+            {"__module__": "grabowski_test_exception"},
+        )
+        error = error_type("blocked")
+        error.effect_started = False
+        completion = interceptor.build_exception_completion(admission, error)
+        self.assertEqual(completion["completion_class"], "failed_before_effect")
+
+    def test_structured_grabowski_rejection_is_rejected_before_effect(self) -> None:
+        admission = interceptor.admit_mutation(
+            tool_name="grabowski_replace_text",
+            arguments={},
+            transport_evidence=self.transport(),
+        )
+        error_type = type(
+            "Rejected",
+            (RuntimeError,),
+            {"__module__": "grabowski_test_exception"},
+        )
+        error = error_type("blocked")
+        error.details = {"effect_started": False, "rejected": True}
+        completion = interceptor.build_exception_completion(admission, error)
+        self.assertEqual(completion["completion_class"], "rejected_before_effect")
+
+    def test_structured_effect_possible_stays_unknown(self) -> None:
+        admission = interceptor.admit_mutation(
+            tool_name="grabowski_replace_text",
+            arguments={},
+            transport_evidence=self.transport(),
+        )
+        error_type = type(
+            "Ambiguous",
+            (RuntimeError,),
+            {"__module__": "grabowski_test_exception"},
+        )
+        error = error_type("ambiguous")
+        error.details = {"effect_started": False, "effect_possible": True}
+        completion = interceptor.build_exception_completion(admission, error)
+        self.assertEqual(completion["completion_class"], "outcome_unknown")
+
+    def test_untrusted_structured_no_effect_stays_unknown(self) -> None:
+        admission = interceptor.admit_mutation(
+            tool_name="grabowski_replace_text",
+            arguments={},
+            transport_evidence=self.transport(),
+        )
+        error = RuntimeError("untrusted")
+        error.effect_started = False
+        completion = interceptor.build_exception_completion(admission, error)
+        self.assertEqual(completion["completion_class"], "outcome_unknown")
+
+    def test_known_pre_effect_guard_is_tool_bound_rejection(self) -> None:
+        admission = interceptor.admit_mutation(
+            tool_name="grabowski_git",
+            arguments={},
+            transport_evidence=self.transport(),
+        )
+        with patch.object(
+            interceptor,
+            "_exception_trace_frames",
+            return_value={("grabowski_operator", "_guard_git")},
+        ):
+            completion = interceptor.build_exception_completion(
+                admission, RuntimeError("git mv blocked")
+            )
+        self.assertEqual(completion["completion_class"], "rejected_before_effect")
+
+    def test_same_guard_frame_does_not_authorize_other_tool(self) -> None:
+        admission = interceptor.admit_mutation(
+            tool_name="grabowski_replace_text",
+            arguments={},
+            transport_evidence=self.transport(),
+        )
+        with patch.object(
+            interceptor,
+            "_exception_trace_frames",
+            return_value={("grabowski_operator", "_guard_git")},
+        ):
+            completion = interceptor.build_exception_completion(
+                admission, RuntimeError("ambiguous")
+            )
+        self.assertEqual(completion["completion_class"], "outcome_unknown")
+
+    def test_task_start_guard_frames_remain_outcome_unknown(self) -> None:
+        admission = interceptor.admit_mutation(
+            tool_name="grabowski_task_start",
+            arguments={},
+            transport_evidence=self.transport(),
+        )
+        with patch.object(
+            interceptor,
+            "_exception_trace_frames",
+            return_value={
+                ("grabowski_tasks", "grabowski_task_start"),
+                ("grabowski_tasks", "_guard_unprepared_managed_cargo_retry"),
+            },
+        ):
+            completion = interceptor.build_exception_completion(
+                admission, RuntimeError("task prelaunch path is not globally effect-free")
+            )
+        self.assertEqual(completion["completion_class"], "outcome_unknown")
+
+    def test_fastmcp_validation_before_domain_entry_is_rejected(self) -> None:
+        admission = interceptor.admit_mutation(
+            tool_name="grabowski_git",
+            arguments={},
+            transport_evidence=self.transport(),
+        )
+        validation_type = type(
+            "ValidationError",
+            (Exception,),
+            {"__module__": "pydantic_core._pydantic_core"},
+        )
+        namespace = {
+            "__name__": "mcp.server.fastmcp.utilities.func_metadata",
+            "ValidationError": validation_type,
+        }
+        exec(
+            compile(
+                "def call_fn_with_arg_validation():\n"
+                "    raise ValidationError('invalid arguments')\n",
+                "func_metadata.py",
+                "exec",
+            ),
+            namespace,
+        )
+        try:
+            namespace["call_fn_with_arg_validation"]()
+        except Exception as error:
+            self.assertEqual(type(error).__name__, "ValidationError")
+            self.assertTrue(
+                interceptor._fastmcp_argument_validation_rejection(error)
+            )
+            completion = interceptor.build_exception_completion(admission, error)
+        else:
+            self.fail("synthetic FastMCP validation did not reject")
+        self.assertEqual(completion["completion_class"], "rejected_before_effect")
+
+    def test_enforced_pre_effect_settles_effect_not_applied(self) -> None:
+        admission = interceptor.admit_mutation(
+            tool_name="grabowski_git",
+            arguments={},
+            transport_evidence=self.transport(),
+        )
+        token = {"token": True}
+        with patch.object(
+            interceptor,
+            "_known_pre_effect_guard_rejection",
+            return_value=True,
+        ), patch.object(
+            interceptor,
+            "finish_fence_not_applied",
+            return_value={"terminal": True},
+        ) as not_applied, patch.object(
+            interceptor, "finish_fence_unknown"
+        ) as unknown:
+            completion = interceptor.record_exception_enforced(
+                admission, RuntimeError("blocked"), token
+            )
+        self.assertEqual(completion["completion_class"], "rejected_before_effect")
+        not_applied.assert_called_once_with(
+            token, evidence_sha256=completion["completion_sha256"]
+        )
+        unknown.assert_not_called()
+
+    def test_enforced_ambiguous_failure_stays_outcome_unknown(self) -> None:
+        admission = interceptor.admit_mutation(
+            tool_name="grabowski_git",
+            arguments={},
+            transport_evidence=self.transport(),
+        )
+        token = {"token": True}
+        with patch.object(
+            interceptor,
+            "finish_fence_unknown",
+            return_value={"terminal": False},
+        ) as unknown, patch.object(
+            interceptor, "finish_fence_not_applied"
+        ) as not_applied:
+            completion = interceptor.record_exception_enforced(
+                admission, RuntimeError("response lost"), token
+            )
+        self.assertEqual(completion["completion_class"], "outcome_unknown")
+        unknown.assert_called_once_with(
+            token, evidence_sha256=completion["completion_sha256"]
+        )
+        not_applied.assert_not_called()
+
     def test_completion_best_effort_audit_tolerates_missing_optional_fields(self) -> None:
         records = []
         interceptor._completion_audit_best_effort(

@@ -50,6 +50,31 @@ finish_fence_success = fence_enforcement.finish_fence_success
 finish_fence_unknown = fence_enforcement.finish_fence_unknown
 abort_fence_before_dispatch = fence_enforcement.abort_fence_before_dispatch
 
+# Only these tool-bound frames are proven to reject before their first domain
+# effect boundary.  Keep this allowlist deliberately small; transport/replay
+# failures and later domain errors remain outcome_unknown.
+_PRE_EFFECT_GUARD_FRAMES = {
+    "grabowski_resource_acquire": frozenset(
+        {("grabowski_resources", "_public_repository_scope_keys")}
+    ),
+    "grabowski_git": frozenset({("grabowski_operator", "_guard_git")}),
+}
+_PRE_EFFECT_COMPLETION_CLASSES = frozenset(
+    {"rejected_before_effect", "failed_before_effect"}
+)
+
+
+def finish_fence_not_applied(
+    token: MutableMapping[str, Any], *, evidence_sha256: str
+) -> dict[str, Any] | None:
+    """Settle the original writer fence after typed non-application proof."""
+
+    return fence_enforcement._finish_fence_enforcement(
+        token,
+        outcome="effect_not_applied",
+        evidence_sha256=evidence_sha256,
+    )
+
 
 def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
@@ -484,6 +509,126 @@ def record_success(
     )
 
 
+def _exception_chain(
+    error: BaseException, *, maximum: int = 8
+) -> list[BaseException]:
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and len(chain) < maximum and id(current) not in seen:
+        chain.append(current)
+        seen.add(id(current))
+        next_error = current.__cause__
+        if next_error is None and not current.__suppress_context__:
+            next_error = current.__context__
+        current = next_error
+    return chain
+
+
+def _exception_trace_frames(error: BaseException) -> set[tuple[str, str]]:
+    frames: set[tuple[str, str]] = set()
+    for current in _exception_chain(error):
+        trace = current.__traceback__
+        while trace is not None:
+            module = trace.tb_frame.f_globals.get("__name__")
+            frames.add(
+                (
+                    module if isinstance(module, str) else "",
+                    trace.tb_frame.f_code.co_name,
+                )
+            )
+            trace = trace.tb_next
+    return frames
+
+
+def _structured_pre_effect_completion_class(error: BaseException) -> str | None:
+    """Accept explicit no-effect evidence only from Grabowski-owned exceptions."""
+
+    for current in _exception_chain(error):
+        if not type(current).__module__.startswith("grabowski_"):
+            continue
+        evidence_candidates: list[Mapping[str, Any]] = []
+        direct = {
+            field: getattr(current, field)
+            for field in ("effect_started", "effect_possible", "no_effect", "rejected")
+            if hasattr(current, field)
+        }
+        if direct:
+            evidence_candidates.append(direct)
+        for field in ("details", "data"):
+            value = getattr(current, field, None)
+            if isinstance(value, Mapping):
+                evidence_candidates.append(value)
+        for evidence in evidence_candidates:
+            if evidence.get("effect_possible") is True:
+                continue
+            if not (
+                evidence.get("effect_started") is False
+                or evidence.get("no_effect") is True
+            ):
+                continue
+            return receipts.exception_completion_class(
+                effect_started=False,
+                rejected=evidence.get("rejected") is True,
+            )
+    return None
+
+
+def _fastmcp_argument_validation_rejection(error: BaseException) -> bool:
+    """Prove validation failed before FastMCP entered any Grabowski domain tool."""
+
+    for current in _exception_chain(error):
+        cls = type(current)
+        if cls.__name__ != "ValidationError" or not cls.__module__.startswith(
+            ("pydantic", "pydantic_core")
+        ):
+            continue
+        frames: set[tuple[str, str]] = set()
+        trace = current.__traceback__
+        while trace is not None:
+            module = trace.tb_frame.f_globals.get("__name__")
+            frames.add(
+                (
+                    module if isinstance(module, str) else "",
+                    trace.tb_frame.f_code.co_name,
+                )
+            )
+            trace = trace.tb_next
+        if (
+            (
+                "mcp.server.fastmcp.utilities.func_metadata",
+                "call_fn_with_arg_validation",
+            )
+            in frames
+            and not any(module.startswith("grabowski_") for module, _ in frames)
+        ):
+            return True
+    return False
+
+
+def _known_pre_effect_guard_rejection(
+    admission: Mapping[str, Any], error: BaseException
+) -> bool:
+    validated = receipts.validate_admission(admission)
+    required_frames = _PRE_EFFECT_GUARD_FRAMES.get(validated["tool"])
+    if not required_frames:
+        return False
+    return bool(required_frames & _exception_trace_frames(error))
+
+
+def exception_completion_class(
+    admission: Mapping[str, Any], error: BaseException
+) -> str:
+    structured = _structured_pre_effect_completion_class(error)
+    if structured is not None:
+        return structured
+    if _fastmcp_argument_validation_rejection(error):
+        return "rejected_before_effect"
+    if _known_pre_effect_guard_rejection(admission, error):
+        return "rejected_before_effect"
+    return "outcome_unknown"
+
+
 def record_exception(
     admission: Mapping[str, Any],
     error: BaseException,
@@ -492,7 +637,7 @@ def record_exception(
 ) -> dict[str, Any]:
     return receipts.complete(
         admission,
-        completion_class="outcome_unknown",
+        completion_class=exception_completion_class(admission, error),
         error=error,
         append_audit=append_audit,
     )
@@ -544,7 +689,7 @@ def build_exception_completion(
 ) -> dict[str, Any]:
     return receipts.complete(
         admission,
-        completion_class="outcome_unknown",
+        completion_class=exception_completion_class(admission, error),
         error=error,
         append_audit=None,
     )
@@ -579,11 +724,23 @@ def record_exception_enforced(
 ) -> dict[str, Any]:
     completion = build_exception_completion(admission, error)
     _completion_audit_best_effort(completion, append_audit)
+    pre_effect = completion["completion_class"] in _PRE_EFFECT_COMPLETION_CLASSES
     try:
-        finish_fence_unknown(token, evidence_sha256=completion["completion_sha256"])
+        if pre_effect:
+            finish_fence_not_applied(
+                token, evidence_sha256=completion["completion_sha256"]
+            )
+        else:
+            finish_fence_unknown(
+                token, evidence_sha256=completion["completion_sha256"]
+            )
     except Exception as fence_error:
         LOGGER.error(
-            "operator-fence outcome-unknown settlement remains pending: %s",
+            (
+                "operator-fence non-application settlement remains pending: %s"
+                if pre_effect
+                else "operator-fence outcome-unknown settlement remains pending: %s"
+            ),
             type(fence_error).__name__,
             exc_info=fence_error,
         )
