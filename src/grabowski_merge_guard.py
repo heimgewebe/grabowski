@@ -1751,28 +1751,77 @@ def _exact_base_content_git_head_cas_update_pr_head(
         )
         return sha, info
 
+    def validate_effective_push_urls(root: Path) -> None:
+        info = run(
+            "verify-effective-push-urls",
+            root,
+            ["remote", "get-url", "--push", "--all", "origin"],
+        )
+        if info["returncode"] != 0:
+            raise RuntimeError(
+                "exact PR-head convergence cannot resolve effective push URLs"
+            )
+        raw_lines = info["stdout"].splitlines()
+        push_urls = [line.strip() for line in raw_lines]
+        if not push_urls or any(not url for url in push_urls):
+            raise RuntimeError(
+                "exact PR-head convergence effective push URLs are invalid"
+            )
+        push_url_digests: list[str] = []
+        for push_url in push_urls:
+            try:
+                push_identity = _merge_guard_github_repository_identity(push_url)
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    "exact PR-head convergence effective push URL is not canonical GitHub"
+                ) from exc
+            if push_identity.casefold() != repo_slug.casefold():
+                raise RuntimeError(
+                    "exact PR-head convergence effective push URL repository drift"
+                )
+            if not (
+                push_url.startswith("git@github.com:")
+                or push_url.startswith("ssh://git@github.com/")
+            ):
+                raise RuntimeError(
+                    "exact PR-head convergence requires canonical SSH GitHub effective push URLs"
+                )
+            push_url_digests.append(
+                hashlib.sha256(push_url.encode("utf-8")).hexdigest()
+            )
+        evidence["effective_push_url_count"] = len(push_urls)
+        evidence["effective_push_url_digests_sha256"] = _sha256_json(
+            sorted(push_url_digests)
+        )
+
     temp_root = Path(tempfile.mkdtemp(prefix="grabowski-pr-head-converge-"))
     try:
         for stage, args in (
             ("init", ["init", "--quiet"]),
             ("disable-hooks", ["config", "core.hooksPath", "/dev/null"]),
             ("remote-add", ["remote", "add", "origin", remote_url]),
-            (
-                "fetch-bound-refs",
-                [
-                    "fetch",
-                    "--quiet",
-                    "--no-tags",
-                    "origin",
-                    f"{base_ref}:refs/converge/base",
-                    f"{head_ref}:refs/converge/head-branch",
-                    f"{pull_ref}:refs/converge/pr-head",
-                ],
-            ),
         ):
             info = run(stage, temp_root, args)
             if info["returncode"] != 0:
                 raise RuntimeError(f"exact PR-head convergence {stage} failed")
+
+        validate_effective_push_urls(temp_root)
+
+        info = run(
+            "fetch-bound-refs",
+            temp_root,
+            [
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "origin",
+                f"{base_ref}:refs/converge/base",
+                f"{head_ref}:refs/converge/head-branch",
+                f"{pull_ref}:refs/converge/pr-head",
+            ],
+        )
+        if info["returncode"] != 0:
+            raise RuntimeError("exact PR-head convergence fetch-bound-refs failed")
 
         for stage, ref_name, expected in (
             ("verify-fetched-base", "refs/converge/base^{commit}", base_sha),

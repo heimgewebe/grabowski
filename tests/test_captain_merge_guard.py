@@ -890,6 +890,7 @@ class _ScriptedPrHeadCasGit:
         base_before: str = _CAS_BASE,
         base_after: str | None = None,
         head_after: str | None = None,
+        push_urls: tuple[str, ...] = ("git@github.com:heimgewebe/infra.git",),
     ) -> None:
         self.push_returncode = push_returncode
         self.push_applies = (
@@ -899,6 +900,7 @@ class _ScriptedPrHeadCasGit:
         self.base_before = base_before
         self.base_after = base_after
         self.head_after = head_after
+        self.push_urls = push_urls
         self.calls = []
         self.pushed = False
         self.base_reads = 0
@@ -916,6 +918,12 @@ class _ScriptedPrHeadCasGit:
             return {
                 "returncode": 0,
                 "stdout": "git@github.com:heimgewebe/infra.git\n",
+                "stderr": "",
+            }
+        if args == ["remote", "get-url", "--push", "--all", "origin"]:
+            return {
+                "returncode": 0,
+                "stdout": "".join(f"{url}\n" for url in self.push_urls),
                 "stderr": "",
             }
         if (
@@ -1027,6 +1035,19 @@ class ExactPrHeadConvergenceCasTests(unittest.TestCase):
             call for call in git.calls if call[:3] == ("rev-list", "--parents", "-n")
         )
         self.assertEqual(("rev-list", "--parents", "-n", "1", "HEAD"), parents)
+
+    def test_exact_pr_head_cas_rejects_identity_changing_effective_push_url(
+        self,
+    ) -> None:
+        git = _ScriptedPrHeadCasGit(
+            push_urls=(
+                "git@github.com:heimgewebe/infra.git",
+                "git@github.com:heimgewebe/other.git",
+            )
+        )
+        with self.assertRaisesRegex(RuntimeError, "effective push URL repository drift"):
+            self.run_cas(git)
+        self.assertFalse(any(call[:1] == ("push",) for call in git.calls))
 
     def test_exact_pr_head_cas_blocks_base_drift_before_dispatch(self) -> None:
         git = _ScriptedPrHeadCasGit(base_before=_CAS_OTHER)
