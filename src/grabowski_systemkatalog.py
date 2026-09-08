@@ -649,7 +649,9 @@ def query_systemkatalog(
             "does_not_establish": combined_nonclaims,
         }
     except SystemkatalogAdapterError as exc:
-        if authority_failover.systemkatalog_failure_is_failover_trigger(exc.code):
+        if authority_failover.systemkatalog_failure_is_failover_trigger(
+            exc.code, details=exc.details
+        ):
             try:
                 return authority_failover.relay_systemkatalog(
                     normalized_operation, normalized_value

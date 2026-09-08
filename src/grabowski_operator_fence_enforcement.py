@@ -586,7 +586,7 @@ def _fence_recover_pending(
     if phase == "outcome_unknown":
         status = _fence_status(client, config, state)
         settlement = status.get("last_settlement")
-        if (
+        settlement_matches = (
             status.get("inflight") is None
             and isinstance(settlement, Mapping)
             and settlement.get("generation") == pending["generation"]
@@ -594,15 +594,25 @@ def _fence_recover_pending(
             and settlement.get("operation_id") == pending["operation_id"]
             and settlement.get("operation_name") == pending["operation_name"]
             and settlement.get("intent_sha256") == pending["intent_sha256"]
-            and settlement.get("outcome") == "effect_applied"
-            and settlement.get("resolution_source") == "reconcile"
-        ):
-            return _fence_set_pending(
-                state_path,
-                state,
-                None,
-                minimum_generation_seen=int(status["generation"]),
-            )
+        )
+        if settlement_matches:
+            if (
+                settlement.get("outcome") == "effect_applied"
+                and settlement.get("resolution_source") == "reconcile"
+            ):
+                return _fence_set_pending(
+                    state_path,
+                    state,
+                    None,
+                    minimum_generation_seen=int(status["generation"]),
+                )
+            if (
+                settlement.get("resolution_source") == "writer"
+                and settlement.get("outcome") in FENCE_ENFORCEMENT_TERMINAL_OUTCOMES
+            ):
+                return _fence_release_or_observe(
+                    client, config, state_path, state, pending
+                )
         raise OperatorFenceEnforcementDenied("unresolved_inflight")
     if phase == "prepared":
         try:

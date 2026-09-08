@@ -2109,14 +2109,16 @@ class BureauFailureIdentityTests(unittest.TestCase):
         )
 
 
-    def test_secondary_candidate_record_relays_before_local_artifacts(self) -> None:
+    def test_secondary_candidate_record_normalizes_before_relay(self) -> None:
         request = {
             "schema_version": 1,
             "idempotency_key": "conversation:relay-test",
             "title": "Relay test",
             "source_kind": "conversation",
             "desired_outcome": "Prove relay",
+            "repo": "heimgewebe/Grabowski",
         }
+        normalized_request = {**request, "repo": "repo.grabowski"}
         expected = {"kind": "bureau_candidate_record_result", "status": "recorded"}
         with (
             mock.patch.object(intake.operator, "_require_operator_mutation"),
@@ -2131,7 +2133,7 @@ class BureauFailureIdentityTests(unittest.TestCase):
         self.assertEqual(result, expected)
         relay.assert_called_once_with(
             "candidate_record",
-            {"request": request},
+            {"request": normalized_request},
             mutation=True,
             required_readback=["candidate_by_idempotency_key"],
             readback_selector={
@@ -2139,6 +2141,29 @@ class BureauFailureIdentityTests(unittest.TestCase):
                 "idempotency_key": "conversation:relay-test",
             },
         )
+        write.assert_not_called()
+        invoke.assert_not_called()
+
+    def test_secondary_candidate_record_rejects_bad_repo_before_relay(self) -> None:
+        request = {
+            "schema_version": 1,
+            "idempotency_key": "conversation:bad-repo-relay-test",
+            "title": "Relay test",
+            "source_kind": "conversation",
+            "desired_outcome": "Prove relay",
+            "repo": "/definitely/not/a/repository",
+        }
+        with (
+            mock.patch.object(intake.operator, "_require_operator_mutation"),
+            mock.patch.object(intake, "_bureau_remote_route", return_value=True),
+            mock.patch.object(intake, "_relay_bureau_or_failure") as relay,
+            mock.patch.object(intake, "_write_bound_json") as write,
+            mock.patch.object(intake, "_invoke_bureau") as invoke,
+        ):
+            result = intake.grabowski_bureau_candidate_record(request)
+        self.assertEqual(result["code"], "candidate-repo-selector-invalid")
+        self.assertFalse(result["effect_started"])
+        relay.assert_not_called()
         write.assert_not_called()
         invoke.assert_not_called()
 
@@ -2200,6 +2225,26 @@ class BureauFailureIdentityTests(unittest.TestCase):
         prepare.assert_not_called()
         acquire.assert_not_called()
         local_proposal.assert_called_once_with(proposal_id)
+
+    def test_local_proposal_authority_requires_regular_plan_artifact(self) -> None:
+        proposal_id = "7" * 64
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            artifacts = root / "artifacts"
+            directory = artifacts / "proposals" / proposal_id
+            directory.mkdir(parents=True)
+            with mock.patch.object(intake, "ARTIFACT_ROOT", artifacts):
+                self.assertFalse(intake._local_proposal_artifacts_exist(proposal_id))
+
+                plan_path = directory / "plan.json"
+                plan_path.write_text("{}", encoding="utf-8")
+                self.assertTrue(intake._local_proposal_artifacts_exist(proposal_id))
+
+                plan_path.unlink()
+                target = root / "plan-target.json"
+                target.write_text("{}", encoding="utf-8")
+                plan_path.symlink_to(target)
+                self.assertFalse(intake._local_proposal_artifacts_exist(proposal_id))
 
     def test_secondary_local_proposal_blocks_cross_host_review(self) -> None:
         proposal_id = "c" * 64

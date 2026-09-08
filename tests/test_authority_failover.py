@@ -61,16 +61,31 @@ class AuthorityFailoverTests(unittest.TestCase):
         module._contract_runtime = runtime
         return module
 
-    def test_only_secondary_runtime_can_fail_over(self) -> None:
+    def test_only_secondary_physical_root_absence_can_fail_over(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertFalse(failover.is_secondary_operator())
             self.assertFalse(
-                failover.systemkatalog_failure_is_failover_trigger("root_unavailable")
+                failover.systemkatalog_failure_is_failover_trigger(
+                    "root_unavailable",
+                    details={"error_type": "FileNotFoundError"},
+                )
             )
         with self.secondary():
             self.assertTrue(failover.is_secondary_operator())
-            self.assertTrue(
+            self.assertFalse(
                 failover.systemkatalog_failure_is_failover_trigger("root_unavailable")
+            )
+            self.assertTrue(
+                failover.systemkatalog_failure_is_failover_trigger(
+                    "root_unavailable",
+                    details={"error_type": "FileNotFoundError"},
+                )
+            )
+            self.assertFalse(
+                failover.systemkatalog_failure_is_failover_trigger(
+                    "root_unavailable",
+                    details={"error_type": "PermissionError"},
+                )
             )
 
     def test_systemkatalog_semantic_or_integrity_denials_never_trigger(self) -> None:

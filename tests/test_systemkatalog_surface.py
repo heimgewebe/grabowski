@@ -241,6 +241,25 @@ class SystemkatalogSurfaceTests(unittest.TestCase):
             result = surface.query_systemkatalog("system", "grabowski")
         self.assertEqual(result["adapter_error"]["code"], "root_unavailable")
 
+    def test_root_permission_error_does_not_relay_on_secondary(self) -> None:
+        failure = surface.SystemkatalogAdapterError(
+            "root_unavailable",
+            "permission denied",
+            details={"error_type": "PermissionError"},
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {surface.authority_failover.BRANDING_ENVIRONMENT: "der-kleine-maulwurf"},
+                clear=False,
+            ),
+            mock.patch.object(surface, "_configured_root", side_effect=failure),
+            mock.patch.object(surface.authority_failover, "relay_systemkatalog") as relay,
+        ):
+            result = surface.query_systemkatalog("system", "grabowski")
+        self.assertEqual(result["adapter_error"]["code"], "root_unavailable")
+        relay.assert_not_called()
+
     def test_missing_query_script_returns_typed_adapter_error(self) -> None:
         self.script.unlink()
         with mock.patch.object(surface, "_configured_root", return_value=self.root), mock.patch.object(

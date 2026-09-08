@@ -209,9 +209,16 @@ def is_secondary_operator() -> bool:
     return os.environ.get(BRANDING_ENVIRONMENT, "").strip() in SECONDARY_BRANDING_VARIANTS
 
 
-def systemkatalog_failure_is_failover_trigger(code: str) -> bool:
-    """Only physical absence of the local canonical root can trigger relay."""
-    return is_secondary_operator() and code == "root_unavailable"
+def systemkatalog_failure_is_failover_trigger(
+    code: str, *, details: dict[str, Any] | None = None
+) -> bool:
+    """Only a typed physical FileNotFound root failure can trigger relay."""
+    return (
+        is_secondary_operator()
+        and code == "root_unavailable"
+        and isinstance(details, dict)
+        and details.get("error_type") == "FileNotFoundError"
+    )
 
 
 def normalize_bureau_registry_root(registry_root: str) -> str:

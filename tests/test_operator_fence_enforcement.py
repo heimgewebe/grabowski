@@ -368,6 +368,45 @@ class OperatorFenceEnforcementTests(unittest.TestCase):
         self.assertEqual(state2["pending"]["operation_id"], second["request_id"] )
         enforcement.abort_fence_before_dispatch(token2)
 
+    def test_writer_terminal_not_applied_recovers_outcome_unknown(self) -> None:
+        first = self.admission("grabowski_git")
+        token = self.begin(first)
+        enforcement.mark_fence_dispatching(token)
+        self.simulate_process_death(token)
+
+        with self.assertRaisesRegex(
+            enforcement.OperatorFenceEnforcementDenied, "outcome_unknown"
+        ):
+            self.begin(self.admission("grabowski_resource_acquire"))
+        pending_state, _ = enforcement._fence_read_json(self.state_path)
+        pending = pending_state["pending"]
+        self.assertEqual(pending["phase"], "outcome_unknown")
+
+        settlement = self.store.settle_effect(
+            owner_id="grabowski",
+            session_id=pending["session_id"],
+            generation=pending["generation"],
+            operation_id=pending["operation_id"],
+            operation_name=pending["operation_name"],
+            intent_sha256=pending["intent_sha256"],
+            outcome="effect_not_applied",
+            evidence_sha256="d" * 64,
+            expected_instance_id=self.store.status()["instance_id"],
+            minimum_generation_seen=pending["generation"],
+        )
+        self.assertEqual(settlement["recorded_settlement"]["resolution_source"], "writer")
+        self.assertEqual(settlement["recorded_settlement"]["outcome"], "effect_not_applied")
+
+        second = self.admission("grabowski_resource_acquire")
+        token2 = self.begin(second)
+        status = self.store.status()
+        self.assertEqual(status["generation"], 2)
+        self.assertEqual(status["writer"]["owner_id"], "grabowski")
+        self.assertEqual(status["inflight"]["operation_id"], second["request_id"])
+        state2, _ = enforcement._fence_read_json(self.state_path)
+        self.assertEqual(state2["pending"]["operation_id"], second["request_id"])
+        enforcement.abort_fence_before_dispatch(token2)
+
     def test_exception_completion_marks_remote_outcome_unknown(self) -> None:
         admission = self.admission("grabowski_git")
         token = self.begin(admission)

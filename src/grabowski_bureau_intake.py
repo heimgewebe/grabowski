@@ -1317,7 +1317,10 @@ def _proposal_directory(proposal_id: str) -> Path:
 
 def _local_proposal_artifacts_exist(proposal_id: str) -> bool:
     directory = _proposal_directory(proposal_id)
-    return directory.is_dir() and not directory.is_symlink()
+    if not directory.is_dir() or directory.is_symlink():
+        return False
+    plan_path = directory / "plan.json"
+    return plan_path.is_file() and not plan_path.is_symlink()
 
 
 def _proposal_authority_split_failure(proposal_id: str) -> dict[str, Any]:
@@ -1391,20 +1394,6 @@ def grabowski_bureau_candidate_record(
     operator._require_operator_mutation("bureau_mutation")
     if not isinstance(request, dict):
         raise ValueError("request must be an object")
-    if _bureau_remote_route():
-        readback_selector = _candidate_relay_readback_selector(request)
-        required_readback = (
-            ["candidate_by_candidate_id"]
-            if readback_selector["kind"] == "candidate_id"
-            else ["candidate_by_idempotency_key"]
-        )
-        return _relay_bureau_or_failure(
-            "candidate_record",
-            {"request": request},
-            mutation=True,
-            required_readback=required_readback,
-            readback_selector=readback_selector,
-        )
     try:
         request = _normalize_candidate_request(request)
     except CandidateRepositorySelectorError:
@@ -1419,6 +1408,20 @@ def grabowski_bureau_candidate_record(
         )
         _audit("bureau-candidate-record", payload, request_sha256=request_id)
         return {**payload, "adapter_request_sha256": request_id}
+    if _bureau_remote_route():
+        readback_selector = _candidate_relay_readback_selector(request)
+        required_readback = (
+            ["candidate_by_candidate_id"]
+            if readback_selector["kind"] == "candidate_id"
+            else ["candidate_by_idempotency_key"]
+        )
+        return _relay_bureau_or_failure(
+            "candidate_record",
+            {"request": request},
+            mutation=True,
+            required_readback=required_readback,
+            readback_selector=readback_selector,
+        )
     operation = _candidate_request_operation(request)
     raw = _canonical_json(request)
     request_id = _sha256(raw)
