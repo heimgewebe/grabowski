@@ -168,7 +168,7 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
         attestation["attestation_sha256"] = dual._canonical_line_sha256(attestation)
         return attestation, blobs
 
-    def _fixture_with_backup_ntfs(
+    def _fixture_with_backup_storage(
         self,
     ) -> tuple[dict[str, object], dict[Path, bytes]]:
         attestation, blobs = self._fixture()
@@ -202,9 +202,30 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
                 "/dev/disk/by-id/usb-Freecom_Freecom_Mobile_Drive_XXS_3.0_93300000078D-0:0",
             ],
         }
+        seagate_smart = {
+            **smart,
+            "target_pattern": "seagate-smart-read",
+            "argv": [
+                "/usr/sbin/smartctl",
+                "-d",
+                "sat",
+                "-a",
+                "/dev/disk/by-id/usb-Seagate_Game_Drive_PS4_NZ0DRYBD-0:0",
+            ],
+        }
+        mount_reconcile = {
+            **check,
+            "target_pattern": "mount-reconcile",
+            "argv": [
+                "/usr/local/libexec/grabowski-local-backup-mount-reconcile",
+                "--apply",
+            ],
+        }
         actions[dual.LOCAL_BACKUP_NTFS_CHECK_ACTION] = check
         actions[dual.LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION] = clear_dirty
         actions[dual.LOCAL_BACKUP_SMART_READ_ACTION] = smart
+        actions[dual.SEAGATE_BACKUP_SMART_READ_ACTION] = seagate_smart
+        actions[dual.LOCAL_BACKUP_MOUNT_RECONCILE_ACTION] = mount_reconcile
         blobs[config_path] = (json.dumps(config, sort_keys=True) + "\n").encode("utf-8")
         action_sha256 = attestation["action_sha256"]
         assert isinstance(action_sha256, dict)
@@ -213,13 +234,25 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
             dual._canonical_line_sha256(clear_dirty)
         )
         action_sha256[dual.LOCAL_BACKUP_SMART_READ_ACTION] = dual._canonical_line_sha256(smart)
+        action_sha256[dual.SEAGATE_BACKUP_SMART_READ_ACTION] = dual._canonical_line_sha256(
+            seagate_smart
+        )
+        action_sha256[dual.LOCAL_BACKUP_MOUNT_RECONCILE_ACTION] = (
+            dual._canonical_line_sha256(mount_reconcile)
+        )
         unsigned = dict(attestation)
         unsigned.pop("attestation_sha256", None)
         attestation["attestation_sha256"] = dual._canonical_line_sha256(unsigned)
         return attestation, blobs
 
-    def test_commit_bound_attestation_with_backup_ntfs_actions_is_accepted(self) -> None:
-        attestation, blobs = self._fixture_with_backup_ntfs()
+    def test_backup_storage_action_set_matches_rootbroker_cutover(self) -> None:
+        self.assertEqual(
+            dual.LOCAL_BACKUP_STORAGE_ACTIONS,
+            rootbroker_cutover_module.LOCAL_BACKUP_STORAGE_ACTIONS,
+        )
+
+    def test_commit_bound_attestation_with_backup_storage_actions_is_accepted(self) -> None:
+        attestation, blobs = self._fixture_with_backup_storage()
         with (
             mock.patch.object(
                 dual, "_read_root_owned_public_json", return_value=attestation
@@ -237,8 +270,8 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
             )
         self.assertEqual(observed["expected_head"], self.HEAD)
 
-    def test_backup_ntfs_target_contract_must_be_pairwise_complete(self) -> None:
-        attestation, blobs = self._fixture_with_backup_ntfs()
+    def test_backup_storage_target_contract_must_be_complete(self) -> None:
+        attestation, blobs = self._fixture_with_backup_storage()
         config_path = Path("config/privileged-actions.example.json")
         config = json.loads(blobs[config_path].decode("utf-8"))
         config["actions"].pop(dual.LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION)
@@ -255,7 +288,7 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
                 )
 
     def test_backup_smart_attestation_digest_drift_is_rejected(self) -> None:
-        attestation, blobs = self._fixture_with_backup_ntfs()
+        attestation, blobs = self._fixture_with_backup_storage()
         action_sha256 = attestation["action_sha256"]
         assert isinstance(action_sha256, dict)
         action_sha256[dual.LOCAL_BACKUP_SMART_READ_ACTION] = "f" * 64
