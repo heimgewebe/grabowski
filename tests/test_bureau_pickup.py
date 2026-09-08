@@ -1507,6 +1507,49 @@ class BureauPickupTests(unittest.TestCase):
             control_head,
         )
 
+    def test_existing_assignment_successor_proof_rejects_tampered_canonical_identity(self) -> None:
+        task, initiative, _intent = self.orphan_recovery_documents()
+        control_root = self.root / "control-main-proof-tamper"
+        control_root.mkdir()
+        canonical = self.orphan_recovery_binding(
+            self.root / "runtime-snapshot-proof-tamper",
+            "2" * 40,
+            task,
+            initiative,
+        )
+        stored = pickup._explicit_registry_binding(str(control_root))
+        control = {
+            "status": "current",
+            "control_root": str(control_root),
+            "branch": "ops/bureau-control-main",
+            "upstream": "origin/main",
+            "head": "3" * 40,
+        }
+        with (
+            mock.patch.object(pickup.bureau_leases, "BUREAU_CONTROL_ROOT", control_root),
+            mock.patch.object(
+                pickup.bureau_leases,
+                "inspect_bureau_control_checkout",
+                return_value=control,
+            ),
+            mock.patch.object(pickup.bureau, "_git_identity_lines", return_value=[]),
+        ):
+            proof = pickup._legacy_control_registry_successor_proof(
+                stored, canonical
+            )
+            tampered = json.loads(json.dumps(proof))
+            tampered["canonical_registry_binding_identity"]["source_commit"] = (
+                "4" * 40
+            )
+            with self.assertRaises(pickup.BureauPickupError) as raised:
+                pickup._validated_legacy_control_registry_successor_proof(
+                    tampered
+                )
+        self.assertEqual(
+            "existing-assignment-lease-repair-successor-proof-invalid",
+            raised.exception.code,
+        )
+
     def test_existing_assignment_repair_effective_request_preserves_historical_request(self) -> None:
         task, initiative, _intent = self.orphan_recovery_documents()
         canonical = self.orphan_recovery_binding(
@@ -5230,7 +5273,7 @@ class BureauPickupTests(unittest.TestCase):
             mock.patch.object(
                 pickup,
                 "_existing_assignment_repair_authority",
-                return_value=({}, {}, canonical),
+                return_value=({}, {}, canonical, None),
             ),
             mock.patch.object(
                 pickup.operator,
@@ -5296,8 +5339,8 @@ class BureauPickupTests(unittest.TestCase):
                 mock.patch.object(pickup.resources, "_now", return_value=221),
                 mock.patch.object(
                     pickup,
-                    "_existing_assignment_repair_revision_binding",
-                    return_value=canonical,
+                    "_existing_assignment_repair_revision_authority",
+                    return_value=(canonical, None),
                 ) as select_binding,
                 mock.patch.object(
                     pickup, "_current_registry_revision_proof", return_value={}
@@ -5312,7 +5355,11 @@ class BureauPickupTests(unittest.TestCase):
                 ) as authorize,
             ):
                 self.assertIsNone(pickup.resources.inspect_resource(key))
-                repaired, effective_binding = pickup._repair_existing_assignment_lease_binding(
+                (
+                    repaired,
+                    effective_binding,
+                    successor_proof_obligation,
+                ) = pickup._repair_existing_assignment_lease_binding(
                     blocking,
                     intent,
                     request,
@@ -5323,6 +5370,7 @@ class BureauPickupTests(unittest.TestCase):
                 )
         self.assertTrue(repaired)
         self.assertEqual(canonical, effective_binding)
+        self.assertIsNone(successor_proof_obligation)
         select_binding.assert_called_once_with(self.default_registry_binding)
         authorize.assert_called_once_with(
             "bureau_mutation", path=canonical["identity"]["registry_root"]
@@ -5339,6 +5387,633 @@ class BureauPickupTests(unittest.TestCase):
             heartbeat_args[1]["coordination_root"],
         )
         self.assertEqual(request_before, request)
+
+    def test_existing_assignment_repair_persists_successor_proof_before_resource_effect(self) -> None:
+        request = pickup._normalize_request(self.request())
+        task, initiative, _unused_intent = self.orphan_recovery_documents()
+        canonical = self.orphan_recovery_binding(
+            self.root / "durable-proof-runtime-snapshot",
+            "2" * 40,
+            task,
+            initiative,
+        )
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        purpose = f"Bureau coordinated pickup {intent['run_id']} group other"
+        group = pickup._acquisition_groups(intent, request)[0]
+        external = {
+            "external_unbound": True,
+            "external_system": None,
+            "external_id": None,
+            "external_state": None,
+            "external_observed_at": None,
+        }
+        successor_proof = {
+            "legacy_registry_root": self.default_registry_binding["identity"][
+                "registry_root"
+            ],
+            "legacy_registry_binding_sha256": self.default_registry_binding[
+                "identity"
+            ]["binding_sha256"],
+            "canonical_registry_root": canonical["identity"]["registry_root"],
+            "canonical_registry_binding_sha256": canonical["identity"][
+                "binding_sha256"
+            ],
+            "canonical_registry_binding_identity": dict(canonical["identity"]),
+            "canonical_source_commit": "2" * 40,
+            "control_head": "3" * 40,
+            "control_branch": "ops/bureau-control-main",
+            "control_upstream": "origin/main",
+            "ancestor_proven": True,
+        }
+        resource_db = self.root / "resources-successor-proof.sqlite3"
+        with mock.patch.object(pickup.resources, "RESOURCE_DB", resource_db):
+            with mock.patch.object(pickup.resources, "_now", return_value=100):
+                original = pickup.resources.acquire_resources(
+                    intent["lease_owner_id"],
+                    [key],
+                    purpose=purpose,
+                    ttl_seconds=120,
+                    metadata=group["metadata"],
+                    nonconflict_proof=None,
+                )["leases"][0]
+            run_dir, acquisition = self.create_acquisition_journal(intent, original)
+            self.write_registry_bound_request(run_dir, request)
+            journal_identity = pickup._journal_run_identity(run_dir, intent)
+            blocking = self.bound_coordinated_status(intent, blocking=True)
+            blocking["lease"] = {
+                "status": "active-binding-drift",
+                "error": {
+                    "code": "lease-expired",
+                    "details": {
+                        "resource_key": key,
+                        "expires_at_unix": original["expires_at_unix"],
+                    },
+                },
+            }
+            real_rebind = pickup.resources.rebind_same_owner_resources
+            observed_authority = []
+
+            def rebind_after_authority(*args, **kwargs):
+                intent_path = pickup._lease_repair_successor_proof_intent_path(
+                    run_dir, intent
+                )
+                self.assertTrue(intent_path.exists())
+                authority = json.loads(intent_path.read_text(encoding="utf-8"))
+                content_paths = [
+                    path
+                    for path in run_dir.glob(
+                        "lease-repair-registry-successor-proof-*.json"
+                    )
+                    if path != intent_path
+                ]
+                self.assertEqual(1, len(content_paths))
+                self.assertEqual(
+                    authority,
+                    json.loads(content_paths[0].read_text(encoding="utf-8")),
+                )
+                self.assertEqual(successor_proof, authority["successor_proof"])
+                self.assertEqual(
+                    pickup._sha256(successor_proof),
+                    authority["successor_proof_sha256"],
+                )
+                observed_authority.append(authority)
+                return real_rebind(*args, **kwargs)
+
+            with (
+                mock.patch.object(pickup.resources, "_now", return_value=221),
+                mock.patch.object(
+                    pickup.bureau_leases,
+                    "BUREAU_CONTROL_ROOT",
+                    Path(successor_proof["legacy_registry_root"]),
+                ),
+                mock.patch.object(
+                    pickup,
+                    "_existing_assignment_repair_authority",
+                    return_value=(
+                        journal_identity,
+                        external,
+                        canonical,
+                        successor_proof,
+                    ),
+                ),
+                mock.patch.object(
+                    pickup.resources,
+                    "rebind_same_owner_resources",
+                    side_effect=rebind_after_authority,
+                ) as rebind,
+                mock.patch.object(
+                    pickup,
+                    "_heartbeat_lease_repair",
+                    side_effect=self.lease_repair_heartbeat_readback,
+                ),
+            ):
+                self.assertIsNone(pickup.resources.inspect_resource(key))
+                (
+                    repaired,
+                    effective_binding,
+                    proof_obligation,
+                ) = pickup._repair_existing_assignment_lease_binding(
+                    blocking,
+                    intent,
+                    request,
+                    acquisition,
+                    run_dir,
+                    self.default_registry_binding,
+                    return_binding=True,
+                )
+                validated_repair = pickup._read_existing_assignment_lease_repair_obligation(
+                    run_dir, intent, request, acquisition
+                )
+        self.assertTrue(repaired)
+        self.assertEqual(canonical, effective_binding)
+        self.assertEqual(1, rebind.call_count)
+        self.assertEqual(1, len(observed_authority))
+        self.assertIsNotNone(proof_obligation)
+        self.assertEqual(successor_proof, proof_obligation["successor_proof"])
+        receipt = pickup._read_bound_json(
+            run_dir / "lease-reacquire.json", label="lease-reacquire"
+        )
+        self.assertEqual(
+            proof_obligation["receipt_sha256"],
+            receipt["registry_successor_proof_receipt_sha256"],
+        )
+        self.assertIsNotNone(validated_repair)
+        self.assertEqual(receipt["receipt_sha256"], validated_repair[0]["receipt_sha256"])
+
+    def test_existing_assignment_repair_replay_reports_historical_successor_proof_after_runtime_advance(self) -> None:
+        request = self.request()
+        normalized = pickup._normalize_request(request)
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        run_dir, acquisition = self.create_acquisition_journal(intent, lease)
+        self.write_registry_bound_request(run_dir, normalized)
+        pickup._write_bound_json(run_dir / "intent.json", intent)
+        journal_identity = pickup._journal_run_identity(run_dir, intent)
+        external = {
+            "external_unbound": True,
+            "external_system": None,
+            "external_id": None,
+            "external_state": None,
+            "external_observed_at": None,
+        }
+        task, initiative, _unused_intent = self.orphan_recovery_documents()
+        historical_binding = self.orphan_recovery_binding(
+            self.root / "historical-successor-snapshot",
+            "2" * 40,
+            task,
+            initiative,
+        )
+        current_binding = self.orphan_recovery_binding(
+            self.root / "advanced-runtime-snapshot",
+            "4" * 40,
+            task,
+            initiative,
+        )
+        successor_proof = {
+            "legacy_registry_root": self.default_registry_binding["identity"][
+                "registry_root"
+            ],
+            "legacy_registry_binding_sha256": self.default_registry_binding[
+                "identity"
+            ]["binding_sha256"],
+            "canonical_registry_root": historical_binding["identity"][
+                "registry_root"
+            ],
+            "canonical_registry_binding_sha256": historical_binding["identity"][
+                "binding_sha256"
+            ],
+            "canonical_registry_binding_identity": dict(
+                historical_binding["identity"]
+            ),
+            "canonical_source_commit": "2" * 40,
+            "control_head": "3" * 40,
+            "control_branch": "ops/bureau-control-main",
+            "control_upstream": "origin/main",
+            "ancestor_proven": True,
+        }
+        with mock.patch.object(
+            pickup.bureau_leases,
+            "BUREAU_CONTROL_ROOT",
+            Path(successor_proof["legacy_registry_root"]),
+        ):
+            proof_obligation = (
+                pickup._persist_lease_repair_successor_proof_obligation(
+                    run_dir, intent, journal_identity, successor_proof
+                )
+            )
+        receipt = {
+            "receipt_sha256": "a" * 64,
+            "registry_successor_proof_receipt_sha256": proof_obligation[
+                "receipt_sha256"
+            ],
+        }
+        existing = {
+            "status": "existing-assignment",
+            "run": {"run_id": intent["run_id"], "state": "assigned"},
+            "envelope": {"claim_intent": intent},
+        }
+        coordinated = self.coordinated_status(intent)
+        with (
+            mock.patch.object(
+                pickup.bureau_leases,
+                "BUREAU_CONTROL_ROOT",
+                Path(successor_proof["legacy_registry_root"]),
+            ),
+            mock.patch.object(
+                pickup, "_recover_orphaned_journal_before_claim", return_value=None
+            ),
+            mock.patch.object(pickup.bureau, "_invoke_bureau", return_value=existing),
+            mock.patch.object(
+                pickup,
+                "_read_existing_assignment_lease_repair_obligation",
+                return_value=(receipt, journal_identity, external),
+            ),
+            mock.patch.object(
+                pickup, "_canonical_registry_binding", return_value=current_binding
+            ),
+            mock.patch.object(
+                pickup,
+                "_existing_assignment_repair_revision_binding",
+                side_effect=AssertionError(
+                    "historical control-root successor proof must not be recomputed"
+                ),
+            ) as legacy_reproof,
+            mock.patch.object(
+                pickup, "_current_registry_revision_proof", return_value={}
+            ) as revision_proof,
+            mock.patch.object(
+                pickup,
+                "_read_lease_repair_activity_status",
+                return_value=coordinated,
+            ) as read_status,
+            mock.patch.object(
+                pickup,
+                "_validate_lease_repair_activity_status",
+                return_value=coordinated,
+            ),
+        ):
+            result = pickup.grabowski_bureau_pickup_execute(request)
+        legacy_reproof.assert_not_called()
+        revision_proof.assert_called_once_with(
+            current_binding,
+            intent,
+            coordination_root=normalized["coordination_root"],
+        )
+        read_status.assert_called_once()
+        self.assertEqual(current_binding, read_status.call_args.args[2])
+        self.assertNotEqual(
+            historical_binding["identity"]["binding_sha256"],
+            current_binding["identity"]["binding_sha256"],
+        )
+        self.assertEqual(
+            historical_binding["identity"]["binding_sha256"],
+            result["registry_binding_sha256"],
+        )
+        self.assertEqual(
+            "canonical-registry-binding", result["registry_binding_kind"]
+        )
+        self.assertEqual(
+            "existing-assignment-repair-canonical-successor",
+            result["registry_binding_source"],
+        )
+        self.assertEqual(successor_proof, result["registry_successor_proof"])
+        self.assertEqual(
+            pickup._sha256(successor_proof),
+            result["registry_successor_proof_sha256"],
+        )
+        self.assertEqual(
+            proof_obligation["receipt_sha256"],
+            result["registry_successor_proof_receipt_sha256"],
+        )
+        self.assertEqual(
+            acquisition["acquisition_sha256"], result["acquisition_sha256"]
+        )
+
+    def test_existing_assignment_retry_recovers_pre_effect_successor_proof_without_repair_receipt(self) -> None:
+        request = self.request()
+        normalized = pickup._normalize_request(request)
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        run_dir, acquisition = self.create_acquisition_journal(intent, lease)
+        self.write_registry_bound_request(run_dir, normalized)
+        pickup._write_bound_json(run_dir / "intent.json", intent)
+        journal_identity = pickup._journal_run_identity(run_dir, intent)
+        task, initiative, _unused_intent = self.orphan_recovery_documents()
+        historical_binding = self.orphan_recovery_binding(
+            self.root / "interrupted-historical-successor-snapshot",
+            "2" * 40,
+            task,
+            initiative,
+        )
+        current_binding = self.orphan_recovery_binding(
+            self.root / "interrupted-advanced-runtime-snapshot",
+            "4" * 40,
+            task,
+            initiative,
+        )
+        successor_proof = {
+            "legacy_registry_root": self.default_registry_binding["identity"][
+                "registry_root"
+            ],
+            "legacy_registry_binding_sha256": self.default_registry_binding[
+                "identity"
+            ]["binding_sha256"],
+            "canonical_registry_root": historical_binding["identity"][
+                "registry_root"
+            ],
+            "canonical_registry_binding_sha256": historical_binding["identity"][
+                "binding_sha256"
+            ],
+            "canonical_registry_binding_identity": dict(
+                historical_binding["identity"]
+            ),
+            "canonical_source_commit": "2" * 40,
+            "control_head": "3" * 40,
+            "control_branch": "ops/bureau-control-main",
+            "control_upstream": "origin/main",
+            "ancestor_proven": True,
+        }
+        with mock.patch.object(
+            pickup.bureau_leases,
+            "BUREAU_CONTROL_ROOT",
+            Path(successor_proof["legacy_registry_root"]),
+        ):
+            proof_obligation = (
+                pickup._persist_lease_repair_successor_proof_obligation(
+                    run_dir, intent, journal_identity, successor_proof
+                )
+            )
+            self.assertIsNone(
+                pickup._read_existing_assignment_lease_repair_obligation(
+                    run_dir, intent, normalized, acquisition
+                )
+            )
+        existing = {
+            "status": "existing-assignment",
+            "run": {"run_id": intent["run_id"], "state": "assigned"},
+            "envelope": {"claim_intent": intent},
+        }
+        coordinated = self.coordinated_status(intent)
+        with (
+            mock.patch.object(
+                pickup.bureau_leases,
+                "BUREAU_CONTROL_ROOT",
+                Path(successor_proof["legacy_registry_root"]),
+            ),
+            mock.patch.object(
+                pickup, "_recover_orphaned_journal_before_claim", return_value=None
+            ),
+            mock.patch.object(pickup.bureau, "_invoke_bureau", return_value=existing),
+            mock.patch.object(
+                pickup, "_canonical_registry_binding", return_value=current_binding
+            ) as current_runtime,
+            mock.patch.object(
+                pickup, "_coordination_status", return_value=coordinated
+            ) as read_status,
+            mock.patch.object(
+                pickup,
+                "_existing_assignment_repair_revision_binding",
+                side_effect=AssertionError(
+                    "interrupted repair must recover the historical successor proof"
+                ),
+            ) as legacy_reproof,
+        ):
+            result = pickup.grabowski_bureau_pickup_execute(request)
+        current_runtime.assert_called_once()
+        read_status.assert_called_once()
+        legacy_reproof.assert_not_called()
+        self.assertNotEqual(
+            historical_binding["identity"]["binding_sha256"],
+            current_binding["identity"]["binding_sha256"],
+        )
+        self.assertEqual(
+            historical_binding["identity"]["binding_sha256"],
+            result["registry_binding_sha256"],
+        )
+        self.assertEqual(
+            "existing-assignment-repair-canonical-successor",
+            result["registry_binding_source"],
+        )
+        self.assertEqual(successor_proof, result["registry_successor_proof"])
+        self.assertEqual(
+            proof_obligation["receipt_sha256"],
+            result["registry_successor_proof_receipt_sha256"],
+        )
+
+    def test_existing_assignment_partial_multigroup_retry_reuses_recovered_successor_authority(self) -> None:
+        repo_key = "repo:/tmp/recovered-partial-repository"
+        path_key = "path:/tmp/recovered-partial-path"
+        intent = self.intent(sorted([repo_key, path_key]))
+        scope = {
+            "schema_version": 1,
+            "repository": "/tmp/recovered-partial-repository",
+            "task_id": intent["task_id"],
+            "base_head": "a" * 40,
+            "head": "a" * 40,
+            "branch": "test-recovered-partial",
+            "worktree": "/tmp/recovered-partial-repository",
+            "effects": ["read"],
+            "paths": [],
+            "components": [],
+            "runtime_resources": [],
+            "processes": [],
+            "deployments": [],
+            "migrations": [],
+            "generated_artifacts": [],
+            "shared_gates": [],
+        }
+        request = pickup._normalize_request(
+            self.request(
+                create_workspace=False,
+                repository_scope_manifests={repo_key: scope},
+            )
+        )
+        groups = pickup._acquisition_groups(intent, request)
+        self.assertEqual(2, len(groups))
+        originals = []
+        for group in groups:
+            _metadata_json, metadata_sha256 = pickup.resources._metadata(
+                group["metadata"]
+            )
+            purpose = (
+                f"Bureau coordinated pickup {intent['run_id']} group {group['name']}"
+            )
+            for key in group["resource_keys"]:
+                original = self.lease(
+                    key, intent["lease_owner_id"], metadata_sha256
+                )
+                original["purpose"] = purpose
+                originals.append(original)
+        acquisition = {
+            "schema_version": 1,
+            "owner_id": intent["lease_owner_id"],
+            "task_id": intent["task_id"],
+            "run_id": intent["run_id"],
+            "claim_intent_sha256": intent["intent_sha256"],
+            "resource_keys": intent["required_resource_keys"],
+            "leases": originals,
+            "groups": [],
+        }
+        acquisition["acquisition_sha256"] = pickup._sha256(acquisition)
+        run_dir = pickup._run_directory(intent["run_id"])
+        self.write_commit_result_journal(intent, run_dir)
+        self.write_registry_bound_request(run_dir, request)
+        journal_identity = pickup._journal_run_identity(run_dir, intent)
+        task, initiative, _unused_intent = self.orphan_recovery_documents()
+        historical_binding = self.orphan_recovery_binding(
+            self.root / "partial-repair-historical-successor-snapshot",
+            "2" * 40,
+            task,
+            initiative,
+        )
+        advanced_binding = self.orphan_recovery_binding(
+            self.root / "partial-repair-advanced-runtime-snapshot",
+            "4" * 40,
+            task,
+            initiative,
+        )
+        successor_proof = {
+            "legacy_registry_root": self.default_registry_binding["identity"][
+                "registry_root"
+            ],
+            "legacy_registry_binding_sha256": self.default_registry_binding[
+                "identity"
+            ]["binding_sha256"],
+            "canonical_registry_root": historical_binding["identity"][
+                "registry_root"
+            ],
+            "canonical_registry_binding_sha256": historical_binding["identity"][
+                "binding_sha256"
+            ],
+            "canonical_registry_binding_identity": dict(
+                historical_binding["identity"]
+            ),
+            "canonical_source_commit": "2" * 40,
+            "control_head": "3" * 40,
+            "control_branch": "ops/bureau-control-main",
+            "control_upstream": "origin/main",
+            "ancestor_proven": True,
+        }
+        blocking = self.bound_coordinated_status(intent, blocking=True)
+        blocking["lease"] = {
+            "status": "active-binding-drift",
+            "error": {
+                "code": "lease-resources-missing",
+                "details": {"missing": [groups[1]["resource_keys"][0]]},
+            },
+        }
+        resource_db = self.root / "resources-partial-successor-retry.sqlite3"
+        with mock.patch.object(pickup.resources, "RESOURCE_DB", resource_db):
+            first_group = groups[0]
+            first_key = first_group["resource_keys"][0]
+            first_purpose = (
+                f"Bureau coordinated pickup {intent['run_id']} group {first_group['name']}"
+            )
+            with mock.patch.object(pickup.resources, "_now", return_value=200):
+                first_live = pickup.resources.acquire_resources(
+                    intent["lease_owner_id"],
+                    [first_key],
+                    purpose=first_purpose,
+                    ttl_seconds=first_group["ttl_seconds"],
+                    metadata=first_group["metadata"],
+                    nonconflict_proof=first_group["nonconflict_proof"],
+                )["leases"][0]
+            with mock.patch.object(
+                pickup.bureau_leases,
+                "BUREAU_CONTROL_ROOT",
+                Path(successor_proof["legacy_registry_root"]),
+            ):
+                proof_obligation = (
+                    pickup._persist_lease_repair_successor_proof_obligation(
+                        run_dir, intent, journal_identity, successor_proof
+                    )
+                )
+            current_control = {
+                "status": "current",
+                "control_root": successor_proof["legacy_registry_root"],
+                "branch": successor_proof["control_branch"],
+                "upstream": successor_proof["control_upstream"],
+                "head": "5" * 40,
+            }
+            with (
+                mock.patch.object(pickup.resources, "_now", return_value=250),
+                mock.patch.object(
+                    pickup.bureau_leases,
+                    "BUREAU_CONTROL_ROOT",
+                    Path(successor_proof["legacy_registry_root"]),
+                ),
+                mock.patch.object(
+                    pickup.bureau_leases,
+                    "inspect_bureau_control_checkout",
+                    return_value=current_control,
+                ),
+                mock.patch.object(
+                    pickup.bureau, "_git_identity_lines", return_value=[]
+                ) as ancestry,
+                mock.patch.object(
+                    pickup, "_current_registry_revision_proof", return_value={}
+                ),
+                mock.patch.object(
+                    pickup, "_canonical_registry_binding", return_value=advanced_binding
+                ) as current_runtime,
+                mock.patch.object(
+                    pickup,
+                    "_persist_lease_repair_successor_proof_obligation",
+                    side_effect=AssertionError(
+                        "recovered proof must be reused instead of rewritten"
+                    ),
+                ) as repersist,
+                mock.patch.object(
+                    pickup,
+                    "_heartbeat_lease_repair",
+                    side_effect=self.lease_repair_heartbeat_readback,
+                ),
+                mock.patch.object(
+                    pickup.operator, "_require_operator_mutation", return_value=None
+                ),
+            ):
+                (
+                    repaired,
+                    effective_binding,
+                    returned_proof_obligation,
+                ) = pickup._repair_existing_assignment_lease_binding(
+                    blocking,
+                    intent,
+                    request,
+                    acquisition,
+                    run_dir,
+                    self.default_registry_binding,
+                    return_binding=True,
+                    recovered_successor_proof_obligation=proof_obligation,
+                )
+                second_key = groups[1]["resource_keys"][0]
+                second_live = pickup.resources.inspect_resource(second_key)
+                first_after = pickup.resources.inspect_resource(first_key)
+        self.assertTrue(repaired)
+        self.assertEqual(historical_binding, effective_binding)
+        self.assertEqual(proof_obligation, returned_proof_obligation)
+        self.assertIsNotNone(second_live)
+        self.assertEqual(intent["lease_owner_id"], second_live["owner_id"])
+        self.assertEqual(first_live, first_after)
+        current_runtime.assert_not_called()
+        repersist.assert_not_called()
+        ancestry.assert_called_once()
+        ancestry_args = ancestry.call_args.args
+        self.assertEqual("merge-base", ancestry_args[1])
+        self.assertEqual("--is-ancestor", ancestry_args[2])
+        self.assertEqual("2" * 40, ancestry_args[3])
+        self.assertEqual("5" * 40, ancestry_args[4])
+        receipt = pickup._read_bound_json(
+            run_dir / "lease-reacquire.json", label="lease-reacquire"
+        )
+        self.assertEqual(
+            proof_obligation["receipt_sha256"],
+            receipt["registry_successor_proof_receipt_sha256"],
+        )
+        self.assertEqual([second_key], receipt["resource_keys"])
 
     def test_existing_assignment_repair_obligation_replay_uses_proven_binding(self) -> None:
         request = self.request()

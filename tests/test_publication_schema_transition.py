@@ -293,6 +293,8 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
         names_sha256: str = NAMES_SHA256,
         schema_by_tool: dict[str, str] = GREEN_SCHEMA_BY_TOOL,
         complete_schema_sha256: str = GREEN_COMPLETE_SCHEMA,
+        agent_instructions_sha256: str = INSTRUCTIONS_SHA256,
+        deployment_source_identity_sha256: str | None = None,
         now_unix: int = 5_000,
     ) -> dict[str, object]:
         return {
@@ -306,16 +308,183 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
             "publication_request_id": request_id,
             "registered_tool_count": tool_count,
             "registered_names_sha256": names_sha256,
-            "agent_instructions_sha256": INSTRUCTIONS_SHA256,
+            "agent_instructions_sha256": agent_instructions_sha256,
             "green_readiness": _green_readiness(
                 schema_by_tool=schema_by_tool,
                 complete_schema_sha256=complete_schema_sha256,
                 tool_count=tool_count,
                 names_sha256=names_sha256,
+                agent_instructions_sha256=agent_instructions_sha256,
             ),
+            "deployment_source_identity_sha256": deployment_source_identity_sha256,
             "path": self.snapshot_path,
             "now_unix": now_unix,
         }
+
+    def _normal_target_successor(
+        self,
+        *,
+        now_unix: int,
+        tool_count: int = TOOL_COUNT,
+        names_sha256: str = NAMES_SHA256,
+        schema_by_tool: dict[str, str] = BLUE_SCHEMA_BY_TOOL,
+        complete_schema_sha256: str = BLUE_COMPLETE_SCHEMA,
+        agent_instructions_sha256: str = INSTRUCTIONS_SHA256,
+    ) -> dict[str, object]:
+        declaration = {
+            "client_id": "external-client",
+            "session_id": "successor-session",
+            "observation_scope": client_snapshot.OBSERVATION_SCOPE_EXTERNAL_CLIENT,
+            "observed_tool_count": tool_count,
+            "observed_names_sha256": names_sha256,
+            "observed_release_id": "green",
+            "observed_agent_instructions_sha256": agent_instructions_sha256,
+            "observed_tools_artifact_sha256": ARTIFACT_SHA256,
+            "observed_schema_coverage_count": tool_count,
+            "observed_schema_tools": sorted(schema_by_tool),
+            "observed_complete_schema_count": tool_count,
+            "observed_complete_schema_sha256": complete_schema_sha256,
+        }
+        artifact = {
+            "artifact_sha256": ARTIFACT_SHA256,
+            "schema_coverage_count": tool_count,
+            "schema_tools": sorted(schema_by_tool),
+            "schema_sha256_by_tool": dict(schema_by_tool),
+            "complete_schema_observable": True,
+            "complete_schema_count": tool_count,
+            "complete_schema_sha256": complete_schema_sha256,
+        }
+        receipt: dict[str, object] = {
+            "schema_version": client_snapshot.SNAPSHOT_SCHEMA_VERSION,
+            "kind": client_snapshot.SNAPSHOT_KIND,
+            "created_at_unix": now_unix,
+            "expires_at_unix": now_unix + client_snapshot.SNAPSHOT_TTL_SECONDS,
+            "client_declaration": declaration,
+            "client_declaration_sha256": client_snapshot._sha256_json(declaration),
+            "server_binding": {
+                "registered_tool_count": tool_count,
+                "registered_names_sha256": names_sha256,
+                "release_id": "green",
+                "repo_head": HEAD_GREEN,
+                "agent_instructions_sha256": agent_instructions_sha256,
+            },
+            "schema_evidence": {
+                "observed_artifact": artifact,
+                "server_artifact": dict(artifact),
+                "probe": {"matches": True, "schema_contract_matches": True},
+            },
+            "cutover_binding": None,
+            "verified": True,
+            "mismatches": [],
+            "verification_model": "external-target-successor-test",
+            "does_not_establish": [],
+        }
+        receipt["receipt_sha256"] = client_snapshot._sha256_json(receipt)
+        client_snapshot._write_private_json(self.snapshot_path, receipt)
+        return receipt
+
+    def test_rebind_write_failure_never_surfaces_durable_lineage(self) -> None:
+        prepared = self._prepare_publication(
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA
+        )
+        original_write = client_snapshot._write_private_json
+
+        def fail_snapshot_write(path: Path, payload: dict[str, object]) -> None:
+            if path == self.snapshot_path:
+                raise OSError("simulated snapshot write failure")
+            original_write(path, payload)
+
+        with mock.patch.object(
+            client_snapshot,
+            "_write_private_json",
+            side_effect=fail_snapshot_write,
+        ):
+            with self.assertRaisesRegex(OSError, "snapshot write failure"):
+                self._rebind(
+                    schema_by_tool=BLUE_SCHEMA_BY_TOOL,
+                    complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+                    source_evidence_time=self.now_unix,
+                    publication_request_id=prepared["request_id"],
+                    now_unix=5_000,
+                )
+        self._assert_snapshot_untouched()
+
+    def test_rebind_surfaces_durable_lineage_when_write_fails_after_publish(self) -> None:
+        prepared = self._prepare_publication(
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA
+        )
+        original_write = client_snapshot._write_private_json
+
+        def publish_then_fail(path: Path, payload: dict[str, object]) -> None:
+            original_write(path, payload)
+            if path == self.snapshot_path:
+                raise OSError("simulated post-publish snapshot write failure")
+
+        with mock.patch.object(
+            client_snapshot,
+            "_write_private_json",
+            side_effect=publish_then_fail,
+        ):
+            with self.assertRaisesRegex(
+                client_snapshot.SnapshotRebindReadbackError,
+                "write outcome is unknown",
+            ) as caught:
+                self._rebind(
+                    schema_by_tool=BLUE_SCHEMA_BY_TOOL,
+                    complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+                    source_evidence_time=self.now_unix,
+                    publication_request_id=prepared["request_id"],
+                    now_unix=5_000,
+                )
+        durable = caught.exception.durable_rebind
+        written = json.loads(self.snapshot_path.read_text(encoding="utf-8"))
+        self.assertTrue(durable["cutover_rebind"])
+        self.assertEqual(durable["receipt_sha256"], written["receipt_sha256"])
+        self.assertEqual(
+            durable["source_snapshot_receipt_sha256"], self.source["receipt_sha256"]
+        )
+        self.assertEqual(durable["target_repo_head"], HEAD_GREEN)
+
+    def test_rebind_surfaces_durable_lineage_when_post_write_readback_fails(self) -> None:
+        prepared = self._prepare_publication(
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA
+        )
+        original_read = client_snapshot._read_private_json
+        snapshot_reads = 0
+
+        def fail_second_snapshot_read(path: Path):
+            nonlocal snapshot_reads
+            if path == self.snapshot_path:
+                snapshot_reads += 1
+                if snapshot_reads == 2:
+                    raise OSError("simulated post-write snapshot readback failure")
+            return original_read(path)
+
+        with mock.patch.object(
+            client_snapshot,
+            "_read_private_json",
+            side_effect=fail_second_snapshot_read,
+        ):
+            with self.assertRaisesRegex(
+                client_snapshot.SnapshotRebindReadbackError,
+                "post-write readback failed",
+            ) as caught:
+                self._rebind(
+                    schema_by_tool=BLUE_SCHEMA_BY_TOOL,
+                    complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+                    source_evidence_time=self.now_unix,
+                    publication_request_id=prepared["request_id"],
+                    now_unix=5_000,
+                )
+        durable = caught.exception.durable_rebind
+        written = json.loads(self.snapshot_path.read_text(encoding="utf-8"))
+        self.assertEqual(snapshot_reads, 2)
+        self.assertTrue(durable["cutover_rebind"])
+        self.assertEqual(durable["receipt_sha256"], written["receipt_sha256"])
+        self.assertEqual(
+            durable["source_snapshot_receipt_sha256"], self.source["receipt_sha256"]
+        )
+        self.assertEqual(durable["target_repo_head"], HEAD_GREEN)
 
     # ---- 1: unchanged schema keeps working -------------------------------
 
@@ -845,6 +1014,355 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
         client_snapshot._write_private_json(self.snapshot_path, tampered)
         foreign = client_snapshot.inspect_cutover_snapshot_binding(**parameters)
         self.assertEqual(foreign["state"], client_snapshot.SNAPSHOT_BINDING_FOREIGN)
+
+    def test_fresh_normal_target_snapshot_continues_exact_unchanged_rebind(self) -> None:
+        prepared = self._prepare_publication(
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA
+        )
+        historical = self._rebind(
+            schema_by_tool=BLUE_SCHEMA_BY_TOOL,
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+            source_evidence_time=self.now_unix,
+            publication_request_id=prepared["request_id"],
+            now_unix=5_000,
+        )
+        successor = self._normal_target_successor(now_unix=5_001)
+        parameters = self._inspection_parameters(
+            prepared["request_id"],
+            schema_by_tool=BLUE_SCHEMA_BY_TOOL,
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+            now_unix=5_001,
+        )
+        observed = client_snapshot.inspect_cutover_snapshot_binding(
+            **parameters,
+            durable_rebind=historical,
+        )
+        self.assertEqual(observed["state"], client_snapshot.SNAPSHOT_BINDING_REBOUND)
+        self.assertTrue(observed["successor_refresh_after_cutover_rebind"])
+        self.assertEqual(
+            observed["historical_rebind_receipt_sha256"],
+            historical["receipt_sha256"],
+        )
+        self.assertEqual(
+            observed["classified_snapshot_receipt_sha256"],
+            successor["receipt_sha256"],
+        )
+        self.assertEqual(
+            observed["source_snapshot_receipt_sha256"],
+            historical["source_snapshot_receipt_sha256"],
+        )
+
+    def test_fresh_successor_continues_authorized_schema_change_rebind(self) -> None:
+        prepared = self._prepare_publication()
+        historical = self._rebind(
+            source_evidence_time=self.now_unix,
+            publication_request_id=prepared["request_id"],
+            now_unix=5_000,
+        )
+        successor = self._normal_target_successor(
+            now_unix=5_001,
+            schema_by_tool=GREEN_SCHEMA_BY_TOOL,
+            complete_schema_sha256=GREEN_COMPLETE_SCHEMA,
+        )
+        observed = client_snapshot.inspect_cutover_snapshot_binding(
+            **self._inspection_parameters(
+                prepared["request_id"],
+                schema_by_tool=GREEN_SCHEMA_BY_TOOL,
+                complete_schema_sha256=GREEN_COMPLETE_SCHEMA,
+                now_unix=5_001,
+            ),
+            durable_rebind=historical,
+        )
+        transition = historical["publication_schema_transition"]
+        assert isinstance(transition, dict)
+        self.assertEqual(observed["state"], client_snapshot.SNAPSHOT_BINDING_REBOUND)
+        self.assertTrue(observed["schema_changed"])
+        self.assertTrue(observed["surface_changed"])
+        self.assertFalse(observed["instructions_changed"])
+        self.assertTrue(observed["current_publication_authorized"])
+        self.assertEqual(
+            observed["publication_transition_sha256"], transition["transition_sha256"]
+        )
+        self.assertEqual(
+            observed["classified_snapshot_receipt_sha256"], successor["receipt_sha256"]
+        )
+
+    def test_fresh_successor_continues_authorized_toolset_change_rebind(self) -> None:
+        target_count = TOOL_COUNT + 2
+        prepared = self._prepare_publication(
+            tool_count=target_count,
+            names_sha256=GREEN_NAMES_SHA256,
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+        )
+        historical = self._rebind(
+            schema_by_tool=BLUE_SCHEMA_BY_TOOL,
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+            tool_count=target_count,
+            names_sha256=GREEN_NAMES_SHA256,
+            source_evidence_time=self.now_unix,
+            publication_request_id=prepared["request_id"],
+            now_unix=5_000,
+        )
+        self._normal_target_successor(
+            now_unix=5_001,
+            tool_count=target_count,
+            names_sha256=GREEN_NAMES_SHA256,
+            schema_by_tool=BLUE_SCHEMA_BY_TOOL,
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+        )
+        observed = client_snapshot.inspect_cutover_snapshot_binding(
+            **self._inspection_parameters(
+                prepared["request_id"],
+                tool_count=target_count,
+                names_sha256=GREEN_NAMES_SHA256,
+                schema_by_tool=BLUE_SCHEMA_BY_TOOL,
+                complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+                now_unix=5_001,
+            ),
+            durable_rebind=historical,
+        )
+        self.assertEqual(observed["state"], client_snapshot.SNAPSHOT_BINDING_REBOUND)
+        self.assertFalse(observed["schema_changed"])
+        self.assertTrue(observed["surface_changed"])
+        self.assertTrue(observed["current_publication_authorized"])
+        self.assertRegex(
+            str(observed["publication_transition_sha256"]), r"^[0-9a-f]{64}$"
+        )
+
+    def test_fresh_successor_continues_instruction_only_rebind(self) -> None:
+        prepared = self._prepare_publication(
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA
+        )
+        historical = self._rebind(
+            schema_by_tool=BLUE_SCHEMA_BY_TOOL,
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+            agent_instructions_sha256=GREEN_INSTRUCTIONS_SHA256,
+            deployment_source_identity_sha256=SOURCE_IDENTITY_SHA256,
+            source_evidence_time=self.now_unix,
+            publication_request_id=prepared["request_id"],
+            now_unix=5_000,
+        )
+        self._normal_target_successor(
+            now_unix=5_001,
+            schema_by_tool=BLUE_SCHEMA_BY_TOOL,
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+            agent_instructions_sha256=GREEN_INSTRUCTIONS_SHA256,
+        )
+        observed = client_snapshot.inspect_cutover_snapshot_binding(
+            **self._inspection_parameters(
+                prepared["request_id"],
+                schema_by_tool=BLUE_SCHEMA_BY_TOOL,
+                complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+                agent_instructions_sha256=GREEN_INSTRUCTIONS_SHA256,
+                deployment_source_identity_sha256=SOURCE_IDENTITY_SHA256,
+                now_unix=5_001,
+            ),
+            durable_rebind=historical,
+        )
+        transition = historical["agent_instructions_transition"]
+        assert isinstance(transition, dict)
+        self.assertEqual(observed["state"], client_snapshot.SNAPSHOT_BINDING_REBOUND)
+        self.assertFalse(observed["surface_changed"])
+        self.assertTrue(observed["instructions_changed"])
+        self.assertEqual(
+            observed["agent_instructions_transition_sha256"],
+            transition["transition_sha256"],
+        )
+
+    def test_changed_successor_requires_bound_publication_transition(self) -> None:
+        prepared = self._prepare_publication()
+        historical = self._rebind(
+            source_evidence_time=self.now_unix,
+            publication_request_id=prepared["request_id"],
+            now_unix=5_000,
+        )
+        self._normal_target_successor(
+            now_unix=5_001,
+            schema_by_tool=GREEN_SCHEMA_BY_TOOL,
+            complete_schema_sha256=GREEN_COMPLETE_SCHEMA,
+        )
+        tampered = json.loads(json.dumps(historical))
+        tampered["cutover_transition"]["publication_schema_transition"] = None
+        observed = client_snapshot.inspect_cutover_snapshot_binding(
+            **self._inspection_parameters(
+                prepared["request_id"],
+                schema_by_tool=GREEN_SCHEMA_BY_TOOL,
+                complete_schema_sha256=GREEN_COMPLETE_SCHEMA,
+                now_unix=5_001,
+            ),
+            durable_rebind=tampered,
+        )
+        self.assertEqual(observed["state"], client_snapshot.SNAPSHOT_BINDING_UNREADABLE)
+        self.assertIn("lacks publication transition", str(observed["error"]))
+
+    def test_changed_successor_rejects_wrong_publication_request_binding(self) -> None:
+        prepared = self._prepare_publication()
+        historical = self._rebind(
+            source_evidence_time=self.now_unix,
+            publication_request_id=prepared["request_id"],
+            now_unix=5_000,
+        )
+        self._normal_target_successor(
+            now_unix=5_001,
+            schema_by_tool=GREEN_SCHEMA_BY_TOOL,
+            complete_schema_sha256=GREEN_COMPLETE_SCHEMA,
+        )
+        observed = client_snapshot.inspect_cutover_snapshot_binding(
+            **self._inspection_parameters(
+                "wrong-publication-request",
+                schema_by_tool=GREEN_SCHEMA_BY_TOOL,
+                complete_schema_sha256=GREEN_COMPLETE_SCHEMA,
+                now_unix=5_001,
+            ),
+            durable_rebind=historical,
+        )
+        self.assertEqual(observed["state"], client_snapshot.SNAPSHOT_BINDING_UNREADABLE)
+        self.assertIn("does not name the cutover activation request", str(observed["error"]))
+
+    def test_instruction_successor_rejects_wrong_deployment_source_identity(self) -> None:
+        prepared = self._prepare_publication(
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA
+        )
+        historical = self._rebind(
+            schema_by_tool=BLUE_SCHEMA_BY_TOOL,
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+            agent_instructions_sha256=GREEN_INSTRUCTIONS_SHA256,
+            deployment_source_identity_sha256=SOURCE_IDENTITY_SHA256,
+            source_evidence_time=self.now_unix,
+            publication_request_id=prepared["request_id"],
+            now_unix=5_000,
+        )
+        self._normal_target_successor(
+            now_unix=5_001,
+            schema_by_tool=BLUE_SCHEMA_BY_TOOL,
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+            agent_instructions_sha256=GREEN_INSTRUCTIONS_SHA256,
+        )
+        observed = client_snapshot.inspect_cutover_snapshot_binding(
+            **self._inspection_parameters(
+                prepared["request_id"],
+                schema_by_tool=BLUE_SCHEMA_BY_TOOL,
+                complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+                agent_instructions_sha256=GREEN_INSTRUCTIONS_SHA256,
+                deployment_source_identity_sha256="ef" * 32,
+                now_unix=5_001,
+            ),
+            durable_rebind=historical,
+        )
+        self.assertEqual(observed["state"], client_snapshot.SNAPSHOT_BINDING_UNREADABLE)
+        self.assertIn("agent instructions transition", str(observed["error"]))
+
+    def test_changed_successor_rejects_non_green_schema_evidence(self) -> None:
+        prepared = self._prepare_publication()
+        historical = self._rebind(
+            source_evidence_time=self.now_unix,
+            publication_request_id=prepared["request_id"],
+            now_unix=5_000,
+        )
+        self._normal_target_successor(
+            now_unix=5_001,
+            schema_by_tool=BLUE_SCHEMA_BY_TOOL,
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+        )
+        observed = client_snapshot.inspect_cutover_snapshot_binding(
+            **self._inspection_parameters(
+                prepared["request_id"],
+                schema_by_tool=GREEN_SCHEMA_BY_TOOL,
+                complete_schema_sha256=GREEN_COMPLETE_SCHEMA,
+                now_unix=5_001,
+            ),
+            durable_rebind=historical,
+        )
+        self.assertEqual(observed["state"], client_snapshot.SNAPSHOT_BINDING_UNREADABLE)
+        self.assertIn("schema does not match target", str(observed["error"]))
+
+    def test_schema_less_successor_cannot_continue_historical_rebind(self) -> None:
+        prepared = self._prepare_publication(
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA
+        )
+        historical = self._rebind(
+            schema_by_tool=BLUE_SCHEMA_BY_TOOL,
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+            source_evidence_time=self.now_unix,
+            publication_request_id=prepared["request_id"],
+            now_unix=5_000,
+        )
+        successor = self._normal_target_successor(now_unix=5_001)
+        successor.pop("schema_evidence")
+        successor.pop("receipt_sha256")
+        successor["receipt_sha256"] = client_snapshot._sha256_json(successor)
+        client_snapshot._write_private_json(self.snapshot_path, successor)
+        parameters = self._inspection_parameters(
+            prepared["request_id"],
+            schema_by_tool=BLUE_SCHEMA_BY_TOOL,
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+            now_unix=5_001,
+        )
+        observed = client_snapshot.inspect_cutover_snapshot_binding(
+            **parameters, durable_rebind=historical
+        )
+        self.assertEqual(
+            observed["state"], client_snapshot.SNAPSHOT_BINDING_UNREADABLE
+        )
+        self.assertIn("schema evidence", str(observed["error"]))
+
+    def test_successor_snapshot_refuses_changed_or_missing_historical_rebind(self) -> None:
+        prepared = self._prepare_publication(
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA
+        )
+        historical = self._rebind(
+            schema_by_tool=BLUE_SCHEMA_BY_TOOL,
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+            source_evidence_time=self.now_unix,
+            publication_request_id=prepared["request_id"],
+            now_unix=5_000,
+        )
+        self._normal_target_successor(now_unix=5_001)
+        parameters = self._inspection_parameters(
+            prepared["request_id"],
+            schema_by_tool=BLUE_SCHEMA_BY_TOOL,
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+            now_unix=5_001,
+        )
+        missing = client_snapshot.inspect_cutover_snapshot_binding(**parameters)
+        self.assertEqual(missing["state"], client_snapshot.SNAPSHOT_BINDING_FOREIGN)
+        self.assertIn("source declaration names another release", str(missing["error"]))
+
+        tampered = json.loads(json.dumps(historical))
+        tampered["cutover_transition"]["schema_changed"] = True
+        observed = client_snapshot.inspect_cutover_snapshot_binding(
+            **parameters,
+            durable_rebind=tampered,
+        )
+        self.assertEqual(observed["state"], client_snapshot.SNAPSHOT_BINDING_UNREADABLE)
+        self.assertIn("does not bind this lineage", str(observed["error"]))
+
+        tampered_continuity = json.loads(json.dumps(historical))
+        tampered_continuity["cutover_transition"]["surface_continuity_sha256"] = "ee" * 32
+        observed = client_snapshot.inspect_cutover_snapshot_binding(**parameters, durable_rebind=tampered_continuity)
+        self.assertEqual(observed["state"], client_snapshot.SNAPSHOT_BINDING_UNREADABLE)
+        self.assertIn("does not bind this lineage", str(observed["error"]))
+
+    def test_successor_snapshot_refuses_stale_normal_target_refresh(self) -> None:
+        prepared = self._prepare_publication(complete_schema_sha256=BLUE_COMPLETE_SCHEMA)
+        historical = self._rebind(
+            schema_by_tool=BLUE_SCHEMA_BY_TOOL,
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+            source_evidence_time=self.now_unix,
+            publication_request_id=prepared["request_id"],
+            now_unix=5_000,
+        )
+        created_at = 5_001
+        self._normal_target_successor(now_unix=created_at)
+        parameters = self._inspection_parameters(
+            prepared["request_id"],
+            schema_by_tool=BLUE_SCHEMA_BY_TOOL,
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+            now_unix=created_at + client_snapshot.SNAPSHOT_TTL_SECONDS + 1,
+        )
+        observed = client_snapshot.inspect_cutover_snapshot_binding(**parameters, durable_rebind=historical)
+        self.assertEqual(observed["state"], client_snapshot.SNAPSHOT_BINDING_UNREADABLE)
+        self.assertIn("successor snapshot is not fresh", str(observed["error"]))
 
     def test_s0_cas_rejects_equivalent_snapshot_replacement_before_write(self) -> None:
         prepared = self._prepare_publication()
