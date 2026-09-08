@@ -2133,10 +2133,11 @@ class BureauFailureIdentityTests(unittest.TestCase):
             "candidate_record",
             {"request": request},
             mutation=True,
-            required_readback=[
-                "candidate_by_candidate_id",
-                "candidate_by_idempotency_key",
-            ],
+            required_readback=["candidate_by_idempotency_key"],
+            readback_selector={
+                "kind": "idempotency_key",
+                "idempotency_key": "conversation:relay-test",
+            },
         )
         write.assert_not_called()
         invoke.assert_not_called()
@@ -2166,6 +2167,13 @@ class BureauFailureIdentityTests(unittest.TestCase):
         relay.assert_called_once()
         self.assertEqual(relay.call_args.args[0], "task_propose")
         self.assertTrue(relay.call_args.kwargs["mutation"])
+        request = relay.call_args.args[1]
+        self.assertEqual(request["registry_root"], str(intake.BUREAU_ROOT))
+        self.assertEqual(request["unresolved_fields"], [])
+        self.assertEqual(
+            relay.call_args.kwargs["adapter_proposal_id"],
+            intake._sha256(intake._canonical_json(request)),
+        )
         prepare.assert_not_called()
         proposal_dir.assert_not_called()
 
@@ -2223,11 +2231,64 @@ class BureauFailureIdentityTests(unittest.TestCase):
             mock.patch.object(intake, "_proposal_directory") as proposal_dir,
         ):
             result = intake.grabowski_bureau_task_review(
-                proposal_id, "reviewer", "a" * 64
+                proposal_id,
+                "reviewer",
+                "a" * 64,
+                registry_root=str(intake.BUREAU_ROOT) + "/",
             )
         self.assertEqual(result, expected)
         relay.assert_called_once()
+        self.assertEqual(
+            relay.call_args.args[1]["registry_root"], str(intake.BUREAU_ROOT)
+        )
         proposal_dir.assert_not_called()
+
+    def test_ambiguous_remote_proposal_preserves_deterministic_id(self) -> None:
+        proposal_id = "9" * 64
+        error = intake.authority_failover.AuthorityRelayError(
+            "relay_remote_failed",
+            "response lost",
+            details={"request_sha256": "8" * 64},
+            dispatched=True,
+        )
+        with (
+            mock.patch.object(intake.authority_failover, "relay_bureau", side_effect=error),
+            mock.patch.object(intake, "_audit"),
+        ):
+            result = intake._relay_bureau_or_failure(
+                "task_propose",
+                {
+                    "task_json": {"id": "INIT-T099"},
+                    "publishing_task_id": "INIT-T001",
+                    "candidate_id": "candidate-a",
+                    "event_id": 0,
+                    "unresolved_fields": [],
+                    "placeholder_justification": "",
+                    "registry_root": str(intake.BUREAU_ROOT),
+                },
+                mutation=True,
+                required_readback=["proposal_artifact"],
+                adapter_proposal_id=proposal_id,
+            )
+        self.assertTrue(result["ambiguity"])
+        self.assertEqual(result["adapter_proposal_id"], proposal_id)
+        self.assertEqual(result["required_readback"], ["proposal_artifact"])
+
+    def test_relay_candidate_close_requires_reconcilable_candidate_id(self) -> None:
+        with (
+            mock.patch.object(intake.operator, "_require_operator_mutation"),
+            mock.patch.object(intake, "_bureau_remote_route", return_value=True),
+            self.assertRaisesRegex(ValueError, "requires candidate_id"),
+        ):
+            intake.grabowski_bureau_candidate_record(
+                {
+                    "operation": "close",
+                    "schema_version": 1,
+                    "candidate_id": "",
+                    "idempotency_key": "close:test",
+                    "outcome": "completed",
+                }
+            )
 
     def test_relay_success_is_audited_locally(self) -> None:
         expected = {
@@ -2272,6 +2333,10 @@ class BureauFailureIdentityTests(unittest.TestCase):
                 {"request": {"schema_version": 1}},
                 mutation=True,
                 required_readback=["candidate_by_idempotency_key"],
+                readback_selector={
+                    "kind": "idempotency_key",
+                    "idempotency_key": "conversation:relay-loss",
+                },
             )
         self.assertEqual(result["code"], "bureau-authority-relay-ambiguous")
         self.assertTrue(result["effect_started"])
@@ -2281,6 +2346,13 @@ class BureauFailureIdentityTests(unittest.TestCase):
             result["required_readback"], ["candidate_by_idempotency_key"]
         )
         self.assertEqual(result["details"]["request_sha256"], request_sha256)
+        self.assertEqual(
+            result["readback_selector"],
+            {
+                "kind": "idempotency_key",
+                "idempotency_key": "conversation:relay-loss",
+            },
+        )
         audit.assert_called_once()
         self.assertEqual(audit.call_args.kwargs["relay_request_sha256"], request_sha256)
         self.assertEqual(audit.call_args.kwargs["relay_code"], "relay_remote_failed")

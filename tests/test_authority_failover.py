@@ -13,9 +13,10 @@ from src import grabowski_authority_failover as failover
 
 
 class _BureauError(RuntimeError):
-    def __init__(self, code: str):
+    def __init__(self, code: str, *, details: dict[str, object] | None = None):
         super().__init__(code)
         self.code = code
+        self.details = details or {}
 
 
 class AuthorityFailoverTests(unittest.TestCase):
@@ -35,6 +36,7 @@ class AuthorityFailoverTests(unittest.TestCase):
         self,
         *,
         repository_error: str | None = None,
+        repository_error_type: str | None = None,
         runtime_error: str | None = None,
     ) -> types.ModuleType:
         module = types.ModuleType("grabowski_bureau_leases")
@@ -42,7 +44,12 @@ class AuthorityFailoverTests(unittest.TestCase):
 
         def repository():
             if repository_error:
-                raise _BureauError(repository_error)
+                details = (
+                    {"error_type": repository_error_type}
+                    if repository_error_type is not None
+                    else {}
+                )
+                raise _BureauError(repository_error, details=details)
             return Path("/home/alex/repos/bureau")
 
         def runtime():
@@ -82,12 +89,37 @@ class AuthorityFailoverTests(unittest.TestCase):
                     )
 
     def test_bureau_missing_local_repository_routes_to_primary(self) -> None:
-        fake = self.fake_bureau_runtime(repository_error="bureau-repository-unavailable")
+        fake = self.fake_bureau_runtime(
+            repository_error="bureau-repository-unavailable",
+            repository_error_type="FileNotFoundError",
+        )
         with self.secondary(), mock.patch.dict(
             sys.modules, {"grabowski_bureau_leases": fake}
         ):
             route = failover.bureau_route(str(failover.PRIMARY_BUREAU_CONTROL_ROOT))
         self.assertEqual(route["route"], "remote-primary")
+        self.assertEqual(route["local_code"], "bureau-repository-unavailable")
+        self.assertEqual(route["local_error_type"], "FileNotFoundError")
+
+    def test_bureau_permission_error_never_routes_to_primary(self) -> None:
+        fake = self.fake_bureau_runtime(
+            repository_error="bureau-repository-unavailable",
+            repository_error_type="PermissionError",
+        )
+        with self.secondary(), mock.patch.dict(
+            sys.modules, {"grabowski_bureau_leases": fake}
+        ):
+            route = failover.bureau_route(str(failover.PRIMARY_BUREAU_CONTROL_ROOT))
+        self.assertEqual(route["route"], "local")
+        self.assertEqual(route["local_code"], "bureau-repository-unavailable")
+
+    def test_bureau_unclassified_unavailable_never_routes_to_primary(self) -> None:
+        fake = self.fake_bureau_runtime(repository_error="bureau-repository-unavailable")
+        with self.secondary(), mock.patch.dict(
+            sys.modules, {"grabowski_bureau_leases": fake}
+        ):
+            route = failover.bureau_route(str(failover.PRIMARY_BUREAU_CONTROL_ROOT))
+        self.assertEqual(route["route"], "local")
         self.assertEqual(route["local_code"], "bureau-repository-unavailable")
 
     def test_bureau_missing_runtime_routes_to_primary(self) -> None:
@@ -116,6 +148,23 @@ class AuthorityFailoverTests(unittest.TestCase):
             route = failover.bureau_route("/tmp/caller-selected-registry")
         self.assertEqual(route["route"], "local")
         self.assertEqual(route["reason"], "caller-specific-registry-root")
+
+    def test_canonical_registry_root_trailing_slash_normalizes_without_io(self) -> None:
+        value = str(failover.PRIMARY_BUREAU_CONTROL_ROOT) + "/"
+        self.assertEqual(
+            failover.normalize_bureau_registry_root(value),
+            str(failover.PRIMARY_BUREAU_CONTROL_ROOT),
+        )
+
+    def test_bureau_request_accepts_equivalent_canonical_registry_spelling(self) -> None:
+        _request, _payload, _digest = failover._request(
+            "bureau",
+            "task_publish_preview",
+            {
+                "proposal_id": "a" * 64,
+                "registry_root": str(failover.PRIMARY_BUREAU_CONTROL_ROOT) + "/",
+            },
+        )
 
     def test_bureau_request_rejects_noncanonical_remote_registry(self) -> None:
         with self.assertRaises(failover.AuthorityRelayError) as raised:

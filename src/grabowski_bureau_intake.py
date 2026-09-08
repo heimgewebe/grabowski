@@ -1168,6 +1168,8 @@ def _relay_bureau_or_failure(
     *,
     mutation: bool,
     required_readback: list[str] | None = None,
+    readback_selector: dict[str, Any] | None = None,
+    adapter_proposal_id: str | None = None,
     timeout_seconds: int = RELAY_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """Relay one already-typed Bureau surface to canonical primary authority."""
@@ -1198,6 +1200,10 @@ def _relay_bureau_or_failure(
             required_readback=readback if ambiguous else [],
             retryable=not mutation and not ambiguous,
         )
+        if ambiguous and readback_selector is not None:
+            payload = {**payload, "readback_selector": readback_selector}
+        if ambiguous and adapter_proposal_id is not None:
+            payload = {**payload, "adapter_proposal_id": adapter_proposal_id}
     _audit_relay(operation, payload, mutation=mutation)
     return payload
 
@@ -1326,17 +1332,55 @@ def _proposal_authority_split_failure(proposal_id: str) -> dict[str, Any]:
 
 def _proposal_authority_route(proposal_id: str, registry_root: str) -> str:
     """Keep a proposal on the host that owns its immutable plan artifact."""
+    canonical_root = authority_failover.normalize_bureau_registry_root(registry_root)
     local_exists = _local_proposal_artifacts_exist(proposal_id)
-    base_route = authority_failover.bureau_route(registry_root)
+    base_route = authority_failover.bureau_route(canonical_root)
     remote_due_unavailability = base_route.get("route") == "remote-primary"
     if local_exists:
         return "split" if remote_due_unavailability else "local"
     if (
         authority_failover.is_secondary_operator()
-        and registry_root == str(BUREAU_ROOT)
+        and canonical_root == str(BUREAU_ROOT)
     ):
         return "remote-primary"
     return "local"
+
+
+def _candidate_relay_readback_selector(request: dict[str, Any]) -> dict[str, Any]:
+    if _candidate_request_operation(request) == "close":
+        value = request.get("candidate_id")
+        if not isinstance(value, str) or not value.strip() or "\x00" in value:
+            raise ValueError(
+                "relayed candidate close requires candidate_id for ambiguous readback"
+            )
+        return {"kind": "candidate_id", "candidate_id": value.strip()}
+    value = request.get("idempotency_key")
+    if not isinstance(value, str) or not value.strip() or "\x00" in value:
+        raise ValueError(
+            "relayed candidate record requires idempotency_key for ambiguous readback"
+        )
+    return {"kind": "idempotency_key", "idempotency_key": value.strip()}
+
+
+def _proposal_request_material(
+    *,
+    task_json: dict[str, Any],
+    publishing_task_id: str,
+    candidate_id: str,
+    event_id: int,
+    unresolved_fields: list[str] | None,
+    placeholder_justification: str,
+    registry_root: str,
+) -> dict[str, Any]:
+    return {
+        "task_json": task_json,
+        "publishing_task_id": publishing_task_id,
+        "candidate_id": candidate_id,
+        "event_id": event_id,
+        "unresolved_fields": sorted(set(unresolved_fields or [])),
+        "placeholder_justification": placeholder_justification,
+        "registry_root": registry_root,
+    }
 
 
 @mcp.tool(name="grabowski_bureau_candidate_record", annotations=MUTATING)
@@ -1348,14 +1392,18 @@ def grabowski_bureau_candidate_record(
     if not isinstance(request, dict):
         raise ValueError("request must be an object")
     if _bureau_remote_route():
+        readback_selector = _candidate_relay_readback_selector(request)
+        required_readback = (
+            ["candidate_by_candidate_id"]
+            if readback_selector["kind"] == "candidate_id"
+            else ["candidate_by_idempotency_key"]
+        )
         return _relay_bureau_or_failure(
             "candidate_record",
             {"request": request},
             mutation=True,
-            required_readback=[
-                "candidate_by_candidate_id",
-                "candidate_by_idempotency_key",
-            ],
+            required_readback=required_readback,
+            readback_selector=readback_selector,
         )
     try:
         request = _normalize_candidate_request(request)
@@ -1592,20 +1640,24 @@ def grabowski_bureau_task_propose(
         raise ValueError("provide exactly one of candidate_id or event_id")
     if not isinstance(task_json, dict):
         raise ValueError("task_json must be an object")
-    if _bureau_remote_route(registry_root):
+    relay_root = authority_failover.normalize_bureau_registry_root(registry_root)
+    if _bureau_remote_route(relay_root):
+        request = _proposal_request_material(
+            task_json=task_json,
+            publishing_task_id=publishing_task_id,
+            candidate_id=candidate_id,
+            event_id=event_id,
+            unresolved_fields=unresolved_fields,
+            placeholder_justification=placeholder_justification,
+            registry_root=relay_root,
+        )
+        proposal_id = _sha256(_canonical_json(request))
         return _relay_bureau_or_failure(
             "task_propose",
-            {
-                "task_json": task_json,
-                "publishing_task_id": publishing_task_id,
-                "candidate_id": candidate_id,
-                "event_id": event_id,
-                "unresolved_fields": unresolved_fields,
-                "placeholder_justification": placeholder_justification,
-                "registry_root": registry_root,
-            },
+            request,
             mutation=True,
             required_readback=["proposal_artifact"],
+            adapter_proposal_id=proposal_id,
         )
     operator._require_operator_mutation(
         "bureau_mutation",
@@ -1614,15 +1666,15 @@ def grabowski_bureau_task_propose(
     resolved_root = _prepare_registry_root(
         registry_root, refresh=True, mutation=False
     )
-    request = {
-        "task_json": task_json,
-        "publishing_task_id": publishing_task_id,
-        "candidate_id": candidate_id,
-        "event_id": event_id,
-        "unresolved_fields": sorted(set(unresolved_fields or [])),
-        "placeholder_justification": placeholder_justification,
-        "registry_root": resolved_root,
-    }
+    request = _proposal_request_material(
+        task_json=task_json,
+        publishing_task_id=publishing_task_id,
+        candidate_id=candidate_id,
+        event_id=event_id,
+        unresolved_fields=unresolved_fields,
+        placeholder_justification=placeholder_justification,
+        registry_root=resolved_root,
+    )
     proposal_id = _sha256(_canonical_json(request))
     directory = _proposal_directory(proposal_id)
     task_path = directory / "task.json"
@@ -1721,7 +1773,8 @@ def grabowski_bureau_task_review(
         raise ValueError("proposal_sha256 must be a lowercase SHA-256 digest")
     if not PROPOSAL_ID_RE.fullmatch(proposal_id):
         raise ValueError("proposal_id must be a lowercase SHA-256 digest")
-    proposal_route = _proposal_authority_route(proposal_id, registry_root)
+    relay_root = authority_failover.normalize_bureau_registry_root(registry_root)
+    proposal_route = _proposal_authority_route(proposal_id, relay_root)
     if proposal_route == "split":
         return _proposal_authority_split_failure(proposal_id)
     if proposal_route == "remote-primary":
@@ -1731,7 +1784,7 @@ def grabowski_bureau_task_review(
                 "proposal_id": proposal_id,
                 "reviewer": reviewer,
                 "proposal_sha256": proposal_sha256,
-                "registry_root": registry_root,
+                "registry_root": relay_root,
             },
             mutation=True,
             required_readback=["proposal_artifact"],
@@ -1838,13 +1891,14 @@ def grabowski_bureau_task_publish_preview(
     """Validate one immutable Bureau proposal and report its exact publication resources without effects."""
     if not PROPOSAL_ID_RE.fullmatch(proposal_id):
         raise ValueError("proposal_id must be a lowercase SHA-256 digest")
-    proposal_route = _proposal_authority_route(proposal_id, registry_root)
+    relay_root = authority_failover.normalize_bureau_registry_root(registry_root)
+    proposal_route = _proposal_authority_route(proposal_id, relay_root)
     if proposal_route == "split":
         return _proposal_authority_split_failure(proposal_id)
     if proposal_route == "remote-primary":
         return _relay_bureau_or_failure(
             "task_publish_preview",
-            {"proposal_id": proposal_id, "registry_root": registry_root},
+            {"proposal_id": proposal_id, "registry_root": relay_root},
             mutation=False,
         )
     plan_path = _proposal_directory(proposal_id) / "plan.json"
@@ -1901,7 +1955,8 @@ def _grabowski_bureau_task_publish_impl(
         raise ValueError("lease_ttl_seconds must be between 90 and 300")
     if not PROPOSAL_ID_RE.fullmatch(proposal_id):
         raise ValueError("proposal_id must be a lowercase SHA-256 digest")
-    proposal_route = _proposal_authority_route(proposal_id, registry_root)
+    relay_root = authority_failover.normalize_bureau_registry_root(registry_root)
+    proposal_route = _proposal_authority_route(proposal_id, relay_root)
     if proposal_route == "split":
         return _proposal_authority_split_failure(proposal_id)
     if proposal_route == "remote-primary":
@@ -1909,7 +1964,7 @@ def _grabowski_bureau_task_publish_impl(
             "task_publish",
             {
                 "proposal_id": proposal_id,
-                "registry_root": registry_root,
+                "registry_root": relay_root,
                 "lease_ttl_seconds": lease_ttl_seconds,
             },
             mutation=True,

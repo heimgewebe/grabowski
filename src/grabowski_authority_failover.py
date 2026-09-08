@@ -214,6 +214,19 @@ def systemkatalog_failure_is_failover_trigger(code: str) -> bool:
     return is_secondary_operator() and code == "root_unavailable"
 
 
+def normalize_bureau_registry_root(registry_root: str) -> str:
+    """Canonicalize only the fixed Bureau control-root spelling, without I/O."""
+    if not isinstance(registry_root, str) or not registry_root or "\x00" in registry_root:
+        return registry_root
+    try:
+        requested = Path(registry_root).expanduser()
+    except (TypeError, ValueError):
+        return registry_root
+    if requested.is_absolute() and requested == PRIMARY_BUREAU_CONTROL_ROOT:
+        return str(PRIMARY_BUREAU_CONTROL_ROOT)
+    return registry_root
+
+
 def bureau_route(registry_root: str | None = None) -> dict[str, Any]:
     """Classify Bureau authority without converting denials into failover."""
     if not is_secondary_operator():
@@ -232,11 +245,16 @@ def bureau_route(registry_root: str | None = None) -> dict[str, Any]:
     try:
         bureau_runtime._validated_bureau_repository_root()
     except bureau_runtime.BureauLeaseContractError as exc:
-        if exc.code == "bureau-repository-unavailable":
+        if (
+            exc.code == "bureau-repository-unavailable"
+            and isinstance(getattr(exc, "details", None), dict)
+            and exc.details.get("error_type") == "FileNotFoundError"
+        ):
             return {
                 "route": "remote-primary",
                 "reason": "local-bureau-repository-unavailable",
                 "local_code": exc.code,
+                "local_error_type": "FileNotFoundError",
             }
         return {
             "route": "local",
@@ -336,7 +354,11 @@ def _validate_bureau_request(operation: str, arguments: dict[str, Any]) -> None:
     if operation == "task_publish" and not 90 <= arguments["lease_ttl_seconds"] <= 300:
         raise AuthorityRelayError("arguments_contract_mismatch", "lease_ttl_seconds is invalid")
     registry_root = arguments.get("registry_root")
-    if registry_root is not None and registry_root != str(PRIMARY_BUREAU_CONTROL_ROOT):
+    if (
+        registry_root is not None
+        and normalize_bureau_registry_root(registry_root)
+        != str(PRIMARY_BUREAU_CONTROL_ROOT)
+    ):
         raise AuthorityRelayError(
             "registry_root_not_canonical",
             "remote Bureau relay only accepts the canonical control checkout",
