@@ -411,6 +411,78 @@ class EffectInterceptorTests(unittest.TestCase):
         completion = interceptor.build_exception_completion(admission, error)
         self.assertEqual(completion["completion_class"], "outcome_unknown")
 
+    def test_structured_positive_candidate_overrides_negative_candidate(self) -> None:
+        admission = interceptor.admit_mutation(
+            tool_name="grabowski_replace_text",
+            arguments={},
+            transport_evidence=self.transport(),
+        )
+        error_type = type(
+            "ConflictingEvidence",
+            (RuntimeError,),
+            {"__module__": "grabowski_test_exception"},
+        )
+        error = error_type("ambiguous")
+        error.effect_started = True
+        error.details = {"effect_started": False, "rejected": True}
+        completion = interceptor.build_exception_completion(admission, error)
+        self.assertEqual(completion["completion_class"], "outcome_unknown")
+
+    def test_structured_positive_cause_overrides_outer_negative_evidence(self) -> None:
+        admission = interceptor.admit_mutation(
+            tool_name="grabowski_replace_text",
+            arguments={},
+            transport_evidence=self.transport(),
+        )
+        error_type = type(
+            "StructuredEvidence",
+            (RuntimeError,),
+            {"__module__": "grabowski_test_exception"},
+        )
+        inner = error_type("effect may have started")
+        inner.effect_possible = True
+        outer = error_type("wrapper says no effect")
+        outer.effect_started = False
+        outer.__cause__ = inner
+        completion = interceptor.build_exception_completion(admission, outer)
+        self.assertEqual(completion["completion_class"], "outcome_unknown")
+
+    def test_implicit_exception_context_is_not_pre_effect_evidence(self) -> None:
+        admission = interceptor.admit_mutation(
+            tool_name="grabowski_replace_text",
+            arguments={},
+            transport_evidence=self.transport(),
+        )
+        error_type = type(
+            "EarlierNoEffect",
+            (RuntimeError,),
+            {"__module__": "grabowski_test_exception"},
+        )
+        earlier = error_type("earlier rejection")
+        earlier.effect_started = False
+        later = RuntimeError("later unrelated failure")
+        later.__context__ = earlier
+        completion = interceptor.build_exception_completion(admission, later)
+        self.assertEqual(completion["completion_class"], "outcome_unknown")
+
+    def test_explicit_cause_preserves_structured_pre_effect_evidence(self) -> None:
+        admission = interceptor.admit_mutation(
+            tool_name="grabowski_replace_text",
+            arguments={},
+            transport_evidence=self.transport(),
+        )
+        error_type = type(
+            "ExplicitNoEffect",
+            (RuntimeError,),
+            {"__module__": "grabowski_test_exception"},
+        )
+        inner = error_type("explicit rejection")
+        inner.effect_started = False
+        outer = RuntimeError("trusted wrapper")
+        outer.__cause__ = inner
+        completion = interceptor.build_exception_completion(admission, outer)
+        self.assertEqual(completion["completion_class"], "failed_before_effect")
+
     def test_untrusted_structured_no_effect_stays_unknown(self) -> None:
         admission = interceptor.admit_mutation(
             tool_name="grabowski_replace_text",

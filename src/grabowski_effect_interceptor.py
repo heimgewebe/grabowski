@@ -512,16 +512,15 @@ def record_success(
 def _exception_chain(
     error: BaseException, *, maximum: int = 8
 ) -> list[BaseException]:
+    """Follow explicit causal wrapping only; implicit context is not proof."""
+
     chain: list[BaseException] = []
     seen: set[int] = set()
     current: BaseException | None = error
     while current is not None and len(chain) < maximum and id(current) not in seen:
         chain.append(current)
         seen.add(id(current))
-        next_error = current.__cause__
-        if next_error is None and not current.__suppress_context__:
-            next_error = current.__context__
-        current = next_error
+        current = current.__cause__
     return chain
 
 
@@ -542,8 +541,10 @@ def _exception_trace_frames(error: BaseException) -> set[tuple[str, str]]:
 
 
 def _structured_pre_effect_completion_class(error: BaseException) -> str | None:
-    """Accept explicit no-effect evidence only from Grabowski-owned exceptions."""
+    """Accept no-effect evidence only when no trusted positive evidence exists."""
 
+    negative_seen = False
+    rejected_seen = False
     for current in _exception_chain(error):
         if not type(current).__module__.startswith("grabowski_"):
             continue
@@ -560,18 +561,26 @@ def _structured_pre_effect_completion_class(error: BaseException) -> str | None:
             if isinstance(value, Mapping):
                 evidence_candidates.append(value)
         for evidence in evidence_candidates:
-            if evidence.get("effect_possible") is True:
-                continue
-            if not (
+            # Positive effect evidence is monotonic: once any trusted candidate
+            # says an effect started or remains possible, no later negative
+            # candidate may downgrade the whole exception to effect_not_applied.
+            if (
+                evidence.get("effect_started") is True
+                or evidence.get("effect_possible") is True
+            ):
+                return None
+            if (
                 evidence.get("effect_started") is False
                 or evidence.get("no_effect") is True
             ):
-                continue
-            return receipts.exception_completion_class(
-                effect_started=False,
-                rejected=evidence.get("rejected") is True,
-            )
-    return None
+                negative_seen = True
+                rejected_seen = rejected_seen or evidence.get("rejected") is True
+    if not negative_seen:
+        return None
+    return receipts.exception_completion_class(
+        effect_started=False,
+        rejected=rejected_seen,
+    )
 
 
 def _fastmcp_argument_validation_rejection(error: BaseException) -> bool:
