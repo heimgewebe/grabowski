@@ -5803,6 +5803,218 @@ class BureauPickupTests(unittest.TestCase):
             result["registry_successor_proof_receipt_sha256"],
         )
 
+    def test_existing_assignment_partial_multigroup_retry_reuses_recovered_successor_authority(self) -> None:
+        repo_key = "repo:/tmp/recovered-partial-repository"
+        path_key = "path:/tmp/recovered-partial-path"
+        intent = self.intent(sorted([repo_key, path_key]))
+        scope = {
+            "schema_version": 1,
+            "repository": "/tmp/recovered-partial-repository",
+            "task_id": intent["task_id"],
+            "base_head": "a" * 40,
+            "head": "a" * 40,
+            "branch": "test-recovered-partial",
+            "worktree": "/tmp/recovered-partial-repository",
+            "effects": ["read"],
+            "paths": [],
+            "components": [],
+            "runtime_resources": [],
+            "processes": [],
+            "deployments": [],
+            "migrations": [],
+            "generated_artifacts": [],
+            "shared_gates": [],
+        }
+        request = pickup._normalize_request(
+            self.request(
+                create_workspace=False,
+                repository_scope_manifests={repo_key: scope},
+            )
+        )
+        groups = pickup._acquisition_groups(intent, request)
+        self.assertEqual(2, len(groups))
+        originals = []
+        for group in groups:
+            _metadata_json, metadata_sha256 = pickup.resources._metadata(
+                group["metadata"]
+            )
+            purpose = (
+                f"Bureau coordinated pickup {intent['run_id']} group {group['name']}"
+            )
+            for key in group["resource_keys"]:
+                original = self.lease(
+                    key, intent["lease_owner_id"], metadata_sha256
+                )
+                original["purpose"] = purpose
+                originals.append(original)
+        acquisition = {
+            "schema_version": 1,
+            "owner_id": intent["lease_owner_id"],
+            "task_id": intent["task_id"],
+            "run_id": intent["run_id"],
+            "claim_intent_sha256": intent["intent_sha256"],
+            "resource_keys": intent["required_resource_keys"],
+            "leases": originals,
+            "groups": [],
+        }
+        acquisition["acquisition_sha256"] = pickup._sha256(acquisition)
+        run_dir = pickup._run_directory(intent["run_id"])
+        self.write_commit_result_journal(intent, run_dir)
+        self.write_registry_bound_request(run_dir, request)
+        journal_identity = pickup._journal_run_identity(run_dir, intent)
+        task, initiative, _unused_intent = self.orphan_recovery_documents()
+        historical_binding = self.orphan_recovery_binding(
+            self.root / "partial-repair-historical-successor-snapshot",
+            "2" * 40,
+            task,
+            initiative,
+        )
+        advanced_binding = self.orphan_recovery_binding(
+            self.root / "partial-repair-advanced-runtime-snapshot",
+            "4" * 40,
+            task,
+            initiative,
+        )
+        successor_proof = {
+            "legacy_registry_root": self.default_registry_binding["identity"][
+                "registry_root"
+            ],
+            "legacy_registry_binding_sha256": self.default_registry_binding[
+                "identity"
+            ]["binding_sha256"],
+            "canonical_registry_root": historical_binding["identity"][
+                "registry_root"
+            ],
+            "canonical_registry_binding_sha256": historical_binding["identity"][
+                "binding_sha256"
+            ],
+            "canonical_registry_binding_identity": dict(
+                historical_binding["identity"]
+            ),
+            "canonical_source_commit": "2" * 40,
+            "control_head": "3" * 40,
+            "control_branch": "ops/bureau-control-main",
+            "control_upstream": "origin/main",
+            "ancestor_proven": True,
+        }
+        blocking = self.bound_coordinated_status(intent, blocking=True)
+        blocking["lease"] = {
+            "status": "active-binding-drift",
+            "error": {
+                "code": "lease-resources-missing",
+                "details": {"missing": [groups[1]["resource_keys"][0]]},
+            },
+        }
+        resource_db = self.root / "resources-partial-successor-retry.sqlite3"
+        with mock.patch.object(pickup.resources, "RESOURCE_DB", resource_db):
+            first_group = groups[0]
+            first_key = first_group["resource_keys"][0]
+            first_purpose = (
+                f"Bureau coordinated pickup {intent['run_id']} group {first_group['name']}"
+            )
+            with mock.patch.object(pickup.resources, "_now", return_value=200):
+                first_live = pickup.resources.acquire_resources(
+                    intent["lease_owner_id"],
+                    [first_key],
+                    purpose=first_purpose,
+                    ttl_seconds=first_group["ttl_seconds"],
+                    metadata=first_group["metadata"],
+                    nonconflict_proof=first_group["nonconflict_proof"],
+                )["leases"][0]
+            with mock.patch.object(
+                pickup.bureau_leases,
+                "BUREAU_CONTROL_ROOT",
+                Path(successor_proof["legacy_registry_root"]),
+            ):
+                proof_obligation = (
+                    pickup._persist_lease_repair_successor_proof_obligation(
+                        run_dir, intent, journal_identity, successor_proof
+                    )
+                )
+            current_control = {
+                "status": "current",
+                "control_root": successor_proof["legacy_registry_root"],
+                "branch": successor_proof["control_branch"],
+                "upstream": successor_proof["control_upstream"],
+                "head": "5" * 40,
+            }
+            with (
+                mock.patch.object(pickup.resources, "_now", return_value=250),
+                mock.patch.object(
+                    pickup.bureau_leases,
+                    "BUREAU_CONTROL_ROOT",
+                    Path(successor_proof["legacy_registry_root"]),
+                ),
+                mock.patch.object(
+                    pickup.bureau_leases,
+                    "inspect_bureau_control_checkout",
+                    return_value=current_control,
+                ),
+                mock.patch.object(
+                    pickup.bureau, "_git_identity_lines", return_value=[]
+                ) as ancestry,
+                mock.patch.object(
+                    pickup, "_current_registry_revision_proof", return_value={}
+                ),
+                mock.patch.object(
+                    pickup, "_canonical_registry_binding", return_value=advanced_binding
+                ) as current_runtime,
+                mock.patch.object(
+                    pickup,
+                    "_persist_lease_repair_successor_proof_obligation",
+                    side_effect=AssertionError(
+                        "recovered proof must be reused instead of rewritten"
+                    ),
+                ) as repersist,
+                mock.patch.object(
+                    pickup,
+                    "_heartbeat_lease_repair",
+                    side_effect=self.lease_repair_heartbeat_readback,
+                ),
+                mock.patch.object(
+                    pickup.operator, "_require_operator_mutation", return_value=None
+                ),
+            ):
+                (
+                    repaired,
+                    effective_binding,
+                    returned_proof_obligation,
+                ) = pickup._repair_existing_assignment_lease_binding(
+                    blocking,
+                    intent,
+                    request,
+                    acquisition,
+                    run_dir,
+                    self.default_registry_binding,
+                    return_binding=True,
+                    recovered_successor_proof_obligation=proof_obligation,
+                )
+                second_key = groups[1]["resource_keys"][0]
+                second_live = pickup.resources.inspect_resource(second_key)
+                first_after = pickup.resources.inspect_resource(first_key)
+        self.assertTrue(repaired)
+        self.assertEqual(historical_binding, effective_binding)
+        self.assertEqual(proof_obligation, returned_proof_obligation)
+        self.assertIsNotNone(second_live)
+        self.assertEqual(intent["lease_owner_id"], second_live["owner_id"])
+        self.assertEqual(first_live, first_after)
+        current_runtime.assert_not_called()
+        repersist.assert_not_called()
+        ancestry.assert_called_once()
+        ancestry_args = ancestry.call_args.args
+        self.assertEqual("merge-base", ancestry_args[1])
+        self.assertEqual("--is-ancestor", ancestry_args[2])
+        self.assertEqual("2" * 40, ancestry_args[3])
+        self.assertEqual("5" * 40, ancestry_args[4])
+        receipt = pickup._read_bound_json(
+            run_dir / "lease-reacquire.json", label="lease-reacquire"
+        )
+        self.assertEqual(
+            proof_obligation["receipt_sha256"],
+            receipt["registry_successor_proof_receipt_sha256"],
+        )
+        self.assertEqual([second_key], receipt["resource_keys"])
+
     def test_existing_assignment_repair_obligation_replay_uses_proven_binding(self) -> None:
         request = self.request()
         normalized = pickup._normalize_request(request)

@@ -4338,9 +4338,57 @@ def _legacy_control_registry_successor_proof(
     }
 
 
+def _recovered_successor_repair_authority(
+    registry_binding: RegistryBinding,
+    recovered_successor_proof: dict[str, Any],
+) -> tuple[RegistryBinding, dict[str, Any]]:
+    """Reuse historical repair authority only while current control continuity holds."""
+
+    proof = _validated_legacy_control_registry_successor_proof(
+        recovered_successor_proof
+    )
+    stored = _validate_registry_binding_identity(registry_binding["identity"])
+    if (
+        stored.get("kind") != "explicit-registry-root"
+        or stored["registry_root"] != proof["legacy_registry_root"]
+        or stored["binding_sha256"] != proof["legacy_registry_binding_sha256"]
+    ):
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-successor-proof-binding-mismatch"
+        )
+    repair_binding = _registry_binding_from_identity(
+        proof["canonical_registry_binding_identity"]
+    )
+    continuity = _legacy_control_registry_successor_proof(
+        registry_binding, repair_binding
+    )
+    stable_fields = (
+        "legacy_registry_root",
+        "legacy_registry_binding_sha256",
+        "canonical_registry_root",
+        "canonical_registry_binding_sha256",
+        "canonical_registry_binding_identity",
+        "canonical_source_commit",
+        "control_branch",
+        "control_upstream",
+        "ancestor_proven",
+    )
+    if any(continuity[field] != proof[field] for field in stable_fields):
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-successor-proof-continuity-drift"
+        )
+    return repair_binding, proof
+
+
 def _existing_assignment_repair_revision_authority(
     registry_binding: RegistryBinding,
+    *,
+    recovered_successor_proof: dict[str, Any] | None = None,
 ) -> tuple[RegistryBinding, dict[str, Any] | None]:
+    if recovered_successor_proof is not None:
+        return _recovered_successor_repair_authority(
+            registry_binding, recovered_successor_proof
+        )
     identity = _validate_registry_binding_identity(registry_binding["identity"])
     if identity.get("kind") != "explicit-registry-root":
         return registry_binding, None
@@ -4380,6 +4428,7 @@ def _existing_assignment_repair_authority(
     registry_binding: RegistryBinding,
     *,
     coordination_root: str,
+    recovered_successor_proof: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], RegistryBinding, dict[str, Any] | None]:
     if coordination.get("status") != "coordinated":
         raise BureauPickupError(
@@ -4460,9 +4509,17 @@ def _existing_assignment_repair_authority(
             },
         )
     external = _existing_assignment_repair_external_binding(run)
-    revision_binding, successor_proof = _existing_assignment_repair_revision_authority(
-        registry_binding
-    )
+    if recovered_successor_proof is None:
+        revision_binding, successor_proof = (
+            _existing_assignment_repair_revision_authority(registry_binding)
+        )
+    else:
+        revision_binding, successor_proof = (
+            _existing_assignment_repair_revision_authority(
+                registry_binding,
+                recovered_successor_proof=recovered_successor_proof,
+            )
+        )
     _bound_bureau_call(
         revision_binding,
         lambda: _current_registry_revision_proof(
@@ -5724,6 +5781,7 @@ def _repair_existing_assignment_lease_binding(
     registry_binding: RegistryBinding,
     *,
     return_binding: bool = False,
+    recovered_successor_proof_obligation: dict[str, Any] | None = None,
 ) -> (
     dict[str, Any]
     | bool
@@ -5743,6 +5801,15 @@ def _repair_existing_assignment_lease_binding(
         }
     ):
         return False
+    recovered_successor_proof = None
+    if recovered_successor_proof_obligation is not None:
+        if not isinstance(recovered_successor_proof_obligation, dict):
+            raise BureauPickupError(
+                "existing-assignment-lease-repair-successor-proof-receipt-invalid"
+            )
+        recovered_successor_proof = recovered_successor_proof_obligation.get(
+            "successor_proof"
+        )
     (
         journal_identity,
         external,
@@ -5755,14 +5822,28 @@ def _repair_existing_assignment_lease_binding(
         run_dir,
         registry_binding,
         coordination_root=request["coordination_root"],
+        recovered_successor_proof=recovered_successor_proof,
     )
+    if recovered_successor_proof_obligation is not None:
+        recovered_successor_proof_obligation = (
+            _validated_lease_repair_successor_proof_obligation(
+                run_dir,
+                intent,
+                journal_identity,
+                recovered_successor_proof_obligation,
+            )
+        )
+        if recovered_successor_proof_obligation["successor_proof"] != successor_proof:
+            raise BureauPickupError(
+                "existing-assignment-lease-repair-successor-proof-recovery-drift"
+            )
     repair_request = _existing_assignment_repair_effective_request(
         request, repair_binding
     )
     operator._require_operator_mutation(
         "bureau_mutation", path=repair_request["registry_root"]
     )
-    successor_proof_obligation: dict[str, Any] | None = None
+    successor_proof_obligation = recovered_successor_proof_obligation
 
     def ensure_successor_proof_obligation() -> dict[str, Any] | None:
         nonlocal successor_proof_obligation
@@ -6429,6 +6510,9 @@ def grabowski_bureau_pickup_execute(
                     run_dir,
                     registry_binding,
                     return_binding=True,
+                    recovered_successor_proof_obligation=(
+                        result_successor_proof_obligation
+                    ),
                 )
                 if not repaired:
                     raise
