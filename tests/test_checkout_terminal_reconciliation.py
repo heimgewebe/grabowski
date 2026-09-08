@@ -1292,6 +1292,37 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
             ]
         )
 
+    def test_github_issue_accepts_bare_repository_number_source(self) -> None:
+        source_id = "heimgewebe/bureau#2177"
+        with patch.object(
+            sources,
+            "_github_json",
+            return_value={
+                "number": 2177,
+                "state": "CLOSED",
+                "url": "https://github.com/heimgewebe/bureau/issues/2177",
+                "closedAt": "2026-08-29T00:00:00Z",
+                "updatedAt": "2026-08-29T00:00:00Z",
+            },
+        ) as github_read:
+            evidence = sources.source_terminal_evidence(
+                {"source": {"kind": "github_issue", "id": source_id}}
+            )
+        self.assertEqual(source_id, evidence["source_id"])
+        self.assertEqual("heimgewebe/bureau", evidence["repository"])
+        self.assertEqual(2177, evidence["issue_number"])
+        github_read.assert_called_once_with(
+            [
+                "issue",
+                "view",
+                "2177",
+                "--repo",
+                "heimgewebe/bureau",
+                "--json",
+                "number,state,url,closedAt,updatedAt",
+            ]
+        )
+
     def test_github_issue_url_accepts_one_trailing_slash_only(self) -> None:
         self.assertEqual(
             ("heimgewebe/chronik", 299),

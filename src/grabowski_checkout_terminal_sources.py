@@ -17,7 +17,7 @@ import grabowski_operator_obligation as operator_obligation
 SCHEMA_VERSION = checkouts.TERMINAL_RECONCILIATION_SCHEMA_VERSION
 TERMINAL_TASK_STATES = frozenset({"verified", "cancelled", "superseded"})
 GITHUB_ISSUE_SOURCE_RE = re.compile(
-    r"(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(?P<number>[1-9][0-9]*):(?P<suffix>[^\x00]+)\Z"
+    r"(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(?P<number>[1-9][0-9]*)(?::(?P<suffix>[^\x00]+))?\Z"
 )
 
 
@@ -382,7 +382,7 @@ def thread_focus_terminal_evidence(source_id: str) -> dict[str, Any]:
 def _parse_github_issue_source_id(source_id: str) -> tuple[str, int]:
     if not isinstance(source_id, str) or not source_id or source_id != source_id.strip():
         raise ValueError(
-            "GitHub issue source id must be repository#number:suffix or a strict github.com issue URL"
+            "GitHub issue source id must be repository#number or repository#number:suffix or a strict github.com issue URL"
         )
     match = GITHUB_ISSUE_SOURCE_RE.fullmatch(source_id)
     if match is not None:
@@ -393,7 +393,7 @@ def _parse_github_issue_source_id(source_id: str) -> tuple[str, int]:
         port = parsed.port
     except ValueError as exc:
         raise ValueError(
-            "GitHub issue source id must be repository#number:suffix or a strict github.com issue URL"
+            "GitHub issue source id must be repository#number or repository#number:suffix or a strict github.com issue URL"
         ) from exc
     if (
         parsed.scheme != "https"
@@ -405,7 +405,7 @@ def _parse_github_issue_source_id(source_id: str) -> tuple[str, int]:
         or parsed.fragment
     ):
         raise ValueError(
-            "GitHub issue source id must be repository#number:suffix or a strict github.com issue URL"
+            "GitHub issue source id must be repository#number or repository#number:suffix or a strict github.com issue URL"
         )
     path_match = re.fullmatch(
         r"/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/issues/(?P<number>[1-9][0-9]*)/?",
@@ -413,14 +413,14 @@ def _parse_github_issue_source_id(source_id: str) -> tuple[str, int]:
     )
     if path_match is None:
         raise ValueError(
-            "GitHub issue source id must be repository#number:suffix or a strict github.com issue URL"
+            "GitHub issue source id must be repository#number or repository#number:suffix or a strict github.com issue URL"
         )
     repository = f"{path_match.group('owner')}/{path_match.group('repo')}"
     number = int(path_match.group("number"))
     canonical_url = f"https://github.com/{repository}/issues/{number}"
     if source_id not in {canonical_url, canonical_url + "/"}:
         raise ValueError(
-            "GitHub issue source id must be repository#number:suffix or a strict github.com issue URL"
+            "GitHub issue source id must be repository#number or repository#number:suffix or a strict github.com issue URL"
         )
     return repository, number
 
