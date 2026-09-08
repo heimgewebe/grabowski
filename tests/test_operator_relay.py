@@ -62,6 +62,36 @@ class OperatorRelayTests(unittest.TestCase):
             ["explicit_lane", "resource_scope", "controller_binding"],
         )
 
+    def test_g66_failover_is_classified_and_does_not_escalate_denials(self) -> None:
+        failover = self.protocol["operator_failover"]
+        self.assertEqual(failover["contract"], "G6.6-classified-local-first-v1")
+        self.assertEqual(failover["primary_surface"], "grabowski")
+        self.assertEqual(failover["secondary_surface"], "der_kleine_maulwurf")
+        self.assertEqual(failover["canonical_authority_host"], "heim-pc")
+        self.assertEqual(
+            failover["implemented_authority_relays"],
+            ["systemkatalog", "bureau_intake"],
+        )
+        self.assertFalse(failover["generic_remote_shell_fallback"])
+        self.assertFalse(failover["new_public_tool_required"])
+        forbidden = set(failover["never_failover_on"])
+        self.assertTrue(
+            {
+                "policy_denial",
+                "authority_denial",
+                "bureau_domain_denial",
+                "github_denial",
+                "ci_failure",
+                "dirty_repository",
+                "runtime_integrity_failure",
+                "outcome_unknown",
+            }.issubset(forbidden)
+        )
+        self.assertEqual(
+            failover["failback"],
+            "retry-local-authority-first-on-every-operation",
+        )
+
     def test_parallelism_and_hard_blocks_are_explicit(self) -> None:
         self.assertEqual(
             self.protocol["overlapping_writer_invariant"],

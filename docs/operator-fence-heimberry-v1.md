@@ -1,6 +1,6 @@
 # Heimberry Operator Fence v1
 
-Status: G6.3 production transport plus terminal G6.4 shadow contract. G6.5 adds opt-in fail-closed mutation enforcement; automatic failover routing remains out of scope.
+Status: G6.3 production transport plus terminal G6.4 shadow contract. G6.5 adds opt-in fail-closed mutation enforcement. G6.6 adds classified local-first failover/failback for canonical Systemkatalog and Bureau-intake authority without adding a generic remote shell path or a new public MCP tool.
 
 ## Purpose
 
@@ -13,7 +13,7 @@ The two callers are exactly:
 
 The transport deliberately adds no TCP daemon and no shared filesystem. Each request is one bounded JSON document over an SSH connection whose host identity and client key are pinned. Heimberry executes one forced command, handles exactly one request, writes exactly one response, and exits.
 
-G6.3 deliberately stopped at authenticated coordinator transport. G6.4 later wired the fence into `grabowski_effect_interceptor` in observation-only shadow mode and proved that the observer had zero Heimberry effect. G6.5 keeps that shadow evidence but adds a separate opt-in enforcement config for mutating effects. It still does not automate failover or failback and grants no root, secret, generic shell or destructive authority.
+G6.3 deliberately stopped at authenticated coordinator transport. G6.4 later wired the fence into `grabowski_effect_interceptor` in observation-only shadow mode and proved that the observer had zero Heimberry effect. G6.5 keeps that shadow evidence but adds a separate opt-in enforcement config for mutating effects. G6.6 leaves that authority boundary intact and adds only classified local-first authority routing for the secondary operator; it grants no root, secret, generic shell or destructive authority.
 
 ## Authority boundary
 
@@ -226,6 +226,23 @@ Its declared roots remain limited to repository and Grabowski/Bureau state paths
 
 `durable_job`, generic `file_write`, `rollback_text`, `artifact_transfer`, `git_cli` and `github_cli` are deliberately absent from `failover-mutate` in G6.5. Their current surfaces are broader than the manual single-writer canary needs; generic job/remote dispatch in particular can outlive the top-level fence call. G6.5 therefore proves mutation only through typed Bureau writes and resource leases. Later slices may add separately typed bounded variants; the broad existing capabilities remain available only to normal higher-authority profiles.
 
+## G6.6 classified authority failover
+
+G6.6 does not copy Bureau or Systemkatalog onto `wg-prod-1`. The canonical truth remains on `heim-pc`. `der-kleine-maulwurf` first probes its local typed authority exactly as before. Only a physical absence of that local canonical authority may select the relay:
+
+- Systemkatalog: `root_unavailable`;
+- Bureau: `bureau-repository-unavailable` or `contract-executable-unavailable`.
+
+Every other result stays local and keeps its original semantics. In particular policy, safety, CI, GitHub, review, Bureau-domain and authority denials, dirty repositories, origin mismatch, runtime-integrity failures and `outcome_unknown` are **not** failover triggers. A failure is therefore never converted into extra authority.
+
+The relay reuses the validated Fleet identity `heim-pc`, but callers never supply an executable, shell program or remote path. The implementation constructs one server-owned Python bootstrap and accepts only canonical JSON for a small allowlist of existing typed operations. The primary process imports the deployed Grabowski runtime and executes the same high-level typed adapter there. For Bureau this is important: proposal artifacts, Resource-Leases, Bureau runtime checks, publication receipts and the canonical registry all stay on `heim-pc`; the secondary does not maintain a parallel lifecycle database.
+
+The relay response is bound to the canonical request SHA-256 and the serving primary runtime identity. A mutating relay whose response is lost is `ambiguity=true` and requires target-state readback; it is never retried unchanged. The existing G6.5 Heimberry fence remains the mutation authority before the secondary typed effect.
+
+Failback is deliberately simple and automatic: every new operation tries the local canonical authority first. If that authority becomes available again, no sticky failover state exists and the remote route is no longer selected.
+
+This slice covers `grabowski_systemkatalog_query` and the Bureau-intake candidate/proposal/review/publication surfaces. It does not claim primary-host power-loss recovery or Bureau-pickup failover. Those need separately typed state ownership rather than silently broadening this relay.
+
 ## Failure semantics
 
 If Heimberry or SSH is unavailable, the RPC client fails closed. G6.5 enforcement interprets that as **no mutation authority**. It must not fall back to a local fence, stale cached lease or the other operator.
@@ -266,6 +283,6 @@ Secondary credential provisioning may be completed with G6.5 only if G6.3 remain
 
 - **G6.4:** terminally accepted: central read-only shadow observation, live zero-effect proof and failure/performance matrix.
 - **G6.5:** this contract: opt-in central enforcement plus the minimal `failover-mutate` secondary profile, followed by exact primary/secondary deployment and a controlled manual writer handoff canary.
-- **G6.6:** implement classified automatic failover/failback routing; policy, safety, CI, GitHub, Bureau and authority denials are never failover triggers.
-- **G6.7:** adversarial race, partition, stale-generation, response-loss, in-flight-death and coordinator-death drills.
+- **G6.6:** classified local-first authority failover/failback implemented for Systemkatalog and Bureau intake; extend only through separately typed surfaces when their state/lease ownership is proven.
+- **G6.7:** adversarial race, partition, stale-generation, response-loss, in-flight-death and coordinator-death drills, plus remaining typed Bureau-pickup failover.
 - **G6.8:** Stage-A production cutover, scheduler routing, observability and final recovery/failback evidence.

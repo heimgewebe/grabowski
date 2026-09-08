@@ -15,6 +15,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import Field
 
+import grabowski_authority_failover as authority_failover
 import grabowski_operator_core as operator
 
 
@@ -561,6 +562,7 @@ def query_systemkatalog(
 ) -> dict[str, Any]:
     """Invoke exactly one revision-bound Systemkatalog v2 read operation."""
     normalized_operation = operation.strip() if isinstance(operation, str) else ""
+    normalized_value: str | None = value
     try:
         normalized_value = _bounded_value(normalized_operation, value)
         root = _configured_root()
@@ -647,6 +649,24 @@ def query_systemkatalog(
             "does_not_establish": combined_nonclaims,
         }
     except SystemkatalogAdapterError as exc:
+        if authority_failover.systemkatalog_failure_is_failover_trigger(exc.code):
+            try:
+                return authority_failover.relay_systemkatalog(
+                    normalized_operation, normalized_value
+                )
+            except authority_failover.AuthorityRelayError as relay_exc:
+                return _failure(
+                    normalized_operation,
+                    value,
+                    SystemkatalogAdapterError(
+                        "authority_relay_unavailable",
+                        "the canonical Systemkatalog authority relay is unavailable",
+                        details={
+                            "relay_code": relay_exc.code,
+                            "dispatched": relay_exc.dispatched,
+                        },
+                    ),
+                )
         return _failure(normalized_operation, value, exc)
     except Exception as exc:  # pragma: no cover - defensive fail-closed boundary
         return _failure(

@@ -473,5 +473,82 @@ class SystemkatalogSurfaceTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "origin_unexpected")
 
 
+    def test_secondary_missing_root_uses_typed_primary_relay(self) -> None:
+        missing = self.root / "missing-secondary"
+        remote = {
+            "schema_version": 1,
+            "kind": "grabowski.systemkatalog_query",
+            "status": "ok",
+            "systemkatalog": self.payload(),
+            "authority_failover": {"route": "remote-primary"},
+        }
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    surface.ROOT_ENVIRONMENT: str(missing),
+                    surface.authority_failover.BRANDING_ENVIRONMENT: "der-kleine-maulwurf",
+                },
+                clear=False,
+            ),
+            mock.patch.object(
+                surface.authority_failover,
+                "relay_systemkatalog",
+                return_value=remote,
+            ) as relay,
+        ):
+            result = surface.query_systemkatalog("system", " grabowski ")
+        self.assertEqual(result, remote)
+        relay.assert_called_once_with("system", "grabowski")
+
+    def test_secondary_dirty_repository_is_not_a_failover_trigger(self) -> None:
+        failure = surface.SystemkatalogAdapterError("repository_dirty", "dirty")
+        with (
+            mock.patch.dict(
+                os.environ,
+                {surface.authority_failover.BRANDING_ENVIRONMENT: "der-kleine-maulwurf"},
+                clear=False,
+            ),
+            mock.patch.object(surface, "_configured_root", return_value=self.root),
+            mock.patch.object(surface, "_repository_identity", side_effect=failure),
+            mock.patch.object(surface.authority_failover, "relay_systemkatalog") as relay,
+        ):
+            result = surface.query_systemkatalog("system", "grabowski")
+        self.assertEqual(result["adapter_error"]["code"], "repository_dirty")
+        relay.assert_not_called()
+
+    def test_secondary_relay_transport_failure_is_typed(self) -> None:
+        missing = self.root / "missing-secondary"
+        relay_error = surface.authority_failover.AuthorityRelayError(
+            "relay_transport_failed",
+            "transport failed",
+            dispatched=False,
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    surface.ROOT_ENVIRONMENT: str(missing),
+                    surface.authority_failover.BRANDING_ENVIRONMENT: "der-kleine-maulwurf",
+                },
+                clear=False,
+            ),
+            mock.patch.object(
+                surface.authority_failover,
+                "relay_systemkatalog",
+                side_effect=relay_error,
+            ),
+        ):
+            result = surface.query_systemkatalog("system", "grabowski")
+        self.assertEqual(
+            result["adapter_error"]["code"], "authority_relay_unavailable"
+        )
+        self.assertEqual(
+            result["adapter_error"]["details"]["relay_code"],
+            "relay_transport_failed",
+        )
+
+
+
 if __name__ == "__main__":
     unittest.main()

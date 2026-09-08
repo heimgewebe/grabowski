@@ -21,6 +21,7 @@ try:
 except ModuleNotFoundError:
     StrictInt = int
 
+import grabowski_authority_failover as authority_failover
 import grabowski_bureau_launcher_contract as managed_launcher_contract
 import grabowski_bureau_leases as bureau_runtime
 import grabowski_mcp as base
@@ -1157,6 +1158,46 @@ def _invoke_bureau(
     return _attach_bureau_contract_identity(payload, contract_identity)
 
 
+def _relay_bureau_or_failure(
+    operation: str,
+    arguments: dict[str, Any],
+    *,
+    mutation: bool,
+    required_readback: list[str] | None = None,
+    timeout_seconds: int = COMMAND_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Relay one already-typed Bureau surface to canonical primary authority."""
+    readback = sorted(set(required_readback or []))
+    try:
+        return authority_failover.relay_bureau(
+            operation,
+            arguments,
+            mutation=mutation,
+            timeout_seconds=timeout_seconds,
+        )
+    except authority_failover.AuthorityRelayError as exc:
+        ambiguous = bool(mutation and exc.dispatched)
+        return _adapter_failure(
+            (
+                "bureau-authority-relay-ambiguous"
+                if ambiguous
+                else "bureau-authority-relay-unavailable"
+            ),
+            details={
+                "relay_code": exc.code,
+                "authority_host": authority_failover.CANONICAL_AUTHORITY_HOST,
+            },
+            effect_started=ambiguous,
+            ambiguity=ambiguous,
+            required_readback=readback if ambiguous else [],
+            retryable=not mutation and not ambiguous,
+        )
+
+
+def _bureau_remote_route(registry_root: str | None = None) -> bool:
+    return authority_failover.bureau_route(registry_root).get("route") == "remote-primary"
+
+
 def _audit_failure_reason(payload: dict[str, Any]) -> str | None:
     """Bounded Bureau failure reason for the audit chain.
 
@@ -1244,6 +1285,16 @@ def grabowski_bureau_candidate_record(
     operator._require_operator_mutation("bureau_mutation")
     if not isinstance(request, dict):
         raise ValueError("request must be an object")
+    if _bureau_remote_route():
+        return _relay_bureau_or_failure(
+            "candidate_record",
+            {"request": request},
+            mutation=True,
+            required_readback=[
+                "candidate_by_candidate_id",
+                "candidate_by_idempotency_key",
+            ],
+        )
     try:
         request = _normalize_candidate_request(request)
     except CandidateRepositorySelectorError:
@@ -1445,6 +1496,21 @@ def grabowski_bureau_candidate_assess(
     ):
         if value:
             arguments.extend([option, value])
+    if _bureau_remote_route():
+        return _relay_bureau_or_failure(
+            "candidate_assess",
+            {
+                "selector": selector,
+                "expected_initiative": initiative_binding,
+                "expected_task_id": task_binding,
+                "candidate_id": "",
+                "event_id": 0,
+                "idempotency_key": "",
+                "initiative": "",
+                "task_id": "",
+            },
+            mutation=False,
+        )
     return _invoke_bureau(arguments)
 
 
@@ -1459,6 +1525,26 @@ def grabowski_bureau_task_propose(
     registry_root: str = str(BUREAU_ROOT),
 ) -> dict[str, Any]:
     """Create an immutable Bureau task proposal artifact without changing Registry or Queue truth."""
+    operator._require_operator_mutation("bureau_mutation")
+    if bool(candidate_id) == bool(event_id):
+        raise ValueError("provide exactly one of candidate_id or event_id")
+    if not isinstance(task_json, dict):
+        raise ValueError("task_json must be an object")
+    if _bureau_remote_route(registry_root):
+        return _relay_bureau_or_failure(
+            "task_propose",
+            {
+                "task_json": task_json,
+                "publishing_task_id": publishing_task_id,
+                "candidate_id": candidate_id,
+                "event_id": event_id,
+                "unresolved_fields": unresolved_fields,
+                "placeholder_justification": placeholder_justification,
+                "registry_root": registry_root,
+            },
+            mutation=True,
+            required_readback=["proposal_artifact"],
+        )
     operator._require_operator_mutation(
         "bureau_mutation",
         path=str(Path(registry_root).expanduser().resolve()),
@@ -1466,10 +1552,6 @@ def grabowski_bureau_task_propose(
     resolved_root = _prepare_registry_root(
         registry_root, refresh=True, mutation=False
     )
-    if bool(candidate_id) == bool(event_id):
-        raise ValueError("provide exactly one of candidate_id or event_id")
-    if not isinstance(task_json, dict):
-        raise ValueError("task_json must be an object")
     request = {
         "task_json": task_json,
         "publishing_task_id": publishing_task_id,
@@ -1570,6 +1652,25 @@ def grabowski_bureau_task_review(
     registry_root: str = str(BUREAU_ROOT),
 ) -> dict[str, Any]:
     """Review one exact Bureau proposal digest without changing Registry, Queue or publication truth."""
+    operator._require_operator_mutation("bureau_mutation")
+    if not reviewer.strip():
+        raise ValueError("reviewer must not be empty")
+    if not SHA256_RE.fullmatch(proposal_sha256):
+        raise ValueError("proposal_sha256 must be a lowercase SHA-256 digest")
+    if not PROPOSAL_ID_RE.fullmatch(proposal_id):
+        raise ValueError("proposal_id must be a lowercase SHA-256 digest")
+    if _bureau_remote_route(registry_root):
+        return _relay_bureau_or_failure(
+            "task_review",
+            {
+                "proposal_id": proposal_id,
+                "reviewer": reviewer,
+                "proposal_sha256": proposal_sha256,
+                "registry_root": registry_root,
+            },
+            mutation=True,
+            required_readback=["proposal_artifact"],
+        )
     operator._require_operator_mutation(
         "bureau_mutation",
         path=str(Path(registry_root).expanduser().resolve()),
@@ -1577,10 +1678,6 @@ def grabowski_bureau_task_review(
     resolved_root = _prepare_registry_root(
         registry_root, refresh=True, mutation=False
     )
-    if not reviewer.strip():
-        raise ValueError("reviewer must not be empty")
-    if not SHA256_RE.fullmatch(proposal_sha256):
-        raise ValueError("proposal_sha256 must be a lowercase SHA-256 digest")
     plan_path = _proposal_directory(proposal_id) / "plan.json"
     if not plan_path.is_file() or plan_path.is_symlink():
         raise FileNotFoundError(f"unknown proposal: {proposal_id}")
@@ -1674,6 +1771,14 @@ def grabowski_bureau_task_publish_preview(
     registry_root: str = str(BUREAU_ROOT),
 ) -> dict[str, Any]:
     """Validate one immutable Bureau proposal and report its exact publication resources without effects."""
+    if not PROPOSAL_ID_RE.fullmatch(proposal_id):
+        raise ValueError("proposal_id must be a lowercase SHA-256 digest")
+    if _bureau_remote_route(registry_root):
+        return _relay_bureau_or_failure(
+            "task_publish_preview",
+            {"proposal_id": proposal_id, "registry_root": registry_root},
+            mutation=False,
+        )
     plan_path = _proposal_directory(proposal_id) / "plan.json"
     if not plan_path.is_file() or plan_path.is_symlink():
         raise FileNotFoundError(f"unknown proposal: {proposal_id}")
@@ -1720,6 +1825,29 @@ def grabowski_bureau_task_publish(
     lease_ttl_seconds: int = 240,
 ) -> dict[str, Any]:
     """Publish one reviewed task through the preview-selected Git or StateStore contract."""
+    operator._require_operator_mutation("bureau_mutation")
+    operator._require_operator_mutation("resource_lease")
+    if lease_ttl_seconds < 90 or lease_ttl_seconds > 300:
+        raise ValueError("lease_ttl_seconds must be between 90 and 300")
+    if not PROPOSAL_ID_RE.fullmatch(proposal_id):
+        raise ValueError("proposal_id must be a lowercase SHA-256 digest")
+    if _bureau_remote_route(registry_root):
+        return _relay_bureau_or_failure(
+            "task_publish",
+            {
+                "proposal_id": proposal_id,
+                "registry_root": registry_root,
+                "lease_ttl_seconds": lease_ttl_seconds,
+            },
+            mutation=True,
+            required_readback=[
+                "publication_receipt",
+                "pull_request",
+                "task_spec_revision",
+                "resource_leases",
+            ],
+            timeout_seconds=120,
+        )
     operator._require_operator_mutation(
         "bureau_mutation",
         path=str(Path(registry_root).expanduser().resolve()),
@@ -1730,9 +1858,6 @@ def grabowski_bureau_task_publish(
         mutation=False,
         require_current=False,
     )
-    operator._require_operator_mutation("resource_lease")
-    if lease_ttl_seconds < 90 or lease_ttl_seconds > 300:
-        raise ValueError("lease_ttl_seconds must be between 90 and 300")
     directory = _proposal_directory(proposal_id)
     plan_path = directory / "plan.json"
     if not plan_path.is_file() or plan_path.is_symlink():

@@ -2713,6 +2713,45 @@
       "missing_cost_approval"
     ],
     "name": "Operator Relay v0",
+    "operator_failover": {
+      "canonical_authority_host": "heim-pc",
+      "contract": "G6.6-classified-local-first-v1",
+      "does_not_establish": [
+        "primary-host-power-loss-recovery",
+        "bureau-pickup-failover",
+        "automatic-merge-authority",
+        "automatic-deploy-authority"
+      ],
+      "failback": "retry-local-authority-first-on-every-operation",
+      "failover_triggers": [
+        "secondary-local-systemkatalog-root-unavailable",
+        "secondary-local-bureau-repository-unavailable",
+        "secondary-local-bureau-runtime-unavailable"
+      ],
+      "generic_remote_shell_fallback": false,
+      "implemented_authority_relays": [
+        "systemkatalog",
+        "bureau_intake"
+      ],
+      "mode": "local-first-classified-authority-relay",
+      "mutation_coordination": "existing-g65-heimberry-fence-remains-authoritative",
+      "never_failover_on": [
+        "policy_denial",
+        "safety_denial",
+        "authority_denial",
+        "bureau_domain_denial",
+        "github_denial",
+        "ci_failure",
+        "review_failure",
+        "dirty_repository",
+        "origin_mismatch",
+        "runtime_integrity_failure",
+        "outcome_unknown"
+      ],
+      "new_public_tool_required": false,
+      "primary_surface": "grabowski",
+      "secondary_surface": "der_kleine_maulwurf"
+    },
     "operator_first_for": [
       "task_decomposition",
       "integration",
@@ -3397,6 +3436,10 @@
         "source": "src/grabowski_context_fabric.py"
       },
       {
+        "module": "grabowski_authority_failover",
+        "source": "src/grabowski_authority_failover.py"
+      },
+      {
         "module": "grabowski_systemkatalog",
         "source": "src/grabowski_systemkatalog.py"
       },
@@ -3594,7 +3637,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "27db499fc6cb114159d769b07ee3f135ebfd58921788be620a47ae39d5ce1bab"
+      "sha256": "7cc8291bf5d9e3379df248f35609c110ed22f5afa8d96f0cdf2dc82b5b08cbe7"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
@@ -3610,6 +3653,7 @@
       "src/grabowski_artifacts.py": "c3d7de87451cc4aeee83a4db66974fb869fddc8020f78fe1409b3e4d2866bc5b",
       "src/grabowski_audit_query.py": "a9dd45e62af4a296a6e2c3539e3c7d8841a25e06d180adaae1aadc4b8a6e3ac6",
       "src/grabowski_audit_signal.py": "b9719ac03dfccc44ef5f6b9cd4b07ac5b9c87b4815827bba79826c7422df3827",
+      "src/grabowski_authority_failover.py": "94382b1f4a9b838a007b2c46a6ecaa4a6446b4d9ae94382349c413e66373d6f6",
       "src/grabowski_blockade_authority.py": "3cc6d2ba115d931ce87e293db02fb006f10b942b142338900a721fec9d12cd35",
       "src/grabowski_blockade_runtime.py": "be0b1f21d621aa59352d188060fed24e879a22029f94f6d441b56132e0309c24",
       "src/grabowski_blockade_store.py": "672a526a50eb9bc3db0445c3ae60decad3a532955e418594be03c876fb5637c8",

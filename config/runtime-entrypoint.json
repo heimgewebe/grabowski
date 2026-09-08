@@ -517,6 +517,10 @@
       "source": "src/grabowski_context_fabric.py"
     },
     {
+      "module": "grabowski_authority_failover",
+      "source": "src/grabowski_authority_failover.py"
+    },
+    {
       "module": "grabowski_systemkatalog",
       "source": "src/grabowski_systemkatalog.py"
     },
