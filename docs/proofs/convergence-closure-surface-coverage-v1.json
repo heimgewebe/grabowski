@@ -107,6 +107,13 @@
     },
     {
       "surface_kind": "grip",
+      "surface_id": "pr-base-converge",
+      "classification": "effect_only",
+      "convergence_requirement": "assessment_after_effect_verification",
+      "reason": "Same-PR base convergence mutates the existing pull-request head branch but does not establish review, merge, deployment or system closure."
+    },
+    {
+      "surface_kind": "grip",
       "surface_id": "pr-create-or-update",
       "classification": "effect_only",
       "convergence_requirement": "assessment_after_effect_verification",

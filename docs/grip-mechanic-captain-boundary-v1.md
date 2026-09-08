@@ -88,7 +88,10 @@ Receipts never echo the raw intent, actor or context. The top-level `execution_i
 - `pr-check-readiness`
 - `post-merge-sync`
 - `branch-publish`
+- `pr-base-converge`
 - `pr-create-or-update`
+
+For an already open same-repository PR whose base advanced, `pr-base-converge` is the preferred normal-action path before considering a successor PR. It binds the exact PR number, base SHA and head SHA and constructs the merge commit from only those two commits. Only the existing PR head branch is published, using an exact-old-head `force-with-lease`; the protected base ref is never mutated. Base is read before and after publication. If `main` advances during publication, the newer base cannot be substituted into the already constructed commit: the head effect is known, but the grip refuses to claim currentness and requires another same-PR convergence on the fresh base. Every non-successful or exceptional push response is reconciled through remote head readback; an inconclusive readback is `outcome_unknown` and forbids blind retry. PR identity and prior-head ancestry are preserved, while all head-bound review, CI and Captain evidence must be renewed after a changed head. A merge conflict, stale head/base binding, cross-repository PR, unknown outcome or CAS rejection never authorizes closing the PR or creating a successor.
 
 ## Task attention decisions
 
