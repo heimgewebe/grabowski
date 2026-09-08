@@ -47,6 +47,10 @@ BUREAU_ROOT = bureau_runtime.BUREAU_CONTROL_ROOT
 MAX_INPUT_BYTES = 1024 * 1024
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 COMMAND_TIMEOUT_SECONDS = 30
+RELAY_TIMEOUT_SECONDS = 60
+RELAY_PUBLISH_TIMEOUT_SECONDS = 120
+PUBLICATION_APPLY_TIMEOUT_SECONDS = 120
+PUBLICATION_RECEIPT_REPLAY_TIMEOUT_SECONDS = 30
 AUDIT_FAILURE_REASON_MAX_CHARS = 512
 CANDIDATE_REPO_IDENTITY_TIMEOUT_SECONDS = 5
 CANDIDATE_REPO_IDENTITY_MAX_OUTPUT_BYTES = 8192
@@ -1164,12 +1168,12 @@ def _relay_bureau_or_failure(
     *,
     mutation: bool,
     required_readback: list[str] | None = None,
-    timeout_seconds: int = COMMAND_TIMEOUT_SECONDS,
+    timeout_seconds: int = RELAY_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """Relay one already-typed Bureau surface to canonical primary authority."""
     readback = sorted(set(required_readback or []))
     try:
-        return authority_failover.relay_bureau(
+        payload = authority_failover.relay_bureau(
             operation,
             arguments,
             mutation=mutation,
@@ -1177,7 +1181,7 @@ def _relay_bureau_or_failure(
         )
     except authority_failover.AuthorityRelayError as exc:
         ambiguous = bool(mutation and exc.dispatched)
-        return _adapter_failure(
+        payload = _adapter_failure(
             (
                 "bureau-authority-relay-ambiguous"
                 if ambiguous
@@ -1185,6 +1189,8 @@ def _relay_bureau_or_failure(
             ),
             details={
                 "relay_code": exc.code,
+                "remote_code": exc.details.get("remote_code"),
+                "request_sha256": exc.details.get("request_sha256"),
                 "authority_host": authority_failover.CANONICAL_AUTHORITY_HOST,
             },
             effect_started=ambiguous,
@@ -1192,6 +1198,32 @@ def _relay_bureau_or_failure(
             required_readback=readback if ambiguous else [],
             retryable=not mutation and not ambiguous,
         )
+    _audit_relay(operation, payload, mutation=mutation)
+    return payload
+
+
+def _audit_relay(operation: str, payload: dict[str, Any], *, mutation: bool) -> None:
+    evidence = payload.get("authority_failover")
+    evidence = evidence if isinstance(evidence, dict) else {}
+    failure_details = payload.get("details")
+    failure_details = failure_details if isinstance(failure_details, dict) else {}
+    remote_runtime = evidence.get("remote_runtime")
+    remote_runtime = remote_runtime if isinstance(remote_runtime, dict) else {}
+    _audit(
+        f"bureau-relay-{operation}",
+        payload,
+        route="remote-primary",
+        authority_host=authority_failover.CANONICAL_AUTHORITY_HOST,
+        relay_mutation=mutation,
+        relay_request_sha256=(
+            evidence.get("request_sha256") or failure_details.get("request_sha256")
+        ),
+        relay_response_sha256=evidence.get("response_sha256"),
+        relay_code=failure_details.get("relay_code"),
+        relay_remote_code=failure_details.get("remote_code"),
+        relay_remote_release_id=remote_runtime.get("release_id"),
+        relay_remote_repo_head=remote_runtime.get("repo_head"),
+    )
 
 
 def _bureau_remote_route(registry_root: str | None = None) -> bool:
@@ -1275,6 +1307,36 @@ def _proposal_directory(proposal_id: str) -> Path:
     if not PROPOSAL_ID_RE.fullmatch(proposal_id):
         raise ValueError("proposal_id must be a lowercase SHA-256 digest")
     return _private_root() / "proposals" / proposal_id
+
+
+def _local_proposal_artifacts_exist(proposal_id: str) -> bool:
+    directory = _proposal_directory(proposal_id)
+    return directory.is_dir() and not directory.is_symlink()
+
+
+def _proposal_authority_split_failure(proposal_id: str) -> dict[str, Any]:
+    payload = _adapter_failure(
+        "bureau-proposal-authority-split",
+        details={"adapter_proposal_id": proposal_id},
+        retryable=False,
+    )
+    _audit("bureau-proposal-authority-split", payload, proposal_id=proposal_id)
+    return payload
+
+
+def _proposal_authority_route(proposal_id: str, registry_root: str) -> str:
+    """Keep a proposal on the host that owns its immutable plan artifact."""
+    local_exists = _local_proposal_artifacts_exist(proposal_id)
+    base_route = authority_failover.bureau_route(registry_root)
+    remote_due_unavailability = base_route.get("route") == "remote-primary"
+    if local_exists:
+        return "split" if remote_due_unavailability else "local"
+    if (
+        authority_failover.is_secondary_operator()
+        and registry_root == str(BUREAU_ROOT)
+    ):
+        return "remote-primary"
+    return "local"
 
 
 @mcp.tool(name="grabowski_bureau_candidate_record", annotations=MUTATING)
@@ -1659,7 +1721,10 @@ def grabowski_bureau_task_review(
         raise ValueError("proposal_sha256 must be a lowercase SHA-256 digest")
     if not PROPOSAL_ID_RE.fullmatch(proposal_id):
         raise ValueError("proposal_id must be a lowercase SHA-256 digest")
-    if _bureau_remote_route(registry_root):
+    proposal_route = _proposal_authority_route(proposal_id, registry_root)
+    if proposal_route == "split":
+        return _proposal_authority_split_failure(proposal_id)
+    if proposal_route == "remote-primary":
         return _relay_bureau_or_failure(
             "task_review",
             {
@@ -1773,7 +1838,10 @@ def grabowski_bureau_task_publish_preview(
     """Validate one immutable Bureau proposal and report its exact publication resources without effects."""
     if not PROPOSAL_ID_RE.fullmatch(proposal_id):
         raise ValueError("proposal_id must be a lowercase SHA-256 digest")
-    if _bureau_remote_route(registry_root):
+    proposal_route = _proposal_authority_route(proposal_id, registry_root)
+    if proposal_route == "split":
+        return _proposal_authority_split_failure(proposal_id)
+    if proposal_route == "remote-primary":
         return _relay_bureau_or_failure(
             "task_publish_preview",
             {"proposal_id": proposal_id, "registry_root": registry_root},
@@ -1818,11 +1886,13 @@ def grabowski_bureau_task_publish_preview(
     return payload
 
 
-@mcp.tool(name="grabowski_bureau_task_publish", annotations=MUTATING)
-def grabowski_bureau_task_publish(
+def _grabowski_bureau_task_publish_impl(
     proposal_id: str,
     registry_root: str = str(BUREAU_ROOT),
     lease_ttl_seconds: int = 240,
+    *,
+    apply_timeout_seconds: int = PUBLICATION_APPLY_TIMEOUT_SECONDS,
+    replay_timeout_seconds: int = PUBLICATION_RECEIPT_REPLAY_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """Publish one reviewed task through the preview-selected Git or StateStore contract."""
     operator._require_operator_mutation("bureau_mutation")
@@ -1831,7 +1901,10 @@ def grabowski_bureau_task_publish(
         raise ValueError("lease_ttl_seconds must be between 90 and 300")
     if not PROPOSAL_ID_RE.fullmatch(proposal_id):
         raise ValueError("proposal_id must be a lowercase SHA-256 digest")
-    if _bureau_remote_route(registry_root):
+    proposal_route = _proposal_authority_route(proposal_id, registry_root)
+    if proposal_route == "split":
+        return _proposal_authority_split_failure(proposal_id)
+    if proposal_route == "remote-primary":
         return _relay_bureau_or_failure(
             "task_publish",
             {
@@ -1846,7 +1919,7 @@ def grabowski_bureau_task_publish(
                 "task_spec_revision",
                 "resource_leases",
             ],
-            timeout_seconds=120,
+            timeout_seconds=RELAY_PUBLISH_TIMEOUT_SECONDS,
         )
     operator._require_operator_mutation(
         "bureau_mutation",
@@ -1895,7 +1968,7 @@ def grabowski_bureau_task_publish(
             publication_mode=publication_mode,
             coordination_state_root=coordination_state_root,
         )
-        payload = _invoke_bureau(apply_arguments, timeout_seconds=30)
+        payload = _invoke_bureau(apply_arguments, timeout_seconds=replay_timeout_seconds)
         _audit(
             "bureau-task-publish-receipt-replay",
             payload,
@@ -2021,7 +2094,7 @@ def grabowski_bureau_task_publish(
     )
     payload = _invoke_bureau(
         apply_arguments,
-        timeout_seconds=120,
+        timeout_seconds=apply_timeout_seconds,
         mutation=True,
         required_readback=required_readback,
     )
@@ -2029,7 +2102,7 @@ def grabowski_bureau_task_publish(
     if bool(payload.get("ambiguity")) and receipt_path.is_file():
         os.chmod(receipt_path, 0o600)
         receipt_readback_attempted = True
-        replay = _invoke_bureau(apply_arguments, timeout_seconds=30)
+        replay = _invoke_bureau(apply_arguments, timeout_seconds=replay_timeout_seconds)
         if replay.get("status") == "published" and not bool(replay.get("ambiguity")):
             payload = {**replay, "ambiguity_reconciled": "receipt-replay"}
     release_requested = not bool(payload.get("ambiguity"))
@@ -2082,3 +2155,23 @@ def grabowski_bureau_task_publish(
         "idempotent_adapter_replay": False,
         "required_resource_keys": resource_keys,
     }
+
+@mcp.tool(name="grabowski_bureau_task_publish", annotations=MUTATING)
+def grabowski_bureau_task_publish(
+    proposal_id: str,
+    registry_root: str = str(BUREAU_ROOT),
+    lease_ttl_seconds: int = 240,
+) -> dict[str, Any]:
+    """Publish one reviewed task through the preview-selected Git or StateStore contract."""
+    # Keep the public MCP capability contract statically visible. The private
+    # implementation repeats both checks because the primary relay invokes it
+    # directly after its own typed preflight.
+    operator._require_operator_mutation("bureau_mutation")
+    operator._require_operator_mutation("resource_lease")
+    return _grabowski_bureau_task_publish_impl(
+        proposal_id,
+        registry_root,
+        lease_ttl_seconds,
+        apply_timeout_seconds=PUBLICATION_APPLY_TIMEOUT_SECONDS,
+        replay_timeout_seconds=PUBLICATION_RECEIPT_REPLAY_TIMEOUT_SECONDS,
+    )

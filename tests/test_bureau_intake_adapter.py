@@ -2174,13 +2174,14 @@ class BureauFailureIdentityTests(unittest.TestCase):
         expected = {"kind": "bureau_task_publication_receipt", "status": "published"}
         with (
             mock.patch.object(intake.operator, "_require_operator_mutation"),
-            mock.patch.object(intake, "_bureau_remote_route", return_value=True),
+            mock.patch.object(intake.authority_failover, "bureau_route", return_value={"route": "local"}),
+            mock.patch.object(intake.authority_failover, "is_secondary_operator", return_value=True),
             mock.patch.object(
                 intake, "_relay_bureau_or_failure", return_value=expected
             ) as relay,
             mock.patch.object(intake, "_prepare_registry_root") as prepare,
             mock.patch.object(intake.resources, "acquire_resources") as acquire,
-            mock.patch.object(intake, "_proposal_directory") as proposal_dir,
+            mock.patch.object(intake, "_local_proposal_artifacts_exist", return_value=False) as local_proposal,
         ):
             result = intake.grabowski_bureau_task_publish(proposal_id)
         self.assertEqual(result, expected)
@@ -2190,16 +2191,81 @@ class BureauFailureIdentityTests(unittest.TestCase):
         self.assertEqual(relay.call_args.kwargs["timeout_seconds"], 120)
         prepare.assert_not_called()
         acquire.assert_not_called()
+        local_proposal.assert_called_once_with(proposal_id)
+
+    def test_secondary_local_proposal_blocks_cross_host_review(self) -> None:
+        proposal_id = "c" * 64
+        with (
+            mock.patch.object(intake.operator, "_require_operator_mutation"),
+            mock.patch.object(intake.authority_failover, "bureau_route", return_value={"route": "remote-primary"}),
+            mock.patch.object(intake, "_local_proposal_artifacts_exist", return_value=True),
+            mock.patch.object(intake, "_relay_bureau_or_failure") as relay,
+            mock.patch.object(intake, "_audit"),
+        ):
+            result = intake.grabowski_bureau_task_review(
+                proposal_id, "reviewer", "d" * 64
+            )
+        self.assertEqual(result["code"], "bureau-proposal-authority-split")
+        self.assertFalse(result["effect_started"])
+        self.assertFalse(result["ambiguity"])
+        self.assertFalse(result["retryable"])
+        relay.assert_not_called()
+
+    def test_remote_proposal_stays_remote_after_local_authority_recovers(self) -> None:
+        proposal_id = "f" * 64
+        expected = {"kind": "bureau_task_review_result", "status": "reviewed"}
+        with (
+            mock.patch.object(intake.operator, "_require_operator_mutation"),
+            mock.patch.object(intake.authority_failover, "bureau_route", return_value={"route": "local"}),
+            mock.patch.object(intake.authority_failover, "is_secondary_operator", return_value=True),
+            mock.patch.object(intake, "_local_proposal_artifacts_exist", return_value=False),
+            mock.patch.object(intake, "_relay_bureau_or_failure", return_value=expected) as relay,
+            mock.patch.object(intake, "_proposal_directory") as proposal_dir,
+        ):
+            result = intake.grabowski_bureau_task_review(
+                proposal_id, "reviewer", "a" * 64
+            )
+        self.assertEqual(result, expected)
+        relay.assert_called_once()
         proposal_dir.assert_not_called()
 
+    def test_relay_success_is_audited_locally(self) -> None:
+        expected = {
+            "kind": "bureau_candidate_record_result",
+            "status": "recorded",
+            "authority_failover": {
+                "request_sha256": "a" * 64,
+                "response_sha256": "b" * 64,
+                "remote_runtime": {
+                    "release_id": "release-test",
+                    "repo_head": "c" * 40,
+                },
+            },
+        }
+        with (
+            mock.patch.object(intake.authority_failover, "relay_bureau", return_value=expected),
+            mock.patch.object(intake, "_audit") as audit,
+        ):
+            result = intake._relay_bureau_or_failure(
+                "candidate_record", {"request": {"schema_version": 1}}, mutation=True
+            )
+        self.assertEqual(result, expected)
+        audit.assert_called_once()
+        self.assertEqual(audit.call_args.args[0], "bureau-relay-candidate_record")
+        self.assertEqual(audit.call_args.kwargs["relay_request_sha256"], "a" * 64)
+        self.assertEqual(audit.call_args.kwargs["relay_response_sha256"], "b" * 64)
+
     def test_mutating_relay_response_loss_remains_ambiguous(self) -> None:
+        request_sha256 = "e" * 64
         error = intake.authority_failover.AuthorityRelayError(
             "relay_remote_failed",
             "response lost",
+            details={"request_sha256": request_sha256},
             dispatched=True,
         )
-        with mock.patch.object(
-            intake.authority_failover, "relay_bureau", side_effect=error
+        with (
+            mock.patch.object(intake.authority_failover, "relay_bureau", side_effect=error),
+            mock.patch.object(intake, "_audit") as audit,
         ):
             result = intake._relay_bureau_or_failure(
                 "candidate_record",
@@ -2214,6 +2280,10 @@ class BureauFailureIdentityTests(unittest.TestCase):
         self.assertEqual(
             result["required_readback"], ["candidate_by_idempotency_key"]
         )
+        self.assertEqual(result["details"]["request_sha256"], request_sha256)
+        audit.assert_called_once()
+        self.assertEqual(audit.call_args.kwargs["relay_request_sha256"], request_sha256)
+        self.assertEqual(audit.call_args.kwargs["relay_code"], "relay_remote_failed")
 
 
 

@@ -26,6 +26,11 @@ class AuthorityFailoverTests(unittest.TestCase):
             clear=False,
         )
 
+    def fake_effect_interceptor(self, enabled: bool = True) -> types.ModuleType:
+        module = types.ModuleType("grabowski_effect_interceptor")
+        module.fence_enforcement_required = mock.Mock(return_value=enabled)
+        return module
+
     def fake_bureau_runtime(
         self,
         *,
@@ -278,11 +283,167 @@ class AuthorityFailoverTests(unittest.TestCase):
         fleet = types.ModuleType("grabowski_fleet")
         fleet.run_fleet_host = mock.Mock(side_effect=OSError("transport down"))
         arguments = {"request": {"schema_version": 1, "operation": "record"}}
-        with self.secondary(), mock.patch.dict(sys.modules, {"grabowski_fleet": fleet}):
+        effect = self.fake_effect_interceptor(True)
+        with self.secondary(), mock.patch.dict(
+            sys.modules,
+            {"grabowski_fleet": fleet, "grabowski_effect_interceptor": effect},
+        ):
             with self.assertRaises(failover.AuthorityRelayError) as raised:
                 failover.relay_bureau("candidate_record", arguments, mutation=True)
         self.assertEqual(raised.exception.code, "relay_transport_failed")
         self.assertTrue(raised.exception.dispatched)
+
+    def test_mutating_relay_requires_active_fence_enforcement(self) -> None:
+        fleet = types.ModuleType("grabowski_fleet")
+        fleet.run_fleet_host = mock.Mock()
+        effect = self.fake_effect_interceptor(False)
+        arguments = {"request": {"schema_version": 1, "operation": "record"}}
+        with self.secondary(), mock.patch.dict(
+            sys.modules,
+            {"grabowski_fleet": fleet, "grabowski_effect_interceptor": effect},
+        ):
+            with self.assertRaises(failover.AuthorityRelayError) as raised:
+                failover.relay_bureau("candidate_record", arguments, mutation=True)
+        self.assertEqual(raised.exception.code, "relay_fence_required")
+        self.assertFalse(raised.exception.dispatched)
+        fleet.run_fleet_host.assert_not_called()
+
+    def test_clean_remote_refusal_does_not_become_ambiguity(self) -> None:
+        refusal = {
+            "schema_version": failover.SCHEMA_VERSION,
+            "kind": failover.ERROR_KIND,
+            "code": "remote_proposal_missing",
+            "message": "refused",
+            "details": {},
+            "effect_dispatched": False,
+        }
+        fleet = types.ModuleType("grabowski_fleet")
+        fleet.run_fleet_host = mock.Mock(
+            return_value={
+                "result": {
+                    "returncode": 2,
+                    "timed_out": False,
+                    "stdout_truncated": False,
+                    "stderr_truncated": False,
+                    "stdout": failover._canonical_json(refusal).decode("utf-8"),
+                    "stderr": "",
+                }
+            }
+        )
+        effect = self.fake_effect_interceptor(True)
+        arguments = {
+            "proposal_id": "a" * 64,
+            "reviewer": "reviewer",
+            "proposal_sha256": "b" * 64,
+            "registry_root": str(failover.PRIMARY_BUREAU_CONTROL_ROOT),
+        }
+        with self.secondary(), mock.patch.dict(
+            sys.modules,
+            {"grabowski_fleet": fleet, "grabowski_effect_interceptor": effect},
+        ):
+            with self.assertRaises(failover.AuthorityRelayError) as raised:
+                failover.relay_bureau("task_review", arguments, mutation=True)
+        self.assertEqual(raised.exception.code, "relay_remote_refused")
+        self.assertEqual(raised.exception.details["remote_code"], "remote_proposal_missing")
+        self.assertFalse(raised.exception.dispatched)
+
+    def test_candidate_record_extra_field_rejected_before_transport(self) -> None:
+        with self.assertRaises(failover.AuthorityRelayError) as raised:
+            failover._request(
+                "bureau",
+                "candidate_record",
+                {"request": {"schema_version": 1, "acceptance_criteria": ["x"]}},
+            )
+        self.assertEqual(raised.exception.code, "arguments_contract_mismatch")
+        self.assertEqual(raised.exception.details["argument"], "request")
+
+    def test_bureau_argument_type_contract_covers_all_operations(self) -> None:
+        self.assertEqual(set(failover.BUREAU_ARGUMENT_TYPES), set(failover.BUREAU_OPERATIONS))
+        for operation, (_function, keys) in failover.BUREAU_OPERATIONS.items():
+            with self.subTest(operation=operation):
+                self.assertEqual(set(failover.BUREAU_ARGUMENT_TYPES[operation]), set(keys))
+
+    def test_wrong_bureau_argument_type_fails_closed(self) -> None:
+        with self.assertRaises(failover.AuthorityRelayError) as raised:
+            failover._request(
+                "bureau",
+                "task_publish",
+                {
+                    "proposal_id": "a" * 64,
+                    "registry_root": str(failover.PRIMARY_BUREAU_CONTROL_ROOT),
+                    "lease_ttl_seconds": "240",
+                },
+            )
+        self.assertEqual(raised.exception.code, "arguments_contract_mismatch")
+        self.assertEqual(raised.exception.details["argument"], "lease_ttl_seconds")
+
+    def test_systemkatalog_argument_types_fail_closed(self) -> None:
+        for arguments in (
+            {"operation": {"bad": True}, "value": None},
+            {"operation": "system", "value": 5},
+        ):
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(failover.AuthorityRelayError) as raised:
+                    failover._request("systemkatalog", "query", arguments)
+                self.assertEqual(raised.exception.code, "arguments_contract_mismatch")
+
+    def test_large_remote_result_is_compacted_with_digest(self) -> None:
+        original = {
+            "schema_version": 1,
+            "kind": "bureau_task_publication_receipt",
+            "status": "published",
+            "effect_started": True,
+            "blob": "x" * 3_000_000,
+        }
+        compact = failover._compact_remote_result(original)
+        self.assertTrue(compact["relay_compacted"])
+        self.assertEqual(
+            compact["remote_result_sha256"],
+            failover._sha256(failover._canonical_json(original)),
+        )
+        self.assertLessEqual(
+            len(failover._canonical_json(compact)),
+            failover.MAX_RELAY_RESULT_BYTES,
+        )
+        self.assertEqual(compact["status"], "published")
+
+    def test_primary_missing_proposal_refuses_before_dispatch(self) -> None:
+        request, payload, _digest = failover._request(
+            "bureau",
+            "task_review",
+            {
+                "proposal_id": "a" * 64,
+                "reviewer": "reviewer",
+                "proposal_sha256": "b" * 64,
+                "registry_root": str(failover.PRIMARY_BUREAU_CONTROL_ROOT),
+            },
+        )
+        encoded = base64.b64encode(payload).decode("ascii")
+        intake = types.ModuleType("grabowski_bureau_intake")
+        intake.grabowski_bureau_task_review = mock.Mock()
+        intake._proposal_directory = mock.Mock(return_value=Path("/definitely/missing/proposal"))
+        binding = {
+            "release_id": "release-test",
+            "repo_head": "a" * 40,
+            "relay_source_sha256": "b" * 64,
+            "provenance_valid": True,
+            "runtime_binding_valid": True,
+            "artifact_integrity_valid": True,
+        }
+        with (
+            mock.patch.object(failover, "is_secondary_operator", return_value=False),
+            mock.patch.object(failover.Path, "home", return_value=failover.PRIMARY_HOME),
+            mock.patch.object(failover, "_runtime_binding", return_value=binding),
+            mock.patch.object(failover, "_dispatch_remote") as dispatch,
+            mock.patch.dict(sys.modules, {"grabowski_bureau_intake": intake}),
+            mock.patch("builtins.print") as printed,
+        ):
+            returncode = failover.remote_main(encoded)
+        self.assertEqual(returncode, 2)
+        dispatch.assert_not_called()
+        envelope = json.loads(printed.call_args.args[0])
+        self.assertEqual(envelope["code"], "remote_proposal_missing")
+        self.assertFalse(envelope["effect_dispatched"])
 
     def test_read_transport_loss_is_not_an_effect_claim(self) -> None:
         fleet = types.ModuleType("grabowski_fleet")

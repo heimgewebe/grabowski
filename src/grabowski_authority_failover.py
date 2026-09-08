@@ -21,6 +21,7 @@ from typing import Any
 SCHEMA_VERSION = 1
 REQUEST_KIND = "grabowski.authority_relay_request"
 RESPONSE_KIND = "grabowski.authority_relay_response"
+ERROR_KIND = "grabowski.authority_relay_error"
 SECONDARY_BRANDING_VARIANTS = frozenset({"der-kleine-maulwurf", "kleiner-maulwurf"})
 BRANDING_ENVIRONMENT = "GRABOWSKI_MCP_BRANDING_VARIANT"
 CANONICAL_AUTHORITY_HOST = "heim-pc"
@@ -30,6 +31,7 @@ PRIMARY_RUNTIME_PYTHON = PRIMARY_RUNTIME_ROOT / ".venv/bin/python"
 PRIMARY_BUREAU_CONTROL_ROOT = Path("/home/alex/repos/.bureau-worktrees/control-main")
 MAX_REQUEST_BYTES = 256 * 1024
 MAX_RESPONSE_BYTES = 2_000_000
+MAX_RELAY_RESULT_BYTES = 1_700_000
 MAX_RELAY_TIMEOUT_SECONDS = 120
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -89,6 +91,81 @@ BUREAU_OPERATIONS: dict[str, tuple[str, frozenset[str]]] = {
         frozenset({"proposal_id", "registry_root", "lease_ttl_seconds"}),
     ),
 }
+
+CANDIDATE_RECORD_FIELDS = frozenset({
+    "schema_version", "operation", "idempotency_key", "title", "source_kind",
+    "desired_outcome", "repo", "source_locator", "source_sha256",
+    "observed_at", "task_id", "candidate_id", "supersedes_event_id", "note",
+    "catalog_validation",
+})
+CANDIDATE_CLOSE_FIELDS = frozenset({
+    "operation", "schema_version", "idempotency_key", "candidate_id",
+    "expected_event_id", "outcome", "evidence", "note",
+})
+
+
+def _text(value: Any) -> bool:
+    return isinstance(value, str)
+
+
+def _count(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _mapping(value: Any) -> bool:
+    return isinstance(value, dict)
+
+
+def _optional_mapping(value: Any) -> bool:
+    return value is None or isinstance(value, dict)
+
+
+def _optional_text_list(value: Any) -> bool:
+    return value is None or (
+        isinstance(value, list) and all(isinstance(item, str) for item in value)
+    )
+
+
+BUREAU_ARGUMENT_TYPES: dict[str, dict[str, Any]] = {
+    "candidate_record": {"request": _mapping},
+    "candidate_assess": {
+        "selector": _optional_mapping,
+        "expected_initiative": _text,
+        "expected_task_id": _text,
+        "candidate_id": _text,
+        "event_id": _count,
+        "idempotency_key": _text,
+        "initiative": _text,
+        "task_id": _text,
+    },
+    "task_propose": {
+        "task_json": _mapping,
+        "publishing_task_id": _text,
+        "candidate_id": _text,
+        "event_id": _count,
+        "unresolved_fields": _optional_text_list,
+        "placeholder_justification": _text,
+        "registry_root": _text,
+    },
+    "task_review": {
+        "proposal_id": _text,
+        "reviewer": _text,
+        "proposal_sha256": _text,
+        "registry_root": _text,
+    },
+    "task_publish_preview": {"proposal_id": _text, "registry_root": _text},
+    "task_publish": {
+        "proposal_id": _text,
+        "registry_root": _text,
+        "lease_ttl_seconds": _count,
+    },
+}
+
+
+def _candidate_request_shape_valid(request: dict[str, Any]) -> bool:
+    fields = CANDIDATE_CLOSE_FIELDS if request.get("operation") == "close" else CANDIDATE_RECORD_FIELDS
+    return set(request).issubset(fields)
+
 
 
 class AuthorityRelayError(RuntimeError):
@@ -166,6 +243,18 @@ def bureau_route(registry_root: str | None = None) -> dict[str, Any]:
             "reason": "local-bureau-contract-denial",
             "local_code": exc.code,
         }
+    except OSError as exc:
+        if isinstance(exc, FileNotFoundError):
+            return {
+                "route": "remote-primary",
+                "reason": "local-bureau-repository-unavailable",
+                "local_error_type": type(exc).__name__,
+            }
+        return {
+            "route": "local",
+            "reason": "local-bureau-repository-error",
+            "local_error_type": type(exc).__name__,
+        }
     try:
         bureau_runtime._contract_runtime()
     except bureau_runtime.BureauLeaseContractError as exc:
@@ -209,6 +298,43 @@ def _validate_bureau_request(operation: str, arguments: dict[str, Any]) -> None:
             "arguments_contract_mismatch",
             "Bureau relay arguments do not match the operation contract",
         )
+    type_contract = BUREAU_ARGUMENT_TYPES.get(operation)
+    if type_contract is None or set(type_contract) != set(contract[1]):
+        raise AuthorityRelayError(
+            "arguments_contract_mismatch",
+            "Bureau relay type contract is incomplete",
+        )
+    for name, accepts in type_contract.items():
+        if not accepts(arguments[name]):
+            raise AuthorityRelayError(
+                "arguments_contract_mismatch",
+                "Bureau relay argument types do not match the operation contract",
+                details={"argument": name},
+            )
+    if operation == "candidate_record" and not _candidate_request_shape_valid(arguments["request"]):
+        raise AuthorityRelayError(
+            "arguments_contract_mismatch",
+            "Bureau candidate request contains fields outside the public typed contract",
+            details={"argument": "request"},
+        )
+    if operation == "task_propose":
+        if bool(arguments["candidate_id"]) == bool(arguments["event_id"]):
+            raise AuthorityRelayError(
+                "arguments_contract_mismatch",
+                "Bureau proposal relay requires exactly one candidate or event selector",
+            )
+    if operation == "task_review":
+        if SHA256_RE.fullmatch(arguments["proposal_id"]) is None:
+            raise AuthorityRelayError("arguments_contract_mismatch", "proposal_id is invalid")
+        if not arguments["reviewer"].strip():
+            raise AuthorityRelayError("arguments_contract_mismatch", "reviewer is empty")
+        if SHA256_RE.fullmatch(arguments["proposal_sha256"]) is None:
+            raise AuthorityRelayError("arguments_contract_mismatch", "proposal_sha256 is invalid")
+    if operation in {"task_publish_preview", "task_publish"}:
+        if SHA256_RE.fullmatch(arguments["proposal_id"]) is None:
+            raise AuthorityRelayError("arguments_contract_mismatch", "proposal_id is invalid")
+    if operation == "task_publish" and not 90 <= arguments["lease_ttl_seconds"] <= 300:
+        raise AuthorityRelayError("arguments_contract_mismatch", "lease_ttl_seconds is invalid")
     registry_root = arguments.get("registry_root")
     if registry_root is not None and registry_root != str(PRIMARY_BUREAU_CONTROL_ROOT):
         raise AuthorityRelayError(
@@ -217,12 +343,22 @@ def _validate_bureau_request(operation: str, arguments: dict[str, Any]) -> None:
         )
 
 
+def _valid_systemkatalog_arguments(operation: str, arguments: Any) -> bool:
+    return (
+        operation == "query"
+        and isinstance(arguments, dict)
+        and set(arguments) == {"operation", "value"}
+        and isinstance(arguments["operation"], str)
+        and (arguments["value"] is None or isinstance(arguments["value"], str))
+    )
+
+
 def _request(authority: str, operation: str, arguments: dict[str, Any]) -> tuple[dict[str, Any], bytes, str]:
     if authority not in {"bureau", "systemkatalog"}:
         raise AuthorityRelayError("authority_not_allowed", "authority is not relayable")
     if authority == "bureau":
         _validate_bureau_request(operation, arguments)
-    elif operation != "query" or set(arguments) != {"operation", "value"}:
+    elif not _valid_systemkatalog_arguments(operation, arguments):
         raise AuthorityRelayError(
             "arguments_contract_mismatch",
             "Systemkatalog relay arguments do not match the query contract",
@@ -255,6 +391,67 @@ def _relay_failure_details(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _remote_refusal(result: dict[str, Any]) -> dict[str, Any] | None:
+    if (
+        result.get("timed_out") is True
+        or result.get("stdout_truncated") is True
+        or result.get("stderr_truncated") is True
+    ):
+        return None
+    stdout = result.get("stdout")
+    if not isinstance(stdout, str) or len(stdout.encode("utf-8")) > MAX_RESPONSE_BYTES:
+        return None
+    try:
+        envelope = json.loads(stdout)
+    except ValueError:
+        return None
+    if (
+        not isinstance(envelope, dict)
+        or envelope.get("schema_version") != SCHEMA_VERSION
+        or envelope.get("kind") != ERROR_KIND
+        or envelope.get("effect_dispatched") is not False
+        or not isinstance(envelope.get("code"), str)
+    ):
+        return None
+    return envelope
+
+
+def _compact_remote_result(result: dict[str, Any]) -> dict[str, Any]:
+    raw = _canonical_json(result)
+    if len(raw) <= MAX_RELAY_RESULT_BYTES:
+        return result
+    preserve = (
+        "schema_version", "kind", "status", "code", "message", "effect_started",
+        "ambiguity", "retryable", "required_readback", "readback_selector",
+        "adapter_request_sha256", "adapter_proposal_id", "proposal_sha256",
+        "publication_mode", "candidate_id", "event_id", "idempotency_key",
+        "task_id", "adapter_receipt_sha256", "lease_owner_id",
+        "lease_expires_at_unix", "leases_acquired", "leases_released",
+        "required_resource_keys", "bureau_contract_identity",
+    )
+    compact = {key: result[key] for key in preserve if key in result}
+    compact.update({
+        "relay_compacted": True,
+        "remote_result_sha256": _sha256(raw),
+        "remote_result_bytes": len(raw),
+    })
+    if "kind" not in compact:
+        compact["kind"] = "grabowski.authority_relay_compact_result"
+    if len(_canonical_json(compact)) > MAX_RELAY_RESULT_BYTES:
+        compact = {
+            "schema_version": result.get("schema_version", SCHEMA_VERSION),
+            "kind": result.get("kind", "grabowski.authority_relay_compact_result"),
+            "status": result.get("status"),
+            "code": result.get("code"),
+            "effect_started": bool(result.get("effect_started")),
+            "ambiguity": bool(result.get("ambiguity")),
+            "relay_compacted": True,
+            "remote_result_sha256": _sha256(raw),
+            "remote_result_bytes": len(raw),
+        }
+    return compact
+
+
 def relay_to_primary(
     authority: str,
     operation: str,
@@ -276,6 +473,21 @@ def relay_to_primary(
         or timeout_seconds > MAX_RELAY_TIMEOUT_SECONDS
     ):
         raise AuthorityRelayError("timeout_invalid", "authority relay timeout is invalid")
+    if mutation:
+        try:
+            import grabowski_effect_interceptor as effect_interceptor
+            enforcement_required = effect_interceptor.fence_enforcement_required()
+        except Exception as exc:
+            raise AuthorityRelayError(
+                "relay_fence_status_unavailable",
+                "secondary fence enforcement status is unavailable",
+                details={"error_type": type(exc).__name__},
+            ) from exc
+        if not enforcement_required:
+            raise AuthorityRelayError(
+                "relay_fence_required",
+                "mutating authority relay requires active G6.5 fence enforcement",
+            )
     _normalized, payload, request_sha256 = _request(authority, operation, arguments)
     encoded = base64.b64encode(payload).decode("ascii")
 
@@ -300,7 +512,10 @@ def relay_to_primary(
         raise AuthorityRelayError(
             "relay_transport_failed",
             "canonical authority relay transport failed",
-            details={"error_type": type(exc).__name__},
+            details={
+                "request_sha256": request_sha256,
+                "error_type": type(exc).__name__,
+            },
             dispatched=dispatched and mutation,
         ) from exc
     result = observation.get("result")
@@ -308,6 +523,7 @@ def relay_to_primary(
         raise AuthorityRelayError(
             "relay_result_invalid",
             "canonical authority relay returned no bounded result",
+            details={"request_sha256": request_sha256},
             dispatched=mutation,
         )
     if (
@@ -316,10 +532,25 @@ def relay_to_primary(
         or result.get("stdout_truncated") is True
         or result.get("stderr_truncated") is True
     ):
+        refusal = _remote_refusal(result)
+        if refusal is not None:
+            raise AuthorityRelayError(
+                "relay_remote_refused",
+                "canonical authority refused the relayed operation before any effect",
+                details={
+                    **_relay_failure_details(result),
+                    "request_sha256": request_sha256,
+                    "remote_code": refusal["code"],
+                },
+                dispatched=False,
+            )
         raise AuthorityRelayError(
             "relay_remote_failed",
             "canonical authority relay did not return a complete success envelope",
-            details=_relay_failure_details(result),
+            details={
+                **_relay_failure_details(result),
+                "request_sha256": request_sha256,
+            },
             dispatched=mutation,
         )
     stdout = result.get("stdout")
@@ -327,6 +558,7 @@ def relay_to_primary(
         raise AuthorityRelayError(
             "relay_response_invalid",
             "canonical authority relay response is missing or exceeds its bound",
+            details={"request_sha256": request_sha256},
             dispatched=mutation,
         )
     try:
@@ -335,7 +567,10 @@ def relay_to_primary(
         raise AuthorityRelayError(
             "relay_response_invalid",
             "canonical authority relay response is not JSON",
-            details={"stdout_sha256": _sha256(stdout.encode("utf-8"))},
+            details={
+                "request_sha256": request_sha256,
+                "stdout_sha256": _sha256(stdout.encode("utf-8")),
+            },
             dispatched=mutation,
         ) from exc
     if (
@@ -350,6 +585,7 @@ def relay_to_primary(
         raise AuthorityRelayError(
             "relay_response_contract_mismatch",
             "canonical authority relay response is not bound to the request",
+            details={"request_sha256": request_sha256},
             dispatched=mutation,
         )
     runtime_binding = response.get("runtime_binding")
@@ -366,9 +602,10 @@ def relay_to_primary(
         raise AuthorityRelayError(
             "relay_runtime_binding_invalid",
             "canonical authority relay response lacks a valid runtime binding",
+            details={"request_sha256": request_sha256},
             dispatched=mutation,
         )
-    response_sha256 = _sha256(_canonical_json(response))
+    response_sha256 = _sha256(stdout.encode("utf-8"))
     return {
         **response["result"],
         "authority_failover": {
@@ -519,12 +756,47 @@ def _decode_remote_request(encoded_request: str) -> tuple[dict[str, Any], bytes,
     return request, payload, _sha256(payload)
 
 
+def _preflight_remote(request: dict[str, Any]) -> None:
+    authority = request["authority"]
+    operation = request["operation"]
+    arguments = request["arguments"]
+    if authority == "systemkatalog":
+        if not _valid_systemkatalog_arguments(operation, arguments):
+            raise AuthorityRelayError("request_contract_mismatch", "Systemkatalog relay request is invalid")
+        import grabowski_systemkatalog
+        if not callable(getattr(grabowski_systemkatalog, "query_systemkatalog", None)):
+            raise AuthorityRelayError(
+                "remote_surface_missing",
+                "primary Systemkatalog surface is unavailable",
+            )
+        return
+    if authority != "bureau":
+        raise AuthorityRelayError("authority_not_allowed", "relay authority is not allowed")
+    _validate_bureau_request(operation, arguments)
+    import grabowski_bureau_intake
+    function_name = BUREAU_OPERATIONS[operation][0]
+    if operation == "task_publish":
+        function_name = "_grabowski_bureau_task_publish_impl"
+    if not callable(getattr(grabowski_bureau_intake, function_name, None)):
+        raise AuthorityRelayError(
+            "remote_surface_missing",
+            "primary Bureau surface is unavailable",
+        )
+    if operation in {"task_review", "task_publish_preview", "task_publish"}:
+        plan_path = grabowski_bureau_intake._proposal_directory(arguments["proposal_id"]) / "plan.json"
+        if not plan_path.is_file() or plan_path.is_symlink():
+            raise AuthorityRelayError(
+                "remote_proposal_missing",
+                "canonical primary does not hold the requested proposal artifact",
+            )
+
+
 def _dispatch_remote(request: dict[str, Any]) -> dict[str, Any]:
     authority = request["authority"]
     operation = request["operation"]
     arguments = request["arguments"]
     if authority == "systemkatalog":
-        if operation != "query" or set(arguments) != {"operation", "value"}:
+        if not _valid_systemkatalog_arguments(operation, arguments):
             raise AuthorityRelayError("request_contract_mismatch", "Systemkatalog relay request is invalid")
         import grabowski_systemkatalog
 
@@ -537,14 +809,37 @@ def _dispatch_remote(request: dict[str, Any]) -> dict[str, Any]:
     function_name = BUREAU_OPERATIONS[operation][0]
     import grabowski_bureau_intake
 
+    if operation == "task_publish":
+        function = getattr(grabowski_bureau_intake, "_grabowski_bureau_task_publish_impl", None)
+        if not callable(function):
+            raise AuthorityRelayError("remote_surface_missing", "primary Bureau publish surface is unavailable")
+        return function(
+            **arguments,
+            apply_timeout_seconds=90,
+            replay_timeout_seconds=20,
+        )
     function = getattr(grabowski_bureau_intake, function_name, None)
     if not callable(function):
         raise AuthorityRelayError("remote_surface_missing", "primary Bureau surface is unavailable")
     return function(**arguments)
 
 
+def _print_remote_error(code: str, message: str, details: dict[str, Any], dispatched: bool) -> int:
+    error = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": ERROR_KIND,
+        "code": code,
+        "message": message,
+        "details": details,
+        "effect_dispatched": bool(dispatched),
+    }
+    print(_canonical_json(error).decode("utf-8"))
+    return 2
+
+
 def remote_main(encoded_request: str) -> int:
     """Private SSH relay entrypoint executed only on the canonical primary host."""
+    dispatched = False
     try:
         if is_secondary_operator() or Path.home() != PRIMARY_HOME:
             raise AuthorityRelayError(
@@ -553,9 +848,12 @@ def remote_main(encoded_request: str) -> int:
             )
         request, _payload, request_sha256 = _decode_remote_request(encoded_request)
         runtime_binding = _runtime_binding()
+        _preflight_remote(request)
+        dispatched = True
         result = _dispatch_remote(request)
         if not isinstance(result, dict):
             raise AuthorityRelayError("remote_result_invalid", "typed authority returned no object")
+        result = _compact_remote_result(result)
         response = {
             "schema_version": SCHEMA_VERSION,
             "kind": RESPONSE_KIND,
@@ -571,12 +869,11 @@ def remote_main(encoded_request: str) -> int:
         print(encoded.decode("utf-8"))
         return 0
     except AuthorityRelayError as exc:
-        error = {
-            "schema_version": SCHEMA_VERSION,
-            "kind": "grabowski.authority_relay_error",
-            "code": exc.code,
-            "message": str(exc),
-            "details": exc.details,
-        }
-        print(_canonical_json(error).decode("utf-8"))
-        return 2
+        return _print_remote_error(exc.code, str(exc), exc.details, dispatched)
+    except Exception as exc:
+        return _print_remote_error(
+            "remote_operation_failed",
+            "canonical typed authority failed after dispatch",
+            {"error_type": type(exc).__name__},
+            dispatched,
+        )
