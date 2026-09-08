@@ -880,6 +880,232 @@ class _ScriptedCasGit:
         return {"returncode": 1, "stdout": "", "stderr": "unexpected git call"}
 
 
+class _ScriptedPrHeadCasGit:
+    def __init__(
+        self,
+        *,
+        push_returncode: int = 0,
+        push_applies: bool | None = None,
+        push_raises: bool = False,
+        base_before: str = _CAS_BASE,
+        base_after: str | None = None,
+        head_after: str | None = None,
+        push_urls: tuple[str, ...] = ("git@github.com:heimgewebe/infra.git",),
+    ) -> None:
+        self.push_returncode = push_returncode
+        self.push_applies = (
+            push_returncode == 0 if push_applies is None else push_applies
+        )
+        self.push_raises = push_raises
+        self.base_before = base_before
+        self.base_after = base_after
+        self.head_after = head_after
+        self.push_urls = push_urls
+        self.calls = []
+        self.pushed = False
+        self.base_reads = 0
+        self.head_reads = 0
+        self.pull_reads = 0
+
+    def __call__(
+        self, _repo: Path, args: list[str], *, timeout: int = 60
+    ) -> dict[str, object]:
+        del timeout
+        self.calls.append(tuple(args))
+        if args[:1] == ["check-ref-format"]:
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+        if args == ["remote", "get-url", "origin"]:
+            return {
+                "returncode": 0,
+                "stdout": "git@github.com:heimgewebe/infra.git\n",
+                "stderr": "",
+            }
+        if args == ["remote", "get-url", "--push", "--all", "origin"]:
+            return {
+                "returncode": 0,
+                "stdout": "".join(f"{url}\n" for url in self.push_urls),
+                "stderr": "",
+            }
+        if (
+            args[:2] == ["init", "--quiet"]
+            or args == ["config", "core.hooksPath", "/dev/null"]
+            or args[:3] == ["remote", "add", "origin"]
+            or args[:1] == ["fetch"]
+            or args[:3] == ["checkout", "--quiet", "--detach"]
+            or "merge" in args
+        ):
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+        if args == ["rev-parse", "refs/converge/base^{commit}"]:
+            return {"returncode": 0, "stdout": _CAS_BASE + "\n", "stderr": ""}
+        if args == ["rev-parse", "refs/converge/head-branch^{commit}"] or args == [
+            "rev-parse",
+            "refs/converge/pr-head^{commit}",
+        ]:
+            return {"returncode": 0, "stdout": _CAS_HEAD + "\n", "stderr": ""}
+        if args == ["rev-list", "--parents", "-n", "1", "HEAD"]:
+            return {
+                "returncode": 0,
+                "stdout": f"{_CAS_MERGE} {_CAS_HEAD} {_CAS_BASE}\n",
+                "stderr": "",
+            }
+        if args == ["rev-parse", "HEAD^{tree}"]:
+            return {"returncode": 0, "stdout": _CAS_TREE + "\n", "stderr": ""}
+        if args == ["ls-remote", "origin", _CAS_REF]:
+            self.base_reads += 1
+            sha = (
+                self.base_before
+                if self.base_reads == 1
+                else (
+                    self.base_after if self.base_after is not None else self.base_before
+                )
+            )
+            return {"returncode": 0, "stdout": f"{sha}\t{_CAS_REF}\n", "stderr": ""}
+        if args == ["ls-remote", "origin", _CAS_HEAD_REF]:
+            self.head_reads += 1
+            sha = (
+                _CAS_HEAD
+                if self.head_reads == 1
+                else (
+                    self.head_after
+                    if self.head_after is not None
+                    else (_CAS_MERGE if self.pushed else _CAS_HEAD)
+                )
+            )
+            return {
+                "returncode": 0,
+                "stdout": f"{sha}\t{_CAS_HEAD_REF}\n",
+                "stderr": "",
+            }
+        if args == ["ls-remote", "origin", _CAS_PULL_REF]:
+            self.pull_reads += 1
+            sha = (
+                _CAS_HEAD
+                if self.pull_reads == 1
+                else (_CAS_MERGE if self.pushed else _CAS_HEAD)
+            )
+            return {
+                "returncode": 0,
+                "stdout": f"{sha}\t{_CAS_PULL_REF}\n",
+                "stderr": "",
+            }
+        if args[:2] == ["push", "--porcelain"]:
+            if self.push_applies:
+                self.pushed = True
+            if self.push_raises:
+                raise RuntimeError("transport lost after dispatch")
+            return {
+                "returncode": self.push_returncode,
+                "stdout": "ok\n" if self.push_returncode == 0 else "",
+                "stderr": "" if self.push_returncode == 0 else "transport/rejection",
+            }
+        return {"returncode": 1, "stdout": "", "stderr": f"unexpected git call: {args}"}
+
+
+class ExactPrHeadConvergenceCasTests(unittest.TestCase):
+    def run_cas(self, git: _ScriptedPrHeadCasGit):
+        return merge_guard._exact_base_content_git_head_cas_update_pr_head(
+            Path.cwd(),
+            base_branch="main",
+            base_sha=_CAS_BASE,
+            head_sha=_CAS_HEAD,
+            head_branch=_CAS_HEAD_BRANCH,
+            pr_number=153,
+            github_runner=_AuthenticatedUserGh(),
+            git_runner=git,
+        )
+
+    def test_exact_pr_head_cas_binds_exact_base_content_and_old_head_without_base_mutation(
+        self,
+    ) -> None:
+        git = _ScriptedPrHeadCasGit()
+        result, evidence = self.run_cas(git)
+        self.assertEqual(0, result["returncode"])
+        self.assertEqual("pushed_and_read_back", evidence["status"])
+        self.assertFalse(evidence["protected_base_mutation"])
+        self.assertTrue(evidence["base_content_bound"])
+        self.assertFalse(evidence["base_live_ref_cas_bound"])
+        self.assertTrue(evidence["head_ref_cas_bound"])
+        self.assertFalse(evidence["head_branch_delete"])
+        push = next(call for call in git.calls if call[:2] == ("push", "--porcelain"))
+        self.assertIn(f"--force-with-lease={_CAS_HEAD_REF}:{_CAS_HEAD}", push)
+        self.assertIn(f"HEAD:{_CAS_HEAD_REF}", push)
+        self.assertFalse(any(_CAS_REF in item for item in push))
+        self.assertFalse(any(item.startswith(":refs/heads/") for item in push))
+        parents = next(
+            call for call in git.calls if call[:3] == ("rev-list", "--parents", "-n")
+        )
+        self.assertEqual(("rev-list", "--parents", "-n", "1", "HEAD"), parents)
+
+    def test_exact_pr_head_cas_rejects_identity_changing_effective_push_url(
+        self,
+    ) -> None:
+        git = _ScriptedPrHeadCasGit(
+            push_urls=(
+                "git@github.com:heimgewebe/infra.git",
+                "git@github.com:heimgewebe/other.git",
+            )
+        )
+        with self.assertRaisesRegex(RuntimeError, "effective push URL repository drift"):
+            self.run_cas(git)
+        self.assertFalse(any(call[:1] == ("push",) for call in git.calls))
+
+    def test_exact_pr_head_cas_blocks_base_drift_before_dispatch(self) -> None:
+        git = _ScriptedPrHeadCasGit(base_before=_CAS_OTHER)
+        with self.assertRaisesRegex(RuntimeError, "base changed before dispatch"):
+            self.run_cas(git)
+        self.assertFalse(any(call[:1] == ("push",) for call in git.calls))
+
+    def test_exact_pr_head_cas_can_prove_head_effect_when_base_advances_after_pre_read(
+        self,
+    ) -> None:
+        git = _ScriptedPrHeadCasGit(
+            push_returncode=0, push_applies=True, base_after=_CAS_OTHER
+        )
+        result, evidence = self.run_cas(git)
+        self.assertEqual(0, result["returncode"])
+        self.assertEqual("pushed_and_read_back", evidence["status"])
+        self.assertTrue(evidence["effect_proven"])
+        self.assertEqual(_CAS_OTHER, evidence["remote_readback"]["base_sha"])
+        self.assertEqual(_CAS_MERGE, evidence["remote_readback"]["head_sha"])
+
+    def test_exact_pr_head_cas_rejection_preserves_old_head(self) -> None:
+        git = _ScriptedPrHeadCasGit(push_returncode=1, push_applies=False)
+        result, evidence = self.run_cas(git)
+        self.assertEqual(1, result["returncode"])
+        self.assertEqual("not_applied_proven", evidence["status"])
+        self.assertTrue(evidence["effect_not_applied_proven"])
+        self.assertEqual(_CAS_HEAD, evidence["remote_readback"]["head_sha"])
+
+    def test_exact_pr_head_cas_recovers_accepted_push_with_lost_response(self) -> None:
+        git = _ScriptedPrHeadCasGit(push_returncode=1, push_applies=True)
+        result, evidence = self.run_cas(git)
+        self.assertEqual(0, result["returncode"])
+        self.assertEqual(
+            "push_response_ambiguous_recovered_applied", evidence["status"]
+        )
+        self.assertTrue(evidence["effect_proven"])
+        self.assertEqual(_CAS_MERGE, evidence["remote_readback"]["head_sha"])
+
+    def test_exact_pr_head_cas_recovers_exception_after_applied_push(self) -> None:
+        git = _ScriptedPrHeadCasGit(push_raises=True, push_applies=True)
+        result, evidence = self.run_cas(git)
+        self.assertEqual(0, result["returncode"])
+        self.assertEqual(
+            "push_response_ambiguous_recovered_applied", evidence["status"]
+        )
+        self.assertEqual("RuntimeError", evidence["push_exception_type"])
+
+    def test_exact_pr_head_cas_marks_inconclusive_readback_unknown(self) -> None:
+        git = _ScriptedPrHeadCasGit(
+            push_returncode=1, push_applies=False, head_after=_CAS_OTHER
+        )
+        result, evidence = self.run_cas(git)
+        self.assertEqual(2, result["returncode"])
+        self.assertEqual("outcome_unknown", evidence["status"])
+        self.assertFalse(evidence["effect_proven"])
+        self.assertFalse(evidence["effect_not_applied_proven"])
+
+
 class CaptainPrivatePlanCasFallbackTests(unittest.TestCase):
     def test_plan_fallback_requires_explicit_same_repository_binding(self) -> None:
         self.assertIsNone(
