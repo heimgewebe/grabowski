@@ -87,9 +87,6 @@ _DEPLOYMENT_ADMISSION_MAX_TOOL_NAME_CHARS = 128
 _DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC = "sync"
 _DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC = "async"
 _DEPLOYMENT_ADMISSION_GATE_INSTALLED = False
-_MAULWURF_RECOVERY_NORMAL_TRANSITION_ACTIVE = False
-_MAULWURF_RECOVERY_TRANSITION_POLL_SECONDS = 0.02
-_MAULWURF_RECOVERY_TRANSITION_TIMEOUT_SECONDS = 120.0
 SYNC_TOOL_EXECUTOR_MAX_WORKERS = 8
 _SYNC_TOOL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=SYNC_TOOL_EXECUTOR_MAX_WORKERS,
@@ -103,6 +100,20 @@ JOB_INVOKER_TOOLS = frozenset(
         "grabowski_job_start",
         "grabowski_runtime_deploy_schedule",
         "grabowski_recovery_provenance_repair",
+    }
+)
+MAULWURF_RECOVERY_DETACHED_EFFECT_TOOLS = JOB_INVOKER_TOOLS | frozenset(
+    {
+        "grabowski_task_start",
+        "grabowski_task_resume",
+        "grabowski_task_reconcile",
+        "grabowski_task_reconcile_resume",
+        "grabowski_browser_worker_start",
+        "grabowski_gui_worker_start",
+        "grabowski_agent_workspace_create",
+        "grabowski_agent_workspace_writer_handoff",
+        "grabowski_agent_workspace_role_retry",
+        "grabowski_agent_competition_start",
     }
 )
 DEFAULT_TIMEOUT = 60
@@ -472,12 +483,15 @@ def _enforce_maulwurf_recovery_mode(
         return
     if _tool_read_only_hint(tool) is True:
         return
-    if _maulwurf_recovery_enabled():
-        return
-    raise PermissionError(
-        "der kleine maulwurf is in NORMAL mode; mutating or unclassified tools "
-        "are disabled until the maulwurf-recovery-on operation is called"
-    )
+    if not _maulwurf_recovery_enabled():
+        raise PermissionError(
+            "der kleine maulwurf is in NORMAL mode; mutating or unclassified tools "
+            "are disabled until the maulwurf-recovery-on operation is called"
+        )
+    if isinstance(tool_name, str) and tool_name in MAULWURF_RECOVERY_DETACHED_EFFECT_TOOLS:
+        raise PermissionError(
+            "der kleine maulwurf RECOVERY mode forbids detached or durable effect starts"
+        )
 
 
 def _deployment_admission_invalid(reason: str) -> dict[str, Any]:
@@ -715,6 +729,12 @@ def _github_pr_view_transport_read_only(arguments: Any) -> bool:
 def _transport_roundtrip_exempt_call(
     tool_name: Any, arguments: Any
 ) -> bool:
+    if (
+        _maulwurf_runtime_active()
+        and _maulwurf_recovery_operation_name(tool_name, arguments)
+        == "maulwurf-recovery-status"
+    ):
+        return True
     if tool_name == "grabowski_github":
         return _github_pr_view_transport_read_only(arguments)
     if tool_name == "grabowski_browser_worker_semantic":
@@ -1145,8 +1165,6 @@ def _deployment_admission_register_tool_call(
     kind: str,
     *,
     drain_blocking: bool = True,
-    maulwurf_mutation: bool = False,
-    maulwurf_transition_control: bool = False,
 ) -> str:
     if kind not in {
         _DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC,
@@ -1155,21 +1173,9 @@ def _deployment_admission_register_tool_call(
         raise ValueError(f"unknown deployment admission execution kind: {kind!r}")
     if not isinstance(drain_blocking, bool):
         raise ValueError("deployment admission drain_blocking must be boolean")
-    if not isinstance(maulwurf_mutation, bool) or not isinstance(
-        maulwurf_transition_control, bool
-    ):
-        raise ValueError("Maulwurf admission flags must be boolean")
     name = tool_name if isinstance(tool_name, str) and tool_name else "unnamed"
     name = name[:_DEPLOYMENT_ADMISSION_MAX_TOOL_NAME_CHARS]
     with _DEPLOYMENT_ADMISSION_LOCK:
-        if (
-            maulwurf_mutation
-            and _MAULWURF_RECOVERY_NORMAL_TRANSITION_ACTIVE
-            and not maulwurf_transition_control
-        ):
-            raise PermissionError(
-                "der kleine maulwurf is transitioning to NORMAL; new mutations are disabled"
-            )
         if (
             len(_DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY)
             >= _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY_MAX
@@ -1206,47 +1212,6 @@ def _deployment_admission_release_tool_call(identity: Any) -> bool:
         return (
             _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY.pop(identity, None) is not None
         )
-
-
-def _maulwurf_recovery_transition_active() -> bool:
-    with _DEPLOYMENT_ADMISSION_LOCK:
-        return _MAULWURF_RECOVERY_NORMAL_TRANSITION_ACTIVE
-
-
-def _maulwurf_recovery_begin_normal_transition(
-    *, timeout_seconds: float = _MAULWURF_RECOVERY_TRANSITION_TIMEOUT_SECONDS
-) -> dict[str, Any]:
-    global _MAULWURF_RECOVERY_NORMAL_TRANSITION_ACTIVE
-    if timeout_seconds <= 0:
-        raise ValueError("Maulwurf recovery transition timeout must be positive")
-    deadline = time.monotonic() + timeout_seconds
-    with _DEPLOYMENT_ADMISSION_LOCK:
-        if _MAULWURF_RECOVERY_NORMAL_TRANSITION_ACTIVE:
-            raise RuntimeError("Maulwurf NORMAL transition is already active")
-        _MAULWURF_RECOVERY_NORMAL_TRANSITION_ACTIVE = True
-    try:
-        while True:
-            with _DEPLOYMENT_ADMISSION_LOCK:
-                remaining = sum(
-                    entry.get("drain_blocking") is not False
-                    for entry in _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY.values()
-                )
-            if remaining == 0:
-                return {"drained": True, "remaining": 0}
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"Maulwurf NORMAL transition timed out with {remaining} active mutation(s)"
-                )
-            time.sleep(_MAULWURF_RECOVERY_TRANSITION_POLL_SECONDS)
-    except BaseException:
-        _maulwurf_recovery_end_normal_transition()
-        raise
-
-
-def _maulwurf_recovery_end_normal_transition() -> None:
-    global _MAULWURF_RECOVERY_NORMAL_TRANSITION_ACTIVE
-    with _DEPLOYMENT_ADMISSION_LOCK:
-        _MAULWURF_RECOVERY_NORMAL_TRANSITION_ACTIVE = False
 
 
 def _deployment_admission_active_registry_snapshot() -> dict[str, dict[str, Any]]:
@@ -1559,11 +1524,6 @@ def _install_deployment_admission_gate() -> None:
         maulwurf_recovery_operation = _maulwurf_recovery_operation_name(
             tool_name, arguments
         )
-        maulwurf_mutation = (
-            _maulwurf_runtime_active()
-            and read_only_hint is not True
-            and maulwurf_recovery_operation != "maulwurf-recovery-status"
-        )
         kind = (
             _DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC
             if tool is not None and getattr(tool, "is_async", True) is False
@@ -1580,11 +1540,8 @@ def _install_deployment_admission_gate() -> None:
                 and maulwurf_recovery_operation
                 not in {"maulwurf-recovery-status", "maulwurf-recovery-off"}
             ),
-            maulwurf_mutation=maulwurf_mutation,
-            maulwurf_transition_control=(
-                maulwurf_recovery_operation == "maulwurf-recovery-off"
-            ),
         )
+        maulwurf_guard: int | None = None
         release_in_finally = True
         try:
             marker = _read_deployment_admission_marker()
@@ -1592,6 +1549,14 @@ def _install_deployment_admission_gate() -> None:
                 raise RuntimeError(
                     "Grabowski deployment admission drain rejects new tool calls "
                     f"while marker state is {marker.get('state')}"
+                )
+            if (
+                _maulwurf_runtime_active()
+                and read_only_hint is not True
+                and maulwurf_recovery_operation is None
+            ):
+                maulwurf_guard = (
+                    _maulwurf_recovery_module().acquire_recovery_mutation_guard()
                 )
             transport_evidence = _require_transport_roundtrip_for_tool(
                 tool_name=tool_name,
@@ -1719,10 +1684,18 @@ def _install_deployment_admission_gate() -> None:
                 # After successful submit the worker may already run. Release
                 # ownership stays with the completion callback; outer finally
                 # must not release admission while that worker may still run.
+                guard_for_callback = maulwurf_guard
+                maulwurf_guard = None
                 release_in_finally = False
 
                 def _release_when_worker_finishes(_completed: Any) -> None:
-                    _deployment_admission_release_tool_call(identity)
+                    try:
+                        if guard_for_callback is not None:
+                            _maulwurf_recovery_module().release_recovery_mutation_guard(
+                                guard_for_callback
+                            )
+                    finally:
+                        _deployment_admission_release_tool_call(identity)
 
                 callback_registered = False
                 try:
@@ -1846,7 +1819,13 @@ def _install_deployment_admission_gate() -> None:
             return result
         finally:
             if release_in_finally:
-                _deployment_admission_release_tool_call(identity)
+                try:
+                    if maulwurf_guard is not None:
+                        _maulwurf_recovery_module().release_recovery_mutation_guard(
+                            maulwurf_guard
+                        )
+                finally:
+                    _deployment_admission_release_tool_call(identity)
 
     gated_call_tool._grabowski_deployment_admission_gate = True
     manager.call_tool = gated_call_tool

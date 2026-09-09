@@ -7,6 +7,8 @@ from pathlib import Path
 import struct
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 from unittest.mock import patch
@@ -119,6 +121,86 @@ class TestDerKleineMaulwurfOperator(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "secret material"):
                         mole.main(["on", "--reason", reason])
                 self.assertFalse(path.exists())
+
+    def test_recovery_status_rejects_secret_bearing_persisted_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mode.json"
+            secret = "".join(("s", "k-", "a" * 24))
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": mole.RECOVERY_MODE_SCHEMA_VERSION,
+                        "kind": mole.RECOVERY_MODE_KIND,
+                        "mode": mole.RECOVERY_MODE_RECOVERY,
+                        "reason": secret,
+                        "changed_at_unix": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            path.chmod(0o600)
+            status = mole.recovery_mode_status(path=path)
+        self.assertFalse(status["valid"])
+        self.assertEqual("normal", status["mode"])
+        self.assertNotIn(secret, json.dumps(status, sort_keys=True))
+
+    def test_normal_mode_guard_denial_creates_no_lock_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mode.json"
+            lock_path = path.with_name(f".{path.name}.lock")
+            with self.assertRaisesRegex(PermissionError, "NORMAL mode"):
+                mole.acquire_recovery_mutation_guard(path=path)
+            self.assertFalse(path.exists())
+            self.assertFalse(lock_path.exists())
+
+    def test_recovery_off_drains_active_mutation_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mode.json"
+            mole.enable_recovery_mode("test-recovery", path=path)
+            guard = mole.acquire_recovery_mutation_guard(path=path)
+            started = threading.Event()
+            finished = threading.Event()
+            outcome: dict[str, object] = {}
+
+            def disable() -> None:
+                started.set()
+                outcome.update(mole.disable_recovery_mode(path=path))
+                finished.set()
+
+            thread = threading.Thread(target=disable)
+            thread.start()
+            self.assertTrue(started.wait(timeout=1.0))
+            time.sleep(0.05)
+            self.assertFalse(finished.is_set())
+            mole.release_recovery_mutation_guard(guard)
+            thread.join(timeout=2.0)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual("normal", outcome.get("mode"))
+            with self.assertRaisesRegex(PermissionError, "NORMAL mode"):
+                mole.acquire_recovery_mutation_guard(path=path)
+
+    def test_post_replace_directory_fsync_failure_is_explicitly_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mode.json"
+            real_fsync = mole.os.fsync
+            calls = 0
+
+            def fail_directory_fsync(descriptor: int) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("directory fsync failed")
+                real_fsync(descriptor)
+
+            with patch.object(mole.os, "fsync", side_effect=fail_directory_fsync):
+                result = mole.enable_recovery_mode("test-recovery", path=path)
+            observed = mole.recovery_mode_status(path=path)
+        self.assertTrue(result["valid"])
+        self.assertTrue(result["ambiguity"])
+        self.assertTrue(result["effect_started"])
+        self.assertFalse(result["durability_confirmed"])
+        self.assertEqual("effect_observed_durability_unknown", result["write_outcome"])
+        self.assertEqual("recovery", observed["mode"])
 
     def test_direct_recovery_cli_fails_when_readback_disagrees(self) -> None:
         with (

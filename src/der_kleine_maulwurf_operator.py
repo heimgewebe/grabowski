@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import fcntl
 import json
 import os
 import re
@@ -2418,6 +2419,112 @@ def recovery_mode_path() -> Path:
     return Path.home() / ".local" / "state" / "grabowski" / "maulwurf-recovery-mode.v1.json"
 
 
+def _open_recovery_state_parent(target: Path) -> int:
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = -1
+    try:
+        descriptor = os.open(target.parent, flags)
+        opened = os.fstat(descriptor)
+        linked = os.lstat(target.parent)
+    except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise RuntimeError("unsafe_recovery_mode_directory") from exc
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or stat.S_ISLNK(linked.st_mode)
+        or opened.st_dev != linked.st_dev
+        or opened.st_ino != linked.st_ino
+        or opened.st_uid != os.geteuid()
+        or opened.st_nlink < 1
+        or stat.S_IMODE(opened.st_mode) & 0o022
+    ):
+        os.close(descriptor)
+        raise RuntimeError("unsafe_recovery_mode_directory")
+    return descriptor
+
+
+def _open_recovery_mode_lock(parent_fd: int, target: Path) -> int:
+    name = f".{target.name}.lock"
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = -1
+    try:
+        descriptor = os.open(name, flags, 0o600, dir_fd=parent_fd)
+        opened = os.fstat(descriptor)
+        linked = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise RuntimeError("unsafe_recovery_mode_lock") from exc
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_dev != linked.st_dev
+        or opened.st_ino != linked.st_ino
+        or opened.st_uid != os.geteuid()
+        or opened.st_nlink != 1
+        or stat.S_IMODE(opened.st_mode) & 0o077
+    ):
+        os.close(descriptor)
+        raise RuntimeError("unsafe_recovery_mode_lock")
+    return descriptor
+
+
+def acquire_recovery_mutation_guard(*, path: Path | None = None) -> int:
+    target = recovery_mode_path() if path is None else Path(path)
+    initial = recovery_mode_status(path=target)
+    if not (
+        initial.get("valid") is True
+        and initial.get("mode") == RECOVERY_MODE_RECOVERY
+    ):
+        raise PermissionError(
+            "der kleine maulwurf is in NORMAL mode; mutating tools are disabled"
+        )
+    parent_fd = _open_recovery_state_parent(target)
+    try:
+        descriptor = _open_recovery_mode_lock(parent_fd, target)
+    finally:
+        os.close(parent_fd)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_SH)
+        status = recovery_mode_status(path=target)
+        if not (
+            status.get("valid") is True
+            and status.get("mode") == RECOVERY_MODE_RECOVERY
+        ):
+            raise PermissionError(
+                "der kleine maulwurf is in NORMAL mode; mutating tools are disabled"
+            )
+        return descriptor
+    except BaseException:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
+
+
+def release_recovery_mutation_guard(descriptor: int | None) -> None:
+    if not isinstance(descriptor, int) or descriptor < 0:
+        return
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
+
+
 def recovery_mode_status(*, path: Path | None = None) -> dict[str, object]:
     target = recovery_mode_path() if path is None else Path(path)
     descriptor: int | None = None
@@ -2497,6 +2604,11 @@ def recovery_mode_status(*, path: Path | None = None) -> dict[str, object]:
         or not isinstance(value.get("changed_at_unix"), int)
         or value.get("changed_at_unix") < 0
         or (value.get("reason") is not None and not isinstance(value.get("reason"), str))
+        or (isinstance(value.get("reason"), str) and len(value["reason"]) > 240)
+        or (
+            isinstance(value.get("reason"), str)
+            and RECOVERY_REASON_SECRET_PATTERN.search(value["reason"]) is not None
+        )
     ):
         return {
             "schema_version": RECOVERY_MODE_SCHEMA_VERSION,
@@ -2527,49 +2639,88 @@ def _write_recovery_mode(
         raise ValueError("recovery reason is too long")
     if normalized_reason is not None and RECOVERY_REASON_SECRET_PATTERN.search(normalized_reason):
         raise ValueError("recovery reason must not contain secret material")
+
     target = recovery_mode_path() if path is None else Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    document = {
-        "schema_version": RECOVERY_MODE_SCHEMA_VERSION,
-        "kind": RECOVERY_MODE_KIND,
-        "mode": mode,
-        "reason": normalized_reason,
-        "changed_at_unix": int(time.time()),
-    }
-    payload = (
-        json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
-    ).encode("utf-8")
-    temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(temporary, flags, 0o600)
+    parent_fd = _open_recovery_state_parent(target)
+    lock_fd = -1
+    temporary_name = f".{target.name}.{uuid.uuid4().hex}.tmp"
+    temporary_present = False
     try:
-        view = memoryview(payload)
-        while view:
-            written = os.write(descriptor, view)
-            if written <= 0:
-                raise OSError("short recovery mode write")
-            view = view[written:]
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    try:
-        os.replace(temporary, target)
-        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        lock_fd = _open_recovery_mode_lock(parent_fd, target)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        document = {
+            "schema_version": RECOVERY_MODE_SCHEMA_VERSION,
+            "kind": RECOVERY_MODE_KIND,
+            "mode": mode,
+            "reason": normalized_reason,
+            "changed_at_unix": int(time.time()),
+        }
+        payload = (
+            json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
         if hasattr(os, "O_NOFOLLOW"):
-            directory_flags |= os.O_NOFOLLOW
-        parent_fd = os.open(target.parent, directory_flags)
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(temporary_name, flags, 0o600, dir_fd=parent_fd)
+        temporary_present = True
+        try:
+            view = memoryview(payload)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("short recovery mode write")
+                view = view[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(
+            temporary_name,
+            target.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        temporary_present = False
         try:
             os.fsync(parent_fd)
-        finally:
-            os.close(parent_fd)
+        except OSError as exc:
+            observed = recovery_mode_status(path=target)
+            matching = observed.get("valid") is True and observed.get("mode") == mode
+            return {
+                **observed,
+                "write_outcome": (
+                    "effect_observed_durability_unknown" if matching else "outcome_unknown"
+                ),
+                "requested_mode": mode,
+                "effect_started": True,
+                "ambiguity": True,
+                "durability_confirmed": False,
+                "error_type": type(exc).__name__,
+            }
+        observed = recovery_mode_status(path=target)
+        return {
+            **observed,
+            "write_outcome": "confirmed",
+            "durability_confirmed": True,
+        }
     finally:
+        if temporary_present:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_fd)
+            except OSError:
+                pass
+        if lock_fd >= 0:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
         try:
-            temporary.unlink()
-        except FileNotFoundError:
+            os.close(parent_fd)
+        except OSError:
             pass
-    return recovery_mode_status(path=target)
 
 
 def enable_recovery_mode(
@@ -2598,6 +2749,8 @@ def main(argv: list[str] | None = None) -> int:
     success = result.get("valid") is True and (
         expected_mode is None or result.get("mode") == expected_mode
     )
+    if expected_mode is not None:
+        success = success and result.get("write_outcome") == "confirmed"
     return 0 if success else 1
 
 

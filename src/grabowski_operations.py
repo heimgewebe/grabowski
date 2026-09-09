@@ -278,22 +278,14 @@ def _run_maulwurf_recovery_operation(
     if operation in {MAULWURF_RECOVERY_ON_OPERATION, MAULWURF_RECOVERY_OFF_OPERATION}:
         operator._require_operator_capability("maulwurf_recovery_control")
 
-    transition_started = False
-    try:
-        if operation == MAULWURF_RECOVERY_OFF_OPERATION:
-            operator._maulwurf_recovery_begin_normal_transition()
-            transition_started = True
-        if operation == MAULWURF_RECOVERY_STATUS_OPERATION:
-            status = mole.recovery_mode_status()
-        elif operation == MAULWURF_RECOVERY_ON_OPERATION:
-            status = mole.enable_recovery_mode((parameters or {})["reason"])
-        elif operation == MAULWURF_RECOVERY_OFF_OPERATION:
-            status = mole.disable_recovery_mode()
-        else:
-            raise ValueError(f"Unknown Maulwurf recovery operation: {operation}")
-    finally:
-        if transition_started:
-            operator._maulwurf_recovery_end_normal_transition()
+    if operation == MAULWURF_RECOVERY_STATUS_OPERATION:
+        status = mole.recovery_mode_status()
+    elif operation == MAULWURF_RECOVERY_ON_OPERATION:
+        status = mole.enable_recovery_mode((parameters or {})["reason"])
+    elif operation == MAULWURF_RECOVERY_OFF_OPERATION:
+        status = mole.disable_recovery_mode()
+    else:
+        raise ValueError(f"Unknown Maulwurf recovery operation: {operation}")
     expected_mode = {
         MAULWURF_RECOVERY_ON_OPERATION: "recovery",
         MAULWURF_RECOVERY_OFF_OPERATION: "normal",
@@ -301,6 +293,8 @@ def _run_maulwurf_recovery_operation(
     success = status.get("valid") is True and (
         expected_mode is None or status.get("mode") == expected_mode
     )
+    if expected_mode is not None:
+        success = success and status.get("write_outcome") == "confirmed"
     return {
         "operation": operation,
         "success": success,
