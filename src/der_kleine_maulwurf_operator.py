@@ -7,6 +7,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import stat
 import time
@@ -2401,6 +2402,11 @@ RECOVERY_MODE_MAX_BYTES = 4096
 RECOVERY_MODE_NORMAL = "normal"
 RECOVERY_MODE_RECOVERY = "recovery"
 RECOVERY_MODE_VALUES = frozenset({RECOVERY_MODE_NORMAL, RECOVERY_MODE_RECOVERY})
+RECOVERY_REASON_SECRET_PATTERN = re.compile(
+    r"(?i)(?:\bBearer\s+[A-Za-z0-9._~+/-]{12,}=*|"
+    r"\b(?:TOKEN|SECRET|PASSWORD|PASSWD|COOKIE|CREDENTIAL|AUTHORIZATION|API_KEY|APIKEY)"
+    r"\b\s*[:=]\s*\S+)"
+)
 
 
 def recovery_mode_path() -> Path:
@@ -2514,6 +2520,8 @@ def _write_recovery_mode(
         raise ValueError("recovery reason is required")
     if normalized_reason is not None and len(normalized_reason) > 240:
         raise ValueError("recovery reason is too long")
+    if normalized_reason is not None and RECOVERY_REASON_SECRET_PATTERN.search(normalized_reason):
+        raise ValueError("recovery reason must not contain secret material")
     target = recovery_mode_path() if path is None else Path(path)
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     document = {

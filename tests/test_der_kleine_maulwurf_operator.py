@@ -105,6 +105,16 @@ class TestDerKleineMaulwurfOperator(unittest.TestCase):
             self.assertEqual("normal", disabled["mode"])
             self.assertFalse(mole.recovery_mode_enabled(path=path))
 
+    def test_direct_recovery_cli_rejects_secret_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mode.json"
+            reason = "".join(("Bear", "er ", "abcdefghijklmnopqrst"))
+            with patch.object(mole, "recovery_mode_path", return_value=path):
+                with self.assertRaisesRegex(ValueError, "secret material"):
+                    mole.main(["on", "--reason", reason])
+            self.assertFalse(path.exists())
+
+
     def test_oversized_recovery_mode_fails_closed_without_unbounded_read(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "mode.json"

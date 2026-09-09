@@ -78,6 +78,31 @@ class MaulwurfRecoveryOperationTests(unittest.TestCase):
                 self.assertEqual("normal", disabled["status"]["mode"])
                 self.assertFalse(mole.recovery_mode_enabled(path=path))
 
+    def test_recovery_write_success_requires_matching_valid_readback(self) -> None:
+        with patch.object(
+            operations.operator, "_maulwurf_runtime_active", return_value=True
+        ):
+            with patch.object(
+                mole,
+                "enable_recovery_mode",
+                return_value={"valid": False, "mode": "normal"},
+            ):
+                result = operations.grabowski_operation_run(
+                    operations.MAULWURF_RECOVERY_ON_OPERATION,
+                    {"reason": "primary unavailable"},
+                )
+                self.assertFalse(result["success"])
+            with patch.object(
+                mole,
+                "disable_recovery_mode",
+                return_value={"valid": True, "mode": "recovery"},
+            ):
+                result = operations.grabowski_operation_run(
+                    operations.MAULWURF_RECOVERY_OFF_OPERATION, None
+                )
+                self.assertFalse(result["success"])
+
+
     def test_typed_operations_are_not_available_on_primary_runtime(self) -> None:
         with patch.object(
             operations.operator, "_maulwurf_runtime_active", return_value=False

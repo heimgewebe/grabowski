@@ -284,9 +284,16 @@ def _run_maulwurf_recovery_operation(
         status = mole.disable_recovery_mode()
     else:
         raise ValueError(f"Unknown Maulwurf recovery operation: {operation}")
+    expected_mode = {
+        MAULWURF_RECOVERY_ON_OPERATION: "recovery",
+        MAULWURF_RECOVERY_OFF_OPERATION: "normal",
+    }.get(operation)
+    success = status.get("valid") is True and (
+        expected_mode is None or status.get("mode") == expected_mode
+    )
     return {
         "operation": operation,
-        "success": True,
+        "success": success,
         "effect": plan["effect"],
         "status": status,
     }
