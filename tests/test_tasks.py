@@ -7111,6 +7111,51 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(result["blocked"][0]["task_id"], started["task"]["task_id"])
         self.assertIn("completed", result["blocked"][0]["reason"])
 
+    def test_recovery_active_task_effects_observes_each_recorded_backend(self) -> None:
+        rows = [
+            {
+                "task_id": "a" * 24, "host": "local",
+                "unit": "grabowski-task-aaaaaaaaaaaaaaaaaaaaaaaa-a1.service",
+                "authoritative_unit": "grabowski-task-aaaaaaaaaaaaaaaaaaaaaaaa-a1.service", "execution_backend": "systemd-root-broker",
+                "systemd_scope": "system", "state": "running", "created_at_unix": 2,
+            },
+            {
+                "task_id": "b" * 24, "host": "remote-node",
+                "unit": "grabowski-task-bbbbbbbbbbbbbbbbbbbbbbbb-a1.service",
+                "authoritative_unit": "grabowski-task-bbbbbbbbbbbbbbbbbbbbbbbb-a1.service",
+                "execution_backend": "systemd-user",
+                "systemd_scope": "user", "state": "outcome_unknown", "created_at_unix": 1,
+            },
+        ]
+        class Result:
+            def fetchall(self): return rows
+        class Connection:
+            parameters = None
+            def execute(self, _query, parameters):
+                self.parameters = parameters
+                return Result()
+        connection = Connection()
+        @contextmanager
+        def snapshot():
+            yield connection
+        observations = [
+            {"state": "running"},
+            {"state": "outcome_unknown"},
+        ]
+        with (
+            patch.object(tasks, "_task_read_snapshot", snapshot),
+            patch.object(tasks, "_observe", side_effect=observations) as observe,
+        ):
+            effects = tasks.recovery_active_task_effects()
+        self.assertEqual(2, observe.call_count)
+        self.assertEqual(
+            (*tasks.RECOVERY_TASK_OBSERVE_STATES, tasks.RECOVERY_ACTIVE_TASK_SCAN_LIMIT + 1),
+            connection.parameters,
+        )
+        self.assertEqual(2, len(effects))
+        self.assertTrue(any("systemd-root-broker:system" in item for item in effects))
+        self.assertTrue(any("remote-node:systemd-user:user" in item for item in effects))
+
     def _task_migration_backups(self) -> list[Path]:
         return sorted(
             self.database.parent.glob(

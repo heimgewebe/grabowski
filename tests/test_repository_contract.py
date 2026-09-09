@@ -676,7 +676,8 @@ class RepositoryContractTests(unittest.TestCase):
             set(failover["capabilities"]),
             {
                 "file_read", "audit_verify", "audit_read", "bureau_mutation",
-                "resource_lease", "process_inspect", "port_inspect",
+                "maulwurf_recovery_control", "resource_lease",
+                "process_inspect", "port_inspect",
             },
         )
         self.assertEqual(

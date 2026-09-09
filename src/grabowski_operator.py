@@ -363,6 +363,7 @@ OPERATOR_CAPABILITIES = (
     "artifact_transfer",
     "browser_worker",
     "gui_worker",
+    "maulwurf_recovery_control",
 )
 PRIVILEGED_REFERENCE_ACTIONS = {
     "install_system_package",
@@ -418,6 +419,86 @@ def _find_server() -> FastMCP:
 
 
 mcp = _find_server()
+
+
+def _maulwurf_runtime_active() -> bool:
+    env_name = getattr(
+        base, "MCP_BRANDING_VARIANT_ENV", "GRABOWSKI_MCP_BRANDING_VARIANT"
+    )
+    variant = os.environ.get(env_name, "").strip()
+    allowed = {
+        getattr(base, "DER_KLEINE_MAULWURF_BRANDING_VARIANT", "der-kleine-maulwurf"),
+        getattr(base, "LEGACY_KLEINER_MAULWURF_BRANDING_VARIANT", "kleiner-maulwurf"),
+    }
+    return variant in allowed
+
+
+def _maulwurf_recovery_module() -> Any:
+    import der_kleine_maulwurf_operator as mole
+
+    return mole
+
+
+def _maulwurf_recovery_enabled() -> bool:
+    return bool(_maulwurf_recovery_module().recovery_mode_enabled())
+
+
+def _maulwurf_recovery_operation_name(tool_name: Any, arguments: Any) -> str | None:
+    if tool_name != "grabowski_operation_run" or not isinstance(arguments, dict):
+        return None
+    operation = arguments.get("operation")
+    if operation in {
+        "maulwurf-recovery-status",
+        "maulwurf-recovery-on",
+        "maulwurf-recovery-off",
+    }:
+        return str(operation)
+    return None
+
+
+def _maulwurf_recovery_control_call(tool_name: Any, arguments: Any) -> bool:
+    return _maulwurf_recovery_operation_name(tool_name, arguments) is not None
+
+
+def _enforce_maulwurf_recovery_mode(
+    tool_name: Any, arguments: Any, tool: Any
+) -> None:
+    if not _maulwurf_runtime_active():
+        return
+    if _maulwurf_recovery_control_call(tool_name, arguments):
+        return
+    if _tool_read_only_hint(tool) is True:
+        return
+    recovery_enabled = _maulwurf_recovery_enabled()
+    if not recovery_enabled:
+        raise PermissionError(
+            "der kleine maulwurf is in NORMAL mode; mutating or unclassified tools "
+            "are disabled until the maulwurf-recovery-on operation is called"
+        )
+    if tool_name == "grabowski_tmux_send":
+        raise PermissionError(
+            "der kleine maulwurf RECOVERY mode does not allow grabowski_tmux_send; "
+            "use tracked jobs, tasks, or agent workspaces for detached recovery work"
+        )
+    if (
+        tool_name == "grabowski_user_service"
+        and isinstance(arguments, dict)
+        and arguments.get("action") in {"start", "restart"}
+    ):
+        raise PermissionError(
+            "der kleine maulwurf RECOVERY mode does not allow user-service start/restart; "
+            "the resulting service would outlive the recovery mutation guard"
+        )
+    if tool_name in {
+        "grabowski_terminal_run",
+        "grabowski_fleet_run",
+        "grabowski_secret_use",
+        "grabowski_juno_run",
+    }:
+        raise PermissionError(
+            "der kleine maulwurf RECOVERY mode does not allow untracked generic execution; "
+            "use tracked jobs, tasks, or agent workspaces for recovery commands"
+        )
 
 
 def _deployment_admission_invalid(reason: str) -> dict[str, Any]:
@@ -669,6 +750,12 @@ def _deployment_admission_drain_blocking(
 def _transport_roundtrip_exempt_call(
     tool_name: Any, arguments: Any
 ) -> bool:
+    if (
+        _maulwurf_runtime_active()
+        and _maulwurf_recovery_operation_name(tool_name, arguments)
+        == "maulwurf-recovery-status"
+    ):
+        return True
     if tool_name == "grabowski_github":
         return _github_pr_view_transport_read_only(arguments)
     if tool_name == "grabowski_browser_worker_semantic":
@@ -1390,7 +1477,7 @@ def _install_deployment_admission_gate() -> None:
         # hint. Enforce it before observer/readiness bypasses and before any
         # transport assertion can be consumed. Headerless local reads retain
         # legacy behavior; an enrolled connector capability is policy-bound.
-        base._transport_authorize_connector_tool(context, tool_name)
+        base._transport_authorize_connector_tool(context, tool_name, arguments)
         observer_evidence: dict[str, Any] | None = None
         try:
             observer_evidence = _deployment_observer_request_evidence(
@@ -1404,6 +1491,7 @@ def _install_deployment_admission_gate() -> None:
             if callable(get_tool) and isinstance(tool_name, str)
             else None
         )
+        _enforce_maulwurf_recovery_mode(tool_name, arguments, tool)
         if (
             observer_evidence is not None
             and observer_evidence.get("marker_bound") is True
@@ -1454,6 +1542,9 @@ def _install_deployment_admission_gate() -> None:
                 return await original(*args, **kwargs)
 
         read_only_hint = _tool_read_only_hint(tool)
+        maulwurf_recovery_operation = _maulwurf_recovery_operation_name(
+            tool_name, arguments
+        )
         kind = (
             _DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC
             if tool is not None and getattr(tool, "is_async", True) is False
@@ -1462,10 +1553,13 @@ def _install_deployment_admission_gate() -> None:
         identity = _deployment_admission_register_tool_call(
             tool_name,
             kind,
-            drain_blocking=_deployment_admission_drain_blocking(
-                tool_name, arguments, tool
+            drain_blocking=(
+                _deployment_admission_drain_blocking(tool_name, arguments, tool)
+                and maulwurf_recovery_operation
+                not in {"maulwurf-recovery-status", "maulwurf-recovery-off"}
             ),
         )
+        maulwurf_guard: int | None = None
         release_in_finally = True
         try:
             marker = _read_deployment_admission_marker()
@@ -1473,6 +1567,14 @@ def _install_deployment_admission_gate() -> None:
                 raise RuntimeError(
                     "Grabowski deployment admission drain rejects new tool calls "
                     f"while marker state is {marker.get('state')}"
+                )
+            if (
+                _maulwurf_runtime_active()
+                and read_only_hint is not True
+                and maulwurf_recovery_operation is None
+            ):
+                maulwurf_guard = (
+                    _maulwurf_recovery_module().acquire_recovery_mutation_guard()
                 )
             transport_evidence = _require_transport_roundtrip_for_tool(
                 tool_name=tool_name,
@@ -1482,12 +1584,16 @@ def _install_deployment_admission_gate() -> None:
             )
             enforcement_configured = (
                 grabowski_effect_interceptor.fence_enforcement_required()
-                if read_only_hint is not True
+                if read_only_hint is not True and not _maulwurf_runtime_active()
                 else False
             )
             if read_only_hint is not True:
                 active_profile = base._load_policy().get("active_profile")
-                if active_profile == "failover-mutate" and not enforcement_configured:
+                if (
+                    active_profile == "failover-mutate"
+                    and not enforcement_configured
+                    and not _maulwurf_runtime_active()
+                ):
                     raise grabowski_effect_interceptor.OperatorFenceEnforcementDenied(
                         "failover_mutation_requires_fence_config"
                     )
@@ -1596,10 +1702,26 @@ def _install_deployment_admission_gate() -> None:
                 # After successful submit the worker may already run. Release
                 # ownership stays with the completion callback; outer finally
                 # must not release admission while that worker may still run.
+                guard_for_callback = maulwurf_guard
+                maulwurf_guard = None
                 release_in_finally = False
 
+                release_lock = threading.Lock()
+                release_done = False
+
                 def _release_when_worker_finishes(_completed: Any) -> None:
-                    _deployment_admission_release_tool_call(identity)
+                    nonlocal release_done
+                    with release_lock:
+                        if release_done:
+                            return
+                        release_done = True
+                    try:
+                        if guard_for_callback is not None:
+                            _maulwurf_recovery_module().release_recovery_mutation_guard(
+                                guard_for_callback
+                            )
+                    finally:
+                        _deployment_admission_release_tool_call(identity)
 
                 callback_registered = False
                 try:
@@ -1616,13 +1738,29 @@ def _install_deployment_admission_gate() -> None:
                             )
                             callback_registered = True
                         except BaseException as callback_error:
-                            logging.getLogger(__name__).error(
-                                "sync tool release callback registration "
-                                "failed after submit; admission remains held "
-                                "until process lifecycle: %s",
-                                type(callback_error).__name__,
-                                exc_info=callback_error,
-                            )
+                            def _fallback_wait_and_release() -> None:
+                                try:
+                                    try:
+                                        worker_future.result()
+                                    except BaseException:
+                                        pass
+                                finally:
+                                    _release_when_worker_finishes(worker_future)
+
+                            try:
+                                threading.Thread(
+                                    target=_fallback_wait_and_release,
+                                    name="grabowski-sync-release-fallback",
+                                    daemon=True,
+                                ).start()
+                                callback_registered = True
+                            except BaseException as fallback_error:
+                                logging.getLogger(__name__).error(
+                                    "sync tool release handoff failed after submit; "
+                                    "admission and recovery guard remain held until process lifecycle: %s",
+                                    type(fallback_error).__name__,
+                                    exc_info=fallback_error,
+                                )
                     # Conservative outcome only: do not release admission or
                     # start a conflicting new effect while the worker may run.
                     # Under fence enforcement the worker exclusively owns
@@ -1723,7 +1861,13 @@ def _install_deployment_admission_gate() -> None:
             return result
         finally:
             if release_in_finally:
-                _deployment_admission_release_tool_call(identity)
+                try:
+                    if maulwurf_guard is not None:
+                        _maulwurf_recovery_module().release_recovery_mutation_guard(
+                            maulwurf_guard
+                        )
+                finally:
+                    _deployment_admission_release_tool_call(identity)
 
     gated_call_tool._grabowski_deployment_admission_gate = True
     manager.call_tool = gated_call_tool
