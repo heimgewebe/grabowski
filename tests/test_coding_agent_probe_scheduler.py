@@ -967,7 +967,7 @@ for line in sys.stdin:
         ):
             SCHEDULER.validate_state_after_probe(before, tampered, probe)
 
-    def test_probe_validation_accepts_ox_preview_verified_pool(self) -> None:
+    def test_probe_validation_rejects_retired_ox_preview_verified_pool(self) -> None:
         probe = {
             "schema_version": 2,
             "observed_at": SCHEDULER.iso_now(),
@@ -987,7 +987,11 @@ for line in sys.stdin:
             "paid_api_requests_authorized": 0,
         }
         probe["catalog_probe_sha256"] = SCHEDULER.probe_digest(probe)
-        SCHEDULER.validate_probe(probe)
+        with self.assertRaisesRegex(
+            SCHEDULER.ProbeSchedulerError,
+            "verified_quota_pools",
+        ):
+            SCHEDULER.validate_probe(probe)
 
     def test_probe_validation_accepts_all_canonical_verified_pools(self) -> None:
         probe = {
