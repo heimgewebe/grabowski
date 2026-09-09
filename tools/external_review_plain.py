@@ -2277,6 +2277,11 @@ def run_from_manifest(
     if provider not in PROVIDERS:
         raise PlainReviewError(f"unsupported plain review provider: {provider}")
     if provider == "ox-alpha":
+        raise PlainReviewError(
+            "Ox Alpha plain review provider is retired; GLM-5.3-Flash routes require "
+            "new exact free-route verification before execution"
+        )
+    if provider == "ox-alpha":
         if context_attestation not in OX_ALPHA_CONTEXT_ATTESTATIONS:
             raise PlainReviewError(
                 "Ox Alpha plain review requires an explicit safe context "
@@ -2569,7 +2574,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument(
-        "--provider", required=True, choices=sorted(PROVIDERS)
+        "--provider", required=True, choices=sorted(PROVIDERS - {"ox-alpha"})
     )
     parser.add_argument("--executable")
     parser.add_argument("--model")

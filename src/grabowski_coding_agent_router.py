@@ -1078,6 +1078,8 @@ def _pool_gate(
     *,
     critical: bool,
 ) -> tuple[bool, list[str], float, bool]:
+    if pool_id == "openrouter-ox-alpha-preview":
+        return False, ["retired Ox Alpha preview pool"], 0.0, False
     pool = _effective_pool(pool_id, catalog, state)
     reasons: list[str] = []
     execution_eligible = True
@@ -1104,26 +1106,6 @@ def _pool_gate(
         return False, ["pool concurrency is saturated"], 0.0, False
     if pool.get("cost_mode") == "temporary-free-account":
         verified = _parse_time(pool.get("verified_at"))
-        if pool_id == "openrouter-ox-alpha-preview":
-            live_catalog = state.get("catalog", {})
-            verified_pools = live_catalog.get("verified_quota_pools", [])
-            provider = live_catalog.get("providers", {}).get("openrouter", {})
-            if (
-                not isinstance(verified_pools, list)
-                or pool_id not in verified_pools
-                or not isinstance(provider, dict)
-                or provider.get("model_id") != "stealth/ox-alpha"
-                or provider.get("price_source") != "public-models-api"
-                or provider.get("zero_price_verified") is not True
-            ):
-                return (
-                    False,
-                    ["temporary-free zero-cost evidence is missing"],
-                    0.0,
-                    False,
-                )
-            if pool.get("credits_allowed") is not False:
-                return False, ["credits fallback is not forbidden"], 0.0, False
         freshness = int(pool.get("freshness_seconds", 86400))
         age = (_utc_now() - verified).total_seconds() if verified is not None else None
         if age is None or not 0 <= age <= freshness:
