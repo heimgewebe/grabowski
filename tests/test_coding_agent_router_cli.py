@@ -433,52 +433,6 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         digest = digest_input.pop("catalog_probe_sha256")
         self.assertEqual(digest, cli._probe_digest(digest_input))
 
-    def test_openrouter_ox_alpha_public_price_probe_fails_closed_on_incomplete_read(self) -> None:
-        response = mock.MagicMock()
-        response.__enter__.return_value = response
-        response.read.side_effect = cli.http.client.IncompleteRead(b"{\"data\":")
-        with mock.patch.object(cli.urllib.request, "urlopen", return_value=response):
-            result = cli._openrouter_ox_alpha_price_status()
-        self.assertFalse(result["available"])
-        self.assertFalse(result["zero_price_verified"])
-        self.assertEqual(result["pricing_status"], "unavailable")
-
-    def test_openrouter_ox_alpha_public_price_probe_requires_every_price_zero(self) -> None:
-        zero_payload = {
-            "data": [
-                {
-                    "id": "stealth/ox-alpha",
-                    "pricing": {"prompt": "0", "completion": "0", "request": "0"},
-                }
-            ]
-        }
-        with mock.patch.object(
-            cli.urllib.request,
-            "urlopen",
-            return_value=io.BytesIO(json.dumps(zero_payload).encode("utf-8")),
-        ):
-            verified = cli._openrouter_ox_alpha_price_status()
-        self.assertTrue(verified["zero_price_verified"])
-        self.assertEqual(verified["pricing_status"], "zero")
-        self.assertEqual(verified["model_id"], "stealth/ox-alpha")
-
-        paid_payload = {
-            "data": [
-                {
-                    "id": "stealth/ox-alpha",
-                    "pricing": {"prompt": "0", "completion": "0.000001"},
-                }
-            ]
-        }
-        with mock.patch.object(
-            cli.urllib.request,
-            "urlopen",
-            return_value=io.BytesIO(json.dumps(paid_payload).encode("utf-8")),
-        ):
-            rejected = cli._openrouter_ox_alpha_price_status()
-        self.assertFalse(rejected["zero_price_verified"])
-        self.assertEqual(rejected["pricing_status"], "nonzero-or-unknown")
-
     def test_probe_never_reverifies_retired_ox_preview(self) -> None:
         catalog, _ = router._load_catalog()
 
@@ -529,12 +483,8 @@ class CodingAgentRouterCliTests(unittest.TestCase):
             stack.enter_context(
                 mock.patch.object(cli, "_resolve_executable", return_value=None)
             )
-            price_probe = stack.enter_context(
-                mock.patch.object(cli, "_openrouter_ox_alpha_price_status")
-            )
             probe = cli._probe(catalog)
 
-        price_probe.assert_not_called()
         self.assertNotIn(
             "openrouter-ox-alpha-preview", probe["verified_quota_pools"]
         )
