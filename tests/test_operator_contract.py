@@ -563,6 +563,24 @@ class OperatorContractTests(unittest.TestCase):
                 with self.subTest(name=name):
                     operator._enforce_maulwurf_recovery_mode(name, {}, tool)
 
+    def test_maulwurf_recovery_blocks_untracked_tmux_send(self) -> None:
+        operator = _load_operator_module()
+        tool = types.SimpleNamespace(
+            is_async=True,
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {"GRABOWSKI_MCP_BRANDING_VARIANT": "der-kleine-maulwurf"},
+            ),
+            patch.object(operator, "_maulwurf_recovery_enabled", return_value=True),
+        ):
+            with self.assertRaisesRegex(PermissionError, "tracked jobs"):
+                operator._enforce_maulwurf_recovery_mode(
+                    "grabowski_tmux_send", {"target": "ops:0", "text": "repair"}, tool
+                )
+
     def test_maulwurf_mutation_holds_recovery_guard_through_domain_call(self) -> None:
         operator = _load_operator_module()
         events: list[str] = []

@@ -469,10 +469,16 @@ def _enforce_maulwurf_recovery_mode(
         return
     if _tool_read_only_hint(tool) is True:
         return
-    if not _maulwurf_recovery_enabled():
+    recovery_enabled = _maulwurf_recovery_enabled()
+    if not recovery_enabled:
         raise PermissionError(
             "der kleine maulwurf is in NORMAL mode; mutating or unclassified tools "
             "are disabled until the maulwurf-recovery-on operation is called"
+        )
+    if tool_name == "grabowski_tmux_send":
+        raise PermissionError(
+            "der kleine maulwurf RECOVERY mode does not allow grabowski_tmux_send; "
+            "use tracked jobs, tasks, or agent workspaces for detached recovery work"
         )
 
 
