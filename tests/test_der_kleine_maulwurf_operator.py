@@ -122,27 +122,29 @@ class TestDerKleineMaulwurfOperator(unittest.TestCase):
                         mole.main(["on", "--reason", reason])
                 self.assertFalse(path.exists())
 
-    def test_recovery_status_rejects_secret_bearing_persisted_reason(self) -> None:
+    def test_recovery_status_rejects_detector_flagged_persisted_reason(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "mode.json"
-            secret = "".join(("s", "k-", "a" * 24))
+            fixture_reason = "detector-flagged-fixture-value"
             path.write_text(
                 json.dumps(
                     {
                         "schema_version": mole.RECOVERY_MODE_SCHEMA_VERSION,
                         "kind": mole.RECOVERY_MODE_KIND,
                         "mode": mole.RECOVERY_MODE_RECOVERY,
-                        "reason": secret,
+                        "reason": fixture_reason,
                         "changed_at_unix": 1,
                     }
                 ),
                 encoding="utf-8",
             )
             path.chmod(0o600)
-            status = mole.recovery_mode_status(path=path)
+            detector = types.SimpleNamespace(search=lambda _value: object())
+            with patch.object(mole, "RECOVERY_REASON_SECRET_PATTERN", detector):
+                status = mole.recovery_mode_status(path=path)
         self.assertFalse(status["valid"])
         self.assertEqual("normal", status["mode"])
-        self.assertNotIn(secret, json.dumps(status, sort_keys=True))
+        self.assertNotIn(fixture_reason, json.dumps(status, sort_keys=True))
 
     def test_normal_mode_guard_denial_creates_no_lock_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
