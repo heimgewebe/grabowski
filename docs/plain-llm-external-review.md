@@ -4,10 +4,10 @@ Status: active, advisory only
 
 ## Purpose
 
-`tools/external_review_plain.py` asks an account-backed Gemini, Grok, or
-explicitly safe-context Ox Alpha command-line client for one independent review
-without giving the model a
-repository checkout or an implementation role. It consumes the immutable
+`tools/external_review_plain.py` asks an account-backed Gemini or Grok
+command-line client for one independent review without giving the model a
+repository checkout or an implementation role. The former Ox Alpha provider is
+retired and is no longer an accepted execution choice. It consumes the immutable
 external-review packet produced by `tools/pr_review_gate.py`, transmits the
 packet prompt plus the exact hash-bound diff, and writes schema-valid optional
 `external_review` evidence.
@@ -21,14 +21,12 @@ This path is deliberately distinct from coding-agent review:
   constrains tools but does not prove that the provider exposed no tool surface;
 - Grok receives an empty tool set in plan mode and disables web search, memory,
   and subagents through explicit CLI flags;
-- Ox Alpha is accepted only with an explicit `public-context`,
-  `synthetic-context`, or `non-sensitive-context` attestation. It runs the exact
-  `openrouter/stealth/ox-alpha` model with `--pure` and a private generated
-  `grabowski-reviewer` agent whose OpenCode permission map denies `*`. The
-  process receives a fresh temporary `HOME` plus XDG config/data/cache/state
-  roots; only the owner-private OpenCode account `auth.json` is copied into that
-  runtime. The deny-all agent config and copied auth are mode `0600`, inode- and
-  hash-rechecked after the turn, and the runtime is discarded afterwards;
+- the historical Ox Alpha transport used an explicit safe-context attestation,
+  exact `openrouter/stealth/ox-alpha` resolution, `--pure`, and a private
+  deny-all OpenCode runtime. That contract is retained only for interpreting old
+  evidence. New `--provider ox-alpha` execution is rejected before provider
+  launch; neither `z-ai/glm-5.3-flash` nor `z-ai/glm-5.3-flash:free` is an
+  implicit replacement;
 - a fixed environment allowlist passes only account-client configuration,
   locale, network, certificate, and temporary-directory settings; API keys,
   Git context, DBus, display, runtime-directory, and SSH-agent variables never
@@ -145,52 +143,20 @@ The default executable name is `grok`, but it must resolve to the canonical
 owner-controlled native binary behind `~/.grok/bin/grok`. Wrappers elsewhere on
 `PATH`, including npm or Node trampolines, fail closed.
 
-## Ox Alpha
+## Ox Alpha (retired)
 
-```bash
-python3 tools/external_review_plain.py \
-  --manifest .review-packets/pr-123/manifest.json \
-  --output .review-audits/pr-123-ox-alpha-external.json \
-  --provider ox-alpha \
-  --context-attestation public-context
-```
+Ox Alpha is no longer an active plain-review provider. `--provider ox-alpha` is
+intentionally rejected before provider launch, so the former invocation must not
+be used for new reviews. Historical Ox Alpha evidence remains readable under the
+existing evidence-validation compatibility contract.
 
-Ox Alpha has no fallback model. The adapter itself does not assert that the
-preview is currently listed or still zero-cost; callers must establish fresh
-model availability and zero-cost eligibility before invoking it. If that proof
-is absent, the review must not be started. Evidence records the exact provider
-argv, deny-all agent identity/config hash, isolated-runtime contract, the fixed
-private exact-copy/reverification policy for account auth, and the exact-model
-no-fallback policy. The central gate independently checks
-those fields and rejects `--auto`, a different agent/model, or policy drift.
-
-The adapter does not attest the signed-in account tier, remaining subscription
-quota, absence of provider-side overage, or the provider's resolved model
-identity. The evidence records the requested model label conservatively as
-`requested_not_provider_attested`. Automatic callers must obtain cost and quota
-truth from Grabowski's verified route and quota-pool preflight; direct callers
-must stop when the account route is not already known to be free or included in
-the subscription. The fixed environment allowlist prevents an accidental API-key
-fallback but is not a subscription entitlement or no-overage proof.
-
-Grok receives the full prompt through a short-lived `0600` file inside the empty
-temporary working directory and uses `--verbatim --prompt-file`; the file is
-removed with that directory after the client exits. Its evidence therefore records
-`transport: prompt_file`, `ephemeral_prompt_file: true`, and
-`prompt_argument_exposure: false`. Gemini has no documented prompt-file option in
-the installed account CLI and still receives the prompt through `--print`; its
-evidence records `transport: argv`, `ephemeral_prompt_file: false`, and
-`prompt_argument_exposure: true`. Gemini prompts are capped at 120,000 UTF-8
-bytes so the single prompt argument remains below Linux's per-argument exec
-limit, even when the generic prompt budget is larger. Another process running as
-the same local user may be able to observe Gemini command arguments while the
-client is active. A future Gemini stdin, file, or browser transport should be
-preferred only if it preserves the same independent prompt and response binding.
-
-No model request is performed by repository tests. Tests replace the provider
-process and validate argv, environment isolation, prompt reconstruction,
-evidence shape, executable identity, bounded process output, workspace readback,
-immutable output behavior, and failure handling.
+Z.ai later identified Ox Alpha as GLM-5.3-Flash. Do not replace the retired route
+with `z-ai/glm-5.3-flash`: that canonical OpenRouter route is a distinct cost
+surface. A future `z-ai/glm-5.3-flash:free` integration is also a separate route
+and requires fresh exact model-resolution, zero-price, provider/retention, and
+access evidence before it can receive execution authority. Until then use an
+active Gemini or Grok plain-review provider, or another separately verified
+review path.
 
 ## Evidence and triage
 
