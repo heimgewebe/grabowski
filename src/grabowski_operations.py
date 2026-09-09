@@ -943,10 +943,49 @@ def _run_fleet_registry_mutation(parameters: dict[str, str] | None) -> dict[str,
     }
 
 
+def _maulwurf_recovery_operation_catalog() -> dict[str, dict[str, Any]]:
+    return {
+        MAULWURF_RECOVERY_STATUS_OPERATION: {
+            "description": "Read the local Maulwurf NORMAL/RECOVERY mode.",
+            "parameters": [],
+            "step_count": 1,
+            "typed_builtin": True,
+            "effect": "read_only",
+        },
+        MAULWURF_RECOVERY_ON_OPERATION: {
+            "description": "Enable local Maulwurf recovery mutations.",
+            "parameters": ["reason"],
+            "step_count": 1,
+            "typed_builtin": True,
+            "effect": "recovery_mode_write",
+        },
+        MAULWURF_RECOVERY_OFF_OPERATION: {
+            "description": "Return the Maulwurf to NORMAL read-only mode.",
+            "parameters": [],
+            "step_count": 1,
+            "typed_builtin": True,
+            "effect": "recovery_mode_write",
+        },
+    }
+
+
+def _maulwurf_recovery_operation_list() -> dict[str, Any]:
+    if not operator._maulwurf_runtime_active():
+        raise PermissionError("Maulwurf recovery operation listing is unavailable")
+    operator._require_operator_capability("maulwurf_recovery_control")
+    return {
+        "path": str(OPERATIONS_CONFIG),
+        "operations": _maulwurf_recovery_operation_catalog(),
+    }
+
+
 @mcp.tool(name="grabowski_operation_list", annotations=READ_ONLY)
 def grabowski_operation_list() -> dict[str, Any]:
     """List validated named operations."""
-    operator._require_operator_capability("terminal_execute")
+    try:
+        operator._require_operator_capability("terminal_execute")
+    except PermissionError:
+        return _maulwurf_recovery_operation_list()
     raw = _load()
     shadowed = RESERVED_TYPED_OPERATIONS.intersection(raw["operations"])
     if shadowed:
@@ -986,27 +1025,7 @@ def grabowski_operation_list() -> dict[str, Any]:
         "effect": "authority_mode_write",
     }
     if operator._maulwurf_runtime_active():
-        operations[MAULWURF_RECOVERY_STATUS_OPERATION] = {
-            "description": "Read the local Maulwurf NORMAL/RECOVERY mode.",
-            "parameters": [],
-            "step_count": 1,
-            "typed_builtin": True,
-            "effect": "read_only",
-        }
-        operations[MAULWURF_RECOVERY_ON_OPERATION] = {
-            "description": "Enable local Maulwurf recovery mutations.",
-            "parameters": ["reason"],
-            "step_count": 1,
-            "typed_builtin": True,
-            "effect": "recovery_mode_write",
-        }
-        operations[MAULWURF_RECOVERY_OFF_OPERATION] = {
-            "description": "Return the Maulwurf to NORMAL read-only mode.",
-            "parameters": [],
-            "step_count": 1,
-            "typed_builtin": True,
-            "effect": "recovery_mode_write",
-        }
+        operations.update(_maulwurf_recovery_operation_catalog())
     for name, spec in BACKUP_STORAGE_TYPED_OPERATIONS.items():
         operations[name] = {
             "description": spec["description"],

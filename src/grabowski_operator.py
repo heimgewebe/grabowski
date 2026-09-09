@@ -489,6 +489,16 @@ def _enforce_maulwurf_recovery_mode(
             "der kleine maulwurf RECOVERY mode does not allow user-service start/restart; "
             "the resulting service would outlive the recovery mutation guard"
         )
+    if tool_name in {
+        "grabowski_terminal_run",
+        "grabowski_fleet_run",
+        "grabowski_secret_use",
+        "grabowski_juno_run",
+    }:
+        raise PermissionError(
+            "der kleine maulwurf RECOVERY mode does not allow untracked generic execution; "
+            "use tracked jobs, tasks, or agent workspaces for recovery commands"
+        )
 
 
 def _deployment_admission_invalid(reason: str) -> dict[str, Any]:

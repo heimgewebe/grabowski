@@ -611,6 +611,31 @@ class OperatorContractTests(unittest.TestCase):
                         tool,
                     )
 
+    def test_maulwurf_recovery_blocks_untracked_generic_execution(self) -> None:
+        operator = _load_operator_module()
+        tool = types.SimpleNamespace(
+            is_async=True,
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {"GRABOWSKI_MCP_BRANDING_VARIANT": "der-kleine-maulwurf"},
+            ),
+            patch.object(operator, "_maulwurf_recovery_enabled", return_value=True),
+        ):
+            calls = (
+                ("grabowski_terminal_run", {"argv": ["python3", "-c", "print(1)"]}),
+                ("grabowski_fleet_run", {"host": "node", "argv": ["true"]}),
+                ("grabowski_secret_use", {"source_path": "/secret", "argv": ["true"]}),
+                ("grabowski_juno_run", {"code": "print(1)"}),
+            )
+            for name, arguments in calls:
+                with self.subTest(name=name), self.assertRaisesRegex(
+                    PermissionError, "untracked generic execution"
+                ):
+                    operator._enforce_maulwurf_recovery_mode(name, arguments, tool)
+
     def test_maulwurf_mutation_holds_recovery_guard_through_domain_call(self) -> None:
         operator = _load_operator_module()
         events: list[str] = []

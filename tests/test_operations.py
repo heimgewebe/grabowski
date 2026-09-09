@@ -176,6 +176,35 @@ class MaulwurfRecoveryOperationTests(unittest.TestCase):
                 self.assertTrue(disabled["success"])
                 self.assertEqual("normal", disabled["status"]["mode"])
 
+    def test_failover_profile_lists_only_recovery_operations_without_terminal_execute(self) -> None:
+        required: list[str] = []
+
+        def require(capability: str) -> None:
+            required.append(capability)
+            if capability == "terminal_execute":
+                raise PermissionError("terminal unavailable")
+            if capability != "maulwurf_recovery_control":
+                raise AssertionError(capability)
+
+        with (
+            patch.object(operations.operator, "_maulwurf_runtime_active", return_value=True),
+            patch.object(
+                operations.operator,
+                "_require_operator_capability",
+                side_effect=require,
+            ),
+        ):
+            result = operations.grabowski_operation_list()
+
+        self.assertEqual(
+            set(result["operations"]),
+            operations.MAULWURF_RECOVERY_TYPED_OPERATIONS,
+        )
+        self.assertEqual(
+            ["terminal_execute", "maulwurf_recovery_control"],
+            required,
+        )
+
     def test_typed_operations_are_not_available_on_primary_runtime(self) -> None:
         with (
             patch.object(operations.operator, "_maulwurf_runtime_active", return_value=False),
