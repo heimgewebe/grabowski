@@ -275,6 +275,8 @@ def _run_maulwurf_recovery_operation(
 ) -> dict[str, Any]:
     plan = _maulwurf_recovery_operation_plan(operation, parameters)
     import der_kleine_maulwurf_operator as mole
+    if operation in {MAULWURF_RECOVERY_ON_OPERATION, MAULWURF_RECOVERY_OFF_OPERATION}:
+        operator._require_operator_capability("file_write")
 
     if operation == MAULWURF_RECOVERY_STATUS_OPERATION:
         status = mole.recovery_mode_status()

@@ -120,6 +120,36 @@ class TestDerKleineMaulwurfOperator(unittest.TestCase):
                         mole.main(["on", "--reason", reason])
                 self.assertFalse(path.exists())
 
+    def test_direct_recovery_cli_fails_when_readback_disagrees(self) -> None:
+        with (
+            patch.object(
+                mole,
+                "enable_recovery_mode",
+                return_value={"valid": False, "mode": "normal"},
+            ),
+            patch("builtins.print"),
+        ):
+            self.assertEqual(1, mole.main(["on", "--reason", "primary unavailable"]))
+        with (
+            patch.object(
+                mole,
+                "disable_recovery_mode",
+                return_value={"valid": True, "mode": "recovery"},
+            ),
+            patch("builtins.print"),
+        ):
+            self.assertEqual(1, mole.main(["off"]))
+        with (
+            patch.object(
+                mole,
+                "recovery_mode_status",
+                return_value={"valid": True, "mode": "normal"},
+            ),
+            patch("builtins.print"),
+        ):
+            self.assertEqual(0, mole.main(["status"]))
+
+
     def test_oversized_recovery_mode_fails_closed_without_unbounded_read(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "mode.json"

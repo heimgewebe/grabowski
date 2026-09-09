@@ -103,6 +103,33 @@ class MaulwurfRecoveryOperationTests(unittest.TestCase):
                 self.assertFalse(result["success"])
 
 
+    def test_recovery_writes_require_file_write_capability(self) -> None:
+        with (
+            patch.object(operations.operator, "_maulwurf_runtime_active", return_value=True),
+            patch.object(
+                operations.operator,
+                "_require_operator_capability",
+                side_effect=PermissionError("file_write required"),
+            ) as require,
+        ):
+            with self.assertRaisesRegex(PermissionError, "file_write required"):
+                operations.grabowski_operation_run(
+                    operations.MAULWURF_RECOVERY_ON_OPERATION,
+                    {"reason": "primary unavailable"},
+                )
+            require.assert_called_once_with("file_write")
+
+        with (
+            patch.object(operations.operator, "_maulwurf_runtime_active", return_value=True),
+            patch.object(operations.operator, "_require_operator_capability") as require,
+        ):
+            result = operations.grabowski_operation_run(
+                operations.MAULWURF_RECOVERY_STATUS_OPERATION, None
+            )
+            self.assertTrue(result["success"])
+            require.assert_not_called()
+
+
     def test_typed_operations_are_not_available_on_primary_runtime(self) -> None:
         with patch.object(
             operations.operator, "_maulwurf_runtime_active", return_value=False

@@ -2594,7 +2594,11 @@ def main(argv: list[str] | None = None) -> int:
     else:
         result = disable_recovery_mode()
     print(json.dumps(result, sort_keys=True))
-    return 0
+    expected_mode = {"on": RECOVERY_MODE_RECOVERY, "off": RECOVERY_MODE_NORMAL}.get(args.action)
+    success = result.get("valid") is True and (
+        expected_mode is None or result.get("mode") == expected_mode
+    )
+    return 0 if success else 1
 
 
 if __name__ == "__main__":
