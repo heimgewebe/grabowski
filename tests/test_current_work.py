@@ -542,7 +542,7 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         )
         self.assertEqual(result["count"], 0)
 
-    def test_cleanup_candidate_without_remote_security_is_hygiene(self) -> None:
+    def test_cleanup_candidate_without_remote_security_is_ready_hygiene(self) -> None:
         result = project(
             checkout_payloads=[
                 {
@@ -560,7 +560,7 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         )
         group = result["work"][0]
         self.assertEqual(group["projection_state"], "hygiene")
-        self.assertIn("cleanup-candidate-not-remote-secured", group["action_reasons"])
+        self.assertIn("cleanup-candidate-ready", group["action_reasons"])
 
     def test_cleanup_candidate_remote_secured_ready_is_hygiene(self) -> None:
         record = checkout(
