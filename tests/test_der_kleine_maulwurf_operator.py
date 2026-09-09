@@ -107,6 +107,70 @@ class TestDerKleineMaulwurfOperator(unittest.TestCase):
             self.assertEqual("normal", disabled["mode"])
             self.assertFalse(mole.recovery_mode_enabled(path=path))
 
+    def test_recovery_status_rejects_in_place_change_during_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mode.json"
+            mole.enable_recovery_mode("test-recovery", path=path)
+            real_fstat = mole.os.fstat
+            calls = 0
+
+            def changed_after_read(descriptor: int):
+                nonlocal calls
+                calls += 1
+                value = real_fstat(descriptor)
+                if calls != 2:
+                    return value
+                return types.SimpleNamespace(
+                    st_dev=value.st_dev,
+                    st_ino=value.st_ino,
+                    st_mode=value.st_mode,
+                    st_uid=value.st_uid,
+                    st_nlink=value.st_nlink,
+                    st_size=value.st_size,
+                    st_mtime_ns=value.st_mtime_ns + 1,
+                    st_ctime_ns=value.st_ctime_ns + 1,
+                )
+
+            with patch.object(mole.os, "fstat", side_effect=changed_after_read):
+                status = mole.recovery_mode_status(path=path)
+        self.assertFalse(status["valid"])
+        self.assertEqual("normal", status["mode"])
+
+    def test_recovery_status_rejects_recovery_document_without_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mode.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": mole.RECOVERY_MODE_SCHEMA_VERSION,
+                        "kind": mole.RECOVERY_MODE_KIND,
+                        "mode": mole.RECOVERY_MODE_RECOVERY,
+                        "reason": None,
+                        "changed_at_unix": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            path.chmod(0o600)
+            status = mole.recovery_mode_status(path=path)
+        self.assertFalse(status["valid"])
+        self.assertEqual("normal", status["mode"])
+
+    def test_recovery_guard_fails_fast_while_exclusive_lock_is_held(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mode.json"
+            mole.enable_recovery_mode("test-recovery", path=path)
+            parent_fd = mole._open_recovery_state_parent(path)
+            lock_fd = mole._open_recovery_mode_lock(parent_fd, path)
+            mole.os.close(parent_fd)
+            mole.fcntl.flock(lock_fd, mole.fcntl.LOCK_EX)
+            try:
+                with self.assertRaisesRegex(PermissionError, "currently held"):
+                    mole.acquire_recovery_mutation_guard(path=path)
+            finally:
+                mole.fcntl.flock(lock_fd, mole.fcntl.LOCK_UN)
+                mole.os.close(lock_fd)
+
     def test_direct_recovery_cli_rejects_secret_reason(self) -> None:
         reasons = (
             "".join(("Bear", "er ", "abcdefghijklmnopqrst")),
@@ -209,6 +273,50 @@ class TestDerKleineMaulwurfOperator(unittest.TestCase):
             self.assertTrue(finished.is_set())
             self.assertFalse(marker_path.exists())
 
+    def test_recovery_off_times_out_instead_of_waiting_forever(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mode.json"
+            mole.enable_recovery_mode("test-recovery", path=path)
+            guard = mole.acquire_recovery_mutation_guard(path=path)
+            try:
+                with (
+                    patch.object(mole, "RECOVERY_MODE_LOCK_TIMEOUT_SECONDS", 0.02),
+                    self.assertRaisesRegex(RuntimeError, "recovery_mode_lock_timeout"),
+                ):
+                    mole.disable_recovery_mode(path=path)
+            finally:
+                mole.release_recovery_mutation_guard(guard)
+            self.assertEqual("recovery", mole.recovery_mode_status(path=path)["mode"])
+            marker_path = path.with_name(mole._recovery_transition_marker_name(path))
+            self.assertFalse(marker_path.exists())
+
+    def test_detached_effect_scan_maps_systemctl_timeout_to_runtime_error(self) -> None:
+        with patch.object(
+            mole.subprocess,
+            "run",
+            side_effect=mole.subprocess.TimeoutExpired(cmd=["systemctl"], timeout=5),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "recovery_detached_unit_state_unavailable"):
+                mole.active_recovery_detached_effects()
+
+    def test_detached_effect_scan_maps_tmux_timeout_to_runtime_error(self) -> None:
+        import grabowski_tasks as tasks
+
+        def fake_run(argv, **_kwargs):
+            if argv[0] == "systemctl":
+                return types.SimpleNamespace(returncode=0, stdout="")
+            raise mole.subprocess.TimeoutExpired(cmd=argv, timeout=5)
+
+        with (
+            patch.object(mole.subprocess, "run", side_effect=fake_run),
+            patch.object(tasks, "recovery_active_task_effects", return_value=[]),
+            patch.object(mole.Path, "is_file", return_value=True),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "recovery_workspace_session_state_unavailable"
+            ):
+                mole.active_recovery_detached_effects()
+
     def test_detached_effect_scan_includes_backend_aware_persistent_tasks(self) -> None:
         import grabowski_tasks as tasks
 
@@ -281,6 +389,22 @@ class TestDerKleineMaulwurfOperator(unittest.TestCase):
             self.assertTrue(disabled["valid"])
             self.assertEqual("normal", disabled["mode"])
             self.assertEqual("confirmed", disabled["write_outcome"])
+
+    def test_explicit_live_recovery_path_cannot_bypass_detached_effect_drain(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mode.json"
+            with patch.object(mole, "recovery_mode_path", return_value=path):
+                mole.enable_recovery_mode("test-recovery", path=path)
+                with patch.object(
+                    mole,
+                    "active_recovery_detached_effects",
+                    return_value=["unit:grabowski-task-test.service"],
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "detached_effects_active"):
+                        mole.disable_recovery_mode(path=path)
+                self.assertEqual(
+                    "recovery", mole.recovery_mode_status(path=path)["mode"]
+                )
 
     def test_direct_recovery_cli_fails_when_readback_disagrees(self) -> None:
         with (

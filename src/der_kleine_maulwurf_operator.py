@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import errno
 import hashlib
 import fcntl
 import json
@@ -2404,6 +2405,9 @@ RECOVERY_MODE_MAX_BYTES = 4096
 RECOVERY_MODE_NORMAL = "normal"
 RECOVERY_MODE_RECOVERY = "recovery"
 RECOVERY_MODE_VALUES = frozenset({RECOVERY_MODE_NORMAL, RECOVERY_MODE_RECOVERY})
+RECOVERY_TRANSITION_LOCK_TIMEOUT_SECONDS = 5.0
+RECOVERY_MODE_LOCK_TIMEOUT_SECONDS = 30.0
+RECOVERY_LOCK_POLL_SECONDS = 0.01
 _RECOVERY_SECRET_KEY_PREFIX = "s" + "k-"
 RECOVERY_REASON_SECRET_PATTERN = re.compile(
     r"(?i)(?:"
@@ -2510,6 +2514,27 @@ def _open_recovery_transition_lock(parent_fd: int, target: Path) -> int:
     return descriptor
 
 
+def _acquire_recovery_flock(
+    descriptor: int,
+    operation: int,
+    *,
+    timeout_seconds: float,
+    error: str,
+) -> None:
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while True:
+        try:
+            fcntl.flock(descriptor, operation | fcntl.LOCK_NB)
+            return
+        except OSError as exc:
+            if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(error) from exc
+            time.sleep(min(RECOVERY_LOCK_POLL_SECONDS, remaining))
+
+
 def _recovery_transition_pending(parent_fd: int, target: Path) -> bool:
     name = _recovery_transition_marker_name(target)
     try:
@@ -2532,7 +2557,12 @@ def _prepare_recovery_control_transition(
     descriptor = _open_recovery_transition_lock(parent_fd, target)
     marker_created = False
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        _acquire_recovery_flock(
+            descriptor,
+            fcntl.LOCK_EX,
+            timeout_seconds=RECOVERY_TRANSITION_LOCK_TIMEOUT_SECONDS,
+            error="recovery_transition_lock_timeout",
+        )
         marker_name = _recovery_transition_marker_name(target)
         if _recovery_transition_pending(parent_fd, target):
             os.unlink(marker_name, dir_fd=parent_fd)
@@ -2582,7 +2612,14 @@ def acquire_recovery_mutation_guard(*, path: Path | None = None) -> int:
     finally:
         os.close(parent_fd)
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_SH)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                raise PermissionError(
+                    "Recovery lock is currently held by another process"
+                ) from exc
+            raise
         parent_fd = _open_recovery_state_parent(target)
         try:
             transition_pending = _recovery_transition_pending(parent_fd, target)
@@ -2638,15 +2675,18 @@ RECOVERY_DETACHED_UNIT_PATTERNS = (
 def active_recovery_detached_effects() -> list[str]:
     import grabowski_tasks as tasks
 
-    result = subprocess.run(
-        [
-            "systemctl", "--user", "list-units", "--type=service",
-            "--state=activating,running,reloading,deactivating",
-            "--no-legend", "--plain", "--no-pager",
-            *RECOVERY_DETACHED_UNIT_PATTERNS,
-        ],
-        capture_output=True, text=True, timeout=5, check=False,
-    )
+    try:
+        result = subprocess.run(
+            [
+                "systemctl", "--user", "list-units", "--type=service",
+                "--state=activating,running,reloading,deactivating",
+                "--no-legend", "--plain", "--no-pager",
+                *RECOVERY_DETACHED_UNIT_PATTERNS,
+            ],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("recovery_detached_unit_state_unavailable") from exc
     if result.returncode != 0:
         raise RuntimeError("recovery_detached_unit_state_unavailable")
     effects: list[str] = list(tasks.recovery_active_task_effects())
@@ -2656,10 +2696,13 @@ def active_recovery_detached_effects() -> list[str]:
             effects.append(f"unit:{unit}")
     tmux = Path("/usr/bin/tmux")
     if tmux.is_file():
-        sessions = subprocess.run(
-            [str(tmux), "list-sessions", "-F", "#{session_name}"],
-            capture_output=True, text=True, timeout=5, check=False,
-        )
+        try:
+            sessions = subprocess.run(
+                [str(tmux), "list-sessions", "-F", "#{session_name}"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError("recovery_workspace_session_state_unavailable") from exc
         if sessions.returncode not in {0, 1}:
             raise RuntimeError("recovery_workspace_session_state_unavailable")
         if sessions.returncode == 1 and sessions.stdout.strip():
@@ -2703,11 +2746,25 @@ def recovery_mode_status(*, path: Path | None = None) -> dict[str, object]:
             or opened.st_uid != metadata.st_uid
             or opened.st_nlink != metadata.st_nlink
             or opened.st_size != metadata.st_size
+            or opened.st_mtime_ns != metadata.st_mtime_ns
+            or opened.st_ctime_ns != metadata.st_ctime_ns
         ):
             raise RuntimeError("recovery_mode_file_changed_during_open")
         payload = os.read(descriptor, RECOVERY_MODE_MAX_BYTES + 1)
         if len(payload) > RECOVERY_MODE_MAX_BYTES:
             raise RuntimeError("recovery_mode_file_too_large")
+        finished = os.fstat(descriptor)
+        if (
+            finished.st_dev != opened.st_dev
+            or finished.st_ino != opened.st_ino
+            or finished.st_mode != opened.st_mode
+            or finished.st_uid != opened.st_uid
+            or finished.st_nlink != opened.st_nlink
+            or finished.st_size != opened.st_size
+            or finished.st_mtime_ns != opened.st_mtime_ns
+            or finished.st_ctime_ns != opened.st_ctime_ns
+        ):
+            raise RuntimeError("recovery_mode_file_changed_during_read")
     except FileNotFoundError:
         return {
             "schema_version": RECOVERY_MODE_SCHEMA_VERSION,
@@ -2756,6 +2813,14 @@ def recovery_mode_status(*, path: Path | None = None) -> dict[str, object]:
         or not isinstance(value.get("changed_at_unix"), int)
         or value.get("changed_at_unix") < 0
         or (value.get("reason") is not None and not isinstance(value.get("reason"), str))
+        or (
+            value.get("mode") == RECOVERY_MODE_RECOVERY
+            and (
+                not isinstance(value.get("reason"), str)
+                or not value["reason"].strip()
+            )
+        )
+        or (value.get("mode") == RECOVERY_MODE_NORMAL and value.get("reason") is not None)
         or (isinstance(value.get("reason"), str) and len(value["reason"]) > 240)
         or (
             isinstance(value.get("reason"), str)
@@ -2804,8 +2869,13 @@ def _write_recovery_mode(
             parent_fd, target, normalizing=mode == RECOVERY_MODE_NORMAL
         )
         lock_fd = _open_recovery_mode_lock(parent_fd, target)
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        if mode == RECOVERY_MODE_NORMAL and path is None:
+        _acquire_recovery_flock(
+            lock_fd,
+            fcntl.LOCK_EX,
+            timeout_seconds=RECOVERY_MODE_LOCK_TIMEOUT_SECONDS,
+            error="recovery_mode_lock_timeout",
+        )
+        if mode == RECOVERY_MODE_NORMAL and target == recovery_mode_path():
             ensure_recovery_detached_effects_stopped()
         document = {
             "schema_version": RECOVERY_MODE_SCHEMA_VERSION,

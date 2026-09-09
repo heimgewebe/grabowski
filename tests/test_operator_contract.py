@@ -669,6 +669,45 @@ class OperatorContractTests(unittest.TestCase):
         self.assertEqual(["acquire", "domain", "release"], events)
 
 
+    def test_sync_callback_registration_failure_releases_recovery_guard_after_worker(self) -> None:
+        operator = _load_operator_module()
+        released = threading.Event()
+        fake_mole = types.SimpleNamespace(
+            acquire_recovery_mutation_guard=lambda: 17,
+            release_recovery_mutation_guard=lambda _fd: released.set(),
+        )
+
+        class BrokenCallbackFuture:
+            def add_done_callback(self, _callback):
+                raise RuntimeError("callback-registration-failed")
+
+            def result(self):
+                return {"called": True}
+
+        fake_executor = types.SimpleNamespace(
+            submit=lambda *_args, **_kwargs: BrokenCallbackFuture()
+        )
+        operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
+            is_async=False,
+            context_kwarg=None,
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {"GRABOWSKI_MCP_BRANDING_VARIANT": "der-kleine-maulwurf"},
+            ),
+            patch.object(operator, "_maulwurf_recovery_enabled", return_value=True),
+            patch.object(operator, "_maulwurf_recovery_module", return_value=fake_mole),
+            patch.object(operator, "_SYNC_TOOL_EXECUTOR", fake_executor),
+            patch.object(operator, "_require_transport_roundtrip_for_tool", return_value=None),
+        ):
+            operator._configure_http_runtime()
+            with self.assertRaisesRegex(RuntimeError, "callback-registration-failed"):
+                operator.asyncio.run(operator.mcp._tool_manager.call_tool("write", {}))
+        self.assertTrue(released.wait(timeout=1.0))
+        self.assertEqual(0, operator._deployment_admission_active_tool_calls())
+
     def test_cold_reentry_tools_wait_for_active_marker_then_reenter_after_expiry(
         self,
     ) -> None:

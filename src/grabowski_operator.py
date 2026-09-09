@@ -1695,7 +1695,15 @@ def _install_deployment_admission_gate() -> None:
                 maulwurf_guard = None
                 release_in_finally = False
 
+                release_lock = threading.Lock()
+                release_done = False
+
                 def _release_when_worker_finishes(_completed: Any) -> None:
+                    nonlocal release_done
+                    with release_lock:
+                        if release_done:
+                            return
+                        release_done = True
                     try:
                         if guard_for_callback is not None:
                             _maulwurf_recovery_module().release_recovery_mutation_guard(
@@ -1719,13 +1727,29 @@ def _install_deployment_admission_gate() -> None:
                             )
                             callback_registered = True
                         except BaseException as callback_error:
-                            logging.getLogger(__name__).error(
-                                "sync tool release callback registration "
-                                "failed after submit; admission remains held "
-                                "until process lifecycle: %s",
-                                type(callback_error).__name__,
-                                exc_info=callback_error,
-                            )
+                            def _fallback_wait_and_release() -> None:
+                                try:
+                                    try:
+                                        worker_future.result()
+                                    except BaseException:
+                                        pass
+                                finally:
+                                    _release_when_worker_finishes(worker_future)
+
+                            try:
+                                threading.Thread(
+                                    target=_fallback_wait_and_release,
+                                    name="grabowski-sync-release-fallback",
+                                    daemon=True,
+                                ).start()
+                                callback_registered = True
+                            except BaseException as fallback_error:
+                                logging.getLogger(__name__).error(
+                                    "sync tool release handoff failed after submit; "
+                                    "admission and recovery guard remain held until process lifecycle: %s",
+                                    type(fallback_error).__name__,
+                                    exc_info=fallback_error,
+                                )
                     # Conservative outcome only: do not release admission or
                     # start a conflicting new effect while the worker may run.
                     # Under fence enforcement the worker exclusively owns
