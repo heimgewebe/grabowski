@@ -355,7 +355,7 @@ class ReviewEvidenceHardeningTests(unittest.TestCase):
                 "current_comment_authorization_state",
                 side_effect=[ci.COMMENT_STATE_CURRENT, ci.COMMENT_STATE_SUPERSEDED],
             ) as freshness,
-            mock.patch.object(ci, "current_diff_sha256", return_value="b" * 64),
+            mock.patch.object(ci, "current_diff_sha256s", return_value=("b" * 64,)),
             mock.patch.object(ci, "publish_commit_status") as publish,
         ):
             result = ci.evaluate_comment_command(args)
