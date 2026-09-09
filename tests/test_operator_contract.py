@@ -368,6 +368,45 @@ class OperatorContractTests(unittest.TestCase):
         self.assertEqual("invalid", symlink["state"])
         self.assertTrue(symlink["active"])
 
+    def test_deployment_admission_drain_uses_concrete_github_pr_view_read(self) -> None:
+        operator = _load_operator_module()
+        github_tool = types.SimpleNamespace(
+            annotations=types.SimpleNamespace(readOnlyHint=False)
+        )
+        pr_view = {
+            "arguments": [
+                "pr",
+                "view",
+                "1141",
+                "--repo",
+                "heimgewebe/grabowski",
+                "--json",
+                "state,headRefOid",
+            ],
+            "cwd": "/home/alex",
+            "timeout_seconds": 60,
+        }
+        self.assertTrue(operator._github_pr_view_transport_read_only(pr_view))
+        self.assertFalse(
+            operator._deployment_admission_drain_blocking(
+                "grabowski_github", pr_view, github_tool
+            )
+        )
+        self.assertTrue(
+            operator._deployment_admission_drain_blocking(
+                "grabowski_github",
+                {"arguments": ["api", "repos/heimgewebe/grabowski"]},
+                github_tool,
+            )
+        )
+        observer_tool = types.SimpleNamespace(
+            annotations=types.SimpleNamespace(readOnlyHint=True)
+        )
+        self.assertTrue(
+            operator._deployment_admission_drain_blocking(
+                operator.deployment_observer.OPERATION, {}, observer_tool
+            )
+        )
 
     def test_deployment_admission_gate_rejects_new_tools_before_effect(self) -> None:
         operator = _load_operator_module()
