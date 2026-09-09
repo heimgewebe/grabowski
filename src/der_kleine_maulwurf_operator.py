@@ -2402,10 +2402,15 @@ RECOVERY_MODE_MAX_BYTES = 4096
 RECOVERY_MODE_NORMAL = "normal"
 RECOVERY_MODE_RECOVERY = "recovery"
 RECOVERY_MODE_VALUES = frozenset({RECOVERY_MODE_NORMAL, RECOVERY_MODE_RECOVERY})
+_RECOVERY_SECRET_KEY_PREFIX = "s" + "k-"
 RECOVERY_REASON_SECRET_PATTERN = re.compile(
-    r"(?i)(?:\bBearer\s+[A-Za-z0-9._~+/-]{12,}=*|"
-    r"\b(?:TOKEN|SECRET|PASSWORD|PASSWD|COOKIE|CREDENTIAL|AUTHORIZATION|API_KEY|APIKEY)"
-    r"\b\s*[:=]\s*\S+)"
+    r"(?i)(?:"
+    + re.escape(_RECOVERY_SECRET_KEY_PREFIX)
+    + r"[A-Za-z0-9._-]{20,}|"
+    r"\bBearer\s+[A-Za-z0-9._~+/-]{12,}=*|"
+    r"-----BEGIN [^-]*PRIVATE KEY-----|"
+    r"[A-Z0-9_-]*(?:TOKEN|SECRET|PASSWORD|PASSWD|COOKIE|CREDENTIAL|AUTHORIZATION|API_KEY|APIKEY)"
+    r"[A-Z0-9_-]*\s*[:=]\s*\S+)"
 )
 
 
