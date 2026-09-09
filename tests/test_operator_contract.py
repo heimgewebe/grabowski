@@ -174,7 +174,9 @@ def _load_operator_module():
 
     fake_base._read_bound_regular_bytes = read_bound_regular_bytes
     fake_base._append_audit = lambda record: None
-    fake_base._transport_authorize_connector_tool = lambda context, tool_name: None
+    fake_base._transport_authorize_connector_tool = (
+        lambda context, tool_name, arguments=None: None
+    )
     fake_base._retain_pending_transport_target = (
         lambda challenge_receipt_sha256, **kwargs: {
             "challenge_receipt_sha256": challenge_receipt_sha256,
@@ -366,6 +368,45 @@ class OperatorContractTests(unittest.TestCase):
         self.assertEqual("invalid", symlink["state"])
         self.assertTrue(symlink["active"])
 
+    def test_deployment_admission_drain_uses_concrete_github_pr_view_read(self) -> None:
+        operator = _load_operator_module()
+        github_tool = types.SimpleNamespace(
+            annotations=types.SimpleNamespace(readOnlyHint=False)
+        )
+        pr_view = {
+            "arguments": [
+                "pr",
+                "view",
+                "1141",
+                "--repo",
+                "heimgewebe/grabowski",
+                "--json",
+                "state,headRefOid",
+            ],
+            "cwd": "/home/alex",
+            "timeout_seconds": 60,
+        }
+        self.assertTrue(operator._github_pr_view_transport_read_only(pr_view))
+        self.assertFalse(
+            operator._deployment_admission_drain_blocking(
+                "grabowski_github", pr_view, github_tool
+            )
+        )
+        self.assertTrue(
+            operator._deployment_admission_drain_blocking(
+                "grabowski_github",
+                {"arguments": ["api", "repos/heimgewebe/grabowski"]},
+                github_tool,
+            )
+        )
+        observer_tool = types.SimpleNamespace(
+            annotations=types.SimpleNamespace(readOnlyHint=True)
+        )
+        self.assertTrue(
+            operator._deployment_admission_drain_blocking(
+                operator.deployment_observer.OPERATION, {}, observer_tool
+            )
+        )
 
     def test_deployment_admission_gate_rejects_new_tools_before_effect(self) -> None:
         operator = _load_operator_module()
@@ -419,6 +460,291 @@ class OperatorContractTests(unittest.TestCase):
 
         authorize.assert_called_once()
         self.assertFalse(domain_started)
+        self.assertEqual(0, operator._deployment_admission_active_tool_calls())
+
+    def test_maulwurf_normal_mode_blocks_mutation_but_keeps_recovery_switch(self) -> None:
+        operator = _load_operator_module()
+        calls: list[str] = []
+
+        async def domain_call(*args, **kwargs):
+            calls.append(str(args[0]))
+            return {"called": True}
+
+        operator.mcp._tool_manager.call_tool = domain_call
+
+        def get_tool(name):
+            return types.SimpleNamespace(
+                is_async=True,
+                context_kwarg=None,
+                annotations=types.SimpleNamespace(readOnlyHint=name == "read"),
+            )
+
+        operator.mcp._tool_manager.get_tool = get_tool
+        with (
+            patch.dict(
+                os.environ,
+                {"GRABOWSKI_MCP_BRANDING_VARIANT": "der-kleine-maulwurf"},
+            ),
+            patch.object(operator, "_maulwurf_recovery_enabled", return_value=False),
+            patch.object(operator.base, "_load_policy", return_value={"active_profile": "failover-mutate"}),
+            patch.object(
+                operator, "_require_transport_roundtrip_for_tool", return_value=None
+            ),
+        ):
+            operator._configure_http_runtime()
+            result = operator.asyncio.run(
+                operator.mcp._tool_manager.call_tool("read", {})
+            )
+            self.assertTrue(result["called"])
+            with self.assertRaisesRegex(PermissionError, "NORMAL mode"):
+                operator.asyncio.run(
+                    operator.mcp._tool_manager.call_tool("write", {})
+                )
+            result = operator.asyncio.run(
+                operator.mcp._tool_manager.call_tool(
+                    "grabowski_operation_run",
+                    {"operation": "maulwurf-recovery-status", "parameters": None},
+                )
+            )
+            self.assertTrue(result["called"])
+            result = operator.asyncio.run(
+                operator.mcp._tool_manager.call_tool(
+                    "grabowski_operation_run",
+                    {
+                        "operation": "maulwurf-recovery-on",
+                        "parameters": {"reason": "primary unavailable"},
+                    },
+                )
+            )
+            self.assertTrue(result["called"])
+
+        self.assertEqual(["read", "grabowski_operation_run", "grabowski_operation_run"], calls)
+
+    def test_maulwurf_recovery_mode_allows_mutation(self) -> None:
+        operator = _load_operator_module()
+        operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
+            is_async=True,
+            context_kwarg=None,
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+        fake_mole = types.SimpleNamespace(
+            acquire_recovery_mutation_guard=lambda: 17,
+            release_recovery_mutation_guard=lambda _fd: None,
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {"GRABOWSKI_MCP_BRANDING_VARIANT": "der-kleine-maulwurf"},
+            ),
+            patch.object(operator, "_maulwurf_recovery_enabled", return_value=True),
+            patch.object(operator, "_maulwurf_recovery_module", return_value=fake_mole),
+            patch.object(
+                operator.grabowski_effect_interceptor,
+                "fence_enforcement_required",
+                side_effect=AssertionError("mole runtime must not consult the old global fence"),
+            ),
+            patch.object(
+                operator, "_require_transport_roundtrip_for_tool", return_value=None
+            ),
+        ):
+            operator._configure_http_runtime()
+            result = operator.asyncio.run(
+                operator.mcp._tool_manager.call_tool("write", {})
+            )
+        self.assertTrue(result["called"])
+
+    def test_maulwurf_recovery_status_is_exact_transport_read_exemption(self) -> None:
+        operator = _load_operator_module()
+        with patch.dict(
+            os.environ,
+            {"GRABOWSKI_MCP_BRANDING_VARIANT": "der-kleine-maulwurf"},
+        ):
+            self.assertTrue(
+                operator._transport_roundtrip_exempt_call(
+                    "grabowski_operation_run",
+                    {"operation": "maulwurf-recovery-status", "parameters": None},
+                )
+            )
+            self.assertFalse(
+                operator._transport_roundtrip_exempt_call(
+                    "grabowski_operation_run",
+                    {
+                        "operation": "maulwurf-recovery-on",
+                        "parameters": {"reason": "primary unavailable"},
+                    },
+                )
+            )
+
+    def test_maulwurf_recovery_allows_detached_effect_starts(self) -> None:
+        operator = _load_operator_module()
+        tool = types.SimpleNamespace(
+            is_async=True,
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {"GRABOWSKI_MCP_BRANDING_VARIANT": "der-kleine-maulwurf"},
+            ),
+            patch.object(operator, "_maulwurf_recovery_enabled", return_value=True),
+        ):
+            for name in (
+                "grabowski_job_start",
+                "grabowski_task_start",
+                "grabowski_task_resume",
+                "grabowski_task_reconcile",
+                "grabowski_task_reconcile_resume",
+                "grabowski_recovery_provenance_repair",
+                "grabowski_agent_workspace_create",
+                "grabowski_agent_workspace_writer_handoff",
+                "grabowski_agent_workspace_role_retry",
+            ):
+                with self.subTest(name=name):
+                    operator._enforce_maulwurf_recovery_mode(name, {}, tool)
+
+    def test_maulwurf_recovery_blocks_untracked_tmux_send(self) -> None:
+        operator = _load_operator_module()
+        tool = types.SimpleNamespace(
+            is_async=True,
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {"GRABOWSKI_MCP_BRANDING_VARIANT": "der-kleine-maulwurf"},
+            ),
+            patch.object(operator, "_maulwurf_recovery_enabled", return_value=True),
+        ):
+            with self.assertRaisesRegex(PermissionError, "tracked jobs"):
+                operator._enforce_maulwurf_recovery_mode(
+                    "grabowski_tmux_send", {"target": "ops:0", "text": "repair"}, tool
+                )
+
+    def test_maulwurf_recovery_blocks_untracked_user_service_starts(self) -> None:
+        operator = _load_operator_module()
+        tool = types.SimpleNamespace(
+            is_async=True,
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {"GRABOWSKI_MCP_BRANDING_VARIANT": "der-kleine-maulwurf"},
+            ),
+            patch.object(operator, "_maulwurf_recovery_enabled", return_value=True),
+        ):
+            for action in ("start", "restart"):
+                with self.subTest(action=action), self.assertRaisesRegex(
+                    PermissionError, "outlive the recovery mutation guard"
+                ):
+                    operator._enforce_maulwurf_recovery_mode(
+                        "grabowski_user_service",
+                        {"unit": "example.service", "action": action},
+                        tool,
+                    )
+            for action in ("stop", "enable", "disable"):
+                with self.subTest(action=action):
+                    operator._enforce_maulwurf_recovery_mode(
+                        "grabowski_user_service",
+                        {"unit": "example.service", "action": action},
+                        tool,
+                    )
+
+    def test_maulwurf_recovery_blocks_untracked_generic_execution(self) -> None:
+        operator = _load_operator_module()
+        tool = types.SimpleNamespace(
+            is_async=True,
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {"GRABOWSKI_MCP_BRANDING_VARIANT": "der-kleine-maulwurf"},
+            ),
+            patch.object(operator, "_maulwurf_recovery_enabled", return_value=True),
+        ):
+            calls = (
+                ("grabowski_terminal_run", {"argv": ["python3", "-c", "print(1)"]}),
+                ("grabowski_fleet_run", {"host": "node", "argv": ["true"]}),
+                ("grabowski_secret_use", {"source_path": "/secret", "argv": ["true"]}),
+                ("grabowski_juno_run", {"code": "print(1)"}),
+            )
+            for name, arguments in calls:
+                with self.subTest(name=name), self.assertRaisesRegex(
+                    PermissionError, "untracked generic execution"
+                ):
+                    operator._enforce_maulwurf_recovery_mode(name, arguments, tool)
+
+    def test_maulwurf_mutation_holds_recovery_guard_through_domain_call(self) -> None:
+        operator = _load_operator_module()
+        events: list[str] = []
+        fake_mole = types.SimpleNamespace(
+            acquire_recovery_mutation_guard=lambda: events.append("acquire") or 17,
+            release_recovery_mutation_guard=lambda _fd: events.append("release"),
+        )
+
+        async def domain_call(*_args, **_kwargs):
+            events.append("domain")
+            return {"called": True}
+
+        operator.mcp._tool_manager.call_tool = domain_call
+        operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
+            is_async=True,
+            context_kwarg=None,
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {"GRABOWSKI_MCP_BRANDING_VARIANT": "der-kleine-maulwurf"},
+            ),
+            patch.object(operator, "_maulwurf_recovery_enabled", return_value=True),
+            patch.object(operator, "_maulwurf_recovery_module", return_value=fake_mole),
+            patch.object(operator, "_require_transport_roundtrip_for_tool", return_value=None),
+        ):
+            operator._configure_http_runtime()
+            result = operator.asyncio.run(operator.mcp._tool_manager.call_tool("write", {}))
+        self.assertTrue(result["called"])
+        self.assertEqual(["acquire", "domain", "release"], events)
+
+
+    def test_sync_callback_registration_failure_releases_recovery_guard_after_worker(self) -> None:
+        operator = _load_operator_module()
+        released = threading.Event()
+        fake_mole = types.SimpleNamespace(
+            acquire_recovery_mutation_guard=lambda: 17,
+            release_recovery_mutation_guard=lambda _fd: released.set(),
+        )
+
+        class BrokenCallbackFuture:
+            def add_done_callback(self, _callback):
+                raise RuntimeError("callback-registration-failed")
+
+            def result(self):
+                return {"called": True}
+
+        fake_executor = types.SimpleNamespace(
+            submit=lambda *_args, **_kwargs: BrokenCallbackFuture()
+        )
+        operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
+            is_async=False,
+            context_kwarg=None,
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {"GRABOWSKI_MCP_BRANDING_VARIANT": "der-kleine-maulwurf"},
+            ),
+            patch.object(operator, "_maulwurf_recovery_enabled", return_value=True),
+            patch.object(operator, "_maulwurf_recovery_module", return_value=fake_mole),
+            patch.object(operator, "_SYNC_TOOL_EXECUTOR", fake_executor),
+            patch.object(operator, "_require_transport_roundtrip_for_tool", return_value=None),
+        ):
+            operator._configure_http_runtime()
+            with self.assertRaisesRegex(RuntimeError, "callback-registration-failed"):
+                operator.asyncio.run(operator.mcp._tool_manager.call_tool("write", {}))
+        self.assertTrue(released.wait(timeout=1.0))
         self.assertEqual(0, operator._deployment_admission_active_tool_calls())
 
     def test_cold_reentry_tools_wait_for_active_marker_then_reenter_after_expiry(

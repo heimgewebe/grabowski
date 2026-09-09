@@ -819,6 +819,46 @@ class ConnectorCapabilityScopeTests(unittest.TestCase):
                 self.context(self.TOKEN_A), "grabowski_destroy_path"
             )
 
+    def test_connector_read_only_policy_allows_exact_maulwurf_status_arguments_only(self) -> None:
+        self.enroll(**{"maulwurf-x": self.TOKEN_A})
+        self.write_tool_policy(
+            "maulwurf-x",
+            mode="allowlist",
+            allowed_tools=["grabowski_operation_run"],
+            read_only_only=True,
+        )
+        self.require_tool_policy()
+        self.base.mcp._tool_manager = types.SimpleNamespace(
+            get_tool=lambda _name: types.SimpleNamespace(
+                annotations=types.SimpleNamespace(readOnlyHint=False)
+            )
+        )
+        with mock.patch.object(
+            self.base,
+            "_transport_registered_tool_names",
+            return_value=["grabowski_operation_run"],
+        ):
+            allowed = self.base._transport_authorize_connector_tool(
+                self.context(self.TOKEN_A),
+                "grabowski_operation_run",
+                {"operation": "maulwurf-recovery-status", "parameters": None},
+            )
+            self.assertEqual("maulwurf-x", allowed["connector_id"])
+            for arguments in (
+                {"operation": "maulwurf-recovery-on", "parameters": {"reason": "x"}},
+                {"operation": "maulwurf-recovery-off", "parameters": None},
+                {"operation": "maulwurf-recovery-status", "parameters": {}},
+                {"operation": "maulwurf-recovery-status", "parameters": None, "extra": True},
+            ):
+                with self.subTest(arguments=arguments), self.assertRaisesRegex(
+                    RuntimeError, "explicitly read-only"
+                ):
+                    self.base._transport_authorize_connector_tool(
+                        self.context(self.TOKEN_A),
+                        "grabowski_operation_run",
+                        arguments,
+                    )
+
     def test_connector_tool_policy_allows_explicit_unrestricted_primary(self) -> None:
         self.enroll(primary=self.TOKEN_A)
         self.write_tool_policy("primary", mode="unrestricted", allowed_tools=[])

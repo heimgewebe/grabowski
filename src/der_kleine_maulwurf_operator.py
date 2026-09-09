@@ -2,9 +2,19 @@
 
 from __future__ import annotations
 
+import argparse
 import base64
+import errno
 import hashlib
-
+import fcntl
+import json
+import os
+import re
+from pathlib import Path
+import stat
+import subprocess
+import time
+import uuid
 
 
 ICON_MIME_TYPE = "image/png"
@@ -2388,3 +2398,601 @@ def mcp_icons():
             sizes=[ICON_SIZE],
         )
     ]
+
+RECOVERY_MODE_SCHEMA_VERSION = 1
+RECOVERY_MODE_KIND = "der_kleine_maulwurf.recovery_mode"
+RECOVERY_MODE_MAX_BYTES = 4096
+RECOVERY_MODE_NORMAL = "normal"
+RECOVERY_MODE_RECOVERY = "recovery"
+RECOVERY_MODE_VALUES = frozenset({RECOVERY_MODE_NORMAL, RECOVERY_MODE_RECOVERY})
+RECOVERY_TRANSITION_LOCK_TIMEOUT_SECONDS = 5.0
+RECOVERY_MODE_LOCK_TIMEOUT_SECONDS = 30.0
+RECOVERY_LOCK_POLL_SECONDS = 0.01
+_RECOVERY_SECRET_KEY_PREFIX = "s" + "k-"
+RECOVERY_REASON_SECRET_PATTERN = re.compile(
+    r"(?i)(?:"
+    + re.escape(_RECOVERY_SECRET_KEY_PREFIX)
+    + r"[A-Za-z0-9._-]{20,}|"
+    r"\bBearer\s+[A-Za-z0-9._~+/-]{12,}=*|"
+    r"-----BEGIN [^-]*PRIVATE KEY-----|"
+    r"[A-Z0-9_-]*(?:TOKEN|SECRET|PASSWORD|PASSWD|COOKIE|CREDENTIAL|AUTHORIZATION|API_KEY|APIKEY)"
+    r"[A-Z0-9_-]*\s*[:=]\s*\S+)"
+)
+
+
+def recovery_mode_path() -> Path:
+    return Path.home() / ".local" / "state" / "grabowski" / "maulwurf-recovery-mode.v1.json"
+
+
+def _open_recovery_state_parent(target: Path) -> int:
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = -1
+    try:
+        descriptor = os.open(target.parent, flags)
+        opened = os.fstat(descriptor)
+        linked = os.lstat(target.parent)
+    except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise RuntimeError("unsafe_recovery_mode_directory") from exc
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or stat.S_ISLNK(linked.st_mode)
+        or opened.st_dev != linked.st_dev
+        or opened.st_ino != linked.st_ino
+        or opened.st_uid != os.geteuid()
+        or opened.st_nlink < 1
+        or stat.S_IMODE(opened.st_mode) & 0o022
+    ):
+        os.close(descriptor)
+        raise RuntimeError("unsafe_recovery_mode_directory")
+    return descriptor
+
+
+def _open_recovery_mode_lock(parent_fd: int, target: Path) -> int:
+    name = f".{target.name}.lock"
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = -1
+    try:
+        descriptor = os.open(name, flags, 0o600, dir_fd=parent_fd)
+        opened = os.fstat(descriptor)
+        linked = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise RuntimeError("unsafe_recovery_mode_lock") from exc
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_dev != linked.st_dev
+        or opened.st_ino != linked.st_ino
+        or opened.st_uid != os.geteuid()
+        or opened.st_nlink != 1
+        or stat.S_IMODE(opened.st_mode) & 0o077
+    ):
+        os.close(descriptor)
+        raise RuntimeError("unsafe_recovery_mode_lock")
+    return descriptor
+
+
+def _recovery_transition_lock_name(target: Path) -> str:
+    return f".{target.name}.transition.lock"
+
+
+def _recovery_transition_marker_name(target: Path) -> str:
+    return f".{target.name}.normalizing"
+
+
+def _open_recovery_transition_lock(parent_fd: int, target: Path) -> int:
+    name = _recovery_transition_lock_name(target)
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = -1
+    try:
+        descriptor = os.open(name, flags, 0o600, dir_fd=parent_fd)
+        opened = os.fstat(descriptor)
+        linked = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise RuntimeError("unsafe_recovery_transition_lock") from exc
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_dev != linked.st_dev
+        or opened.st_ino != linked.st_ino
+        or opened.st_uid != os.geteuid()
+        or opened.st_nlink != 1
+        or stat.S_IMODE(opened.st_mode) & 0o077
+    ):
+        os.close(descriptor)
+        raise RuntimeError("unsafe_recovery_transition_lock")
+    return descriptor
+
+
+def _acquire_recovery_flock(
+    descriptor: int,
+    operation: int,
+    *,
+    timeout_seconds: float,
+    error: str,
+) -> None:
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while True:
+        try:
+            fcntl.flock(descriptor, operation | fcntl.LOCK_NB)
+            return
+        except OSError as exc:
+            if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(error) from exc
+            time.sleep(min(RECOVERY_LOCK_POLL_SECONDS, remaining))
+
+
+def _recovery_transition_pending(parent_fd: int, target: Path) -> bool:
+    name = _recovery_transition_marker_name(target)
+    try:
+        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise RuntimeError("unsafe_recovery_transition_marker")
+    return True
+
+
+def _prepare_recovery_control_transition(
+    parent_fd: int, target: Path, *, normalizing: bool
+) -> tuple[int, bool]:
+    descriptor = _open_recovery_transition_lock(parent_fd, target)
+    marker_created = False
+    try:
+        _acquire_recovery_flock(
+            descriptor,
+            fcntl.LOCK_EX,
+            timeout_seconds=RECOVERY_TRANSITION_LOCK_TIMEOUT_SECONDS,
+            error="recovery_transition_lock_timeout",
+        )
+        marker_name = _recovery_transition_marker_name(target)
+        if _recovery_transition_pending(parent_fd, target):
+            os.unlink(marker_name, dir_fd=parent_fd)
+        if normalizing:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            marker_fd = os.open(marker_name, flags, 0o600, dir_fd=parent_fd)
+            os.close(marker_fd)
+            marker_created = True
+        return descriptor, marker_created
+    except BaseException:
+        if marker_created:
+            _clear_recovery_transition_marker(parent_fd, target)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(descriptor)
+        raise
+
+
+def _clear_recovery_transition_marker(parent_fd: int, target: Path) -> None:
+    try:
+        os.unlink(_recovery_transition_marker_name(target), dir_fd=parent_fd)
+    except FileNotFoundError:
+        pass
+
+
+def acquire_recovery_mutation_guard(*, path: Path | None = None) -> int:
+    target = recovery_mode_path() if path is None else Path(path)
+    parent_fd = _open_recovery_state_parent(target)
+    try:
+        if _recovery_transition_pending(parent_fd, target):
+            raise PermissionError(
+                "der kleine maulwurf is transitioning to NORMAL; new mutations are disabled"
+            )
+        initial = recovery_mode_status(path=target)
+        if not (
+            initial.get("valid") is True
+            and initial.get("mode") == RECOVERY_MODE_RECOVERY
+        ):
+            raise PermissionError(
+                "der kleine maulwurf is in NORMAL mode; mutating tools are disabled"
+            )
+        descriptor = _open_recovery_mode_lock(parent_fd, target)
+    finally:
+        os.close(parent_fd)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                raise PermissionError(
+                    "Recovery lock is currently held by another process"
+                ) from exc
+            raise
+        parent_fd = _open_recovery_state_parent(target)
+        try:
+            transition_pending = _recovery_transition_pending(parent_fd, target)
+        finally:
+            os.close(parent_fd)
+        status = recovery_mode_status(path=target)
+        if transition_pending:
+            raise PermissionError(
+                "der kleine maulwurf is transitioning to NORMAL; new mutations are disabled"
+            )
+        if not (
+            status.get("valid") is True
+            and status.get("mode") == RECOVERY_MODE_RECOVERY
+        ):
+            raise PermissionError(
+                "der kleine maulwurf is in NORMAL mode; mutating tools are disabled"
+            )
+        return descriptor
+    except BaseException:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
+
+
+def release_recovery_mutation_guard(descriptor: int | None) -> None:
+    if not isinstance(descriptor, int) or descriptor < 0:
+        return
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
+
+
+RECOVERY_DETACHED_UNIT_PATTERNS = (
+    "grabowski-job-*.service",
+    "grabowski-task-*.service",
+    "grabowski-browser-worker-*.service",
+    "grabowski-gui-worker-*.service",
+    "grabowski-browser-semantic-*.service",
+)
+
+
+def active_recovery_detached_effects() -> list[str]:
+    import grabowski_tasks as tasks
+
+    try:
+        result = subprocess.run(
+            [
+                "systemctl", "--user", "list-units", "--type=service",
+                "--state=activating,running,reloading,deactivating",
+                "--no-legend", "--plain", "--no-pager",
+                *RECOVERY_DETACHED_UNIT_PATTERNS,
+            ],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("recovery_detached_unit_state_unavailable") from exc
+    if result.returncode != 0:
+        raise RuntimeError("recovery_detached_unit_state_unavailable")
+    effects: list[str] = list(tasks.recovery_active_task_effects())
+    for line in result.stdout.splitlines():
+        unit = line.strip().split(maxsplit=1)[0] if line.strip() else ""
+        if unit:
+            effects.append(f"unit:{unit}")
+    tmux = Path("/usr/bin/tmux")
+    if tmux.is_file():
+        try:
+            sessions = subprocess.run(
+                [str(tmux), "list-sessions", "-F", "#{session_name}"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError("recovery_workspace_session_state_unavailable") from exc
+        if sessions.returncode not in {0, 1}:
+            raise RuntimeError("recovery_workspace_session_state_unavailable")
+        if sessions.returncode == 1 and sessions.stdout.strip():
+            raise RuntimeError("recovery_workspace_session_state_unavailable")
+        for raw in sessions.stdout.splitlines():
+            name = raw.strip()
+            if name.startswith("gaw-"):
+                effects.append(f"tmux:{name}")
+    return sorted(set(effects))
+
+
+def ensure_recovery_detached_effects_stopped() -> None:
+    effects = active_recovery_detached_effects()
+    if effects:
+        raise RuntimeError("recovery_detached_effects_active:" + ",".join(effects))
+
+
+def recovery_mode_status(*, path: Path | None = None) -> dict[str, object]:
+    target = recovery_mode_path() if path is None else Path(path)
+    descriptor: int | None = None
+    try:
+        metadata = os.lstat(target)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+        ):
+            raise RuntimeError("unsafe_recovery_mode_file")
+        if metadata.st_size > RECOVERY_MODE_MAX_BYTES:
+            raise RuntimeError("recovery_mode_file_too_large")
+        flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(target, flags)
+        opened = os.fstat(descriptor)
+        if (
+            opened.st_dev != metadata.st_dev
+            or opened.st_ino != metadata.st_ino
+            or opened.st_mode != metadata.st_mode
+            or opened.st_uid != metadata.st_uid
+            or opened.st_nlink != metadata.st_nlink
+            or opened.st_size != metadata.st_size
+            or opened.st_mtime_ns != metadata.st_mtime_ns
+            or opened.st_ctime_ns != metadata.st_ctime_ns
+        ):
+            raise RuntimeError("recovery_mode_file_changed_during_open")
+        payload = os.read(descriptor, RECOVERY_MODE_MAX_BYTES + 1)
+        if len(payload) > RECOVERY_MODE_MAX_BYTES:
+            raise RuntimeError("recovery_mode_file_too_large")
+        finished = os.fstat(descriptor)
+        if (
+            finished.st_dev != opened.st_dev
+            or finished.st_ino != opened.st_ino
+            or finished.st_mode != opened.st_mode
+            or finished.st_uid != opened.st_uid
+            or finished.st_nlink != opened.st_nlink
+            or finished.st_size != opened.st_size
+            or finished.st_mtime_ns != opened.st_mtime_ns
+            or finished.st_ctime_ns != opened.st_ctime_ns
+        ):
+            raise RuntimeError("recovery_mode_file_changed_during_read")
+    except FileNotFoundError:
+        return {
+            "schema_version": RECOVERY_MODE_SCHEMA_VERSION,
+            "kind": RECOVERY_MODE_KIND,
+            "mode": RECOVERY_MODE_NORMAL,
+            "valid": True,
+            "present": False,
+            "reason": None,
+            "changed_at_unix": None,
+        }
+    except (OSError, RuntimeError) as exc:
+        return {
+            "schema_version": RECOVERY_MODE_SCHEMA_VERSION,
+            "kind": RECOVERY_MODE_KIND,
+            "mode": RECOVERY_MODE_NORMAL,
+            "valid": False,
+            "present": True,
+            "reason": f"invalid:{type(exc).__name__}",
+            "changed_at_unix": None,
+        }
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if len(payload) > RECOVERY_MODE_MAX_BYTES:
+        return {
+            "schema_version": RECOVERY_MODE_SCHEMA_VERSION,
+            "kind": RECOVERY_MODE_KIND,
+            "mode": RECOVERY_MODE_NORMAL,
+            "valid": False,
+            "present": True,
+            "reason": "invalid:too_large",
+            "changed_at_unix": None,
+        }
+    try:
+        value = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        value = None
+    required = {"schema_version", "kind", "mode", "reason", "changed_at_unix"}
+    if (
+        not isinstance(value, dict)
+        or set(value) != required
+        or value.get("schema_version") != RECOVERY_MODE_SCHEMA_VERSION
+        or value.get("kind") != RECOVERY_MODE_KIND
+        or value.get("mode") not in RECOVERY_MODE_VALUES
+        or isinstance(value.get("changed_at_unix"), bool)
+        or not isinstance(value.get("changed_at_unix"), int)
+        or value.get("changed_at_unix") < 0
+        or (value.get("reason") is not None and not isinstance(value.get("reason"), str))
+        or (
+            value.get("mode") == RECOVERY_MODE_RECOVERY
+            and (
+                not isinstance(value.get("reason"), str)
+                or not value["reason"].strip()
+            )
+        )
+        or (value.get("mode") == RECOVERY_MODE_NORMAL and value.get("reason") is not None)
+        or (isinstance(value.get("reason"), str) and len(value["reason"]) > 240)
+        or (
+            isinstance(value.get("reason"), str)
+            and RECOVERY_REASON_SECRET_PATTERN.search(value["reason"]) is not None
+        )
+    ):
+        return {
+            "schema_version": RECOVERY_MODE_SCHEMA_VERSION,
+            "kind": RECOVERY_MODE_KIND,
+            "mode": RECOVERY_MODE_NORMAL,
+            "valid": False,
+            "present": True,
+            "reason": "invalid:document",
+            "changed_at_unix": None,
+        }
+    return {**value, "valid": True, "present": True}
+
+
+def recovery_mode_enabled(*, path: Path | None = None) -> bool:
+    status = recovery_mode_status(path=path)
+    return status.get("valid") is True and status.get("mode") == RECOVERY_MODE_RECOVERY
+
+
+def _write_recovery_mode(
+    mode: str, *, reason: str | None, path: Path | None = None
+) -> dict[str, object]:
+    if mode not in RECOVERY_MODE_VALUES:
+        raise ValueError("unsupported recovery mode")
+    normalized_reason = None if reason is None else reason.strip()
+    if mode == RECOVERY_MODE_RECOVERY and not normalized_reason:
+        raise ValueError("recovery reason is required")
+    if normalized_reason is not None and len(normalized_reason) > 240:
+        raise ValueError("recovery reason is too long")
+    if normalized_reason is not None and RECOVERY_REASON_SECRET_PATTERN.search(normalized_reason):
+        raise ValueError("recovery reason must not contain secret material")
+
+    target = recovery_mode_path() if path is None else Path(path)
+    parent_fd = _open_recovery_state_parent(target)
+    transition_fd = -1
+    transition_marker_created = False
+    lock_fd = -1
+    temporary_name = f".{target.name}.{uuid.uuid4().hex}.tmp"
+    temporary_present = False
+    try:
+        transition_fd, transition_marker_created = _prepare_recovery_control_transition(
+            parent_fd, target, normalizing=mode == RECOVERY_MODE_NORMAL
+        )
+        lock_fd = _open_recovery_mode_lock(parent_fd, target)
+        _acquire_recovery_flock(
+            lock_fd,
+            fcntl.LOCK_EX,
+            timeout_seconds=RECOVERY_MODE_LOCK_TIMEOUT_SECONDS,
+            error="recovery_mode_lock_timeout",
+        )
+        if mode == RECOVERY_MODE_NORMAL and target == recovery_mode_path():
+            ensure_recovery_detached_effects_stopped()
+        document = {
+            "schema_version": RECOVERY_MODE_SCHEMA_VERSION,
+            "kind": RECOVERY_MODE_KIND,
+            "mode": mode,
+            "reason": normalized_reason,
+            "changed_at_unix": int(time.time()),
+        }
+        payload = (
+            json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(temporary_name, flags, 0o600, dir_fd=parent_fd)
+        temporary_present = True
+        try:
+            view = memoryview(payload)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("short recovery mode write")
+                view = view[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(
+            temporary_name,
+            target.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        temporary_present = False
+        try:
+            os.fsync(parent_fd)
+        except OSError as exc:
+            observed = recovery_mode_status(path=target)
+            matching = observed.get("valid") is True and observed.get("mode") == mode
+            return {
+                **observed,
+                "write_outcome": (
+                    "effect_observed_durability_unknown" if matching else "outcome_unknown"
+                ),
+                "requested_mode": mode,
+                "effect_started": True,
+                "ambiguity": True,
+                "durability_confirmed": False,
+                "error_type": type(exc).__name__,
+            }
+        observed = recovery_mode_status(path=target)
+        return {
+            **observed,
+            "write_outcome": "confirmed",
+            "durability_confirmed": True,
+        }
+    finally:
+        if temporary_present:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_fd)
+            except OSError:
+                pass
+        if lock_fd >= 0:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+        if transition_marker_created:
+            _clear_recovery_transition_marker(parent_fd, target)
+        if transition_fd >= 0:
+            try:
+                fcntl.flock(transition_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(transition_fd)
+            except OSError:
+                pass
+        try:
+            os.close(parent_fd)
+        except OSError:
+            pass
+
+
+def enable_recovery_mode(
+    reason: str, *, path: Path | None = None
+) -> dict[str, object]:
+    return _write_recovery_mode(RECOVERY_MODE_RECOVERY, reason=reason, path=path)
+
+
+def disable_recovery_mode(*, path: Path | None = None) -> dict[str, object]:
+    return _write_recovery_mode(RECOVERY_MODE_NORMAL, reason=None, path=path)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="der-kleine-maulwurf-recovery")
+    parser.add_argument("action", choices=("status", "on", "off"))
+    parser.add_argument("--reason", default="manual-recovery")
+    args = parser.parse_args(argv)
+    if args.action == "status":
+        result = recovery_mode_status()
+    elif args.action == "on":
+        result = enable_recovery_mode(args.reason)
+    else:
+        result = disable_recovery_mode()
+    print(json.dumps(result, sort_keys=True))
+    expected_mode = {"on": RECOVERY_MODE_RECOVERY, "off": RECOVERY_MODE_NORMAL}.get(args.action)
+    success = result.get("valid") is True and (
+        expected_mode is None or result.get("mode") == expected_mode
+    )
+    if expected_mode is not None:
+        success = success and result.get("write_outcome") == "confirmed"
+    return 0 if success else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

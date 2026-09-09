@@ -136,12 +136,14 @@ class PolicyRuntimeProofTests(unittest.TestCase):
                         "audit_verify",
                         "audit_read",
                         "bureau_mutation",
+                        "maulwurf_recovery_control",
                         "resource_lease",
                         "process_inspect",
                         "port_inspect",
                     },
                 )
                 grabowski_mcp._require_capability("bureau_mutation")
+                grabowski_mcp._require_capability("maulwurf_recovery_control")
                 for forbidden in (
                     "terminal_execute",
                     "durable_job",

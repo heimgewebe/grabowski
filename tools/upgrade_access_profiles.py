@@ -130,7 +130,7 @@ def upgraded(policy: dict[str, Any], template: dict[str, Any]) -> dict[str, Any]
     failover_capabilities = failover_mutate.get("capabilities")
     expected_failover_capabilities = {
         "file_read", "audit_verify", "audit_read", "bureau_mutation",
-        "resource_lease", "process_inspect", "port_inspect",
+        "maulwurf_recovery_control", "resource_lease", "process_inspect", "port_inspect",
     }
     if failover_mutate.get("trusted_owner") is not False:
         raise ValueError("template failover-mutate must disable trusted_owner")
@@ -142,14 +142,12 @@ def upgraded(policy: dict[str, Any], template: dict[str, Any]) -> dict[str, Any]
         raise ValueError("template failover-mutate capabilities are not the fixed G6.5 contract")
     upgraded_trusted_owner = copy.deepcopy(trusted_owner)
     upgraded_trusted_capabilities = upgraded_trusted_owner["capabilities"]
-    if (
-        "terminal_execute" in upgraded_trusted_capabilities
-        and "bureau_mutation" not in upgraded_trusted_capabilities
-    ):
-        # Before the split, typed Bureau mutation was authorized by
-        # terminal_execute. Adding only bureau_mutation therefore preserves the
-        # existing trusted-owner authority instead of widening it.
-        upgraded_trusted_capabilities.append("bureau_mutation")
+    if "terminal_execute" in upgraded_trusted_capabilities:
+        # Preserve trusted-owner compatibility while adding only narrow typed
+        # capabilities that replace older coarse authority.
+        for capability in ("bureau_mutation", "maulwurf_recovery_control"):
+            if capability not in upgraded_trusted_capabilities:
+                upgraded_trusted_capabilities.append(capability)
 
     active_profile = policy.get("active_profile", "trusted-owner")
     if not isinstance(active_profile, str):
@@ -180,13 +178,12 @@ def upgraded(policy: dict[str, Any], template: dict[str, Any]) -> dict[str, Any]
         raise ValueError("active profile would be lost")
     expected_trusted_owner = copy.deepcopy(trusted_owner)
     expected_capabilities = expected_trusted_owner["capabilities"]
-    if (
-        "terminal_execute" in expected_capabilities
-        and "bureau_mutation" not in expected_capabilities
-    ):
-        expected_capabilities.append("bureau_mutation")
+    if "terminal_execute" in expected_capabilities:
+        for capability in ("bureau_mutation", "maulwurf_recovery_control"):
+            if capability not in expected_capabilities:
+                expected_capabilities.append(capability)
     if result["profiles"]["trusted-owner"] != expected_trusted_owner:
-        raise ValueError("trusted-owner authority changed beyond Bureau compatibility split")
+        raise ValueError("trusted-owner authority changed beyond typed compatibility split")
     return result
 
 
