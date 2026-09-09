@@ -3130,6 +3130,34 @@ class DeploymentAdmissionTests(unittest.TestCase):
             with self.assertRaises(core.DeployError):
                 dual._operator_admission_call_counts(malformed)
 
+    def test_operator_admission_accepts_v1_predecessor_conservatively(self) -> None:
+        predecessor = {
+            "active_tool_calls": 2,
+            "drain_blocking_tool_calls": 0,
+            "read_only_active_tool_calls": 2,
+            "effect_classification": (
+                dual.OPERATOR_ADMISSION_PREDECESSOR_EFFECT_CLASSIFICATION
+            ),
+        }
+        counts = dual._operator_admission_call_counts(predecessor)
+        self.assertFalse(counts["effect_aware"])
+        self.assertEqual(2, counts["blocking_tool_calls"])
+        self.assertEqual(2, counts["read_only_active_tool_calls"])
+
+        idle_predecessor = {
+            **predecessor,
+            "active_tool_calls": 0,
+            "drain_blocking_tool_calls": 0,
+            "read_only_active_tool_calls": 0,
+        }
+        idle_counts = dual._operator_admission_call_counts(idle_predecessor)
+        self.assertFalse(idle_counts["effect_aware"])
+        self.assertEqual(0, idle_counts["blocking_tool_calls"])
+
+        malformed = {**predecessor, "read_only_active_tool_calls": 1}
+        with self.assertRaises(core.DeployError):
+            dual._operator_admission_call_counts(malformed)
+
     def test_operator_admission_accepts_valid_preclassification_pair_conservatively(self) -> None:
         legacy = {
             "active_tool_calls": 2,

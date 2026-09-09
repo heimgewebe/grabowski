@@ -374,6 +374,9 @@ OPERATOR_ADMISSION_MAX_TIMEOUT_SECONDS = 120
 # but not the effect-aware classification added by this release.
 OPERATOR_ADMISSION_BOOTSTRAP_DRAIN_SECONDS = 300
 OPERATOR_ADMISSION_EFFECT_CLASSIFICATION = "readOnlyHint-or-exact-github-pr-view-is-read-only-v2"
+OPERATOR_ADMISSION_PREDECESSOR_EFFECT_CLASSIFICATION = (
+    "readOnlyHint-true-is-read-only-v1"
+)
 OPERATOR_ADMISSION_DYNAMIC_TIMEOUT_WINDOWS = 6
 OPERATOR_ADMISSION_STOP_OPERATIONS = 6
 OPERATOR_ADMISSION_START_OPERATIONS = 4
@@ -3744,6 +3747,30 @@ def _operator_admission_call_counts(
         ):
             core.fail(
                 "Operator-Admission-Legacy-Zähler sind inkonsistent",
+                phase=phase,
+                details={"observation": observed},
+            )
+        return {
+            "effect_aware": False,
+            "active_tool_calls": active_calls,
+            "blocking_tool_calls": active_calls,
+            "read_only_active_tool_calls": read_only,
+        }
+    # During a rolling upgrade the still-running predecessor advertises v1.
+    # Accept that exact contract, but do not trust its narrower read-only bucket
+    # under v2 semantics: every in-flight predecessor call remains blocking.
+    if classification == OPERATOR_ADMISSION_PREDECESSOR_EFFECT_CLASSIFICATION:
+        if (
+            not isinstance(blocking, int)
+            or isinstance(blocking, bool)
+            or blocking < 0
+            or not isinstance(read_only, int)
+            or isinstance(read_only, bool)
+            or read_only < 0
+            or blocking + read_only != active_calls
+        ):
+            core.fail(
+                "Operator-Admission-Effektklassifikation ist inkonsistent",
                 phase=phase,
                 details={"observation": observed},
             )
