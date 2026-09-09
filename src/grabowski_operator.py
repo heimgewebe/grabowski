@@ -4918,7 +4918,7 @@ def _reject_push_configuration(repo: Path, remote: str) -> None:
 
 def _git_probe_bytes(repo: Path, arguments: list[str]) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
-        ["git", "-C", str(repo), *arguments],
+        ["git", "-c", "core.fsmonitor=false", "-C", str(repo), *arguments],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
@@ -5191,10 +5191,102 @@ def _normalize_git_branch_attempt(value: Any) -> dict[str, Any]:
         raise ValueError("branch_attempt.branch is invalid")
     normalized["branch"] = branch
     expected = value.get("expected_preimage_sha256")
-    if not isinstance(expected, str) or GIT_BRANCH_ATTEMPT_SHA256_RE.fullmatch(expected) is None:
+    if expected is not None and (
+        not isinstance(expected, str)
+        or GIT_BRANCH_ATTEMPT_SHA256_RE.fullmatch(expected) is None
+    ):
         raise ValueError("branch_attempt.expected_preimage_sha256 is invalid")
     normalized["expected_preimage_sha256"] = expected
     return normalized
+
+
+def _jit_git_add_preimage_allowed(repo: Path, command_arguments: list[str]) -> bool:
+    """Admit only literal, non-directory paths for server-bound JIT staging."""
+    if len(command_arguments) < 2 or command_arguments[0] != "--":
+        return False
+    tracked = _git_probe_bytes(repo, ["ls-files", "-z"])
+    if tracked.returncode != 0:
+        return False
+    tracked_paths = set(tracked.stdout.split(b"\0"))
+    for value in command_arguments[1:]:
+        if not value or any(character in value for character in ("\x00", "\n", "\r")):
+            return False
+        relative = Path(value)
+        if relative.is_absolute() or any(
+            component in {"", ".", ".."} for component in relative.parts
+        ):
+            return False
+        encoded_path = os.fsencode(value)
+        if encoded_path not in tracked_paths:
+            return False
+        target = repo / relative
+        try:
+            resolved_parent = target.parent.resolve(strict=False)
+        except OSError:
+            return False
+        if resolved_parent != repo and repo not in resolved_parent.parents:
+            return False
+        try:
+            linked = os.lstat(target)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return False
+        else:
+            if stat.S_ISDIR(linked.st_mode):
+                return False
+    return True
+
+
+def _jit_git_commit_preimage_allowed(command_arguments: list[str]) -> bool:
+    """Keep JIT commit on the normal no-implicit-staging command shape."""
+    no_value_options = {
+        "--allow-empty",
+        "--allow-empty-message",
+        "--amend",
+        "--no-verify",
+        "--quiet",
+        "--signoff",
+        "-q",
+        "-s",
+    }
+    noninteractive_message_bound = False
+    index = 0
+    while index < len(command_arguments):
+        item = command_arguments[index]
+        if item in {"-m", "--message"}:
+            if index + 1 >= len(command_arguments):
+                return False
+            noninteractive_message_bound = True
+            index += 2
+            continue
+        if item.startswith("-m") and len(item) > 2:
+            noninteractive_message_bound = True
+            index += 1
+            continue
+        if item.startswith("--message=") and len(item) > len("--message="):
+            noninteractive_message_bound = True
+            index += 1
+            continue
+        if item == "--no-edit":
+            noninteractive_message_bound = True
+            index += 1
+            continue
+        if item in no_value_options:
+            index += 1
+            continue
+        return False
+    return noninteractive_message_bound
+
+
+def _jit_git_preimage_allowed(
+    repo: Path, subcommand: str, command_arguments: list[str]
+) -> bool:
+    if subcommand == "add":
+        return _jit_git_add_preimage_allowed(repo, command_arguments)
+    if subcommand == "commit":
+        return _jit_git_commit_preimage_allowed(command_arguments)
+    return False
 
 
 def _branch_attempt_reconcile_result(
@@ -6083,6 +6175,49 @@ def grabowski_git(
             subcommand, _command_arguments, normalized_attempt["branch"]
         )
         observed_before = _git_branch_preimage(path)
+        requested_preimage_sha256 = normalized_attempt["expected_preimage_sha256"]
+        if requested_preimage_sha256 is None:
+            if _configurations or not _jit_git_preimage_allowed(
+                path, subcommand, _command_arguments
+            ):
+                raise PermissionError(
+                    "branch_attempt.expected_preimage_sha256 is required except for "
+                    "server-bound JIT git add -- <literal-file> and ordinary git commit "
+                    "without implicit staging"
+                )
+            normalized_attempt = {
+                **normalized_attempt,
+                "expected_preimage_sha256": observed_before["preimage_sha256"],
+            }
+            if subcommand == "add":
+                command = _validate_argv(
+                    [
+                        "git",
+                        "-c",
+                        "core.fsmonitor=false",
+                        "-C",
+                        str(path),
+                        "--literal-pathspecs",
+                        *arguments,
+                    ],
+                    cwd=path,
+                )
+            elif subcommand == "commit":
+                command = _validate_argv(
+                    [
+                        "git",
+                        "-c",
+                        "core.hooksPath=/dev/null",
+                        "-c",
+                        "core.fsmonitor=false",
+                        "-c",
+                        "commit.gpgSign=false",
+                        "-C",
+                        str(path),
+                        *arguments,
+                    ],
+                    cwd=path,
+                )
         if normalized_attempt["branch"] != observed_before["branch"]:
             return _branch_attempt_reconcile_result(
                 repo=path,
@@ -6091,7 +6226,11 @@ def grabowski_git(
                 observed=observed_before,
                 reason="branch-drift-before-effect",
             )
-        if normalized_attempt["expected_preimage_sha256"] != observed_before["preimage_sha256"]:
+        if (
+            requested_preimage_sha256 is not None
+            and normalized_attempt["expected_preimage_sha256"]
+            != observed_before["preimage_sha256"]
+        ):
             return _branch_attempt_reconcile_result(
                 repo=path,
                 arguments=arguments,

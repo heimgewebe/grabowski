@@ -3520,6 +3520,329 @@ class OperatorContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(PermissionError, "requires a branch_attempt"):
                     operator.grabowski_git(str(repo), ["add", "README.md"])
 
+    def test_grabowski_git_jit_add_stages_one_literal_file_without_old_preimage(self) -> None:
+        operator = _load_operator_module()
+        import grabowski_resources as resources
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            resource_db = root / "resources.sqlite3"
+            operator.subprocess.run(
+                ["git", "init", "-q", "-b", "feature", str(repo)], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Grabowski Test"],
+                check=True,
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "user.email", "grabowski@example.invalid"],
+                check=True,
+            )
+            readme = repo / "README.md"
+            readme.write_text("baseline\n", encoding="utf-8")
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "add", "README.md"], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "commit", "-q", "-m", "baseline"],
+                check=True,
+            )
+            readme.write_text("after-long-tests\n", encoding="utf-8")
+            fsmonitor = root / "fake-fsmonitor"
+            fsmonitor.write_text(
+                '#!/bin/sh\ntouch "$0.ran"\nexit 1\n', encoding="utf-8"
+            )
+            fsmonitor.chmod(0o755)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "core.fsmonitor", str(fsmonitor)],
+                check=True,
+            )
+            attempt = {
+                "schema_version": 1,
+                "owner_id": "operator:jit-add",
+                "operation_id": "operation-a",
+                "attempt_id": "attempt-1",
+                "branch": "feature",
+            }
+            with (
+                patch.object(resources, "RESOURCE_DB", resource_db),
+                patch.object(operator, "_require_operator_mutation", return_value=None),
+                patch.object(operator, "_append_effect_audit", return_value="a" * 64),
+            ):
+                result = operator.grabowski_git(
+                    str(repo), ["add", "--", "README.md"], branch_attempt=attempt
+                )
+
+            self.assertEqual(0, result["returncode"])
+            receipt = result["branch_mutation"]
+            self.assertEqual("completed", receipt["status"])
+            self.assertEqual(
+                receipt["expected_preimage_sha256"],
+                receipt["observed_preimage_sha256"],
+            )
+            self.assertRegex(receipt["expected_preimage_sha256"], r"^[0-9a-f]{64}$")
+            self.assertIn("--literal-pathspecs", result["argv"])
+            self.assertIn("core.fsmonitor=false", result["argv"])
+            self.assertFalse(Path(f"{fsmonitor}.ran").exists())
+            staged = operator.subprocess.run(
+                ["git", "-C", str(repo), "diff", "--cached", "--", "README.md"],
+                stdout=operator.subprocess.PIPE,
+                check=True,
+            )
+            self.assertIn(b"after-long-tests", staged.stdout)
+
+    def test_grabowski_git_jit_add_rejects_broad_or_directory_pathspecs(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            operator.subprocess.run(
+                ["git", "init", "-q", "-b", "feature", str(repo)], check=True
+            )
+            (repo / "README.md").write_text("content\n", encoding="utf-8")
+            (repo / "subdir").mkdir()
+            self.assertFalse(operator._jit_git_add_preimage_allowed(repo, ["README.md"]))
+            self.assertFalse(operator._jit_git_add_preimage_allowed(repo, ["--", "."]))
+            self.assertFalse(operator._jit_git_add_preimage_allowed(repo, ["--", "subdir"]))
+            self.assertFalse(
+                operator._jit_git_add_preimage_allowed(repo, ["--", str(repo / "README.md")])
+            )
+            self.assertFalse(
+                operator._jit_git_add_preimage_allowed(repo, ["--", "README.md"])
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "add", "README.md"], check=True
+            )
+            self.assertTrue(
+                operator._jit_git_add_preimage_allowed(repo, ["--", "README.md"])
+            )
+            (repo / "README.md").unlink()
+            self.assertTrue(
+                operator._jit_git_add_preimage_allowed(repo, ["--", "README.md"])
+            )
+
+    def test_grabowski_git_jit_commit_ignores_unstaged_worktree_drift(self) -> None:
+        operator = _load_operator_module()
+        import grabowski_resources as resources
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            resource_db = root / "resources.sqlite3"
+            operator.subprocess.run(
+                ["git", "init", "-q", "-b", "feature", str(repo)], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Grabowski Test"],
+                check=True,
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "user.email", "grabowski@example.invalid"],
+                check=True,
+            )
+            readme = repo / "README.md"
+            other = repo / "OTHER.md"
+            readme.write_text("baseline\n", encoding="utf-8")
+            other.write_text("baseline-other\n", encoding="utf-8")
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "add", "README.md", "OTHER.md"], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "commit", "-q", "-m", "baseline"],
+                check=True,
+            )
+            readme.write_text("staged-change\n", encoding="utf-8")
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "add", "README.md"], check=True
+            )
+            other.write_text("late-unstaged-change\n", encoding="utf-8")
+            hook = repo / ".git" / "hooks" / "pre-commit"
+            hook.write_text("#!/bin/sh\ngit add OTHER.md\n", encoding="utf-8")
+            hook.chmod(0o755)
+            signer = root / "fake-gpg"
+            signer.write_text(
+                '#!/bin/sh\ntouch "$0.ran"\nexit 1\n', encoding="utf-8"
+            )
+            signer.chmod(0o755)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "commit.gpgSign", "true"],
+                check=True,
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "gpg.program", str(signer)],
+                check=True,
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "core.fsmonitor", str(signer)],
+                check=True,
+            )
+            attempt = {
+                "schema_version": 1,
+                "owner_id": "operator:jit-commit",
+                "operation_id": "operation-a",
+                "attempt_id": "attempt-1",
+                "branch": "feature",
+            }
+            with (
+                patch.object(resources, "RESOURCE_DB", resource_db),
+                patch.object(operator, "_require_operator_mutation", return_value=None),
+                patch.object(operator, "_append_effect_audit", return_value="b" * 64),
+            ):
+                result = operator.grabowski_git(
+                    str(repo), ["commit", "-m", "jit commit"], branch_attempt=attempt
+                )
+
+            self.assertEqual(0, result["returncode"])
+            self.assertEqual(
+                result["branch_mutation"]["expected_preimage_sha256"],
+                result["branch_mutation"]["observed_preimage_sha256"],
+            )
+            self.assertIn("core.hooksPath=/dev/null", result["argv"])
+            self.assertIn("core.fsmonitor=false", result["argv"])
+            self.assertIn("commit.gpgSign=false", result["argv"])
+            self.assertFalse(Path(f"{signer}.ran").exists())
+            committed_readme = operator.subprocess.run(
+                ["git", "-C", str(repo), "show", "HEAD:README.md"],
+                stdout=operator.subprocess.PIPE,
+                check=True,
+            ).stdout
+            committed_other = operator.subprocess.run(
+                ["git", "-C", str(repo), "show", "HEAD:OTHER.md"],
+                stdout=operator.subprocess.PIPE,
+                check=True,
+            ).stdout
+            self.assertEqual(b"staged-change\n", committed_readme)
+            self.assertEqual(b"baseline-other\n", committed_other)
+            self.assertEqual("late-unstaged-change\n", other.read_text(encoding="utf-8"))
+
+    def test_grabowski_git_jit_commit_requires_noninteractive_message_and_rejects_implicit_staging(self) -> None:
+        operator = _load_operator_module()
+        self.assertTrue(operator._jit_git_commit_preimage_allowed(["-m", "message"]))
+        self.assertTrue(operator._jit_git_commit_preimage_allowed(["--message=message"]))
+        self.assertTrue(
+            operator._jit_git_commit_preimage_allowed(["--amend", "--no-edit"])
+        )
+        for arguments in (
+            [],
+            ["--amend"],
+            ["--allow-empty-message"],
+            ["-a", "-m", "message"],
+            ["--all", "-m", "message"],
+            ["--include", "README.md", "-m", "message"],
+            ["--only", "README.md", "-m", "message"],
+            ["--", "README.md"],
+        ):
+            with self.subTest(arguments=arguments):
+                self.assertFalse(operator._jit_git_commit_preimage_allowed(arguments))
+
+    def test_grabowski_git_jit_commit_rejects_caller_git_configuration(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            operator.subprocess.run(
+                ["git", "init", "-q", "-b", "feature", str(repo)], check=True
+            )
+            with patch.object(operator, "_require_operator_mutation", return_value=None):
+                with self.assertRaisesRegex(
+                    PermissionError, "expected_preimage_sha256 is required"
+                ):
+                    operator.grabowski_git(
+                        str(repo),
+                        [
+                            "-c",
+                            "core.hooksPath=/tmp/attacker-hooks",
+                            "commit",
+                            "-m",
+                            "message",
+                        ],
+                        branch_attempt={
+                            "schema_version": 1,
+                            "owner_id": "operator:jit-config",
+                            "operation_id": "operation-a",
+                            "attempt_id": "attempt-1",
+                            "branch": "feature",
+                        },
+                    )
+
+    def test_grabowski_git_jit_commit_editor_forms_require_caller_preimage(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            operator.subprocess.run(
+                ["git", "init", "-q", "-b", "feature", str(repo)], check=True
+            )
+            with patch.object(operator, "_require_operator_mutation", return_value=None):
+                for index, arguments in enumerate((["commit"], ["commit", "--amend"]), 1):
+                    with self.subTest(arguments=arguments):
+                        with self.assertRaisesRegex(
+                            PermissionError, "expected_preimage_sha256 is required"
+                        ):
+                            operator.grabowski_git(
+                                str(repo),
+                                arguments,
+                                branch_attempt={
+                                    "schema_version": 1,
+                                    "owner_id": "operator:jit-editor",
+                                    "operation_id": "operation-a",
+                                    "attempt_id": f"attempt-{index}",
+                                    "branch": "feature",
+                                },
+                            )
+
+    def test_grabowski_git_jit_preimage_still_blocks_drift_after_attempt_lease(self) -> None:
+        operator = _load_operator_module()
+        import grabowski_resources as resources
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            operator.subprocess.run(
+                ["git", "init", "-q", "-b", "feature", str(repo)], check=True
+            )
+            before = operator._git_branch_preimage(repo)
+            after = {
+                **before,
+                "preimage_sha256": "f" * 64,
+                "index_sha256": "e" * 64,
+            }
+            lease = {
+                "resource_key": f"repo:{repo}:branch:feature",
+                "attempt_binding_sha256": "c" * 64,
+                "lease": {"metadata_sha256": "d" * 64, "expires_at_unix": 9999999999},
+            }
+            with (
+                patch.object(operator, "_require_operator_mutation", return_value=None),
+                patch.object(operator, "_append_effect_audit", return_value="a" * 64),
+                patch.object(operator, "_git_branch_preimage", side_effect=[before, after]),
+                patch.object(resources, "acquire_branch_mutation_attempt", return_value=lease),
+                patch.object(
+                    resources,
+                    "complete_branch_mutation_attempt",
+                    return_value={"action": "released"},
+                ) as cleanup,
+                patch.object(operator, "_run") as run,
+            ):
+                result = operator.grabowski_git(
+                    str(repo),
+                    ["commit", "-m", "must not run"],
+                    branch_attempt={
+                        "schema_version": 1,
+                        "owner_id": "operator:jit-race",
+                        "operation_id": "operation-a",
+                        "attempt_id": "attempt-1",
+                        "branch": "feature",
+                    },
+                )
+            receipt = result["branch_mutation"]
+            self.assertEqual("reconcile_required", receipt["status"])
+            self.assertEqual(
+                before["preimage_sha256"], receipt["expected_preimage_sha256"]
+            )
+            self.assertEqual("f" * 64, receipt["observed_preimage_sha256"])
+            self.assertEqual("git-preimage-drift-after-attempt-lease", receipt["reason"])
+            self.assertFalse(receipt["effect_attempted"])
+            cleanup.assert_called_once_with(lease)
+            run.assert_not_called()
+
     def test_grabowski_git_blocks_worktree_destructive_subcommands_before_attempt_observation(self) -> None:
         operator = _load_operator_module()
         commands = (
