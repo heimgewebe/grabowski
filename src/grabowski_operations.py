@@ -41,6 +41,16 @@ SEAGATE_BACKUP_SMART_READ_OPERATION = "seagate-backup-smart-read"
 BACKUP_MOUNT_RECONCILE_OPERATION = "backup-mount-reconcile"
 ROOTBROKER_AUTHORITY_REFRESH_OPERATION = "rootbroker-authority-refresh"
 BLOCKADE_AUTHORITY_HARDEN_OPERATION = "blockade-authority-harden"
+MAULWURF_RECOVERY_STATUS_OPERATION = "maulwurf-recovery-status"
+MAULWURF_RECOVERY_ON_OPERATION = "maulwurf-recovery-on"
+MAULWURF_RECOVERY_OFF_OPERATION = "maulwurf-recovery-off"
+MAULWURF_RECOVERY_TYPED_OPERATIONS = frozenset(
+    {
+        MAULWURF_RECOVERY_STATUS_OPERATION,
+        MAULWURF_RECOVERY_ON_OPERATION,
+        MAULWURF_RECOVERY_OFF_OPERATION,
+    }
+)
 BACKUP_STORAGE_TYPED_OPERATIONS = {
     BACKUP_NTFS_CHECK_OPERATION: {
         "description": "Run the fixed root-read-only ntfsfix check for the configured BACKUP volume.",
@@ -83,6 +93,7 @@ RESERVED_TYPED_OPERATIONS = frozenset(
         FLEET_MUTATION_OPERATION,
         BLOCKADE_AUTHORITY_HARDEN_OPERATION,
         ROOTBROKER_AUTHORITY_REFRESH_OPERATION,
+        *MAULWURF_RECOVERY_TYPED_OPERATIONS,
         *BACKUP_STORAGE_TYPED_OPERATIONS,
     }
 )
@@ -221,6 +232,62 @@ def _run_step(step: dict[str, Any]) -> dict[str, Any]:
     return fleet.run_fleet_host(step["target"], step["argv"],
                                 timeout_seconds=step["timeout_seconds"],
                                 max_output_bytes=operator.DEFAULT_OUTPUT_BYTES)
+
+
+def _maulwurf_recovery_operation_plan(
+    operation: str, parameters: dict[str, str] | None
+) -> dict[str, Any]:
+    if not operator._maulwurf_runtime_active():
+        raise RuntimeError("Maulwurf recovery operations are available only on the mole runtime")
+    supplied = parameters or {}
+    if not isinstance(supplied, dict) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in supplied.items()
+    ):
+        raise ValueError("parameters must be an object of strings")
+    if operation == MAULWURF_RECOVERY_ON_OPERATION:
+        if set(supplied) != {"reason"}:
+            raise ValueError("maulwurf-recovery-on requires exactly the reason parameter")
+        reason = supplied["reason"].strip()
+        if not reason or len(reason) > 240:
+            raise ValueError("recovery reason must contain 1..240 characters")
+    elif supplied:
+        raise ValueError(f"{operation} accepts no parameters")
+    import der_kleine_maulwurf_operator as mole
+
+    return {
+        "operation": operation,
+        "typed_builtin": True,
+        "effect": (
+            "read_only"
+            if operation == MAULWURF_RECOVERY_STATUS_OPERATION
+            else "recovery_mode_write"
+        ),
+        "parameters": (["reason"] if operation == MAULWURF_RECOVERY_ON_OPERATION else []),
+        "current_status": mole.recovery_mode_status(),
+    }
+
+
+def _run_maulwurf_recovery_operation(
+    operation: str, parameters: dict[str, str] | None
+) -> dict[str, Any]:
+    plan = _maulwurf_recovery_operation_plan(operation, parameters)
+    import der_kleine_maulwurf_operator as mole
+
+    if operation == MAULWURF_RECOVERY_STATUS_OPERATION:
+        status = mole.recovery_mode_status()
+    elif operation == MAULWURF_RECOVERY_ON_OPERATION:
+        status = mole.enable_recovery_mode((parameters or {})["reason"])
+    elif operation == MAULWURF_RECOVERY_OFF_OPERATION:
+        status = mole.disable_recovery_mode()
+    else:
+        raise ValueError(f"Unknown Maulwurf recovery operation: {operation}")
+    return {
+        "operation": operation,
+        "success": True,
+        "effect": plan["effect"],
+        "status": status,
+    }
 
 
 def _append_fleet_mutation_audit(audit: dict[str, Any]) -> dict[str, Any]:
@@ -905,6 +972,28 @@ def grabowski_operation_list() -> dict[str, Any]:
         "typed_builtin": True,
         "effect": "authority_mode_write",
     }
+    if operator._maulwurf_runtime_active():
+        operations[MAULWURF_RECOVERY_STATUS_OPERATION] = {
+            "description": "Read the local Maulwurf NORMAL/RECOVERY mode.",
+            "parameters": [],
+            "step_count": 1,
+            "typed_builtin": True,
+            "effect": "read_only",
+        }
+        operations[MAULWURF_RECOVERY_ON_OPERATION] = {
+            "description": "Enable local Maulwurf recovery mutations.",
+            "parameters": ["reason"],
+            "step_count": 1,
+            "typed_builtin": True,
+            "effect": "recovery_mode_write",
+        }
+        operations[MAULWURF_RECOVERY_OFF_OPERATION] = {
+            "description": "Return the Maulwurf to NORMAL read-only mode.",
+            "parameters": [],
+            "step_count": 1,
+            "typed_builtin": True,
+            "effect": "recovery_mode_write",
+        }
     for name, spec in BACKUP_STORAGE_TYPED_OPERATIONS.items():
         operations[name] = {
             "description": spec["description"],
@@ -927,6 +1016,8 @@ def grabowski_operation_plan(operation: str,
         return _blockade_authority_harden_operation_plan(parameters)
     if operation == ROOTBROKER_AUTHORITY_REFRESH_OPERATION:
         return _rootbroker_authority_refresh_plan(parameters)
+    if operation in MAULWURF_RECOVERY_TYPED_OPERATIONS:
+        return _maulwurf_recovery_operation_plan(operation, parameters)
     if operation in BACKUP_STORAGE_TYPED_OPERATIONS:
         return _backup_storage_operation_plan(operation, parameters)
     return _render(operation, parameters)
@@ -942,6 +1033,8 @@ def grabowski_operation_run(operation: str,
         return _run_blockade_authority_harden_operation(parameters)
     if operation == ROOTBROKER_AUTHORITY_REFRESH_OPERATION:
         return _run_rootbroker_authority_refresh_operation(parameters)
+    if operation in MAULWURF_RECOVERY_TYPED_OPERATIONS:
+        return _run_maulwurf_recovery_operation(operation, parameters)
     if operation in BACKUP_STORAGE_TYPED_OPERATIONS:
         return _run_backup_storage_operation(operation, parameters)
     plan = _render(operation, parameters)

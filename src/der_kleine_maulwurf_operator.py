@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import argparse
 import base64
 import hashlib
-
+import json
+import os
+from pathlib import Path
+import stat
+import time
+import uuid
 
 
 ICON_MIME_TYPE = "image/png"
@@ -2388,3 +2394,165 @@ def mcp_icons():
             sizes=[ICON_SIZE],
         )
     ]
+
+RECOVERY_MODE_SCHEMA_VERSION = 1
+RECOVERY_MODE_KIND = "der_kleine_maulwurf.recovery_mode"
+RECOVERY_MODE_MAX_BYTES = 4096
+RECOVERY_MODE_NORMAL = "normal"
+RECOVERY_MODE_RECOVERY = "recovery"
+RECOVERY_MODE_VALUES = frozenset({RECOVERY_MODE_NORMAL, RECOVERY_MODE_RECOVERY})
+
+
+def recovery_mode_path() -> Path:
+    return Path.home() / ".local" / "state" / "grabowski" / "maulwurf-recovery-mode.v1.json"
+
+
+def recovery_mode_status(*, path: Path | None = None) -> dict[str, object]:
+    target = recovery_mode_path() if path is None else Path(path)
+    try:
+        metadata = os.lstat(target)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+        ):
+            raise RuntimeError("unsafe_recovery_mode_file")
+        payload = target.read_bytes()
+    except FileNotFoundError:
+        return {
+            "schema_version": RECOVERY_MODE_SCHEMA_VERSION,
+            "kind": RECOVERY_MODE_KIND,
+            "mode": RECOVERY_MODE_NORMAL,
+            "valid": True,
+            "present": False,
+            "reason": None,
+            "changed_at_unix": None,
+        }
+    except (OSError, RuntimeError) as exc:
+        return {
+            "schema_version": RECOVERY_MODE_SCHEMA_VERSION,
+            "kind": RECOVERY_MODE_KIND,
+            "mode": RECOVERY_MODE_NORMAL,
+            "valid": False,
+            "present": True,
+            "reason": f"invalid:{type(exc).__name__}",
+            "changed_at_unix": None,
+        }
+    if len(payload) > RECOVERY_MODE_MAX_BYTES:
+        return {
+            "schema_version": RECOVERY_MODE_SCHEMA_VERSION,
+            "kind": RECOVERY_MODE_KIND,
+            "mode": RECOVERY_MODE_NORMAL,
+            "valid": False,
+            "present": True,
+            "reason": "invalid:too_large",
+            "changed_at_unix": None,
+        }
+    try:
+        value = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        value = None
+    required = {"schema_version", "kind", "mode", "reason", "changed_at_unix"}
+    if (
+        not isinstance(value, dict)
+        or set(value) != required
+        or value.get("schema_version") != RECOVERY_MODE_SCHEMA_VERSION
+        or value.get("kind") != RECOVERY_MODE_KIND
+        or value.get("mode") not in RECOVERY_MODE_VALUES
+        or isinstance(value.get("changed_at_unix"), bool)
+        or not isinstance(value.get("changed_at_unix"), int)
+        or value.get("changed_at_unix") < 0
+        or (value.get("reason") is not None and not isinstance(value.get("reason"), str))
+    ):
+        return {
+            "schema_version": RECOVERY_MODE_SCHEMA_VERSION,
+            "kind": RECOVERY_MODE_KIND,
+            "mode": RECOVERY_MODE_NORMAL,
+            "valid": False,
+            "present": True,
+            "reason": "invalid:document",
+            "changed_at_unix": None,
+        }
+    return {**value, "valid": True, "present": True}
+
+
+def recovery_mode_enabled(*, path: Path | None = None) -> bool:
+    status = recovery_mode_status(path=path)
+    return status.get("valid") is True and status.get("mode") == RECOVERY_MODE_RECOVERY
+
+
+def _write_recovery_mode(
+    mode: str, *, reason: str | None, path: Path | None = None
+) -> dict[str, object]:
+    if mode not in RECOVERY_MODE_VALUES:
+        raise ValueError("unsupported recovery mode")
+    normalized_reason = None if reason is None else reason.strip()
+    if mode == RECOVERY_MODE_RECOVERY and not normalized_reason:
+        raise ValueError("recovery reason is required")
+    if normalized_reason is not None and len(normalized_reason) > 240:
+        raise ValueError("recovery reason is too long")
+    target = recovery_mode_path() if path is None else Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    document = {
+        "schema_version": RECOVERY_MODE_SCHEMA_VERSION,
+        "kind": RECOVERY_MODE_KIND,
+        "mode": mode,
+        "reason": normalized_reason,
+        "changed_at_unix": int(time.time()),
+    }
+    payload = (
+        json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(temporary, flags, 0o600)
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short recovery mode write")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        os.replace(temporary, target)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return recovery_mode_status(path=target)
+
+
+def enable_recovery_mode(
+    reason: str, *, path: Path | None = None
+) -> dict[str, object]:
+    return _write_recovery_mode(RECOVERY_MODE_RECOVERY, reason=reason, path=path)
+
+
+def disable_recovery_mode(*, path: Path | None = None) -> dict[str, object]:
+    return _write_recovery_mode(RECOVERY_MODE_NORMAL, reason=None, path=path)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="der-kleine-maulwurf-recovery")
+    parser.add_argument("action", choices=("status", "on", "off"))
+    parser.add_argument("--reason", default="manual-recovery")
+    args = parser.parse_args(argv)
+    if args.action == "status":
+        result = recovery_mode_status()
+    elif args.action == "on":
+        result = enable_recovery_mode(args.reason)
+    else:
+        result = disable_recovery_mode()
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

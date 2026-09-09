@@ -16,6 +16,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 operations = importlib.import_module("grabowski_operations")
+mole = importlib.import_module("der_kleine_maulwurf_operator")
 
 
 class FakeSocket:
@@ -49,6 +50,60 @@ class FakeSocket:
             self.response = b""
             return value
         return b""
+
+
+class MaulwurfRecoveryOperationTests(unittest.TestCase):
+    def test_typed_operations_round_trip_without_new_tool_surface(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "mode.json"
+            with (
+                patch.object(operations.operator, "_maulwurf_runtime_active", return_value=True),
+                patch.object(mole, "recovery_mode_path", return_value=path),
+            ):
+                status = operations.grabowski_operation_plan(
+                    operations.MAULWURF_RECOVERY_STATUS_OPERATION, None
+                )
+                self.assertEqual("normal", status["current_status"]["mode"])
+
+                enabled = operations.grabowski_operation_run(
+                    operations.MAULWURF_RECOVERY_ON_OPERATION,
+                    {"reason": "primary unavailable"},
+                )
+                self.assertEqual("recovery", enabled["status"]["mode"])
+                self.assertTrue(mole.recovery_mode_enabled(path=path))
+
+                disabled = operations.grabowski_operation_run(
+                    operations.MAULWURF_RECOVERY_OFF_OPERATION, None
+                )
+                self.assertEqual("normal", disabled["status"]["mode"])
+                self.assertFalse(mole.recovery_mode_enabled(path=path))
+
+    def test_typed_operations_are_not_available_on_primary_runtime(self) -> None:
+        with patch.object(
+            operations.operator, "_maulwurf_runtime_active", return_value=False
+        ):
+            with self.assertRaisesRegex(RuntimeError, "only on the mole runtime"):
+                operations.grabowski_operation_plan(
+                    operations.MAULWURF_RECOVERY_STATUS_OPERATION, None
+                )
+            with self.assertRaisesRegex(RuntimeError, "only on the mole runtime"):
+                operations.grabowski_operation_run(
+                    operations.MAULWURF_RECOVERY_ON_OPERATION,
+                    {"reason": "should not work"},
+                )
+
+    def test_recovery_on_requires_a_bounded_reason(self) -> None:
+        with patch.object(
+            operations.operator, "_maulwurf_runtime_active", return_value=True
+        ):
+            with self.assertRaisesRegex(ValueError, "requires exactly"):
+                operations.grabowski_operation_plan(
+                    operations.MAULWURF_RECOVERY_ON_OPERATION, None
+                )
+            with self.assertRaisesRegex(ValueError, "1..240"):
+                operations.grabowski_operation_plan(
+                    operations.MAULWURF_RECOVERY_ON_OPERATION, {"reason": "   "}
+                )
 
 
 class BackupNtfsOperationTests(unittest.TestCase):

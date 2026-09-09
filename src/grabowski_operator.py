@@ -420,6 +420,54 @@ def _find_server() -> FastMCP:
 mcp = _find_server()
 
 
+def _maulwurf_runtime_active() -> bool:
+    env_name = getattr(
+        base, "MCP_BRANDING_VARIANT_ENV", "GRABOWSKI_MCP_BRANDING_VARIANT"
+    )
+    variant = os.environ.get(env_name, "").strip()
+    allowed = {
+        getattr(base, "DER_KLEINE_MAULWURF_BRANDING_VARIANT", "der-kleine-maulwurf"),
+        getattr(base, "LEGACY_KLEINER_MAULWURF_BRANDING_VARIANT", "kleiner-maulwurf"),
+    }
+    return variant in allowed
+
+
+def _maulwurf_recovery_module() -> Any:
+    import der_kleine_maulwurf_operator as mole
+
+    return mole
+
+
+def _maulwurf_recovery_enabled() -> bool:
+    return bool(_maulwurf_recovery_module().recovery_mode_enabled())
+
+
+def _maulwurf_recovery_control_call(tool_name: Any, arguments: Any) -> bool:
+    if tool_name != "grabowski_operation_run" or not isinstance(arguments, dict):
+        return False
+    return arguments.get("operation") in {
+        "maulwurf-recovery-on",
+        "maulwurf-recovery-off",
+    }
+
+
+def _enforce_maulwurf_recovery_mode(
+    tool_name: Any, arguments: Any, tool: Any
+) -> None:
+    if not _maulwurf_runtime_active():
+        return
+    if _maulwurf_recovery_control_call(tool_name, arguments):
+        return
+    if _tool_read_only_hint(tool) is True:
+        return
+    if _maulwurf_recovery_enabled():
+        return
+    raise PermissionError(
+        "der kleine maulwurf is in NORMAL mode; mutating or unclassified tools "
+        "are disabled until the maulwurf-recovery-on operation is called"
+    )
+
+
 def _deployment_admission_invalid(reason: str) -> dict[str, Any]:
     return {
         "schema_version": 1,
@@ -1390,6 +1438,7 @@ def _install_deployment_admission_gate() -> None:
             if callable(get_tool) and isinstance(tool_name, str)
             else None
         )
+        _enforce_maulwurf_recovery_mode(tool_name, arguments, tool)
         if (
             observer_evidence is not None
             and observer_evidence.get("marker_bound") is True
@@ -1469,7 +1518,7 @@ def _install_deployment_admission_gate() -> None:
             )
             enforcement_configured = (
                 grabowski_effect_interceptor.fence_enforcement_required()
-                if read_only_hint is not True
+                if read_only_hint is not True and not _maulwurf_runtime_active()
                 else False
             )
             if read_only_hint is not True:

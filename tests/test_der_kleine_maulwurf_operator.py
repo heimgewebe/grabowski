@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import struct
 import sys
+import tempfile
 import types
 import unittest
 from unittest.mock import patch
@@ -85,6 +86,33 @@ class TestDerKleineMaulwurfOperator(unittest.TestCase):
             "from der_kleine_maulwurf_operator import mcp_icons", source
         )
         self.assertIn("_configured_app_name, _configured_icons", source)
+
+    def test_recovery_mode_defaults_normal_and_round_trips(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mode.json"
+            initial = mole.recovery_mode_status(path=path)
+            self.assertEqual("normal", initial["mode"])
+            self.assertTrue(initial["valid"])
+            self.assertFalse(initial["present"])
+            self.assertFalse(mole.recovery_mode_enabled(path=path))
+
+            enabled = mole.enable_recovery_mode("test-recovery", path=path)
+            self.assertEqual("recovery", enabled["mode"])
+            self.assertTrue(mole.recovery_mode_enabled(path=path))
+            self.assertEqual(0o600, path.stat().st_mode & 0o777)
+
+            disabled = mole.disable_recovery_mode(path=path)
+            self.assertEqual("normal", disabled["mode"])
+            self.assertFalse(mole.recovery_mode_enabled(path=path))
+
+    def test_invalid_recovery_mode_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mode.json"
+            path.write_text("not-json", encoding="utf-8")
+            path.chmod(0o600)
+            status = mole.recovery_mode_status(path=path)
+        self.assertFalse(status["valid"])
+        self.assertEqual("normal", status["mode"])
 
     def test_runtime_contract_installs_branding_provider(self) -> None:
         contract = json.loads((ROOT / "config" / "runtime-entrypoint.json").read_text())

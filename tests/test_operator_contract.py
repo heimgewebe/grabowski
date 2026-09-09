@@ -421,6 +421,84 @@ class OperatorContractTests(unittest.TestCase):
         self.assertFalse(domain_started)
         self.assertEqual(0, operator._deployment_admission_active_tool_calls())
 
+    def test_maulwurf_normal_mode_blocks_mutation_but_keeps_recovery_switch(self) -> None:
+        operator = _load_operator_module()
+        calls: list[str] = []
+
+        async def domain_call(*args, **kwargs):
+            calls.append(str(args[0]))
+            return {"called": True}
+
+        operator.mcp._tool_manager.call_tool = domain_call
+
+        def get_tool(name):
+            return types.SimpleNamespace(
+                is_async=True,
+                context_kwarg=None,
+                annotations=types.SimpleNamespace(readOnlyHint=name == "read"),
+            )
+
+        operator.mcp._tool_manager.get_tool = get_tool
+        with (
+            patch.dict(
+                os.environ,
+                {"GRABOWSKI_MCP_BRANDING_VARIANT": "der-kleine-maulwurf"},
+            ),
+            patch.object(operator, "_maulwurf_recovery_enabled", return_value=False),
+            patch.object(
+                operator, "_require_transport_roundtrip_for_tool", return_value=None
+            ),
+        ):
+            operator._configure_http_runtime()
+            result = operator.asyncio.run(
+                operator.mcp._tool_manager.call_tool("read", {})
+            )
+            self.assertTrue(result["called"])
+            with self.assertRaisesRegex(PermissionError, "NORMAL mode"):
+                operator.asyncio.run(
+                    operator.mcp._tool_manager.call_tool("write", {})
+                )
+            result = operator.asyncio.run(
+                operator.mcp._tool_manager.call_tool(
+                    "grabowski_operation_run",
+                    {
+                        "operation": "maulwurf-recovery-on",
+                        "parameters": {"reason": "primary unavailable"},
+                    },
+                )
+            )
+            self.assertTrue(result["called"])
+
+        self.assertEqual(["read", "grabowski_operation_run"], calls)
+
+    def test_maulwurf_recovery_mode_allows_mutation(self) -> None:
+        operator = _load_operator_module()
+        operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
+            is_async=True,
+            context_kwarg=None,
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {"GRABOWSKI_MCP_BRANDING_VARIANT": "der-kleine-maulwurf"},
+            ),
+            patch.object(operator, "_maulwurf_recovery_enabled", return_value=True),
+            patch.object(
+                operator.grabowski_effect_interceptor,
+                "fence_enforcement_required",
+                side_effect=AssertionError("mole runtime must not consult the old global fence"),
+            ),
+            patch.object(
+                operator, "_require_transport_roundtrip_for_tool", return_value=None
+            ),
+        ):
+            operator._configure_http_runtime()
+            result = operator.asyncio.run(
+                operator.mcp._tool_manager.call_tool("write", {})
+            )
+        self.assertTrue(result["called"])
+
     def test_cold_reentry_tools_wait_for_active_marker_then_reenter_after_expiry(
         self,
     ) -> None:
