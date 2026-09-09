@@ -53,6 +53,13 @@ class FakeSocket:
 
 
 class MaulwurfRecoveryOperationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.detached_effects = patch.object(
+            mole, "active_recovery_detached_effects", return_value=[]
+        )
+        self.detached_effects.start()
+        self.addCleanup(self.detached_effects.stop)
+
     def test_typed_operations_round_trip_without_new_tool_surface(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             path = Path(raw) / "mode.json"

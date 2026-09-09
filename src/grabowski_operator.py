@@ -102,20 +102,6 @@ JOB_INVOKER_TOOLS = frozenset(
         "grabowski_recovery_provenance_repair",
     }
 )
-MAULWURF_RECOVERY_DETACHED_EFFECT_TOOLS = JOB_INVOKER_TOOLS | frozenset(
-    {
-        "grabowski_task_start",
-        "grabowski_task_resume",
-        "grabowski_task_reconcile",
-        "grabowski_task_reconcile_resume",
-        "grabowski_browser_worker_start",
-        "grabowski_gui_worker_start",
-        "grabowski_agent_workspace_create",
-        "grabowski_agent_workspace_writer_handoff",
-        "grabowski_agent_workspace_role_retry",
-        "grabowski_agent_competition_start",
-    }
-)
 DEFAULT_TIMEOUT = 60
 MAX_TIMEOUT = 120
 TRUSTED_MAX_TIMEOUT = 86_400
@@ -487,10 +473,6 @@ def _enforce_maulwurf_recovery_mode(
         raise PermissionError(
             "der kleine maulwurf is in NORMAL mode; mutating or unclassified tools "
             "are disabled until the maulwurf-recovery-on operation is called"
-        )
-    if isinstance(tool_name, str) and tool_name in MAULWURF_RECOVERY_DETACHED_EFFECT_TOOLS:
-        raise PermissionError(
-            "der kleine maulwurf RECOVERY mode forbids detached or durable effect starts"
         )
 
 

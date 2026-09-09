@@ -534,7 +534,7 @@ class OperatorContractTests(unittest.TestCase):
                 )
             )
 
-    def test_maulwurf_recovery_rejects_detached_effect_starts(self) -> None:
+    def test_maulwurf_recovery_allows_detached_effect_starts(self) -> None:
         operator = _load_operator_module()
         tool = types.SimpleNamespace(
             is_async=True,
@@ -558,9 +558,7 @@ class OperatorContractTests(unittest.TestCase):
                 "grabowski_agent_workspace_writer_handoff",
                 "grabowski_agent_workspace_role_retry",
             ):
-                with self.subTest(name=name), self.assertRaisesRegex(
-                    PermissionError, "detached or durable"
-                ):
+                with self.subTest(name=name):
                     operator._enforce_maulwurf_recovery_mode(name, {}, tool)
 
     def test_maulwurf_mutation_holds_recovery_guard_through_domain_call(self) -> None:

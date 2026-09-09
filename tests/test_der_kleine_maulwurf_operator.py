@@ -204,6 +204,33 @@ class TestDerKleineMaulwurfOperator(unittest.TestCase):
         self.assertEqual("effect_observed_durability_unknown", result["write_outcome"])
         self.assertEqual("recovery", observed["mode"])
 
+    def test_live_recovery_off_refuses_while_detached_effects_are_active(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mode.json"
+            with patch.object(mole, "recovery_mode_path", return_value=path):
+                enabled = mole.enable_recovery_mode("test-recovery")
+                self.assertEqual("confirmed", enabled["write_outcome"])
+                with patch.object(
+                    mole, "active_recovery_detached_effects",
+                    return_value=["unit:grabowski-task-test.service"],
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "detached_effects_active"):
+                        mole.disable_recovery_mode()
+                self.assertEqual("recovery", mole.recovery_mode_status()["mode"])
+
+    def test_live_recovery_off_succeeds_after_detached_effects_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mode.json"
+            with (
+                patch.object(mole, "recovery_mode_path", return_value=path),
+                patch.object(mole, "active_recovery_detached_effects", return_value=[]),
+            ):
+                mole.enable_recovery_mode("test-recovery")
+                disabled = mole.disable_recovery_mode()
+            self.assertTrue(disabled["valid"])
+            self.assertEqual("normal", disabled["mode"])
+            self.assertEqual("confirmed", disabled["write_outcome"])
+
     def test_direct_recovery_cli_fails_when_readback_disagrees(self) -> None:
         with (
             patch.object(

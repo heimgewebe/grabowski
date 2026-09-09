@@ -11,6 +11,7 @@ import os
 import re
 from pathlib import Path
 import stat
+import subprocess
 import time
 import uuid
 
@@ -2525,6 +2526,55 @@ def release_recovery_mutation_guard(descriptor: int | None) -> None:
         pass
 
 
+RECOVERY_DETACHED_UNIT_PATTERNS = (
+    "grabowski-job-*.service",
+    "grabowski-task-*.service",
+    "grabowski-browser-worker-*.service",
+    "grabowski-gui-worker-*.service",
+    "grabowski-browser-semantic-*.service",
+)
+
+
+def active_recovery_detached_effects() -> list[str]:
+    result = subprocess.run(
+        [
+            "systemctl", "--user", "list-units", "--type=service",
+            "--state=activating,running,reloading,deactivating",
+            "--no-legend", "--plain", "--no-pager",
+            *RECOVERY_DETACHED_UNIT_PATTERNS,
+        ],
+        capture_output=True, text=True, timeout=5, check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("recovery_detached_unit_state_unavailable")
+    effects: list[str] = []
+    for line in result.stdout.splitlines():
+        unit = line.strip().split(maxsplit=1)[0] if line.strip() else ""
+        if unit:
+            effects.append(f"unit:{unit}")
+    tmux = Path("/usr/bin/tmux")
+    if tmux.is_file():
+        sessions = subprocess.run(
+            [str(tmux), "list-sessions", "-F", "#{session_name}"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        if sessions.returncode not in {0, 1}:
+            raise RuntimeError("recovery_workspace_session_state_unavailable")
+        if sessions.returncode == 1 and sessions.stdout.strip():
+            raise RuntimeError("recovery_workspace_session_state_unavailable")
+        for raw in sessions.stdout.splitlines():
+            name = raw.strip()
+            if name.startswith("gaw-"):
+                effects.append(f"tmux:{name}")
+    return sorted(set(effects))
+
+
+def ensure_recovery_detached_effects_stopped() -> None:
+    effects = active_recovery_detached_effects()
+    if effects:
+        raise RuntimeError("recovery_detached_effects_active:" + ",".join(effects))
+
+
 def recovery_mode_status(*, path: Path | None = None) -> dict[str, object]:
     target = recovery_mode_path() if path is None else Path(path)
     descriptor: int | None = None
@@ -2648,6 +2698,8 @@ def _write_recovery_mode(
     try:
         lock_fd = _open_recovery_mode_lock(parent_fd, target)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        if mode == RECOVERY_MODE_NORMAL and path is None:
+            ensure_recovery_detached_effects_stopped()
         document = {
             "schema_version": RECOVERY_MODE_SCHEMA_VERSION,
             "kind": RECOVERY_MODE_KIND,
