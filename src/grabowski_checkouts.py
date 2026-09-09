@@ -57,7 +57,11 @@ MAX_RETENTION_SECONDS = 365 * 24 * 60 * 60
 # Compatibility telemetry remains in schema 2; cleanup itself is immediately eligible.
 CHECKOUT_CLEANUP_GRACE_SECONDS = 0
 CLEANUP_PLAN_SCHEMA_VERSION = 2
-CLEANUP_PLAN_HASH_EXCLUDED_FIELDS = ("archive_age_seconds",)
+CLEANUP_PLAN_HASH_EXCLUDED_FIELDS = (
+    "archive_age_seconds",
+    "remote_secured",
+    "remote_secured_refs",
+)
 ACTIVE_CHECKOUT_LIMIT_ENV = "GRABOWSKI_MAX_ACTIVE_CHECKOUTS_PER_REPO"
 DEFAULT_MAX_ACTIVE_CHECKOUTS_PER_REPO = 16
 MIN_CONFIGURABLE_ACTIVE_CHECKOUTS_PER_REPO = 16
