@@ -20,6 +20,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import der_kleine_maulwurf_operator as mole  # noqa: E402
+import grabowski_tasks as tasks  # noqa: E402
 
 
 class _TestIcon:
@@ -300,7 +301,6 @@ class TestDerKleineMaulwurfOperator(unittest.TestCase):
                 mole.active_recovery_detached_effects()
 
     def test_detached_effect_scan_maps_tmux_timeout_to_runtime_error(self) -> None:
-        import grabowski_tasks as tasks
 
         def fake_run(argv, **_kwargs):
             if argv[0] == "systemctl":
@@ -318,7 +318,6 @@ class TestDerKleineMaulwurfOperator(unittest.TestCase):
                 mole.active_recovery_detached_effects()
 
     def test_detached_effect_scan_includes_backend_aware_persistent_tasks(self) -> None:
-        import grabowski_tasks as tasks
 
         def fake_run(argv, **_kwargs):
             if argv[0] == "systemctl":
