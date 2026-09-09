@@ -82,7 +82,7 @@ _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY_MAX = 4096
 _DEPLOYMENT_ADMISSION_IDENTITY_ATTEMPTS_MAX = 8
 _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_SAMPLE_MAX = 16
 _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_NAME_GROUP_MAX = 32
-_DEPLOYMENT_ADMISSION_EFFECT_CLASSIFICATION = "readOnlyHint-true-is-read-only-v1"
+_DEPLOYMENT_ADMISSION_EFFECT_CLASSIFICATION = "readOnlyHint-or-exact-github-pr-view-is-read-only-v2"
 _DEPLOYMENT_ADMISSION_MAX_TOOL_NAME_CHARS = 128
 _DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC = "sync"
 _DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC = "async"
@@ -650,6 +650,20 @@ def _github_pr_view_transport_read_only(arguments: Any) -> bool:
         selector_seen = True
         index += 1
     return selector_seen and repo_seen and json_seen
+
+
+def _deployment_admission_drain_blocking(
+    tool_name: Any, arguments: Any, tool: Any
+) -> bool:
+    """Treat only concretely proven reads as non-blocking during deploy drain."""
+    if tool_name == deployment_observer.OPERATION:
+        return True
+    if _tool_read_only_hint(tool) is True:
+        return False
+    return not (
+        tool_name == "grabowski_github"
+        and _github_pr_view_transport_read_only(arguments)
+    )
 
 
 def _transport_roundtrip_exempt_call(
@@ -1448,9 +1462,8 @@ def _install_deployment_admission_gate() -> None:
         identity = _deployment_admission_register_tool_call(
             tool_name,
             kind,
-            drain_blocking=(
-                read_only_hint is not True
-                or tool_name == deployment_observer.OPERATION
+            drain_blocking=_deployment_admission_drain_blocking(
+                tool_name, arguments, tool
             ),
         )
         release_in_finally = True
