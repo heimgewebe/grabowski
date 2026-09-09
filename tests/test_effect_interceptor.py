@@ -447,6 +447,40 @@ class EffectInterceptorTests(unittest.TestCase):
         completion = interceptor.build_exception_completion(admission, outer)
         self.assertEqual(completion["completion_class"], "outcome_unknown")
 
+    def test_deep_positive_cause_overrides_outer_negative_evidence(self) -> None:
+        admission = interceptor.admit_mutation(
+            tool_name="grabowski_replace_text",
+            arguments={},
+            transport_evidence=self.transport(),
+        )
+        error_type = type(
+            "DeepStructuredEvidence",
+            (RuntimeError,),
+            {"__module__": "grabowski_test_exception"},
+        )
+        deepest = error_type("effect may have started")
+        deepest.effect_possible = True
+        current = deepest
+        for index in range(10):
+            wrapper = error_type(f"wrapper {index}")
+            wrapper.__cause__ = current
+            current = wrapper
+        current.effect_started = False
+        completion = interceptor.build_exception_completion(admission, current)
+        self.assertEqual(completion["completion_class"], "outcome_unknown")
+
+    def test_explicit_cause_cycle_is_bounded(self) -> None:
+        error_type = type(
+            "CyclicCause",
+            (RuntimeError,),
+            {"__module__": "grabowski_test_exception"},
+        )
+        first = error_type("first")
+        second = error_type("second")
+        first.__cause__ = second
+        second.__cause__ = first
+        self.assertEqual(interceptor._exception_chain(first), [first, second])
+
     def test_implicit_exception_context_is_not_pre_effect_evidence(self) -> None:
         admission = interceptor.admit_mutation(
             tool_name="grabowski_replace_text",

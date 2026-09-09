@@ -509,15 +509,13 @@ def record_success(
     )
 
 
-def _exception_chain(
-    error: BaseException, *, maximum: int = 8
-) -> list[BaseException]:
-    """Follow explicit causal wrapping only; implicit context is not proof."""
+def _exception_chain(error: BaseException) -> list[BaseException]:
+    """Follow the complete explicit cause chain; implicit context is not proof."""
 
     chain: list[BaseException] = []
     seen: set[int] = set()
     current: BaseException | None = error
-    while current is not None and len(chain) < maximum and id(current) not in seen:
+    while current is not None and id(current) not in seen:
         chain.append(current)
         seen.add(id(current))
         current = current.__cause__
