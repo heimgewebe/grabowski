@@ -1342,7 +1342,7 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertIn("active_retention_not_elapsed", dry_run["plan"]["cleanup_blockers"])
         self.assertNotIn("archive_grace_not_elapsed", dry_run["plan"]["cleanup_blockers"])
 
-    def test_cleanup_accepts_exact_merged_github_pull_head_ref(self) -> None:
+    def test_cleanup_uses_verified_archive_without_github_pull_head_lookup(self) -> None:
         self._git(
             "remote",
             "add",
@@ -1397,13 +1397,12 @@ class CheckoutLifecycleTests(unittest.TestCase):
                 expected_branch="topic",
             )
 
-        self.assertTrue(dry_run["plan"]["remote_secured"])
-        self.assertEqual(
-            dry_run["plan"]["remote_secured_refs"],
-            ["github:heimgewebe/reposkop:refs/pull/101/head"],
-        )
+        self.assertFalse(dry_run["plan"]["remote_secured"])
+        self.assertEqual(dry_run["plan"]["remote_secured_refs"], [])
+        self.assertTrue(all(item["present"] for item in dry_run["plan"]["recovery_refs"]))
+        self.assertNotIn("head_not_remote_secured", dry_run["plan"]["cleanup_blockers"])
         self.assertTrue(dry_run["plan"]["safe_to_apply"])
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 0)
 
     def test_remote_security_prioritizes_exact_head_among_many_reused_branch_prs(self) -> None:
         self._git(
@@ -1524,7 +1523,7 @@ class CheckoutLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(3, len(calls))
 
-    def test_cleanup_rejects_mismatched_github_pull_head_ref(self) -> None:
+    def test_cleanup_accepts_verified_archive_without_matching_github_pull_head_ref(self) -> None:
         self._git(
             "remote",
             "add",
@@ -1573,13 +1572,13 @@ class CheckoutLifecycleTests(unittest.TestCase):
             )
 
         self.assertFalse(dry_run["plan"]["remote_secured"])
-        self.assertIn(
+        self.assertNotIn(
             "head_not_remote_secured",
             dry_run["plan"]["cleanup_blockers"],
         )
-        self.assertFalse(dry_run["plan"]["safe_to_apply"])
+        self.assertTrue(dry_run["plan"]["safe_to_apply"])
 
-    def test_cleanup_fails_closed_when_github_result_has_no_returncode(self) -> None:
+    def test_cleanup_does_not_depend_on_github_result(self) -> None:
         self._git(
             "remote",
             "add",
@@ -1610,11 +1609,11 @@ class CheckoutLifecycleTests(unittest.TestCase):
             )
 
         self.assertFalse(dry_run["plan"]["remote_secured"])
-        self.assertIn(
+        self.assertNotIn(
             "head_not_remote_secured",
             dry_run["plan"]["cleanup_blockers"],
         )
-        self.assertFalse(dry_run["plan"]["safe_to_apply"])
+        self.assertTrue(dry_run["plan"]["safe_to_apply"])
 
     def test_remote_security_local_ref_fast_path_skips_github(self) -> None:
         self._publish_remote()
@@ -1743,7 +1742,7 @@ class CheckoutLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(
             dry_run["plan"]["plan_hash_excludes"],
-            ["archive_age_seconds"],
+            ["archive_age_seconds", "remote_secured", "remote_secured_refs"],
         )
         self.assertEqual(
             dry_run["plan"]["archive_age_seconds"],
@@ -1753,6 +1752,54 @@ class CheckoutLifecycleTests(unittest.TestCase):
             applied["plan"]["archive_age_seconds"],
             checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS + 101,
         )
+        self.assertEqual(
+            dry_run["plan"]["plan_sha256"],
+            applied["plan"]["plan_sha256"],
+        )
+        self.assertFalse(self.checkout.exists())
+
+    def test_cleanup_plan_ignores_diagnostic_remote_observation_drift(self) -> None:
+        archive = self._archive()["archive"]
+        assert isinstance(archive, dict)
+        observations = [
+            {
+                "remote_secured": True,
+                "remote_secured_refs": ["refs/remotes/origin/topic"],
+            },
+            {
+                "remote_secured": False,
+                "remote_secured_refs": [],
+            },
+        ]
+        observation_index = [0]
+
+        def observe(*_args: object, **_kwargs: object) -> dict[str, object]:
+            index = min(observation_index[0], len(observations) - 1)
+            observation_index[0] += 1
+            return dict(observations[index])
+
+        with patch.object(checkouts, "_remote_secured_observation", side_effect=observe):
+            dry_run = checkouts.grabowski_checkout_cleanup(
+                str(self.repo),
+                str(self.checkout),
+                "owner-a",
+                dry_run=True,
+                archive_id=archive["archive_id"],
+                expected_head=self.head,
+                expected_branch="topic",
+            )
+            applied = checkouts.grabowski_checkout_cleanup(
+                str(self.repo),
+                str(self.checkout),
+                "owner-a",
+                dry_run=False,
+                plan_id=dry_run["dry_run_record"]["plan_id"],
+                expected_plan_sha256=dry_run["plan"]["plan_sha256"],
+                confirmation="remove-linked-checkout",
+            )
+
+        self.assertTrue(dry_run["plan"]["remote_secured"])
+        self.assertFalse(applied["plan"]["remote_secured"])
         self.assertEqual(
             dry_run["plan"]["plan_sha256"],
             applied["plan"]["plan_sha256"],
