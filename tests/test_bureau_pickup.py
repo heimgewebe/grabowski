@@ -7824,7 +7824,7 @@ class BureauPickupTests(unittest.TestCase):
         )
         self.assertEqual(1, invoke.call_count)
 
-    def test_recorded_repair_activity_with_stale_run_blocks_execute_retry(
+    def test_recorded_repair_activity_with_stale_run_allows_execute_retry(
         self,
     ) -> None:
         (
@@ -7863,13 +7863,9 @@ class BureauPickupTests(unittest.TestCase):
                 side_effect=[existing, recorded],
             ) as invoke,
         ):
-            with self.assertRaises(pickup.BureauPickupError) as raised:
-                pickup.grabowski_bureau_pickup_execute(request)
+            result = pickup.grabowski_bureau_pickup_execute(request)
 
-        self.assertEqual(
-            "existing-assignment-execution-not-bound", raised.exception.code
-        )
-        self.assertIn("heartbeat_stale", raised.exception.details["reason_codes"])
+        self.assertEqual("existing-assignment", result["status"])
         self.assertEqual(2, invoke.call_count)
         status_argv = invoke.call_args_list[1].args[0]
         self.assertIn("--activity-id", status_argv)
