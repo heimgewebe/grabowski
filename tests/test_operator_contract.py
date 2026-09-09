@@ -174,7 +174,9 @@ def _load_operator_module():
 
     fake_base._read_bound_regular_bytes = read_bound_regular_bytes
     fake_base._append_audit = lambda record: None
-    fake_base._transport_authorize_connector_tool = lambda context, tool_name: None
+    fake_base._transport_authorize_connector_tool = (
+        lambda context, tool_name, arguments=None: None
+    )
     fake_base._retain_pending_transport_target = (
         lambda challenge_receipt_sha256, **kwargs: {
             "challenge_receipt_sha256": challenge_receipt_sha256,

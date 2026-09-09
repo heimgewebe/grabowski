@@ -5346,9 +5346,22 @@ def _transport_tool_read_only_hint(tool: Any) -> bool | None:
     return hint if isinstance(hint, bool) else None
 
 
+def _transport_exact_argument_read_only_call(
+    tool_name: str, arguments: Any
+) -> bool:
+    return (
+        tool_name == "grabowski_operation_run"
+        and isinstance(arguments, dict)
+        and arguments.get("operation") == "maulwurf-recovery-status"
+        and set(arguments) <= {"operation", "parameters"}
+        and arguments.get("parameters") is None
+    )
+
+
 def _transport_authorize_connector_tool(
     ctx: Context | None,
     tool_name: str,
+    arguments: Any = None,
 ) -> dict[str, Any] | None:
     """Enforce the principal-bound tool policy before any domain tool runs."""
     connector_id = _transport_connector_identity(ctx)
@@ -5368,7 +5381,10 @@ def _transport_authorize_connector_tool(
             manager = getattr(mcp, "_tool_manager", None)
             get_tool = getattr(manager, "get_tool", None)
             tool = get_tool(tool_name) if callable(get_tool) else None
-            if _transport_tool_read_only_hint(tool) is not True:
+            if (
+                _transport_tool_read_only_hint(tool) is not True
+                and not _transport_exact_argument_read_only_call(tool_name, arguments)
+            ):
                 raise RuntimeError(
                     f"transport connector {connector_id} requires an explicitly read-only tool: {tool_name}"
                 )

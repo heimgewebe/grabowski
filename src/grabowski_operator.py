@@ -1438,7 +1438,7 @@ def _install_deployment_admission_gate() -> None:
         # hint. Enforce it before observer/readiness bypasses and before any
         # transport assertion can be consumed. Headerless local reads retain
         # legacy behavior; an enrolled connector capability is policy-bound.
-        base._transport_authorize_connector_tool(context, tool_name)
+        base._transport_authorize_connector_tool(context, tool_name, arguments)
         observer_evidence: dict[str, Any] | None = None
         try:
             observer_evidence = _deployment_observer_request_evidence(
