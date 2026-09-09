@@ -7332,6 +7332,47 @@ def _observe(record: dict[str, Any]) -> dict[str, Any]:
 
 
 
+RECOVERY_ACTIVE_TASK_SCAN_LIMIT = 100
+RECOVERY_TASK_OBSERVE_STATES = ("launching", "running", "outcome_unknown", "interrupted")
+
+
+def recovery_active_task_effects(
+    *, limit: int = RECOVERY_ACTIVE_TASK_SCAN_LIMIT
+) -> list[str]:
+    """Freshly observe persisted task states that may still hide a live effect."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+        raise ValueError("recovery active task limit must be between 1 and 100")
+    observe_states = RECOVERY_TASK_OBSERVE_STATES
+    active_states = TASK_STATE_PROJECTIONS["active"]
+    placeholders = ",".join("?" for _ in observe_states)
+    with _task_read_snapshot() as connection:
+        rows = connection.execute(
+            f"SELECT * FROM tasks WHERE state IN ({placeholders}) "
+            "ORDER BY created_at_unix DESC, task_id DESC LIMIT ?",
+            (*observe_states, limit + 1),
+        ).fetchall()
+    if len(rows) > limit:
+        raise RuntimeError("recovery_active_task_scan_limit_exceeded")
+    effects: list[str] = []
+    for row in rows:
+        record = dict(row)
+        try:
+            observation = _observe(record)
+        except Exception as exc:
+            raise RuntimeError(
+                f"recovery_task_observation_unavailable:{record.get('task_id', 'unknown')}"
+            ) from exc
+        observed_state = str(observation.get("state") or "outcome_unknown")
+        if observed_state in active_states or observed_state == "outcome_unknown":
+            effects.append(
+                "task:"
+                f"{record['task_id']}@{record['host']}:"
+                f"{_execution_backend(record)}:{_systemd_scope(record)}:"
+                f"{_authoritative_unit(record)}:{observed_state}"
+            )
+    return effects
+
+
 def _normalize_task_operation_identity(
     value: dict[str, Any] | None,
     *,

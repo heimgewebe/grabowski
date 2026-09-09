@@ -181,6 +181,57 @@ class TestDerKleineMaulwurfOperator(unittest.TestCase):
             with self.assertRaisesRegex(PermissionError, "NORMAL mode"):
                 mole.acquire_recovery_mutation_guard(path=path)
 
+    def test_recovery_off_blocks_new_guards_while_waiting_for_existing_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mode.json"
+            mole.enable_recovery_mode("test-recovery", path=path)
+            guard = mole.acquire_recovery_mutation_guard(path=path)
+            finished = threading.Event()
+
+            def disable() -> None:
+                mole.disable_recovery_mode(path=path)
+                finished.set()
+
+            thread = threading.Thread(target=disable)
+            thread.start()
+            marker_path = path.with_name(mole._recovery_transition_marker_name(path))
+            deadline = time.monotonic() + 1.0
+            while not marker_path.exists():
+                if time.monotonic() >= deadline:
+                    self.fail("NORMAL transition marker was not published")
+                time.sleep(0.005)
+            with self.assertRaisesRegex(PermissionError, "transitioning to NORMAL"):
+                mole.acquire_recovery_mutation_guard(path=path)
+            self.assertFalse(finished.is_set())
+            mole.release_recovery_mutation_guard(guard)
+            thread.join(timeout=2.0)
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(finished.is_set())
+            self.assertFalse(marker_path.exists())
+
+    def test_detached_effect_scan_includes_backend_aware_persistent_tasks(self) -> None:
+        import grabowski_tasks as tasks
+
+        def fake_run(argv, **_kwargs):
+            if argv[0] == "systemctl":
+                return types.SimpleNamespace(returncode=0, stdout="")
+            return types.SimpleNamespace(returncode=1, stdout="")
+
+        with (
+            patch.object(mole.subprocess, "run", side_effect=fake_run),
+            patch.object(
+                tasks,
+                "recovery_active_task_effects",
+                return_value=[
+                    "task:root@local:systemd-root-broker:system:root.service:running",
+                    "task:remote@node:systemd-user:user:remote.service:running",
+                ],
+            ),
+        ):
+            effects = mole.active_recovery_detached_effects()
+        self.assertIn("task:root@local:systemd-root-broker:system:root.service:running", effects)
+        self.assertIn("task:remote@node:systemd-user:user:remote.service:running", effects)
+
     def test_post_replace_directory_fsync_failure_is_explicitly_unknown(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "mode.json"

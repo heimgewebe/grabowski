@@ -2475,24 +2475,124 @@ def _open_recovery_mode_lock(parent_fd: int, target: Path) -> int:
     return descriptor
 
 
+def _recovery_transition_lock_name(target: Path) -> str:
+    return f".{target.name}.transition.lock"
+
+
+def _recovery_transition_marker_name(target: Path) -> str:
+    return f".{target.name}.normalizing"
+
+
+def _open_recovery_transition_lock(parent_fd: int, target: Path) -> int:
+    name = _recovery_transition_lock_name(target)
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = -1
+    try:
+        descriptor = os.open(name, flags, 0o600, dir_fd=parent_fd)
+        opened = os.fstat(descriptor)
+        linked = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise RuntimeError("unsafe_recovery_transition_lock") from exc
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_dev != linked.st_dev
+        or opened.st_ino != linked.st_ino
+        or opened.st_uid != os.geteuid()
+        or opened.st_nlink != 1
+        or stat.S_IMODE(opened.st_mode) & 0o077
+    ):
+        os.close(descriptor)
+        raise RuntimeError("unsafe_recovery_transition_lock")
+    return descriptor
+
+
+def _recovery_transition_pending(parent_fd: int, target: Path) -> bool:
+    name = _recovery_transition_marker_name(target)
+    try:
+        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise RuntimeError("unsafe_recovery_transition_marker")
+    return True
+
+
+def _prepare_recovery_control_transition(
+    parent_fd: int, target: Path, *, normalizing: bool
+) -> tuple[int, bool]:
+    descriptor = _open_recovery_transition_lock(parent_fd, target)
+    marker_created = False
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        marker_name = _recovery_transition_marker_name(target)
+        if _recovery_transition_pending(parent_fd, target):
+            os.unlink(marker_name, dir_fd=parent_fd)
+        if normalizing:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            marker_fd = os.open(marker_name, flags, 0o600, dir_fd=parent_fd)
+            os.close(marker_fd)
+            marker_created = True
+        return descriptor, marker_created
+    except BaseException:
+        if marker_created:
+            _clear_recovery_transition_marker(parent_fd, target)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(descriptor)
+        raise
+
+
+def _clear_recovery_transition_marker(parent_fd: int, target: Path) -> None:
+    try:
+        os.unlink(_recovery_transition_marker_name(target), dir_fd=parent_fd)
+    except FileNotFoundError:
+        pass
+
+
 def acquire_recovery_mutation_guard(*, path: Path | None = None) -> int:
     target = recovery_mode_path() if path is None else Path(path)
-    initial = recovery_mode_status(path=target)
-    if not (
-        initial.get("valid") is True
-        and initial.get("mode") == RECOVERY_MODE_RECOVERY
-    ):
-        raise PermissionError(
-            "der kleine maulwurf is in NORMAL mode; mutating tools are disabled"
-        )
     parent_fd = _open_recovery_state_parent(target)
     try:
+        if _recovery_transition_pending(parent_fd, target):
+            raise PermissionError(
+                "der kleine maulwurf is transitioning to NORMAL; new mutations are disabled"
+            )
+        initial = recovery_mode_status(path=target)
+        if not (
+            initial.get("valid") is True
+            and initial.get("mode") == RECOVERY_MODE_RECOVERY
+        ):
+            raise PermissionError(
+                "der kleine maulwurf is in NORMAL mode; mutating tools are disabled"
+            )
         descriptor = _open_recovery_mode_lock(parent_fd, target)
     finally:
         os.close(parent_fd)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_SH)
+        parent_fd = _open_recovery_state_parent(target)
+        try:
+            transition_pending = _recovery_transition_pending(parent_fd, target)
+        finally:
+            os.close(parent_fd)
         status = recovery_mode_status(path=target)
+        if transition_pending:
+            raise PermissionError(
+                "der kleine maulwurf is transitioning to NORMAL; new mutations are disabled"
+            )
         if not (
             status.get("valid") is True
             and status.get("mode") == RECOVERY_MODE_RECOVERY
@@ -2536,6 +2636,8 @@ RECOVERY_DETACHED_UNIT_PATTERNS = (
 
 
 def active_recovery_detached_effects() -> list[str]:
+    import grabowski_tasks as tasks
+
     result = subprocess.run(
         [
             "systemctl", "--user", "list-units", "--type=service",
@@ -2547,7 +2649,7 @@ def active_recovery_detached_effects() -> list[str]:
     )
     if result.returncode != 0:
         raise RuntimeError("recovery_detached_unit_state_unavailable")
-    effects: list[str] = []
+    effects: list[str] = list(tasks.recovery_active_task_effects())
     for line in result.stdout.splitlines():
         unit = line.strip().split(maxsplit=1)[0] if line.strip() else ""
         if unit:
@@ -2692,10 +2794,15 @@ def _write_recovery_mode(
 
     target = recovery_mode_path() if path is None else Path(path)
     parent_fd = _open_recovery_state_parent(target)
+    transition_fd = -1
+    transition_marker_created = False
     lock_fd = -1
     temporary_name = f".{target.name}.{uuid.uuid4().hex}.tmp"
     temporary_present = False
     try:
+        transition_fd, transition_marker_created = _prepare_recovery_control_transition(
+            parent_fd, target, normalizing=mode == RECOVERY_MODE_NORMAL
+        )
         lock_fd = _open_recovery_mode_lock(parent_fd, target)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         if mode == RECOVERY_MODE_NORMAL and path is None:
@@ -2767,6 +2874,17 @@ def _write_recovery_mode(
                 pass
             try:
                 os.close(lock_fd)
+            except OSError:
+                pass
+        if transition_marker_created:
+            _clear_recovery_transition_marker(parent_fd, target)
+        if transition_fd >= 0:
+            try:
+                fcntl.flock(transition_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(transition_fd)
             except OSError:
                 pass
         try:
