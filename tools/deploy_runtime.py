@@ -48,11 +48,20 @@ AGENT_INSTRUCTIONS_HEADER_RE = re.compile(
     r"(?P<version>[a-z0-9][a-z0-9-]{0,127}) "
     r"\(schema (?P<schema>[1-9][0-9]*)\)\.$"
 )
+MCP_MODERN_PROTOCOL_VERSION = "2026-07-28"
 MCP_PROTOCOL_VERSIONS = (
     "2025-06-18",
     "2025-03-26",
     "2024-11-05",
 )
+MCP_SUPPORTED_PROTOCOL_VERSIONS = (
+    MCP_MODERN_PROTOCOL_VERSION,
+    *MCP_PROTOCOL_VERSIONS,
+)
+MCP_PROBE_CLIENT_INFO = {
+    "name": "grabowski-deploy-probe",
+    "version": "1.0",
+}
 ALLOWED_VENV_BASE_DISTS = {"pip", "setuptools", "wheel"}
 TIMEOUTS = {
     "git": 10,
@@ -1328,11 +1337,13 @@ def send_json(proc: subprocess.Popen[bytes], payload: dict[str, Any]) -> None:
     proc.stdin.flush()
 
 
-def wait_for_id(
+def _wait_for_id(
     proc: subprocess.Popen[bytes],
     wanted_id: int,
     timeout_seconds: int,
-) -> dict[str, Any]:
+    *,
+    required: bool,
+) -> dict[str, Any] | None:
     if proc.stdout is None:
         fail("MCP-Probe besitzt kein stdout.")
 
@@ -1361,9 +1372,39 @@ def wait_for_id(
         if message.get("id") == wanted_id:
             return message
 
-    fail(
-        f"Keine MCP-Antwort auf JSON-RPC-ID {wanted_id}; "
-        f"empfangen: {seen!r}"
+    if required:
+        fail(
+            f"Keine MCP-Antwort auf JSON-RPC-ID {wanted_id}; "
+            f"empfangen: {seen!r}"
+        )
+    return None
+
+
+def wait_for_id(
+    proc: subprocess.Popen[bytes],
+    wanted_id: int,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    result = _wait_for_id(
+        proc,
+        wanted_id,
+        timeout_seconds,
+        required=True,
+    )
+    assert result is not None
+    return result
+
+
+def wait_for_id_optional(
+    proc: subprocess.Popen[bytes],
+    wanted_id: int,
+    timeout_seconds: int,
+) -> dict[str, Any] | None:
+    return _wait_for_id(
+        proc,
+        wanted_id,
+        timeout_seconds,
+        required=False,
     )
 
 
@@ -1385,7 +1426,7 @@ def _valid_agent_instructions_identity(value: Any) -> bool:
 
 def agent_instructions_identity(instructions: Any) -> dict[str, Any]:
     if not isinstance(instructions, str) or not instructions:
-        fail("MCP initialize enthält keine Agentenanweisungen")
+        fail("MCP-Probe enthält keine Agentenanweisungen")
     encoded = instructions.encode("utf-8")
     if len(encoded) > AGENT_INSTRUCTIONS_MAX_BYTES:
         fail(
@@ -1418,27 +1459,145 @@ def agent_instructions_identity(instructions: Any) -> dict[str, Any]:
 class MCPProbeResult:
     protocol_version: str
     agent_instructions: dict[str, Any]
+    verification_path: str = "legacy-initialize-tools-list"
 
 
-def probe_mcp(
+def _mcp_request_meta(protocol_version: str) -> dict[str, Any]:
+    return {
+        "io.modelcontextprotocol/protocolVersion": protocol_version,
+        "io.modelcontextprotocol/clientInfo": dict(MCP_PROBE_CLIENT_INFO),
+        "io.modelcontextprotocol/clientCapabilities": {},
+    }
+
+
+def _start_mcp_probe_process(
+    release_path: Path,
+    python_exe: Path,
+    contract: RuntimeContract,
+    stderr_file: Any,
+) -> subprocess.Popen[bytes]:
+    return subprocess.Popen(
+        contract.command_argv(release_path, python_exe),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=stderr_file,
+        cwd=str(release_path),
+        bufsize=0,
+        env=pip_env(),
+    )
+
+
+def _validate_expected_tools(
+    listed: dict[str, Any],
+    contract: RuntimeContract,
+) -> None:
+    if "error" in listed:
+        raise DeployError(f"tools/list meldete {listed['error']}")
+    tools = listed.get("result", {}).get("tools")
+    if not isinstance(tools, list):
+        raise DeployError(f"tools/list enthält keine Liste: {listed!r}")
+    names = {
+        item.get("name")
+        for item in tools
+        if isinstance(item, dict)
+    }
+    missing = sorted(set(contract.expected_tools) - names)
+    if missing:
+        raise DeployError(
+            "MCP-Probe vermisst Werkzeuge: " + ", ".join(missing)
+        )
+
+
+def _probe_mcp_modern(
+    release_path: Path,
+    python_exe: Path,
+    contract: RuntimeContract,
+) -> MCPProbeResult | None:
+    """Probe the 2026-07-28 era on a disposable process.
+
+    A missing response or any JSON-RPC error means only that the modern probe
+    did not succeed. It does not establish that the peer is legacy. The caller
+    therefore verifies the classic initialize path on a fresh sibling process;
+    only a successful handshake may produce a legacy verification result.
+    """
+    with tempfile.TemporaryFile() as stderr_file:
+        proc = _start_mcp_probe_process(
+            release_path, python_exe, contract, stderr_file
+        )
+        try:
+            send_json(
+                proc,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "server/discover",
+                    "params": {
+                        "_meta": _mcp_request_meta(MCP_MODERN_PROTOCOL_VERSION),
+                    },
+                },
+            )
+            discovered = wait_for_id_optional(
+                proc, 1, TIMEOUTS["mcp_probe"]
+            )
+            if discovered is None:
+                return None
+            error = discovered.get("error")
+            if error is not None:
+                return None
+
+            result = discovered.get("result")
+            if not isinstance(result, dict):
+                raise DeployError(
+                    f"Ungültige server/discover-Antwort: {discovered!r}"
+                )
+            supported_versions = result.get("supportedVersions")
+            if (
+                not isinstance(supported_versions, list)
+                or not all(isinstance(item, str) for item in supported_versions)
+                or MCP_MODERN_PROTOCOL_VERSION not in supported_versions
+            ):
+                raise DeployError(
+                    "server/discover bestätigt MCP 2026-07-28 nicht"
+                )
+            if not isinstance(result.get("capabilities"), dict):
+                raise DeployError(
+                    "server/discover enthält keine gültigen Capabilities"
+                )
+            instructions = agent_instructions_identity(result.get("instructions"))
+
+            send_json(
+                proc,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/list",
+                    "params": {
+                        "_meta": _mcp_request_meta(MCP_MODERN_PROTOCOL_VERSION),
+                    },
+                },
+            )
+            listed = wait_for_id(proc, 2, TIMEOUTS["mcp_probe"])
+            _validate_expected_tools(listed, contract)
+            return MCPProbeResult(
+                protocol_version=MCP_MODERN_PROTOCOL_VERSION,
+                agent_instructions=instructions,
+                verification_path="modern-discover-tools-list",
+            )
+        finally:
+            stop_process(proc)
+
+
+def _probe_mcp_legacy(
     release_path: Path,
     python_exe: Path,
     contract: RuntimeContract,
 ) -> MCPProbeResult:
     last_error: Exception | None = None
-
     for version in MCP_PROTOCOL_VERSIONS:
         with tempfile.TemporaryFile() as stderr_file:
-            proc = subprocess.Popen(
-                contract.command_argv(release_path, python_exe),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=stderr_file,
-                cwd=str(release_path),
-                bufsize=0,
-                env=pip_env(),
+            proc = _start_mcp_probe_process(
+                release_path, python_exe, contract, stderr_file
             )
-
             try:
                 send_json(
                     proc,
@@ -1449,10 +1608,7 @@ def probe_mcp(
                         "params": {
                             "protocolVersion": version,
                             "capabilities": {},
-                            "clientInfo": {
-                                "name": "grabowski-deploy-probe",
-                                "version": "1.0",
-                            },
+                            "clientInfo": dict(MCP_PROBE_CLIENT_INFO),
                         },
                     },
                 )
@@ -1461,7 +1617,6 @@ def probe_mcp(
                     raise DeployError(
                         f"initialize({version}) meldete {initialized['error']}"
                     )
-
                 initialize_result = initialized.get("result", {})
                 negotiated = initialize_result.get("protocolVersion")
                 if not isinstance(negotiated, str):
@@ -1471,7 +1626,6 @@ def probe_mcp(
                 instructions = agent_instructions_identity(
                     initialize_result.get("instructions")
                 )
-
                 send_json(
                     proc,
                     {
@@ -1490,51 +1644,37 @@ def probe_mcp(
                     },
                 )
                 listed = wait_for_id(proc, 2, TIMEOUTS["mcp_probe"])
-                if "error" in listed:
-                    raise DeployError(
-                        f"tools/list meldete {listed['error']}"
-                    )
-
-                tools = listed.get("result", {}).get("tools")
-                if not isinstance(tools, list):
-                    raise DeployError(
-                        f"tools/list enthält keine Liste: {listed!r}"
-                    )
-
-                names = {
-                    item.get("name")
-                    for item in tools
-                    if isinstance(item, dict)
-                }
-                missing = sorted(set(contract.expected_tools) - names)
-                if missing:
-                    raise DeployError(
-                        "MCP-Probe vermisst Werkzeuge: "
-                        + ", ".join(missing)
-                    )
-
-                stop_process(proc)
+                _validate_expected_tools(listed, contract)
                 return MCPProbeResult(
                     protocol_version=negotiated,
                     agent_instructions=instructions,
+                    verification_path="legacy-initialize-tools-list",
                 )
-
             except Exception as exc:
                 last_error = exc
-                stop_process(proc)
                 stderr_file.seek(0)
                 stderr_tail = stderr_file.read().decode(
-                    "utf-8",
-                    errors="replace",
+                    "utf-8", errors="replace"
                 )
                 if stderr_tail:
                     print(
                         f"MCP-Probe stderr ({version}):\n{redact_text(stderr_tail)}",
                         file=sys.stderr,
                     )
+            finally:
+                stop_process(proc)
+    fail(f"MCP-Legacy-Probe fehlgeschlagen: {last_error}")
 
-    fail(f"MCP-Probe fehlgeschlagen: {last_error}")
 
+def probe_mcp(
+    release_path: Path,
+    python_exe: Path,
+    contract: RuntimeContract,
+) -> MCPProbeResult:
+    modern = _probe_mcp_modern(release_path, python_exe, contract)
+    if modern is not None:
+        return modern
+    return _probe_mcp_legacy(release_path, python_exe, contract)
 
 def python_provenance(python_exe: Path) -> dict[str, str]:
     data = python_json(
@@ -1568,6 +1708,7 @@ class BuildResult:
     protocol_version: str
     provenance: dict[str, str]
     agent_instructions: dict[str, Any]
+    mcp_verification_path: str = "legacy-initialize-tools-list"
 
 
 def mark_incomplete(release_path: Path, phase: str, exc: BaseException) -> None:
@@ -1696,6 +1837,7 @@ def build_release(
             protocol_version=probe.protocol_version,
             provenance=provenance,
             agent_instructions=probe.agent_instructions,
+            mcp_verification_path=probe.verification_path,
         )
     except Exception as exc:
         mark_incomplete(release_path, phase, exc)
@@ -1875,7 +2017,7 @@ def validate_manifest_schema(
     if validator is None:
         validator = local_contract_validator()
     errors = list(validator.manifest_errors(manifest))
-    if manifest.get("mcp_protocol_version") not in MCP_PROTOCOL_VERSIONS:
+    if manifest.get("mcp_protocol_version") not in MCP_SUPPORTED_PROTOCOL_VERSIONS:
         errors.append("mcp_protocol_version")
     return sorted(set(errors))
 
@@ -3116,6 +3258,7 @@ def deploy(
         print(f"Lock-SHA256:     {snapshot.runtime_lock_sha256}")
         print(f"Entry-Point:     {snapshot.contract.describe()}")
         print(f"MCP-Protokoll:   {build.protocol_version}")
+        print(f"MCP-Verifikation:{build.mcp_verification_path:>24}")
         if build.agent_instructions:
             print(
                 "Agent-Vertrag:  "
@@ -3223,6 +3366,7 @@ def check(repo: Path, runtime: Path) -> None:
         print(f"Entry-Point:     {snapshot.contract.describe()}")
         print(f"Python:          {build.provenance['python_version']}")
         print(f"MCP-Protokoll:   {build.protocol_version}")
+        print(f"MCP-Verifikation:{build.mcp_verification_path:>24}")
         if build.agent_instructions:
             print(
                 "Agent-Vertrag:  "

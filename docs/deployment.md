@@ -84,10 +84,17 @@ danach nur diese Snapshots. Er:
 - führt `pip check` aus,
 - gleicht installierte Distributionen gegen den Lock ab,
 - installiert den deklarierten Modul-Entry-Point in die Release-Venv,
-- führt `initialize` und `tools/list` aus,
+- probiert zuerst den sessionlosen MCP-2026-07-28-Pfad über `server/discover` und `tools/list`; nur Legacy-Erkennung startet danach einen frischen Prozess mit `initialize`, `notifications/initialized` und `tools/list`,
 - prüft die erwarteten Werkzeuge aus dem Runtimevertrag,
 - erzeugt und validiert ein Deployment-Manifest,
 - verändert weder produktive Runtime noch Profil noch Dienst.
+
+Ein erfolgreicher Legacy-Handshake ist damit nur noch ein Kompatibilitätsnachweis
+für die ältere MCP-Generation. Er belegt weder eine universelle Session-Invariante
+noch, dass die Gegenstelle den aktuellen sessionlosen MCP-Pfad verwendet. Der
+moderne Probe läuft absichtlich auf einem Wegwerfprozess; nur ein fehlender oder
+nicht als modern erkannter Discover-Pfad darf anschließend auf einem frischen
+Prozess in den Legacy-Handshake fallen.
 
 Der versionierte Agentenanweisungsvertrag, seine Manifestbindung und seine
 Beweisgrenzen sind in [`agent-facing-contract.md`](agent-facing-contract.md)

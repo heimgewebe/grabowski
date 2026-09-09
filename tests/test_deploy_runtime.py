@@ -2175,5 +2175,128 @@ class DeployRuntimeTests(unittest.TestCase):
             self.assertEqual(runtime.resolve(), old_release.resolve())
 
 
+    def test_modern_probe_uses_discover_and_per_request_metadata_without_initialize(self) -> None:
+        contract = self._contract()
+        proc = object()
+        discovered = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "supportedVersions": [deploy_runtime.MCP_MODERN_PROTOCOL_VERSION],
+                "capabilities": {},
+                "instructions": TEST_AGENT_INSTRUCTIONS,
+            },
+        }
+        listed = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "tools": [{"name": name} for name in contract.expected_tools],
+            },
+        }
+        with (
+            patch.object(deploy_runtime, "_start_mcp_probe_process", return_value=proc),
+            patch.object(deploy_runtime, "send_json") as send,
+            patch.object(deploy_runtime, "wait_for_id_optional", return_value=discovered),
+            patch.object(deploy_runtime, "wait_for_id", return_value=listed),
+            patch.object(deploy_runtime, "stop_process") as stop,
+        ):
+            result = deploy_runtime._probe_mcp_modern(
+                Path("/release"), Path("/python"), contract
+            )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.protocol_version, "2026-07-28")
+        self.assertEqual(result.verification_path, "modern-discover-tools-list")
+        payloads = [call.args[1] for call in send.call_args_list]
+        self.assertEqual(
+            [payload["method"] for payload in payloads],
+            ["server/discover", "tools/list"],
+        )
+        self.assertNotIn("initialize", [payload["method"] for payload in payloads])
+        for payload in payloads:
+            meta = payload["params"]["_meta"]
+            self.assertEqual(
+                meta["io.modelcontextprotocol/protocolVersion"], "2026-07-28"
+            )
+            self.assertEqual(
+                meta["io.modelcontextprotocol/clientInfo"]["name"],
+                "grabowski-deploy-probe",
+            )
+            self.assertEqual(
+                meta["io.modelcontextprotocol/clientCapabilities"], {}
+            )
+        stop.assert_called_once_with(proc)
+
+    def test_modern_legacy_signal_falls_back_to_fresh_legacy_probe(self) -> None:
+        expected = deploy_runtime.MCPProbeResult(
+            protocol_version="2025-06-18",
+            agent_instructions=TEST_AGENT_INSTRUCTIONS_IDENTITY,
+        )
+        with (
+            patch.object(deploy_runtime, "_probe_mcp_modern", return_value=None) as modern,
+            patch.object(deploy_runtime, "_probe_mcp_legacy", return_value=expected) as legacy,
+        ):
+            result = deploy_runtime.probe_mcp(
+                Path("/release"), Path("/python"), self._contract()
+            )
+        self.assertIs(result, expected)
+        modern.assert_called_once()
+        legacy.assert_called_once()
+
+    def test_modern_error_only_requests_a_fresh_legacy_probe(self) -> None:
+        proc = object()
+        for code in (-32601, -32602, -32022):
+            error = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {"code": code, "message": "probe rejected"},
+            }
+            with (
+                patch.object(deploy_runtime, "_start_mcp_probe_process", return_value=proc),
+                patch.object(deploy_runtime, "send_json"),
+                patch.object(deploy_runtime, "wait_for_id_optional", return_value=error),
+                patch.object(deploy_runtime, "wait_for_id") as listed,
+                patch.object(deploy_runtime, "stop_process") as stop,
+            ):
+                result = deploy_runtime._probe_mcp_modern(
+                    Path("/release"), Path("/python"), self._contract()
+                )
+            self.assertIsNone(result)
+            listed.assert_not_called()
+            stop.assert_called_once_with(proc)
+
+    def test_failed_modern_probe_cannot_be_reported_as_modern_success(self) -> None:
+        expected = deploy_runtime.MCPProbeResult(
+            protocol_version="2025-06-18",
+            agent_instructions=TEST_AGENT_INSTRUCTIONS_IDENTITY,
+            verification_path="legacy-initialize-tools-list",
+        )
+        with (
+            patch.object(deploy_runtime, "_probe_mcp_modern", return_value=None),
+            patch.object(deploy_runtime, "_probe_mcp_legacy", return_value=expected),
+        ):
+            result = deploy_runtime.probe_mcp(
+                Path("/release"), Path("/python"), self._contract()
+            )
+        self.assertEqual(result.protocol_version, "2025-06-18")
+        self.assertEqual(result.verification_path, "legacy-initialize-tools-list")
+
+    def test_manifest_build_policy_accepts_modern_protocol_version(self) -> None:
+        validator = types.SimpleNamespace(manifest_errors=lambda _manifest: [])
+        self.assertEqual(
+            deploy_runtime.validate_manifest_schema(
+                {"mcp_protocol_version": "2026-07-28"}, validator=validator
+            ),
+            [],
+        )
+        self.assertEqual(
+            deploy_runtime.validate_manifest_schema(
+                {"mcp_protocol_version": "2099-01-01"}, validator=validator
+            ),
+            ["mcp_protocol_version"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
