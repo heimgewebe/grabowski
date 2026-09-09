@@ -3511,13 +3511,17 @@ class OperatorContractTests(unittest.TestCase):
             self.assertEqual(b"baseline-other\n", committed_other)
             self.assertEqual("late-unstaged-change\n", other.read_text(encoding="utf-8"))
 
-    def test_grabowski_git_jit_commit_rejects_implicit_staging(self) -> None:
+    def test_grabowski_git_jit_commit_requires_noninteractive_message_and_rejects_implicit_staging(self) -> None:
         operator = _load_operator_module()
         self.assertTrue(operator._jit_git_commit_preimage_allowed(["-m", "message"]))
+        self.assertTrue(operator._jit_git_commit_preimage_allowed(["--message=message"]))
         self.assertTrue(
             operator._jit_git_commit_preimage_allowed(["--amend", "--no-edit"])
         )
         for arguments in (
+            [],
+            ["--amend"],
+            ["--allow-empty-message"],
             ["-a", "-m", "message"],
             ["--all", "-m", "message"],
             ["--include", "README.md", "-m", "message"],
@@ -3526,6 +3530,31 @@ class OperatorContractTests(unittest.TestCase):
         ):
             with self.subTest(arguments=arguments):
                 self.assertFalse(operator._jit_git_commit_preimage_allowed(arguments))
+
+    def test_grabowski_git_jit_commit_editor_forms_require_caller_preimage(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            operator.subprocess.run(
+                ["git", "init", "-q", "-b", "feature", str(repo)], check=True
+            )
+            with patch.object(operator, "_require_operator_mutation", return_value=None):
+                for index, arguments in enumerate((["commit"], ["commit", "--amend"]), 1):
+                    with self.subTest(arguments=arguments):
+                        with self.assertRaisesRegex(
+                            PermissionError, "expected_preimage_sha256 is required"
+                        ):
+                            operator.grabowski_git(
+                                str(repo),
+                                arguments,
+                                branch_attempt={
+                                    "schema_version": 1,
+                                    "owner_id": "operator:jit-editor",
+                                    "operation_id": "operation-a",
+                                    "attempt_id": f"attempt-{index}",
+                                    "branch": "feature",
+                                },
+                            )
 
     def test_grabowski_git_jit_preimage_still_blocks_drift_after_attempt_lease(self) -> None:
         operator = _load_operator_module()

@@ -5147,32 +5147,39 @@ def _jit_git_commit_preimage_allowed(command_arguments: list[str]) -> bool:
         "--allow-empty",
         "--allow-empty-message",
         "--amend",
-        "--no-edit",
         "--no-verify",
         "--quiet",
         "--signoff",
         "-q",
         "-s",
     }
+    noninteractive_message_bound = False
     index = 0
     while index < len(command_arguments):
         item = command_arguments[index]
         if item in {"-m", "--message"}:
             if index + 1 >= len(command_arguments):
                 return False
+            noninteractive_message_bound = True
             index += 2
             continue
         if item.startswith("-m") and len(item) > 2:
+            noninteractive_message_bound = True
             index += 1
             continue
         if item.startswith("--message=") and len(item) > len("--message="):
+            noninteractive_message_bound = True
+            index += 1
+            continue
+        if item == "--no-edit":
+            noninteractive_message_bound = True
             index += 1
             continue
         if item in no_value_options:
             index += 1
             continue
         return False
-    return True
+    return noninteractive_message_bound
 
 
 def _jit_git_preimage_allowed(
