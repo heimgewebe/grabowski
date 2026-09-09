@@ -8292,6 +8292,45 @@ class BureauPickupTests(unittest.TestCase):
         status_argv = invoke.call_args_list[1].args[0]
         self.assertIn("--activity-id", status_argv)
 
+    def test_heartbeat_lease_repair_stale_run_readback_blocks_resume(self) -> None:
+        (
+            intent,
+            request,
+            acquisition,
+            _run_dir,
+            journal_identity,
+            external,
+            receipt,
+        ) = self._heartbeat_receipt_fixture()
+        activity_id = pickup._lease_repair_activity_id(receipt["receipt_sha256"])
+        stale_readback = self._matching_activity_readback(
+            intent, journal_identity, external, activity_id
+        )
+        stale_readback["run"]["heartbeat_at"] = self.utc_heartbeat(
+            pickup.EXECUTION_HEARTBEAT_MAX_AGE_SECONDS + 120
+        )
+
+        with mock.patch.object(
+            pickup.bureau,
+            "_invoke_bureau",
+            side_effect=[{"status": "heartbeat-recorded"}, stale_readback],
+        ):
+            with self.assertRaises(pickup.BureauPickupError) as raised:
+                REAL_HEARTBEAT_LEASE_REPAIR(
+                    intent,
+                    request,
+                    acquisition,
+                    self.default_registry_binding,
+                    journal_identity,
+                    external,
+                    receipt,
+                )
+
+        self.assertEqual(
+            "existing-assignment-execution-not-bound", raised.exception.code
+        )
+        self.assertIn("heartbeat_stale", raised.exception.details["reason_codes"])
+
     def test_nested_bureau_activity_status_contract_proves_heartbeat(self) -> None:
         (
             intent,
