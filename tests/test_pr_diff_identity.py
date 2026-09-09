@@ -42,15 +42,32 @@ def test_variable_github_index_abbreviations_have_one_identity() -> None:
     assert hashlib.sha256(short).hexdigest() != hashlib.sha256(long).hexdigest()
 
 
+def test_optional_hunk_context_labels_have_one_identity() -> None:
+    plain = b"@@ -1,2 +1,2 @@\n-old\n+new\n"
+    labeled = b"@@ -1,2 +1,2 @@ def render(value):\n-old\n+new\n"
+
+    assert canonicalize_github_pr_diff_identity(plain) == plain
+    assert canonicalize_github_pr_diff_identity(labeled) == plain
+    assert github_pr_diff_identity_sha256(plain) == github_pr_diff_identity_sha256(labeled)
+    assert hashlib.sha256(plain).hexdigest() != hashlib.sha256(labeled).hexdigest()
+
+
+def test_hunk_range_still_changes_identity() -> None:
+    first = b"@@ -1,2 +1,2 @@ label\n-old\n+new\n"
+    second = first.replace(b"@@ -1,2 +1,2 @@", b"@@ -2,2 +2,2 @@")
+
+    assert github_pr_diff_identity_sha256(first) != github_pr_diff_identity_sha256(second)
+
+
 def test_patch_content_still_changes_identity() -> None:
-    first = b"index aaaaaaa1..bbbbbbb2 100644\n@@ -1 +1 @@\n-old\n+new\n"
+    first = b"index aaaaaaa1..bbbbbbb2 100644\n@@ -1 +1 @@ label\n-old\n+new\n"
     second = first.replace(b"+new\n", b"+different\n")
 
     assert github_pr_diff_identity_sha256(first) != github_pr_diff_identity_sha256(second)
 
 
-def test_non_index_bytes_and_crlf_are_preserved_exactly() -> None:
-    raw = b"captain-diff\r\n"
+def test_non_diff_hunk_like_bytes_are_preserved_exactly() -> None:
+    raw = b"@@ not-a-range @@ context\r\n"
 
     assert canonicalize_github_pr_diff_identity(raw) == raw
     assert github_pr_diff_identity_sha256(raw) == hashlib.sha256(raw).hexdigest()
@@ -63,9 +80,16 @@ def test_index_mode_and_crlf_are_preserved() -> None:
     assert canonicalize_github_pr_diff_identity(raw) == expected
 
 
+def test_hunk_context_is_stripped_and_crlf_is_preserved() -> None:
+    raw = b"@@ -10,4 +12,5 @@ class Demo:\r\n-old\r\n+new\r\n"
+    expected = b"@@ -10,4 +12,5 @@\r\n-old\r\n+new\r\n"
+
+    assert canonicalize_github_pr_diff_identity(raw) == expected
+
+
 def test_review_gate_ci_uses_shared_identity(monkeypatch) -> None:
     module = _load_tool("pr_review_gate_ci")
-    raw = b"index f43b5a86..17e33268 100644\n@@ -1 +1 @@\n-a\n+b\n"
+    raw = b"index f43b5a86..17e33268 100644\n@@ -1 +1 @@ label\n-a\n+b\n"
     monkeypatch.setattr(module, "_run_bytes", lambda _argv: raw)
 
     assert module.current_diff_sha256("heimgewebe/metarepo", 714) == github_pr_diff_identity_sha256(raw)
@@ -73,7 +97,7 @@ def test_review_gate_ci_uses_shared_identity(monkeypatch) -> None:
 
 def test_legacy_claude_live_check_uses_shared_identity(monkeypatch) -> None:
     module = _load_tool("external_review_claude")
-    raw = b"index f43b5a86..17e33268 100644\n@@ -1 +1 @@\n-a\n+b\n"
+    raw = b"index f43b5a86..17e33268 100644\n@@ -1 +1 @@ label\n-a\n+b\n"
     completed = subprocess.CompletedProcess(["gh"], 0, stdout=raw, stderr=b"")
     monkeypatch.setattr(module, "run_checked", lambda *args, **kwargs: completed)
 
@@ -81,4 +105,7 @@ def test_legacy_claude_live_check_uses_shared_identity(monkeypatch) -> None:
 
 
 def test_canonicalization_version_is_explicit() -> None:
-    assert GITHUB_PR_DIFF_IDENTITY_CANONICALIZATION == "github-index-oid-prefix-7-v1"
+    assert (
+        GITHUB_PR_DIFF_IDENTITY_CANONICALIZATION
+        == "github-index-oid-prefix-7+hunk-context-strip-v2"
+    )
