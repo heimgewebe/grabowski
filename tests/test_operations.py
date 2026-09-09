@@ -104,6 +104,11 @@ class MaulwurfRecoveryOperationTests(unittest.TestCase):
                 operations.grabowski_operation_plan(
                     operations.MAULWURF_RECOVERY_ON_OPERATION, {"reason": "   "}
                 )
+            with self.assertRaisesRegex(ValueError, "secret material"):
+                operations.grabowski_operation_plan(
+                    operations.MAULWURF_RECOVERY_ON_OPERATION,
+                    {"reason": "Authorization: Bearer abcdefghijklmnopqrst"},
+                )
 
 
 class BackupNtfsOperationTests(unittest.TestCase):

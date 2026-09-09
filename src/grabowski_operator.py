@@ -446,6 +446,7 @@ def _maulwurf_recovery_control_call(tool_name: Any, arguments: Any) -> bool:
     if tool_name != "grabowski_operation_run" or not isinstance(arguments, dict):
         return False
     return arguments.get("operation") in {
+        "maulwurf-recovery-status",
         "maulwurf-recovery-on",
         "maulwurf-recovery-off",
     }
@@ -1523,7 +1524,11 @@ def _install_deployment_admission_gate() -> None:
             )
             if read_only_hint is not True:
                 active_profile = base._load_policy().get("active_profile")
-                if active_profile == "failover-mutate" and not enforcement_configured:
+                if (
+                    active_profile == "failover-mutate"
+                    and not enforcement_configured
+                    and not _maulwurf_runtime_active()
+                ):
                     raise grabowski_effect_interceptor.OperatorFenceEnforcementDenied(
                         "failover_mutation_requires_fence_config"
                     )

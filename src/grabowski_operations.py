@@ -251,6 +251,8 @@ def _maulwurf_recovery_operation_plan(
         reason = supplied["reason"].strip()
         if not reason or len(reason) > 240:
             raise ValueError("recovery reason must contain 1..240 characters")
+        if operator._redact(reason) != reason:
+            raise ValueError("recovery reason must not contain secret material")
     elif supplied:
         raise ValueError(f"{operation} accepts no parameters")
     import der_kleine_maulwurf_operator as mole

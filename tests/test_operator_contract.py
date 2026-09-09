@@ -445,6 +445,7 @@ class OperatorContractTests(unittest.TestCase):
                 {"GRABOWSKI_MCP_BRANDING_VARIANT": "der-kleine-maulwurf"},
             ),
             patch.object(operator, "_maulwurf_recovery_enabled", return_value=False),
+            patch.object(operator.base, "_load_policy", return_value={"active_profile": "failover-mutate"}),
             patch.object(
                 operator, "_require_transport_roundtrip_for_tool", return_value=None
             ),
@@ -461,6 +462,13 @@ class OperatorContractTests(unittest.TestCase):
             result = operator.asyncio.run(
                 operator.mcp._tool_manager.call_tool(
                     "grabowski_operation_run",
+                    {"operation": "maulwurf-recovery-status", "parameters": None},
+                )
+            )
+            self.assertTrue(result["called"])
+            result = operator.asyncio.run(
+                operator.mcp._tool_manager.call_tool(
+                    "grabowski_operation_run",
                     {
                         "operation": "maulwurf-recovery-on",
                         "parameters": {"reason": "primary unavailable"},
@@ -469,7 +477,7 @@ class OperatorContractTests(unittest.TestCase):
             )
             self.assertTrue(result["called"])
 
-        self.assertEqual(["read", "grabowski_operation_run"], calls)
+        self.assertEqual(["read", "grabowski_operation_run", "grabowski_operation_run"], calls)
 
     def test_maulwurf_recovery_mode_allows_mutation(self) -> None:
         operator = _load_operator_module()

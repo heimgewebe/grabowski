@@ -2409,6 +2409,7 @@ def recovery_mode_path() -> Path:
 
 def recovery_mode_status(*, path: Path | None = None) -> dict[str, object]:
     target = recovery_mode_path() if path is None else Path(path)
+    descriptor: int | None = None
     try:
         metadata = os.lstat(target)
         if (
@@ -2418,7 +2419,25 @@ def recovery_mode_status(*, path: Path | None = None) -> dict[str, object]:
             or stat.S_IMODE(metadata.st_mode) & 0o077
         ):
             raise RuntimeError("unsafe_recovery_mode_file")
-        payload = target.read_bytes()
+        if metadata.st_size > RECOVERY_MODE_MAX_BYTES:
+            raise RuntimeError("recovery_mode_file_too_large")
+        flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(target, flags)
+        opened = os.fstat(descriptor)
+        if (
+            opened.st_dev != metadata.st_dev
+            or opened.st_ino != metadata.st_ino
+            or opened.st_mode != metadata.st_mode
+            or opened.st_uid != metadata.st_uid
+            or opened.st_nlink != metadata.st_nlink
+            or opened.st_size != metadata.st_size
+        ):
+            raise RuntimeError("recovery_mode_file_changed_during_open")
+        payload = os.read(descriptor, RECOVERY_MODE_MAX_BYTES + 1)
+        if len(payload) > RECOVERY_MODE_MAX_BYTES:
+            raise RuntimeError("recovery_mode_file_too_large")
     except FileNotFoundError:
         return {
             "schema_version": RECOVERY_MODE_SCHEMA_VERSION,
@@ -2439,6 +2458,9 @@ def recovery_mode_status(*, path: Path | None = None) -> dict[str, object]:
             "reason": f"invalid:{type(exc).__name__}",
             "changed_at_unix": None,
         }
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
     if len(payload) > RECOVERY_MODE_MAX_BYTES:
         return {
             "schema_version": RECOVERY_MODE_SCHEMA_VERSION,
@@ -2521,6 +2543,14 @@ def _write_recovery_mode(
         os.close(descriptor)
     try:
         os.replace(temporary, target)
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            directory_flags |= os.O_NOFOLLOW
+        parent_fd = os.open(target.parent, directory_flags)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
     finally:
         try:
             temporary.unlink()

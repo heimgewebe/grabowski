@@ -105,6 +105,16 @@ class TestDerKleineMaulwurfOperator(unittest.TestCase):
             self.assertEqual("normal", disabled["mode"])
             self.assertFalse(mole.recovery_mode_enabled(path=path))
 
+    def test_oversized_recovery_mode_fails_closed_without_unbounded_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mode.json"
+            path.write_bytes(b"x" * (mole.RECOVERY_MODE_MAX_BYTES + 1))
+            path.chmod(0o600)
+            with patch.object(Path, "read_bytes", side_effect=AssertionError("must not use unbounded read")):
+                status = mole.recovery_mode_status(path=path)
+        self.assertFalse(status["valid"])
+        self.assertEqual("normal", status["mode"])
+
     def test_invalid_recovery_mode_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "mode.json"
