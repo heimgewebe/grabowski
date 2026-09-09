@@ -5119,6 +5119,9 @@ def _jit_git_add_preimage_allowed(repo: Path, command_arguments: list[str]) -> b
             component in {"", ".", ".."} for component in relative.parts
         ):
             return False
+        encoded_path = os.fsencode(value)
+        if encoded_path not in tracked_paths:
+            return False
         target = repo / relative
         try:
             resolved_parent = target.parent.resolve(strict=False)
@@ -5129,8 +5132,7 @@ def _jit_git_add_preimage_allowed(repo: Path, command_arguments: list[str]) -> b
         try:
             linked = os.lstat(target)
         except FileNotFoundError:
-            if os.fsencode(value) not in tracked_paths:
-                return False
+            continue
         except OSError:
             return False
         else:
@@ -6084,6 +6086,18 @@ def grabowski_git(
             if subcommand == "add":
                 command = _validate_argv(
                     [*command_prefix, "--literal-pathspecs", *arguments], cwd=path
+                )
+            elif subcommand == "commit":
+                command = _validate_argv(
+                    [
+                        "git",
+                        "-c",
+                        "core.hooksPath=/dev/null",
+                        "-C",
+                        str(path),
+                        *arguments,
+                    ],
+                    cwd=path,
                 )
         if normalized_attempt["branch"] != observed_before["branch"]:
             return _branch_attempt_reconcile_result(

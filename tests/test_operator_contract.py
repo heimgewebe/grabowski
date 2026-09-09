@@ -3423,6 +3423,16 @@ class OperatorContractTests(unittest.TestCase):
             self.assertFalse(
                 operator._jit_git_add_preimage_allowed(repo, ["--", str(repo / "README.md")])
             )
+            self.assertFalse(
+                operator._jit_git_add_preimage_allowed(repo, ["--", "README.md"])
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "add", "README.md"], check=True
+            )
+            self.assertTrue(
+                operator._jit_git_add_preimage_allowed(repo, ["--", "README.md"])
+            )
+            (repo / "README.md").unlink()
             self.assertTrue(
                 operator._jit_git_add_preimage_allowed(repo, ["--", "README.md"])
             )
@@ -3462,6 +3472,9 @@ class OperatorContractTests(unittest.TestCase):
                 ["git", "-C", str(repo), "add", "README.md"], check=True
             )
             other.write_text("late-unstaged-change\n", encoding="utf-8")
+            hook = repo / ".git" / "hooks" / "pre-commit"
+            hook.write_text("#!/bin/sh\ngit add OTHER.md\n", encoding="utf-8")
+            hook.chmod(0o755)
             attempt = {
                 "schema_version": 1,
                 "owner_id": "operator:jit-commit",
@@ -3483,6 +3496,7 @@ class OperatorContractTests(unittest.TestCase):
                 result["branch_mutation"]["expected_preimage_sha256"],
                 result["branch_mutation"]["observed_preimage_sha256"],
             )
+            self.assertIn("core.hooksPath=/dev/null", result["argv"])
             committed_readme = operator.subprocess.run(
                 ["git", "-C", str(repo), "show", "HEAD:README.md"],
                 stdout=operator.subprocess.PIPE,
