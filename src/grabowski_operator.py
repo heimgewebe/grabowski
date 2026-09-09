@@ -6080,7 +6080,9 @@ def grabowski_git(
         observed_before = _git_branch_preimage(path)
         requested_preimage_sha256 = normalized_attempt["expected_preimage_sha256"]
         if requested_preimage_sha256 is None:
-            if not _jit_git_preimage_allowed(path, subcommand, _command_arguments):
+            if _configurations or not _jit_git_preimage_allowed(
+                path, subcommand, _command_arguments
+            ):
                 raise PermissionError(
                     "branch_attempt.expected_preimage_sha256 is required except for "
                     "server-bound JIT git add -- <literal-file> and ordinary git commit "

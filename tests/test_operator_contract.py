@@ -3531,6 +3531,35 @@ class OperatorContractTests(unittest.TestCase):
             with self.subTest(arguments=arguments):
                 self.assertFalse(operator._jit_git_commit_preimage_allowed(arguments))
 
+    def test_grabowski_git_jit_commit_rejects_caller_git_configuration(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            operator.subprocess.run(
+                ["git", "init", "-q", "-b", "feature", str(repo)], check=True
+            )
+            with patch.object(operator, "_require_operator_mutation", return_value=None):
+                with self.assertRaisesRegex(
+                    PermissionError, "expected_preimage_sha256 is required"
+                ):
+                    operator.grabowski_git(
+                        str(repo),
+                        [
+                            "-c",
+                            "core.hooksPath=/tmp/attacker-hooks",
+                            "commit",
+                            "-m",
+                            "message",
+                        ],
+                        branch_attempt={
+                            "schema_version": 1,
+                            "owner_id": "operator:jit-config",
+                            "operation_id": "operation-a",
+                            "attempt_id": "attempt-1",
+                            "branch": "feature",
+                        },
+                    )
+
     def test_grabowski_git_jit_commit_editor_forms_require_caller_preimage(self) -> None:
         operator = _load_operator_module()
         with tempfile.TemporaryDirectory() as directory:
