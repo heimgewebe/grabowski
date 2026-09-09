@@ -652,6 +652,20 @@ def _github_pr_view_transport_read_only(arguments: Any) -> bool:
     return selector_seen and repo_seen and json_seen
 
 
+def _deployment_admission_drain_blocking(
+    tool_name: Any, arguments: Any, tool: Any
+) -> bool:
+    """Treat only concretely proven reads as non-blocking during deploy drain."""
+    if tool_name == deployment_observer.OPERATION:
+        return True
+    if _tool_read_only_hint(tool) is True:
+        return False
+    return not (
+        tool_name == "grabowski_github"
+        and _github_pr_view_transport_read_only(arguments)
+    )
+
+
 def _transport_roundtrip_exempt_call(
     tool_name: Any, arguments: Any
 ) -> bool:
@@ -1448,9 +1462,8 @@ def _install_deployment_admission_gate() -> None:
         identity = _deployment_admission_register_tool_call(
             tool_name,
             kind,
-            drain_blocking=(
-                read_only_hint is not True
-                or tool_name == deployment_observer.OPERATION
+            drain_blocking=_deployment_admission_drain_blocking(
+                tool_name, arguments, tool
             ),
         )
         release_in_finally = True
