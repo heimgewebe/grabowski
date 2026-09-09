@@ -25,6 +25,7 @@ if str(_SRC_DIR) not in sys.path:
 from grabowski_pr_diff import (  # noqa: E402
     canonicalize_github_pr_diff_identity,
     github_pr_diff_identity_sha256,
+    github_pr_diff_identity_sha256_v1,
 )
 
 try:
@@ -826,6 +827,7 @@ def load_pr_state(repo: Path, pr: int) -> dict[str, Any]:
     # Self-review evidence is local and diff-bound. PR comments, approvals and
     # review bodies are deliberately absent from the live query and gate state.
     pr_diff_sha256: str | None = None
+    pr_diff_previous_sha256: str | None = None
     pr_diff_text: str | None = None
     pr_diff_error: str | None = None
     pr_diff_source: str | None = None
@@ -854,6 +856,7 @@ def load_pr_state(repo: Path, pr: int) -> dict[str, Any]:
     if raw_pr_diff_bytes is not None:
         pr_diff_bytes = canonicalize_github_pr_diff_identity(raw_pr_diff_bytes)
         pr_diff_sha256 = github_pr_diff_identity_sha256(raw_pr_diff_bytes)
+        pr_diff_previous_sha256 = github_pr_diff_identity_sha256_v1(raw_pr_diff_bytes)
         try:
             pr_diff_text = pr_diff_bytes.decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -871,6 +874,7 @@ def load_pr_state(repo: Path, pr: int) -> dict[str, Any]:
         "headRepoName": head_repo_name,
         "checkoutRepoName": _canonical_repo_slug(checkout_name),
         "pr_diff_sha256": pr_diff_sha256,
+        "pr_diff_previous_sha256": pr_diff_previous_sha256,
         "pr_diff_text": pr_diff_text,
         "pr_diff_error": pr_diff_error,
         "pr_diff_source": pr_diff_source,
@@ -1440,6 +1444,20 @@ def _valid_sha256(value: Any) -> bool:
     return _normalize_sha256(value) is not None
 
 
+def _current_pr_diff_identity_sha256s(state: dict[str, Any]) -> frozenset[str]:
+    identities: set[str] = set()
+    for key in ("pr_diff_sha256", "pr_diff_previous_sha256"):
+        normalized = _normalize_sha256(state.get(key))
+        if normalized is not None:
+            identities.add(normalized)
+    return frozenset(identities)
+
+
+def _diff_identity_matches_current(state: dict[str, Any], value: Any) -> bool:
+    normalized = _normalize_sha256(value)
+    return normalized is not None and normalized in _current_pr_diff_identity_sha256s(state)
+
+
 def _normalize_git_sha(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
@@ -1510,8 +1528,7 @@ def _claude_policy_waiver_failures(
     current_head = _normalize_git_sha(pr.get("headRefOid"))
     if current_head is None or _normalize_git_sha(waiver.get("head_sha")) != current_head:
         failures.append("head_sha mismatch")
-    current_diff = _normalize_sha256(state.get("pr_diff_sha256"))
-    if current_diff is None or _normalize_sha256(waiver.get("diff_sha256")) != current_diff:
+    if not _diff_identity_matches_current(state, waiver.get("diff_sha256")):
         failures.append("diff_sha256 mismatch")
     if not _bounded_non_empty_string(waiver.get("approver"), maximum=200):
         failures.append("approver is missing or too long")
@@ -1664,13 +1681,9 @@ def _claude_cli_evidence_failures(pr: dict[str, Any], evidence: Any, *, repo_nam
 
 
 def _self_review_diff_bound(state: dict[str, Any], self_review: dict[str, Any]) -> bool:
-    current_diff_sha256 = state.get("pr_diff_sha256")
-    evidence_diff_sha256 = self_review.get("diff_sha256")
     return (
         state.get("pr_diff_bypass") is not True
-        and _valid_sha256(current_diff_sha256)
-        and _valid_sha256(evidence_diff_sha256)
-        and _normalize_sha256(evidence_diff_sha256) == _normalize_sha256(current_diff_sha256)
+        and _diff_identity_matches_current(state, self_review.get("diff_sha256"))
     )
 
 
@@ -1685,8 +1698,8 @@ def _self_review_diff_failures(state: dict[str, Any], self_review: dict[str, Any
         ]
 
     failures: list[str] = []
-    current_diff_sha256 = state.get("pr_diff_sha256")
-    if not _valid_sha256(current_diff_sha256):
+    current_diff_identities = _current_pr_diff_identity_sha256s(state)
+    if not current_diff_identities:
         pr_diff_error = state.get("pr_diff_error")
         if isinstance(pr_diff_error, str) and pr_diff_error.strip():
             failures.append(f"current PR diff hash is unavailable: {_brief_error(pr_diff_error)}")
@@ -1696,7 +1709,7 @@ def _self_review_diff_failures(state: dict[str, Any], self_review: dict[str, Any
     evidence_diff_sha256 = self_review.get("diff_sha256")
     if not _valid_sha256(evidence_diff_sha256):
         failures.append("self-review diff_sha256 is missing or invalid")
-    elif _valid_sha256(current_diff_sha256) and not _self_review_diff_bound(state, self_review):
+    elif current_diff_identities and not _self_review_diff_bound(state, self_review):
         failures.append("self-review diff_sha256 mismatch")
 
     return failures
@@ -2483,14 +2496,14 @@ def _external_review_failures(
     if not _valid_sha256(diff_sha256):
         failures.append("diff_sha256 is missing or invalid")
     else:
-        current_diff_sha256 = state.get("pr_diff_sha256")
-        if not _valid_sha256(current_diff_sha256):
+        current_diff_identities = _current_pr_diff_identity_sha256s(state)
+        if not current_diff_identities:
             pr_diff_error = state.get("pr_diff_error")
             if isinstance(pr_diff_error, str) and pr_diff_error.strip():
                 failures.append(f"current PR diff hash is unavailable: {_brief_error(pr_diff_error)}")
             else:
                 failures.append("current PR diff hash is unavailable")
-        elif _normalize_sha256(diff_sha256) != _normalize_sha256(current_diff_sha256):
+        elif not _diff_identity_matches_current(state, diff_sha256):
             failures.append("diff_sha256 mismatch")
     if not _valid_sha256(external_review.get("prompt_sha256")):
         failures.append("prompt_sha256 is missing or invalid")

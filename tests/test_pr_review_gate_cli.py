@@ -76,7 +76,7 @@ class PrReviewGateTargetIdentityTests(unittest.TestCase):
             b"index 123456789abcdef..abcdef0123456789 100644\n"
             b"--- a/assets/a.js\n"
             b"+++ b/assets/a.js\n"
-            b"@@ -1 +1 @@\n"
+            b"@@ -1 +1 @@ function render()\n"
             b"-old\n"
             b"+new\n"
         )
@@ -115,6 +115,13 @@ class PrReviewGateTargetIdentityTests(unittest.TestCase):
         self.assertEqual(
             state["pr_diff_sha256"],
             pr_review_gate.github_pr_diff_identity_sha256(local_diff),
+        )
+        self.assertEqual(
+            state["pr_diff_previous_sha256"],
+            pr_review_gate.github_pr_diff_identity_sha256_v1(local_diff),
+        )
+        self.assertNotEqual(
+            state["pr_diff_sha256"], state["pr_diff_previous_sha256"]
         )
         self.assertEqual(
             state["pr_diff_text"].encode("utf-8"),
@@ -592,6 +599,46 @@ class PrReviewGateEvidenceHardeningTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "BLOCK")
         self.assertIn("finding 0 is not terminally triaged", result["failures"])
 
+
+    def test_self_review_accepts_previous_canonical_diff_identity(self) -> None:
+        state = self._state()
+        state["pr_diff_bypass"] = False
+        state.pop("pr_diff_bypass_reason", None)
+        state["pr_diff_sha256"] = "1" * 64
+        state["pr_diff_previous_sha256"] = "2" * 64
+        result = pr_review_gate.evaluate_review_gate(
+            state, self_review=self._review(diff_sha256="2" * 64)
+        )
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertTrue(result["review_sources"]["self_review_diff_bound"])
+
+    def test_external_review_accepts_previous_canonical_diff_identity(self) -> None:
+        state = self._state()
+        state["pr_diff_bypass"] = False
+        state.pop("pr_diff_bypass_reason", None)
+        state["pr_diff_sha256"] = "1" * 64
+        state["pr_diff_previous_sha256"] = "2" * 64
+        evidence = {
+            "schema_version": 1,
+            "kind": "external_review",
+            "repo": "heimgewebe/grabowski",
+            "pr": 58,
+            "head_sha": "a" * 40,
+            "diff_sha256": "2" * 64,
+            "prompt_sha256": "3" * 64,
+            "prompt_includes_diff": True,
+            "reviews": [],
+            "external_reviews_triaged": True,
+            "findings": [],
+        }
+        failures = pr_review_gate._external_review_failures(
+            state,
+            state["pr"],
+            evidence,
+            required=False,
+            repo_name="heimgewebe/grabowski",
+        )
+        self.assertNotIn("diff_sha256 mismatch", failures)
 
     def test_self_review_workflow_metadata_is_required(self) -> None:
         review = self._review()

@@ -126,6 +126,18 @@ class ReviewEvidenceCiEvaluationTests(unittest.TestCase):
         )
         self.assertIn("status evidence head_sha mismatch", failures)
 
+    def test_previous_canonical_diff_identity_is_accepted(self) -> None:
+        projection = ci.build_status_projection(_audit_bytes(diff_sha256="d" * 64))
+        failures = ci.evaluate_status_projection(
+            projection,
+            repo_name="heimgewebe/grabowski",
+            pr=_pr(),
+            diff_sha256="b" * 64,
+            complexity=self._complexity(),
+            equivalent_diff_sha256s=("d" * 64,),
+        )
+        self.assertNotIn("status evidence diff_sha256 mismatch", failures)
+
     def test_stale_diff_is_blocked(self) -> None:
         projection = ci.build_status_projection(_audit_bytes(diff_sha256="d" * 64))
         failures = ci.evaluate_status_projection(
@@ -136,6 +148,21 @@ class ReviewEvidenceCiEvaluationTests(unittest.TestCase):
             complexity=self._complexity(),
         )
         self.assertIn("status evidence diff_sha256 mismatch", failures)
+
+    def test_current_diff_sha256s_exposes_v2_and_previous_v1(self) -> None:
+        raw = (
+            b"index 123456789abcdef..abcdef0123456789 100644\n"
+            b"@@ -1 +1 @@ function render()\n-old\n+new\n"
+        )
+        original = ci._run_bytes
+        ci._run_bytes = lambda _argv: raw
+        try:
+            identities = ci.current_diff_sha256s("heimgewebe/grabowski", 42)
+        finally:
+            ci._run_bytes = original
+        self.assertEqual(identities[0], gate.github_pr_diff_identity_sha256(raw))
+        self.assertEqual(identities[1], gate.github_pr_diff_identity_sha256_v1(raw))
+        self.assertNotEqual(identities[0], identities[1])
 
     def test_red_audit_is_blocked(self) -> None:
         projection = ci.build_status_projection(
