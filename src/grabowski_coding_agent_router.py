@@ -1078,6 +1078,8 @@ def _pool_gate(
     *,
     critical: bool,
 ) -> tuple[bool, list[str], float, bool]:
+    if pool_id == "openrouter-ox-alpha-preview":
+        return False, ["retired Ox Alpha preview pool"], 0.0, False
     pool = _effective_pool(pool_id, catalog, state)
     reasons: list[str] = []
     execution_eligible = True

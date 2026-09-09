@@ -1651,7 +1651,21 @@ class CodingAgentRouterTests(unittest.TestCase):
                 self.assertFalse(execution)
                 self.assertEqual(exclusion, ["disabled or controller route"])
 
-    def test_retired_ox_alpha_pool_is_intrinsically_non_executable(self) -> None:
+    def test_retired_ox_alpha_pool_rejects_pre_retirement_override_catalog(self) -> None:
+        legacy_catalog = json.loads(json.dumps(self.catalog))
+        legacy_pool = legacy_catalog["quota_pools"]["openrouter-ox-alpha-preview"]
+        legacy_pool.pop("blocked_reason", None)
+        legacy_pool.update(
+            {
+                "cost_mode": "temporary-free-account",
+                "marginal_cost_usd": 0,
+                "max_concurrency": 1,
+                "payg_fallback_allowed": False,
+                "credits_allowed": False,
+                "freshness_seconds": 7200,
+                "unknown_execution": "allowed-while-fresh-zero-cost-preview",
+            }
+        )
         state = self._fresh_state()
         state["pools"]["openrouter-ox-alpha-preview"] = {
             "status": "available",
@@ -1660,13 +1674,13 @@ class CodingAgentRouterTests(unittest.TestCase):
         }
         allowed, reasons, _, execution = router._pool_gate(
             "openrouter-ox-alpha-preview",
-            self.catalog,
+            legacy_catalog,
             state,
             critical=False,
         )
         self.assertFalse(allowed)
         self.assertFalse(execution)
-        self.assertEqual(reasons, ["cost is unknown or non-zero"])
+        self.assertEqual(reasons, ["retired Ox Alpha preview pool"])
 
     def test_no_enabled_route_substitutes_paid_or_unverified_glm_flash(self) -> None:
         enabled = [
