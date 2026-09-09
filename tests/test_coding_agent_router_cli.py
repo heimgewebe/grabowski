@@ -479,7 +479,7 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         self.assertFalse(rejected["zero_price_verified"])
         self.assertEqual(rejected["pricing_status"], "nonzero-or-unknown")
 
-    def test_probe_verifies_ox_pool_only_with_local_model_and_zero_public_price(self) -> None:
+    def test_probe_never_reverifies_retired_ox_preview(self) -> None:
         catalog, _ = router._load_catalog()
 
         def metadata(_harnesses, harness, arguments, _catalog):
@@ -491,118 +491,91 @@ class CodingAgentRouterCliTests(unittest.TestCase):
                 }
             return {"ok": False, "stdout": "", "stderr": ""}
 
-        zero_price = {
-            "available": True,
-            "model_id": "stealth/ox-alpha",
-            "price_source": "public-models-api",
-            "zero_price_verified": True,
-            "pricing_status": "zero",
-        }
-        def run_probe(price_status):
-            with contextlib.ExitStack() as stack:
-                stack.enter_context(
-                    mock.patch.object(
-                        cli,
-                        "_binary_versions",
-                        return_value={
-                            "opencode": {"available": True, "binary": "/opencode"}
-                        },
-                    )
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.object(
+                    cli,
+                    "_binary_versions",
+                    return_value={
+                        "opencode": {"available": True, "binary": "/opencode"}
+                    },
                 )
-                stack.enter_context(
-                    mock.patch.object(
-                        cli, "_run_harness_metadata", side_effect=metadata
-                    )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    cli, "_run_harness_metadata", side_effect=metadata
                 )
-                stack.enter_context(
-                    mock.patch.object(
-                        cli,
-                        "_openhands_subscription_auth_status",
-                        return_value={"authenticated": False},
-                    )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    cli,
+                    "_openhands_subscription_auth_status",
+                    return_value={"authenticated": False},
                 )
-                stack.enter_context(
-                    mock.patch.object(
-                        cli,
-                        "_grok_subscription_auth_status",
-                        return_value={
-                            "authenticated": False,
-                            "entitlement_verified": False,
-                            "status": "missing",
-                            "subscription_tier": None,
-                            "account_binding_sha256": None,
-                        },
-                    )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    cli,
+                    "_grok_subscription_auth_status",
+                    return_value={
+                        "authenticated": False,
+                        "entitlement_verified": False,
+                        "status": "missing",
+                        "subscription_tier": None,
+                        "account_binding_sha256": None,
+                    },
                 )
-                stack.enter_context(
-                    mock.patch.object(cli, "_resolve_executable", return_value=None)
-                )
-                stack.enter_context(
-                    mock.patch.object(
-                        cli,
-                        "_openrouter_ox_alpha_price_status",
-                        return_value=price_status,
-                    )
-                )
-                return cli._probe(catalog)
+            )
+            stack.enter_context(
+                mock.patch.object(cli, "_resolve_executable", return_value=None)
+            )
+            price_probe = stack.enter_context(
+                mock.patch.object(cli, "_openrouter_ox_alpha_price_status")
+            )
+            probe = cli._probe(catalog)
 
-        verified = run_probe(zero_price)
-        self.assertIn("openrouter-ox-alpha-preview", verified["verified_quota_pools"])
-        self.assertTrue(verified["providers"]["openrouter"]["zero_price_verified"])
-        self.assertNotIn("opencode-free", verified["verified_quota_pools"])
-
-        nonzero_price = {
-            **zero_price,
-            "zero_price_verified": False,
-            "pricing_status": "nonzero-or-unknown",
-        }
-        rejected = run_probe(nonzero_price)
-        self.assertNotIn("openrouter-ox-alpha-preview", rejected["verified_quota_pools"])
-
-    def test_probe_write_clears_ox_price_freshness_without_explicit_reverification(self) -> None:
-        _, validation = router._load_catalog()
-        first = {
-            "schema_version": 2,
-            "observed_at": "2026-08-24T05:00:00Z",
-            "harnesses": {},
-            "providers": {
-                "openrouter": {
-                    "available": True,
-                    "model_id": "stealth/ox-alpha",
-                    "price_source": "public-models-api",
-                    "zero_price_verified": True,
-                    "pricing_status": "zero",
-                }
-            },
-            "verified_quota_pools": ["openrouter-ox-alpha-preview"],
-            "api_key_environment_scrubbed": [],
-            "model_invocations": 0,
-            "paid_api_requests_authorized": 0,
-        }
-        first["catalog_probe_sha256"] = cli._probe_digest(first)
-        cli._write_probe(first, validation)
-        stored = json.loads(self.state.read_text(encoding="utf-8"))
+        price_probe.assert_not_called()
+        self.assertNotIn(
+            "openrouter-ox-alpha-preview", probe["verified_quota_pools"]
+        )
         self.assertEqual(
-            stored["pools"]["openrouter-ox-alpha-preview"]["verified_at"],
-            first["observed_at"],
+            probe["providers"]["openrouter"]["pricing_status"],
+            "ox-alpha-preview-retired",
+        )
+        self.assertFalse(
+            probe["providers"]["openrouter"]["zero_price_verified"]
         )
 
-        second = {
-            **first,
-            "observed_at": "2026-08-24T05:45:00Z",
-            "providers": {
-                "openrouter": {
-                    **first["providers"]["openrouter"],
-                    "zero_price_verified": False,
-                    "pricing_status": "nonzero-or-unknown",
+    def test_catalog_change_resets_historical_ox_pool_state(self) -> None:
+        _, validation = router._load_catalog()
+        historical = {
+            "schema_version": 2,
+            "updated_at": "2026-08-24T05:00:00Z",
+            "catalog_sha256": "0" * 64,
+            "catalog": {
+                "verified_quota_pools": ["openrouter-ox-alpha-preview"]
+            },
+            "pools": {
+                "openrouter-ox-alpha-preview": {
+                    "status": "available",
+                    "verified_at": "2026-08-24T05:00:00Z",
                 }
             },
-            "verified_quota_pools": [],
+            "routes": {
+                "opencode-openrouter-ox-alpha-free-preview": {
+                    "status": "available"
+                }
+            },
+            "history": {"kept": {"runs": 1}},
         }
-        second["catalog_probe_sha256"] = cli._probe_digest(second)
-        cli._write_probe(second, validation)
-        stored = json.loads(self.state.read_text(encoding="utf-8"))
-        self.assertNotIn("verified_at", stored["pools"]["openrouter-ox-alpha-preview"])
+        self.state.write_text(json.dumps(historical), encoding="utf-8")
+
+        reset = cli._load_mutable_state(validation["catalog_sha256"])
+
+        self.assertEqual(reset["catalog"], {})
+        self.assertEqual(reset["pools"], {})
+        self.assertEqual(reset["routes"], {})
+        self.assertEqual(reset["history"], historical["history"])
 
     def test_opencode_free_entitlement_accepts_current_builtin_free_models_only(self) -> None:
         self.assertTrue(cli._opencode_free_model_verified(["opencode/hy3-free"]))
@@ -942,32 +915,34 @@ class CodingAgentRouterCliTests(unittest.TestCase):
             self.assertNotIn("cooldown_until", pool)
             self.assertNotIn("reset_at", pool)
 
-    def test_set_quota_registers_ox_alpha_openrouter_preview_pool_as_unknown(
-        self,
-    ) -> None:
+    def test_set_quota_cannot_reanimate_retired_ox_preview_pool(self) -> None:
         status, _ = self._main(
             [
                 "set-quota",
                 "--pool",
                 "openrouter-ox-alpha-preview",
                 "--status",
-                "unknown",
+                "available",
             ]
         )
         self.assertEqual(status, 0)
-        pool = json.loads(self.state.read_text(encoding="utf-8"))["pools"][
+        pool_state = json.loads(self.state.read_text(encoding="utf-8"))["pools"][
             "openrouter-ox-alpha-preview"
         ]
-        self.assertEqual(pool["status"], "unknown")
+        catalog = router._load_catalog()[0]
+        pool_contract = catalog["quota_pools"]["openrouter-ox-alpha-preview"]
+        self.assertEqual(pool_state["status"], "available")
+        self.assertEqual(pool_contract["max_concurrency"], 0)
+        self.assertIsNone(pool_contract["marginal_cost_usd"])
         allowed, reasons, _, execution = router._pool_gate(
             "openrouter-ox-alpha-preview",
-            router._load_catalog()[0],
-            {"pools": {"openrouter-ox-alpha-preview": pool}},
+            catalog,
+            {"pools": {"openrouter-ox-alpha-preview": pool_state}},
             critical=False,
         )
         self.assertFalse(allowed)
-        self.assertIn("zero-cost evidence is missing", reasons[0])
         self.assertFalse(execution)
+        self.assertTrue(reasons)
 
     def test_set_quota_available_clears_stale_status_fields(self) -> None:
         _, validation = router._load_catalog()

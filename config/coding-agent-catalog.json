@@ -650,11 +650,11 @@
       "quality_prior_class": "C"
     },
     "ox-alpha": {
-      "availability": "live-verified-free-via-openrouter",
-      "evidence": "openrouter-stealth-ox-alpha-zero-price-live-listing-2026-08-24; openrouter-free-tier-key-http-200-2026-08-24; opencode-exact-model-resolution-and-zero-cost-live-smoke-2026-08-24; opencode-plan-agent-zero-cost-live-smoke-2026-08-24",
-      "family": "stealth-ox-alpha",
-      "name": "Ox Alpha (OpenRouter free preview)",
-      "provider_family": "stealth",
+      "availability": "retired-preview-revealed-as-glm-5.3-flash",
+      "evidence": "historical-openrouter-stealth-ox-alpha-zero-price-live-smokes-2026-08-24; z-ai-glm-5.3-flash-reveal-2026-08-26; local-opencode-model-list-z-ai-glm-5.3-flash-without-free-slug-2026-09-09",
+      "family": "z-ai-glm-5.3-flash",
+      "name": "GLM-5.3-Flash (former Ox Alpha preview)",
+      "provider_family": "z-ai",
       "quality": {
         "architecture": 4,
         "autonomy": 4,
@@ -1186,20 +1186,20 @@
       "unknown_execution": "advisory-only"
     },
     "openrouter-ox-alpha-preview": {
-      "cost_mode": "temporary-free-account",
+      "blocked_reason": "Ox Alpha preview retired after GLM-5.3-Flash reveal. Do not substitute the paid z-ai/glm-5.3-flash route; z-ai/glm-5.3-flash:free requires separate fresh exact model-resolution, zero-price, provider/retention, and access evidence.",
+      "cost_mode": "retired-preview",
       "credits_allowed": false,
       "excluded_cost_surfaces": [
         "openrouter-payg-api",
         "purchased-ai-credits"
       ],
-      "freshness_seconds": 7200,
-      "marginal_cost_usd": 0,
-      "max_concurrency": 1,
-      "note": "Stealth Ox Alpha (stealth/ox-alpha) via OpenRouter is a temporary $0 input / $0 output preview from an anonymous provider identity; prompts and completions are retained by the provider. The exact model must remain locally resolvable and the public OpenRouter model catalog must report zero for every advertised pricing field. That pool-specific price proof expires after two hours; unrelated metadata refreshes do not renew it. A zero-cost synthetic live smoke and a separate OpenCode plan-agent zero-cost live smoke also succeeded on 2026-08-24. Opaque provider quota does not by itself force advisory-only use while the $0 proof is current; PAYG or credits fallback is forbidden.",
+      "marginal_cost_usd": null,
+      "max_concurrency": 0,
+      "note": "Historical Ox Alpha (stealth/ox-alpha) $0 evidence from 2026-08-24 is provenance only and authorizes no current execution. Z.ai revealed Ox Alpha as GLM-5.3-Flash on 2026-08-26. On 2026-09-09 local OpenCode enumerated openrouter/z-ai/glm-5.3-flash but not the separate :free slug, so no paid or unverified replacement is permitted.",
       "payg_fallback_allowed": false,
-      "quota_mode": "provider-free-preview-model",
+      "quota_mode": "retired",
       "reserve_floor": 0.1,
-      "unknown_execution": "allowed-while-fresh-zero-cost-preview"
+      "unknown_execution": "advisory-only"
     },
     "openhands-account": {
       "cost_mode": "signed-in-account",
@@ -2611,11 +2611,11 @@
       "burn_weight": 0.3,
       "contrast_only": false,
       "delegation_overhead_minutes": 3,
-      "enabled": true,
+      "enabled": false,
       "harness": "opencode",
       "harness_quality": 7,
       "id": "opencode-openrouter-ox-alpha-free-preview",
-      "independence_group": "stealth-ox-alpha-openrouter",
+      "independence_group": "z-ai-glm-5.3-flash-openrouter-preview",
       "min_duration_minutes": 5,
       "model": "ox-alpha",
       "priority": 40,
@@ -2651,7 +2651,8 @@
         "public-context",
         "synthetic-context",
         "non-sensitive-context"
-      ]
+      ],
+      "disabled_reason": "Ox Alpha preview retired after its identity was revealed as Z.ai GLM-5.3-Flash. Historical stealth/ox-alpha argv is retained only for provenance; do not substitute the paid z-ai/glm-5.3-flash route. A z-ai/glm-5.3-flash:free route requires separate fresh exact verification before activation."
     },
     {
       "argv_prefix": [
@@ -2669,12 +2670,12 @@
       "burn_weight": 0.3,
       "critical_eligible": true,
       "delegation_overhead_minutes": 3,
-      "enabled": true,
+      "enabled": false,
       "experimental_quality_floor_bypass": true,
       "harness": "opencode",
       "harness_quality": 7,
       "id": "opencode-openrouter-ox-alpha-review-preview",
-      "independence_group": "stealth-ox-alpha-openrouter",
+      "independence_group": "z-ai-glm-5.3-flash-openrouter-preview",
       "min_duration_minutes": 5,
       "model": "ox-alpha",
       "priority": 40,
@@ -2700,7 +2701,8 @@
         "public-context",
         "synthetic-context",
         "non-sensitive-context"
-      ]
+      ],
+      "disabled_reason": "Ox Alpha preview retired after its identity was revealed as Z.ai GLM-5.3-Flash. Historical stealth/ox-alpha argv is retained only for provenance; do not substitute the paid z-ai/glm-5.3-flash route. A z-ai/glm-5.3-flash:free route requires separate fresh exact verification before activation."
     },
     {
       "argv_prefix": [

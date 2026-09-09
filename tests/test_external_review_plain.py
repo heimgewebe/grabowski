@@ -351,122 +351,36 @@ class PlainExternalReviewTests(unittest.TestCase):
                 (),
             )
 
-    def test_ox_alpha_transmits_full_diff_by_private_file_with_exact_policy(self) -> None:
+    def test_ox_alpha_provider_is_retired_before_execution(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifest = self._packet(root)
-            manifest_value = json.loads(manifest.read_text(encoding="utf-8"))
-            diff_text = Path(manifest_value["diff_path"]).read_text(encoding="utf-8")
             output = root / "ox-alpha-evidence.json"
-
-            def fake_run(argv, **kwargs):
-                self.assertEqual(
-                    argv[:8],
-                    [
-                        "/private/ox-alpha",
-                        "run",
-                        "--pure",
-                        "--agent",
-                        plain.OX_ALPHA_AGENT,
-                        "--model",
-                        plain.OX_ALPHA_MODEL,
-                        "--file",
-                    ],
-                )
-                self.assertEqual(argv[9], plain.OX_ALPHA_PROMPT_MESSAGE)
-                self.assertNotIn("--auto", argv)
-                self.assertNotIn(diff_text, argv)
-                isolated = Path(str(kwargs["cwd"]))
-                prompt_path = Path(argv[8])
-                self.assertEqual(prompt_path.parent, isolated)
-                self.assertEqual(stat.S_IMODE(prompt_path.stat().st_mode), 0o600)
-                prompt = prompt_path.read_text(encoding="utf-8")
-                self.assertIn(diff_text, prompt)
-                self.assertEqual(list(isolated.iterdir()), [prompt_path])
-                environment = kwargs["environment"]
-                self.assertNotIn("OPENROUTER_API_KEY", environment)
-                runtime_root = Path(environment["HOME"]).parent
-                self.assertNotEqual(Path(environment["HOME"]), self._account_home_path)
-                self.assertEqual(Path(environment["XDG_CONFIG_HOME"]).parent, runtime_root)
-                self.assertEqual(Path(environment["XDG_DATA_HOME"]).parent, runtime_root)
-                self.assertEqual(Path(environment["XDG_CACHE_HOME"]).parent, runtime_root)
-                self.assertEqual(Path(environment["XDG_STATE_HOME"]).parent, runtime_root)
-                config = Path(environment["XDG_CONFIG_HOME"]) / "opencode" / "opencode.json"
-                auth = Path(environment["XDG_DATA_HOME"]) / "opencode" / "auth.json"
-                self.assertEqual(plain.sha256_bytes(config.read_bytes()), plain.OX_ALPHA_AGENT_CONFIG_SHA256)
-                self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o600)
-                self.assertEqual(stat.S_IMODE(auth.stat().st_mode), 0o600)
-                return subprocess.CompletedProcess(
-                    argv,
-                    0,
-                    '{"verdict":"PASS","finding_count":0,"findings":[]}',
-                    "",
-                )
-
             with (
-                mock.patch.dict(
-                    os.environ,
-                    {"OPENROUTER_API_KEY": "must-not-leak"},
-                ),
-                mock.patch.object(
-                    plain,
-                    "run_bounded_process",
-                    side_effect=fake_run,
+                mock.patch.object(plain, "run_provider") as run,
+                self.assertRaisesRegex(
+                    plain.PlainReviewError,
+                    "provider is retired",
                 ),
             ):
-                evidence = self._run(
-                    manifest,
-                    output,
+                plain.run_from_manifest(
+                    manifest_path=manifest,
+                    output_path=output,
+                    raw_review_path=None,
+                    transmitted_prompt_path=None,
                     provider="ox-alpha",
                     executable="opencode",
                     model=None,
+                    timeout_seconds=300,
+                    max_prompt_bytes=100_000,
                     context_attestation="non-sensitive-context",
                 )
+            run.assert_not_called()
+            self.assertFalse(output.exists())
+            self.assertFalse(output.with_suffix(".review.txt").exists())
+            self.assertFalse(output.with_suffix(".prompt.txt").exists())
 
-            self.assertEqual(
-                evidence["diff_sha256"], manifest_value["diff_sha256"]
-            )
-            self.assertEqual(
-                evidence["review_input"]["requested_model"],
-                plain.OX_ALPHA_MODEL,
-            )
-            self.assertEqual(
-                evidence["review_input"]["context_attestation"],
-                "non-sensitive-context",
-            )
-            self.assertEqual(
-                evidence["review_input"]["paid_fallback_policy"],
-                plain.OX_ALPHA_PAID_FALLBACK_POLICY,
-            )
-            self.assertEqual(
-                evidence["reviews"][0]["tool_policy"],
-                plain.OX_ALPHA_TOOL_POLICY,
-            )
-            self.assertEqual(
-                evidence["review_input"]["runtime_isolation"],
-                plain.OX_ALPHA_RUNTIME_ISOLATION,
-            )
-            self.assertEqual(
-                evidence["review_input"]["agent_name"],
-                plain.OX_ALPHA_AGENT,
-            )
-            self.assertEqual(
-                evidence["review_input"]["agent_config_sha256"],
-                plain.OX_ALPHA_AGENT_CONFIG_SHA256,
-            )
-            self.assertEqual(
-                evidence["review_input"]["account_auth_copy_policy"],
-                plain.OX_ALPHA_AUTH_COPY_POLICY,
-            )
-            self.assertEqual(
-                evidence["review_input"]["provider_argv"][4],
-                plain.OX_ALPHA_AGENT,
-            )
-            self.assertFalse(evidence["review_input"]["prompt_argument_exposure"])
-            self.assertTrue(evidence["review_input"]["ephemeral_prompt_file"])
-            self.assertEqual(schemas.EXTERNAL_REVIEW_SCHEMA.validate(evidence), ())
-
-    def test_ox_alpha_rejects_missing_or_unsafe_context_attestation(self) -> None:
+    def test_ox_alpha_retirement_precedes_legacy_context_policy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifest = self._packet(root)
@@ -476,7 +390,7 @@ class PlainExternalReviewTests(unittest.TestCase):
                     mock.patch.object(plain, "run_provider") as run,
                     self.assertRaisesRegex(
                         plain.PlainReviewError,
-                        "requires an explicit safe context attestation",
+                        "provider is retired",
                     ),
                 ):
                     plain.run_from_manifest(

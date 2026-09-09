@@ -51,7 +51,6 @@ PROBE_VERIFIABLE_QUOTA_POOLS = (
     "grok-com",
     "jules-account",
     "opencode-free",
-    "openrouter-ox-alpha-preview",
     "openhands-account",
 )
 SENSITIVE_PROBE_FIELD_TOKENS = (
@@ -852,17 +851,13 @@ def _probe(catalog: dict[str, Any]) -> dict[str, Any]:
         "models": opencode_models,
         "free_model_verified": _opencode_free_model_verified(opencode_models),
     }
-    providers["openrouter"] = (
-        _openrouter_ox_alpha_price_status()
-        if OPENROUTER_OX_ALPHA_OPENCODE_MODEL in opencode_models
-        else {
-            "available": False,
-            "model_id": None,
-            "price_source": "public-models-api",
-            "zero_price_verified": False,
-            "pricing_status": "local-model-unavailable",
-        }
-    )
+    providers["openrouter"] = {
+        "available": False,
+        "model_id": None,
+        "price_source": None,
+        "zero_price_verified": False,
+        "pricing_status": "ox-alpha-preview-retired",
+    }
     openhands_auth = _openhands_subscription_auth_status()
     providers["openhands"] = {
         "available": harnesses.get("openhands", {}).get("available") is True,
@@ -956,12 +951,6 @@ def _probe(catalog: dict[str, Any]) -> dict[str, Any]:
         verified_quota_pools.append("jules-account")
     if providers["opencode"].get("free_model_verified") is True:
         verified_quota_pools.append("opencode-free")
-    if (
-        OPENROUTER_OX_ALPHA_OPENCODE_MODEL in providers["opencode"].get("models", [])
-        and providers["openrouter"].get("model_id") == OPENROUTER_OX_ALPHA_MODEL
-        and providers["openrouter"].get("zero_price_verified") is True
-    ):
-        verified_quota_pools.append("openrouter-ox-alpha-preview")
     if providers["openhands"].get("authenticated") is True:
         verified_quota_pools.append("openhands-account")
     body = {
