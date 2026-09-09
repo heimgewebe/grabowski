@@ -48,8 +48,8 @@ class UpgradeAccessProfilesTests(unittest.TestCase):
                     "trusted_owner": False,
                     "capabilities": [
                         "file_read", "audit_verify", "audit_read",
-                        "bureau_mutation", "resource_lease",
-                        "process_inspect", "port_inspect",
+                        "bureau_mutation", "maulwurf_recovery_control",
+                        "resource_lease", "process_inspect", "port_inspect",
                     ],
                 },
                 "trusted-owner": {
@@ -86,7 +86,9 @@ class UpgradeAccessProfilesTests(unittest.TestCase):
             ["failover-mutate", "maintain", "observe", "trusted-owner"],
         )
         expected_trusted = copy.deepcopy(self.trusted_owner)
-        expected_trusted["capabilities"].append("bureau_mutation")
+        expected_trusted["capabilities"].extend(
+            ["bureau_mutation", "maulwurf_recovery_control"]
+        )
         self.assertEqual(result["profiles"]["trusted-owner"], expected_trusted)
         self.assertEqual(
             result["profiles"]["failover-mutate"],
@@ -172,7 +174,9 @@ class UpgradeAccessProfilesTests(unittest.TestCase):
         self.assertTrue(result["applied"])
         self.assertEqual(value["active_profile"], "trusted-owner")
         expected_trusted = copy.deepcopy(self.trusted_owner)
-        expected_trusted["capabilities"].append("bureau_mutation")
+        expected_trusted["capabilities"].extend(
+            ["bureau_mutation", "maulwurf_recovery_control"]
+        )
         self.assertEqual(value["profiles"]["trusted-owner"], expected_trusted)
         self.assertIn("failover-mutate", value["profiles"])
         self.assertEqual(stat.S_IMODE(self.policy_path.stat().st_mode), 0o600)

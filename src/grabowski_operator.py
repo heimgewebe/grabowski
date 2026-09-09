@@ -87,6 +87,9 @@ _DEPLOYMENT_ADMISSION_MAX_TOOL_NAME_CHARS = 128
 _DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC = "sync"
 _DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC = "async"
 _DEPLOYMENT_ADMISSION_GATE_INSTALLED = False
+_MAULWURF_RECOVERY_NORMAL_TRANSITION_ACTIVE = False
+_MAULWURF_RECOVERY_TRANSITION_POLL_SECONDS = 0.02
+_MAULWURF_RECOVERY_TRANSITION_TIMEOUT_SECONDS = 120.0
 SYNC_TOOL_EXECUTOR_MAX_WORKERS = 8
 _SYNC_TOOL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=SYNC_TOOL_EXECUTOR_MAX_WORKERS,
@@ -363,6 +366,7 @@ OPERATOR_CAPABILITIES = (
     "artifact_transfer",
     "browser_worker",
     "gui_worker",
+    "maulwurf_recovery_control",
 )
 PRIVILEGED_REFERENCE_ACTIONS = {
     "install_system_package",
@@ -442,14 +446,21 @@ def _maulwurf_recovery_enabled() -> bool:
     return bool(_maulwurf_recovery_module().recovery_mode_enabled())
 
 
-def _maulwurf_recovery_control_call(tool_name: Any, arguments: Any) -> bool:
+def _maulwurf_recovery_operation_name(tool_name: Any, arguments: Any) -> str | None:
     if tool_name != "grabowski_operation_run" or not isinstance(arguments, dict):
-        return False
-    return arguments.get("operation") in {
+        return None
+    operation = arguments.get("operation")
+    if operation in {
         "maulwurf-recovery-status",
         "maulwurf-recovery-on",
         "maulwurf-recovery-off",
-    }
+    }:
+        return str(operation)
+    return None
+
+
+def _maulwurf_recovery_control_call(tool_name: Any, arguments: Any) -> bool:
+    return _maulwurf_recovery_operation_name(tool_name, arguments) is not None
 
 
 def _enforce_maulwurf_recovery_mode(
@@ -1134,6 +1145,8 @@ def _deployment_admission_register_tool_call(
     kind: str,
     *,
     drain_blocking: bool = True,
+    maulwurf_mutation: bool = False,
+    maulwurf_transition_control: bool = False,
 ) -> str:
     if kind not in {
         _DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC,
@@ -1142,9 +1155,21 @@ def _deployment_admission_register_tool_call(
         raise ValueError(f"unknown deployment admission execution kind: {kind!r}")
     if not isinstance(drain_blocking, bool):
         raise ValueError("deployment admission drain_blocking must be boolean")
+    if not isinstance(maulwurf_mutation, bool) or not isinstance(
+        maulwurf_transition_control, bool
+    ):
+        raise ValueError("Maulwurf admission flags must be boolean")
     name = tool_name if isinstance(tool_name, str) and tool_name else "unnamed"
     name = name[:_DEPLOYMENT_ADMISSION_MAX_TOOL_NAME_CHARS]
     with _DEPLOYMENT_ADMISSION_LOCK:
+        if (
+            maulwurf_mutation
+            and _MAULWURF_RECOVERY_NORMAL_TRANSITION_ACTIVE
+            and not maulwurf_transition_control
+        ):
+            raise PermissionError(
+                "der kleine maulwurf is transitioning to NORMAL; new mutations are disabled"
+            )
         if (
             len(_DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY)
             >= _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY_MAX
@@ -1181,6 +1206,47 @@ def _deployment_admission_release_tool_call(identity: Any) -> bool:
         return (
             _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY.pop(identity, None) is not None
         )
+
+
+def _maulwurf_recovery_transition_active() -> bool:
+    with _DEPLOYMENT_ADMISSION_LOCK:
+        return _MAULWURF_RECOVERY_NORMAL_TRANSITION_ACTIVE
+
+
+def _maulwurf_recovery_begin_normal_transition(
+    *, timeout_seconds: float = _MAULWURF_RECOVERY_TRANSITION_TIMEOUT_SECONDS
+) -> dict[str, Any]:
+    global _MAULWURF_RECOVERY_NORMAL_TRANSITION_ACTIVE
+    if timeout_seconds <= 0:
+        raise ValueError("Maulwurf recovery transition timeout must be positive")
+    deadline = time.monotonic() + timeout_seconds
+    with _DEPLOYMENT_ADMISSION_LOCK:
+        if _MAULWURF_RECOVERY_NORMAL_TRANSITION_ACTIVE:
+            raise RuntimeError("Maulwurf NORMAL transition is already active")
+        _MAULWURF_RECOVERY_NORMAL_TRANSITION_ACTIVE = True
+    try:
+        while True:
+            with _DEPLOYMENT_ADMISSION_LOCK:
+                remaining = sum(
+                    entry.get("drain_blocking") is not False
+                    for entry in _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY.values()
+                )
+            if remaining == 0:
+                return {"drained": True, "remaining": 0}
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Maulwurf NORMAL transition timed out with {remaining} active mutation(s)"
+                )
+            time.sleep(_MAULWURF_RECOVERY_TRANSITION_POLL_SECONDS)
+    except BaseException:
+        _maulwurf_recovery_end_normal_transition()
+        raise
+
+
+def _maulwurf_recovery_end_normal_transition() -> None:
+    global _MAULWURF_RECOVERY_NORMAL_TRANSITION_ACTIVE
+    with _DEPLOYMENT_ADMISSION_LOCK:
+        _MAULWURF_RECOVERY_NORMAL_TRANSITION_ACTIVE = False
 
 
 def _deployment_admission_active_registry_snapshot() -> dict[str, dict[str, Any]]:
@@ -1490,6 +1556,14 @@ def _install_deployment_admission_gate() -> None:
                 return await original(*args, **kwargs)
 
         read_only_hint = _tool_read_only_hint(tool)
+        maulwurf_recovery_operation = _maulwurf_recovery_operation_name(
+            tool_name, arguments
+        )
+        maulwurf_mutation = (
+            _maulwurf_runtime_active()
+            and read_only_hint is not True
+            and maulwurf_recovery_operation != "maulwurf-recovery-status"
+        )
         kind = (
             _DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC
             if tool is not None and getattr(tool, "is_async", True) is False
@@ -1499,8 +1573,16 @@ def _install_deployment_admission_gate() -> None:
             tool_name,
             kind,
             drain_blocking=(
-                read_only_hint is not True
-                or tool_name == deployment_observer.OPERATION
+                (
+                    read_only_hint is not True
+                    or tool_name == deployment_observer.OPERATION
+                )
+                and maulwurf_recovery_operation
+                not in {"maulwurf-recovery-status", "maulwurf-recovery-off"}
+            ),
+            maulwurf_mutation=maulwurf_mutation,
+            maulwurf_transition_control=(
+                maulwurf_recovery_operation == "maulwurf-recovery-off"
             ),
         )
         release_in_finally = True

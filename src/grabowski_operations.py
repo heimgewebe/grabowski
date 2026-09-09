@@ -276,16 +276,24 @@ def _run_maulwurf_recovery_operation(
     plan = _maulwurf_recovery_operation_plan(operation, parameters)
     import der_kleine_maulwurf_operator as mole
     if operation in {MAULWURF_RECOVERY_ON_OPERATION, MAULWURF_RECOVERY_OFF_OPERATION}:
-        operator._require_operator_capability("file_write")
+        operator._require_operator_capability("maulwurf_recovery_control")
 
-    if operation == MAULWURF_RECOVERY_STATUS_OPERATION:
-        status = mole.recovery_mode_status()
-    elif operation == MAULWURF_RECOVERY_ON_OPERATION:
-        status = mole.enable_recovery_mode((parameters or {})["reason"])
-    elif operation == MAULWURF_RECOVERY_OFF_OPERATION:
-        status = mole.disable_recovery_mode()
-    else:
-        raise ValueError(f"Unknown Maulwurf recovery operation: {operation}")
+    transition_started = False
+    try:
+        if operation == MAULWURF_RECOVERY_OFF_OPERATION:
+            operator._maulwurf_recovery_begin_normal_transition()
+            transition_started = True
+        if operation == MAULWURF_RECOVERY_STATUS_OPERATION:
+            status = mole.recovery_mode_status()
+        elif operation == MAULWURF_RECOVERY_ON_OPERATION:
+            status = mole.enable_recovery_mode((parameters or {})["reason"])
+        elif operation == MAULWURF_RECOVERY_OFF_OPERATION:
+            status = mole.disable_recovery_mode()
+        else:
+            raise ValueError(f"Unknown Maulwurf recovery operation: {operation}")
+    finally:
+        if transition_started:
+            operator._maulwurf_recovery_end_normal_transition()
     expected_mode = {
         MAULWURF_RECOVERY_ON_OPERATION: "recovery",
         MAULWURF_RECOVERY_OFF_OPERATION: "normal",
@@ -1020,6 +1028,8 @@ def grabowski_operation_list() -> dict[str, Any]:
 def grabowski_operation_plan(operation: str,
                               parameters: dict[str, str] | None = None) -> dict[str, Any]:
     """Render one operation and its rollback path without executing it."""
+    if operation in MAULWURF_RECOVERY_TYPED_OPERATIONS:
+        return _maulwurf_recovery_operation_plan(operation, parameters)
     operator._require_operator_capability("terminal_execute")
     if operation == FLEET_MUTATION_OPERATION:
         return fleet_mutation.plan_registry_mutation(parameters)["public"]
@@ -1027,8 +1037,6 @@ def grabowski_operation_plan(operation: str,
         return _blockade_authority_harden_operation_plan(parameters)
     if operation == ROOTBROKER_AUTHORITY_REFRESH_OPERATION:
         return _rootbroker_authority_refresh_plan(parameters)
-    if operation in MAULWURF_RECOVERY_TYPED_OPERATIONS:
-        return _maulwurf_recovery_operation_plan(operation, parameters)
     if operation in BACKUP_STORAGE_TYPED_OPERATIONS:
         return _backup_storage_operation_plan(operation, parameters)
     return _render(operation, parameters)

@@ -523,6 +523,7 @@ OPERATOR_CAPABILITIES = (
     "artifact_transfer",
     "browser_worker",
     "gui_worker",
+    "maulwurf_recovery_control",
 )
 RESERVED_DISABLED_CAPABILITIES = (
     "file_delete",
@@ -921,6 +922,7 @@ FAILOVER_MUTATE_CAPABILITIES = frozenset(
         "audit_verify",
         "audit_read",
         "bureau_mutation",
+        "maulwurf_recovery_control",
         "resource_lease",
         "process_inspect",
         "port_inspect",

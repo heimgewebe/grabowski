@@ -507,6 +507,65 @@ class OperatorContractTests(unittest.TestCase):
             )
         self.assertTrue(result["called"])
 
+    def test_maulwurf_normal_transition_drains_and_blocks_new_mutations(self) -> None:
+        operator = _load_operator_module()
+        with patch.dict(
+            os.environ,
+            {"GRABOWSKI_MCP_BRANDING_VARIANT": "der-kleine-maulwurf"},
+        ):
+            active = operator._deployment_admission_register_tool_call(
+                "write-a",
+                operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC,
+                drain_blocking=True,
+                maulwurf_mutation=True,
+            )
+            result: dict[str, object] = {}
+            errors: list[BaseException] = []
+
+            def begin_transition() -> None:
+                try:
+                    result.update(
+                        operator._maulwurf_recovery_begin_normal_transition(
+                            timeout_seconds=1.0
+                        )
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            thread = threading.Thread(target=begin_transition)
+            thread.start()
+            deadline = time.monotonic() + 1.0
+            while not operator._maulwurf_recovery_transition_active():
+                if time.monotonic() >= deadline:
+                    self.fail("Maulwurf NORMAL transition did not start")
+                time.sleep(0.005)
+            try:
+                with self.assertRaisesRegex(PermissionError, "transitioning to NORMAL"):
+                    operator._deployment_admission_register_tool_call(
+                        "write-b",
+                        operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC,
+                        drain_blocking=True,
+                        maulwurf_mutation=True,
+                    )
+                off_identity = operator._deployment_admission_register_tool_call(
+                    "grabowski_operation_run",
+                    operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC,
+                    drain_blocking=False,
+                    maulwurf_mutation=True,
+                    maulwurf_transition_control=True,
+                )
+                self.assertTrue(thread.is_alive())
+                operator._deployment_admission_release_tool_call(active)
+                thread.join(timeout=1.0)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual([], errors)
+                self.assertEqual({"drained": True, "remaining": 0}, result)
+            finally:
+                operator._deployment_admission_release_tool_call(active)
+                if "off_identity" in locals():
+                    operator._deployment_admission_release_tool_call(off_identity)
+                operator._maulwurf_recovery_end_normal_transition()
+
     def test_cold_reentry_tools_wait_for_active_marker_then_reenter_after_expiry(
         self,
     ) -> None:

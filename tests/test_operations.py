@@ -58,6 +58,7 @@ class MaulwurfRecoveryOperationTests(unittest.TestCase):
             path = Path(raw) / "mode.json"
             with (
                 patch.object(operations.operator, "_maulwurf_runtime_active", return_value=True),
+                patch.object(operations.operator, "_require_operator_capability"),
                 patch.object(mole, "recovery_mode_path", return_value=path),
             ):
                 status = operations.grabowski_operation_plan(
@@ -79,8 +80,9 @@ class MaulwurfRecoveryOperationTests(unittest.TestCase):
                 self.assertFalse(mole.recovery_mode_enabled(path=path))
 
     def test_recovery_write_success_requires_matching_valid_readback(self) -> None:
-        with patch.object(
-            operations.operator, "_maulwurf_runtime_active", return_value=True
+        with (
+            patch.object(operations.operator, "_maulwurf_runtime_active", return_value=True),
+            patch.object(operations.operator, "_require_operator_capability"),
         ):
             with patch.object(
                 mole,
@@ -103,21 +105,21 @@ class MaulwurfRecoveryOperationTests(unittest.TestCase):
                 self.assertFalse(result["success"])
 
 
-    def test_recovery_writes_require_file_write_capability(self) -> None:
+    def test_recovery_writes_require_typed_control_capability(self) -> None:
         with (
             patch.object(operations.operator, "_maulwurf_runtime_active", return_value=True),
             patch.object(
                 operations.operator,
                 "_require_operator_capability",
-                side_effect=PermissionError("file_write required"),
+                side_effect=PermissionError("recovery control required"),
             ) as require,
         ):
-            with self.assertRaisesRegex(PermissionError, "file_write required"):
+            with self.assertRaisesRegex(PermissionError, "recovery control required"):
                 operations.grabowski_operation_run(
                     operations.MAULWURF_RECOVERY_ON_OPERATION,
                     {"reason": "primary unavailable"},
                 )
-            require.assert_called_once_with("file_write")
+            require.assert_called_once_with("maulwurf_recovery_control")
 
         with (
             patch.object(operations.operator, "_maulwurf_runtime_active", return_value=True),
@@ -130,9 +132,47 @@ class MaulwurfRecoveryOperationTests(unittest.TestCase):
             require.assert_not_called()
 
 
+    def test_failover_profile_can_plan_and_toggle_without_generic_file_write(self) -> None:
+        policy = json.loads(
+            (ROOT / "config" / "access.home-wide-operator.example.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        policy["active_profile"] = "failover-mutate"
+        self.assertNotIn(
+            "file_write", policy["profiles"]["failover-mutate"]["capabilities"]
+        )
+        self.assertIn(
+            "maulwurf_recovery_control",
+            policy["profiles"]["failover-mutate"]["capabilities"],
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "mode.json"
+            with (
+                patch.object(operations.operator, "_maulwurf_runtime_active", return_value=True),
+                patch.object(operations.operator.base, "_load_policy", return_value=policy),
+                patch.object(mole, "recovery_mode_path", return_value=path),
+            ):
+                planned = operations.grabowski_operation_plan(
+                    operations.MAULWURF_RECOVERY_ON_OPERATION,
+                    {"reason": "primary unavailable"},
+                )
+                self.assertEqual("recovery_mode_write", planned["effect"])
+                enabled = operations.grabowski_operation_run(
+                    operations.MAULWURF_RECOVERY_ON_OPERATION,
+                    {"reason": "primary unavailable"},
+                )
+                self.assertTrue(enabled["success"])
+                disabled = operations.grabowski_operation_run(
+                    operations.MAULWURF_RECOVERY_OFF_OPERATION, None
+                )
+                self.assertTrue(disabled["success"])
+                self.assertEqual("normal", disabled["status"]["mode"])
+
     def test_typed_operations_are_not_available_on_primary_runtime(self) -> None:
-        with patch.object(
-            operations.operator, "_maulwurf_runtime_active", return_value=False
+        with (
+            patch.object(operations.operator, "_maulwurf_runtime_active", return_value=False),
+            patch.object(operations.operator, "_require_operator_capability"),
         ):
             with self.assertRaisesRegex(RuntimeError, "only on the mole runtime"):
                 operations.grabowski_operation_plan(
@@ -145,8 +185,9 @@ class MaulwurfRecoveryOperationTests(unittest.TestCase):
                 )
 
     def test_recovery_on_requires_a_bounded_reason(self) -> None:
-        with patch.object(
-            operations.operator, "_maulwurf_runtime_active", return_value=True
+        with (
+            patch.object(operations.operator, "_maulwurf_runtime_active", return_value=True),
+            patch.object(operations.operator, "_require_operator_capability"),
         ):
             with self.assertRaisesRegex(ValueError, "requires exactly"):
                 operations.grabowski_operation_plan(
