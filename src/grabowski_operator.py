@@ -480,6 +480,15 @@ def _enforce_maulwurf_recovery_mode(
             "der kleine maulwurf RECOVERY mode does not allow grabowski_tmux_send; "
             "use tracked jobs, tasks, or agent workspaces for detached recovery work"
         )
+    if (
+        tool_name == "grabowski_user_service"
+        and isinstance(arguments, dict)
+        and arguments.get("action") in {"start", "restart"}
+    ):
+        raise PermissionError(
+            "der kleine maulwurf RECOVERY mode does not allow user-service start/restart; "
+            "the resulting service would outlive the recovery mutation guard"
+        )
 
 
 def _deployment_admission_invalid(reason: str) -> dict[str, Any]:
