@@ -24,6 +24,7 @@ if str(_SRC_DIR) not in sys.path:
 
 from grabowski_pr_diff import (  # noqa: E402
     canonicalize_github_pr_diff_identity,
+    canonicalize_github_pr_diff_identity_v1,
     github_pr_diff_identity_sha256,
     github_pr_diff_identity_sha256_v1,
 )
@@ -829,6 +830,7 @@ def load_pr_state(repo: Path, pr: int) -> dict[str, Any]:
     pr_diff_sha256: str | None = None
     pr_diff_previous_sha256: str | None = None
     pr_diff_text: str | None = None
+    pr_diff_previous_text: str | None = None
     pr_diff_error: str | None = None
     pr_diff_source: str | None = None
     pr_diff_provider_error: str | None = None
@@ -855,10 +857,14 @@ def load_pr_state(repo: Path, pr: int) -> dict[str, Any]:
             pr_diff_error = pr_diff_provider_error
     if raw_pr_diff_bytes is not None:
         pr_diff_bytes = canonicalize_github_pr_diff_identity(raw_pr_diff_bytes)
+        pr_diff_previous_bytes = canonicalize_github_pr_diff_identity_v1(
+            raw_pr_diff_bytes
+        )
         pr_diff_sha256 = github_pr_diff_identity_sha256(raw_pr_diff_bytes)
         pr_diff_previous_sha256 = github_pr_diff_identity_sha256_v1(raw_pr_diff_bytes)
         try:
             pr_diff_text = pr_diff_bytes.decode("utf-8")
+            pr_diff_previous_text = pr_diff_previous_bytes.decode("utf-8")
         except UnicodeDecodeError as exc:
             pr_diff_error = f"current PR diff is not valid UTF-8: {exc}"
     head_repository = view.get("headRepository") if isinstance(view, dict) else None
@@ -876,6 +882,7 @@ def load_pr_state(repo: Path, pr: int) -> dict[str, Any]:
         "pr_diff_sha256": pr_diff_sha256,
         "pr_diff_previous_sha256": pr_diff_previous_sha256,
         "pr_diff_text": pr_diff_text,
+        "pr_diff_previous_text": pr_diff_previous_text,
         "pr_diff_error": pr_diff_error,
         "pr_diff_source": pr_diff_source,
         "pr_diff_provider_error": pr_diff_provider_error,
@@ -1456,6 +1463,21 @@ def _current_pr_diff_identity_sha256s(state: dict[str, Any]) -> frozenset[str]:
 def _diff_identity_matches_current(state: dict[str, Any], value: Any) -> bool:
     normalized = _normalize_sha256(value)
     return normalized is not None and normalized in _current_pr_diff_identity_sha256s(state)
+
+
+def _pr_diff_text_for_identity(state: dict[str, Any], value: Any) -> str | None:
+    normalized = _normalize_sha256(value)
+    if normalized is None:
+        return None
+    current = _normalize_sha256(state.get("pr_diff_sha256"))
+    if normalized == current:
+        text = state.get("pr_diff_text")
+        return text if isinstance(text, str) else None
+    previous = _normalize_sha256(state.get("pr_diff_previous_sha256"))
+    if normalized == previous:
+        text = state.get("pr_diff_previous_text")
+        return text if isinstance(text, str) else None
+    return None
 
 
 def _normalize_git_sha(value: Any) -> str | None:
@@ -2569,7 +2591,7 @@ def _external_review_failures(
         packet_prompt = build_external_review_prompt(state, diff_filename, normalized_diff_sha256)
         expected_packet_prompt_sha256 = _sha256_text(packet_prompt)
         prompt_nonce = raw_review_input.get("prompt_nonce") if isinstance(raw_review_input, dict) else None
-        diff_text = state.get("pr_diff_text")
+        diff_text = _pr_diff_text_for_identity(state, normalized_diff_sha256)
         if isinstance(prompt_nonce, str) and isinstance(diff_text, str):
             if PROMPT_NONCE_RE.fullmatch(prompt_nonce):
                 expected_claude_prompt_sha256 = _sha256_text(

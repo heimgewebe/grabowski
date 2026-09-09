@@ -31,6 +31,13 @@ def _canonicalize_github_pr_diff_identity_v1(diff_bytes: bytes) -> bytes:
     return _INDEX_LINE_RE.sub(replace_index_line, diff_bytes)
 
 
+def canonicalize_github_pr_diff_identity_v1(diff_bytes: bytes) -> bytes:
+    """Return the immediately preceding canonical diff bytes for transition checks."""
+    if not isinstance(diff_bytes, bytes):
+        raise TypeError("diff_bytes must be bytes")
+    return _canonicalize_github_pr_diff_identity_v1(diff_bytes)
+
+
 def canonicalize_github_pr_diff_identity(diff_bytes: bytes) -> bytes:
     """Stabilize redundant Git diff metadata without changing patch content.
 
@@ -47,7 +54,7 @@ def canonicalize_github_pr_diff_identity(diff_bytes: bytes) -> bytes:
     def replace_hunk_header(match: re.Match[bytes]) -> bytes:
         return (match.group("header") or b"") + (match.group("cr") or b"")
 
-    canonical = _canonicalize_github_pr_diff_identity_v1(diff_bytes)
+    canonical = canonicalize_github_pr_diff_identity_v1(diff_bytes)
     return _HUNK_HEADER_RE.sub(replace_hunk_header, canonical)
 
 
@@ -57,6 +64,4 @@ def github_pr_diff_identity_sha256(diff_bytes: bytes) -> str:
 
 def github_pr_diff_identity_sha256_v1(diff_bytes: bytes) -> str:
     """Return the immediately preceding canonical identity for transition checks."""
-    if not isinstance(diff_bytes, bytes):
-        raise TypeError("diff_bytes must be bytes")
-    return hashlib.sha256(_canonicalize_github_pr_diff_identity_v1(diff_bytes)).hexdigest()
+    return hashlib.sha256(canonicalize_github_pr_diff_identity_v1(diff_bytes)).hexdigest()
