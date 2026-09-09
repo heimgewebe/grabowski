@@ -3475,6 +3475,19 @@ class OperatorContractTests(unittest.TestCase):
             hook = repo / ".git" / "hooks" / "pre-commit"
             hook.write_text("#!/bin/sh\ngit add OTHER.md\n", encoding="utf-8")
             hook.chmod(0o755)
+            signer = root / "fake-gpg"
+            signer.write_text(
+                '#!/bin/sh\ntouch "$0.ran"\nexit 1\n', encoding="utf-8"
+            )
+            signer.chmod(0o755)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "commit.gpgSign", "true"],
+                check=True,
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "gpg.program", str(signer)],
+                check=True,
+            )
             attempt = {
                 "schema_version": 1,
                 "owner_id": "operator:jit-commit",
@@ -3497,6 +3510,8 @@ class OperatorContractTests(unittest.TestCase):
                 result["branch_mutation"]["observed_preimage_sha256"],
             )
             self.assertIn("core.hooksPath=/dev/null", result["argv"])
+            self.assertIn("commit.gpgSign=false", result["argv"])
+            self.assertFalse(Path(f"{signer}.ran").exists())
             committed_readme = operator.subprocess.run(
                 ["git", "-C", str(repo), "show", "HEAD:README.md"],
                 stdout=operator.subprocess.PIPE,

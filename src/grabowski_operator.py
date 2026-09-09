@@ -6102,6 +6102,8 @@ def grabowski_git(
                         "git",
                         "-c",
                         "core.hooksPath=/dev/null",
+                        "-c",
+                        "commit.gpgSign=false",
                         "-C",
                         str(path),
                         *arguments,
