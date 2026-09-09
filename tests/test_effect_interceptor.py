@@ -615,6 +615,115 @@ class EffectInterceptorTests(unittest.TestCase):
             self.fail("synthetic FastMCP validation did not reject")
         self.assertEqual(completion["completion_class"], "rejected_before_effect")
 
+    def test_fastmcp_validation_through_operator_wrappers_is_rejected(self) -> None:
+        admission = interceptor.admit_mutation(
+            tool_name="grabowski_git",
+            arguments={},
+            transport_evidence=self.transport(),
+        )
+        validation_type = type(
+            "ValidationError",
+            (Exception,),
+            {"__module__": "pydantic_core._pydantic_core"},
+        )
+        fastmcp = {
+            "__name__": "mcp.server.fastmcp.utilities.func_metadata",
+            "ValidationError": validation_type,
+        }
+        exec(
+            compile(
+                "def call_fn_with_arg_validation():\n"
+                "    raise ValidationError('invalid arguments')\n",
+                "func_metadata.py",
+                "exec",
+            ),
+            fastmcp,
+        )
+        wrappers = {
+            "__name__": "grabowski_operator",
+            "call_fn_with_arg_validation": fastmcp["call_fn_with_arg_validation"],
+        }
+        exec(
+            compile(
+                "def _run_sync_tool_call():\n"
+                "    return call_fn_with_arg_validation()\n"
+                "def _run_sync_tool_call_with_effect():\n"
+                "    return _run_sync_tool_call()\n"
+                "def gated_call_tool():\n"
+                "    return _run_sync_tool_call_with_effect()\n",
+                "grabowski_operator.py",
+                "exec",
+            ),
+            wrappers,
+        )
+        try:
+            wrappers["gated_call_tool"]()
+        except Exception as error:
+            self.assertTrue(interceptor._fastmcp_argument_validation_rejection(error))
+            completion = interceptor.build_exception_completion(admission, error)
+        else:
+            self.fail("synthetic wrapped FastMCP validation did not reject")
+        self.assertEqual(completion["completion_class"], "rejected_before_effect")
+
+    def test_fastmcp_validation_with_domain_frame_stays_unknown(self) -> None:
+        admission = interceptor.admit_mutation(
+            tool_name="grabowski_task_start",
+            arguments={},
+            transport_evidence=self.transport(),
+        )
+        validation_type = type(
+            "ValidationError",
+            (Exception,),
+            {"__module__": "pydantic_core._pydantic_core"},
+        )
+        fastmcp = {
+            "__name__": "mcp.server.fastmcp.utilities.func_metadata",
+            "ValidationError": validation_type,
+        }
+        exec(
+            compile(
+                "def call_fn_with_arg_validation():\n"
+                "    raise ValidationError('domain validation')\n",
+                "func_metadata.py",
+                "exec",
+            ),
+            fastmcp,
+        )
+        domain = {
+            "__name__": "grabowski_tasks",
+            "call_fn_with_arg_validation": fastmcp["call_fn_with_arg_validation"],
+        }
+        exec(
+            compile(
+                "def grabowski_task_start():\n"
+                "    return call_fn_with_arg_validation()\n",
+                "grabowski_tasks.py",
+                "exec",
+            ),
+            domain,
+        )
+        wrappers = {
+            "__name__": "grabowski_operator",
+            "grabowski_task_start": domain["grabowski_task_start"],
+        }
+        exec(
+            compile(
+                "def gated_call_tool():\n"
+                "    return grabowski_task_start()\n",
+                "grabowski_operator.py",
+                "exec",
+            ),
+            wrappers,
+        )
+        try:
+            wrappers["gated_call_tool"]()
+        except Exception as error:
+            self.assertFalse(interceptor._fastmcp_argument_validation_rejection(error))
+            completion = interceptor.build_exception_completion(admission, error)
+        else:
+            self.fail("synthetic domain validation did not reject")
+        self.assertEqual(completion["completion_class"], "outcome_unknown")
+
     def test_enforced_pre_effect_settles_effect_not_applied(self) -> None:
         admission = interceptor.admit_mutation(
             tool_name="grabowski_git",

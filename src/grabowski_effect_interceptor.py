@@ -62,6 +62,13 @@ _PRE_EFFECT_GUARD_FRAMES = {
 _PRE_EFFECT_COMPLETION_CLASSES = frozenset(
     {"rejected_before_effect", "failed_before_effect"}
 )
+_FASTMCP_PRE_EFFECT_WRAPPER_FRAMES = frozenset(
+    {
+        ("grabowski_operator", "gated_call_tool"),
+        ("grabowski_operator", "_run_sync_tool_call"),
+        ("grabowski_operator", "_run_sync_tool_call_with_effect"),
+    }
+)
 
 
 def finish_fence_not_applied(
@@ -601,13 +608,16 @@ def _fastmcp_argument_validation_rejection(error: BaseException) -> bool:
                 )
             )
             trace = trace.tb_next
+        grabowski_frames = {
+            frame for frame in frames if frame[0].startswith("grabowski_")
+        }
         if (
             (
                 "mcp.server.fastmcp.utilities.func_metadata",
                 "call_fn_with_arg_validation",
             )
             in frames
-            and not any(module.startswith("grabowski_") for module, _ in frames)
+            and grabowski_frames <= _FASTMCP_PRE_EFFECT_WRAPPER_FRAMES
         ):
             return True
     return False
