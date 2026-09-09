@@ -3376,6 +3376,15 @@ class OperatorContractTests(unittest.TestCase):
                 check=True,
             )
             readme.write_text("after-long-tests\n", encoding="utf-8")
+            fsmonitor = root / "fake-fsmonitor"
+            fsmonitor.write_text(
+                '#!/bin/sh\ntouch "$0.ran"\nexit 1\n', encoding="utf-8"
+            )
+            fsmonitor.chmod(0o755)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "core.fsmonitor", str(fsmonitor)],
+                check=True,
+            )
             attempt = {
                 "schema_version": 1,
                 "owner_id": "operator:jit-add",
@@ -3401,6 +3410,8 @@ class OperatorContractTests(unittest.TestCase):
             )
             self.assertRegex(receipt["expected_preimage_sha256"], r"^[0-9a-f]{64}$")
             self.assertIn("--literal-pathspecs", result["argv"])
+            self.assertIn("core.fsmonitor=false", result["argv"])
+            self.assertFalse(Path(f"{fsmonitor}.ran").exists())
             staged = operator.subprocess.run(
                 ["git", "-C", str(repo), "diff", "--cached", "--", "README.md"],
                 stdout=operator.subprocess.PIPE,
@@ -3488,6 +3499,10 @@ class OperatorContractTests(unittest.TestCase):
                 ["git", "-C", str(repo), "config", "gpg.program", str(signer)],
                 check=True,
             )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "core.fsmonitor", str(signer)],
+                check=True,
+            )
             attempt = {
                 "schema_version": 1,
                 "owner_id": "operator:jit-commit",
@@ -3510,6 +3525,7 @@ class OperatorContractTests(unittest.TestCase):
                 result["branch_mutation"]["observed_preimage_sha256"],
             )
             self.assertIn("core.hooksPath=/dev/null", result["argv"])
+            self.assertIn("core.fsmonitor=false", result["argv"])
             self.assertIn("commit.gpgSign=false", result["argv"])
             self.assertFalse(Path(f"{signer}.ran").exists())
             committed_readme = operator.subprocess.run(

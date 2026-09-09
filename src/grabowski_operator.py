@@ -4821,7 +4821,7 @@ def _reject_push_configuration(repo: Path, remote: str) -> None:
 
 def _git_probe_bytes(repo: Path, arguments: list[str]) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
-        ["git", "-C", str(repo), *arguments],
+        ["git", "-c", "core.fsmonitor=false", "-C", str(repo), *arguments],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
@@ -6094,7 +6094,16 @@ def grabowski_git(
             }
             if subcommand == "add":
                 command = _validate_argv(
-                    [*command_prefix, "--literal-pathspecs", *arguments], cwd=path
+                    [
+                        "git",
+                        "-c",
+                        "core.fsmonitor=false",
+                        "-C",
+                        str(path),
+                        "--literal-pathspecs",
+                        *arguments,
+                    ],
+                    cwd=path,
                 )
             elif subcommand == "commit":
                 command = _validate_argv(
@@ -6102,6 +6111,8 @@ def grabowski_git(
                         "git",
                         "-c",
                         "core.hooksPath=/dev/null",
+                        "-c",
+                        "core.fsmonitor=false",
                         "-c",
                         "commit.gpgSign=false",
                         "-C",
