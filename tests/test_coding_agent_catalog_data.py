@@ -117,74 +117,32 @@ class CodingAgentCatalogDataTests(unittest.TestCase):
         self.assertEqual(routes["openhands-always-approve"]["harness"], "openhands")
         self.assertIn("--always-approve", routes["openhands-always-approve"]["argv_prefix"])
 
-    def test_ox_alpha_openrouter_preview_has_broad_but_scoped_authority(self) -> None:
+    def test_ox_alpha_openrouter_preview_is_retired_fail_closed(self) -> None:
         catalog, _ = router._load_catalog()
         routes = {item["id"]: item for item in catalog["routes"]}
         writer = routes["opencode-openrouter-ox-alpha-free-preview"]
         reviewer = routes["opencode-openrouter-ox-alpha-review-preview"]
-
-        self.assertEqual(writer["harness"], "opencode")
-        self.assertEqual(writer["model"], "ox-alpha")
-        self.assertIn("openrouter/stealth/ox-alpha", writer["argv_prefix"])
-        self.assertFalse(writer["contrast_only"])
-        self.assertTrue(writer["experimental_quality_floor_bypass"])
-        self.assertTrue(writer["enabled"])
-        self.assertEqual(writer["quota_pools"], ["openrouter-ox-alpha-preview"])
-        self.assertEqual(
-            set(writer["task_classes"]),
-            {
-                "mechanical", "triage", "docs", "tests", "bounded-patch",
-                "frontend", "refactor", "complex-patch", "deep-debug",
-                "architecture", "long-agent", "migration", "isolated-pr",
-            },
-        )
-        self.assertNotIn("local-private", writer["task_classes"])
-        expected_private_flags = {
-            "user_data", "secrets", "private-context", "customer-data", "credential",
-        }
-        self.assertEqual(set(writer["forbidden_risk_flags"]), expected_private_flags)
-        expected_safe_flags = {"public-context", "synthetic-context", "non-sensitive-context"}
-        self.assertEqual(set(writer["required_any_risk_flags"]), expected_safe_flags)
-
-        self.assertTrue(reviewer["review_only"])
-        self.assertTrue(reviewer["critical_eligible"])
-        self.assertFalse(reviewer.get("primary_review_authority", False))
-        self.assertTrue(reviewer["experimental_quality_floor_bypass"])
-        self.assertEqual(set(reviewer["forbidden_risk_flags"]), expected_private_flags)
-        self.assertEqual(set(reviewer["required_any_risk_flags"]), expected_safe_flags)
-        self.assertEqual(
-            catalog["policy"]["direct_work_policy"]["primary_review_route_exceptions"],
-            [],
-        )
-        self.assertIn("--agent", reviewer["argv_prefix"])
-        self.assertIn("plan", reviewer["argv_prefix"])
-        self.assertNotIn("--auto", reviewer["argv_prefix"])
-        self.assertEqual(
-            set(reviewer["task_classes"]),
-            {"independent-review", "critical-review", "security-review"},
-        )
-
         model = catalog["models"]["ox-alpha"]
-        self.assertEqual(model["provider_family"], "stealth")
-        self.assertEqual(model["quality_prior_class"], "C")
-        self.assertLessEqual(model["quality"]["reliability"], 5)
         pool = catalog["quota_pools"]["openrouter-ox-alpha-preview"]
-        self.assertEqual(pool["marginal_cost_usd"], 0)
-        self.assertEqual(pool["max_concurrency"], 1)
-        self.assertEqual(pool["freshness_seconds"], 7200)
-        self.assertFalse(pool["credits_allowed"])
+
+        self.assertFalse(writer["enabled"])
+        self.assertFalse(reviewer["enabled"])
+        self.assertIn("GLM-5.3-Flash", writer["disabled_reason"])
+        self.assertIn("z-ai/glm-5.3-flash:free", writer["disabled_reason"])
+        self.assertIn("openrouter/stealth/ox-alpha", writer["argv_prefix"])
+        self.assertEqual(model["provider_family"], "z-ai")
+        self.assertEqual(model["family"], "z-ai-glm-5.3-flash")
+        self.assertEqual(
+            model["availability"],
+            "retired-preview-revealed-as-glm-5.3-flash",
+        )
+        self.assertEqual(pool["cost_mode"], "retired-preview")
+        self.assertIsNone(pool["marginal_cost_usd"])
+        self.assertEqual(pool["max_concurrency"], 0)
         self.assertFalse(pool["payg_fallback_allowed"])
-        self.assertIn("unrelated metadata refreshes do not renew", pool["note"])
-        self.assertEqual(
-            pool["unknown_execution"],
-            "allowed-while-fresh-zero-cost-preview",
-        )
-        self.assertEqual(
-            catalog["quota_pools"]["openrouter-paid"]["max_concurrency"], 0
-        )
-        self.assertFalse(
-            catalog["quota_pools"]["openrouter-paid"]["payg_fallback_allowed"]
-        )
+        self.assertFalse(pool["credits_allowed"])
+        self.assertEqual(pool["unknown_execution"], "advisory-only")
+        self.assertNotIn("freshness_seconds", pool)
 
 
 if __name__ == "__main__":

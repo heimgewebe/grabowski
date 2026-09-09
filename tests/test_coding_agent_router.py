@@ -1594,290 +1594,106 @@ class CodingAgentRouterTests(unittest.TestCase):
             result["excluded"]["scoped-writer:codex-spark-low"][0],
         )
 
-    def test_ox_alpha_openrouter_preview_routes_are_broad_but_scoped(self) -> None:
+    def test_ox_alpha_preview_contract_is_retired_fail_closed(self) -> None:
         validation = router._validate_catalog(self.catalog)
         self.assertTrue(validation["valid"])
-        model = self.catalog["models"]["ox-alpha"]
+        routes = {item["id"]: item for item in self.catalog["routes"]}
+        writer = routes["opencode-openrouter-ox-alpha-free-preview"]
+        reviewer = routes["opencode-openrouter-ox-alpha-review-preview"]
         pool = self.catalog["quota_pools"]["openrouter-ox-alpha-preview"]
-        routes = {item["id"]: item for item in self.catalog["routes"]}
-        writer = routes["opencode-openrouter-ox-alpha-free-preview"]
-        reviewer = routes["opencode-openrouter-ox-alpha-review-preview"]
+        model = self.catalog["models"]["ox-alpha"]
 
-        writer_capabilities = router._route_capabilities(writer, self.catalog)
-        self.assertEqual(writer_capabilities["route_role"], "scoped-writer")
-        self.assertTrue(writer_capabilities["scoped_writer_capable"])
-        self.assertFalse(writer["contrast_only"])
-        self.assertTrue(writer["experimental_quality_floor_bypass"])
-        self.assertEqual(
-            set(writer["task_classes"]),
+        self.assertFalse(writer["enabled"])
+        self.assertFalse(reviewer["enabled"])
+        self.assertEqual(model["provider_family"], "z-ai")
+        self.assertEqual(model["family"], "z-ai-glm-5.3-flash")
+        self.assertEqual(pool["cost_mode"], "retired-preview")
+        self.assertIsNone(pool["marginal_cost_usd"])
+        self.assertEqual(pool["max_concurrency"], 0)
+        self.assertIn("paid z-ai/glm-5.3-flash", pool["blocked_reason"])
+        self.assertIn("z-ai/glm-5.3-flash:free", pool["blocked_reason"])
+
+    def test_retired_ox_alpha_routes_never_score_even_with_historical_live_state(self) -> None:
+        routes = {item["id"]: item for item in self.catalog["routes"]}
+        state = self._fresh_state()
+        state["catalog"]["providers"]["opencode"]["models"] = [
+            "openrouter/stealth/ox-alpha"
+        ]
+        state["catalog"]["providers"]["openrouter"] = {
+            "available": True,
+            "model_id": "stealth/ox-alpha",
+            "price_source": "public-models-api",
+            "zero_price_verified": True,
+        }
+        state["catalog"]["verified_quota_pools"] = [
+            "openrouter-ox-alpha-preview"
+        ]
+        for route_id, reviewer, task_class in (
+            ("opencode-openrouter-ox-alpha-free-preview", False, "architecture"),
+            ("opencode-openrouter-ox-alpha-review-preview", True, "security-review"),
+        ):
+            with self.subTest(route=route_id):
+                score, _, _, _, exclusion, execution = router._score_route(
+                    routes[route_id],
+                    task_class,
+                    self.catalog,
+                    state,
+                    changed_files=20,
+                    duration_minutes=180,
+                    novelty="high",
+                    risk_flags=["public-context"],
+                    latency_priority=False,
+                    reviewer=reviewer,
+                    previous_group="openai-controller" if reviewer else None,
+                    previous_provider="openai" if reviewer else None,
+                )
+                self.assertIsNone(score)
+                self.assertFalse(execution)
+                self.assertEqual(exclusion, ["disabled or controller route"])
+
+    def test_retired_ox_alpha_pool_rejects_pre_retirement_override_catalog(self) -> None:
+        legacy_catalog = json.loads(json.dumps(self.catalog))
+        legacy_pool = legacy_catalog["quota_pools"]["openrouter-ox-alpha-preview"]
+        legacy_pool.pop("blocked_reason", None)
+        legacy_pool.update(
             {
-                "mechanical", "triage", "docs", "tests", "bounded-patch",
-                "frontend", "refactor", "complex-patch", "deep-debug",
-                "architecture", "long-agent", "migration", "isolated-pr",
-            },
+                "cost_mode": "temporary-free-account",
+                "marginal_cost_usd": 0,
+                "max_concurrency": 1,
+                "payg_fallback_allowed": False,
+                "credits_allowed": False,
+                "freshness_seconds": 7200,
+                "unknown_execution": "allowed-while-fresh-zero-cost-preview",
+            }
         )
-        self.assertNotIn("local-private", writer["task_classes"])
-        expected_private_flags = {
-            "user_data", "secrets", "private-context", "customer-data", "credential",
+        state = self._fresh_state()
+        state["pools"]["openrouter-ox-alpha-preview"] = {
+            "status": "available",
+            "active_sessions": 0,
+            "verified_at": router._utc_now().isoformat(),
         }
-        self.assertEqual(set(writer["forbidden_risk_flags"]), expected_private_flags)
-        expected_safe_flags = {"public-context", "synthetic-context", "non-sensitive-context"}
-        self.assertEqual(set(writer["required_any_risk_flags"]), expected_safe_flags)
-
-        reviewer_capabilities = router._route_capabilities(reviewer, self.catalog)
-        self.assertEqual(reviewer_capabilities["route_role"], "reviewer")
-        self.assertTrue(reviewer_capabilities["review_capable"])
-        self.assertTrue(reviewer["review_only"])
-        self.assertTrue(reviewer["critical_eligible"])
-        self.assertFalse(reviewer.get("primary_review_authority", False))
-        self.assertTrue(reviewer["experimental_quality_floor_bypass"])
-        self.assertEqual(set(reviewer["forbidden_risk_flags"]), expected_private_flags)
-        self.assertEqual(set(reviewer["required_any_risk_flags"]), expected_safe_flags)
-        self.assertIn("--agent", reviewer["argv_prefix"])
-        self.assertIn("plan", reviewer["argv_prefix"])
-        self.assertNotIn("--auto", reviewer["argv_prefix"])
-        self.assertEqual(
-            set(reviewer["task_classes"]),
-            {"independent-review", "critical-review", "security-review"},
-        )
-
-        self.assertEqual(model["provider_family"], "stealth")
-        self.assertEqual(model["quality_prior_class"], "C")
-        self.assertLessEqual(model["quality"]["reliability"], 5)
-        self.assertEqual(pool["cost_mode"], "temporary-free-account")
-        self.assertEqual(pool["marginal_cost_usd"], 0)
-        self.assertEqual(pool["max_concurrency"], 1)
-        self.assertFalse(pool["payg_fallback_allowed"])
-        self.assertEqual(
-            pool["unknown_execution"],
-            "allowed-while-fresh-zero-cost-preview",
-        )
-        self.assertIn("pool-specific price proof", pool["note"] or "")
-
-    def test_ox_alpha_explicit_experimental_policy_bypasses_quality_floor_without_regrading(self) -> None:
-        routes = {item["id"]: item for item in self.catalog["routes"]}
-        state = self._fresh_state()
-        state["catalog"]["providers"]["opencode"] = {
-            "free_model_verified": True,
-            "models": [
-                "opencode/deepseek-v4-flash-free",
-                "openrouter/stealth/ox-alpha",
-            ],
-        }
-
-        writer = routes["opencode-openrouter-ox-alpha-free-preview"]
-        score, _, _, reasons, exclusion, execution = router._score_route(
-            writer,
-            "architecture",
-            self.catalog,
-            state,
-            changed_files=20,
-            duration_minutes=180,
-            novelty="high",
-            risk_flags=["synthetic-context"],
-            latency_priority=False,
-            reviewer=False,
-            previous_group=None,
-            previous_provider=None,
-        )
-        self.assertIsNotNone(score)
-        self.assertEqual(exclusion, [])
-        self.assertTrue(execution)
-        self.assertTrue(any("quality floor bypassed" in reason for reason in reasons))
-
-        reviewer = routes["opencode-openrouter-ox-alpha-review-preview"]
-        score, _, _, reasons, exclusion, execution = router._score_route(
-            reviewer,
-            "security-review",
-            self.catalog,
-            state,
-            changed_files=20,
-            duration_minutes=180,
-            novelty="high",
-            risk_flags=["public-context"],
-            latency_priority=False,
-            reviewer=True,
-            previous_group="openai-controller",
-            previous_provider="openai",
-        )
-        self.assertIsNotNone(score)
-        self.assertEqual(exclusion, [])
-        self.assertTrue(execution)
-        self.assertTrue(any("quality floor bypassed" in reason for reason in reasons))
-        self.assertEqual(self.catalog["models"]["ox-alpha"]["quality"]["review"], 3)
-
-        score, _, _, _, exclusion, execution = router._score_route(
-            reviewer,
-            "security-review",
-            self.catalog,
-            state,
-            changed_files=20,
-            duration_minutes=180,
-            novelty="high",
-            risk_flags=["security-sensitive"],
-            latency_priority=False,
-            reviewer=True,
-            previous_group="openai-controller",
-            previous_provider="openai",
-        )
-        self.assertIsNone(score)
-        self.assertFalse(execution)
-        self.assertEqual(
-            exclusion,
-            [
-                "route requires explicit safe-context risk flag: "
-                "non-sensitive-context, public-context, synthetic-context"
-            ],
-        )
-
-        score, _, _, _, exclusion, execution = router._score_route(
-            reviewer,
-            "security-review",
-            self.catalog,
-            state,
-            changed_files=20,
-            duration_minutes=180,
-            novelty="high",
-            risk_flags=["public-context", "private-context"],
-            latency_priority=False,
-            reviewer=True,
-            previous_group="openai-controller",
-            previous_provider="openai",
-        )
-        self.assertIsNone(score)
-        self.assertFalse(execution)
-        self.assertEqual(
-            exclusion,
-            ["route forbids sensitive risk flags: private-context"],
-        )
-
-        score, _, _, _, exclusion, execution = router._score_route(
-            writer,
-            "architecture",
-            self.catalog,
-            state,
-            changed_files=20,
-            duration_minutes=180,
-            novelty="high",
-            risk_flags=["synthetic-context", "user_data"],
-            latency_priority=False,
-            reviewer=False,
-            previous_group=None,
-            previous_provider=None,
-        )
-        self.assertIsNone(score)
-        self.assertFalse(execution)
-        self.assertEqual(exclusion, ["route forbids sensitive risk flags: user_data"])
-
-
-    def test_opencode_native_free_and_openrouter_ox_entitlements_are_independent(
-        self,
-    ) -> None:
-        routes = {item["id"]: item for item in self.catalog["routes"]}
-        native_route = routes["opencode-deepseek-v4-flash-free"]
-        ox_route = routes["opencode-openrouter-ox-alpha-free-preview"]
-        state = self._fresh_state()
-        opencode = state["catalog"]["providers"]["opencode"]
-
-        opencode["free_model_verified"] = False
-        available, reason = router._route_available(native_route, self.catalog, state)
-        self.assertFalse(available)
-        self.assertEqual(reason, "OpenCode free model entitlement is unverified")
-
-        # Ox Alpha uses its own OpenRouter preview pool. Native OpenCode-Free
-        # entitlement must not gate it when the exact authenticated model is
-        # present in the fresh OpenCode model probe.
-        available, reason = router._route_available(ox_route, self.catalog, state)
-        self.assertTrue(available)
-        self.assertEqual(reason, "live catalog route is available")
-
-        opencode["models"].remove("openrouter/stealth/ox-alpha")
-        available, reason = router._route_available(ox_route, self.catalog, state)
-        self.assertFalse(available)
-        self.assertEqual(reason, "OpenCode model is absent")
-
-    def test_openrouter_ox_alpha_preview_pool_requires_fresh_verification(
-        self,
-    ) -> None:
-        state = self._fresh_state()
-        state["pools"]["openrouter-ox-alpha-preview"]["verified_at"] = (
-            "2000-01-01T00:00:00Z"
-        )
         allowed, reasons, _, execution = router._pool_gate(
             "openrouter-ox-alpha-preview",
-            self.catalog,
+            legacy_catalog,
             state,
             critical=False,
         )
         self.assertFalse(allowed)
         self.assertFalse(execution)
-        self.assertIn("stale or future-dated", reasons[0])
+        self.assertEqual(reasons, ["retired Ox Alpha preview pool"])
 
-    def test_openrouter_generic_catalog_refresh_cannot_renew_price_proof(self) -> None:
-        state = self._fresh_state()
-        state["pools"]["openrouter-ox-alpha-preview"].pop("verified_at")
-        state["catalog"]["observed_at"] = datetime.now(timezone.utc).isoformat()
-        allowed, reasons, _, execution = router._pool_gate(
-            "openrouter-ox-alpha-preview",
-            self.catalog,
-            state,
-            critical=False,
-        )
-        self.assertFalse(allowed)
-        self.assertFalse(execution)
-        self.assertIn("stale or future-dated", reasons[0])
-
-    def test_openrouter_ox_alpha_requires_current_zero_price_probe(self) -> None:
-        state = self._fresh_state()
-        state["catalog"]["providers"]["openrouter"]["zero_price_verified"] = False
-        allowed, reasons, _, execution = router._pool_gate(
-            "openrouter-ox-alpha-preview",
-            self.catalog,
-            state,
-            critical=False,
-        )
-        self.assertFalse(allowed)
-        self.assertFalse(execution)
-        self.assertIn("zero-cost evidence is missing", reasons[0])
-
-    def test_openrouter_ox_alpha_requires_exact_model_identity(self) -> None:
-        state = self._fresh_state()
-        state["catalog"]["providers"]["openrouter"]["model_id"] = "stealth/not-ox-alpha"
-        allowed, reasons, _, execution = router._pool_gate(
-            "openrouter-ox-alpha-preview",
-            self.catalog,
-            state,
-            critical=False,
-        )
-        self.assertFalse(allowed)
-        self.assertFalse(execution)
-        self.assertIn("zero-cost evidence is missing", reasons[0])
-
-    def test_openrouter_ox_alpha_forbids_credits_fallback(self) -> None:
-        state = self._fresh_state()
-        self.catalog["quota_pools"]["openrouter-ox-alpha-preview"]["credits_allowed"] = True
-        allowed, reasons, _, execution = router._pool_gate(
-            "openrouter-ox-alpha-preview",
-            self.catalog,
-            state,
-            critical=False,
-        )
-        self.assertFalse(allowed)
-        self.assertFalse(execution)
-        self.assertEqual(reasons, ["credits fallback is not forbidden"])
-
-    def test_openrouter_ox_alpha_forbids_payg_fallback(self) -> None:
-        state = self._fresh_state()
-        self.catalog["quota_pools"]["openrouter-ox-alpha-preview"]["payg_fallback_allowed"] = True
-        allowed, reasons, _, execution = router._pool_gate(
-            "openrouter-ox-alpha-preview",
-            self.catalog,
-            state,
-            critical=False,
-        )
-        self.assertFalse(allowed)
-        self.assertFalse(execution)
-        self.assertEqual(reasons, ["PAYG fallback is not forbidden"])
+    def test_no_enabled_route_substitutes_paid_or_unverified_glm_flash(self) -> None:
+        enabled = [
+            route for route in self.catalog["routes"]
+            if route.get("enabled") is True
+        ]
+        argv = [
+            str(arg)
+            for route in enabled
+            for arg in route.get("argv_prefix", [])
+        ]
+        self.assertNotIn("openrouter/z-ai/glm-5.3-flash", argv)
+        self.assertNotIn("openrouter/z-ai/glm-5.3-flash:free", argv)
 
     def test_controller_owned_work_has_no_scoped_writer(self) -> None:
         result = self._route("deployment")
