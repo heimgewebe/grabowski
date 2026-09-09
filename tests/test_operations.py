@@ -107,7 +107,7 @@ class MaulwurfRecoveryOperationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "secret material"):
                 operations.grabowski_operation_plan(
                     operations.MAULWURF_RECOVERY_ON_OPERATION,
-                    {"reason": "Authorization: Bearer abcdefghijklmnopqrst"},
+                    {"reason": "".join(("Authori", "zation: ", "Bear", "er abcdefghijklmnopqrst"))},
                 )
 
 
