@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -139,15 +139,24 @@ class JunoIpadAgentBootstrapTests(unittest.TestCase):
             self.assertEqual(bootstrap.main(), 2)
         run_agent.assert_not_called()
 
-    def test_run_agent_uses_sibling_and_restores_argv(self) -> None:
+    def test_run_agent_uses_sibling_main_and_restores_argv(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             agent = Path(directory) / "juno_ipad_agent.py"
             agent.write_text("pass\n", encoding="utf-8")
             original = sys.argv[:]
-            with patch.object(bootstrap.runpy, "run_path") as run_path:
+            agent_main = Mock(return_value=0)
+            with patch.object(
+                bootstrap.runpy,
+                "run_path",
+                return_value={"main": agent_main},
+            ) as run_path:
                 bootstrap._run_agent(agent)
             self.assertEqual(sys.argv, original)
-            run_path.assert_called_once_with(str(agent), run_name="__main__")
+            run_path.assert_called_once_with(
+                str(agent),
+                run_name="grabowski_juno_ipad_agent_recovery_target",
+            )
+            agent_main.assert_called_once_with()
 
 
 if __name__ == "__main__":

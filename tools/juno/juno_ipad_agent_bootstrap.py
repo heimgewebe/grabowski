@@ -2,8 +2,8 @@
 """Duplicate-safe local bootstrap for the Grabowski Juno iPad Agent.
 
 This file is intended as the target of a Juno/Shortcuts "Run Python File"
-action.  It starts the sibling agent only when the canonical local health
-endpoint is definitely absent.  Ambiguous health failures fail closed so a
+action. It starts the sibling agent only when the canonical local health
+endpoint is definitely absent. Ambiguous health failures fail closed so a
 second server is never started on top of a possibly wedged first instance.
 """
 
@@ -42,7 +42,7 @@ def _probe_once() -> tuple[ProbeState, str]:
         )
         response = connection.getresponse()
         payload = response.read(MAX_HEALTH_BYTES + 1)
-    except (ConnectionRefusedError,):
+    except ConnectionRefusedError:
         return "absent", "connection refused"
     except (TimeoutError, socket.timeout):
         return "ambiguous", "health request timed out"
@@ -88,7 +88,16 @@ def _run_agent(agent_path: Path | None = None) -> None:
     previous_argv = sys.argv[:]
     try:
         sys.argv = [str(path)]
-        runpy.run_path(str(path), run_name="__main__")
+        namespace = runpy.run_path(
+            str(path),
+            run_name="grabowski_juno_ipad_agent_recovery_target",
+        )
+        agent_main = namespace.get("main")
+        if not callable(agent_main):
+            raise RuntimeError("Juno agent sibling does not expose main()")
+        result = agent_main()
+        if result not in (None, 0):
+            raise RuntimeError(f"Juno agent exited with status {result}")
     finally:
         sys.argv = previous_argv
 
