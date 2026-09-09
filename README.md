@@ -77,14 +77,23 @@ make context-refresh
 make context-check
 ```
 
-Die laufende Instanz liefert mit `grabowski_context` bei jedem Aufruf den
-aktuellen Runtime-, Policy- und Checkout-Zustand. `make validate` schlägt fehl,
-wenn der generierte Kontext veraltet ist oder Toolvertrag, Deklarationen und
-Risikoprofile auseinanderlaufen.
+Für die erste Orientierung genügen `grabowski_runtime_health()` und
+`grabowski_contract_drift()`. Wenn die Aufgabe den kombinierten Runtime-,
+Policy- und Checkout-Zustand benötigt, liefert `grabowski_context` ihn live:
+
+```text
+grabowski_context(profile="repository-work")
+```
+
+Gültige Kontextprofile sind `concise` (Standard), `repository-work`,
+`host-operations` und `full`. Sie bestimmen die Kontextansicht.
+
+`make validate` schlägt fehl, wenn der generierte Kontext veraltet ist oder
+Toolvertrag, Deklarationen und Risikoprofile auseinanderlaufen.
 
 ## Typisierte Lesespur
 
-Fuer Status-, Git-, GitHub- und Service-Diagnostik stehen eng begrenzte Read-Werkzeuge bereit. Generische Operatorwerkzeuge bleiben als Fallback erhalten, sollen aber nicht fuer gewoehnliche Leseaufgaben verwendet werden. Die Profile `core`, `operator` und `full` werden aus einem kanonischen Vertrag abgeleitet; `core` schliesst breite Dateisystem-, tmux-, Prozess- und Worker-Oberflaechen aus. Ein zweiter Connector wird erst nach einem Canary-Vergleich erwogen. Fuer Dienstneustarts steht ein verzoegerter, commitgebundener Self-Deploy-Job bereit. Details: [`docs/typed-read-surface.md`](docs/typed-read-surface.md).
+Fuer Status-, Git-, GitHub- und Service-Diagnostik stehen eng begrenzte Read-Werkzeuge bereit. Generische Operatorwerkzeuge bleiben als Fallback erhalten, sollen aber nicht fuer gewoehnliche Leseaufgaben verwendet werden. Die Veröffentlichungsprofile `core`, `operator` und `full` bestimmen die publizierte Toolauswahl und werden aus einem kanonischen Vertrag abgeleitet; `core` schliesst breite Dateisystem-, tmux-, Prozess- und Worker-Oberflaechen aus. `core` und `operator` sind keine gültigen Werte für `grabowski_context(profile=...)`. Ein zweiter Connector wird erst nach einem Canary-Vergleich erwogen. Fuer Dienstneustarts steht ein verzoegerter, commitgebundener Self-Deploy-Job bereit. Details: [`docs/typed-read-surface.md`](docs/typed-read-surface.md).
 
 ## Validierung
 
