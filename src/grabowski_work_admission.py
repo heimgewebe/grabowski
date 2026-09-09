@@ -57,7 +57,6 @@ CONVERGENCE_STATES = frozenset(
         "archived_blocked",
         "archived_grace",
         "archived_retained",
-        "archived_not_remote_secured",
         "managed_active_attention",
         "managed_lifecycle_drift",
         "archive_drifted",
@@ -472,7 +471,6 @@ def _inert_checkout_for_admission(item: dict[str, Any], *, state: str) -> bool:
     if state in {
         "archived_grace",
         "archived_retained",
-        "archived_not_remote_secured",
     }:
         return archive_open
 

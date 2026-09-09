@@ -1162,9 +1162,7 @@ def _add_checkouts(
                 # Dirty remains visible as hygiene; it never authorizes cleanup.
                 _hygiene(group, "dirty-checkout-visible")
         elif item["cleanup_candidate"]:
-            if item.get("remote_secured") is not True:
-                _hygiene(group, "cleanup-candidate-not-remote-secured")
-            elif item["coordination_blocking"] or item["processes"] or item["retention_active"]:
+            if item["coordination_blocking"] or item["processes"] or item["retention_active"]:
                 _blocking(group, "cleanup-candidate-coordination-blocked")
             else:
                 _hygiene(group, "cleanup-candidate-ready")

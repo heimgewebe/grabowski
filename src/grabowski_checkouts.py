@@ -2436,13 +2436,6 @@ def _checkout_lifecycle_decision(
             hygiene_mark = "archived"
             next_step = "wait_for_archive_grace_before_cleanup_dry_run"
             reasons.append("archived checkout is still inside the recovery grace period")
-        elif not remote_is_secured:
-            state = "archived_not_remote_secured"
-            hygiene_mark = "archived"
-            next_step = "secure_checkout_head_on_remote_before_cleanup_dry_run"
-            reasons.append(
-                "clean managed archive exists but head is not present on local remote-tracking refs"
-            )
         else:
             state = "cleanup_candidate"
             hygiene_mark = "obsolete"
@@ -2450,7 +2443,7 @@ def _checkout_lifecycle_decision(
             requires_cleanup_dry_run = True
             next_step = "run_checkout_cleanup_dry_run_before_apply"
             reasons.append(
-                "terminal clean remote-secured checkout is lease/process/retention-free with mature archive"
+                "terminal clean checkout has an exact recovery archive and is lease/process/retention-free"
             )
     elif archive_present and not archive_open:
         state = "archive_closed"
@@ -2477,13 +2470,6 @@ def _checkout_lifecycle_decision(
         hygiene_mark = "archived"
         next_step = "wait_for_archive_grace_before_cleanup_dry_run"
         reasons.append("archived checkout is still inside the recovery grace period")
-    elif archive_present and not remote_is_secured:
-        state = "archived_not_remote_secured"
-        hygiene_mark = "archived"
-        next_step = "secure_checkout_head_on_remote_before_cleanup_dry_run"
-        reasons.append(
-            "clean archive exists but head is not present on local remote-tracking refs"
-        )
     elif archive_present:
         state = "cleanup_candidate"
         hygiene_mark = "obsolete"
@@ -2491,7 +2477,7 @@ def _checkout_lifecycle_decision(
         requires_cleanup_dry_run = True
         next_step = "run_checkout_cleanup_dry_run_before_apply"
         reasons.append(
-            "terminal clean remote-secured checkout is lease/process/retention-free with mature archive"
+            "terminal clean checkout has an exact recovery archive and is lease/process/retention-free"
         )
     elif retention_is_active:
         state = "retained"
@@ -2517,7 +2503,6 @@ def _checkout_lifecycle_decision(
         or blocking
         or retention_is_active
         or process_count > 0
-        or not remote_is_secured
     ):
         cleanup_candidate = False
         requires_cleanup_dry_run = False
@@ -4233,7 +4218,9 @@ def _cleanup_plan(
         include_tasks=True,
         include_resources=True,
     )
-    remote = _remote_secured_observation(record, verify_github_pull_ref=True)
+    # Cleanup safety comes from the exact verified recovery archive. Remote
+    # reachability remains diagnostic only and must not trigger network fallback.
+    remote = _remote_secured_observation(record, verify_github_pull_ref=False)
     remote_secured = bool(remote.get("remote_secured"))
     dirty = status.get("dirty") is not False
     command = ["git", "-C", str(top_level), "worktree", "remove", str(checkout)]
@@ -4265,7 +4252,6 @@ def _cleanup_plan(
                 ("archive_grace_not_elapsed", not archive_grace_elapsed),
                 ("active_coordination", coordination["blocking"]),
                 ("dirty_checkout", dirty),
-                ("head_not_remote_secured", not remote_secured),
             )
             if blocked
         ],
@@ -4278,7 +4264,6 @@ def _cleanup_plan(
             and archive_grace_elapsed
             and not coordination["blocking"]
             and not dirty
-            and remote_secured
         ),
         "rollback": {
             "available": True,
