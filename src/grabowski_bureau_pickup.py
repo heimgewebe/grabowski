@@ -5670,7 +5670,13 @@ def _validate_lease_repair_activity_status(
             "existing-assignment-lease-repair-heartbeat-run-drift",
             details={"mismatches": identity_mismatches},
         )
-    _require_active_execution_binding(readback, action=action)
+    # A replay may tolerate stale freshness after exact repair identity is proven.
+    # The heartbeat mutation itself must still read back a fresh canonical run.
+    if (
+        action != "resume-existing-assignment-after-lease-repair"
+        or _classify_execution_binding(run)["classification"] != "stale"
+    ):
+        _require_active_execution_binding(readback, action=action)
     return readback
 
 
