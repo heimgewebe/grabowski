@@ -1421,6 +1421,14 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertEqual(group["projection_state"], "terminal_archived")
         self.assertTrue(group["action_required"])
         self.assertIn("attention-actionable", group["action_reasons"])
+        self.assertEqual(
+            group["next_convergence_action"],
+            "review actionable attention without blocking independent work",
+        )
+        self.assertEqual(
+            result["next_convergence_action"],
+            "review actionable attention without blocking independent work",
+        )
 
     def test_active_task_actionable_attention_stays_active(self) -> None:
         task_id = "actionable-active"

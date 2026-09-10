@@ -1808,6 +1808,20 @@ def derive_group_convergence_recommendation(group: dict[str, Any]) -> dict[str, 
             "priority": 5,
         }
 
+    if (
+        projection_state == "terminal_archived"
+        and "attention-actionable" in action_reasons
+        and not has_live_surfaces
+    ):
+        return {
+            "convergence_stage": "terminal_archived",
+            "next_convergence_action": (
+                "review actionable attention without blocking independent work"
+            ),
+            "finishable_chain": False,
+            "priority": 5,
+        }
+
     # Fallbacks for active/blocking/resumable states
     if projection_state == "blocking":
         reason_str = ", ".join(sorted(action_reasons)[:2]) or "unresolved evidence"
