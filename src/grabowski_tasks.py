@@ -7342,9 +7342,7 @@ def _recovery_local_task_host_names() -> tuple[str, ...]:
         sorted(
             name
             for name, candidate in registered["hosts"].items()
-            if candidate["enabled"]
-            and candidate["transport"] == "local"
-            and candidate["target"] == "local"
+            if candidate["enabled"] and candidate["transport"] == "local"
         )
     )
     if not local_hosts:

@@ -7201,7 +7201,7 @@ class TaskTests(unittest.TestCase):
 
         fleet_registry = {
             "hosts": {
-                "wg-prod-1": {"enabled": True, "transport": "local", "target": "local"},
+                "wg-prod-1": {"enabled": True, "transport": "local", "target": "localhost"},
                 "heim-pc": {"enabled": True, "transport": "ssh", "target": "alex@heim-pc"},
             }
         }
