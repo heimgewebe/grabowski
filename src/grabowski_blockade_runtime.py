@@ -60,7 +60,9 @@ def _scope_action(record: policy.BlockadeRecord, **values: Any) -> policy.Action
 
 def _matching_engage_audit(
     snapshot: store.MarkerSnapshot,
-) -> dict[str, Any]:
+    *,
+    allow_missing: bool = False,
+) -> dict[str, Any] | None:
     for item in reversed(base._audit_records()):
         if item.get("path") != str(base.KILL_SWITCH_PATH):
             continue
@@ -68,6 +70,7 @@ def _matching_engage_audit(
             item.get("operation") in {
                 "operator-blockade-engage",
                 "operator-blockade-migration-complete",
+                "operator-blockade-adoption-complete",
             }
             and item.get("blockade_id") == snapshot.record.blockade_id
             and item.get("blockade_record_sha256") == snapshot.record_sha256
@@ -77,6 +80,8 @@ def _matching_engage_audit(
         raise PermissionError(
             "latest canonical marker audit record is not the matching typed engagement"
         )
+    if allow_missing:
+        return None
     raise PermissionError(
         "typed blockade marker has no matching engagement audit record"
     )
@@ -542,7 +547,6 @@ def grabowski_operator_blockade_disarm(
         raise PermissionError("record SHA-256 precondition failed")
     if snapshot.file_sha256 != expected_marker_file_sha256:
         raise PermissionError("marker file SHA-256 precondition failed")
-    engage_audit = _matching_engage_audit(snapshot)
     state = base._kill_switch_state()
     recovery_status, deployment_valid, canonical_fresh, broker_ready = (
         _recovery_evidence()
@@ -574,6 +578,40 @@ def grabowski_operator_blockade_disarm(
     decision = policy.evaluate_blockades(records, action)
     if not decision.allowed:
         raise PermissionError("blockade disarm denied: " + ",".join(decision.reasons))
+
+    engage_audit = _matching_engage_audit(snapshot, allow_missing=True)
+    if engage_audit is None:
+        adoption_id = uuid.uuid4().hex
+        _append_verified_audit(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "operation": "operator-blockade-adoption-complete",
+                "transaction_id": adoption_id,
+                "path": str(base.KILL_SWITCH_PATH),
+                "before_sha256": snapshot.file_sha256,
+                "after_sha256": snapshot.file_sha256,
+                "blockade_id": snapshot.record.blockade_id,
+                "blockade_record_sha256": snapshot.record_sha256,
+                "adoption_source": "pre-audit-root-marker",
+                "recovery_status_sha256": hashlib.sha256(
+                    policy.canonical_json(recovery_status)
+                ).hexdigest(),
+                "deployment_provenance_valid": deployment_valid,
+                "canonical_recovery_fresh": canonical_fresh,
+                "root_broker_ready": broker_ready,
+            }
+        )
+        adopted = _exact_marker_readback(
+            record_sha256=snapshot.record_sha256,
+            marker_file_sha256=snapshot.file_sha256,
+        )
+        if adopted is None:
+            raise RuntimeError("adopted blockade marker disappeared before disarm")
+        snapshot = adopted
+        engage_audit = _matching_engage_audit(snapshot)
+        if engage_audit is None:
+            raise RuntimeError("adopted blockade audit readback is missing")
+
     transaction_id = uuid.uuid4().hex
     broker = _lifecycle_call(
         {

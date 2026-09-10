@@ -570,6 +570,150 @@ class BlockadeRuntimeTests(unittest.TestCase):
         self.assertEqual(result["receipt"]["record_sha256"], snapshot.record_sha256)
         self.assertEqual(result["broker"]["outcome"], "unknown")
 
+    def test_pre_audit_root_marker_is_adopted_only_after_disarm_gate_passes(self) -> None:
+        record = runtime.policy.BlockadeRecord(
+            blockade_id="pre-audit-root-marker",
+            posture="hard_stop",
+            scope=runtime.policy.Scope("global", "*"),
+            reason="Pre-audit root marker compatibility proof.",
+            trigger_class="audit_provenance_unknown",
+            engaged_at=datetime.now(timezone.utc),
+            evidence_refs=("test:pre-audit-root-marker",),
+            provenance=runtime.policy.Provenance(
+                tool="pre-audit-test",
+                request_id="pre-audit-request",
+                session_id="pre-audit-session",
+                task_id="pre-audit-task",
+                owner_id="pre-audit-owner",
+            ),
+        )
+        store.engage_blockade_marker(
+            record,
+            self.marker,
+            expected_marker_path=self.marker,
+            transaction_id="historical-pre-audit-engage",
+        )
+        snapshot = self.snapshot()
+        self.assertEqual(base._audit_records(), [])
+        real_broker = self.broker_lifecycle
+
+        def require_adoption_before_disarm(payload, *, justification):
+            if payload["operation"] == "disarm":
+                self.assertTrue(self.marker.is_file())
+                audit_records = base._audit_records()
+                self.assertEqual(
+                    [item["operation"] for item in audit_records],
+                    ["operator-blockade-adoption-complete"],
+                )
+                self.assertEqual(
+                    audit_records[0]["before_sha256"], snapshot.file_sha256
+                )
+                self.assertEqual(
+                    audit_records[0]["after_sha256"], snapshot.file_sha256
+                )
+            return real_broker(payload, justification=justification)
+
+        with mock.patch.object(
+            runtime.privileged,
+            "run_blockade_lifecycle_reference",
+            side_effect=require_adoption_before_disarm,
+        ):
+            result = self.disarm(snapshot)
+
+        self.assertFalse(self.marker.exists())
+        self.assertEqual(result["receipt"]["record_sha256"], snapshot.record_sha256)
+        audit_records = base._audit_records()
+        self.assertEqual(
+            [item["operation"] for item in audit_records],
+            ["operator-blockade-adoption-complete", "operator-blockade-disarm"],
+        )
+        self.assertEqual(
+            audit_records[-1]["engage_audit_record_sha256"],
+            audit_records[0]["record_sha256"],
+        )
+
+    def test_pre_audit_marker_is_not_adopted_when_recovery_gate_fails(self) -> None:
+        record = runtime.policy.BlockadeRecord(
+            blockade_id="pre-audit-unsafe-recovery",
+            posture="hard_stop",
+            scope=runtime.policy.Scope("global", "*"),
+            reason="Unsafe recovery must remain blocked.",
+            trigger_class="audit_provenance_unknown",
+            engaged_at=datetime.now(timezone.utc),
+            evidence_refs=("test:pre-audit-unsafe-recovery",),
+            provenance=runtime.policy.Provenance(
+                tool="pre-audit-test",
+                request_id="pre-audit-request",
+                session_id="pre-audit-session",
+                task_id="pre-audit-task",
+                owner_id="pre-audit-owner",
+            ),
+        )
+        store.engage_blockade_marker(
+            record,
+            self.marker,
+            expected_marker_path=self.marker,
+            transaction_id="historical-pre-audit-unsafe",
+        )
+        snapshot = self.snapshot()
+        unsafe = self.recovery_status()
+        unsafe["checks"]["local_backup_fresh"] = False
+        with mock.patch.object(runtime.recovery, "recovery_status", return_value=unsafe):
+            with self.assertRaises(PermissionError):
+                self.disarm(snapshot)
+
+        self.assertTrue(self.marker.is_file())
+        self.assertEqual(base._audit_records(), [])
+
+    def test_pre_audit_marker_does_not_override_conflicting_canonical_audit(self) -> None:
+        record = runtime.policy.BlockadeRecord(
+            blockade_id="pre-audit-conflicting-audit",
+            posture="hard_stop",
+            scope=runtime.policy.Scope("global", "*"),
+            reason="Conflicting canonical audit must fail closed.",
+            trigger_class="audit_provenance_unknown",
+            engaged_at=datetime.now(timezone.utc),
+            evidence_refs=("test:pre-audit-conflict",),
+            provenance=runtime.policy.Provenance(
+                tool="pre-audit-test",
+                request_id="pre-audit-request",
+                session_id="pre-audit-session",
+                task_id="pre-audit-task",
+                owner_id="pre-audit-owner",
+            ),
+        )
+        store.engage_blockade_marker(
+            record,
+            self.marker,
+            expected_marker_path=self.marker,
+            transaction_id="historical-pre-audit-conflict",
+        )
+        snapshot = self.snapshot()
+        runtime._append_verified_audit(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "operation": "operator-blockade-engage",
+                "transaction_id": "different-marker-audit",
+                "path": str(self.marker),
+                "before_sha256": None,
+                "after_sha256": "0" * 64,
+                "blockade_id": "different-blockade",
+                "blockade_record_sha256": "1" * 64,
+            }
+        )
+
+        with self.assertRaisesRegex(
+            PermissionError,
+            "latest canonical marker audit record is not the matching typed engagement",
+        ):
+            self.disarm(snapshot)
+
+        self.assertTrue(self.marker.is_file())
+        self.assertEqual(
+            [item["operation"] for item in base._audit_records()],
+            ["operator-blockade-engage"],
+        )
+
     def test_disarm_is_hash_bound_and_audit_verified(self) -> None:
         self.engage()
         snapshot = self.snapshot()
