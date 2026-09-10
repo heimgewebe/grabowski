@@ -16,6 +16,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import grabowski_coding_agent_router as router  # noqa: E402
+import grabowski_current_work as current_work  # noqa: E402
 
 
 class CodingAgentRouterTests(unittest.TestCase):
@@ -48,8 +49,30 @@ class CodingAgentRouterTests(unittest.TestCase):
             clear=False,
         )
         self.environment.start()
+        self.physical_occupancy = mock.patch.object(
+            router,
+            "_physical_pool_occupancy",
+            return_value={
+                "status": "current",
+                "tracked_provider_pools": sorted(
+                    current_work.PHYSICAL_CODING_AGENT_PROVIDER_POOLS
+                ),
+                "provider_pool_sessions": {},
+                "provider_pool_lifecycle_sessions": {},
+                "lifecycle_counts": {
+                    "active": 0,
+                    "protected": 0,
+                    "unbound": 0,
+                    "infrastructure": 0,
+                },
+                "strong_identity_count": 0,
+                "identity_partial_count": 0,
+            },
+        )
+        self.physical_occupancy.start()
 
     def tearDown(self) -> None:
+        self.physical_occupancy.stop()
         self.environment.stop()
         self.temporary.cleanup()
 
@@ -1065,6 +1088,86 @@ class CodingAgentRouterTests(unittest.TestCase):
         openrouter = router._pool_gate("openrouter-paid", self.catalog, self.state, critical=True)
         self.assertFalse(cline[0])
         self.assertFalse(openrouter[0])
+
+    def test_physical_pool_occupancy_uses_live_process_inventory_parser(self) -> None:
+        self.physical_occupancy.stop()
+        try:
+            with mock.patch.object(
+                router.operator,
+                "_current_user_process_payload",
+                return_value={
+                    "returncode": 0,
+                    "observed_at_unix": 123,
+                    "lines": [
+                        "100 1 S 1000 tmux: server /usr/bin/tmux new-session -d -s cockpit-work-1",
+                        "150 100 S 900 bash /bin/bash",
+                        "200 150 S 800 codex codex --model gpt-5.6-sol",
+                    ],
+                    "identities": [],
+                },
+            ):
+                occupancy = router._physical_pool_occupancy()
+        finally:
+            self.physical_occupancy.start()
+        self.assertEqual(occupancy["status"], "current")
+        self.assertEqual(occupancy["observed_at_unix"], 123)
+        self.assertEqual(occupancy["lifecycle_counts"]["protected"], 1)
+        self.assertEqual(occupancy["provider_pool_sessions"]["openai-agentic"], 1)
+
+    def test_protected_physical_agent_consumes_provider_concurrency(self) -> None:
+        state = self._fresh_state()
+        state["pools"]["claude-pro"] = {"active_sessions": 0}
+        state["_physical_pool_occupancy"] = {
+            "status": "current",
+            "tracked_provider_pools": sorted(
+                current_work.PHYSICAL_CODING_AGENT_PROVIDER_POOLS
+            ),
+            "provider_pool_sessions": {"claude-pro": 1},
+            "provider_pool_lifecycle_sessions": {
+                "claude-pro": {"active": 0, "protected": 1, "unbound": 0}
+            },
+        }
+        effective = router._effective_pool("claude-pro", self.catalog, state)
+        self.assertEqual(effective["state_active_sessions"], 0)
+        self.assertEqual(effective["observed_physical_sessions"], 1)
+        self.assertEqual(effective["active_sessions"], 1)
+        allowed, reasons, _, execution = router._pool_gate(
+            "claude-pro", self.catalog, state, critical=False
+        )
+        self.assertFalse(allowed)
+        self.assertFalse(execution)
+        self.assertIn("pool concurrency is saturated", reasons)
+
+    def test_physical_occupancy_failure_fails_external_pool_closed(self) -> None:
+        state = self._fresh_state()
+        state["_physical_pool_occupancy"] = {
+            "status": "unavailable",
+            "tracked_provider_pools": sorted(
+                current_work.PHYSICAL_CODING_AGENT_PROVIDER_POOLS
+            ),
+            "error_type": "RuntimeError",
+        }
+        allowed, reasons, _, execution = router._pool_gate(
+            "claude-pro", self.catalog, state, critical=False
+        )
+        self.assertFalse(allowed)
+        self.assertFalse(execution)
+        self.assertIn("physical coding-agent occupancy is unavailable", reasons[0])
+
+    def test_physical_occupancy_failure_does_not_block_untracked_remote_pool(self) -> None:
+        state = self._fresh_state()
+        state["pools"]["jules-account"] = {"active_sessions": 1}
+        state["_physical_pool_occupancy"] = {
+            "status": "unavailable",
+            "tracked_provider_pools": sorted(
+                current_work.PHYSICAL_CODING_AGENT_PROVIDER_POOLS
+            ),
+            "error_type": "RuntimeError",
+        }
+        effective = router._effective_pool("jules-account", self.catalog, state)
+        self.assertNotIn("_state_error", effective)
+        self.assertEqual(effective["active_sessions"], 1)
+        self.assertEqual(effective["active_sessions_source"], "advisory-state-only")
 
     def test_parent_quota_pool_is_enforced_even_when_route_omits_it(self) -> None:
         catalog = json.loads(json.dumps(self.catalog))

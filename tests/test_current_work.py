@@ -373,6 +373,103 @@ class CurrentWorkProjectionTests(unittest.TestCase):
             self.assertEqual(group["projection_state"], "hygiene")
             self.assertEqual(group["work_class"], "hygiene")
 
+    def test_coding_agent_parent_chain_protects_foreign_tmux_work_and_counts_pool(self) -> None:
+        identity_material = {
+            "boot_id": "11111111-2222-3333-4444-555555555555",
+            "executable": "claude",
+            "pid": 200,
+            "ppid": 150,
+            "start_ticks": 987654,
+        }
+        identity_sha256 = current_work._digest(identity_material)
+        result = project(
+            process_payload={
+                "returncode": 0,
+                "lines": [
+                    "100 1 S 1000 tmux: server /usr/local/bin/tmux new-session -d -s cockpit-work-1",
+                    "150 100 S 900 bash /bin/bash",
+                    "200 150 S 800 claude claude --model sonnet --secret hidden",
+                ],
+                "identities": [
+                    {**identity_material, "identity_sha256": identity_sha256}
+                ],
+            }
+        )
+        lifecycle = result["coding_agent_process_lifecycle"]
+        self.assertEqual(lifecycle["counts"]["protected"], 1)
+        self.assertEqual(lifecycle["counts"]["unbound"], 0)
+        self.assertEqual(lifecycle["provider_pool_sessions"]["claude-pro"], 1)
+        self.assertEqual(
+            lifecycle["provider_pool_lifecycle_sessions"]["claude-pro"]["protected"],
+            1,
+        )
+        protected = next(
+            group
+            for group in result["work"]
+            if group["work_id"].startswith("physical-process-protected:")
+        )
+        self.assertEqual(protected["projection_state"], "active")
+        self.assertFalse(protected["action_required"])
+        process = protected["physical_refs"]["processes"][0]
+        self.assertEqual(process["identity_status"], "strong")
+        self.assertEqual(process["process_identity_sha256"], identity_sha256)
+        self.assertNotIn("hidden", str(result))
+
+    def test_coding_agent_inherits_workspace_binding_from_parent_process(self) -> None:
+        workspace = "gaw-parent-bound"
+        result = project(
+            resources_payload={
+                "leases": [
+                    lease(
+                        f"agent-workspace:{workspace}",
+                        f"workspace:{workspace}",
+                    )
+                ],
+                "count": 1,
+                "truncated": False,
+            },
+            process_payload={
+                "returncode": 0,
+                "lines": [
+                    "150 1 S 90 python3 -m grabowski_agent_workspace pane "
+                    f"{workspace} writer",
+                    "200 150 S 80 claude claude --model sonnet",
+                ],
+            },
+        )
+        group = next(
+            item for item in result["work"] if item["work_id"] == f"workspace:{workspace}"
+        )
+        self.assertEqual(group["projection_state"], "active")
+        self.assertEqual(
+            group["physical_refs"]["processes"][0]["workspace_id"], workspace
+        )
+        self.assertEqual(
+            result["coding_agent_process_lifecycle"]["counts"]["active"], 1
+        )
+        self.assertEqual(result["unbound_physical"]["process_total_unbound"], 0)
+
+    def test_tunnel_child_codex_app_server_is_protected_infrastructure_not_pool_use(self) -> None:
+        result = project(
+            process_payload={
+                "returncode": 0,
+                "lines": [
+                    "300 1 S 100 tunnel-client /home/alex/.local/bin/tunnel-client run --profile grabowski",
+                    "301 300 S 90 codex codex app-server",
+                ],
+            }
+        )
+        lifecycle = result["coding_agent_process_lifecycle"]
+        self.assertEqual(lifecycle["counts"]["infrastructure"], 1)
+        self.assertEqual(lifecycle["provider_pool_sessions"], {})
+        self.assertEqual(result["unbound_physical"]["process_total_unbound"], 0)
+        self.assertFalse(
+            any(
+                group["work_id"].startswith("physical-process")
+                for group in result["work"]
+            )
+        )
+
     def test_dirty_unbound_checkout_is_hygiene_not_coordination_blocking(self) -> None:
         result = project(
             checkout_payloads=[
