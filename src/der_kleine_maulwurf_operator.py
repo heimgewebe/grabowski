@@ -2689,7 +2689,7 @@ def active_recovery_detached_effects() -> list[str]:
         raise RuntimeError("recovery_detached_unit_state_unavailable") from exc
     if result.returncode != 0:
         raise RuntimeError("recovery_detached_unit_state_unavailable")
-    effects: list[str] = list(tasks.recovery_active_task_effects())
+    effects: list[str] = list(tasks.recovery_active_task_effects(local_only=True))
     for line in result.stdout.splitlines():
         unit = line.strip().split(maxsplit=1)[0] if line.strip() else ""
         if unit:
