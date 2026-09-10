@@ -20,6 +20,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import der_kleine_maulwurf_operator as mole  # noqa: E402
+import grabowski_tasks as tasks  # noqa: E402
 
 
 class _TestIcon:
@@ -300,7 +301,6 @@ class TestDerKleineMaulwurfOperator(unittest.TestCase):
                 mole.active_recovery_detached_effects()
 
     def test_detached_effect_scan_maps_tmux_timeout_to_runtime_error(self) -> None:
-        import grabowski_tasks as tasks
 
         def fake_run(argv, **_kwargs):
             if argv[0] == "systemctl":
@@ -317,8 +317,29 @@ class TestDerKleineMaulwurfOperator(unittest.TestCase):
             ):
                 mole.active_recovery_detached_effects()
 
+    def test_detached_effect_scan_includes_backend_aware_persistent_tasks(self) -> None:
+
+        def fake_run(argv, **_kwargs):
+            if argv[0] == "systemctl":
+                return types.SimpleNamespace(returncode=0, stdout="")
+            return types.SimpleNamespace(returncode=1, stdout="")
+
+        with (
+            patch.object(mole.subprocess, "run", side_effect=fake_run),
+            patch.object(
+                tasks,
+                "recovery_active_task_effects",
+                return_value=[
+                    "task:root@local:systemd-root-broker:system:root.service:running",
+                    "task:remote@node:systemd-user:user:remote.service:running",
+                ],
+            ),
+        ):
+            effects = mole.active_recovery_detached_effects()
+        self.assertIn("task:root@local:systemd-root-broker:system:root.service:running", effects)
+        self.assertIn("task:remote@node:systemd-user:user:remote.service:running", effects)
+
     def test_detached_effect_scan_limits_persistent_tasks_to_local_host(self) -> None:
-        import grabowski_tasks as tasks
 
         def fake_run(argv, **_kwargs):
             if argv[0] == "systemctl":
