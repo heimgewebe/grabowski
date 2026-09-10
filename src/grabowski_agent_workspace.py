@@ -6929,6 +6929,66 @@ def _lane_owned_checkout_decision(
     }
 
 
+def _terminal_lane_owned_checkout_decision(
+    manifest: dict[str, Any],
+    checkout: dict[str, Any],
+    terminal_lane: dict[str, Any],
+) -> dict[str, Any]:
+    """Preserve Work Lane checkout ownership after a bound terminal closeout."""
+    if terminal_lane.get("valid") is not True:
+        raise AgentWorkspaceError("terminal Work Lane reconciliation evidence is invalid")
+    lifecycle = manifest.get("checkout_lifecycle")
+    resources_value = manifest.get("resources")
+    if not isinstance(lifecycle, dict):
+        raise AgentWorkspaceError("lane-backed workspace checkout lifecycle is missing")
+    if (
+        not isinstance(resources_value, dict)
+        or lifecycle.get("owner_id") != resources_value.get("owner_id")
+    ):
+        raise AgentWorkspaceError(
+            "lane-backed workspace checkout lifecycle owner mismatches resources"
+        )
+    return {
+        "schema_version": 1,
+        "state": "lane_terminal_ownership_preserved",
+        "selected_action": "preserve_lane_owned",
+        "reason": (
+            "workspace stale reconciliation cannot retroactively own or release "
+            "resources settled by the terminal Work Lane"
+        ),
+        "checkout_key": lifecycle.get("checkout_key"),
+        "checkout_path": lifecycle.get("checkout_path"),
+        "owner_id": lifecycle.get("owner_id"),
+        "lane_id": terminal_lane.get("lane_id"),
+        "lane_receipt_sha256": terminal_lane.get("terminal_receipt_sha256"),
+        "lane_preimage_receipt_sha256": terminal_lane.get("expected_receipt_sha256"),
+        "lane_closeout_assessment_sha256": terminal_lane.get("assessment_sha256"),
+        "lane_closeout_state": terminal_lane.get("closeout_state"),
+        "source": lifecycle.get("source"),
+        "artifact_class": lifecycle.get("artifact_class"),
+        "lifecycle_phase": "terminal",
+        "task": lifecycle.get("task"),
+        "purpose": lifecycle.get("purpose"),
+        "created_at_unix": lifecycle.get("created_at_unix"),
+        "expires_at_unix": lifecycle.get("expires_at_unix"),
+        "expected_head": lifecycle.get("expected_head"),
+        "expected_branch": lifecycle.get("expected_branch"),
+        "observed_head": checkout.get("head"),
+        "observed_dirty": (
+            None if not checkout.get("exists") else not bool(checkout.get("clean"))
+        ),
+        "ownership_satisfied": True,
+        "next_action": "continue_cleanup_only_from_terminal_work_lane_truth",
+        "automatic_cleanup_authorized": False,
+        "does_not_establish": [
+            "permission_to_release_lane_resources",
+            "permission_to_delete_checkout",
+            "pull_request_integration_truth",
+            "bureau_task_completion",
+        ],
+    }
+
+
 def _resource_close_contract_satisfied(
     manifest: dict[str, Any], close_receipt: Any
 ) -> bool:
@@ -11651,6 +11711,19 @@ def grabowski_agent_workspace_reconcile_stale(
             if stale.get("reconciliation_kind") == "legacy_absence"
             else None
         )
+        lane_mode = _lane_backed(manifest)
+        resources_value = manifest.get("resources")
+        if lane_mode and (
+            not isinstance(resources_value, dict)
+            or not isinstance(resources_value.get("lease_keys"), list)
+        ):
+            raise AgentWorkspaceError("lane-backed workspace resource binding is invalid")
+        expected_resource_keys = (
+            sorted(resources_value["lease_keys"]) if lane_mode else []
+        )
+        terminal_lane = (
+            stale.get("terminal_lane_reconciliation") if lane_mode else None
+        )
         receipt = {
             "schema_version": 1,
             "state": "complete",
@@ -11666,9 +11739,9 @@ def grabowski_agent_workspace_reconcile_stale(
             "branch_preserved": bool(plan["checkout"]["exists"]),
             "dirty": None if not plan["checkout"]["exists"] else not plan["checkout"]["clean"],
             "tmux_removed": False,
-            "resources_released": True,
+            "resources_released": not lane_mode,
             "released_resource_keys": [],
-            "remaining_resource_keys": [],
+            "remaining_resource_keys": expected_resource_keys,
             "resource_release_error": None,
             "no_unsecured_changes_discarded": True,
             "failed_roles": failed_roles,
@@ -11687,6 +11760,27 @@ def grabowski_agent_workspace_reconcile_stale(
             "worktree_mutation_performed": False,
             "historical_evidence_preserved": True,
         }
+        if lane_mode:
+            if not isinstance(terminal_lane, dict) or terminal_lane.get("valid") is not True:
+                raise AgentWorkspaceError(
+                    "terminal Work Lane reconciliation evidence is invalid"
+                )
+            receipt.update(
+                {
+                    "lane_resources_preserved": True,
+                    "workspace_resources_owned": False,
+                    "resource_release_not_applicable": (
+                        "Work Lane exclusively owned resource release; terminal "
+                        "closeout already settled it"
+                    ),
+                    "terminal_lane_reconciliation": terminal_lane,
+                    "checkout_lifecycle_decision": (
+                        _terminal_lane_owned_checkout_decision(
+                            manifest, plan["checkout"], terminal_lane
+                        )
+                    ),
+                }
+            )
         receipt["receipt_sha256"] = _sha256_json(receipt)
         _atomic_json(_workspace_dir(identifier) / "close-receipt.json", receipt)
         manifest["close_receipt"] = receipt

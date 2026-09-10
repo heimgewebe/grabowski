@@ -1822,6 +1822,102 @@ class AgentWorkspaceTests(unittest.TestCase):
             {item["code"] for item in stale["blockers"]},
         )
 
+    def test_stale_lane_backed_workspace_reconcile_emits_valid_lane_close_contract(self) -> None:
+        lane = self.lane_receipt(idempotency_key="stale-terminal-lane-reconcile")
+        manifest = self.lane_manifest(lane)
+        manifest["created_at"] = "2026-01-01T00:00:00+00:00"
+        manifest["tasks"] = {"writer": None, "tests": None, "review": None}
+        manifest["task_start_intents"] = {}
+        workspace._write_manifest(manifest)
+        terminal_lane = self.terminalize_lane_no_change(lane, manifest)
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.resources, "list_resources", return_value=[]),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=False),
+            mock.patch.object(workspace.base, "_append_audit"),
+            mock.patch.object(workspace, "_now", return_value=1784050000),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            result = workspace.grabowski_agent_workspace_reconcile_stale(
+                manifest["workspace_id"],
+                plan["plan_sha256"],
+                "mark-stale-workspace-abandoned",
+            )
+            replay = workspace.grabowski_agent_workspace_reconcile_stale(
+                manifest["workspace_id"],
+                plan["plan_sha256"],
+                "mark-stale-workspace-abandoned",
+            )
+
+        receipt = result["close_receipt"]
+        self.assertFalse(receipt["resources_released"])
+        self.assertTrue(receipt["lane_resources_preserved"])
+        self.assertFalse(receipt["workspace_resources_owned"])
+        self.assertEqual(receipt["released_resource_keys"], [])
+        self.assertEqual(
+            receipt["remaining_resource_keys"],
+            sorted(manifest["resources"]["lease_keys"]),
+        )
+        decision = receipt["checkout_lifecycle_decision"]
+        self.assertEqual(decision["selected_action"], "preserve_lane_owned")
+        self.assertTrue(decision["ownership_satisfied"])
+        self.assertEqual(decision["owner_id"], manifest["resources"]["owner_id"])
+        self.assertEqual(decision["lane_id"], lane["lane_id"])
+        self.assertEqual(
+            decision["lane_receipt_sha256"], terminal_lane["receipt_sha256"]
+        )
+        self.assertEqual(
+            decision["lane_preimage_receipt_sha256"], lane["receipt_sha256"]
+        )
+        persisted = workspace._manifest(manifest["workspace_id"])
+        integrity = workspace._close_integrity_status(
+            persisted, persisted["close_receipt"]
+        )
+        self.assertTrue(integrity["valid"], integrity)
+        self.assertTrue(integrity["resource_close_contract_satisfied"])
+        self.assertEqual(replay["state"], "already_closed")
+        self.assertTrue(replay["idempotent"])
+
+    def test_stale_lane_backed_workspace_reconcile_rejects_checkout_owner_mismatch(self) -> None:
+        lane = self.lane_receipt(idempotency_key="stale-terminal-owner-mismatch")
+        manifest = self.lane_manifest(lane)
+        manifest["created_at"] = "2026-01-01T00:00:00+00:00"
+        manifest["tasks"] = {"writer": None, "tests": None, "review": None}
+        manifest["task_start_intents"] = {}
+        manifest["checkout_lifecycle"]["owner_id"] = "lane:wrong-owner"
+        workspace._write_manifest(manifest)
+        self.terminalize_lane_no_change(lane, manifest)
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.resources, "list_resources", return_value=[]),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=False),
+            mock.patch.object(workspace, "_now", return_value=1784050000),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            with self.assertRaisesRegex(
+                workspace.AgentWorkspaceError,
+                "checkout lifecycle owner mismatches resources",
+            ):
+                workspace.grabowski_agent_workspace_reconcile_stale(
+                    manifest["workspace_id"],
+                    plan["plan_sha256"],
+                    "mark-stale-workspace-abandoned",
+                )
+
+        persisted = workspace._manifest(manifest["workspace_id"])
+        self.assertIsNone(persisted.get("close_receipt"))
+        self.assertFalse(
+            (workspace._workspace_dir(manifest["workspace_id"]) / "close-receipt.json").exists()
+        )
+
     def test_stale_lane_backed_workspace_rejects_terminal_lane_with_live_owner_leases(self) -> None:
         lane = self.lane_receipt(idempotency_key="stale-terminal-lane-live-resources")
         manifest = self.lane_manifest(lane)
