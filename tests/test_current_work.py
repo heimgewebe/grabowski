@@ -2041,6 +2041,52 @@ class CurrentWorkProjectionTests(unittest.TestCase):
             ):
                 self.fail("positively bound work appeared after heuristic-only hygiene")
 
+    def test_dirty_expired_active_binding_identity_drift_is_hygiene(self) -> None:
+        existing = checkout(
+            "key-dirty-expired-active-drift",
+            "/home/alex/repos/.worktrees/key-dirty-expired-active-drift",
+            dirty=True,
+            lifecycle_state="managed_lifecycle_drift",
+            binding_owner="operator:dirty-expired-active-drift",
+            binding_phase="active",
+            binding_consistent=False,
+            retention_active=False,
+            retention_until_unix=1,
+            drift_reasons=["expected-branch-mismatch"],
+        )
+        result = project(
+            checkout_payloads=[{"repository": REPOSITORY, "worktrees": [existing]}],
+            reconciliation_payload={
+                "bindings": [
+                    {
+                        "checkout_key": "key-dirty-expired-active-drift",
+                        "state": "binding_identity_drift",
+                        "blocking": True,
+                        "reasons": ["expected-branch-mismatch"],
+                        "binding_identity": {"checkout_key": "key-dirty-expired-active-drift"},
+                        "worktree_identity": {"checkout_key": "key-dirty-expired-active-drift"},
+                        "evidence": {"owner_id": "operator:dirty-expired-active-drift"},
+                        "recommended_next_step": "reconcile_binding_identity_before_lifecycle_action",
+                    }
+                ],
+                "pagination": {"has_more": False},
+            },
+        )
+        matching = [
+            row
+            for row in result["work"]
+            if row["binding"]["id"] == "key-dirty-expired-active-drift"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0]["projection_state"], "hygiene")
+        self.assertEqual(matching[0]["work_class"], "hygiene")
+        self.assertTrue(matching[0]["action_required"])
+        self.assertIn("dirty-checkout-visible", matching[0]["action_reasons"])
+        self.assertIn(
+            "checkout-binding-binding_identity_drift",
+            matching[0]["action_reasons"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
