@@ -7156,6 +7156,65 @@ class TaskTests(unittest.TestCase):
         self.assertTrue(any("systemd-root-broker:system" in item for item in effects))
         self.assertTrue(any("remote-node:systemd-user:user" in item for item in effects))
 
+    def test_recovery_active_task_effects_can_limit_scan_to_local_hosts(self) -> None:
+        rows = [
+            {
+                "task_id": "c" * 24,
+                "host": "wg-prod-1",
+                "unit": "grabowski-task-cccccccccccccccccccccccc-a1.service",
+                "authoritative_unit": "grabowski-task-cccccccccccccccccccccccc-a1.service",
+                "execution_backend": "systemd-user",
+                "systemd_scope": "user",
+                "state": "running",
+                "created_at_unix": 3,
+            },
+        ]
+
+        class Result:
+            def fetchall(self):
+                return rows
+
+        class Connection:
+            query = None
+            parameters = None
+
+            def execute(self, query, parameters):
+                self.query = query
+                self.parameters = parameters
+                return Result()
+
+        connection = Connection()
+
+        @contextmanager
+        def snapshot():
+            yield connection
+
+        fleet_registry = {
+            "hosts": {
+                "wg-prod-1": {"enabled": True, "transport": "local", "target": "local"},
+                "heim-pc": {"enabled": True, "transport": "ssh", "target": "alex@heim-pc"},
+            }
+        }
+        with (
+            patch.object(tasks.fleet, "load_fleet", return_value=fleet_registry),
+            patch.object(tasks, "_task_read_snapshot", snapshot),
+            patch.object(tasks, "_observe", return_value={"state": "running"}) as observe,
+        ):
+            effects = tasks.recovery_active_task_effects(local_only=True)
+        observe.assert_called_once()
+        self.assertIn("host IN (?,?)", connection.query)
+        self.assertEqual(
+            (
+                *tasks.RECOVERY_TASK_OBSERVE_STATES,
+                "wg-prod-1",
+                "local",
+                tasks.RECOVERY_ACTIVE_TASK_SCAN_LIMIT + 1,
+            ),
+            connection.parameters,
+        )
+        self.assertEqual(1, len(effects))
+        self.assertIn("@wg-prod-1:", effects[0])
+
     def _task_migration_backups(self) -> list[Path]:
         return sorted(
             self.database.parent.glob(

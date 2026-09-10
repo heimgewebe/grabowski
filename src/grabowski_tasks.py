@@ -7336,20 +7336,48 @@ RECOVERY_ACTIVE_TASK_SCAN_LIMIT = 100
 RECOVERY_TASK_OBSERVE_STATES = ("launching", "running", "outcome_unknown", "interrupted")
 
 
+def _recovery_local_task_host_names() -> tuple[str, ...]:
+    registered = fleet.load_fleet()
+    local_hosts = tuple(
+        sorted(
+            name
+            for name, candidate in registered["hosts"].items()
+            if candidate["enabled"]
+            and candidate["transport"] == "local"
+            and candidate["target"] == "local"
+        )
+    )
+    if not local_hosts:
+        raise RuntimeError("recovery_local_task_host_unavailable")
+    if len(local_hosts) == 1 and "local" not in registered["hosts"]:
+        return (*local_hosts, "local")
+    return local_hosts
+
+
 def recovery_active_task_effects(
-    *, limit: int = RECOVERY_ACTIVE_TASK_SCAN_LIMIT
+    *,
+    limit: int = RECOVERY_ACTIVE_TASK_SCAN_LIMIT,
+    local_only: bool = False,
 ) -> list[str]:
     """Freshly observe persisted task states that may still hide a live effect."""
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
         raise ValueError("recovery active task limit must be between 1 and 100")
+    if not isinstance(local_only, bool):
+        raise ValueError("recovery active task local_only must be boolean")
     observe_states = RECOVERY_TASK_OBSERVE_STATES
     active_states = TASK_STATE_PROJECTIONS["active"]
     placeholders = ",".join("?" for _ in observe_states)
+    host_filter: tuple[str, ...] = ()
+    host_clause = ""
+    if local_only:
+        host_filter = _recovery_local_task_host_names()
+        host_placeholders = ",".join("?" for _ in host_filter)
+        host_clause = f" AND host IN ({host_placeholders})"
     with _task_read_snapshot() as connection:
         rows = connection.execute(
-            f"SELECT * FROM tasks WHERE state IN ({placeholders}) "
+            f"SELECT * FROM tasks WHERE state IN ({placeholders}){host_clause} "
             "ORDER BY created_at_unix DESC, task_id DESC LIMIT ?",
-            (*observe_states, limit + 1),
+            (*observe_states, *host_filter, limit + 1),
         ).fetchall()
     if len(rows) > limit:
         raise RuntimeError("recovery_active_task_scan_limit_exceeded")

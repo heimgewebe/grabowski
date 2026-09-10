@@ -317,7 +317,7 @@ class TestDerKleineMaulwurfOperator(unittest.TestCase):
             ):
                 mole.active_recovery_detached_effects()
 
-    def test_detached_effect_scan_includes_backend_aware_persistent_tasks(self) -> None:
+    def test_detached_effect_scan_limits_persistent_tasks_to_local_host(self) -> None:
         import grabowski_tasks as tasks
 
         def fake_run(argv, **_kwargs):
@@ -331,14 +331,16 @@ class TestDerKleineMaulwurfOperator(unittest.TestCase):
                 tasks,
                 "recovery_active_task_effects",
                 return_value=[
-                    "task:root@local:systemd-root-broker:system:root.service:running",
-                    "task:remote@node:systemd-user:user:remote.service:running",
+                    "task:local@wg-prod-1:systemd-user:user:local.service:running",
                 ],
-            ),
+            ) as active_tasks,
         ):
             effects = mole.active_recovery_detached_effects()
-        self.assertIn("task:root@local:systemd-root-broker:system:root.service:running", effects)
-        self.assertIn("task:remote@node:systemd-user:user:remote.service:running", effects)
+        active_tasks.assert_called_once_with(local_only=True)
+        self.assertIn(
+            "task:local@wg-prod-1:systemd-user:user:local.service:running",
+            effects,
+        )
 
     def test_post_replace_directory_fsync_failure_is_explicitly_unknown(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
