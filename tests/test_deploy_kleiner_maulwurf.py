@@ -262,6 +262,51 @@ class KleinerMaulwurfDeployTests(unittest.TestCase):
                 km._restore_selector(state)
         publish.assert_not_called()
 
+    def test_selector_rollback_accepts_new_generation_identity(self) -> None:
+        state = self._state()
+        state.published_selector_sha256 = "4" * 64
+        candidate = {
+            "selector_sha256": state.published_selector_sha256,
+            "selected_slot": state.old_selector["selected_slot"],
+            "upstream_port": km.MCP_PORT,
+            "runtime_binding": state.new_binding,
+            "runtime_binding_sha256": state.new_binding_sha256,
+        }
+        restored = {
+            "selector_sha256": "5" * 64,
+            "selected_slot": state.old_selector["selected_slot"],
+            "upstream_port": km.MCP_PORT,
+            "runtime_binding": state.old_binding,
+            "runtime_binding_sha256": state.old_binding_sha256,
+        }
+        with (
+            patch.object(
+                km.ingress,
+                "read_routing_selector",
+                side_effect=[candidate, restored],
+            ),
+            patch.object(
+                km.ingress,
+                "publish_routing_selector",
+                return_value=restored,
+            ) as publish,
+            patch.object(
+                km, "_runtime_release", return_value=state.old_release_path
+            ),
+            patch.object(km, "_require_stack_active"),
+        ):
+            km._restore_selector(state)
+            self.assertEqual(state.rollback_selector_sha256, "5" * 64)
+            km._verify_rollback(state)
+
+        publish.assert_called_once_with(
+            path=state.selector_path,
+            expected_selector_sha256=state.published_selector_sha256,
+            selected_slot=state.old_selector["selected_slot"],
+            runtime_binding=state.old_binding,
+            cutover_id=f"km-rollback-{state.snapshot.repo_head[:12]}",
+        )
+
     def test_prepare_rejects_head_drift_before_service_or_build_effects(self) -> None:
         runtime = Path("/runtime")
         snapshot = SimpleNamespace(repo_head="a" * 40)

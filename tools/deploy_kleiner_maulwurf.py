@@ -42,6 +42,7 @@ class CutoverState:
     new_binding_sha256: str
     selector_path: Path
     published_selector_sha256: str | None = None
+    rollback_selector_sha256: str | None = None
 
 
 def _fail(message: str) -> None:
@@ -256,18 +257,30 @@ def _restore_selector(state: CutoverState) -> None:
     ) and current.get("selector_sha256") == state.old_selector.get(
         "selector_sha256"
     ):
+        state.rollback_selector_sha256 = state.old_selector["selector_sha256"]
         return
     if state.published_selector_sha256 is None:
         _fail("routing selector changed before this cutover published a selector")
     if current.get("selector_sha256") != state.published_selector_sha256:
         _fail("routing selector changed outside this cutover; refusing rollback")
-    ingress.publish_routing_selector(
+    restored = ingress.publish_routing_selector(
         path=state.selector_path,
         expected_selector_sha256=state.published_selector_sha256,
         selected_slot=selected_slot,
         runtime_binding=state.old_binding,
         cutover_id=f"km-rollback-{state.snapshot.repo_head[:12]}",
     )
+    restored_sha256 = restored.get("selector_sha256")
+    if not isinstance(restored_sha256, str) or len(restored_sha256) != 64:
+        _fail("routing selector rollback returned no exact selector identity")
+    if not _selector_matches(
+        restored,
+        binding=state.old_binding,
+        binding_sha256=state.old_binding_sha256,
+        selected_slot=selected_slot,
+    ):
+        _fail("routing selector rollback did not bind the previous runtime")
+    state.rollback_selector_sha256 = restored_sha256
 
 
 def _verify_final(state: CutoverState) -> dict[str, Any]:
@@ -297,8 +310,11 @@ def _verify_rollback(state: CutoverState) -> None:
         _fail("rollback runtime pointer does not resolve to the previous release")
     selector = ingress.read_routing_selector(state.selector_path)
     selected_slot = state.old_selector["selected_slot"]
-    if selector.get("selector_sha256") != state.old_selector.get("selector_sha256"):
-        _fail("rollback routing selector identity differs from the previous selector")
+    expected_selector_sha256 = (
+        state.rollback_selector_sha256 or state.old_selector["selector_sha256"]
+    )
+    if selector.get("selector_sha256") != expected_selector_sha256:
+        _fail("rollback routing selector identity changed after restoration")
     if not _selector_matches(
         selector,
         binding=state.old_binding,
