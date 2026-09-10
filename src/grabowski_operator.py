@@ -6645,10 +6645,48 @@ def grabowski_tmux_send(
     }
 
 
-@mcp.tool(name="grabowski_process_list", annotations=READ_ONLY)
-def grabowski_process_list(pattern: str | None = None) -> dict[str, Any]:
-    """List current-user processes, optionally filtered by a regex."""
-    _require_operator_capability("process_inspect")
+def _linux_process_identity(
+    pid: int,
+    ppid: int,
+    executable: str,
+    *,
+    boot_id: str,
+) -> dict[str, Any] | None:
+    """Return a boot-scoped start identity only when /proc still matches ps."""
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(
+            encoding="utf-8", errors="strict"
+        )
+        close = stat_text.rfind(")")
+        if close < 0:
+            return None
+        fields = stat_text[close + 2 :].split()
+        if len(fields) < 20:
+            return None
+        observed_ppid = int(fields[1])
+        start_ticks = int(fields[19])
+    except (OSError, UnicodeError, ValueError):
+        return None
+    if observed_ppid != ppid or start_ticks < 0:
+        return None
+    material = {
+        "boot_id": boot_id,
+        "executable": executable,
+        "pid": pid,
+        "ppid": ppid,
+        "start_ticks": start_ticks,
+    }
+    encoded = json.dumps(
+        material, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return {
+        **material,
+        "identity_sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def _current_user_process_payload(pattern: str | None = None) -> dict[str, Any]:
+    """Collect current-user ps rows plus strong boot/start identities when available."""
     result = _run(
         [
             "ps",
@@ -6665,7 +6703,55 @@ def grabowski_process_list(pattern: str | None = None) -> dict[str, Any]:
     if pattern:
         regex = re.compile(pattern)
         lines = [line for line in lines if regex.search(line)]
-    return {"pattern": pattern, "lines": lines, "count": len(lines)}
+    try:
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(
+            encoding="ascii", errors="strict"
+        ).strip()
+    except (OSError, UnicodeError):
+        boot_id = ""
+    identities: list[dict[str, Any]] = []
+    argv_by_pid: dict[int, list[str]] = {}
+    for line in lines:
+        parts = line.split(None, 5)
+        if len(parts) != 6:
+            continue
+        pid_raw, ppid_raw, _state, _elapsed, executable, _arguments = parts
+        try:
+            pid, ppid = int(pid_raw), int(ppid_raw)
+        except ValueError:
+            continue
+        if boot_id:
+            identity = _linux_process_identity(
+                pid, ppid, executable, boot_id=boot_id
+            )
+            if identity is not None:
+                identities.append(identity)
+        try:
+            raw_cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError:
+            continue
+        if raw_cmdline:
+            argv_by_pid[pid] = [
+                item.decode("utf-8", errors="surrogateescape")
+                for item in raw_cmdline.rstrip(b"\0").split(b"\0")
+            ]
+    return {
+        "pattern": pattern,
+        "lines": lines,
+        "count": len(lines),
+        "returncode": result.get("returncode"),
+        "observed_at_unix": int(time.time()),
+        "identities": identities,
+        "argv_by_pid": argv_by_pid,
+        "truncated": bool(result.get("stdout_truncated", False)),
+    }
+
+
+@mcp.tool(name="grabowski_process_list", annotations=READ_ONLY)
+def grabowski_process_list(pattern: str | None = None) -> dict[str, Any]:
+    """List current-user processes, optionally filtered by a regex."""
+    _require_operator_capability("process_inspect")
+    return _current_user_process_payload(pattern)
 
 
 @mcp.tool(name="grabowski_process_signal", annotations=MUTATING)
