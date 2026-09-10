@@ -439,21 +439,34 @@ PHYSICAL_CODING_AGENT_PROVIDER_POOLS = frozenset(
 )
 
 
-def _coding_agent_provider_pools(executable: str, arguments: str) -> list[str]:
+def _argv_option_value(argv: list[str], option: str) -> str:
+    lowered_option = option.lower()
+    prefix = lowered_option + "="
+    lowered_argv = [item.lower() for item in argv]
+    for index, item in enumerate(lowered_argv):
+        if item == lowered_option and index + 1 < len(lowered_argv):
+            return lowered_argv[index + 1]
+        if item.startswith(prefix):
+            return item[len(prefix):]
+    return ""
+
+
+def _coding_agent_provider_pools(executable: str, argv: list[str]) -> list[str]:
     executable = executable.lower()
-    lowered = arguments.lower()
+    lowered_argv = [item.lower() for item in argv]
     if executable == "claude":
         return ["claude-pro"]
     if executable == "codex":
-        if "app-server" in lowered:
+        if len(lowered_argv) > 1 and lowered_argv[1] == "app-server":
             return []
-        if "gpt-5.3-codex-spark" in lowered:
+        if _argv_option_value(argv, "--model") == "gpt-5.3-codex-spark":
             return ["openai-codex-spark"]
         return ["openai-agentic"]
     if executable == "agy":
-        if "claude" in lowered:
+        selected_model = _argv_option_value(argv, "--model")
+        if "claude" in selected_model:
             return ["antigravity-claude", "antigravity-account"]
-        if "gpt-oss" in lowered:
+        if "gpt-oss" in selected_model:
             return ["antigravity-gptoss", "antigravity-account"]
         return ["antigravity-gemini", "antigravity-account"]
     if executable == "opencode":
@@ -502,13 +515,19 @@ def parse_processes(payload: dict[str, Any] | None) -> dict[str, Any]:
     identity_rows = payload.get("identities", [])
     if not isinstance(identity_rows, list):
         raise CurrentWorkProjectionError("process identities must be a list")
+    argv_by_pid = payload.get("argv_by_pid", {})
+    if not isinstance(argv_by_pid, dict):
+        raise CurrentWorkProjectionError("process argv_by_pid must be an object")
+    source_truncated = payload.get("truncated", False)
+    if not isinstance(source_truncated, bool):
+        raise CurrentWorkProjectionError("process truncated flag must be a boolean")
     identities_by_pid = {
         item.get("pid"): item
         for item in identity_rows
         if isinstance(item, dict) and isinstance(item.get("pid"), int)
     }
     lines = payload.get("lines", [])
-    truncated = len(lines) > MAX_PROCESSES
+    truncated = source_truncated or len(lines) > MAX_PROCESSES
     working: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     for index, line in enumerate(lines[:MAX_PROCESSES], 1):
@@ -540,6 +559,8 @@ def parse_processes(payload: dict[str, Any] | None) -> dict[str, Any]:
             command_class = "coding-agent"
         elif "grabowski_operator" in arguments:
             command_class = "operator-runtime"
+        raw_argv = argv_by_pid.get(pid, [])
+        argv = [item for item in raw_argv if isinstance(item, str)] if isinstance(raw_argv, list) else []
         process = {
             "pid": pid,
             "ppid": ppid,
@@ -549,6 +570,7 @@ def parse_processes(payload: dict[str, Any] | None) -> dict[str, Any]:
             "command_class": command_class,
             "workspace_id": workspace_id,
             "_arguments": arguments,
+            "_argv": argv,
             "identity_status": "partial",
         }
         identity = identities_by_pid.get(pid)
@@ -591,6 +613,7 @@ def parse_processes(payload: dict[str, Any] | None) -> dict[str, Any]:
     provider_pool_lifecycle_sessions: dict[str, dict[str, int]] = {}
     strong_identity_count = 0
     identity_partial_count = 0
+    coding_agent_argv_partial_count = 0
     for process in working:
         if process.get("identity_status") == "strong":
             strong_identity_count += 1
@@ -604,8 +627,21 @@ def parse_processes(payload: dict[str, Any] | None) -> dict[str, Any]:
         if process.get("workspace_id") is None and inherited_workspace is not None:
             process["workspace_id"] = inherited_workspace
         arguments = str(process.get("_arguments", ""))
-        pools = _coding_agent_provider_pools(process["executable"], arguments)
-        if "app-server" in arguments.lower() and protection_reason == "ancestor-tunnel-client":
+        argv = process.get("_argv", [])
+        if not isinstance(argv, list):
+            argv = []
+        if (
+            str(process.get("executable", "")).lower() in {"codex", "agy"}
+            and not argv
+        ):
+            coding_agent_argv_partial_count += 1
+        pools = _coding_agent_provider_pools(process["executable"], argv)
+        is_codex_app_server = (
+            str(process.get("executable", "")).lower() == "codex"
+            and len(argv) > 1
+            and str(argv[1]).lower() == "app-server"
+        )
+        if is_codex_app_server and protection_reason == "ancestor-tunnel-client":
             lifecycle_state = "infrastructure"
             pools = []
         elif process.get("workspace_id"):
@@ -628,7 +664,11 @@ def parse_processes(payload: dict[str, Any] | None) -> dict[str, Any]:
                 lifecycle[lifecycle_state] = lifecycle.get(lifecycle_state, 0) + 1
 
     processes = [
-        {key: value for key, value in process.items() if key != "_arguments"}
+        {
+            key: value
+            for key, value in process.items()
+            if key not in {"_arguments", "_argv"}
+        }
         for process in working
     ]
     return {
@@ -644,6 +684,7 @@ def parse_processes(payload: dict[str, Any] | None) -> dict[str, Any]:
         },
         "strong_identity_count": strong_identity_count,
         "identity_partial_count": identity_partial_count,
+        "coding_agent_argv_partial_count": coding_agent_argv_partial_count,
     }
 
 

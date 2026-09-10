@@ -1010,6 +1010,12 @@ def _physical_pool_occupancy() -> dict[str, Any]:
         if payload.get("returncode") not in (None, 0):
             raise CodingAgentRouterError("process inventory command failed")
         parsed = current_work.parse_processes(payload)
+        if (
+            parsed.get("truncated") is True
+            or parsed.get("errors")
+            or parsed.get("coding_agent_argv_partial_count", 0) > 0
+        ):
+            raise CodingAgentRouterError("process inventory is incomplete")
     except (
         AttributeError,
         CodingAgentRouterError,

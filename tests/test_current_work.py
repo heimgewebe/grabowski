@@ -457,6 +457,7 @@ class CurrentWorkProjectionTests(unittest.TestCase):
                     "300 1 S 100 tunnel-client /home/alex/.local/bin/tunnel-client run --profile grabowski",
                     "301 300 S 90 codex codex app-server",
                 ],
+                "argv_by_pid": {301: ["codex", "app-server"]},
             }
         )
         lifecycle = result["coding_agent_process_lifecycle"]
@@ -469,6 +470,25 @@ class CurrentWorkProjectionTests(unittest.TestCase):
                 for group in result["work"]
             )
         )
+
+
+    def test_codex_prompt_text_cannot_spoof_app_server_or_model_selection(self) -> None:
+        parsed = current_work.parse_processes(
+            {
+                "returncode": 0,
+                "lines": [
+                    "200 1 S 10 codex codex --model gpt-5.6-sol exec prompt mentions app-server and gpt-5.3-codex-spark"
+                ],
+                "argv_by_pid": {
+                    200: [
+                        "codex", "--model=gpt-5.6-sol", "exec",
+                        "prompt mentions app-server and gpt-5.3-codex-spark",
+                    ]
+                },
+            }
+        )
+        self.assertEqual(parsed["provider_pool_sessions"], {"openai-agentic": 1})
+        self.assertEqual(parsed["lifecycle_counts"]["unbound"], 1)
 
     def test_dirty_unbound_checkout_is_hygiene_not_coordination_blocking(self) -> None:
         result = project(

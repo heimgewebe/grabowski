@@ -6710,21 +6710,31 @@ def _current_user_process_payload(pattern: str | None = None) -> dict[str, Any]:
     except (OSError, UnicodeError):
         boot_id = ""
     identities: list[dict[str, Any]] = []
-    if boot_id:
-        for line in lines:
-            parts = line.split(None, 5)
-            if len(parts) != 6:
-                continue
-            pid_raw, ppid_raw, _state, _elapsed, executable, _arguments = parts
-            try:
-                pid, ppid = int(pid_raw), int(ppid_raw)
-            except ValueError:
-                continue
+    argv_by_pid: dict[int, list[str]] = {}
+    for line in lines:
+        parts = line.split(None, 5)
+        if len(parts) != 6:
+            continue
+        pid_raw, ppid_raw, _state, _elapsed, executable, _arguments = parts
+        try:
+            pid, ppid = int(pid_raw), int(ppid_raw)
+        except ValueError:
+            continue
+        if boot_id:
             identity = _linux_process_identity(
                 pid, ppid, executable, boot_id=boot_id
             )
             if identity is not None:
                 identities.append(identity)
+        try:
+            raw_cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError:
+            continue
+        if raw_cmdline:
+            argv_by_pid[pid] = [
+                item.decode("utf-8", errors="surrogateescape")
+                for item in raw_cmdline.rstrip(b"\0").split(b"\0")
+            ]
     return {
         "pattern": pattern,
         "lines": lines,
@@ -6732,6 +6742,8 @@ def _current_user_process_payload(pattern: str | None = None) -> dict[str, Any]:
         "returncode": result.get("returncode"),
         "observed_at_unix": int(time.time()),
         "identities": identities,
+        "argv_by_pid": argv_by_pid,
+        "truncated": bool(result.get("stdout_truncated", False)),
     }
 
 

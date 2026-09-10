@@ -1104,6 +1104,7 @@ class CodingAgentRouterTests(unittest.TestCase):
                         "200 150 S 800 codex codex --model gpt-5.6-sol",
                     ],
                     "identities": [],
+                    "argv_by_pid": {200: ["codex", "--model", "gpt-5.6-sol"]},
                 },
             ):
                 occupancy = router._physical_pool_occupancy()
@@ -1113,6 +1114,43 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertEqual(occupancy["observed_at_unix"], 123)
         self.assertEqual(occupancy["lifecycle_counts"]["protected"], 1)
         self.assertEqual(occupancy["provider_pool_sessions"]["openai-agentic"], 1)
+
+
+    def test_physical_pool_occupancy_rejects_truncated_or_malformed_inventory(self) -> None:
+        self.physical_occupancy.stop()
+        try:
+            for payload in (
+                {
+                    "returncode": 0,
+                    "observed_at_unix": 123,
+                    "lines": ["1 0 S 1 init init"] * (current_work.MAX_PROCESSES + 1),
+                    "identities": [],
+                    "argv_by_pid": {},
+                },
+                {
+                    "returncode": 0,
+                    "observed_at_unix": 123,
+                    "lines": ["malformed"],
+                    "identities": [],
+                    "argv_by_pid": {},
+                },
+                {
+                    "returncode": 0,
+                    "observed_at_unix": 123,
+                    "lines": ["200 1 S 10 codex codex --model gpt-5.6-sol"],
+                    "identities": [],
+                    "argv_by_pid": {},
+                },
+            ):
+                with self.subTest(payload_shape=len(payload["lines"])):
+                    with mock.patch.object(
+                        router.operator, "_current_user_process_payload", return_value=payload
+                    ):
+                        occupancy = router._physical_pool_occupancy()
+                    self.assertEqual(occupancy["status"], "unavailable")
+                    self.assertEqual(occupancy["error_type"], "CodingAgentRouterError")
+        finally:
+            self.physical_occupancy.start()
 
     def test_protected_physical_agent_consumes_provider_concurrency(self) -> None:
         state = self._fresh_state()
