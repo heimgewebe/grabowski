@@ -52,7 +52,7 @@ CHECKOUT_LIFECYCLE_PHASES = {
 }
 CURRENT_WORK_VIEWS = {"current", "history"}
 PROJECTION_STATES = {"active", "blocking", "resumable", "hygiene", "terminal_archived", "unknown"}
-ATTENTION_BLOCKING_CLASSIFICATIONS = {"actionable", "outcome_unknown", "invalid_evidence"}
+ATTENTION_BLOCKING_CLASSIFICATIONS = {"outcome_unknown", "invalid_evidence"}
 ATTENTION_RESUMABLE_CLASSIFICATIONS = {"decision_deferred"}
 ATTENTION_ARCHIVED_CLASSIFICATIONS = {
     "decision_closed",
@@ -854,6 +854,23 @@ def _apply_attention(
         classification = item["classification"]
         if classification in ATTENTION_BLOCKING_CLASSIFICATIONS:
             _blocking(group, f"attention-{classification}")
+        elif classification == "actionable":
+            group["action_required"] = True
+            reason = "attention-actionable"
+            if reason not in group["action_reasons"]:
+                group["action_reasons"].append(reason)
+            if group["projection_state"] == "unknown":
+                state = item["state"]
+                if state in ACTIVE_TASK_STATES:
+                    _set_projection_state(group, "active")
+                elif state == "interrupted":
+                    _resumable(group, "task-interrupted")
+                elif state == "outcome_unknown":
+                    _blocking(group, "task-outcome_unknown")
+                elif state in TERMINAL_TASK_STATES:
+                    _set_projection_state(group, "terminal_archived")
+                else:
+                    _unknown(group, f"unknown-attention-state:{state}")
         elif classification in ATTENTION_RESUMABLE_CLASSIFICATIONS:
             _resumable(group, f"attention-{classification}")
         elif classification in ATTENTION_ARCHIVED_CLASSIFICATIONS:
