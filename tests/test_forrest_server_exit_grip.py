@@ -34,6 +34,11 @@ def result(argv: list[str], stdout: str = "", returncode: int = 0):
 
 
 class ForrestServerExitRuntimeTests(unittest.TestCase):
+    def test_machine_target_is_commonserver_while_public_fixture_stays_legacy(self):
+        self.assertEqual(runtime.HOST, "commonserver")
+        self.assertIn("wg-prod-1.tail6dbb90.ts.net", PRE)
+        self.assertNotIn("commonserver.tail6dbb90.ts.net", PRE)
+
     def test_apply_removes_only_443_and_preserves_8443(self):
         sequence = [
             result(["tailscale", "serve", "status"], PRE),
