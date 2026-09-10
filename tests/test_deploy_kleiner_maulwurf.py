@@ -283,6 +283,36 @@ class KleinerMaulwurfDeployTests(unittest.TestCase):
                 km._restore_pointer(state)
         restore.assert_not_called()
 
+    def test_rollback_stops_after_pointer_restore_failure(self) -> None:
+        state = self._state()
+        with (
+            patch.object(km, "_verify_pre_cutover_preimage"),
+            patch.object(km, "_stop_stack", side_effect=[None, None]),
+            patch.object(
+                km,
+                "_verify_pointer_before_activation",
+                side_effect=km.KleinerMaulwurfDeployError("cutover failed"),
+            ),
+            patch.object(
+                km,
+                "_restore_pointer",
+                side_effect=km.KleinerMaulwurfDeployError("foreign pointer"),
+            ) as restore_pointer,
+            patch.object(km, "_restore_selector") as restore_selector,
+            patch.object(km, "_start_stack") as start_stack,
+            patch.object(km, "_verify_rollback") as verify_rollback,
+        ):
+            with self.assertRaisesRegex(
+                km.KleinerMaulwurfDeployError,
+                "rollback was incomplete: pointer:KleinerMaulwurfDeployError:foreign pointer",
+            ):
+                km._run_cutover(state, timeout_seconds=10)
+
+        restore_pointer.assert_called_once_with(state)
+        restore_selector.assert_not_called()
+        start_stack.assert_not_called()
+        verify_rollback.assert_not_called()
+
     def test_foreign_selector_is_not_overwritten_during_rollback(self) -> None:
         state = self._state()
         state.published_selector_sha256 = "4" * 64

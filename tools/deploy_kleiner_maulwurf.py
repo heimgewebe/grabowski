@@ -413,6 +413,10 @@ def _run_cutover(state: CutoverState, *, timeout_seconds: int) -> dict[str, Any]
                 rollback_errors.append(
                     f"{phase}:{type(rollback_exc).__name__}:{rollback_exc}"
                 )
+                # Rollback phases are ordered dependencies. Once one phase can
+                # no longer prove its post-state, later mutations must not run
+                # against an unknown or foreign composite state.
+                break
         if rollback_errors:
             raise KleinerMaulwurfDeployError(
                 "smaller-mole cutover failed and rollback was incomplete: "
