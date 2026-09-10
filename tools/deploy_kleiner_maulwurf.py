@@ -20,6 +20,8 @@ START_ORDER = (MCP_SERVICE, INGRESS_SERVICE, TUNNEL_SERVICE)
 STOP_ORDER = tuple(reversed(START_ORDER))
 MCP_PORT = 18182
 INGRESS_PORT = 18180
+CANONICAL_RUNTIME = Path.home() / ".local/share/grabowski-mcp"
+CANONICAL_SELECTOR = ingress.DEFAULT_SELECTOR_FILE
 
 
 class KleinerMaulwurfDeployError(RuntimeError):
@@ -47,6 +49,14 @@ class CutoverState:
 
 def _fail(message: str) -> None:
     raise KleinerMaulwurfDeployError(message)
+
+
+def _candidate_cutover_id(state: CutoverState) -> str:
+    return f"km-deploy-{state.snapshot.repo_head[:12]}"
+
+
+def _rollback_cutover_id(state: CutoverState) -> str:
+    return f"km-rollback-{state.snapshot.repo_head[:12]}"
 
 
 def _systemctl(action: str, service: str) -> None:
@@ -150,6 +160,22 @@ def _selector_matches(
     )
 
 
+def _selector_is_own_candidate(
+    state: CutoverState, selector: dict[str, Any]
+) -> bool:
+    return (
+        _selector_matches(
+            selector,
+            binding=state.new_binding,
+            binding_sha256=state.new_binding_sha256,
+            selected_slot=state.old_selector["selected_slot"],
+        )
+        and selector.get("previous_selector_sha256")
+        == state.old_selector["selector_sha256"]
+        and selector.get("cutover_id") == _candidate_cutover_id(state)
+    )
+
+
 def _verify_pre_cutover_preimage(state: CutoverState) -> None:
     core.verify_apply_snapshot_unchanged(
         state.repo, state.snapshot, state.release_path
@@ -171,14 +197,15 @@ def _verify_pre_cutover_preimage(state: CutoverState) -> None:
     _require_stack_active()
 
 
-def _prepare_deploy(
-    repo: Path,
-    runtime: Path,
-    expected_head: str,
-    selector_path: Path,
-) -> CutoverState:
+def _verify_pointer_before_activation(state: CutoverState) -> None:
+    if _runtime_release(state.runtime) != state.old_release_path:
+        _fail("runtime pointer changed after service stop; refusing activation")
+
+
+def _prepare_deploy(repo: Path, expected_head: str) -> CutoverState:
     repo = repo.expanduser().resolve(strict=True)
-    runtime = core.require_runtime_replaceable(runtime.expanduser())
+    runtime = core.require_runtime_replaceable(CANONICAL_RUNTIME)
+    selector_path = CANONICAL_SELECTOR
     snapshot = core.snapshot_from_worktree(repo)
     if snapshot.repo_head != expected_head:
         _fail(
@@ -259,16 +286,23 @@ def _restore_selector(state: CutoverState) -> None:
     ):
         state.rollback_selector_sha256 = state.old_selector["selector_sha256"]
         return
+
+    current_sha256 = current.get("selector_sha256")
     if state.published_selector_sha256 is None:
-        _fail("routing selector changed before this cutover published a selector")
-    if current.get("selector_sha256") != state.published_selector_sha256:
+        if not _selector_is_own_candidate(state, current):
+            _fail(
+                "ambiguous routing selector publication is not owned by this cutover"
+            )
+        state.published_selector_sha256 = current_sha256
+    elif current_sha256 != state.published_selector_sha256:
         _fail("routing selector changed outside this cutover; refusing rollback")
+
     restored = ingress.publish_routing_selector(
         path=state.selector_path,
         expected_selector_sha256=state.published_selector_sha256,
         selected_slot=selected_slot,
         runtime_binding=state.old_binding,
-        cutover_id=f"km-rollback-{state.snapshot.repo_head[:12]}",
+        cutover_id=_rollback_cutover_id(state),
     )
     restored_sha256 = restored.get("selector_sha256")
     if not isinstance(restored_sha256, str) or len(restored_sha256) != 64:
@@ -331,6 +365,9 @@ def _run_cutover(state: CutoverState, *, timeout_seconds: int) -> dict[str, Any]
     _verify_pre_cutover_preimage(state)
     try:
         _stop_stack(timeout_seconds)
+        # Stopping three dependent units is intentionally bounded but not atomic.
+        # Re-read the pointer at the last possible moment before overwriting it.
+        _verify_pointer_before_activation(state)
         core.activate_pointer(state.activation)
 
         _start_service(MCP_SERVICE, timeout_seconds)
@@ -341,7 +378,7 @@ def _run_cutover(state: CutoverState, *, timeout_seconds: int) -> dict[str, Any]
             expected_selector_sha256=state.old_selector["selector_sha256"],
             selected_slot=state.old_selector["selected_slot"],
             runtime_binding=state.new_binding,
-            cutover_id=f"km-deploy-{state.snapshot.repo_head[:12]}",
+            cutover_id=_candidate_cutover_id(state),
         )
         published_sha256 = published.get("selector_sha256")
         if not isinstance(published_sha256, str) or len(published_sha256) != 64:
@@ -389,9 +426,7 @@ def _run_cutover(state: CutoverState, *, timeout_seconds: int) -> dict[str, Any]
 def deploy(
     *,
     repo: Path,
-    runtime: Path,
     expected_head: str,
-    selector_path: Path,
     timeout_seconds: int,
 ) -> dict[str, Any]:
     if timeout_seconds < 1 or timeout_seconds > 120:
@@ -401,28 +436,18 @@ def deploy(
     ):
         _fail("expected head must be an exact lowercase 40-character commit SHA")
     with core.deployment_lock(core.DEFAULT_LOCK_FILE):
-        state = _prepare_deploy(repo, runtime, expected_head, selector_path)
+        state = _prepare_deploy(repo, expected_head)
         return _run_cutover(state, timeout_seconds=timeout_seconds)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Build and atomically activate a smaller-mole Grabowski runtime, "
-            "including MCP, ingress and tunnel lifecycle."
+            "Build and atomically activate the canonical smaller-mole Grabowski "
+            "runtime, including MCP, ingress and tunnel lifecycle."
         )
     )
     parser.add_argument("--repo", type=Path, required=True)
-    parser.add_argument(
-        "--runtime",
-        type=Path,
-        default=Path.home() / ".local/share/grabowski-mcp",
-    )
-    parser.add_argument(
-        "--selector",
-        type=Path,
-        default=ingress.DEFAULT_SELECTOR_FILE,
-    )
     parser.add_argument("--expected-head", required=True)
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument(
@@ -435,9 +460,7 @@ def main() -> int:
         parser.error("--apply is required for the runtime cutover")
     result = deploy(
         repo=args.repo,
-        runtime=args.runtime,
         expected_head=args.expected_head,
-        selector_path=args.selector,
         timeout_seconds=args.timeout,
     )
     print(json.dumps(result, sort_keys=True))

@@ -82,6 +82,7 @@ class KleinerMaulwurfDeployTests(unittest.TestCase):
 
         with (
             patch.object(km, "_verify_pre_cutover_preimage"),
+            patch.object(km, "_verify_pointer_before_activation"),
             patch.object(km, "_systemctl", side_effect=systemctl),
             patch.object(km, "_wait_service"),
             patch.object(km, "_wait_port", side_effect=wait_port),
@@ -136,6 +137,7 @@ class KleinerMaulwurfDeployTests(unittest.TestCase):
 
         with (
             patch.object(km, "_verify_pre_cutover_preimage"),
+            patch.object(km, "_verify_pointer_before_activation"),
             patch.object(km, "_systemctl", side_effect=systemctl),
             patch.object(km, "_wait_service"),
             patch.object(km, "_wait_port", side_effect=wait_port),
@@ -234,6 +236,40 @@ class KleinerMaulwurfDeployTests(unittest.TestCase):
         restore_pointer.assert_not_called()
         restore_selector.assert_not_called()
 
+    def test_pointer_is_revalidated_after_stack_stop_before_activation(self) -> None:
+        state = self._state()
+        events: list[str] = []
+        with (
+            patch.object(km, "_verify_pre_cutover_preimage"),
+            patch.object(
+                km,
+                "_stop_stack",
+                side_effect=lambda _timeout: events.append("stop"),
+            ),
+            patch.object(
+                km,
+                "_verify_pointer_before_activation",
+                side_effect=lambda _state: (
+                    events.append("pointer-check"),
+                    (_ for _ in ()).throw(
+                        km.KleinerMaulwurfDeployError("foreign pointer")
+                    ),
+                ),
+            ),
+            patch.object(km.core, "activate_pointer") as activate,
+            patch.object(km, "_restore_pointer"),
+            patch.object(km, "_restore_selector"),
+            patch.object(km, "_start_stack"),
+            patch.object(km, "_verify_rollback"),
+        ):
+            with self.assertRaisesRegex(
+                km.KleinerMaulwurfDeployError,
+                "previous runtime was restored",
+            ):
+                km._run_cutover(state, timeout_seconds=10)
+        self.assertEqual(events[:2], ["stop", "pointer-check"])
+        activate.assert_not_called()
+
     def test_foreign_pointer_is_not_overwritten_during_rollback(self) -> None:
         state = self._state()
         with (
@@ -304,14 +340,52 @@ class KleinerMaulwurfDeployTests(unittest.TestCase):
             expected_selector_sha256=state.published_selector_sha256,
             selected_slot=state.old_selector["selected_slot"],
             runtime_binding=state.old_binding,
-            cutover_id=f"km-rollback-{state.snapshot.repo_head[:12]}",
+            cutover_id=km._rollback_cutover_id(state),
+        )
+
+    def test_ambiguous_candidate_selector_publication_is_recovered(self) -> None:
+        state = self._state()
+        candidate = {
+            "selector_sha256": "4" * 64,
+            "previous_selector_sha256": state.old_selector["selector_sha256"],
+            "cutover_id": km._candidate_cutover_id(state),
+            "selected_slot": state.old_selector["selected_slot"],
+            "upstream_port": km.MCP_PORT,
+            "runtime_binding": state.new_binding,
+            "runtime_binding_sha256": state.new_binding_sha256,
+        }
+        restored = {
+            "selector_sha256": "5" * 64,
+            "selected_slot": state.old_selector["selected_slot"],
+            "upstream_port": km.MCP_PORT,
+            "runtime_binding": state.old_binding,
+            "runtime_binding_sha256": state.old_binding_sha256,
+        }
+        with (
+            patch.object(km.ingress, "read_routing_selector", return_value=candidate),
+            patch.object(
+                km.ingress,
+                "publish_routing_selector",
+                return_value=restored,
+            ) as publish,
+        ):
+            km._restore_selector(state)
+
+        self.assertEqual(state.published_selector_sha256, "4" * 64)
+        self.assertEqual(state.rollback_selector_sha256, "5" * 64)
+        publish.assert_called_once_with(
+            path=state.selector_path,
+            expected_selector_sha256="4" * 64,
+            selected_slot=state.old_selector["selected_slot"],
+            runtime_binding=state.old_binding,
+            cutover_id=km._rollback_cutover_id(state),
         )
 
     def test_prepare_rejects_head_drift_before_service_or_build_effects(self) -> None:
         runtime = Path("/runtime")
         snapshot = SimpleNamespace(repo_head="a" * 40)
         with (
-            patch.object(km.core, "require_runtime_replaceable", return_value=runtime),
+            patch.object(km.core, "require_runtime_replaceable", return_value=runtime) as require_runtime,
             patch.object(km.core, "snapshot_from_worktree", return_value=snapshot),
             patch.object(km, "_require_stack_active") as stack,
             patch.object(km.core, "build_release") as build,
@@ -320,12 +394,8 @@ class KleinerMaulwurfDeployTests(unittest.TestCase):
                 km.KleinerMaulwurfDeployError,
                 "source checkout head differs",
             ):
-                km._prepare_deploy(
-                    ROOT,
-                    runtime,
-                    "b" * 40,
-                    Path("/selector.json"),
-                )
+                km._prepare_deploy(ROOT, "b" * 40)
+        require_runtime.assert_called_once_with(km.CANONICAL_RUNTIME)
         stack.assert_not_called()
         build.assert_not_called()
 
@@ -340,9 +410,7 @@ class KleinerMaulwurfDeployTests(unittest.TestCase):
             ):
                 km.deploy(
                     repo=Path("/repo"),
-                    runtime=Path("/runtime"),
                     expected_head="a" * 40,
-                    selector_path=Path("/selector.json"),
                     timeout_seconds=0,
                 )
             with self.assertRaisesRegex(
@@ -351,31 +419,33 @@ class KleinerMaulwurfDeployTests(unittest.TestCase):
             ):
                 km.deploy(
                     repo=Path("/repo"),
-                    runtime=Path("/runtime"),
                     expected_head="not-a-head",
-                    selector_path=Path("/selector.json"),
                     timeout_seconds=10,
                 )
         prepare.assert_not_called()
         deployment_lock.assert_not_called()
 
-    def test_deploy_reuses_core_deployment_lock(self) -> None:
+    def test_deploy_reuses_core_deployment_lock_and_canonical_paths(self) -> None:
         state = self._state()
         with (
             patch.object(km.core, "deployment_lock") as deployment_lock,
-            patch.object(km, "_prepare_deploy", return_value=state),
+            patch.object(km, "_prepare_deploy", return_value=state) as prepare,
             patch.object(km, "_run_cutover", return_value={"ok": True}) as cutover,
         ):
             result = km.deploy(
                 repo=Path("/repo"),
-                runtime=Path("/runtime"),
                 expected_head="a" * 40,
-                selector_path=Path("/selector.json"),
                 timeout_seconds=10,
             )
         self.assertEqual(result, {"ok": True})
         deployment_lock.assert_called_once_with(km.core.DEFAULT_LOCK_FILE)
+        prepare.assert_called_once_with(Path("/repo"), "a" * 40)
         cutover.assert_called_once_with(state, timeout_seconds=10)
+        self.assertEqual(
+            km.CANONICAL_RUNTIME,
+            Path.home() / ".local/share/grabowski-mcp",
+        )
+        self.assertEqual(km.CANONICAL_SELECTOR, km.ingress.DEFAULT_SELECTOR_FILE)
 
 
 if __name__ == "__main__":
