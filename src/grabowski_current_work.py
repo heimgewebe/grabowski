@@ -52,7 +52,7 @@ CHECKOUT_LIFECYCLE_PHASES = {
 }
 CURRENT_WORK_VIEWS = {"current", "history"}
 PROJECTION_STATES = {"active", "blocking", "resumable", "hygiene", "terminal_archived", "unknown"}
-ATTENTION_BLOCKING_CLASSIFICATIONS = {"actionable", "outcome_unknown", "invalid_evidence"}
+ATTENTION_BLOCKING_CLASSIFICATIONS = {"outcome_unknown", "invalid_evidence"}
 ATTENTION_RESUMABLE_CLASSIFICATIONS = {"decision_deferred"}
 ATTENTION_ARCHIVED_CLASSIFICATIONS = {
     "decision_closed",
@@ -854,6 +854,22 @@ def _apply_attention(
         classification = item["classification"]
         if classification in ATTENTION_BLOCKING_CLASSIFICATIONS:
             _blocking(group, f"attention-{classification}")
+        elif classification == "actionable":
+            group["action_required"] = True
+            reason = "attention-actionable"
+            if reason not in group["action_reasons"]:
+                group["action_reasons"].append(reason)
+            state = item["state"]
+            if state in ACTIVE_TASK_STATES:
+                _set_projection_state(group, "active")
+            elif state == "interrupted":
+                _resumable(group, "task-interrupted")
+            elif state == "outcome_unknown":
+                _blocking(group, "task-outcome_unknown")
+            elif state in TERMINAL_TASK_STATES:
+                _hygiene(group, reason)
+            else:
+                _unknown(group, f"unknown-attention-state:{state}")
         elif classification in ATTENTION_RESUMABLE_CLASSIFICATIONS:
             _resumable(group, f"attention-{classification}")
         elif classification in ATTENTION_ARCHIVED_CLASSIFICATIONS:
@@ -1781,6 +1797,19 @@ def derive_group_convergence_recommendation(group: dict[str, Any]) -> dict[str, 
                 "priority": 4,
             }
 
+    if (
+        projection_state == "hygiene"
+        and "attention-actionable" in action_reasons
+    ):
+        return {
+            "convergence_stage": "hygiene",
+            "next_convergence_action": (
+                "review actionable attention without blocking independent work"
+            ),
+            "finishable_chain": False,
+            "priority": 5,
+        }
+
     # Historical reconciliation without a current authority or physical surface is
     # hygiene.  It remains visible but must not displace operative work.
     if projection_state == "hygiene":
@@ -2032,6 +2061,12 @@ def build_current_work_projection(
         "sources; aggregate values also include global operator sources and may change "
         "when repository-filtered checkout evidence binds to global work groups"
     ]
+    has_actionable_attention_followup = any(
+        group["projection_state"] == "hygiene"
+        and group["action_required"]
+        and "attention-actionable" in group["action_reasons"]
+        for group in projected
+    )
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -2105,6 +2140,8 @@ def build_current_work_projection(
             if state_counts["blocking"]
             else "inspect resumable work groups"
             if state_counts["resumable"]
+            else "review actionable attention without blocking independent work"
+            if has_actionable_attention_followup
             else "process hygiene and rescue candidates separately"
             if state_counts["hygiene"]
             else "none"
