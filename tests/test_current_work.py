@@ -1407,6 +1407,78 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertEqual(group["projection_state"], "blocking")
         self.assertIn("archived-attention-with-live-surfaces", group["action_reasons"])
 
+    def test_terminal_actionable_attention_requires_action_without_blocking(self) -> None:
+        task_id = "actionable-terminal"
+        result = project(
+            attention_payload={
+                "records": [attention(task_id, "actionable", state="failed")],
+                "pagination": {"has_more": False},
+            },
+        )
+        self.assertEqual(result["total_projected"], 1)
+        self.assertEqual(result["state_counts"]["blocking"], 0)
+        group = result["work"][0]
+        self.assertEqual(group["projection_state"], "hygiene")
+        self.assertEqual(group["convergence_stage"], "hygiene")
+        self.assertTrue(group["action_required"])
+        self.assertIn("attention-actionable", group["action_reasons"])
+        self.assertEqual(
+            group["next_convergence_action"],
+            "review actionable attention without blocking independent work",
+        )
+        self.assertEqual(
+            result["next_convergence_action"],
+            "review actionable attention without blocking independent work",
+        )
+        self.assertEqual(
+            result["recommended_next_action"],
+            "review actionable attention without blocking independent work",
+        )
+
+    def test_active_task_actionable_attention_stays_active(self) -> None:
+        task_id = "actionable-active"
+        result = project(
+            tasks_payload={
+                "tasks": [task(task_id, "running")],
+                "pagination": {"has_more": False},
+            },
+            attention_payload={
+                "records": [attention(task_id, "actionable", state="running")],
+                "pagination": {"has_more": False},
+            },
+        )
+        self.assertEqual(result["state_counts"]["blocking"], 0)
+        group = result["work"][0]
+        self.assertEqual(group["projection_state"], "active")
+        self.assertTrue(group["action_required"])
+        self.assertIn("attention-actionable", group["action_reasons"])
+
+    def test_interrupted_actionable_attention_remains_resumable(self) -> None:
+        task_id = "actionable-interrupted"
+        result = project(
+            attention_payload={
+                "records": [attention(task_id, "actionable", state="interrupted")],
+                "pagination": {"has_more": False},
+            },
+        )
+        group = result["work"][0]
+        self.assertEqual(group["projection_state"], "resumable")
+        self.assertTrue(group["action_required"])
+        self.assertIn("attention-actionable", group["action_reasons"])
+        self.assertIn("task-interrupted", group["action_reasons"])
+
+    def test_outcome_unknown_attention_remains_blocking(self) -> None:
+        task_id = "attention-outcome-unknown"
+        result = project(
+            attention_payload={
+                "records": [attention(task_id, "outcome_unknown", state="failed")],
+                "pagination": {"has_more": False},
+            },
+        )
+        group = result["work"][0]
+        self.assertEqual(group["projection_state"], "blocking")
+        self.assertIn("attention-outcome_unknown", group["action_reasons"])
+
     def test_attention_only_terminal_task_absorbs_task_owned_live_lease(self) -> None:
         task_id = "attention-lease-task"
         result = project(
