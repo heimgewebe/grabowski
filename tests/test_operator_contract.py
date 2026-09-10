@@ -407,6 +407,28 @@ class OperatorContractTests(unittest.TestCase):
                 operator.deployment_observer.OPERATION, {}, observer_tool
             )
         )
+        for operation in (
+            "maulwurf-recovery-status",
+            "maulwurf-recovery-off",
+        ):
+            with self.subTest(operation=operation):
+                self.assertFalse(
+                    operator._deployment_admission_drain_blocking(
+                        "grabowski_operation_run",
+                        {"operation": operation, "parameters": None},
+                        github_tool,
+                    )
+                )
+        self.assertTrue(
+            operator._deployment_admission_drain_blocking(
+                "grabowski_operation_run",
+                {
+                    "operation": "maulwurf-recovery-on",
+                    "parameters": {"reason": "primary unavailable"},
+                },
+                github_tool,
+            )
+        )
 
     def test_deployment_admission_gate_rejects_new_tools_before_effect(self) -> None:
         operator = _load_operator_module()

@@ -736,10 +736,15 @@ def _github_pr_view_transport_read_only(arguments: Any) -> bool:
 def _deployment_admission_drain_blocking(
     tool_name: Any, arguments: Any, tool: Any
 ) -> bool:
-    """Treat only concretely proven reads as non-blocking during deploy drain."""
+    """Classify whether a call must keep the deployment drain open."""
     if tool_name == deployment_observer.OPERATION:
         return True
     if _tool_read_only_hint(tool) is True:
+        return False
+    if _maulwurf_recovery_operation_name(tool_name, arguments) in {
+        "maulwurf-recovery-status",
+        "maulwurf-recovery-off",
+    }:
         return False
     return not (
         tool_name == "grabowski_github"
@@ -1553,10 +1558,8 @@ def _install_deployment_admission_gate() -> None:
         identity = _deployment_admission_register_tool_call(
             tool_name,
             kind,
-            drain_blocking=(
-                _deployment_admission_drain_blocking(tool_name, arguments, tool)
-                and maulwurf_recovery_operation
-                not in {"maulwurf-recovery-status", "maulwurf-recovery-off"}
+            drain_blocking=_deployment_admission_drain_blocking(
+                tool_name, arguments, tool
             ),
         )
         maulwurf_guard: int | None = None
