@@ -138,5 +138,43 @@ class CheckoutTerminalSourcesTests(unittest.TestCase):
             sources.work_lane_terminal_evidence("chat-thread-identity")
 
 
+    def test_legacy_operator_obligation_source_kind_uses_canonical_observer(self) -> None:
+        source_id = "goo-legacy-source-12345678"
+        calls: list[str] = []
+
+        def observer(value: str) -> dict[str, object]:
+            calls.append(value)
+            return sources._terminal_evidence(
+                {
+                    "schema_version": sources.SCHEMA_VERSION,
+                    "kind": "operator_obligation",
+                    "source_id": value,
+                    "terminal_state": "completed",
+                }
+            )
+
+        with patch.dict(sources._OBSERVERS, {"operator_obligation": observer}):
+            evidence = sources.source_terminal_evidence(
+                {"source": {"kind": "operator-obligation", "id": source_id}}
+            )
+
+        self.assertEqual(calls, [source_id])
+        self.assertEqual(evidence["kind"], "operator_obligation")
+        self.assertEqual(evidence["source_id"], source_id)
+        self.assertEqual(evidence["source_kind_alias"], "operator-obligation")
+        self.assertEqual(
+            evidence["evidence_sha256"],
+            checkouts._sha256_json(
+                {key: value for key, value in evidence.items() if key != "evidence_sha256"}
+            ),
+        )
+
+    def test_unwitnessed_source_kind_still_fails_closed(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "unsupported checkout lifecycle source kind"):
+            sources.source_terminal_evidence(
+                {"source": {"kind": "operator-obligations", "id": "goo-example-12345678"}}
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
