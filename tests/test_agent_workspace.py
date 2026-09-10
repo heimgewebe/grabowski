@@ -622,6 +622,50 @@ class AgentWorkspaceTests(unittest.TestCase):
         workspace._write_manifest(manifest)
         return manifest
 
+    def terminalize_lane_no_change(
+        self,
+        lane: dict,
+        manifest: dict,
+        *,
+        expected_receipt_sha256: str | None = None,
+        release_resources: bool = True,
+    ) -> dict:
+        observation = workspace.work_acquire.lane_closeout.LaneCloseoutObservation(
+            lane_id=lane["lane_id"],
+            repository=str(self.git.repo),
+            workspace=str(self.git.writer),
+            branch="feat/writer",
+            base_revision=self.git.base,
+            writer_state="completed",
+            task_active=False,
+            process_active=False,
+            lease_active=True,
+            git_dirty=False,
+            head_sha=self.git.base,
+            ahead_commits=0,
+            no_change_proven=True,
+        )
+        assessment = workspace.work_acquire.lane_closeout.assess(observation)
+        with workspace.work_acquire._lane_lock(lane["lane_id"]) as path:
+            current = workspace.work_acquire._read_state(path)
+            self.assertIsInstance(current, dict)
+            current["terminal_closeout"] = {
+                "schema_version": 1,
+                "kind": "grabowski.work_lane_terminal_closeout",
+                "closeout_state": assessment["closeout_state"],
+                "assessment_sha256": assessment["assessment_sha256"],
+                "expected_receipt_sha256": (
+                    expected_receipt_sha256 or lane["receipt_sha256"]
+                ),
+                "assessment": assessment,
+            }
+            terminal = workspace.work_acquire._write_state(path, current)
+        if release_resources:
+            workspace.resources.release_resources(
+                f"lane:{lane['lane_id']}", lane["inputs"]["resource_keys"]
+            )
+        return terminal
+
     def closed_lane_candidate_fixture(self) -> tuple[dict, dict, dict, dict, dict]:
         lane = self.lane_receipt(idempotency_key="p3-candidate-adoption")
         manifest = self.lane_manifest(lane)
@@ -1746,6 +1790,89 @@ class AgentWorkspaceTests(unittest.TestCase):
                     cleanup_plan["plan_sha256"],
                     confirmation="archive-and-remove-worktree",
                 )
+
+
+    def test_stale_lane_backed_workspace_accepts_exact_terminal_lane_preimage(self) -> None:
+        lane = self.lane_receipt(idempotency_key="stale-terminal-lane-exact")
+        manifest = self.lane_manifest(lane)
+        manifest["created_at"] = "2026-01-01T00:00:00+00:00"
+        manifest["tasks"] = {"writer": None, "tests": None, "review": None}
+        manifest["task_start_intents"] = {}
+        workspace._write_manifest(manifest)
+        terminal_lane = self.terminalize_lane_no_change(lane, manifest)
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.resources, "list_resources", return_value=[]),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=False),
+            mock.patch.object(workspace, "_now", return_value=1784050000),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+
+        stale = plan["stale_reconciliation"]
+        self.assertTrue(stale["eligible"], stale)
+        evidence = stale["terminal_lane_reconciliation"]
+        self.assertTrue(evidence["valid"])
+        self.assertEqual(evidence["expected_receipt_sha256"], lane["receipt_sha256"])
+        self.assertEqual(evidence["terminal_receipt_sha256"], terminal_lane["receipt_sha256"])
+        self.assertNotIn(
+            "work_lane_owns_terminal_reconciliation",
+            {item["code"] for item in stale["blockers"]},
+        )
+
+    def test_stale_lane_backed_workspace_rejects_terminal_lane_with_live_owner_leases(self) -> None:
+        lane = self.lane_receipt(idempotency_key="stale-terminal-lane-live-resources")
+        manifest = self.lane_manifest(lane)
+        manifest["created_at"] = "2026-01-01T00:00:00+00:00"
+        manifest["tasks"] = {"writer": None, "tests": None, "review": None}
+        manifest["task_start_intents"] = {}
+        workspace._write_manifest(manifest)
+        self.terminalize_lane_no_change(lane, manifest, release_resources=False)
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=False),
+            mock.patch.object(workspace, "_now", return_value=1784050000),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+
+        evidence = plan["stale_reconciliation"]["terminal_lane_reconciliation"]
+        self.assertFalse(evidence["valid"])
+        self.assertIn("still has live resource leases", evidence["error"])
+        self.assertFalse(plan["stale_reconciliation"]["eligible"])
+
+    def test_stale_lane_backed_workspace_rejects_terminal_lane_preimage_mismatch(self) -> None:
+        lane = self.lane_receipt(idempotency_key="stale-terminal-lane-mismatch")
+        manifest = self.lane_manifest(lane)
+        manifest["created_at"] = "2026-01-01T00:00:00+00:00"
+        manifest["tasks"] = {"writer": None, "tests": None, "review": None}
+        manifest["task_start_intents"] = {}
+        workspace._write_manifest(manifest)
+        self.terminalize_lane_no_change(
+            lane, manifest, expected_receipt_sha256="0" * 64
+        )
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.resources, "list_resources", return_value=[]),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=False),
+            mock.patch.object(workspace, "_now", return_value=1784050000),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+
+        stale = plan["stale_reconciliation"]
+        self.assertFalse(stale["eligible"])
+        self.assertFalse(stale["terminal_lane_reconciliation"]["valid"])
+        self.assertIn(
+            "work_lane_owns_terminal_reconciliation",
+            {item["code"] for item in stale["blockers"]},
+        )
 
     def test_writer_checkout_lifecycle_binding_is_explicit_and_idempotent(self) -> None:
         manifest = self.manifest()

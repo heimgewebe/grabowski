@@ -10722,17 +10722,109 @@ def _workspace_liveness(
     }
 
 
+def _terminal_lane_reconciliation_binding(manifest: dict[str, Any]) -> dict[str, Any]:
+    if not _lane_backed(manifest):
+        return {"required": False, "valid": True}
+    resources_value = manifest.get("resources")
+    lane_binding = (
+        resources_value.get("lane_binding")
+        if isinstance(resources_value, dict)
+        else None
+    )
+    if not isinstance(lane_binding, dict):
+        return {"required": True, "valid": False, "error": "lane_binding_missing"}
+    lane_id = str(lane_binding.get("lane_id", ""))
+    expected_receipt = str(lane_binding.get("receipt_sha256", ""))
+    try:
+        if re.fullmatch(r"[0-9a-f]{32}", lane_id) is None:
+            raise AgentWorkspaceError("lane_id is invalid")
+        if SHA256_RE.fullmatch(expected_receipt) is None:
+            raise AgentWorkspaceError("workspace lane receipt binding is invalid")
+        with work_acquire._lane_lock(lane_id) as receipt_path:
+            receipt = work_acquire._read_state(receipt_path)
+        if receipt is None or receipt.get("lane_id") != lane_id:
+            raise AgentWorkspaceError("work lane receipt is missing or mismatched")
+        terminal = receipt.get("terminal_closeout")
+        assessment = work_acquire._terminal_closeout_assessment(receipt)
+        if not isinstance(terminal, dict) or assessment is None:
+            raise AgentWorkspaceError("work lane has no valid terminal closeout")
+        if terminal.get("expected_receipt_sha256") != expected_receipt:
+            raise AgentWorkspaceError(
+                "work lane terminal closeout does not descend from workspace binding"
+            )
+        inputs = receipt.get("inputs")
+        if (
+            not isinstance(inputs, dict)
+            or receipt.get("inputs_sha256") != work_acquire._sha(inputs)
+        ):
+            raise AgentWorkspaceError("work lane input integrity is invalid")
+        lane_identity = {
+            key: value
+            for key, value in inputs.items()
+            if key not in {"lane_id", "lease_owner_id", "ttl_seconds"}
+        }
+        if work_acquire._sha(lane_identity)[:32] != lane_id:
+            raise AgentWorkspaceError("terminal work lane identity digest is invalid")
+        try:
+            _owner_id, _registered_keys, live_owner_leases = (
+                work_acquire._terminal_lane_resource_observation(receipt)
+            )
+        except Exception as exc:
+            raise AgentWorkspaceError(
+                f"terminal work lane resources are not safely observable: {_error_summary(exc)}"
+            ) from exc
+        if live_owner_leases:
+            raise AgentWorkspaceError("terminal work lane still has live resource leases")
+        source = inputs.get("source")
+        binding = manifest.get("binding")
+        expected_identity = {
+            "repo": manifest.get("repository"),
+            "base_head": manifest.get("expected_base_head"),
+            "branch": manifest.get("writer_branch"),
+            "target_path": manifest.get("writer_worktree"),
+            "lane_id": lane_id,
+            "lease_owner_id": f"lane:{lane_id}",
+        }
+        if any(inputs.get(key) != value for key, value in expected_identity.items()):
+            raise AgentWorkspaceError("terminal work lane identity mismatches workspace")
+        if not isinstance(binding, dict) or source != {
+            "kind": binding.get("kind"),
+            "id": binding.get("id"),
+        }:
+            raise AgentWorkspaceError("terminal work lane source mismatches workspace")
+        receipt_sha256 = receipt.get("receipt_sha256")
+        if not isinstance(receipt_sha256, str) or SHA256_RE.fullmatch(receipt_sha256) is None:
+            raise AgentWorkspaceError("terminal work lane receipt digest is invalid")
+    except Exception as exc:
+        return {
+            "required": True,
+            "valid": False,
+            "lane_id": lane_id or None,
+            "expected_receipt_sha256": expected_receipt or None,
+            "error": _error_summary(exc),
+        }
+    return {
+        "required": True,
+        "valid": True,
+        "lane_id": lane_id,
+        "expected_receipt_sha256": expected_receipt,
+        "terminal_receipt_sha256": receipt_sha256,
+        "closeout_state": assessment["closeout_state"],
+        "assessment_sha256": assessment["assessment_sha256"],
+        "live_owner_lease_count": 0,
+    }
+
+
 def _stale_workspace_reconciliation_plan(
     manifest: dict[str, Any], liveness: dict[str, Any]
 ) -> dict[str, Any]:
     blockers: list[dict[str, Any]] = []
-    if _lane_backed(manifest):
+    terminal_lane = _terminal_lane_reconciliation_binding(manifest)
+    if _lane_backed(manifest) and terminal_lane.get("valid") is not True:
         blockers.append(
             {
                 "code": "work_lane_owns_terminal_reconciliation",
-                "lane_id": manifest.get("resources", {})
-                .get("lane_binding", {})
-                .get("lane_id"),
+                "lane_id": terminal_lane.get("lane_id"),
             }
         )
     close_receipt = manifest.get("close_receipt")
@@ -10813,6 +10905,7 @@ def _stale_workspace_reconciliation_plan(
         "removes_tmux": False,
         "removes_worktree": False,
         "deletes_workspace_evidence": False,
+        "terminal_lane_reconciliation": terminal_lane,
     }
 
 
