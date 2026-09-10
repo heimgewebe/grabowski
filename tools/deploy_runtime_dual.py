@@ -5600,6 +5600,37 @@ def _stop_green_operator(unit: str) -> dict[str, Any]:
     return {"retired": True, "unit": name, "service": after.to_dict()}
 
 
+_RUNTIME_PROBE_FAILURE_REASON_MAX_CHARS = 512
+
+
+def _runtime_probe_failure_details(result: Any) -> dict[str, Any]:
+    details: dict[str, Any] = {"returncode": result.returncode}
+    stdout = getattr(result, "stdout", None)
+    if not isinstance(stdout, str):
+        return details
+    try:
+        value = json.loads(stdout)
+    except (UnicodeError, json.JSONDecodeError):
+        return details
+    if not isinstance(value, dict) or value.get("state") != "error":
+        return details
+    reason = value.get("reason")
+    if not isinstance(reason, str):
+        return details
+    reason = " ".join(reason.split())
+    if not reason:
+        return details
+    truncated = len(reason) > _RUNTIME_PROBE_FAILURE_REASON_MAX_CHARS
+    if truncated:
+        reason = reason[: _RUNTIME_PROBE_FAILURE_REASON_MAX_CHARS - 3] + "..."
+    details["probe_failure"] = {
+        "state": "error",
+        "reason": reason,
+        "reason_truncated": truncated,
+    }
+    return details
+
+
 def _probe_release_runtime(
     *,
     release_path: Path,
@@ -5644,7 +5675,7 @@ def _probe_release_runtime(
         core.fail(
             "Runtime MCP readiness probe failed",
             phase="green-readiness",
-            details={"returncode": result.returncode},
+            details=_runtime_probe_failure_details(result),
         )
     try:
         value = json.loads(result.stdout)

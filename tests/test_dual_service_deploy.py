@@ -4949,6 +4949,83 @@ class SignedIngressProfileCutoverTests(unittest.TestCase):
             self.assertEqual([profile], list(root.iterdir()))
 
 
+class RuntimeReadinessProbeDiagnosticsTests(unittest.TestCase):
+    def test_structured_probe_failure_reason_is_preserved(self) -> None:
+        result = SimpleNamespace(
+            returncode=2,
+            stdout=json.dumps(
+                {"state": "error", "reason": "runtime release identity mismatch"}
+            ),
+            stderr="",
+        )
+
+        self.assertEqual(
+            dual._runtime_probe_failure_details(result),
+            {
+                "returncode": 2,
+                "probe_failure": {
+                    "state": "error",
+                    "reason": "runtime release identity mismatch",
+                    "reason_truncated": False,
+                },
+            },
+        )
+
+    def test_structured_probe_failure_reason_is_bounded(self) -> None:
+        reason = "x" * (dual._RUNTIME_PROBE_FAILURE_REASON_MAX_CHARS + 50)
+        result = SimpleNamespace(
+            returncode=2,
+            stdout=json.dumps({"state": "error", "reason": reason}),
+            stderr="",
+        )
+
+        details = dual._runtime_probe_failure_details(result)
+        failure = details["probe_failure"]
+        self.assertTrue(failure["reason_truncated"])
+        self.assertEqual(
+            len(failure["reason"]), dual._RUNTIME_PROBE_FAILURE_REASON_MAX_CHARS
+        )
+        self.assertTrue(failure["reason"].endswith("..."))
+        self.assertNotIn(reason, json.dumps(details, sort_keys=True))
+
+    def test_probe_failure_receipt_uses_structured_reason(self) -> None:
+        result = SimpleNamespace(
+            returncode=2,
+            stdout=json.dumps(
+                {"state": "error", "reason": "manifest identity does not match"}
+            ),
+            stderr="sensitive unstructured stderr",
+        )
+        with mock.patch.object(core, "run", return_value=result):
+            with self.assertRaises(core.DeployError) as raised:
+                dual._probe_release_runtime(
+                    release_path=Path("/tmp/release"),
+                    port=dual.GREEN_OPERATOR_LISTENER_PORT,
+                    auth_mode="disabled",
+                    expected_release_id="release",
+                    expected_repo_head="a" * 40,
+                    expected_agent_instructions_sha256="b" * 64,
+                    timeout_seconds=5,
+                )
+
+        self.assertEqual(raised.exception.phase, "green-readiness")
+        self.assertEqual(
+            raised.exception.details,
+            {
+                "returncode": 2,
+                "probe_failure": {
+                    "state": "error",
+                    "reason": "manifest identity does not match",
+                    "reason_truncated": False,
+                },
+            },
+        )
+        self.assertNotIn(
+            "sensitive unstructured stderr",
+            json.dumps(raised.exception.details, sort_keys=True),
+        )
+
+
 class RuntimeDeployObserverActivationDiagnosticsTests(unittest.TestCase):
     def test_activation_failures_report_exact_stage_without_exception_message(self) -> None:
         directory = Path("/tmp/grabowski-observer-job")
