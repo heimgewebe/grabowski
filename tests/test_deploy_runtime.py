@@ -2266,6 +2266,70 @@ class DeployRuntimeTests(unittest.TestCase):
             listed.assert_not_called()
             stop.assert_called_once_with(proc)
 
+    def test_modern_verification_failures_fall_back_to_fresh_legacy_probe(self) -> None:
+        contract = self._contract()
+        proc = object()
+        valid_discovery = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "supportedVersions": [deploy_runtime.MCP_MODERN_PROTOCOL_VERSION],
+                "capabilities": {},
+                "instructions": TEST_AGENT_INSTRUCTIONS,
+            },
+        }
+        cases = (
+            (
+                "unsupported-version",
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "supportedVersions": ["2025-06-18"],
+                        "capabilities": {},
+                        "instructions": TEST_AGENT_INSTRUCTIONS,
+                    },
+                },
+                None,
+            ),
+            (
+                "malformed-capabilities",
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "supportedVersions": [deploy_runtime.MCP_MODERN_PROTOCOL_VERSION],
+                        "capabilities": [],
+                        "instructions": TEST_AGENT_INSTRUCTIONS,
+                    },
+                },
+                None,
+            ),
+            (
+                "tools-list-error",
+                valid_discovery,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "error": {"code": -32601, "message": "tools/list rejected"},
+                },
+            ),
+        )
+        for name, discovered, listed in cases:
+            with self.subTest(name=name):
+                with (
+                    patch.object(deploy_runtime, "_start_mcp_probe_process", return_value=proc),
+                    patch.object(deploy_runtime, "send_json"),
+                    patch.object(deploy_runtime, "wait_for_id_optional", return_value=discovered),
+                    patch.object(deploy_runtime, "wait_for_id", return_value=listed),
+                    patch.object(deploy_runtime, "stop_process") as stop,
+                ):
+                    result = deploy_runtime._probe_mcp_modern(
+                        Path("/release"), Path("/python"), contract
+                    )
+                self.assertIsNone(result)
+                stop.assert_called_once_with(proc)
+
     def test_failed_modern_probe_cannot_be_reported_as_modern_success(self) -> None:
         expected = deploy_runtime.MCPProbeResult(
             protocol_version="2025-06-18",

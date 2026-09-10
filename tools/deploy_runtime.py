@@ -1583,6 +1583,8 @@ def _probe_mcp_modern(
                 agent_instructions=instructions,
                 verification_path="modern-discover-tools-list",
             )
+        except DeployError:
+            return None
         finally:
             stop_process(proc)
 
