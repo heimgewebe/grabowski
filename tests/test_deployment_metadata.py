@@ -243,6 +243,18 @@ class DeploymentMetadataTests(unittest.TestCase):
         self.assertTrue(metadata["runtime_asset_identity_valid"])
         self.assertTrue(metadata["provenance_valid"])
 
+    def test_modern_mcp_protocol_version_is_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = self._release(Path(directory))
+            manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+            manifest["mcp_protocol_version"] = "2026-07-28"
+            paths["manifest"].write_text(
+                json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            metadata = self._metadata(paths)
+        self.assertTrue(metadata["protocol_identity_valid"])
+        self.assertTrue(metadata["artifact_integrity_valid"])
+
     def test_agent_instructions_manifest_drift_invalidates_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             paths = self._release(Path(directory))
