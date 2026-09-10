@@ -339,6 +339,30 @@ class TestDerKleineMaulwurfOperator(unittest.TestCase):
         self.assertIn("task:root@local:systemd-root-broker:system:root.service:running", effects)
         self.assertIn("task:remote@node:systemd-user:user:remote.service:running", effects)
 
+    def test_detached_effect_scan_limits_persistent_tasks_to_local_host(self) -> None:
+
+        def fake_run(argv, **_kwargs):
+            if argv[0] == "systemctl":
+                return types.SimpleNamespace(returncode=0, stdout="")
+            return types.SimpleNamespace(returncode=1, stdout="")
+
+        with (
+            patch.object(mole.subprocess, "run", side_effect=fake_run),
+            patch.object(
+                tasks,
+                "recovery_active_task_effects",
+                return_value=[
+                    "task:local@wg-prod-1:systemd-user:user:local.service:running",
+                ],
+            ) as active_tasks,
+        ):
+            effects = mole.active_recovery_detached_effects()
+        active_tasks.assert_called_once_with(local_only=True)
+        self.assertIn(
+            "task:local@wg-prod-1:systemd-user:user:local.service:running",
+            effects,
+        )
+
     def test_post_replace_directory_fsync_failure_is_explicitly_unknown(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "mode.json"
