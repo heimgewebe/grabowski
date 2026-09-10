@@ -472,6 +472,13 @@ _OBSERVERS: dict[str, Callable[[str], dict[str, Any]]] = {
     "work_lane": work_lane_terminal_evidence,
 }
 
+# One historical checkout generation used the pre-canonical spelling below.
+# Treat only that witnessed spelling as an alias; absence of source evidence
+# still fails closed through the canonical observer.
+_LEGACY_SOURCE_KIND_ALIASES = {
+    "operator-obligation": "operator_obligation",
+}
+
 
 def source_terminal_evidence(binding: dict[str, Any]) -> dict[str, Any]:
     source = binding.get("source")
@@ -483,7 +490,8 @@ def source_terminal_evidence(binding: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("checkout lifecycle source binding is invalid")
     if frozenset(_OBSERVERS) != checkouts.TERMINAL_EVIDENCE_SOURCE_KINDS:
         raise RuntimeError("checkout terminal evidence observer contract drift")
-    observer = _OBSERVERS.get(kind)
+    canonical_kind = _LEGACY_SOURCE_KIND_ALIASES.get(kind, kind)
+    observer = _OBSERVERS.get(canonical_kind)
     if observer is None:
         if kind == "automation":
             raise RuntimeError(
@@ -492,10 +500,12 @@ def source_terminal_evidence(binding: dict[str, Any]) -> dict[str, Any]:
             )
         raise RuntimeError(f"unsupported checkout lifecycle source kind: {kind}")
     evidence = observer(source_id)
-    if evidence.get("kind") != kind or evidence.get("source_id") != source_id:
+    if evidence.get("kind") != canonical_kind or evidence.get("source_id") != source_id:
         raise RuntimeError("source terminal evidence is bound to another source")
     claimed = evidence.get("evidence_sha256")
     core = {key: value for key, value in evidence.items() if key != "evidence_sha256"}
     if claimed != checkouts._sha256_json(core):
         raise RuntimeError("source terminal evidence digest is invalid")
+    if canonical_kind != kind:
+        evidence = _terminal_evidence({**core, "source_kind_alias": kind})
     return evidence
