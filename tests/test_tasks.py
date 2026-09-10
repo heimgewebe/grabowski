@@ -7168,6 +7168,16 @@ class TaskTests(unittest.TestCase):
                 "state": "running",
                 "created_at_unix": 3,
             },
+            {
+                "task_id": "d" * 24,
+                "host": "old-local-name",
+                "unit": "grabowski-task-dddddddddddddddddddddddd-a1.service",
+                "authoritative_unit": "grabowski-task-dddddddddddddddddddddddd-a1.service",
+                "execution_backend": "systemd-root-broker",
+                "systemd_scope": "system",
+                "state": "running",
+                "created_at_unix": 2,
+            },
         ]
 
         class Result:
@@ -7201,19 +7211,25 @@ class TaskTests(unittest.TestCase):
             patch.object(tasks, "_observe", return_value={"state": "running"}) as observe,
         ):
             effects = tasks.recovery_active_task_effects(local_only=True)
-        observe.assert_called_once()
-        self.assertIn("host IN (?,?)", connection.query)
+        self.assertEqual(2, observe.call_count)
+        self.assertIn(
+            "(host IN (?,?) OR execution_backend = ?)", connection.query
+        )
         self.assertEqual(
             (
                 *tasks.RECOVERY_TASK_OBSERVE_STATES,
                 "wg-prod-1",
                 "local",
+                "systemd-root-broker",
                 tasks.RECOVERY_ACTIVE_TASK_SCAN_LIMIT + 1,
             ),
             connection.parameters,
         )
-        self.assertEqual(1, len(effects))
-        self.assertIn("@wg-prod-1:", effects[0])
+        self.assertEqual(2, len(effects))
+        self.assertIn("@wg-prod-1:systemd-user:user:", effects[0])
+        self.assertIn(
+            "@old-local-name:systemd-root-broker:system:", effects[1]
+        )
 
     def _task_migration_backups(self) -> list[Path]:
         return sorted(

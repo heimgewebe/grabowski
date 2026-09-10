@@ -7367,17 +7367,23 @@ def recovery_active_task_effects(
     observe_states = RECOVERY_TASK_OBSERVE_STATES
     active_states = TASK_STATE_PROJECTIONS["active"]
     placeholders = ",".join("?" for _ in observe_states)
-    host_filter: tuple[str, ...] = ()
-    host_clause = ""
+    local_filter: tuple[str, ...] = ()
+    local_clause = ""
     if local_only:
-        host_filter = _recovery_local_task_host_names()
-        host_placeholders = ",".join("?" for _ in host_filter)
-        host_clause = f" AND host IN ({host_placeholders})"
+        local_hosts = _recovery_local_task_host_names()
+        host_placeholders = ",".join("?" for _ in local_hosts)
+        local_clause = (
+            f" AND (host IN ({host_placeholders}) OR execution_backend = ?)"
+        )
+        # Root-broker tasks can only be created for local fleet targets. Keep
+        # them drain-visible even if the local fleet host is renamed while a
+        # task is still active; user-manager tasks remain host-name scoped.
+        local_filter = (*local_hosts, "systemd-root-broker")
     with _task_read_snapshot() as connection:
         rows = connection.execute(
-            f"SELECT * FROM tasks WHERE state IN ({placeholders}){host_clause} "
+            f"SELECT * FROM tasks WHERE state IN ({placeholders}){local_clause} "
             "ORDER BY created_at_unix DESC, task_id DESC LIMIT ?",
-            (*observe_states, *host_filter, limit + 1),
+            (*observe_states, *local_filter, limit + 1),
         ).fetchall()
     if len(rows) > limit:
         raise RuntimeError("recovery_active_task_scan_limit_exceeded")
