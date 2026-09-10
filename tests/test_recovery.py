@@ -677,10 +677,10 @@ class RecoveryToolTests(unittest.TestCase):
             self.assertTrue(recovery._uses_default_heimserver_recovery_backend())
 
     def test_recovery_status_reports_custom_target_without_unblocking_stale_evidence(self) -> None:
-        target = "wg-prod-1:rest-server/grabowski-recovery-probe"
+        target = "commonserver:rest-server/grabowski-recovery-probe"
         result = _run_ready_recovery_status(
             {"valid": False, "target": target, "target_matches_configured": True},
-            host="wg-prod-1",
+            host="commonserver",
             target=target,
         )
 
@@ -708,7 +708,7 @@ class RecoveryToolTests(unittest.TestCase):
             with self.subTest(target=target):
                 result = _run_ready_recovery_status(
                     _fresh_server_marker(target),
-                    host="wg-prod-1",
+                    host="commonserver",
                     target=target,
                 )
 
@@ -724,10 +724,10 @@ class RecoveryToolTests(unittest.TestCase):
                 self.assertTrue(any(action.startswith("repair server recovery target configuration:") for action in result["required_actions"]))
 
     def test_recovery_status_allows_custom_target_with_matching_fresh_evidence(self) -> None:
-        target = "wg-prod-1:rest-server/grabowski-recovery-probe"
+        target = "commonserver:rest-server/grabowski-recovery-probe"
         result = _run_ready_recovery_status(
             _fresh_server_marker(target),
-            host="wg-prod-1",
+            host="commonserver",
             target=target,
         )
 
@@ -741,7 +741,7 @@ class RecoveryToolTests(unittest.TestCase):
 
 
     def test_server_source_marker_reports_hash_of_exact_raw_record(self) -> None:
-        target = "wg-prod-1:rest-server/grabowski-recovery-probe"
+        target = "commonserver:rest-server/grabowski-recovery-probe"
         with tempfile.TemporaryDirectory() as raw:
             marker_path = Path(raw) / "last-server-recovery.json"
             encoded = (
@@ -770,10 +770,10 @@ class RecoveryToolTests(unittest.TestCase):
         self.assertEqual(marker["source_record_sha256"], hashlib.sha256(encoded).hexdigest())
 
     def test_recovery_status_blocks_when_kill_switch_is_engaged(self) -> None:
-        target = "wg-prod-1:rest-server/grabowski-recovery-probe"
+        target = "commonserver:rest-server/grabowski-recovery-probe"
         result = _run_ready_recovery_status(
             _fresh_server_marker(target),
-            host="wg-prod-1",
+            host="commonserver",
             target=target,
             kill_switch={
                 "engaged": True,
@@ -793,13 +793,13 @@ class RecoveryToolTests(unittest.TestCase):
         )
 
     def test_recovery_status_blocks_unpublished_current_source(self) -> None:
-        target = "wg-prod-1:rest-server/grabowski-recovery-probe"
+        target = "commonserver:rest-server/grabowski-recovery-probe"
         source = _source_server_marker(target)
         source["source_record_sha256"] = "c" * 64
         source["timestamp_unix"] = int(source["timestamp_unix"]) + 1
         result = _run_ready_recovery_status(
             _fresh_server_marker(target),
-            host="wg-prod-1",
+            host="commonserver",
             target=target,
             source_marker=source,
         )
@@ -817,10 +817,10 @@ class RecoveryToolTests(unittest.TestCase):
         )
 
     def test_recovery_status_exposes_bound_test_switch_recovery(self) -> None:
-        target = "wg-prod-1:rest-server/grabowski-recovery-probe"
+        target = "commonserver:rest-server/grabowski-recovery-probe"
         result = _run_ready_recovery_status(
             _fresh_server_marker(target),
-            host="wg-prod-1",
+            host="commonserver",
             target=target,
             kill_switch={
                 "engaged": True,
@@ -1102,24 +1102,24 @@ class RecoveryToolTests(unittest.TestCase):
             )
             marker_path.chmod(0o600)
             with patch.object(recovery, "SERVER_RECOVERY", marker_path), patch.object(
-                recovery, "SERVER_RECOVERY_TARGET", "wg-prod-1:rest-server/grabowski-recovery-probe"
+                recovery, "SERVER_RECOVERY_TARGET", "commonserver:rest-server/grabowski-recovery-probe"
             ):
                 marker = recovery._server_source_marker()
 
         self.assertFalse(marker["valid"])
         self.assertFalse(marker["target_matches_configured"])
-        self.assertEqual(marker["configured_target"], "wg-prod-1:rest-server/grabowski-recovery-probe")
+        self.assertEqual(marker["configured_target"], "commonserver:rest-server/grabowski-recovery-probe")
         self.assertEqual(marker["target"], "heimserver:rest-server/grabowski-recovery-probe")
         self.assertEqual(marker["error"], "server recovery target does not match configured target")
 
     def test_recovery_status_blocks_fresh_marker_for_different_configured_target(self) -> None:
-        configured_target = "wg-prod-1:rest-server/grabowski-recovery-probe"
+        configured_target = "commonserver:rest-server/grabowski-recovery-probe"
         stale_for_config = _fresh_server_marker("heimserver:rest-server/grabowski-recovery-probe")
         stale_for_config["configured_target"] = configured_target
         stale_for_config["target_matches_configured"] = False
         stale_for_config["valid"] = False
         stale_for_config["error"] = "server recovery target does not match configured target"
-        result = _run_ready_recovery_status(stale_for_config, host="wg-prod-1", target=configured_target)
+        result = _run_ready_recovery_status(stale_for_config, host="commonserver", target=configured_target)
 
         self.assertFalse(result["checks"]["server_recovery_fresh"])
         self.assertFalse(result["ready_for_user_power_worker"])

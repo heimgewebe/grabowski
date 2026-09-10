@@ -108,7 +108,7 @@ class MaulwurfXPublicBridgeAsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_relay_preserves_http_host_and_authorization_bytes(self) -> None:
         request = (
             b"POST /mcp HTTP/1.1\r\n"
-            b"Host: wg-prod-1.tail6dbb90.ts.net:10000\r\n"
+            b"Host: commonserver.tail6dbb90.ts.net:10000\r\n"
             b"Authorization: Bearer mx-test\r\n"
             b"Content-Type: application/json\r\n\r\n{}"
         )

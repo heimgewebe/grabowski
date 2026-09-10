@@ -1509,13 +1509,13 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                     )
 
                 policy["profiles"]["test"]["forbidden_hosts"] = [
-                    "wg-prod-1",
+                    "commonserver",
                     "heim-pc",
                     "heimserver",
                 ]
-                with self.assertRaisesRegex(PermissionError, "wg-prod-1"):
+                with self.assertRaisesRegex(PermissionError, "commonserver"):
                     grabowski_mcp._reject_forbidden_hosts_in_argv(
-                        ["ssh", "wg-prod-1", "hostname"], policy=policy
+                        ["ssh", "commonserver", "hostname"], policy=policy
                     )
                 with self.assertRaisesRegex(PermissionError, "heim-pc"):
                     grabowski_mcp._reject_forbidden_hosts_in_argv(

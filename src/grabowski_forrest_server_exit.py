@@ -7,7 +7,7 @@ import subprocess
 from typing import Any
 
 SSH = "/usr/bin/ssh"
-HOST = "wg-prod-1"
+HOST = "commonserver"
 EXPECTED_443 = "http://127.0.0.1:18000"
 PRESERVED_8443 = "http://127.0.0.1:18090"
 SSH_PREFIX = [

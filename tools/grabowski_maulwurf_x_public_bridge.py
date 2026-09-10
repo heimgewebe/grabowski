@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Transparent bounded TCP/TLS bridge for the Maulwurf X public ingress.
 
-Tailscale Funnel terminates public HTTPS on wg-prod-1 and forwards plaintext TCP
+Tailscale Funnel terminates public HTTPS on commonserver and forwards plaintext TCP
 HTTP to this loopback listener.  This bridge opens a TLS-verified connection to
 the existing heim-pc Funnel.  It deliberately has no HTTP, MCP, credential or
 Grabowski policy logic; those authorities stay on the Maulwurf X gateway and

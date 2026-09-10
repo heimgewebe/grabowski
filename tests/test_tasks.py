@@ -2678,7 +2678,7 @@ class TaskTests(unittest.TestCase):
             "ExecMainStatus=0\n"
         )
         observed = {
-            "host": "wg-prod-1",
+            "host": "commonserver",
             "transport": "ssh",
             "roles": ["vps", "production"],
             "observer": tasks.fleet.TASK_UNIT_SHOW_OBSERVER,
@@ -2687,12 +2687,12 @@ class TaskTests(unittest.TestCase):
         with patch.object(
             tasks,
             "_dispatch",
-            side_effect=tasks.fleet.FleetCommandDenied("Executable is not allowed for fleet host wg-prod-1: systemctl"),
+            side_effect=tasks.fleet.FleetCommandDenied("Executable is not allowed for fleet host commonserver: systemctl"),
         ), patch.object(
             tasks.fleet, "run_fleet_task_unit_show", return_value=observed
         ) as show:
             result = tasks._observe({
-                "host": "wg-prod-1",
+                "host": "commonserver",
                 "unit": "grabowski-task-0123456789abcdef01234567-a1.service",
             })
         self.assertEqual(result["state"], "completed")
@@ -2702,7 +2702,7 @@ class TaskTests(unittest.TestCase):
             "fleet-dispatch-permission-denied",
         )
         show.assert_called_once_with(
-            "wg-prod-1",
+            "commonserver",
             "grabowski-task-0123456789abcdef01234567-a1.service",
             tasks.fleet.TASK_UNIT_SHOW_PROPERTIES,
             timeout_seconds=30,
@@ -2713,13 +2713,13 @@ class TaskTests(unittest.TestCase):
         with patch.object(
             tasks,
             "_dispatch",
-            side_effect=tasks.fleet.FleetCommandDenied("Executable is not allowed for fleet host wg-prod-1: systemctl"),
+            side_effect=tasks.fleet.FleetCommandDenied("Executable is not allowed for fleet host commonserver: systemctl"),
         ), patch.object(
             tasks.fleet, "run_fleet_task_unit_show", side_effect=RuntimeError("ssh failed")
         ):
             with self.assertRaisesRegex(RuntimeError, "ssh failed"):
                 tasks._observe({
-                    "host": "wg-prod-1",
+                    "host": "commonserver",
                     "unit": "grabowski-task-0123456789abcdef01234567-a1.service",
                 })
 

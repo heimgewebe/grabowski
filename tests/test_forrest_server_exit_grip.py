@@ -10,20 +10,20 @@ import grabowski_grips
 
 PRE = """
 # Funnel on:
-#     - https://wg-prod-1.tail6dbb90.ts.net:8443
-#     - https://wg-prod-1.tail6dbb90.ts.net
+#     - https://commonserver.tail6dbb90.ts.net:8443
+#     - https://commonserver.tail6dbb90.ts.net
 
-https://wg-prod-1.tail6dbb90.ts.net (Funnel on)
+https://commonserver.tail6dbb90.ts.net (Funnel on)
 |-- / proxy http://127.0.0.1:18000
 
-https://wg-prod-1.tail6dbb90.ts.net:8443 (Funnel on)
+https://commonserver.tail6dbb90.ts.net:8443 (Funnel on)
 |-- / proxy http://127.0.0.1:18090
 """
 POST = """
 # Funnel on:
-#     - https://wg-prod-1.tail6dbb90.ts.net:8443
+#     - https://commonserver.tail6dbb90.ts.net:8443
 
-https://wg-prod-1.tail6dbb90.ts.net:8443 (Funnel on)
+https://commonserver.tail6dbb90.ts.net:8443 (Funnel on)
 |-- / proxy http://127.0.0.1:18090
 """
 SOCKETS = "LISTEN 0 4096 127.0.0.1:18090 0.0.0.0:*\n"

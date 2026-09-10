@@ -911,7 +911,7 @@ GRIP_SPECS: dict[str, GripSpec] = {
     "forrest-server-exit-apply": GripSpec(
         name="forrest-server-exit-apply",
         version="1.0",
-        summary="Remove only Forrest's fixed wg-prod-1 HTTPS 443 serve route after exact protected-route and backend-port preconditions.",
+        summary="Remove only Forrest's fixed commonserver HTTPS 443 serve route after exact protected-route and backend-port preconditions.",
         effect=MUTATING,
         required_parameters=(),
         acceptance_ids=(
@@ -14774,7 +14774,7 @@ def _run_forrest_server_exit_apply(
         )
     import grabowski_forrest_server_exit
 
-    _check(receipt, "fixed-target-bound", "pass", "wg-prod-1:https:443")
+    _check(receipt, "fixed-target-bound", "pass", "commonserver:https:443")
     try:
         output = grabowski_forrest_server_exit.apply()
     except (OSError, PermissionError, RuntimeError, TypeError, ValueError) as exc:
