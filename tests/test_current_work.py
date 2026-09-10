@@ -1418,7 +1418,8 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertEqual(result["total_projected"], 1)
         self.assertEqual(result["state_counts"]["blocking"], 0)
         group = result["work"][0]
-        self.assertEqual(group["projection_state"], "terminal_archived")
+        self.assertEqual(group["projection_state"], "hygiene")
+        self.assertEqual(group["convergence_stage"], "hygiene")
         self.assertTrue(group["action_required"])
         self.assertIn("attention-actionable", group["action_reasons"])
         self.assertEqual(

@@ -855,22 +855,7 @@ def _apply_attention(
         if classification in ATTENTION_BLOCKING_CLASSIFICATIONS:
             _blocking(group, f"attention-{classification}")
         elif classification == "actionable":
-            group["action_required"] = True
-            reason = "attention-actionable"
-            if reason not in group["action_reasons"]:
-                group["action_reasons"].append(reason)
-            if group["projection_state"] == "unknown":
-                state = item["state"]
-                if state in ACTIVE_TASK_STATES:
-                    _set_projection_state(group, "active")
-                elif state == "interrupted":
-                    _resumable(group, "task-interrupted")
-                elif state == "outcome_unknown":
-                    _blocking(group, "task-outcome_unknown")
-                elif state in TERMINAL_TASK_STATES:
-                    _set_projection_state(group, "terminal_archived")
-                else:
-                    _unknown(group, f"unknown-attention-state:{state}")
+            _hygiene(group, "attention-actionable")
         elif classification in ATTENTION_RESUMABLE_CLASSIFICATIONS:
             _resumable(group, f"attention-{classification}")
         elif classification in ATTENTION_ARCHIVED_CLASSIFICATIONS:
@@ -1798,26 +1783,25 @@ def derive_group_convergence_recommendation(group: dict[str, Any]) -> dict[str, 
                 "priority": 4,
             }
 
+    if (
+        projection_state == "hygiene"
+        and "attention-actionable" in action_reasons
+    ):
+        return {
+            "convergence_stage": "hygiene",
+            "next_convergence_action": (
+                "review actionable attention without blocking independent work"
+            ),
+            "finishable_chain": False,
+            "priority": 5,
+        }
+
     # Historical reconciliation without a current authority or physical surface is
     # hygiene.  It remains visible but must not displace operative work.
     if projection_state == "hygiene":
         return {
             "convergence_stage": "hygiene",
             "next_convergence_action": "process historical checkout-binding hygiene separately",
-            "finishable_chain": False,
-            "priority": 5,
-        }
-
-    if (
-        projection_state == "terminal_archived"
-        and "attention-actionable" in action_reasons
-        and not has_live_surfaces
-    ):
-        return {
-            "convergence_stage": "terminal_archived",
-            "next_convergence_action": (
-                "review actionable attention without blocking independent work"
-            ),
             "finishable_chain": False,
             "priority": 5,
         }
@@ -2064,7 +2048,7 @@ def build_current_work_projection(
         "when repository-filtered checkout evidence binds to global work groups"
     ]
     has_actionable_attention_followup = any(
-        group["projection_state"] == "terminal_archived"
+        group["projection_state"] == "hygiene"
         and group["action_required"]
         and "attention-actionable" in group["action_reasons"]
         for group in projected
@@ -2142,10 +2126,10 @@ def build_current_work_projection(
             if state_counts["blocking"]
             else "inspect resumable work groups"
             if state_counts["resumable"]
-            else "process hygiene and rescue candidates separately"
-            if state_counts["hygiene"]
             else "review actionable attention without blocking independent work"
             if has_actionable_attention_followup
+            else "process hygiene and rescue candidates separately"
+            if state_counts["hygiene"]
             else "none"
         ),
         "next_convergence_action_scope": MIXED_SOURCE_SCOPE,
