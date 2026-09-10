@@ -9,7 +9,7 @@ Heimberry is the single online authority for which operator may perform globally
 The two callers are exactly:
 
 - `grabowski` on heim-pc;
-- `der-kleine-maulwurf` on wg-prod-1.
+- `der-kleine-maulwurf` on commonserver.
 
 The transport deliberately adds no TCP daemon and no shared filesystem. Each request is one bounded JSON document over an SSH connection whose host identity and client key are pinned. Heimberry executes one forced command, handles exactly one request, writes exactly one response, and exits.
 
