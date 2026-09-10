@@ -11,7 +11,7 @@ Der kanonische Produktionspfad ist genau:
 ```text
 Grok / Grok Custom Connector
   -> https://wg-prod-1.tail6dbb90.ts.net:10000/mcp
-  -> wg-prod-1 Tailscale Funnel :10000
+  -> legacy Tailscale Funnel wg-prod-1 :10000
   -> http://127.0.0.1:18091
   -> maulwurf-x-public-bridge.service
        transparent TCP only; no HTTP rewrite, credentials or MCP policy
@@ -26,6 +26,11 @@ Grok / Grok Custom Connector
        signed one-call transport
   -> canonical/green Grabowski operator
 ```
+
+Die Maschine hinter dem ersten Funnel heißt OS- und Fleet-seitig `commonserver`.
+Der öffentliche Tailscale-/Funnel-DNS-Name `wg-prod-1.tail6dbb90.ts.net` bleibt
+bewusst als Kompatibilitätsschicht bestehen, bis ein separater Public-DNS-Cutover
+nachgewiesen ist.
 
 Der bestehende OpenAI-Tunnel und `primary.token` bleiben unverändert. Das
 externe Grok-Credential darf nie identisch mit der internen Grabowski-Capability
@@ -83,12 +88,12 @@ Dadurch bestehen drei getrennte Schranken:
    create-only Finding-Record; eine spätere Prüfung oder Übernahme ist ein eigener
    Autoritätsschritt.
 
-### 4. Public Bridge auf wg-prod-1
+### 4. Public Bridge auf commonserver
 
 Der Bridge-Layer ist absichtlich **keine** weitere Security-Authority. Er kennt
 weder HTTP-Header noch MCP-Methoden, Toolnamen oder Credentials. Er transportiert
 nur Bytes von seinem Loopback-Listener zu einem TLS-verifizierten heim-pc-Funnel.
-Insbesondere liegen auf wg-prod-1 keine Maulwurf-X-Tokenbytes.
+Insbesondere liegen auf commonserver keine Maulwurf-X-Tokenbytes.
 
 Der Loopback-Listenvertrag ist nicht nur ein Default: die Bridge verweigert
 jeden `--listen-host` außer `127.0.0.1` und `::1`. Damit kann die CLI den
@@ -195,7 +200,7 @@ Die Aktivierung muss in dieser Reihenfolge erfolgen:
    `required-v1` und Modus `0600` anlegen.
 7. `grabowski-transport-ingress-maulwurf-x.service` **enable + start** und lokal prüfen.
 8. `grabowski-external-connector-maulwurf-x.service` **enable + start** und lokal prüfen.
-9. Auf wg-prod-1 die commitgebundene Public Bridge installieren/aktivieren und
+9. Auf commonserver die commitgebundene Public Bridge installieren/aktivieren und
    verifizieren, dass Funnel `:10000` weiterhin ausschließlich auf
    `http://127.0.0.1:18091` zeigt. Port `8443` bleibt unberührt.
 10. Den öffentlichen Pfad mit dem realen öffentlichen Hostnamen positiv und
@@ -229,20 +234,20 @@ den primären Connector als Pflichtabhängigkeit belastet.
 ### Kanonischer Produktionspfad
 
 Für den aktuellen Produktionsvertrag gilt ausschließlich der am Anfang dieses
-Dokuments gezeigte wg-prod-1-Pfad. Der kürzere direkte heim-pc-Funnel wurde
+Dokuments gezeigte öffentliche `wg-prod-1.tail6dbb90.ts.net`-Pfad. Der kürzere direkte heim-pc-Funnel wurde
 bewusst **nicht** kanonisiert, weil am realen öffentlichen Rand TLS-EOF-Fehler
 beobachtet wurden. Eine spätere Vereinfachung auf direkten heim-pc-Ingress ist
 ein eigener, neu zu beweisender Cutover und keine alternative Laufzeitwahrheit
 dieses Vertrags.
 
-Port `8443` auf wg-prod-1 gehört einem anderen Funnel und wird von diesem Vertrag
+Port `8443` unter der Legacy-Funnel-Identität `wg-prod-1.tail6dbb90.ts.net` gehört einem anderen Funnel und wird von diesem Vertrag
 **nicht** verändert. Auch der Installer verändert keinerlei Tailscale
 Serve-/Funnel-Konfiguration. Die Funnel-Konfiguration wird separat und immer nach
 frischem vollständigem `tailscale serve status` verwaltet.
 
-### Installation auf wg-prod-1
+### Installation auf commonserver
 
-Die drei versionierten Artefakte werden commitgebunden auf wg-prod-1 in einen
+Die drei versionierten Artefakte werden commitgebunden auf commonserver in einen
 temporären, nicht geheimen Staging-Pfad übertragen. Dort wird ausgeführt:
 
 ```text
@@ -290,9 +295,9 @@ Vor Consumer-Cutover werden mindestens folgende Punkte frisch geprüft:
 4. systemd-Linger für den Benutzer ist aktiv;
 5. keine manuell gestartete oder verwaiste Bridge-Instanz existiert;
 6. Namensauflösung von `heim-pc.tail6dbb90.ts.net` funktioniert unter den echten
-   Address-Family-Beschränkungen der wg-prod-1-Unit. `AF_UNIX` wird nur ergänzt,
+   Address-Family-Beschränkungen der auf commonserver laufenden Unit. `AF_UNIX` wird nur ergänzt,
    falls dieser reale Test es verlangt;
-7. wg-prod-1 Funnel `:10000` zeigt auf `http://127.0.0.1:18091`, während
+7. Der Legacy-Funnel `wg-prod-1.tail6dbb90.ts.net:10000` zeigt auf `http://127.0.0.1:18091`, während
    bestehende andere Funnel unverändert bleiben;
 8. heim-pc Gateway und signed ingress laufen auf `18184` bzw. `18183`;
 9. ein Request mit dem realen öffentlichen Host
@@ -356,9 +361,9 @@ Negative Beweise:
 
 Der Rollback ist schichtweise und beschädigt den primären Connector nicht:
 
-1. öffentlichen Maulwurf-X-Funnel auf wg-prod-1 deaktivieren bzw. auf den zuvor
+1. öffentlichen Maulwurf-X-Funnel unter der Legacy-Identität `wg-prod-1.tail6dbb90.ts.net` deaktivieren bzw. auf den zuvor
    frisch gelesenen Zustand zurücksetzen;
-2. `maulwurf-x-public-bridge.service` auf wg-prod-1 stoppen/deaktivieren;
+2. `maulwurf-x-public-bridge.service` auf commonserver stoppen/deaktivieren;
 3. Gateway-Service auf heim-pc stoppen/deaktivieren;
 4. sekundären signed-ingress-Service stoppen/deaktivieren;
 5. `maulwurf-x`-Secrets und Policy nur nach gesondertem Audit entfernen;
