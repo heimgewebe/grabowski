@@ -2063,6 +2063,12 @@ def build_current_work_projection(
         "sources; aggregate values also include global operator sources and may change "
         "when repository-filtered checkout evidence binds to global work groups"
     ]
+    has_actionable_attention_followup = any(
+        group["projection_state"] == "terminal_archived"
+        and group["action_required"]
+        and "attention-actionable" in group["action_reasons"]
+        for group in projected
+    )
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -2138,6 +2144,8 @@ def build_current_work_projection(
             if state_counts["resumable"]
             else "process hygiene and rescue candidates separately"
             if state_counts["hygiene"]
+            else "review actionable attention without blocking independent work"
+            if has_actionable_attention_followup
             else "none"
         ),
         "next_convergence_action_scope": MIXED_SOURCE_SCOPE,

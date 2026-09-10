@@ -1429,6 +1429,10 @@ class CurrentWorkProjectionTests(unittest.TestCase):
             result["next_convergence_action"],
             "review actionable attention without blocking independent work",
         )
+        self.assertEqual(
+            result["recommended_next_action"],
+            "review actionable attention without blocking independent work",
+        )
 
     def test_active_task_actionable_attention_stays_active(self) -> None:
         task_id = "actionable-active"
