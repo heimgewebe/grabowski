@@ -4987,6 +4987,14 @@ class RuntimeReadinessProbeDiagnosticsTests(unittest.TestCase):
         )
         self.assertTrue(failure["reason"].endswith("..."))
         self.assertNotIn(reason, json.dumps(details, sort_keys=True))
+        summary = core.safe_error_summary(
+            core.DeployError(
+                "Runtime MCP readiness probe failed",
+                phase="green-readiness",
+                details=details,
+            )
+        )
+        self.assertEqual(summary["details"], details)
 
     def test_probe_failure_receipt_uses_structured_reason(self) -> None:
         result = SimpleNamespace(

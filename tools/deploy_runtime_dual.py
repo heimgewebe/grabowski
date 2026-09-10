@@ -5600,7 +5600,7 @@ def _stop_green_operator(unit: str) -> dict[str, Any]:
     return {"retired": True, "unit": name, "service": after.to_dict()}
 
 
-_RUNTIME_PROBE_FAILURE_REASON_MAX_CHARS = 512
+_RUNTIME_PROBE_FAILURE_REASON_MAX_CHARS = 500
 
 
 def _runtime_probe_failure_details(result: Any) -> dict[str, Any]:
