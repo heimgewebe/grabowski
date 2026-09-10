@@ -14,6 +14,10 @@ from typing import Iterable
 BWRAP = Path(os.environ.get("GRABOWSKI_BWRAP_BIN", "/usr/bin/bwrap"))
 TAIL_BYTES = 12000
 MAX_WRITABLE_SCOPE_ENTRIES = 100_000
+_GIT_COMMAND_CONFIG = (
+    ("core.hooksPath", "/dev/null"),
+    ("core.fsmonitor", "false"),
+)
 
 
 class AgentSandboxError(RuntimeError):
@@ -88,13 +92,18 @@ def prepare_external_agent_command(command: list[str]) -> PreparedSandboxCommand
     )
 
 
+def _git_command_environment() -> dict[str, str]:
+    """Return command-scope Git overrides safe to expose to external agents."""
+    environment = {"GIT_CONFIG_COUNT": str(len(_GIT_COMMAND_CONFIG))}
+    for index, (key, value) in enumerate(_GIT_COMMAND_CONFIG):
+        environment[f"GIT_CONFIG_KEY_{index}"] = key
+        environment[f"GIT_CONFIG_VALUE_{index}"] = value
+    return environment
+
+
 def safe_git_environment(base: dict[str, str] | None = None) -> dict[str, str]:
     """Return a non-interactive Git environment with executable helpers disabled."""
     environment = dict(os.environ if base is None else base)
-    command_config = [
-        ("core.hooksPath", "/dev/null"),
-        ("core.fsmonitor", "false"),
-    ]
     environment.update(
         {
             "LC_ALL": "C",
@@ -105,12 +114,9 @@ def safe_git_environment(base: dict[str, str] | None = None) -> dict[str, str]:
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_ATTR_NOSYSTEM": "1",
             "GIT_ALLOW_PROTOCOL": "ssh:https:file",
-            "GIT_CONFIG_COUNT": str(len(command_config)),
         }
     )
-    for index, (key, value) in enumerate(command_config):
-        environment[f"GIT_CONFIG_KEY_{index}"] = key
-        environment[f"GIT_CONFIG_VALUE_{index}"] = value
+    environment.update(_git_command_environment())
     return environment
 
 
@@ -377,6 +383,12 @@ def minimal_sandbox_argv(
             "--setenv",
             "GIT_OPTIONAL_LOCKS",
             "0",
+        ]
+    )
+    for key, value in _git_command_environment().items():
+        arguments.extend(["--setenv", key, value])
+    arguments.extend(
+        [
             "--chdir",
             str(worktree),
             "--",
