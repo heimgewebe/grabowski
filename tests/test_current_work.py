@@ -1453,6 +1453,20 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertTrue(group["action_required"])
         self.assertIn("attention-actionable", group["action_reasons"])
 
+    def test_interrupted_actionable_attention_remains_resumable(self) -> None:
+        task_id = "actionable-interrupted"
+        result = project(
+            attention_payload={
+                "records": [attention(task_id, "actionable", state="interrupted")],
+                "pagination": {"has_more": False},
+            },
+        )
+        group = result["work"][0]
+        self.assertEqual(group["projection_state"], "resumable")
+        self.assertTrue(group["action_required"])
+        self.assertIn("attention-actionable", group["action_reasons"])
+        self.assertIn("task-interrupted", group["action_reasons"])
+
     def test_outcome_unknown_attention_remains_blocking(self) -> None:
         task_id = "attention-outcome-unknown"
         result = project(
