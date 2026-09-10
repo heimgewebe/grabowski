@@ -118,7 +118,7 @@ class ReviewEvidencePublicationRaceTests(unittest.TestCase):
         with self._env(_comment_body()), mock.patch.object(
             ci, "collaborator_permission", return_value="write"
         ), mock.patch.object(ci, "load_live_pr", side_effect=[_pr(), _pr()]), mock.patch.object(
-            ci, "current_diff_sha256", return_value="b" * 64
+            ci, "current_diff_sha256s", return_value=("b" * 64,)
         ), mock.patch.object(
             ci,
             "current_comment_authorization_state",
@@ -133,7 +133,7 @@ class ReviewEvidencePublicationRaceTests(unittest.TestCase):
             ci, "collaborator_permission", return_value="write"
         ), mock.patch.object(
             ci, "load_live_pr", side_effect=[_pr(base="c"), _pr(base="d")]
-        ), mock.patch.object(ci, "current_diff_sha256", return_value="b" * 64), mock.patch.object(
+        ), mock.patch.object(ci, "current_diff_sha256s", return_value=("b" * 64,)), mock.patch.object(
             ci,
             "current_comment_authorization_state",
             side_effect=[ci.COMMENT_STATE_CURRENT, ci.COMMENT_STATE_CURRENT],

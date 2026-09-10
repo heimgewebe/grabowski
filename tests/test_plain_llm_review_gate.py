@@ -127,14 +127,18 @@ def _plain_external_evidence(
     *,
     provider: str = "grok",
     model: str = "grok-4.6",
+    diff_sha256: str = DIFF_SHA,
+    diff_text: str | None = None,
 ) -> dict[str, object]:
     diff_filename = f"pr-7-{HEAD[:12]}.diff"
     packet_prompt = gate.build_external_review_prompt(
-        state, diff_filename, DIFF_SHA
+        state, diff_filename, diff_sha256
     )
     prompt_nonce = "1" * 32
     prompt = gate.build_plain_llm_review_prompt(
-        packet_prompt, str(state["pr_diff_text"]), prompt_nonce
+        packet_prompt,
+        str(state["pr_diff_text"]) if diff_text is None else diff_text,
+        prompt_nonce,
     )
     prompt_sha256 = gate._sha256_text(prompt)
     packet_prompt_sha256 = gate._sha256_text(packet_prompt)
@@ -176,7 +180,7 @@ def _plain_external_evidence(
         "repo": "heimgewebe/grabowski",
         "pr": 7,
         "head_sha": HEAD,
-        "diff_sha256": DIFF_SHA,
+        "diff_sha256": diff_sha256,
         "prompt_sha256": prompt_sha256,
         "prompt_includes_diff": True,
         "prompt_transmitted": True,
@@ -185,7 +189,7 @@ def _plain_external_evidence(
             "repo": "heimgewebe/grabowski",
             "pr": 7,
             "head_sha": HEAD,
-            "diff_sha256": DIFF_SHA,
+            "diff_sha256": diff_sha256,
             "transport": (
                 "prompt_file"
                 if provider in {"grok", "ox-alpha"}
@@ -374,6 +378,47 @@ def _warnings(result: dict[str, object]) -> str:
 
 
 class PlainLlmReviewGateTests(unittest.TestCase):
+    def test_previous_v1_evidence_reconstructs_previous_diff_prompt(self) -> None:
+        raw = (
+            b"diff --git a/x b/x\n"
+            b"index 123456789abcdef..abcdef0123456789 100644\n"
+            b"--- a/x\n"
+            b"+++ b/x\n"
+            b"@@ -1 +1 @@ function render()\n"
+            b"-old\n"
+            b"+new\n"
+        )
+        current_bytes = gate.canonicalize_github_pr_diff_identity(raw)
+        previous_bytes = gate.canonicalize_github_pr_diff_identity_v1(raw)
+        current_sha = gate.github_pr_diff_identity_sha256(raw)
+        previous_sha = gate.github_pr_diff_identity_sha256_v1(raw)
+        self.assertNotEqual(current_sha, previous_sha)
+        self.assertNotEqual(current_bytes, previous_bytes)
+
+        state = _state()
+        state["pr_diff_sha256"] = current_sha
+        state["pr_diff_previous_sha256"] = previous_sha
+        state["pr_diff_text"] = current_bytes.decode("utf-8")
+        state["pr_diff_previous_text"] = previous_bytes.decode("utf-8")
+        self_review = _self_review()
+        self_review["diff_sha256"] = current_sha
+        evidence = _plain_external_evidence(
+            state,
+            diff_sha256=previous_sha,
+            diff_text=previous_bytes.decode("utf-8"),
+        )
+
+        result = _evaluate_review_gate(
+            state,
+            self_review=self_review,
+            external_review_evidence=evidence,
+        )
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertNotIn(
+            "prompt_sha256 does not match independently reconstructed",
+            _warnings(result),
+        )
+
     def test_valid_grok_evidence_is_independently_bound(self) -> None:
         state = _state()
         result = _evaluate_review_gate(

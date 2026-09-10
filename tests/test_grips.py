@@ -13648,6 +13648,9 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         canonical_diff_sha256 = merge_guard.github_pr_diff_identity_sha256(
             diff_text.encode("utf-8")
         )
+        previous_canonical_diff_sha256 = merge_guard.github_pr_diff_identity_sha256_v1(
+            diff_text.encode("utf-8")
+        )
         self.assertNotEqual(raw_diff_sha256, canonical_diff_sha256)
         parameters = authorized_captain_run_parameters(
             diff_sha256=raw_diff_sha256,
@@ -13705,8 +13708,111 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         reconcile.assert_called_once()
         reconcile_kwargs = reconcile.call_args.kwargs
         self.assertEqual(raw_diff_sha256, reconcile_kwargs["diff_sha256"])
-        self.assertCountEqual(
-            [raw_diff_sha256, canonical_diff_sha256],
+        self.assertEqual(canonical_diff_sha256, previous_canonical_diff_sha256)
+        self.assertEqual(
+            [canonical_diff_sha256],
+            reconcile_kwargs["equivalent_diff_sha256s"],
+        )
+
+    def test_atomic_merge_guard_accepts_previous_canonical_diff_identity(self) -> None:
+        diff_text = (
+            "diff --git a/src/changed.py b/src/changed.py\n"
+            "index 123456789abcdef..abcdef0123456789 100644\n"
+            "--- a/src/changed.py\n"
+            "+++ b/src/changed.py\n"
+            "@@ -1 +1 @@ def render(value):\n"
+            "-old\n"
+            "+new\n"
+        )
+        raw_diff_sha256 = hashlib.sha256(diff_text.encode("utf-8")).hexdigest()
+        canonical_diff_sha256 = merge_guard.github_pr_diff_identity_sha256(
+            diff_text.encode("utf-8")
+        )
+        previous_canonical_diff_sha256 = merge_guard.github_pr_diff_identity_sha256_v1(
+            diff_text.encode("utf-8")
+        )
+        self.assertNotEqual(raw_diff_sha256, previous_canonical_diff_sha256)
+        self.assertNotEqual(previous_canonical_diff_sha256, canonical_diff_sha256)
+        parameters = authorized_captain_run_parameters(
+            diff_sha256=previous_canonical_diff_sha256,
+            codex_review_evidence=captain_codex_review_evidence(
+                diff_sha256=previous_canonical_diff_sha256
+            ),
+        )
+        review_evidence = parameters["review_evidence"]
+        assert isinstance(review_evidence, dict)
+        review_evidence["diff_sha256"] = previous_canonical_diff_sha256
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": "e" * 40,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        _, request_body = captain_codex_request_material(
+            diff_sha256=previous_canonical_diff_sha256
+        )
+        request_comment = {
+            "id": 101,
+            "body": request_body,
+            "created_at": "2026-07-26T08:00:00Z",
+            "author_association": "NONE",
+            "user": {"login": "github-actions[bot]"},
+        }
+        codex_state = captain_codex_live_state(
+            view,
+            diff_text=diff_text,
+            request_pages=[[request_comment]],
+        )
+        codex_state["request_comment"] = request_comment
+        gh = FakeGh(
+            view=view,
+            diff_text=diff_text,
+            codex_state=codex_state,
+        )
+        reconciliation = {
+            "schema_version": 1,
+            "kind": "grabowski_decision_review_reconciliation",
+            "status": "not_applicable",
+            "attempt_count": 0,
+            "slot_count": 0,
+            "errors": [],
+        }
+        with patch.object(
+            merge_guard.decision_reviews,
+            "reconcile",
+            return_value=reconciliation,
+        ) as reconcile:
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=gh,
+            )
+
+        execution = result["output"]["executions"][0]
+        guard = execution["merge_lease_guard"]
+        self.assertTrue(execution["verification_passed"])
+        self.assertEqual(
+            "canonical-v1-compat",
+            guard["bindings"]["diff_identity_mode"],
+        )
+        self.assertEqual(
+            previous_canonical_diff_sha256,
+            guard["bindings"]["previous_canonical_diff_sha256"],
+        )
+        reconcile.assert_called_once()
+        reconcile_kwargs = reconcile.call_args.kwargs
+        self.assertEqual(previous_canonical_diff_sha256, reconcile_kwargs["diff_sha256"])
+        self.assertEqual(
+            [canonical_diff_sha256],
             reconcile_kwargs["equivalent_diff_sha256s"],
         )
 

@@ -519,6 +519,7 @@ def evaluate_status_projection(
     pr: dict[str, Any],
     diff_sha256: str,
     complexity: dict[str, Any],
+    equivalent_diff_sha256s: tuple[str, ...] = (),
 ) -> list[str]:
     failures = _status_schema_failures(status)
     if failures:
@@ -528,6 +529,14 @@ def evaluate_status_projection(
     current_head = _normalize_git_sha(pr.get("headRefOid"))
     current_base = _normalize_git_sha(pr.get("baseRefOid"))
     current_diff = _normalize_sha256(diff_sha256)
+    accepted_diff_identities = {
+        item
+        for item in (
+            current_diff,
+            *(_normalize_sha256(value) for value in equivalent_diff_sha256s),
+        )
+        if item is not None
+    }
     if pr.get("state") != "OPEN":
         failures.append("PR is not open")
     if pr.get("isDraft") is True:
@@ -540,7 +549,7 @@ def evaluate_status_projection(
         failures.append("status evidence head_sha mismatch")
     if _normalize_git_sha(status.get("base_sha")) != current_base:
         failures.append("status evidence base_sha mismatch")
-    if _normalize_sha256(status.get("diff_sha256")) != current_diff:
+    if _normalize_sha256(status.get("diff_sha256")) not in accepted_diff_identities:
         failures.append("status evidence diff_sha256 mismatch")
     if status.get("review_policy_version") != evidence_schemas.REVIEW_POLICY_VERSION:
         failures.append("status evidence review policy version is stale or invalid")
@@ -641,9 +650,20 @@ def load_live_pr(repo_name: str, pr_number: int) -> dict[str, Any]:
     )
 
 
-def current_diff_sha256(repo_name: str, pr_number: int) -> str:
+def current_diff_sha256s(repo_name: str, pr_number: int) -> tuple[str, ...]:
     diff = _run_bytes(["gh", "pr", "diff", str(pr_number), "--repo", repo_name])
-    return gate.github_pr_diff_identity_sha256(diff)
+    return tuple(
+        dict.fromkeys(
+            (
+                gate.github_pr_diff_identity_sha256(diff),
+                gate.github_pr_diff_identity_sha256_v1(diff),
+            )
+        )
+    )
+
+
+def current_diff_sha256(repo_name: str, pr_number: int) -> str:
+    return current_diff_sha256s(repo_name, pr_number)[0]
 
 
 def collaborator_permission(repo_name: str, actor: str) -> str | None:
@@ -1007,7 +1027,8 @@ def evaluate_comment_command(args: argparse.Namespace) -> int:
             print(json.dumps(result, indent=2, sort_keys=True))
             return 0 if comment_state == COMMENT_STATE_SUPERSEDED else 1
 
-    diff_sha256 = current_diff_sha256(repo_name, args.pr)
+    diff_sha256s = current_diff_sha256s(repo_name, args.pr)
+    diff_sha256 = diff_sha256s[0]
     complexity = gate.classify_complexity(pr, None, repo_name=repo_name)
     failures: list[str] = []
     status: dict[str, Any] | None = None
@@ -1026,6 +1047,7 @@ def evaluate_comment_command(args: argparse.Namespace) -> int:
                 pr=pr,
                 diff_sha256=diff_sha256,
                 complexity=complexity,
+                equivalent_diff_sha256s=diff_sha256s[1:],
             )
         )
 
