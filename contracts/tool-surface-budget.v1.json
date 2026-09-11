@@ -1987,7 +1987,7 @@
   "baseline": {
     "tool_count": 125,
     "tool_names_sha256": "a84638ec397aa635aa55546d579f009c237f64ffed39eafe2bff525762f46418",
-    "tool_semantics_sha256": "29683f3dd745a9045bd4410b535abaa533a5ddc8aa7e177b72a60a5952a4e2f1",
+    "tool_semantics_sha256": "ed7e499ec8f243ac9be7d67ba60b83b6866b2a4644d249ead7982db8450dc0dd",
     "tools": [
       {
         "authority_class": "read",
@@ -2737,7 +2737,7 @@
           "root-command-dependent"
         ],
         "read_only": false,
-        "reversibility": "command-dependent-with-recovery-evidence",
+        "reversibility": "command-dependent",
         "risk_class": "critical",
         "tool": "grabowski_power_run"
       },

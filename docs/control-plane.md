@@ -51,7 +51,7 @@ Details: [`docs/checkout-lifecycle.md`](checkout-lifecycle.md).
 
 ## Privilegierter Broker
 
-`config/privileged-actions.example.json` definiert root-eigene argv-Vorlagen, einen optionalen Power-Worker-Modus, den festen Root-Task-systemd-Modus sowie die typisierten Blockade- und Operator-Systemdienst-Verträge. Allgemeine Hochleistungsaktionen bleiben im Repository-Beispiel deaktiviert; eng katalogisierte Recovery-, Blockade-, Root-Task-, Process-Observer-, Bootstrap- und Operator-Service-Control-Aktionen sind als konkrete Betriebsverträge aktiviert. Der Broker besteht aus:
+`config/privileged-actions.example.json` definiert root-eigene argv-Verträge, den im Trusted-Owner-Modell aktivierten allgemeinen `operator_power_argv`-Rootpfad, den festen Root-Task-systemd-Modus sowie die typisierten Blockade- und Operator-Systemdienst-Verträge. Der allgemeine Rootpfad ist an die kanonische Operatorprozess-Identität gebunden; eng katalogisierte Recovery-, Blockade-, Root-Task-, Process-Observer-, Bootstrap- und Operator-Service-Control-Aktionen behalten daneben ihre spezialisierten Verträge. Der Broker besteht aus:
 
 - `src/grabowski_privileged_broker.py`: Referenz-, TTL-, Template-, Power-argv- und Replay-Prüfung,
 - `tools/grabowski_privileged_broker.py`: root-seitiger Handler ohne implizite Shell,
