@@ -421,14 +421,114 @@ def parse_tmux_sessions(payload: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+CODING_AGENT_EXECUTABLES = frozenset(
+    {"agy", "claude", "codex", "opencode", "openhands"}
+)
+PHYSICAL_CODING_AGENT_PROVIDER_POOLS = frozenset(
+    {
+        "antigravity-account",
+        "antigravity-claude",
+        "antigravity-gemini",
+        "antigravity-gptoss",
+        "claude-pro",
+        "openai-agentic",
+        "openai-codex-spark",
+        "opencode-free",
+        "openhands-account",
+    }
+)
+
+
+def _argv_option_value(argv: list[str], option: str) -> str:
+    lowered_option = option.lower()
+    prefix = lowered_option + "="
+    lowered_argv = [item.lower() for item in argv]
+    for index, item in enumerate(lowered_argv):
+        if item == lowered_option and index + 1 < len(lowered_argv):
+            return lowered_argv[index + 1]
+        if item.startswith(prefix):
+            return item[len(prefix):]
+    return ""
+
+
+def _coding_agent_provider_pools(executable: str, argv: list[str]) -> list[str]:
+    executable = executable.lower()
+    lowered_argv = [item.lower() for item in argv]
+    if executable == "claude":
+        return ["claude-pro"]
+    if executable == "codex":
+        if len(lowered_argv) > 1 and lowered_argv[1] == "app-server":
+            return []
+        if _argv_option_value(argv, "--model") == "gpt-5.3-codex-spark":
+            return ["openai-codex-spark"]
+        return ["openai-agentic"]
+    if executable == "agy":
+        selected_model = _argv_option_value(argv, "--model")
+        if "claude" in selected_model:
+            return ["antigravity-claude", "antigravity-account"]
+        if "gpt-oss" in selected_model:
+            return ["antigravity-gptoss", "antigravity-account"]
+        return ["antigravity-gemini", "antigravity-account"]
+    if executable == "opencode":
+        return ["opencode-free"]
+    if executable == "openhands":
+        return ["openhands-account"]
+    return []
+
+
+def _process_ancestor_context(
+    process: dict[str, Any],
+    by_pid: dict[int, dict[str, Any]],
+) -> tuple[str | None, str | None]:
+    """Return inherited workspace and conservative protection reason."""
+    workspace_id: str | None = None
+    protection_reason: str | None = None
+    seen: set[int] = set()
+    parent_pid = int(process.get("ppid") or 0)
+    for _depth in range(64):
+        if parent_pid <= 0 or parent_pid in seen:
+            break
+        seen.add(parent_pid)
+        parent = by_pid.get(parent_pid)
+        if parent is None:
+            break
+        if workspace_id is None and parent.get("workspace_id"):
+            workspace_id = str(parent["workspace_id"])
+        executable = str(parent.get("executable", "")).lower()
+        arguments = str(parent.get("_arguments", "")).lower()
+        if protection_reason is None:
+            if executable.startswith("tmux") or "cockpit-work-" in arguments:
+                protection_reason = "ancestor-tmux-or-cockpit"
+            elif executable == "tunnel-client" or "tunnel-client run" in arguments:
+                protection_reason = "ancestor-tunnel-client"
+            elif "grabowski_operator" in arguments:
+                protection_reason = "ancestor-grabowski-runtime"
+        parent_pid = int(parent.get("ppid") or 0)
+    return workspace_id, protection_reason
+
+
 def parse_processes(payload: dict[str, Any] | None) -> dict[str, Any]:
     if payload is None:
         payload = {"returncode": None, "lines": []}
     if not isinstance(payload, dict) or not isinstance(payload.get("lines", []), list):
         raise CurrentWorkProjectionError("process payload and lines must be typed")
+    identity_rows = payload.get("identities", [])
+    if not isinstance(identity_rows, list):
+        raise CurrentWorkProjectionError("process identities must be a list")
+    argv_by_pid = payload.get("argv_by_pid", {})
+    if not isinstance(argv_by_pid, dict):
+        raise CurrentWorkProjectionError("process argv_by_pid must be an object")
+    source_truncated = payload.get("truncated", False)
+    if not isinstance(source_truncated, bool):
+        raise CurrentWorkProjectionError("process truncated flag must be a boolean")
+    identities_by_pid = {
+        item.get("pid"): item
+        for item in identity_rows
+        if isinstance(item, dict) and isinstance(item.get("pid"), int)
+    }
     lines = payload.get("lines", [])
-    truncated = len(lines) > MAX_PROCESSES
-    processes: list[dict[str, Any]] = []
+    truncated = source_truncated or len(lines) > MAX_PROCESSES
+    working: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     for index, line in enumerate(lines[:MAX_PROCESSES], 1):
         if not isinstance(line, str):
@@ -455,26 +555,136 @@ def parse_processes(payload: dict[str, Any] | None) -> dict[str, Any]:
         command_class = "other"
         if workspace_id:
             command_class = "agent-workspace-pane"
-        elif executable in {"claude", "codex", "agy", "opencode", "openhands"}:
+        elif executable.lower() in CODING_AGENT_EXECUTABLES:
             command_class = "coding-agent"
         elif "grabowski_operator" in arguments:
             command_class = "operator-runtime"
-        processes.append(
-            {
+        raw_argv = argv_by_pid.get(pid, [])
+        argv = [item for item in raw_argv if isinstance(item, str)] if isinstance(raw_argv, list) else []
+        process = {
+            "pid": pid,
+            "ppid": ppid,
+            "state": state[:32],
+            "elapsed_seconds": elapsed,
+            "executable": executable[:128],
+            "command_class": command_class,
+            "workspace_id": workspace_id,
+            "_arguments": arguments,
+            "_argv": argv,
+            "identity_status": "partial",
+        }
+        identity = identities_by_pid.get(pid)
+        if isinstance(identity, dict):
+            material = {
+                "boot_id": identity.get("boot_id"),
+                "executable": executable,
                 "pid": pid,
                 "ppid": ppid,
-                "state": state[:32],
-                "elapsed_seconds": elapsed,
-                "executable": executable[:128],
-                "command_class": command_class,
-                "workspace_id": workspace_id,
+                "start_ticks": identity.get("start_ticks"),
             }
+            if (
+                identity.get("ppid") == ppid
+                and identity.get("executable") == executable
+                and isinstance(identity.get("boot_id"), str)
+                and bool(identity.get("boot_id"))
+                and isinstance(identity.get("start_ticks"), int)
+                and not isinstance(identity.get("start_ticks"), bool)
+                and identity.get("start_ticks") >= 0
+                and identity.get("identity_sha256") == _digest(material)
+            ):
+                process.update(
+                    {
+                        "boot_id": identity["boot_id"],
+                        "start_ticks": identity["start_ticks"],
+                        "process_identity_sha256": identity["identity_sha256"],
+                        "identity_status": "strong",
+                    }
+                )
+        working.append(process)
+
+    by_pid = {int(item["pid"]): item for item in working}
+    lifecycle_counts = {
+        "active": 0,
+        "protected": 0,
+        "unbound": 0,
+        "infrastructure": 0,
+    }
+    provider_pool_sessions: dict[str, int] = {}
+    provider_pool_lifecycle_sessions: dict[str, dict[str, int]] = {}
+    strong_identity_count = 0
+    identity_partial_count = 0
+    coding_agent_argv_partial_count = 0
+    for process in working:
+        if process.get("identity_status") == "strong":
+            strong_identity_count += 1
+        else:
+            identity_partial_count += 1
+        if process["command_class"] != "coding-agent":
+            continue
+        inherited_workspace, protection_reason = _process_ancestor_context(
+            process, by_pid
         )
+        if process.get("workspace_id") is None and inherited_workspace is not None:
+            process["workspace_id"] = inherited_workspace
+        arguments = str(process.get("_arguments", ""))
+        argv = process.get("_argv", [])
+        if not isinstance(argv, list):
+            argv = []
+        if (
+            str(process.get("executable", "")).lower() in {"codex", "agy"}
+            and not argv
+        ):
+            coding_agent_argv_partial_count += 1
+        pools = _coding_agent_provider_pools(process["executable"], argv)
+        is_codex_app_server = (
+            str(process.get("executable", "")).lower() == "codex"
+            and len(argv) > 1
+            and str(argv[1]).lower() == "app-server"
+        )
+        if is_codex_app_server and protection_reason == "ancestor-tunnel-client":
+            lifecycle_state = "infrastructure"
+            pools = []
+        elif process.get("workspace_id"):
+            lifecycle_state = "active"
+        elif protection_reason is not None:
+            lifecycle_state = "protected"
+        else:
+            lifecycle_state = "unbound"
+        process["lifecycle_state"] = lifecycle_state
+        process["provider_pools"] = pools
+        if protection_reason is not None:
+            process["protection_reason"] = protection_reason
+        lifecycle_counts[lifecycle_state] += 1
+        if lifecycle_state != "infrastructure":
+            for pool_id in pools:
+                provider_pool_sessions[pool_id] = provider_pool_sessions.get(pool_id, 0) + 1
+                lifecycle = provider_pool_lifecycle_sessions.setdefault(
+                    pool_id, {"active": 0, "protected": 0, "unbound": 0}
+                )
+                lifecycle[lifecycle_state] = lifecycle.get(lifecycle_state, 0) + 1
+
+    processes = [
+        {
+            key: value
+            for key, value in process.items()
+            if key not in {"_arguments", "_argv"}
+        }
+        for process in working
+    ]
     return {
         "processes": processes,
         "errors": errors,
         "truncated": truncated,
         "count": len(processes),
+        "lifecycle_counts": lifecycle_counts,
+        "provider_pool_sessions": dict(sorted(provider_pool_sessions.items())),
+        "provider_pool_lifecycle_sessions": {
+            pool_id: dict(sorted(counts.items()))
+            for pool_id, counts in sorted(provider_pool_lifecycle_sessions.items())
+        },
+        "strong_identity_count": strong_identity_count,
+        "identity_partial_count": identity_partial_count,
+        "coding_agent_argv_partial_count": coding_agent_argv_partial_count,
     }
 
 
@@ -1500,16 +1710,53 @@ def _add_physical_surfaces(
                 _hygiene(group, "physical-workspace-rescue-candidate")
             _append(group["physical_refs"]["processes"], {"source": "process-list", **process})
         elif process["command_class"] == "coding-agent":
+            lifecycle_state = str(process.get("lifecycle_state") or "unbound")
+            if lifecycle_state == "infrastructure":
+                continue
+            pid = int(process.get("pid") or 0)
+            identity = process.get("process_identity_sha256")
+            binding_id = str(identity) if isinstance(identity, str) else str(pid)
+            if lifecycle_state == "protected":
+                protected_id = (
+                    f"physical-process-protected:{identity[:24]}"
+                    if isinstance(identity, str)
+                    else f"physical-process-protected:{pid}"
+                )
+                group = _ensure(
+                    groups,
+                    protected_id,
+                    "physical-process-protected",
+                    binding_id,
+                )
+                group["binding_status"] = "physical-only"
+                _append(
+                    group["physical_refs"]["processes"],
+                    {"source": "process-list", **process},
+                )
+                _append(
+                    group["heuristic_refs"],
+                    {
+                        "kind": "protected-coding-agent-process",
+                        "process_identity_sha256": identity,
+                        "protection_reason": process.get("protection_reason"),
+                        "authority": False,
+                    },
+                )
+                _set_projection_state(group, "active")
+                continue
             unbound_process_total += 1
             if len(unbound_processes) < MAX_UNBOUND_SAMPLE:
                 unbound_processes.append(process)
-            pid = int(process.get("pid") or 0)
-            rescue_id = f"physical-process-rescue:{pid}"
+            rescue_id = (
+                f"physical-process-rescue:{identity[:24]}"
+                if isinstance(identity, str)
+                else f"physical-process-rescue:{pid}"
+            )
             group = _ensure(
                 groups,
                 rescue_id,
                 "physical-process-rescue",
-                str(pid),
+                binding_id,
             )
             group["binding_status"] = "physical-only"
             _append(
@@ -1521,6 +1768,8 @@ def _add_physical_surfaces(
                 {
                     "kind": "unbound-process-rescue-candidate",
                     "pid": pid,
+                    "process_identity_sha256": identity,
+                    "identity_status": process.get("identity_status"),
                     "command_class": process.get("command_class"),
                     "authority": False,
                 },
@@ -2017,6 +2266,15 @@ def build_current_work_projection(
                 str(process.get("workspace_id") or ""),
             ),
         ),
+        "coding_agent_process_lifecycle": {
+            "counts": processes["lifecycle_counts"],
+            "provider_pool_sessions": processes["provider_pool_sessions"],
+            "provider_pool_lifecycle_sessions": processes[
+                "provider_pool_lifecycle_sessions"
+            ],
+            "strong_identity_count": processes["strong_identity_count"],
+            "identity_partial_count": processes["identity_partial_count"],
+        },
         "source_errors": errors,
         "source_truncation": source_truncation,
         "repository_filters": repositories,
@@ -2132,6 +2390,20 @@ def build_current_work_projection(
             "sample_truncated": unbound_tmux_total > len(unbound_tmux) or unbound_process_total > len(unbound_processes),
         },
         "unbound_physical_scope": MIXED_SOURCE_SCOPE,
+        "coding_agent_process_lifecycle": {
+            "counts": processes["lifecycle_counts"],
+            "provider_pool_sessions": processes["provider_pool_sessions"],
+            "provider_pool_lifecycle_sessions": processes[
+                "provider_pool_lifecycle_sessions"
+            ],
+            "strong_identity_count": processes["strong_identity_count"],
+            "identity_partial_count": processes["identity_partial_count"],
+            "terminalized_count": 0,
+            "terminalization_policy": (
+                "physical observation never authorizes signalling; terminalization requires "
+                "separate strong orphan proof and a receipt-bound lifecycle effect"
+            ),
+        },
         "scope_notes": scope_notes,
         "warnings": warnings,
         "recommended_next_action_scope": MIXED_SOURCE_SCOPE,

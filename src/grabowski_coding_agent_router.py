@@ -11,6 +11,7 @@ import sys
 from typing import Any
 
 import grabowski_operator_core as operator
+import grabowski_current_work as current_work
 
 mcp = operator.mcp
 READ_ONLY = operator.READ_ONLY
@@ -1002,6 +1003,53 @@ def _state_catalog_fresh(state: dict[str, Any]) -> bool:
     return 0 <= age <= CATALOG_FRESHNESS_SECONDS
 
 
+def _physical_pool_occupancy() -> dict[str, Any]:
+    """Observe live agent occupancy without exporting process command lines."""
+    try:
+        payload = operator._current_user_process_payload()
+        if payload.get("returncode") not in (None, 0):
+            raise CodingAgentRouterError("process inventory command failed")
+        parsed = current_work.parse_processes(payload)
+        if (
+            parsed.get("truncated") is True
+            or parsed.get("errors")
+            or parsed.get("coding_agent_argv_partial_count", 0) > 0
+        ):
+            raise CodingAgentRouterError("process inventory is incomplete")
+    except (
+        AttributeError,
+        CodingAgentRouterError,
+        current_work.CurrentWorkProjectionError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        return {
+            "status": "unavailable",
+            "error_type": type(exc).__name__,
+            "tracked_provider_pools": sorted(
+                current_work.PHYSICAL_CODING_AGENT_PROVIDER_POOLS
+            ),
+            "provider_pool_sessions": {},
+            "provider_pool_lifecycle_sessions": {},
+        }
+    return {
+        "status": "current",
+        "observed_at_unix": payload.get("observed_at_unix"),
+        "tracked_provider_pools": sorted(
+            current_work.PHYSICAL_CODING_AGENT_PROVIDER_POOLS
+        ),
+        "provider_pool_sessions": parsed["provider_pool_sessions"],
+        "provider_pool_lifecycle_sessions": parsed[
+            "provider_pool_lifecycle_sessions"
+        ],
+        "lifecycle_counts": parsed["lifecycle_counts"],
+        "strong_identity_count": parsed["strong_identity_count"],
+        "identity_partial_count": parsed["identity_partial_count"],
+    }
+
+
 def _effective_pool(
     pool_id: str,
     catalog: dict[str, Any],
@@ -1042,7 +1090,67 @@ def _effective_pool(
         or active_sessions < 0
     ):
         return {**static_pool, "_state_error": "active_sessions is invalid"}
-    pool["active_sessions"] = active_sessions
+    pool["state_active_sessions"] = active_sessions
+    physical = state.get("_physical_pool_occupancy")
+    physical_pool_is_tracked = False
+    if physical is not None:
+        if not isinstance(physical, dict):
+            return {
+                **static_pool,
+                "_state_error": "physical coding-agent occupancy is invalid",
+            }
+        tracked_pools = physical.get("tracked_provider_pools")
+        if (
+            not isinstance(tracked_pools, list)
+            or any(not isinstance(item, str) or not item for item in tracked_pools)
+        ):
+            return {
+                **static_pool,
+                "_state_error": "physical coding-agent tracked pools are invalid",
+            }
+        physical_pool_is_tracked = pool_id in tracked_pools
+    if physical_pool_is_tracked:
+        if physical.get("status") != "current":
+            return {
+                **static_pool,
+                "_state_error": "physical coding-agent occupancy is unavailable",
+            }
+        lifecycle_by_pool = physical.get("provider_pool_lifecycle_sessions", {})
+        if not isinstance(lifecycle_by_pool, dict):
+            return {
+                **static_pool,
+                "_state_error": "physical coding-agent occupancy is invalid",
+            }
+        lifecycle = lifecycle_by_pool.get(
+            pool_id, {"active": 0, "protected": 0, "unbound": 0}
+        )
+        if not isinstance(lifecycle, dict):
+            return {
+                **static_pool,
+                "_state_error": "physical pool lifecycle occupancy is invalid",
+            }
+        counts: dict[str, int] = {}
+        for lifecycle_state in ("active", "protected", "unbound"):
+            value = lifecycle.get(lifecycle_state, 0)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                return {
+                    **static_pool,
+                    "_state_error": "physical pool lifecycle occupancy is invalid",
+                }
+            counts[lifecycle_state] = value
+        observed_physical = sum(counts.values())
+        effective_active = (
+            max(active_sessions, counts["active"])
+            + counts["protected"]
+            + counts["unbound"]
+        )
+        pool["observed_physical_sessions"] = observed_physical
+        pool["physical_lifecycle_sessions"] = counts
+        pool["active_sessions"] = effective_active
+        pool["active_sessions_source"] = "advisory-active-max-plus-protected-and-unbound"
+    else:
+        pool["active_sessions"] = active_sessions
+        pool["active_sessions_source"] = "advisory-state-only"
     used_tasks = pool.get("used_tasks")
     if used_tasks is not None and (
         isinstance(used_tasks, bool)
@@ -2095,10 +2203,30 @@ def grabowski_coding_agent_catalog(include_disabled: bool = False) -> dict[str, 
         ],
     }
     inventory_sha256 = _canonical_sha256(body)
+    physical_occupancy = _physical_pool_occupancy()
+    runtime_state = {**state, "_physical_pool_occupancy": physical_occupancy}
+    quota_pool_runtime: dict[str, dict[str, Any]] = {}
+    for pool_id in sorted(catalog["quota_pools"]):
+        effective = _effective_pool(pool_id, catalog, runtime_state)
+        quota_pool_runtime[pool_id] = {
+            key: effective.get(key)
+            for key in (
+                "max_concurrency",
+                "state_active_sessions",
+                "observed_physical_sessions",
+                "physical_lifecycle_sessions",
+                "active_sessions",
+                "active_sessions_source",
+                "_state_error",
+            )
+            if key in effective
+        }
     return {
         **body,
         "inventory_sha256": inventory_sha256,
         "claude_credential_commitment": _claude_credential_commitment(),
+        "coding_agent_process_lifecycle": physical_occupancy,
+        "quota_pool_runtime": quota_pool_runtime,
     }
 
 
@@ -2201,6 +2329,7 @@ def canonical_execution_route(
     if scoped_writer_allowed or external_review_requested:
         state, state_status, state_error_type = _current_contrast_state(catalog, validation)
         if state is not None:
+            state = {**state, "_physical_pool_occupancy": _physical_pool_occupancy()}
             try:
                 route_derivations = _route_derivations(catalog)
             except (AttributeError, CodingAgentRouterError, KeyError, TypeError, ValueError) as exc:
