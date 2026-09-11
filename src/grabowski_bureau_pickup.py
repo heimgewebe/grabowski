@@ -6927,7 +6927,7 @@ def _validate_acquisition(acquisition: dict[str, Any]) -> None:
 
 def _verify_release_binding(
     run_id: str, status: dict[str, Any], acquisition: dict[str, Any]
-) -> tuple[str, list[str], list[str]]:
+) -> tuple[str, list[str], list[str], list[dict[str, Any]]]:
     if status.get("status") != "coordinated":
         raise BureauPickupError("terminal-readback-unavailable")
     run = status.get("run")
@@ -6958,6 +6958,7 @@ def _verify_release_binding(
     }
     release_keys: list[str] = []
     preserved_keys: list[str] = []
+    release_snapshots: list[dict[str, Any]] = []
     for key in keys:
         expected = expected_by_key.get(key)
         if expected is None:
@@ -6978,7 +6979,8 @@ def _verify_release_binding(
                 "lease-release-metadata-drift", details={"resource_key": key}
             )
         release_keys.append(key)
-    return owner_id, release_keys, preserved_keys
+        release_snapshots.append(_lease_snapshot(observed))
+    return owner_id, release_keys, preserved_keys, release_snapshots
 
 
 def _terminal_release_lease_projection(value: Any, resource_keys: Any) -> Any:
@@ -7140,15 +7142,36 @@ def grabowski_bureau_pickup_release(run_id: str) -> dict[str, Any]:
     status, effective_binding = _coordination_status_for_binding(
         normalized_run_id, binding
     )
-    owner_id, keys, preserved_keys = _verify_release_binding(
+    owner_id, keys, preserved_keys, release_snapshots = _verify_release_binding(
         normalized_run_id, status, acquisition
     )
     terminal_readback = _write_or_reuse_terminal_readback(
         run_dir / "terminal-readback.json", status
     )
     if keys:
+        try:
+            released = resources.release_resources(
+                owner_id,
+                keys,
+                expected_leases=release_snapshots,
+            )
+        except RuntimeError as exc:
+            prefix = "Resource lease changed before release: "
+            message = str(exc)
+            if not message.startswith(prefix):
+                raise
+            raise BureauPickupError(
+                "lease-release-generation-changed",
+                details={
+                    "resource_key": message.removeprefix(prefix),
+                    "recommended_next_action": (
+                        "read back the current lease generation and retry "
+                        "bureau-pickup-release"
+                    ),
+                },
+            ) from exc
         result = {
-            **resources.release_resources(owner_id, keys),
+            **released,
             "released_resource_keys": keys,
             "preserved_resource_keys": preserved_keys,
         }

@@ -4355,7 +4355,44 @@ class BureauPickupTests(unittest.TestCase):
         ):
             result = pickup.grabowski_bureau_pickup_release(intent["run_id"])
         self.assertEqual(result["status"], "released")
-        release.assert_called_once_with(intent["lease_owner_id"], [key])
+        release.assert_called_once_with(
+            intent["lease_owner_id"],
+            [key],
+            expected_leases=[pickup._lease_snapshot(lease)],
+        )
+
+    def test_terminal_release_maps_release_snapshot_race_to_pickup_error(self) -> None:
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        self.create_acquisition_journal(intent, lease)
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                return_value=self.terminal_status(intent),
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "inspect_resource",
+                return_value=lease,
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "release_resources",
+                side_effect=RuntimeError(
+                    f"Resource lease changed before release: {key}"
+                ),
+            ),
+        ):
+            with self.assertRaises(pickup.BureauPickupError) as caught:
+                pickup.grabowski_bureau_pickup_release(intent["run_id"])
+        self.assertEqual("lease-release-generation-changed", caught.exception.code)
+        self.assertEqual(key, caught.exception.details["resource_key"])
+        self.assertIn(
+            "retry bureau-pickup-release",
+            caught.exception.details["recommended_next_action"],
+        )
 
     def test_terminal_release_preserves_strict_foreign_successor_and_releases_owner_keys(
         self,
@@ -4405,7 +4442,11 @@ class BureauPickupTests(unittest.TestCase):
         ):
             result = pickup.grabowski_bureau_pickup_release(intent["run_id"])
         self.assertEqual("released", result["status"])
-        release.assert_called_once_with(intent["lease_owner_id"], [owner_key])
+        release.assert_called_once_with(
+            intent["lease_owner_id"],
+            [owner_key],
+            expected_leases=[pickup._lease_snapshot(owner_lease)],
+        )
         self.assertEqual([owner_key], result["released_resource_keys"])
         self.assertEqual([foreign_key], result["preserved_resource_keys"])
         self.assertEqual(foreign_before, foreign_after)
@@ -4727,9 +4768,13 @@ class BureauPickupTests(unittest.TestCase):
         ):
             result = pickup.grabowski_bureau_pickup_release(intent["run_id"])
         self.assertEqual("released", result["status"])
-        release.assert_called_once_with(intent["lease_owner_id"], [key])
+        release.assert_called_once_with(
+            intent["lease_owner_id"],
+            [key],
+            expected_leases=[pickup._lease_snapshot(renewed)],
+        )
 
-    def test_release_allows_reacquired_lease_with_same_lineage(self) -> None:
+    def test_release_snapshot_guards_reacquired_lease_with_same_lineage(self) -> None:
         intent = self.intent()
         key = intent["required_resource_keys"][0]
         lease = self.lease(key, intent["lease_owner_id"])
@@ -4755,7 +4800,11 @@ class BureauPickupTests(unittest.TestCase):
         ):
             result = pickup.grabowski_bureau_pickup_release(intent["run_id"])
         self.assertEqual("released", result["status"])
-        release.assert_called_once_with(intent["lease_owner_id"], [key])
+        release.assert_called_once_with(
+            intent["lease_owner_id"],
+            [key],
+            expected_leases=[pickup._lease_snapshot(reacquired)],
+        )
 
     def test_release_rejects_unknown_run_state(self) -> None:
         intent = self.intent()
@@ -5147,7 +5196,11 @@ class BureauPickupTests(unittest.TestCase):
             result = pickup.grabowski_bureau_pickup_release(intent["run_id"])
         self.assertEqual("released", result["status"])
         self.assertEqual(2, inspect.call_count)
-        release.assert_called_once_with(intent["lease_owner_id"], [key])
+        release.assert_called_once_with(
+            intent["lease_owner_id"],
+            [key],
+            expected_leases=[pickup._lease_snapshot(lease)],
+        )
 
     def test_exact_retry_recovers_own_existing_assignment_after_intent_expiry(self,
     ) -> None:
@@ -9140,7 +9193,11 @@ class BureauPickupTests(unittest.TestCase):
         self.assertEqual(intent["run_id"], result["run_id"])
         self.assertTrue((run_dir / "orphan-reconcile.json").is_file())
         self.assertTrue((run_dir / "terminal-readback.json").is_file())
-        release.assert_called_once_with(intent["lease_owner_id"], [key])
+        release.assert_called_once_with(
+            intent["lease_owner_id"],
+            [key],
+            expected_leases=[pickup._lease_snapshot(lease)],
+        )
         fail_argv = invoke.call_args_list[1].args[0]
         self.assertIn("fail", fail_argv)
         self.assertIn(intent["run_id"], fail_argv)
@@ -9187,7 +9244,11 @@ class BureauPickupTests(unittest.TestCase):
         ):
             result = pickup.grabowski_bureau_pickup_orphan_reconcile(request)
         self.assertEqual("reconciled", result["status"])
-        release.assert_called_once_with(intent["lease_owner_id"], [key])
+        release.assert_called_once_with(
+            intent["lease_owner_id"],
+            [key],
+            expected_leases=[pickup._lease_snapshot(lease)],
+        )
         self.assertEqual(4, invoke.call_count)
         roots = []
         for call in invoke.call_args_list:
@@ -9656,7 +9717,11 @@ class BureauPickupTests(unittest.TestCase):
         ):
             second = pickup.grabowski_bureau_pickup_orphan_reconcile(retry_request)
         self.assertEqual("reconciled", second["status"])
-        release.assert_called_once_with(intent["lease_owner_id"], [key])
+        release.assert_called_once_with(
+            intent["lease_owner_id"],
+            [key],
+            expected_leases=[pickup._lease_snapshot(lease)],
+        )
         self.assertEqual(primary_before, primary_path.read_bytes())
         retry_paths = list(run_dir.glob("orphan-pre-effect-retry-*.json"))
         self.assertEqual(1, len(retry_paths))
@@ -9866,7 +9931,11 @@ class BureauPickupTests(unittest.TestCase):
         ):
             result = pickup.grabowski_bureau_pickup_orphan_reconcile(request)
         self.assertEqual("reconciled", result["status"])
-        release.assert_called_once_with(intent["lease_owner_id"], [key])
+        release.assert_called_once_with(
+            intent["lease_owner_id"],
+            [key],
+            expected_leases=[pickup._lease_snapshot(renewed)],
+        )
 
     def test_orphan_reconcile_rejects_changed_lease_metadata_lineage(self) -> None:
         intent, _run_dir, _acq, coordination, request, lease, _key = (
@@ -9985,7 +10054,11 @@ class BureauPickupTests(unittest.TestCase):
             result = pickup.grabowski_bureau_pickup_orphan_reconcile(request)
         self.assertEqual("reconciled", result["status"])
         self.assertTrue((run_dir / "orphan-reconcile.json").is_file())
-        release.assert_called_once_with(intent["lease_owner_id"], [key])
+        release.assert_called_once_with(
+            intent["lease_owner_id"],
+            [key],
+            expected_leases=[pickup._lease_snapshot(lease)],
+        )
         for call in invoke.call_args_list:
             self.assertNotIn("fail", call.args[0])
 
