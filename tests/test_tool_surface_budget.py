@@ -50,17 +50,16 @@ class ToolSurfaceBudgetTests(unittest.TestCase):
         self.assertTrue(report["valid"], report)
         self.assertTrue(report["schema_valid"])
         self.assertEqual(report["baseline_tool_count"], 125)
-        self.assertEqual(report["current_tool_count"], 198)
+        self.assertEqual(report["current_tool_count"], 197)
         self.assertEqual(report["growth"], 81)
         self.assertEqual(report["accepted_addition_count"], 81)
         self.assertEqual(report["operation_count"], 3)
-        self.assertEqual(report["retired_tool_count"], 8)
-        self.assertEqual(report["migration_candidate_count"], 1)
-        candidates = self.contract["migration_candidates"]
-        self.assertEqual(len(candidates), 1)
-        self.assertEqual(candidates[0]["tool"], "grabowski_agent_execution_route")
-        self.assertEqual(candidates[0]["target_operation_family"], "agent-routing")
-        self.assertIn("deprecated compatibility adapter", candidates[0]["reason"])
+        self.assertEqual(report["retired_tool_count"], 9)
+        self.assertEqual(report["migration_candidate_count"], 0)
+        self.assertEqual(self.contract["migration_candidates"], [])
+        retirement = self.contract["retired_tools"]["grabowski_agent_execution_route"]
+        self.assertIn("canonical coding-agent routing", retirement["reason"])
+        self.assertIn("grabowski_coding_agent_route", retirement["compatibility"])
 
     def test_runtime_tool_projection_accepts_schema_two_without_assets(self) -> None:
         # Projection validates the whole contract, so the fixture must be a

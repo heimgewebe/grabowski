@@ -1921,6 +1921,10 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertIsNotNone(result["scoped_writer"])
         self.assertTrue(result["contrast_programming"]["requires_explicit_request"])
         self.assertFalse(result["contrast_programming"]["automatic_patch_apply"])
+        self.assertEqual(
+            result["contrast_programming"]["route_tool"],
+            "grabowski_coding_agent_route",
+        )
         self.assertIn("execution_authority", result["does_not_establish"])
         self.assertIn("merge_readiness", result["does_not_establish"])
 
