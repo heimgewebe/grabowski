@@ -72,10 +72,10 @@ def _execution(source: Path, destination: Path, digest: str, generated_at: int) 
 
 
 class RecoveryFreshnessContractTests(unittest.TestCase):
-    def test_example_config_binds_publisher_and_power_gate_to_same_record(self) -> None:
+    def test_example_config_keeps_recovery_root_task_but_decouples_power(self) -> None:
         config = json.loads((ROOT / "config/privileged-actions.example.json").read_text(encoding="utf-8"))
         publisher = config["actions"]["publish_recovery_marker"]
-        power_gate = config["actions"]["operator_power_argv"]["gate"]
+        power = config["actions"]["operator_power_argv"]
         root_task = config["actions"]["operator_root_task_systemd_unit"]
         root_task_gate = root_task["start_gate"]
 
@@ -85,13 +85,18 @@ class RecoveryFreshnessContractTests(unittest.TestCase):
         self.assertFalse(root_task["allow_shell"])
         self.assertTrue(root_task["allowed_argv_prefixes"])
         self.assertEqual(publisher["mode"], "recovery-marker-publish")
-        self.assertEqual(publisher["destination_path"], power_gate["recovery_marker_path"])
-        self.assertEqual(publisher["max_recovery_age_seconds"], power_gate["max_recovery_age_seconds"])
-        self.assertEqual(publisher["kill_switch_path"], power_gate["kill_switch_path"])
-        self.assertEqual(publisher["configured_target"], power_gate["configured_target"])
-        self.assertEqual(root_task_gate, power_gate)
+        self.assertEqual(publisher["destination_path"], root_task_gate["recovery_marker_path"])
+        self.assertEqual(publisher["max_recovery_age_seconds"], root_task_gate["max_recovery_age_seconds"])
+        self.assertEqual(publisher["kill_switch_path"], root_task_gate["kill_switch_path"])
+        self.assertEqual(publisher["configured_target"], root_task_gate["configured_target"])
+        self.assertTrue(root_task_gate["require_root_owned_gate_files"])
         self.assertTrue(publisher["require_root_owned_destination"])
-        self.assertTrue(power_gate["require_root_owned_gate_files"])
+
+        self.assertTrue(power["enabled"])
+        self.assertTrue(power["allow_shell"])
+        self.assertEqual(power["policy_intent"], "trusted-owner-root-autonomy")
+        self.assertNotIn("gate", power)
+        self.assertNotIn("allowed_argv_prefixes", power)
 
     def test_canonical_inspector_reports_typed_fail_closed_reasons(self) -> None:
         now = int(time.time())

@@ -271,11 +271,6 @@ def _normalize_power_justification(justification: str) -> str:
     return justification.strip()
 
 
-def _power_recovery_status() -> dict[str, Any]:
-    import grabowski_recovery as recovery
-    return recovery.grabowski_recovery_status()
-
-
 def _create_privileged_reference(
     *,
     action: str,
@@ -1053,7 +1048,7 @@ def grabowski_power_run(
     justification: str = "",
     max_output_bytes: int = 250_000,
 ) -> dict[str, Any]:
-    """Run one audited root command through the recovery-gated power broker."""
+    """Run one audited root command through the canonical root-owned broker."""
     operator._require_operator_mutation("power_execute")
     command = _normalize_power_argv(argv)
     working_directory = _normalize_power_cwd(cwd)
@@ -1064,12 +1059,6 @@ def grabowski_power_run(
     broker = grabowski_privileged_broker_status()
     if not broker.get("ready"):
         raise PermissionError("privileged broker is not ready")
-    recovery = _power_recovery_status()
-    if not (
-        recovery.get("ready_for_user_power_worker")
-        and recovery.get("ready_for_privileged_actions")
-    ):
-        raise PermissionError("recovery gate is not ready for power-worker execution")
 
     target = json.dumps(
         {"argv": command, "cwd": working_directory, "timeout_seconds": timeout},
@@ -1154,12 +1143,11 @@ def grabowski_power_run(
         "broker_returncode": broker_returncode,
         "success": success,
         "duration_seconds": round(time.monotonic() - started, 3),
-        "recovery_checked_at_unix": recovery.get("checked_at_unix"),
     }
     _append_operator_audit(audit_record)
     return {
         "success": success,
-        "execution_model": "recovery-gated-root-power-worker",
+        "execution_model": "canonical-root-broker",
         "action": POWER_ACTION,
         "request_id": reference["request_id"],
         "reference_sha256": reference["reference_sha256"],
@@ -1172,9 +1160,4 @@ def grabowski_power_run(
         "stderr": stderr,
         "stdout_truncated": stdout_truncated,
         "stderr_truncated": stderr_truncated,
-        "recovery_gate": {
-            "ready_for_user_power_worker": recovery.get("ready_for_user_power_worker"),
-            "ready_for_privileged_actions": recovery.get("ready_for_privileged_actions"),
-            "checked_at_unix": recovery.get("checked_at_unix"),
-        },
     }
