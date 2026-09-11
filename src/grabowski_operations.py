@@ -696,6 +696,11 @@ def _run_platform_connector_capture_operation(
             != publication_binding["request_sha256"]
         ):
             raise ValueError("platform publication request changed before root capture")
+        if (
+            latest_publication_binding.get("current_state")
+            != publication_binding.get("current_state")
+        ):
+            raise ValueError("platform publication state changed before root capture")
         if _platform_runtime_identity(latest_binding, latest_metadata) != runtime_identity:
             raise ValueError("active runtime changed before root capture")
         staged_path, staged_sha256 = _write_platform_capture_stage(document)
@@ -733,10 +738,31 @@ def _run_platform_connector_capture_operation(
                 "postflight_error_class": type(exc).__name__,
                 "recommended_next_action": "read the exact platform snapshot before any new publish intent",
             }
+        if invocation is not None and invocation.get("outcome") == "succeeded":
+            audit = {
+                "timestamp_unix": int(time.time()),
+                "operation": "named-operation-run",
+                "recipe": PLATFORM_CONNECTOR_CAPTURE_OPERATION,
+                "parameters_sha256": plan["parameters_sha256"],
+                "expected_snapshot_sha256": expected_snapshot_sha256,
+                "root_effect_confirmed": True,
+                "post_root_snapshot_matches": False,
+                "root_audit_sha256": _root_audit_sha256(invocation),
+                "broker_outcome": "succeeded",
+                "postflight_error_class": type(exc).__name__,
+                "success": False,
+            }
+            base._append_audit(audit)
         if staged_path is not None:
             staged_path.unlink(missing_ok=True)
         raise
-    root_effect_confirmed = after_root.get("snapshot_sha256") == expected_snapshot_sha256
+    post_root_snapshot_matches = (
+        after_root.get("snapshot_sha256") == expected_snapshot_sha256
+    )
+    broker_write_confirmed = (
+        invocation is not None and invocation.get("outcome") == "succeeded"
+    )
+    root_effect_confirmed = post_root_snapshot_matches or broker_write_confirmed
     post_runtime_stable = post_runtime_identity == runtime_identity
     runtime_binding_matches = after_root.get("runtime_binding_matches") is True
     publication_contract_matches = after_root.get("publication_contract_matches") is True
@@ -788,6 +814,41 @@ def _run_platform_connector_capture_operation(
                 }
                 base._append_audit(audit)
             raise
+    if root_effect_confirmed and not post_root_snapshot_matches:
+        audit = {
+            "timestamp_unix": int(time.time()),
+            "operation": "named-operation-run",
+            "recipe": PLATFORM_CONNECTOR_CAPTURE_OPERATION,
+            "parameters_sha256": plan["parameters_sha256"],
+            "expected_snapshot_sha256": expected_snapshot_sha256,
+            "root_effect_confirmed": True,
+            "post_root_snapshot_matches": False,
+            "root_audit_sha256": (
+                _root_audit_sha256(invocation) if invocation is not None else None
+            ),
+            "broker_outcome": invocation.get("outcome") if invocation is not None else None,
+            "publication_state": after_root.get("publication_state"),
+            "post_runtime_stable": post_runtime_stable,
+            "runtime_binding_matches": runtime_binding_matches,
+            "publication_contract_matches": publication_contract_matches,
+            "success": False,
+        }
+        base._append_audit(audit)
+        return {
+            "operation": PLATFORM_CONNECTOR_CAPTURE_OPERATION,
+            "success": False,
+            "outcome": "failed",
+            "effect": plan["effect"],
+            "expected_snapshot_sha256": expected_snapshot_sha256,
+            "root_effect_confirmed": True,
+            "post_root_snapshot_matches": False,
+            "root_audit_sha256": audit["root_audit_sha256"],
+            "recommended_next_action": (
+                "read the convergence receipt and trusted platform snapshot before any retry; "
+                "prepare a new publication request if their identities differ"
+            ),
+            "audit": audit,
+        }
     if not root_effect_confirmed:
         return {
             "operation": PLATFORM_CONNECTOR_CAPTURE_OPERATION,
@@ -796,6 +857,7 @@ def _run_platform_connector_capture_operation(
             "effect": plan["effect"],
             "expected_snapshot_sha256": expected_snapshot_sha256,
             "root_effect_confirmed": False,
+            "post_root_snapshot_matches": False,
         }
     if not (post_runtime_stable and runtime_binding_matches and publication_contract_matches):
         audit = {
@@ -805,6 +867,7 @@ def _run_platform_connector_capture_operation(
             "parameters_sha256": plan["parameters_sha256"],
             "expected_snapshot_sha256": expected_snapshot_sha256,
             "root_effect_confirmed": True,
+            "post_root_snapshot_matches": post_root_snapshot_matches,
             "root_audit_sha256": (
                 _root_audit_sha256(invocation) if invocation is not None else None
             ),
@@ -844,6 +907,7 @@ def _run_platform_connector_capture_operation(
             "parameters_sha256": plan["parameters_sha256"],
             "expected_snapshot_sha256": expected_snapshot_sha256,
             "root_effect_confirmed": True,
+            "post_root_snapshot_matches": post_root_snapshot_matches,
             "root_audit_sha256": (
                 _root_audit_sha256(invocation) if invocation is not None else None
             ),
@@ -882,15 +946,47 @@ def _run_platform_connector_capture_operation(
     final_runtime_stable = (
         _platform_runtime_identity(final_binding, final_metadata) == runtime_identity
     )
-    success = bool(
+    candidate_success = bool(
         reconciliation.get("state") == "platform_converged"
         and final_runtime_stable
         and final.get("fresh") is True
         and final.get("state") == "matched"
+        and final.get("snapshot_sha256") == expected_snapshot_sha256
         and final.get("runtime_binding_matches") is True
         and final.get("publication_contract_matches") is True
         and final.get("publication_state") == "platform_converged"
     )
+    receipt_snapshot_sha256 = None
+    receipt_snapshot_matches = False
+    if candidate_success:
+        try:
+            receipt = base.grabowski_client_snapshot._read_publication_receipt(
+                plan["publication_request_id"]
+            )
+            receipt_snapshot_sha256 = receipt.get("snapshot_sha256")
+            receipt_snapshot_matches = (
+                receipt_snapshot_sha256 == expected_snapshot_sha256
+                and receipt_snapshot_sha256 == final.get("snapshot_sha256")
+            )
+        except Exception as exc:
+            audit = {
+                "timestamp_unix": int(time.time()),
+                "operation": "named-operation-run",
+                "recipe": PLATFORM_CONNECTOR_CAPTURE_OPERATION,
+                "parameters_sha256": plan["parameters_sha256"],
+                "expected_snapshot_sha256": expected_snapshot_sha256,
+                "root_effect_confirmed": True,
+                "post_root_snapshot_matches": post_root_snapshot_matches,
+                "root_audit_sha256": (
+                    _root_audit_sha256(invocation) if invocation is not None else None
+                ),
+                "publication_state": reconciliation.get("state"),
+                "receipt_readback_error_class": type(exc).__name__,
+                "success": False,
+            }
+            base._append_audit(audit)
+            raise
+    success = candidate_success and receipt_snapshot_matches
     audit = {
         "timestamp_unix": int(time.time()),
         "operation": "named-operation-run",
@@ -898,8 +994,11 @@ def _run_platform_connector_capture_operation(
         "parameters_sha256": plan["parameters_sha256"],
         "expected_snapshot_sha256": expected_snapshot_sha256,
         "root_effect_confirmed": root_effect_confirmed,
+        "post_root_snapshot_matches": post_root_snapshot_matches,
         "root_audit_sha256": _root_audit_sha256(invocation) if invocation is not None else None,
         "publication_state": reconciliation.get("state"),
+        "receipt_snapshot_sha256": receipt_snapshot_sha256,
+        "receipt_snapshot_matches": receipt_snapshot_matches,
         "success": success,
     }
     base._append_audit(audit)
@@ -911,8 +1010,11 @@ def _run_platform_connector_capture_operation(
         "snapshot_sha256": expected_snapshot_sha256,
         "source_artifact_sha256": plan["artifact_sha256"],
         "root_effect_confirmed": root_effect_confirmed,
+        "post_root_snapshot_matches": post_root_snapshot_matches,
         "root_audit_sha256": audit["root_audit_sha256"],
         "reconciliation": reconciliation,
+        "receipt_snapshot_sha256": receipt_snapshot_sha256,
+        "receipt_snapshot_matches": receipt_snapshot_matches,
         "platform_state": final.get("state"),
         "platform_publication_state": final.get("publication_state"),
         "platform_publication_contract_matches": final.get("publication_contract_matches"),
