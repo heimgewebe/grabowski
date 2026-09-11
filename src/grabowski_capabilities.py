@@ -915,13 +915,6 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": ["state-refresh", "lease-release", "possible-process-start"],
         "reversibility": "conditional",
     },
-    "grabowski_task_reconcile": {
-        "category": "task",
-        "purpose": "Legacy compatibility entrypoint; refreshes state only and never resumes processes.",
-        "risk_class": "medium",
-        "effects": ["state-refresh", "lease-release"],
-        "reversibility": "conditional",
-    },
     "grabowski_resource_nonconflict_assess": {
         "category": "resource",
         "purpose": "Assess and audit complete, attested same-repository scopes; issue a short hash-bound proof only when every conflict axis is disjoint.",

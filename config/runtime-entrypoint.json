@@ -158,7 +158,6 @@
     "grabowski_resource_release",
     "grabowski_resource_inspect",
     "grabowski_resource_list",
-    "grabowski_task_reconcile",
     "grabowski_artifact_stat",
     "grabowski_artifact_push",
     "grabowski_artifact_pull",
