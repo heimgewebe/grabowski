@@ -574,10 +574,10 @@ def _platform_capture_publication_binding(
         raise ValueError("platform capture requested contract is not the current request contract")
     if plan["observed_at_unix"] < request["requested_at_unix"]:
         raise ValueError("platform observation predates the publication request")
+    now_unix = int(time.time())
     if (
         plan["observed_at_unix"]
-        > int(time.time())
-        + base.grabowski_client_snapshot.SNAPSHOT_CLOCK_SKEW_SECONDS
+        > now_unix + base.grabowski_client_snapshot.SNAPSHOT_CLOCK_SKEW_SECONDS
     ):
         raise ValueError("platform observation is too far in the future")
     runtime_contract = base.grabowski_client_snapshot._platform_publication_contract(
@@ -588,6 +588,11 @@ def _platform_capture_publication_binding(
     )
     if runtime_contract["tool_contract_sha256"] != request_contract_sha256:
         raise ValueError("active runtime contract differs from the publication request")
+    if (
+        plan["observed_at_unix"]
+        < now_unix - base.grabowski_client_snapshot.SNAPSHOT_TTL_SECONDS
+    ):
+        raise ValueError("platform observation is stale")
     return {
         "request_id": request["request_id"],
         "request_sha256": request["request_sha256"],
@@ -794,12 +799,33 @@ def _run_platform_connector_capture_operation(
             "recommended_next_action": "capture a fresh platform observation bound to the current runtime before reconciliation",
             "audit": audit,
         }
-    reconciliation = base.grabowski_client_snapshot.reconcile_platform_publication_for_runtime(
-        registered_tool_count=post_binding["registered_tool_count"],
-        registered_names_sha256=post_binding["registered_names_sha256"],
-        complete_schema_count=post_metadata["complete_schema_count"],
-        complete_schema_sha256=post_metadata["complete_schema_sha256"],
-    )
+    try:
+        reconciliation = base.grabowski_client_snapshot.reconcile_platform_publication_for_runtime(
+            registered_tool_count=post_binding["registered_tool_count"],
+            registered_names_sha256=post_binding["registered_names_sha256"],
+            complete_schema_count=post_metadata["complete_schema_count"],
+            complete_schema_sha256=post_metadata["complete_schema_sha256"],
+        )
+    except Exception as exc:
+        audit = {
+            "timestamp_unix": int(time.time()),
+            "operation": "named-operation-run",
+            "recipe": PLATFORM_CONNECTOR_CAPTURE_OPERATION,
+            "parameters_sha256": plan["parameters_sha256"],
+            "expected_snapshot_sha256": expected_snapshot_sha256,
+            "root_effect_confirmed": True,
+            "root_audit_sha256": (
+                _root_audit_sha256(invocation) if invocation is not None else None
+            ),
+            "publication_state": after_root.get("publication_state"),
+            "post_runtime_stable": post_runtime_stable,
+            "runtime_binding_matches": runtime_binding_matches,
+            "publication_contract_matches": publication_contract_matches,
+            "reconciliation_error_class": type(exc).__name__,
+            "success": False,
+        }
+        base._append_audit(audit)
+        raise
     final_binding, final_runtime_tools, final_metadata = _platform_runtime_context()
     final = _platform_snapshot_readback(final_binding, final_runtime_tools)
     final_runtime_stable = (

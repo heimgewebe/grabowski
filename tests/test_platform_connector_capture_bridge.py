@@ -344,6 +344,70 @@ class PlatformConnectorCaptureBridgeTests(unittest.TestCase):
                     metadata,
                 )
 
+    def test_stale_observation_is_rejected_before_root_staging(self) -> None:
+        binding = {
+            "registered_tool_count": 1,
+            "registered_names_sha256": "3" * 64,
+            "release_id": "release-test-1",
+            "repo_head": "4" * 40,
+            "agent_instructions_sha256": "5" * 64,
+        }
+        metadata = {
+            "complete_schema_count": 1,
+            "complete_schema_sha256": "6" * 64,
+        }
+        current = {
+            "state": "awaiting_platform_observation",
+            "request_id": "request-test-1",
+            "contract_sha256": CONTRACT_SHA,
+            "current_sha256": "7" * 64,
+        }
+        request = {
+            "request_id": "request-test-1",
+            "request_sha256": "8" * 64,
+            "requested_at_unix": 900,
+            "expected_contract": {"tool_contract_sha256": CONTRACT_SHA},
+        }
+        now_unix = 1000 + operations.base.grabowski_client_snapshot.SNAPSHOT_TTL_SECONDS + 1
+        stage = Mock()
+        invoke = Mock()
+        build = Mock()
+        with (
+            patch.object(operations.time, "time", return_value=now_unix),
+            patch.object(operations.operator, "_require_operator_capability"),
+            patch.object(operations.operator, "_require_operator_mutation"),
+            patch.object(operations, "_read_platform_capture_artifact", return_value={}),
+            patch.object(operations, "_platform_runtime_context", return_value=(binding, {}, metadata)),
+            patch.object(
+                operations.base.grabowski_client_snapshot,
+                "_read_publication_current",
+                return_value=current,
+            ),
+            patch.object(
+                operations.base.grabowski_client_snapshot,
+                "_read_publication_request",
+                return_value=request,
+            ),
+            patch.object(
+                operations.base.grabowski_client_snapshot,
+                "_platform_publication_contract",
+                return_value={"tool_contract_sha256": CONTRACT_SHA},
+            ),
+            patch.object(
+                operations.base.grabowski_client_snapshot,
+                "build_platform_connector_snapshot",
+                build,
+            ),
+            patch.object(operations, "_write_platform_capture_stage", stage),
+            patch.object(operations, "_invoke_mainpid_privileged_action", invoke),
+        ):
+            with self.assertRaisesRegex(ValueError, "platform observation is stale"):
+                operations._run_platform_connector_capture_operation(_parameters())
+
+        build.assert_not_called()
+        stage.assert_not_called()
+        invoke.assert_not_called()
+
     def test_runtime_drift_while_building_stops_before_root_staging(self) -> None:
         binding = {
             "registered_tool_count": 1,
@@ -684,6 +748,64 @@ class PlatformConnectorCaptureBridgeTests(unittest.TestCase):
         self.assertFalse(result["root_effect_confirmed"])
         self.assertTrue(result["staged_snapshot_retained"])
         reconcile.assert_not_called()
+
+    def test_confirmed_root_effect_is_audited_when_reconciliation_raises(self) -> None:
+        binding = {
+            "registered_tool_count": 1,
+            "registered_names_sha256": "9" * 64,
+            "release_id": "release-test-1",
+            "repo_head": "a" * 40,
+            "agent_instructions_sha256": "b" * 64,
+        }
+        metadata = {
+            "complete_schema_count": 1,
+            "complete_schema_sha256": "c" * 64,
+        }
+        document = {"snapshot_sha256": "8" * 64, "runtime_binding": binding}
+        staged = Mock()
+        staged.__str__ = Mock(
+            return_value="/home/alex/worktrees/.grabowski-platform-snapshot-11111111111111111111111111111111.json"
+        )
+        audit = Mock()
+        with (
+            patch.object(operations.operator, "_require_operator_capability"),
+            patch.object(operations.operator, "_require_operator_mutation"),
+            patch.object(operations, "_read_platform_capture_artifact", return_value={}),
+            patch.object(operations, "_platform_capture_publication_binding", return_value={"request_sha256": "f" * 64}),
+            patch.object(operations.base.grabowski_client_snapshot, "build_platform_connector_snapshot", return_value=document),
+            patch.object(operations, "_platform_runtime_context", return_value=(binding, {}, metadata)),
+            patch.object(
+                operations,
+                "_platform_snapshot_readback",
+                side_effect=[
+                    {"snapshot_sha256": None},
+                    {
+                        "snapshot_sha256": document["snapshot_sha256"],
+                        "runtime_binding_matches": True,
+                        "publication_contract_matches": True,
+                        "publication_state": "awaiting_platform_observation",
+                    },
+                ],
+            ),
+            patch.object(operations, "_write_platform_capture_stage", return_value=(staged, "d" * 64)),
+            patch.object(operations, "_invoke_mainpid_privileged_action", return_value={"outcome": "succeeded"}),
+            patch.object(
+                operations.base.grabowski_client_snapshot,
+                "reconcile_platform_publication_for_runtime",
+                side_effect=RuntimeError("reconciliation exploded"),
+            ),
+            patch.object(operations.base, "_append_audit", audit),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "reconciliation exploded"):
+                operations._run_platform_connector_capture_operation(_parameters())
+
+        staged.unlink.assert_called_once_with(missing_ok=True)
+        audit.assert_called_once()
+        audit_record = audit.call_args.args[0]
+        self.assertTrue(audit_record["root_effect_confirmed"])
+        self.assertFalse(audit_record["success"])
+        self.assertEqual(audit_record["reconciliation_error_class"], "RuntimeError")
+        self.assertEqual(audit_record["publication_state"], "awaiting_platform_observation")
 
     def test_exact_root_effect_reconciles_once(self) -> None:
         binding = {
