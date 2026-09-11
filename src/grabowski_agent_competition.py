@@ -1938,7 +1938,6 @@ def _workspace_route_shadow_calibration(
     return {**body, "calibration_sha256": _sha256_json(body)}
 
 
-@mcp.tool(name="grabowski_agent_execution_route", annotations=READ_ONLY)
 def grabowski_agent_execution_route(
     task_kind: str,
     changed_file_estimate: int,

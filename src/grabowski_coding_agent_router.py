@@ -2562,7 +2562,7 @@ def canonical_execution_route(
         "contrast_programming": {
             "allowed": not direct_review_task,
             "requires_explicit_request": True,
-            "route_tool": "grabowski_agent_execution_route",
+            "route_tool": "grabowski_coding_agent_route",
             "route_selector": "coding-agent-catalog",
             "start_tool": "grabowski_agent_competition_start",
             "concrete_route_id_required_for_canonical_start": True,
