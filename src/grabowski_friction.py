@@ -2647,6 +2647,7 @@ EXECUTION_GOVERNOR_IMMUTABLE_BOUNDARIES = (
     "privileged_execution",
 )
 EXECUTION_GOVERNOR_NON_CLAIMS = (
+    "execution_authority",
     "automatic_task_creation_authority",
     "automatic_policy_mutation_authority",
     "merge_or_deploy_permission",
@@ -2997,7 +2998,6 @@ def execution_shape_recommendation(
         "authority": "proposal_only_shadow_mode",
         "mode": "shadow",
         "recommendation_id": recommendation_id,
-        "execution_authorized": False,
         "route_feasible": route_feasible,
         "recommended_route": route,
         "reason_codes": reasons,

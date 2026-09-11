@@ -35,7 +35,8 @@ class AgentBootstrapTests(unittest.TestCase):
         )
         self.assertTrue(result["allowed_shape"])
         self.assertEqual(result["recommendation"], "proceed_bounded")
-        self.assertFalse(result["execution_authorized"])
+        self.assertNotIn("execution_authorized", result)
+        self.assertIn("permission_to_execute", result["does_not_establish"])
 
     def test_call_shape_rejects_collection_action(self) -> None:
         module = self.load_module()
@@ -105,7 +106,8 @@ class AgentBootstrapTests(unittest.TestCase):
             first["recommended_tool"],
             "grabowski_agent_workspace_optimize",
         )
-        self.assertFalse(first["execution_authorized"])
+        self.assertNotIn("execution_authorized", first)
+        self.assertIn("permission_to_execute", first["does_not_establish"])
         self.assertEqual(
             adaptive["workspace_fingerprint_unavailable_reason"],
             "workspace_metrics_deferred_from_synchronous_bootstrap",
@@ -154,7 +156,8 @@ class AgentBootstrapTests(unittest.TestCase):
         }
         result = module.agent_bootstrap()
         self.assertEqual(result["adaptive_mode"], "disabled_fail_closed")
-        self.assertFalse(result["execution_authorized"])
+        self.assertNotIn("execution_authorized", result)
+        self.assertIn("execution_authority", result["does_not_establish"])
         self.assertFalse(result["automatic_live_routing_enabled"])
 
     def test_bootstrap_uses_current_workspace_cohort_fingerprint_when_generic_is_absent(self) -> None:
