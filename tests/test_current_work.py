@@ -2204,6 +2204,39 @@ class CurrentWorkProjectionTests(unittest.TestCase):
             matching[0]["action_reasons"],
         )
 
+    def test_prunable_missing_expired_active_binding_drift_remains_blocking(self) -> None:
+        existing = checkout(
+            "key-missing-expired-active-drift",
+            "/home/alex/repos/.worktrees/key-missing-expired-active-drift",
+            lifecycle_state="prunable_or_missing",
+            binding_owner="operator:missing-expired-active-drift",
+            binding_phase="active",
+            binding_consistent=False,
+            retention_active=False,
+            retention_until_unix=1,
+            drift_reasons=["expected-branch-mismatch"],
+        )
+        result = project(
+            checkout_payloads=[{"repository": REPOSITORY, "worktrees": [existing]}],
+            reconciliation_payload={
+                "bindings": [{
+                    "checkout_key": "key-missing-expired-active-drift",
+                    "state": "binding_identity_drift",
+                    "blocking": True,
+                    "reasons": ["expected-branch-mismatch"],
+                    "binding_identity": {"checkout_key": "key-missing-expired-active-drift"},
+                    "worktree_identity": {"checkout_key": "key-missing-expired-active-drift"},
+                    "evidence": {"owner_id": "operator:missing-expired-active-drift"},
+                    "recommended_next_step": "reconcile_binding_identity_before_lifecycle_action",
+                }],
+                "pagination": {"has_more": False},
+            },
+        )
+        matching = [row for row in result["work"] if row["binding"]["id"] == "key-missing-expired-active-drift"]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0]["projection_state"], "blocking")
+        self.assertEqual(matching[0]["work_class"], "operational")
+
 
 if __name__ == "__main__":
     unittest.main()
