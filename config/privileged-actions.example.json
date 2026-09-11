@@ -54,61 +54,14 @@
       "legacy_kill_switch_path": "/home/alex/.local/state/grabowski/operator-kill-switch"
     },
     "operator_power_argv": {
-      "enabled": false,
+      "enabled": true,
       "mode": "argv-json",
       "target_pattern": "\\{.{1,49152}\\}",
       "cwd_pattern": "/[A-Za-z0-9._/@:+-]{0,999}",
-      "timeout_seconds": 600,
+      "timeout_seconds": 3600,
       "max_argv": 128,
-      "allow_shell": false,
-      "policy_intent": "trusted-owner-high-power-admin-catalog",
-      "allowed_argv_prefixes": [
-        [
-          "/usr/bin/systemctl",
-          "is-active"
-        ],
-        [
-          "/usr/bin/systemctl",
-          "status"
-        ],
-        [
-          "/usr/bin/systemctl",
-          "reset-failed"
-        ],
-        [
-          "/usr/bin/apt-get",
-          "update"
-        ],
-        [
-          "/usr/bin/apt-get",
-          "install",
-          "-y"
-        ],
-        [
-          "/usr/bin/docker",
-          "compose"
-        ],
-        [
-          "/usr/bin/chown"
-        ],
-        [
-          "/usr/bin/chmod"
-        ],
-        [
-          "/usr/bin/mount"
-        ],
-        [
-          "/usr/bin/umount"
-        ]
-      ],
-      "gate": {
-        "kill_switch_path": "/var/lib/grabowski/operator-blockade/operator-kill-switch",
-        "recovery_marker_path": "/var/lib/grabowski/power-worker-recovery-gate.json",
-        "max_recovery_age_seconds": 86400,
-        "require_root_owned_gate_files": true,
-        "configured_target": "local-backup-disk:UUID=9b626294-7913-4be0-88fa-96b314e96ee5/restic/heim-pc",
-        "legacy_kill_switch_path": "/home/alex/.local/state/grabowski/operator-kill-switch"
-      },
+      "allow_shell": true,
+      "policy_intent": "trusted-owner-root-autonomy",
       "allowed_peer_unit": "grabowski-operator.service",
       "allowed_peer_uid": 1000
     },

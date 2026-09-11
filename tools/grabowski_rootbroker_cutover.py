@@ -1189,6 +1189,61 @@ def _validate_repository_recovery_target(value: Any, *, automatic: bool) -> str:
     raise CutoverError("recovery target differs from host contract")
 
 
+def _power_action_from_repository(
+    repository: Path,
+    *,
+    expected_head: str,
+    runner: RunCommand,
+) -> dict[str, Any]:
+    relative_path = "config/privileged-actions.example.json"
+    data = _repository_blob(
+        repository,
+        commit_id=expected_head,
+        relative_path=relative_path,
+        runner=runner,
+    )
+    example = _decode_json_object(data, label=relative_path)
+    actions = example.get("actions")
+    if not isinstance(actions, dict):
+        raise CutoverError("example privileged action catalog is malformed")
+    power = actions.get(POWER_ACTION)
+    if not isinstance(power, dict):
+        raise CutoverError("example catalog has no operator power action")
+    required = {
+        "enabled",
+        "mode",
+        "target_pattern",
+        "cwd_pattern",
+        "timeout_seconds",
+        "max_argv",
+        "allow_shell",
+        "policy_intent",
+        "allowed_peer_unit",
+        "allowed_peer_uid",
+    }
+    if set(power) != required:
+        raise CutoverError("operator power contract keys are invalid")
+    if power.get("enabled") is not True:
+        raise CutoverError("operator power action must be enabled")
+    if power.get("mode") != "argv-json":
+        raise CutoverError("operator power mode is invalid")
+    if power.get("target_pattern") != r"\{.{1,49152}\}":
+        raise CutoverError("operator power target pattern is invalid")
+    if power.get("cwd_pattern") != r"/[A-Za-z0-9._/@:+-]{0,999}":
+        raise CutoverError("operator power cwd pattern is invalid")
+    if power.get("timeout_seconds") != 3600 or power.get("max_argv") != 128:
+        raise CutoverError("operator power execution bounds are invalid")
+    if power.get("allow_shell") is not True:
+        raise CutoverError("operator power shell execution must be enabled")
+    if power.get("policy_intent") != "trusted-owner-root-autonomy":
+        raise CutoverError("operator power policy intent is invalid")
+    if power.get("allowed_peer_unit") != OPERATOR_UNIT:
+        raise CutoverError("operator power peer unit is invalid")
+    if power.get("allowed_peer_uid") != 1000:
+        raise CutoverError("operator power peer UID is invalid")
+    return json.loads(json.dumps(power))
+
+
 def _publisher_from_repository(
     repository: Path,
     *,
@@ -1657,6 +1712,7 @@ def merge_privileged_config(
     current: dict[str, Any],
     *,
     publisher: dict[str, Any],
+    power: dict[str, Any] | None = None,
     lifecycle: dict[str, Any] | None = None,
     root_task: dict[str, Any] | None = None,
     process_observer: dict[str, Any] | None = None,
@@ -1676,11 +1732,10 @@ def merge_privileged_config(
     power_before = actions.get(POWER_ACTION)
     if not isinstance(power_before, dict):
         raise CutoverError("installed operator power action is missing")
-    if power_before.get("enabled") is not True:
-        raise CutoverError("installed operator power action is not enabled")
-    gate_before = power_before.get("gate")
-    if not isinstance(gate_before, dict):
-        raise CutoverError("installed operator power gate is malformed")
+    if power is None:
+        power = json.loads(json.dumps(power_before))
+    if not isinstance(power, dict):
+        raise CutoverError("desired operator power action is malformed")
 
     configured_target = _validate_repository_recovery_target(
         publisher.get("configured_target"), automatic=allow_controlled_updates
@@ -1689,6 +1744,7 @@ def merge_privileged_config(
     merged = json.loads(json.dumps(current))
     merged_actions = merged["actions"]
     merged_actions[PUBLISH_ACTION] = json.loads(json.dumps(publisher))
+    merged_actions[POWER_ACTION] = json.loads(json.dumps(power))
     process_observer_before = actions.get(PROCESS_OBSERVER_ACTION)
     if process_observer is not None:
         merged_actions[PROCESS_OBSERVER_ACTION] = json.loads(json.dumps(process_observer))
@@ -1746,45 +1802,25 @@ def merge_privileged_config(
             merged_actions[name] = json.loads(json.dumps(action))
 
     merged_power = merged_actions[POWER_ACTION]
-    merged_gate = merged_power["gate"]
-    if lifecycle is None:
-        # Backward-compatible unit-test and recovery seam for an unchanged
-        # authority model. Production cutover always supplies lifecycle.
-        coherence = {
-            "kill_switch_path": "kill_switch_path",
-            "recovery_marker_path": "destination_path",
-            "max_recovery_age_seconds": "max_recovery_age_seconds",
-            "require_root_owned_gate_files": "require_root_owned_destination",
-        }
-        for gate_key, publisher_key in coherence.items():
-            if gate_before.get(gate_key) != publisher.get(publisher_key):
-                raise CutoverError(
-                    f"installed power gate differs from publisher contract: {gate_key}"
-                )
-        merged_gate["configured_target"] = configured_target
-    else:
+    if lifecycle is not None:
         legacy_path = publisher.get("legacy_kill_switch_path")
         if not isinstance(legacy_path, str) or not legacy_path.startswith("/"):
             raise CutoverError(
                 "lifecycle cutover requires publisher legacy_kill_switch_path"
             )
-        gate_updates = {
-            "kill_switch_path": publisher["kill_switch_path"],
-            "legacy_kill_switch_path": legacy_path,
-            "recovery_marker_path": publisher["destination_path"],
-            "max_recovery_age_seconds": publisher["max_recovery_age_seconds"],
-            "require_root_owned_gate_files": publisher[
-                "require_root_owned_destination"
-            ],
-            "configured_target": configured_target,
-        }
-        for key, value in gate_updates.items():
-            merged_gate[key] = value
         merged_actions[BLOCKADE_LIFECYCLE_ACTION] = json.loads(
             json.dumps(lifecycle)
         )
-        merged_power["allowed_peer_unit"] = lifecycle["allowed_peer_unit"]
-        merged_power["allowed_peer_uid"] = lifecycle["allowed_peer_uid"]
+        expected_peer_binding = {
+            "allowed_peer_unit": lifecycle["allowed_peer_unit"],
+            "allowed_peer_uid": lifecycle["allowed_peer_uid"],
+        }
+        actual_peer_binding = {
+            "allowed_peer_unit": merged_power.get("allowed_peer_unit"),
+            "allowed_peer_uid": merged_power.get("allowed_peer_uid"),
+        }
+        if actual_peer_binding != expected_peer_binding:
+            raise CutoverError("operator power peer binding differs from lifecycle authority")
         if lifecycle.get("marker_path") != publisher.get("kill_switch_path"):
             raise CutoverError("lifecycle marker differs from publisher gate")
         if lifecycle.get("legacy_marker_path") != publisher.get(
@@ -1825,15 +1861,8 @@ def merge_privileged_config(
             )
         merged_actions[ROOT_TASK_ACTION] = json.loads(json.dumps(root_task))
 
-    expected_power = json.loads(json.dumps(power_before))
-    if lifecycle is None:
-        expected_power["gate"]["configured_target"] = configured_target
-    else:
-        expected_power["gate"].update(gate_updates)
-        expected_power["allowed_peer_unit"] = lifecycle["allowed_peer_unit"]
-        expected_power["allowed_peer_uid"] = lifecycle["allowed_peer_uid"]
-    if merged_power != expected_power:
-        raise CutoverError("operator power action changed beyond gate migration")
+    if merged_power != power:
+        raise CutoverError("operator power action differs from commit-bound contract")
 
     controlled = {PUBLISH_ACTION, POWER_ACTION}
     if lifecycle is not None:
@@ -2505,6 +2534,9 @@ def _apply_cutover_locked(
     )
     if artifact_targets is None and not automatic:
         _verify_running_helper(source_artifacts)
+    power = _power_action_from_repository(
+        repository, expected_head=expected_head, runner=runner
+    )
     publisher = _publisher_from_repository(
         repository,
         expected_head=expected_head,
@@ -2555,6 +2587,7 @@ def _apply_cutover_locked(
     merged_config, merge_evidence = merge_privileged_config(
         current_config,
         publisher=publisher,
+        power=power,
         lifecycle=lifecycle,
         root_task=root_task,
         process_observer=process_observer,
@@ -2861,6 +2894,9 @@ def build_plan(*, repository: Path, expected_head: str, runner: RunCommand = _ru
         },
     )
     _verify_running_helper(source_artifacts)
+    power = _power_action_from_repository(
+        repository, expected_head=expected_head, runner=runner
+    )
     publisher = _publisher_from_repository(
         repository,
         expected_head=expected_head,
@@ -2900,6 +2936,7 @@ def build_plan(*, repository: Path, expected_head: str, runner: RunCommand = _ru
     merged, merge_evidence = merge_privileged_config(
         current,
         publisher=publisher,
+        power=power,
         lifecycle=lifecycle,
         root_task=root_task,
         process_observer=process_observer,

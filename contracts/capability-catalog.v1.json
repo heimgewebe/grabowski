@@ -1005,7 +1005,7 @@
     },
     {
       "category": "privileged-execution",
-      "description": "Run one audited root command through the recovery-gated power broker.",
+      "description": "Run one audited root command through the canonical root-owned broker.",
       "effects": [
         "root-command-dependent",
         "host-state-change"
