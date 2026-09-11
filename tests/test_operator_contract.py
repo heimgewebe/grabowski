@@ -5655,6 +5655,21 @@ class GitServerVerifiedReadTransportTests(unittest.TestCase):
             self.assertGreaterEqual(capability.call_count, 2)
             mutation.assert_not_called()
 
+    def test_generic_git_log_and_show_disable_signature_helpers(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = self._repo(operator, temporary)
+            for git_arguments in (["show", "--stat"], ["log", "-1"]):
+                with self.subTest(git_arguments=git_arguments):
+                    with patch.object(
+                        operator, "_require_operator_mutation"
+                    ) as mutation:
+                        result = operator.grabowski_git(str(repo), git_arguments)
+                    self.assertIn("--no-ext-diff", result["argv"])
+                    self.assertIn("--no-textconv", result["argv"])
+                    self.assertIn("--no-show-signature", result["argv"])
+                    mutation.assert_not_called()
+
     def test_generic_git_unsafe_or_mutating_shapes_remain_fail_closed(self) -> None:
         operator = _load_operator_module()
         with tempfile.TemporaryDirectory() as temporary:

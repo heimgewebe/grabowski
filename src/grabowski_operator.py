@@ -849,7 +849,10 @@ def _git_server_read_command(
     command_arguments = list(read_shape["command_arguments"])
     hardened_arguments = command_arguments
     if subcommand in {"diff", "log", "show"}:
-        hardened_arguments = ["--no-ext-diff", "--no-textconv", *command_arguments]
+        hardening = ["--no-ext-diff", "--no-textconv"]
+        if subcommand in {"log", "show"}:
+            hardening.append("--no-show-signature")
+        hardened_arguments = [*hardening, *command_arguments]
     return _validate_argv(
         [
             "git",
