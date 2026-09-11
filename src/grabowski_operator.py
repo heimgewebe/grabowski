@@ -2335,6 +2335,15 @@ _GITHUB_PR_VIEW_KEYRING_PROBE_TIMEOUT_SECONDS = 1
 _GITHUB_PR_VIEW_BUSCTL_PATH = "/usr/bin/busctl"
 _GITHUB_PR_VIEW_DEFAULT_KEYRING_OBJECT = "/org/freedesktop/secrets/aliases/default"
 _GITHUB_PR_VIEW_MAX_TOKEN_BYTES = 4096
+_GITHUB_PR_ISOLATED_AUTH_COMMANDS = frozenset({"list", "create", "edit", "ready", "view"})
+
+
+def _github_pr_uses_isolated_auth(arguments: list[str]) -> bool:
+    return (
+        len(arguments) >= 2
+        and arguments[0] == "pr"
+        and arguments[1] in _GITHUB_PR_ISOLATED_AUTH_COMMANDS
+    )
 
 
 def _github_pr_view_host(source: dict[str, str]) -> str:
@@ -6536,7 +6545,8 @@ def grabowski_github(
     command = _validate_argv(
         [trusted_github_cli, *arguments], cwd=working_directory
     )
-    if transport_exempt:
+    isolated_auth = transport_exempt or _github_pr_uses_isolated_auth(arguments)
+    if isolated_auth:
         source_environment = _safe_environment()
         github_host = _github_pr_view_host(source_environment)
         github_token = _github_pr_view_auth_token(
