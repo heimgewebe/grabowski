@@ -696,16 +696,92 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         self.assertTrue(result["recorded"])
         stored = json.loads(self.state.read_text(encoding="utf-8"))
         self.assertEqual(stored["history"], initial["history"])
-        self.assertEqual(stored["routes"][route_id]["runs"], 1)
+        self.assertNotIn("runs", stored["routes"][route_id])
+        self.assertNotIn("failures", stored["routes"][route_id])
+        self.assertNotIn("by_task_class", stored["routes"][route_id])
+        self.assertEqual(stored["routes"][route_id]["last_outcome"], "rate_limit")
         self.assertEqual(
             stored["routes"][route_id]["last_duration_seconds"], 12.5
         )
+        self.assertFalse(result["quality_recorded"])
         route = router._route_map(catalog)[route_id]
         for pool_id in route["quota_pools"]:
             pool = stored["pools"][pool_id]
             self.assertEqual(pool["status"], "cooldown")
             self.assertEqual(pool["remaining_ratio"], 0.2)
             self.assertIsNotNone(router._parse_time(pool["cooldown_until"]))
+
+    def test_quality_observation_is_scoped_to_task_class(self) -> None:
+        route_id = "claude-sonnet-5-high"
+        status, result = self._main(
+            [
+                "observe",
+                "--route",
+                route_id,
+                "--task-class",
+                "long-agent",
+                "--outcome",
+                "success",
+                "--duration-seconds",
+                "42",
+                "--rework-minutes",
+                "3",
+            ]
+        )
+        self.assertEqual(status, 0)
+        self.assertTrue(result["quality_recorded"])
+        self.assertEqual(result["task_class"], "long-agent")
+        stored = json.loads(self.state.read_text(encoding="utf-8"))
+        route_state = stored["routes"][route_id]
+        self.assertNotIn("runs", route_state)
+        scoped = route_state["by_task_class"]["long-agent"]
+        self.assertEqual(scoped["runs"], 1)
+        self.assertEqual(scoped["successes"], 1)
+        self.assertEqual(scoped["failures"], 0)
+        self.assertEqual(scoped["average_rework_minutes"], 3.0)
+        self.assertEqual(scoped["last_duration_seconds"], 42.0)
+
+    def test_quality_observation_requires_supported_task_class(self) -> None:
+        cases = [
+            [
+                "observe",
+                "--route",
+                "claude-sonnet-5-high",
+                "--outcome",
+                "success",
+            ],
+            [
+                "observe",
+                "--route",
+                "claude-sonnet-5-high",
+                "--task-class",
+                "triage",
+                "--outcome",
+                "quality_failure",
+            ],
+        ]
+        for argv in cases:
+            with self.subTest(argv=argv):
+                status, result = self._main(argv)
+                self.assertEqual(status, 1)
+                self.assertEqual(result["error"], "coding_agent_router_cli_failed_closed")
+                self.assertFalse(self.state.exists())
+
+    def test_infrastructure_observation_rejects_rework_quality_metric(self) -> None:
+        status, result = self._main(
+            [
+                "observe",
+                "--route",
+                "claude-sonnet-5-high",
+                "--outcome",
+                "transient",
+                "--rework-minutes",
+                "2",
+            ]
+        )
+        self.assertEqual(status, 1)
+        self.assertEqual(result["error"], "coding_agent_router_cli_failed_closed")
+        self.assertFalse(self.state.exists())
 
     def test_probe_binds_only_explicitly_verified_pool_timestamps(self) -> None:
         _, validation = router._load_catalog()
@@ -799,14 +875,28 @@ class CodingAgentRouterCliTests(unittest.TestCase):
             "catalog_sha256": validation["catalog_sha256"],
             "catalog": {},
             "pools": {},
-            "routes": {route_id: {"runs": True}},
+            "routes": {
+                route_id: {
+                    "by_task_class": {
+                        "independent-review": {"runs": True}
+                    }
+                }
+            },
             "history": {},
         }
         self.state.write_text(json.dumps(initial), encoding="utf-8")
         os.chmod(self.state, 0o600)
         before = self.state.read_bytes()
         status, result = self._main(
-            ["observe", "--route", route_id, "--outcome", "success"]
+            [
+                "observe",
+                "--route",
+                route_id,
+                "--task-class",
+                "independent-review",
+                "--outcome",
+                "success",
+            ]
         )
         self.assertEqual(status, 1)
         self.assertEqual(result["error_type"], "CodingAgentRouterCliError")
@@ -831,11 +921,15 @@ class CodingAgentRouterCliTests(unittest.TestCase):
             },
             "routes": {
                 route_id: {
-                    "runs": 1,
-                    "successes": 1,
-                    "failures": 0,
-                    "average_rework_minutes": 10.0,
-                    "rework_observations": 1,
+                    "by_task_class": {
+                        "independent-review": {
+                            "runs": 1,
+                            "successes": 1,
+                            "failures": 0,
+                            "average_rework_minutes": 10.0,
+                            "rework_observations": 1,
+                        }
+                    }
                 }
             },
             "history": {},
@@ -847,6 +941,8 @@ class CodingAgentRouterCliTests(unittest.TestCase):
                 "observe",
                 "--route",
                 route_id,
+                "--task-class",
+                "independent-review",
                 "--outcome",
                 "success",
                 "--rework-minutes",
@@ -855,7 +951,7 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         )
         self.assertEqual(status, 0)
         stored = json.loads(self.state.read_text(encoding="utf-8"))
-        record = stored["routes"][route_id]
+        record = stored["routes"][route_id]["by_task_class"]["independent-review"]
         self.assertEqual(record["average_rework_minutes"], 15.0)
         self.assertEqual(record["rework_observations"], 2)
         for pool_id in router._route_map(catalog)[route_id]["quota_pools"]:
