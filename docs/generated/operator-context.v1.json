@@ -2491,17 +2491,6 @@
     },
     {
       "category": "agent-workspace",
-      "description": "Compatibility adapter over canonical execution routing plus legacy contrast advice.",
-      "effects": [],
-      "id": "grabowski_agent_execution_route",
-      "purpose": "Expose the legacy execution-routing adapter over canonical controller or lane-scoped-writer routing, with optional advisory contrast candidates.",
-      "read_only": true,
-      "reversibility": "not-applicable",
-      "risk_class": "low",
-      "tool": "grabowski_agent_execution_route"
-    },
-    {
-      "category": "agent-workspace",
       "description": "Read the validated canonical coding-model, harness, route and quota inventory.",
       "effects": [],
       "id": "grabowski_coding_agent_catalog",
@@ -3023,7 +3012,6 @@
       "grabowski_agent_workspace_reconcile_stale",
       "grabowski_agent_workspace_reconcile_idle_tmux",
       "grabowski_agent_workspace_cleanup",
-      "grabowski_agent_execution_route",
       "grabowski_coding_agent_catalog",
       "grabowski_coding_agent_route",
       "grabowski_agent_competition_start",
@@ -3586,7 +3574,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "c89aa9c07dd4ac22cdbfd893aef19d6b4f47f5a7b3deee70057d3b375fc08ccd"
+      "sha256": "68d16ce357af3ae69564960ffb37482aaee5d327ad3d8484d462dc6fd13a2ace"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3594,13 +3582,13 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "27db499fc6cb114159d769b07ee3f135ebfd58921788be620a47ae39d5ce1bab"
+      "sha256": "f65d5f4345da0bba5c28ebd9951e52ecf326429ba2657b89155d7b137c54fdbc"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
       "src/der_kleine_maulwurf_operator.py": "e924d54aa1e0b1d6dbcdc0390515f7f5f4aa4b22c055af674278aea1772bcbce",
       "src/grabowski_agent_bootstrap.py": "30d9764e86f6e2ef8ff5d52c77e84832259412db7194390b4c42e06e196b403d",
-      "src/grabowski_agent_competition.py": "14e9221e20a4f84cdca55eb1d2d7692ba1251af3e510da6b8891c23f115ba119",
+      "src/grabowski_agent_competition.py": "55edc7fbda06aa37f996af83ae8e919ab8e1f0fba79438a6aca8dfbf7f28c4a5",
       "src/grabowski_agent_role.py": "41e18f20608fb675d1bbc2953d934522f5404b0140fc1f590d56ff5d9e4e46ec",
       "src/grabowski_agent_sandbox.py": "0d669bea9919bcfb43c912e6866a4466ab59198899f08f3353498d8be2241487",
       "src/grabowski_agent_workspace.py": "845c864fde68eff1c90787ebbcf1847b2c5f57d6a3b20d5bb731e52b6c55a312",
