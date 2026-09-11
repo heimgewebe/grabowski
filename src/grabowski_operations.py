@@ -559,6 +559,12 @@ def _platform_capture_publication_binding(
         raise ValueError("platform capture requested contract is not the current request contract")
     if plan["observed_at_unix"] < request["requested_at_unix"]:
         raise ValueError("platform observation predates the publication request")
+    if (
+        plan["observed_at_unix"]
+        > int(time.time())
+        + base.grabowski_client_snapshot.SNAPSHOT_CLOCK_SKEW_SECONDS
+    ):
+        raise ValueError("platform observation is too far in the future")
     runtime_contract = base.grabowski_client_snapshot._platform_publication_contract(
         registered_tool_count=binding["registered_tool_count"],
         registered_names_sha256=binding["registered_names_sha256"],
@@ -574,6 +580,16 @@ def _platform_capture_publication_binding(
         "current_state": current["state"],
         "contract_sha256": request_contract_sha256,
         "runtime_contract_sha256": runtime_contract["tool_contract_sha256"],
+    }
+
+
+def _platform_runtime_identity(
+    binding: dict[str, Any], runtime_metadata: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        "binding": dict(binding),
+        "complete_schema_count": runtime_metadata["complete_schema_count"],
+        "complete_schema_sha256": runtime_metadata["complete_schema_sha256"],
     }
 
 
@@ -621,6 +637,11 @@ def _run_platform_connector_capture_operation(
     observed_tools = _read_platform_capture_artifact(
         Path(plan["artifact_path"]), plan["artifact_sha256"]
     )
+    binding, runtime_tools, runtime_metadata = _platform_runtime_context()
+    runtime_identity = _platform_runtime_identity(binding, runtime_metadata)
+    publication_binding = _platform_capture_publication_binding(
+        plan, binding, runtime_metadata
+    )
     document = base.grabowski_client_snapshot.build_platform_connector_snapshot(
         observed_tools=observed_tools,
         runtime_root=base.DEPLOYMENT_MANIFEST.parent,
@@ -631,23 +652,24 @@ def _run_platform_connector_capture_operation(
         requested_contract_sha256=plan["requested_contract_sha256"],
         observed_at_unix=plan["observed_at_unix"],
     )
-    binding, runtime_tools, runtime_metadata = _platform_runtime_context()
-    publication_binding = _platform_capture_publication_binding(
-        plan, binding, runtime_metadata
-    )
+    if document.get("runtime_binding") != binding:
+        raise ValueError("active runtime changed while building the platform snapshot")
     before = _platform_snapshot_readback(binding, runtime_tools)
     expected_snapshot_sha256 = document["snapshot_sha256"]
     invocation: dict[str, Any] | None = None
     staged_path: Path | None = None
     if before.get("snapshot_sha256") != expected_snapshot_sha256:
+        latest_binding, _latest_tools, latest_metadata = _platform_runtime_context()
         latest_publication_binding = _platform_capture_publication_binding(
-            plan, binding, runtime_metadata
+            plan, latest_binding, latest_metadata
         )
         if (
             latest_publication_binding["request_sha256"]
             != publication_binding["request_sha256"]
         ):
             raise ValueError("platform publication request changed before root capture")
+        if _platform_runtime_identity(latest_binding, latest_metadata) != runtime_identity:
+            raise ValueError("active runtime changed before root capture")
         staged_path, staged_sha256 = _write_platform_capture_stage(document)
         target = json.dumps(
             {"source_path": str(staged_path), "expected_file_sha256": staged_sha256},
@@ -655,14 +677,25 @@ def _run_platform_connector_capture_operation(
             sort_keys=True,
             separators=(",", ":"),
         )
-        invocation = _invoke_mainpid_privileged_action(
-            action=PLATFORM_CONNECTOR_CAPTURE_ACTION,
-            target=target,
-            justification="publish one hash-bound request-scoped ChatGPT connector catalog observation",
-            timeout_seconds=120,
-        )
-    after_root = _platform_snapshot_readback(binding, runtime_tools)
-    root_effect_confirmed = after_root.get("snapshot_sha256") == expected_snapshot_sha256
+        try:
+            invocation = _invoke_mainpid_privileged_action(
+                action=PLATFORM_CONNECTOR_CAPTURE_ACTION,
+                target=target,
+                justification="publish one hash-bound request-scoped ChatGPT connector catalog observation",
+                timeout_seconds=120,
+            )
+        except Exception:
+            staged_path.unlink(missing_ok=True)
+            raise
+    post_binding, post_runtime_tools, post_metadata = _platform_runtime_context()
+    post_runtime_identity = _platform_runtime_identity(post_binding, post_metadata)
+    after_root = _platform_snapshot_readback(post_binding, post_runtime_tools)
+    root_effect_confirmed = bool(
+        post_runtime_identity == runtime_identity
+        and after_root.get("snapshot_sha256") == expected_snapshot_sha256
+        and after_root.get("runtime_binding_matches") is True
+        and after_root.get("publication_contract_matches") is True
+    )
     if invocation is not None and invocation.get("outcome") == "unknown" and not root_effect_confirmed:
         return {
             "operation": PLATFORM_CONNECTOR_CAPTURE_OPERATION,
@@ -699,13 +732,23 @@ def _run_platform_connector_capture_operation(
             "root_effect_confirmed": False,
         }
     reconciliation = base.grabowski_client_snapshot.reconcile_platform_publication_for_runtime(
-        registered_tool_count=binding["registered_tool_count"],
-        registered_names_sha256=binding["registered_names_sha256"],
-        complete_schema_count=runtime_metadata["complete_schema_count"],
-        complete_schema_sha256=runtime_metadata["complete_schema_sha256"],
+        registered_tool_count=post_binding["registered_tool_count"],
+        registered_names_sha256=post_binding["registered_names_sha256"],
+        complete_schema_count=post_metadata["complete_schema_count"],
+        complete_schema_sha256=post_metadata["complete_schema_sha256"],
     )
-    final = _platform_snapshot_readback(binding, runtime_tools)
-    success = reconciliation.get("state") == "platform_converged"
+    final_binding, final_runtime_tools, final_metadata = _platform_runtime_context()
+    final = _platform_snapshot_readback(final_binding, final_runtime_tools)
+    final_runtime_stable = (
+        _platform_runtime_identity(final_binding, final_metadata) == runtime_identity
+    )
+    success = bool(
+        reconciliation.get("state") == "platform_converged"
+        and final_runtime_stable
+        and final.get("runtime_binding_matches") is True
+        and final.get("publication_contract_matches") is True
+        and final.get("publication_state") == "platform_converged"
+    )
     audit = {
         "timestamp_unix": int(time.time()),
         "operation": "named-operation-run",

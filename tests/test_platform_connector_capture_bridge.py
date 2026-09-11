@@ -187,7 +187,7 @@ class PlatformConnectorCaptureBridgeTests(unittest.TestCase):
             patch.object(
                 operations.base.grabowski_client_snapshot,
                 "build_platform_connector_snapshot",
-                return_value={"snapshot_sha256": "2" * 64},
+                return_value={"snapshot_sha256": "2" * 64, "runtime_binding": binding},
             ),
             patch.object(
                 operations,
@@ -281,8 +281,7 @@ class PlatformConnectorCaptureBridgeTests(unittest.TestCase):
                     metadata,
                 )
 
-    def test_unknown_root_outcome_stops_before_reconciliation(self) -> None:
-        document = {"snapshot_sha256": "2" * 64}
+    def test_future_observation_is_rejected_before_root_staging(self) -> None:
         binding = {
             "registered_tool_count": 1,
             "registered_names_sha256": "3" * 64,
@@ -290,6 +289,212 @@ class PlatformConnectorCaptureBridgeTests(unittest.TestCase):
             "repo_head": "4" * 40,
             "agent_instructions_sha256": "5" * 64,
         }
+        metadata = {
+            "complete_schema_count": 1,
+            "complete_schema_sha256": "6" * 64,
+        }
+        current = {
+            "state": "awaiting_platform_observation",
+            "request_id": "request-test-1",
+            "contract_sha256": CONTRACT_SHA,
+            "current_sha256": "7" * 64,
+        }
+        request = {
+            "request_id": "request-test-1",
+            "request_sha256": "8" * 64,
+            "requested_at_unix": 900,
+            "expected_contract": {"tool_contract_sha256": CONTRACT_SHA},
+        }
+        future = str(
+            1000
+            + operations.base.grabowski_client_snapshot.SNAPSHOT_CLOCK_SKEW_SECONDS
+            + 1
+        )
+        with (
+            patch.object(operations.time, "time", return_value=1000),
+            patch.object(
+                operations.base.grabowski_client_snapshot,
+                "_read_publication_current",
+                return_value=current,
+            ),
+            patch.object(
+                operations.base.grabowski_client_snapshot,
+                "_read_publication_request",
+                return_value=request,
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "too far in the future"):
+                operations._platform_capture_publication_binding(
+                    operations._platform_connector_capture_plan(
+                        _parameters(observed_at_unix=future)
+                    ),
+                    binding,
+                    metadata,
+                )
+
+    def test_runtime_drift_while_building_stops_before_root_staging(self) -> None:
+        binding = {
+            "registered_tool_count": 1,
+            "registered_names_sha256": "3" * 64,
+            "release_id": "release-test-1",
+            "repo_head": "4" * 40,
+            "agent_instructions_sha256": "5" * 64,
+        }
+        metadata = {
+            "complete_schema_count": 1,
+            "complete_schema_sha256": "6" * 64,
+        }
+        stage = Mock()
+        invoke = Mock()
+        with (
+            patch.object(operations.operator, "_require_operator_capability"),
+            patch.object(operations.operator, "_require_operator_mutation"),
+            patch.object(operations, "_read_platform_capture_artifact", return_value={}),
+            patch.object(
+                operations,
+                "_platform_runtime_context",
+                return_value=(binding, {}, metadata),
+            ),
+            patch.object(
+                operations,
+                "_platform_capture_publication_binding",
+                return_value={"request_sha256": "f" * 64},
+            ),
+            patch.object(
+                operations.base.grabowski_client_snapshot,
+                "build_platform_connector_snapshot",
+                return_value={
+                    "snapshot_sha256": "2" * 64,
+                    "runtime_binding": {**binding, "repo_head": "0" * 40},
+                },
+            ),
+            patch.object(operations, "_write_platform_capture_stage", stage),
+            patch.object(operations, "_invoke_mainpid_privileged_action", invoke),
+        ):
+            with self.assertRaisesRegex(ValueError, "runtime changed while building"):
+                operations._run_platform_connector_capture_operation(_parameters())
+
+        stage.assert_not_called()
+        invoke.assert_not_called()
+
+    def test_runtime_drift_immediately_before_root_staging_is_rejected(self) -> None:
+        binding = {
+            "registered_tool_count": 1,
+            "registered_names_sha256": "3" * 64,
+            "release_id": "release-test-1",
+            "repo_head": "4" * 40,
+            "agent_instructions_sha256": "5" * 64,
+        }
+        drifted_binding = {**binding, "repo_head": "0" * 40}
+        metadata = {
+            "complete_schema_count": 1,
+            "complete_schema_sha256": "6" * 64,
+        }
+        document = {"snapshot_sha256": "2" * 64, "runtime_binding": binding}
+        stage = Mock()
+        invoke = Mock()
+        with (
+            patch.object(operations.operator, "_require_operator_capability"),
+            patch.object(operations.operator, "_require_operator_mutation"),
+            patch.object(operations, "_read_platform_capture_artifact", return_value={}),
+            patch.object(
+                operations,
+                "_platform_runtime_context",
+                side_effect=[
+                    (binding, {}, metadata),
+                    (drifted_binding, {}, metadata),
+                ],
+            ),
+            patch.object(
+                operations,
+                "_platform_capture_publication_binding",
+                return_value={"request_sha256": "f" * 64},
+            ),
+            patch.object(
+                operations.base.grabowski_client_snapshot,
+                "build_platform_connector_snapshot",
+                return_value=document,
+            ),
+            patch.object(
+                operations,
+                "_platform_snapshot_readback",
+                return_value={"snapshot_sha256": None},
+            ),
+            patch.object(operations, "_write_platform_capture_stage", stage),
+            patch.object(operations, "_invoke_mainpid_privileged_action", invoke),
+        ):
+            with self.assertRaisesRegex(ValueError, "runtime changed before root capture"):
+                operations._run_platform_connector_capture_operation(_parameters())
+
+        stage.assert_not_called()
+        invoke.assert_not_called()
+
+    def test_pretransport_broker_exception_removes_stage(self) -> None:
+        binding = {
+            "registered_tool_count": 1,
+            "registered_names_sha256": "3" * 64,
+            "release_id": "release-test-1",
+            "repo_head": "4" * 40,
+            "agent_instructions_sha256": "5" * 64,
+        }
+        metadata = {
+            "complete_schema_count": 1,
+            "complete_schema_sha256": "6" * 64,
+        }
+        document = {"snapshot_sha256": "2" * 64, "runtime_binding": binding}
+        staged = Mock()
+        staged.__str__ = Mock(
+            return_value="/home/alex/worktrees/.grabowski-platform-snapshot-11111111111111111111111111111111.json"
+        )
+        with (
+            patch.object(operations.operator, "_require_operator_capability"),
+            patch.object(operations.operator, "_require_operator_mutation"),
+            patch.object(operations, "_read_platform_capture_artifact", return_value={}),
+            patch.object(
+                operations,
+                "_platform_runtime_context",
+                return_value=(binding, {}, metadata),
+            ),
+            patch.object(
+                operations,
+                "_platform_capture_publication_binding",
+                return_value={"request_sha256": "f" * 64},
+            ),
+            patch.object(
+                operations.base.grabowski_client_snapshot,
+                "build_platform_connector_snapshot",
+                return_value=document,
+            ),
+            patch.object(
+                operations,
+                "_platform_snapshot_readback",
+                return_value={"snapshot_sha256": None},
+            ),
+            patch.object(
+                operations,
+                "_write_platform_capture_stage",
+                return_value=(staged, "7" * 64),
+            ),
+            patch.object(
+                operations,
+                "_invoke_mainpid_privileged_action",
+                side_effect=PermissionError("broker unavailable"),
+            ),
+        ):
+            with self.assertRaisesRegex(PermissionError, "broker unavailable"):
+                operations._run_platform_connector_capture_operation(_parameters())
+
+        staged.unlink.assert_called_once_with(missing_ok=True)
+
+    def test_unknown_root_outcome_stops_before_reconciliation(self) -> None:
+        binding = {
+            "registered_tool_count": 1,
+            "registered_names_sha256": "3" * 64,
+            "release_id": "release-test-1",
+            "repo_head": "4" * 40,
+            "agent_instructions_sha256": "5" * 64,
+        }
+        document = {"snapshot_sha256": "2" * 64, "runtime_binding": binding}
         reconcile = Mock()
         with (
             patch.object(operations.operator, "_require_operator_capability"),
@@ -339,7 +544,6 @@ class PlatformConnectorCaptureBridgeTests(unittest.TestCase):
         reconcile.assert_not_called()
 
     def test_exact_root_effect_reconciles_once(self) -> None:
-        document = {"snapshot_sha256": "8" * 64}
         binding = {
             "registered_tool_count": 1,
             "registered_names_sha256": "9" * 64,
@@ -351,6 +555,7 @@ class PlatformConnectorCaptureBridgeTests(unittest.TestCase):
             "complete_schema_count": 1,
             "complete_schema_sha256": "c" * 64,
         }
+        document = {"snapshot_sha256": "8" * 64, "runtime_binding": binding}
         reconcile = Mock(return_value={"state": "platform_converged"})
         with (
             patch.object(operations.operator, "_require_operator_capability"),
@@ -376,10 +581,15 @@ class PlatformConnectorCaptureBridgeTests(unittest.TestCase):
                 "_platform_snapshot_readback",
                 side_effect=[
                     {"snapshot_sha256": None},
-                    {"snapshot_sha256": document["snapshot_sha256"]},
+                    {
+                        "snapshot_sha256": document["snapshot_sha256"],
+                        "runtime_binding_matches": True,
+                        "publication_contract_matches": True,
+                    },
                     {
                         "snapshot_sha256": document["snapshot_sha256"],
                         "state": "matched",
+                        "runtime_binding_matches": True,
                         "publication_state": "platform_converged",
                         "publication_contract_matches": True,
                     },
