@@ -7149,12 +7149,29 @@ def grabowski_bureau_pickup_release(run_id: str) -> dict[str, Any]:
         run_dir / "terminal-readback.json", status
     )
     if keys:
-        result = {
-            **resources.release_resources(
+        try:
+            released = resources.release_resources(
                 owner_id,
                 keys,
                 expected_leases=release_snapshots,
-            ),
+            )
+        except RuntimeError as exc:
+            prefix = "Resource lease changed before release: "
+            message = str(exc)
+            if not message.startswith(prefix):
+                raise
+            raise BureauPickupError(
+                "lease-release-generation-changed",
+                details={
+                    "resource_key": message.removeprefix(prefix),
+                    "recommended_next_action": (
+                        "read back the current lease generation and retry "
+                        "bureau-pickup-release"
+                    ),
+                },
+            ) from exc
+        result = {
+            **released,
             "released_resource_keys": keys,
             "preserved_resource_keys": preserved_keys,
         }

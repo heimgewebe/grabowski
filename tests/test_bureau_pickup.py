@@ -4361,6 +4361,39 @@ class BureauPickupTests(unittest.TestCase):
             expected_leases=[pickup._lease_snapshot(lease)],
         )
 
+    def test_terminal_release_maps_release_snapshot_race_to_pickup_error(self) -> None:
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        self.create_acquisition_journal(intent, lease)
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                return_value=self.terminal_status(intent),
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "inspect_resource",
+                return_value=lease,
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "release_resources",
+                side_effect=RuntimeError(
+                    f"Resource lease changed before release: {key}"
+                ),
+            ),
+        ):
+            with self.assertRaises(pickup.BureauPickupError) as caught:
+                pickup.grabowski_bureau_pickup_release(intent["run_id"])
+        self.assertEqual("lease-release-generation-changed", caught.exception.code)
+        self.assertEqual(key, caught.exception.details["resource_key"])
+        self.assertIn(
+            "retry bureau-pickup-release",
+            caught.exception.details["recommended_next_action"],
+        )
+
     def test_terminal_release_preserves_strict_foreign_successor_and_releases_owner_keys(
         self,
     ) -> None:
