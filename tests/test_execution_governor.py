@@ -220,7 +220,7 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(result["recommended_route"], "operator_stop")
         self.assertFalse(result["route_feasible"])
-        self.assertFalse(result["execution_authorized"])
+        self.assertNotIn("execution_authorized", result)
         self.assertTrue(result["action_shape"]["stop"])
         self.assertFalse(result["action_shape"]["isolated_mutation"])
         self.assertEqual(result["retry_policy"]["retry_limit"], 0)
@@ -253,7 +253,7 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(result["recommended_route"], "state_readback")
         self.assertTrue(result["route_feasible"])
-        self.assertFalse(result["execution_authorized"])
+        self.assertNotIn("execution_authorized", result)
         self.assertEqual(result["retry_policy"]["retry_limit"], 0)
         self.assertIn("possible_mutation_outcome_unknown", result["reason_codes"])
         self.assertTrue(result["action_shape"]["state_readback_only"])
@@ -328,7 +328,8 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(result["recommended_route"], "typed_tool")
         self.assertTrue(result["route_feasible"])
-        self.assertFalse(result["execution_authorized"])
+        self.assertNotIn("execution_authorized", result)
+        self.assertIn("execution_authority", result["does_not_establish"])
         self.assertIn("resource_lease_nonconflict_proof_valid", result["reason_codes"])
         self.assertTrue(result["nonconflict_evidence"]["valid"])
         self.assertTrue(
@@ -376,7 +377,7 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(result["recommended_route"], "explicit_preflight")
         self.assertFalse(result["route_feasible"])
-        self.assertFalse(result["execution_authorized"])
+        self.assertNotIn("execution_authorized", result)
         self.assertIn("immutable_high_impact_boundary", result["reason_codes"])
 
     def test_policy_gate_never_becomes_an_adaptive_bypass(self) -> None:
@@ -407,7 +408,7 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(conflict["recommended_route"], "stop_resource_conflict")
         self.assertFalse(conflict["route_feasible"])
-        self.assertFalse(conflict["execution_authorized"])
+        self.assertNotIn("execution_authorized", conflict)
 
         no_readback = self._recommend(
             module,
@@ -418,7 +419,7 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(no_readback["recommended_route"], "stop_missing_readback")
         self.assertFalse(no_readback["route_feasible"])
-        self.assertFalse(no_readback["execution_authorized"])
+        self.assertNotIn("execution_authorized", no_readback)
         self.assertTrue(no_readback["action_shape"]["one_mutation_per_attempt"])
 
     def test_high_risk_never_receives_live_adaptive_authority(self) -> None:
@@ -433,7 +434,7 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(result["recommended_route"], "explicit_preflight")
         self.assertFalse(result["route_feasible"])
-        self.assertFalse(result["execution_authorized"])
+        self.assertNotIn("execution_authorized", result)
         self.assertFalse(result["promotion"]["applied"])
         self.assertEqual(result["promotion"]["eligible_risk_levels"], ["low", "medium"])
         self.assertIn("authorization", result["immutable_boundaries"])
@@ -654,7 +655,7 @@ class ExecutionGovernorRuntimeTests(unittest.TestCase):
         self.assertNotIn(
             "recurring_connector_transport_evidence", result["reason_codes"]
         )
-        self.assertFalse(result["execution_authorized"])
+        self.assertNotIn("execution_authorized", result)
 
     def test_parallel_outcome_appends_remain_unique_and_parseable(self) -> None:
         module = self._load_module()
