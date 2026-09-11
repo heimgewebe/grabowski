@@ -637,7 +637,7 @@ def _tool_read_only_hint(tool: Any) -> bool | None:
 
 
 GIT_SERVER_READ_ONLY_SUBCOMMANDS = frozenset(
-    {"diff", "log", "rev-parse", "show", "status"}
+    {"diff", "log", "rev-parse", "show"}
 )
 GIT_SERVER_READ_ONLY_OPTIONS = {
     "diff": frozenset(
@@ -710,15 +710,6 @@ GIT_SERVER_READ_ONLY_OPTIONS = {
             "-s",
         }
     ),
-    "status": frozenset(
-        {
-            "--branch",
-            "--porcelain",
-            "--short",
-            "-b",
-            "-s",
-        }
-    ),
 }
 
 
@@ -730,15 +721,6 @@ def _git_server_read_option_allowed(subcommand: str, option: str) -> bool:
             re.fullmatch(r"--short=[1-9][0-9]{0,2}", option) is not None
             or option in {"--abbrev-ref=loose", "--abbrev-ref=strict"}
             or option in {"--path-format=absolute", "--path-format=relative"}
-        )
-    if subcommand == "status":
-        return (
-            option in {"--porcelain=v1", "--porcelain=v2"}
-            or option in {
-                "--untracked-files=no",
-                "--untracked-files=normal",
-                "--untracked-files=all",
-            }
         )
     if subcommand == "log":
         return (
@@ -772,6 +754,13 @@ def _server_verified_git_read_invocation(
     if arguments[0] != subcommand or configurations:
         return None
     if subcommand not in GIT_SERVER_READ_ONLY_SUBCOMMANDS:
+        return None
+    # A worktree diff can run repository-configured clean filters while merely
+    # inspecting files.  Only index-vs-tree diff forms are effect-free enough
+    # for this transport exemption; worktree diff and status stay gated.
+    if subcommand == "diff" and not any(
+        item in {"--cached", "--staged"} for item in command_arguments
+    ):
         return None
     after_separator = False
     for item in command_arguments:

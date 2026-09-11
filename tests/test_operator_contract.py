@@ -5599,8 +5599,7 @@ class GitServerVerifiedReadTransportTests(unittest.TestCase):
             repo = self._repo(operator, temporary)
             for git_arguments in (
                 ["rev-parse", "--show-toplevel"],
-                ["status", "--short"],
-                ["diff", "--check"],
+                ["diff", "--cached", "--check"],
                 ["show", "--stat"],
                 ["log", "-1"],
             ):
@@ -5643,8 +5642,12 @@ class GitServerVerifiedReadTransportTests(unittest.TestCase):
                 patch.object(operator, "_require_operator_capability") as capability,
                 patch.object(operator, "_require_operator_mutation") as mutation,
             ):
-                first = operator.grabowski_git(str(repo), ["diff", "--check"])
-                second = operator.grabowski_git(str(repo), ["diff", "--check"])
+                first = operator.grabowski_git(
+                    str(repo), ["diff", "--cached", "--check"]
+                )
+                second = operator.grabowski_git(
+                    str(repo), ["diff", "--cached", "--check"]
+                )
             self.assertEqual(first["returncode"], 0)
             self.assertEqual(second["returncode"], 0)
             self.assertIn("--no-ext-diff", first["argv"])
@@ -5668,7 +5671,9 @@ class GitServerVerifiedReadTransportTests(unittest.TestCase):
                 ["show", "--show-signature"],
                 ["show", "--show-sig"],
                 ["log", "--output=/tmp/log.txt"],
+                ["status", "--short"],
                 ["status", "--porc"],
+                ["diff", "--check"],
                 ["rev-parse", "--parseopt"],
                 ["-c", "diff.external=/tmp/helper", "diff", "--check"],
             )
