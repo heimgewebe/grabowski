@@ -9368,35 +9368,11 @@ class TaskTests(unittest.TestCase):
             "approval_task_id": approval_task_id,
             "created_at": "2026-09-01T00:00:00Z",
             "expires_at": "2099-01-01T00:00:00Z",
-            "authorized_by": "test-reviewer",
-            "authorization": "test-runtime-authorization",
             "authority_task_spec": {
                 "task_id": approval_task_id,
                 "revision": authority_revision,
                 "spec_sha256": authority_spec_sha256,
                 "state": "ready",
-            },
-            "runtime_approval": {
-                "schema_version": 1,
-                "action_class": "runtime_mutation",
-                "action_classes": ["runtime_mutation"],
-                "allowed": True,
-                "reason": "approved",
-                "required": True,
-                "required_level": "break_glass",
-                "expected_task_id": approval_task_id,
-                "expected_reference": target_sha256,
-                "evidence": {
-                    "schema_version": 1,
-                    "source": "test-runtime-authorization",
-                    "approved": True,
-                    "level": "break_glass",
-                    "reviewer": "test-reviewer",
-                    "task_id": approval_task_id,
-                    "reference": target_sha256,
-                    "scope": ["runtime_mutation"],
-                    "note": "Bureau immutable runtime refresh",
-                },
             },
             "required_resource_keys": keys,
             "target_sha256": target_sha256,
@@ -9540,7 +9516,7 @@ class TaskTests(unittest.TestCase):
                 fixture["request"], fixture["intent"], fixture["authority"], task_id, bad_unit
             )
 
-    def test_runtime_refresh_prelaunch_rejects_unbound_owner_approval_and_resource_kind(self) -> None:
+    def test_runtime_refresh_prelaunch_rejects_unbound_owner_authority_and_resource_kind(self) -> None:
         fixture = self._runtime_refresh_prelaunch_fixture()
         task_id = "9" * 24
         unit = f"grabowski-task-{task_id}-a1.service"
@@ -9555,31 +9531,31 @@ class TaskTests(unittest.TestCase):
                 unit,
             )
 
-        bad_approval_payload = {
+        bad_authority_payload = {
             key: value
             for key, value in fixture["intent"].items()
             if key != "intent_sha256"
         }
-        bad_approval_payload["runtime_approval"] = {
-            **bad_approval_payload["runtime_approval"],
-            "allowed": False,
+        bad_authority_payload["authority_task_spec"] = {
+            **bad_authority_payload["authority_task_spec"],
+            "task_id": "BUREAU-RUNTIME-REFRESH-OTHER",
         }
-        bad_approval_digest = hashlib.sha256(
-            (tasks._canonical_json(bad_approval_payload) + "\n").encode("utf-8")
+        bad_authority_digest = hashlib.sha256(
+            (tasks._canonical_json(bad_authority_payload) + "\n").encode("utf-8")
         ).hexdigest()
-        bad_approval_intent = {
-            **bad_approval_payload,
-            "intent_sha256": bad_approval_digest,
+        bad_authority_intent = {
+            **bad_authority_payload,
+            "intent_sha256": bad_authority_digest,
         }
-        bad_approval_request = {
+        bad_authority_request = {
             **fixture["request"],
-            "expected_intent_sha256": bad_approval_digest,
-            "lease_owner": f"runtime-refresh:{bad_approval_digest[:16]}",
+            "expected_intent_sha256": bad_authority_digest,
+            "lease_owner": f"runtime-refresh:{bad_authority_digest[:16]}",
         }
-        with self.assertRaisesRegex(ValueError, "approval binding is invalid"):
+        with self.assertRaisesRegex(ValueError, "authority binding is invalid"):
             tasks._runtime_refresh_prelaunch_lease_binding_request(
-                bad_approval_request,
-                bad_approval_intent,
+                bad_authority_request,
+                bad_authority_intent,
                 fixture["authority"],
                 task_id,
                 unit,
@@ -9600,7 +9576,7 @@ class TaskTests(unittest.TestCase):
             "expected_intent_sha256": expired_digest,
             "lease_owner": f"runtime-refresh:{expired_digest[:16]}",
         }
-        with self.assertRaisesRegex(ValueError, "approval expires too soon"):
+        with self.assertRaisesRegex(ValueError, "intent expires too soon"):
             tasks._runtime_refresh_prelaunch_lease_binding_request(
                 expired_request,
                 expired_intent,
@@ -10430,7 +10406,7 @@ class TaskTests(unittest.TestCase):
                     side_effect=AssertionError("journal recovery must not run"),
                 ) as reconcile,
             ):
-                with self.assertRaisesRegex(ValueError, "approval expires too soon"):
+                with self.assertRaisesRegex(ValueError, "intent expires too soon"):
                     tasks.grabowski_task_start(
                         "local",
                         expired_fixture["argv"],
