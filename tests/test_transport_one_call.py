@@ -1310,6 +1310,33 @@ class OperatorSignedTransportTests(unittest.TestCase):
         ):
             self.assertNotIn(key, environment)
 
+    def test_exempt_github_auth_lookup_timeout_terminates_child_without_token_leak(self) -> None:
+        process = mock.Mock()
+        process.communicate.side_effect = operator.subprocess.TimeoutExpired(
+            cmd=["/usr/bin/gh", "auth", "token"],
+            timeout=operator._GITHUB_PR_VIEW_AUTH_TIMEOUT_SECONDS,
+        )
+        source = {
+            "HOME": "/home/alex",
+            "XDG_RUNTIME_DIR": "/run/user/1000",
+            "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+        }
+        with (
+            mock.patch.object(operator, "_trusted_owner_mode", return_value=True),
+            mock.patch.object(
+                operator, "_github_pr_view_default_keyring_locked", return_value=False
+            ),
+            mock.patch.object(operator.subprocess, "Popen", return_value=process) as popen,
+            mock.patch.object(operator, "_terminate_process_group") as terminate,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "credential lookup timed out"):
+                operator._github_pr_view_auth_token(
+                    "/usr/bin/gh", source, "github.com"
+                )
+        terminate.assert_called_once_with(process)
+        self.assertNotIn("GH_TOKEN", popen.call_args.kwargs["env"])
+        self.assertNotIn("GH_ENTERPRISE_TOKEN", popen.call_args.kwargs["env"])
+
     def test_exempt_github_auth_prefers_server_token_without_keyring_lookup(self) -> None:
         with (
             mock.patch.object(operator, "_trusted_owner_mode", return_value=True),
@@ -1358,7 +1385,7 @@ class OperatorSignedTransportTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "must remain absent"):
                 operator._github_pr_view_isolated_config_path()
 
-    def test_nonexempt_github_call_keeps_default_child_environment(self) -> None:
+    def test_unrelated_nonexempt_github_call_keeps_default_child_environment(self) -> None:
         with (
             mock.patch.object(operator, "_require_operator_mutation"),
             mock.patch.object(
@@ -1371,6 +1398,54 @@ class OperatorSignedTransportTests(unittest.TestCase):
                 cwd=str(ROOT),
             )
         self.assertIsNone(run.call_args.kwargs["environment"])
+
+    def test_nonexempt_github_call_uses_isolated_child_environment(self) -> None:
+        with (
+            mock.patch.object(operator, "_trusted_owner_mode", return_value=True),
+            mock.patch.object(operator, "_require_operator_mutation"),
+            mock.patch.object(
+                operator, "_trusted_github_cli_path", return_value="/usr/bin/gh"
+            ),
+            mock.patch.object(
+                operator,
+                "_github_pr_view_auth_token",
+                return_value="fixture-token",
+            ) as auth_token,
+            mock.patch.object(operator, "_run", return_value={"returncode": 0}) as run,
+        ):
+            operator.grabowski_github(
+                [
+                    "pr",
+                    "create",
+                    "--base",
+                    "main",
+                    "--head",
+                    "topic",
+                    "--title",
+                    "Title",
+                    "--body",
+                    "Body",
+                ],
+                cwd=str(ROOT),
+            )
+        auth_token.assert_called_once()
+        command = run.call_args.args[0]
+        environment = run.call_args.kwargs["environment"]
+        isolated = str(operator._GITHUB_PR_VIEW_ISOLATED_CONFIG_PATH)
+        self.assertEqual(command[0], "/usr/bin/gh")
+        self.assertNotIn("fixture-token", command)
+        self.assertEqual(environment["HOME"], isolated)
+        self.assertEqual(environment["XDG_CONFIG_HOME"], isolated)
+        self.assertEqual(environment["GH_CONFIG_DIR"], isolated)
+        self.assertEqual(environment["GH_TOKEN"], "fixture-token")
+        self.assertEqual(environment["GH_PROMPT_DISABLED"], "1")
+        self.assertEqual(str(run.call_args.kwargs["cwd"]), str(ROOT))
+        for unsafe_key in (
+            "HTTPS_PROXY",
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+        ):
+            self.assertNotIn(unsafe_key, environment)
 
     def test_github_pr_view_does_not_consume_signed_assertion(self) -> None:
         tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=False))
