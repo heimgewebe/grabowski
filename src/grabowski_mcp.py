@@ -644,7 +644,6 @@ TOOL_CAPABILITY_REQUIREMENTS = {
         "tmux_interaction",
     ),
     "grabowski_agent_workspace_cleanup": ("git_cli", "resource_lease"),
-    "grabowski_agent_execution_route": (),
     "grabowski_coding_agent_catalog": (),
     "grabowski_coding_agent_route": (),
     "grabowski_agent_competition_start": ("durable_job", "git_cli"),

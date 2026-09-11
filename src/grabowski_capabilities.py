@@ -1388,13 +1388,6 @@ TOOL_PROFILES.update(
             "effects": [],
             "reversibility": "not-applicable",
         },
-        "grabowski_agent_execution_route": {
-            "category": "agent-workspace",
-            "purpose": "Expose the legacy execution-routing adapter over canonical controller or lane-scoped-writer routing, with optional advisory contrast candidates.",
-            "risk_class": "low",
-            "effects": [],
-            "reversibility": "not-applicable",
-        },
         "grabowski_agent_competition_start": {
             "category": "agent-workspace",
             "purpose": "Start one durable advisory-only external competitor or contrast programmer against a commit-bound context packet with a frozen runner and isolated provider workspace.",
