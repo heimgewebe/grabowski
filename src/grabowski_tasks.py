@@ -10897,15 +10897,6 @@ def grabowski_task_reconcile(auto_resume: bool = False) -> dict[str, Any]:
     return _task_reconcile_after_guard(auto_resume)
 
 
-@mcp.tool(name="grabowski_task_reconcile", annotations=MUTATING)
-async def _grabowski_task_reconcile_tool(
-    auto_resume: bool = False,
-) -> dict[str, Any]:
-    """Reconcile persistent tasks after process loss or host restart."""
-    operator._require_operator_capability("durable_job")
-    return await asyncio.to_thread(_task_reconcile_after_guard, auto_resume)
-
-
 def grabowski_task_list(
     limit: int = DEFAULT_TASK_LIST_LIMIT,
     state: str | None = None,

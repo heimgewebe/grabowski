@@ -10845,7 +10845,6 @@ class RuntimeContractTests(unittest.TestCase):
             "grabowski_task_reconcile_check",
             "grabowski_task_reconcile_refresh",
             "grabowski_task_reconcile_resume",
-            "grabowski_task_reconcile",
             "grabowski_resource_acquire",
             "grabowski_resource_renew",
             "grabowski_resource_release",
@@ -10862,6 +10861,7 @@ class RuntimeContractTests(unittest.TestCase):
             "grabowski_agent_workspace_close",
         ):
             self.assertIn(tool, expected)
+        self.assertNotIn("grabowski_task_reconcile", expected)
         self.assertNotIn("grabowski_agent_workspace_adopt", expected)
         workspace_source = (ROOT / "src" / "grabowski_agent_workspace.py").read_text(
             encoding="utf-8"

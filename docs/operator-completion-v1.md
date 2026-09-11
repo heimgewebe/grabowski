@@ -10,7 +10,7 @@ Bei einem terminalen Taskzustand ist nicht mehr der Taskdatensatz die erste Auto
 
 Merge-Delegation und Terminalisierung werden über eine kurzlebige Task-Autoritätsadoption im selben Ressourcen-Writer serialisiert. Gewinnt der Merge zuerst, blockiert Terminalisierung bis Cleanup oder spätestens bis zur delegationsgebundenen Ablaufzeit. Gewinnt Terminalisierung zuerst, sind alle Task-Leases widerrufen und weitere Merge-Adoptionen blockieren. Das Lifecycle-Receipt bindet Transition, Taskprojektion, angeforderte Ressourcen, sämtliche vorgefundenen Owner-Leases, tatsächlich widerrufene und fehlende Schlüssel sowie Recovery-Status und Zeitpunkte; private Lease-Metadaten werden nicht ausgegeben.
 
-`grabowski_task_reconcile` gleicht Taskdatensätze mit User-systemd-Units ab. Der Legacy-Einstieg bleibt als Kompatibilitätspfad erhalten, führt aber nur noch Zustandsabgleich und Lease-Pflege aus; `auto_resume=True` wird als deaktivierter Legacy-Pfad markiert und startet keine Prozesse. Wiederanlauf erfolgt ausschließlich über den expliziten Resume-Pfad mit Begründung und Bound. Beispiel-Units verwenden periodisch `--mode refresh`.
+Der öffentliche MCP-Legacy-Einstieg `grabowski_task_reconcile` ist entfernt. Öffentliche Caller verwenden den expliziten Split `grabowski_task_reconcile_check`, `grabowski_task_reconcile_refresh` oder `grabowski_task_reconcile_resume`. Der interne Python-/CLI-Pfad `python -m grabowski_task_reconcile` bleibt für systemd und historische interne Consumer bestehen; Beispiel-Units verwenden periodisch `--mode refresh`, und Wiederanlauf erfolgt ausschließlich über den expliziten Resume-Pfad mit Begründung und Bound.
 
 ## Artefakte
 
