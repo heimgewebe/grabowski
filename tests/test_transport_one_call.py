@@ -1227,6 +1227,46 @@ class OperatorSignedTransportTests(unittest.TestCase):
             )
         )
 
+    def test_exempt_github_default_keyring_probe_reports_locked(self) -> None:
+        probe = SimpleNamespace(returncode=0, stdout=b"b true\n")
+        source = {
+            "HOME": "/home/alex",
+            "XDG_RUNTIME_DIR": "/run/user/1000",
+            "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+        }
+        with mock.patch.object(
+            operator.subprocess, "run", return_value=probe
+        ) as run:
+            locked = operator._github_pr_view_default_keyring_locked(
+                source, "github.com"
+            )
+        self.assertIs(locked, True)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[0], "/usr/bin/busctl")
+        self.assertEqual(argv[-1], "Locked")
+        environment = run.call_args.kwargs["env"]
+        self.assertEqual(
+            environment["DBUS_SESSION_BUS_ADDRESS"],
+            "unix:path=/run/user/1000/bus",
+        )
+
+    def test_exempt_github_auth_fails_fast_when_default_keyring_is_locked(self) -> None:
+        with (
+            mock.patch.object(operator, "_trusted_owner_mode", return_value=True),
+            mock.patch.object(
+                operator, "_github_pr_view_default_keyring_locked", return_value=True
+            ) as keyring_probe,
+            mock.patch.object(operator.subprocess, "Popen") as popen,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "keyring is locked"):
+                operator._github_pr_view_auth_token(
+                    "/usr/bin/gh",
+                    {"XDG_RUNTIME_DIR": "/run/user/1000"},
+                    "github.com",
+                )
+        keyring_probe.assert_called_once()
+        popen.assert_not_called()
+
     def test_exempt_github_auth_lookup_uses_local_keyring_without_network_env(self) -> None:
         process = mock.Mock()
         process.returncode = 0
@@ -1243,6 +1283,9 @@ class OperatorSignedTransportTests(unittest.TestCase):
         }
         with (
             mock.patch.object(operator, "_trusted_owner_mode", return_value=True),
+            mock.patch.object(
+                operator, "_github_pr_view_default_keyring_locked", return_value=False
+            ),
             mock.patch.object(operator.subprocess, "Popen", return_value=process) as popen,
         ):
             token = operator._github_pr_view_auth_token(
@@ -1270,12 +1313,16 @@ class OperatorSignedTransportTests(unittest.TestCase):
     def test_exempt_github_auth_prefers_server_token_without_keyring_lookup(self) -> None:
         with (
             mock.patch.object(operator, "_trusted_owner_mode", return_value=True),
+            mock.patch.object(
+                operator, "_github_pr_view_default_keyring_locked"
+            ) as keyring_probe,
             mock.patch.object(operator.subprocess, "Popen") as popen,
         ):
             token = operator._github_pr_view_auth_token(
                 "/usr/bin/gh", {"GH_TOKEN": "fixture-token"}, "github.com"
             )
         self.assertEqual(token, "fixture-token")
+        keyring_probe.assert_not_called()
         popen.assert_not_called()
 
     def test_exempt_github_untrusted_ignores_env_token_and_uses_local_auth(self) -> None:
