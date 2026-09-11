@@ -687,15 +687,31 @@ def _run_platform_connector_capture_operation(
         except Exception:
             staged_path.unlink(missing_ok=True)
             raise
-    post_binding, post_runtime_tools, post_metadata = _platform_runtime_context()
-    post_runtime_identity = _platform_runtime_identity(post_binding, post_metadata)
-    after_root = _platform_snapshot_readback(post_binding, post_runtime_tools)
-    root_effect_confirmed = bool(
-        post_runtime_identity == runtime_identity
-        and after_root.get("snapshot_sha256") == expected_snapshot_sha256
-        and after_root.get("runtime_binding_matches") is True
-        and after_root.get("publication_contract_matches") is True
-    )
+    try:
+        post_binding, post_runtime_tools, post_metadata = _platform_runtime_context()
+        post_runtime_identity = _platform_runtime_identity(post_binding, post_metadata)
+        after_root = _platform_snapshot_readback(post_binding, post_runtime_tools)
+    except Exception as exc:
+        if invocation is not None and invocation.get("outcome") == "unknown":
+            return {
+                "operation": PLATFORM_CONNECTOR_CAPTURE_OPERATION,
+                "success": False,
+                "outcome": "unknown",
+                "effect": plan["effect"],
+                "expected_snapshot_sha256": expected_snapshot_sha256,
+                "root_effect_confirmed": False,
+                "staged_snapshot_path": str(staged_path) if staged_path is not None else None,
+                "staged_snapshot_retained": staged_path is not None,
+                "postflight_error_class": type(exc).__name__,
+                "recommended_next_action": "read the exact platform snapshot before any new publish intent",
+            }
+        if staged_path is not None:
+            staged_path.unlink(missing_ok=True)
+        raise
+    root_effect_confirmed = after_root.get("snapshot_sha256") == expected_snapshot_sha256
+    post_runtime_stable = post_runtime_identity == runtime_identity
+    runtime_binding_matches = after_root.get("runtime_binding_matches") is True
+    publication_contract_matches = after_root.get("publication_contract_matches") is True
     if invocation is not None and invocation.get("outcome") == "unknown" and not root_effect_confirmed:
         return {
             "operation": PLATFORM_CONNECTOR_CAPTURE_OPERATION,
@@ -730,6 +746,19 @@ def _run_platform_connector_capture_operation(
             "effect": plan["effect"],
             "expected_snapshot_sha256": expected_snapshot_sha256,
             "root_effect_confirmed": False,
+        }
+    if not (post_runtime_stable and runtime_binding_matches and publication_contract_matches):
+        return {
+            "operation": PLATFORM_CONNECTOR_CAPTURE_OPERATION,
+            "success": False,
+            "outcome": "failed",
+            "effect": plan["effect"],
+            "expected_snapshot_sha256": expected_snapshot_sha256,
+            "root_effect_confirmed": True,
+            "post_runtime_stable": post_runtime_stable,
+            "runtime_binding_matches": runtime_binding_matches,
+            "publication_contract_matches": publication_contract_matches,
+            "recommended_next_action": "capture a fresh platform observation bound to the current runtime before reconciliation",
         }
     reconciliation = base.grabowski_client_snapshot.reconcile_platform_publication_for_runtime(
         registered_tool_count=post_binding["registered_tool_count"],

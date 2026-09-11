@@ -486,6 +486,128 @@ class PlatformConnectorCaptureBridgeTests(unittest.TestCase):
 
         staged.unlink.assert_called_once_with(missing_ok=True)
 
+    def test_unknown_broker_exact_write_separates_root_effect_from_contract_mismatch(self) -> None:
+        binding = {
+            "registered_tool_count": 1,
+            "registered_names_sha256": "3" * 64,
+            "release_id": "release-test-1",
+            "repo_head": "4" * 40,
+            "agent_instructions_sha256": "5" * 64,
+        }
+        metadata = {
+            "complete_schema_count": 1,
+            "complete_schema_sha256": "6" * 64,
+        }
+        document = {"snapshot_sha256": "2" * 64, "runtime_binding": binding}
+        staged = Mock()
+        staged.__str__ = Mock(
+            return_value="/home/alex/worktrees/.grabowski-platform-snapshot-11111111111111111111111111111111.json"
+        )
+        reconcile = Mock()
+        with (
+            patch.object(operations.operator, "_require_operator_capability"),
+            patch.object(operations.operator, "_require_operator_mutation"),
+            patch.object(operations, "_read_platform_capture_artifact", return_value={}),
+            patch.object(operations, "_platform_runtime_context", return_value=(binding, {}, metadata)),
+            patch.object(operations, "_platform_capture_publication_binding", return_value={"request_sha256": "f" * 64}),
+            patch.object(operations.base.grabowski_client_snapshot, "build_platform_connector_snapshot", return_value=document),
+            patch.object(
+                operations,
+                "_platform_snapshot_readback",
+                side_effect=[
+                    {"snapshot_sha256": None},
+                    {
+                        "snapshot_sha256": document["snapshot_sha256"],
+                        "runtime_binding_matches": True,
+                        "publication_contract_matches": False,
+                    },
+                ],
+            ),
+            patch.object(operations, "_write_platform_capture_stage", return_value=(staged, "7" * 64)),
+            patch.object(operations, "_invoke_mainpid_privileged_action", return_value={"outcome": "unknown"}),
+            patch.object(operations.base.grabowski_client_snapshot, "reconcile_platform_publication_for_runtime", reconcile),
+        ):
+            result = operations._run_platform_connector_capture_operation(_parameters())
+
+        self.assertEqual(result["outcome"], "failed")
+        self.assertTrue(result["root_effect_confirmed"])
+        self.assertTrue(result["post_runtime_stable"])
+        self.assertTrue(result["runtime_binding_matches"])
+        self.assertFalse(result["publication_contract_matches"])
+        staged.unlink.assert_called_once_with(missing_ok=True)
+        reconcile.assert_not_called()
+
+    def test_definitive_broker_outcome_cleans_stage_when_post_readback_raises(self) -> None:
+        binding = {
+            "registered_tool_count": 1,
+            "registered_names_sha256": "3" * 64,
+            "release_id": "release-test-1",
+            "repo_head": "4" * 40,
+            "agent_instructions_sha256": "5" * 64,
+        }
+        metadata = {"complete_schema_count": 1, "complete_schema_sha256": "6" * 64}
+        document = {"snapshot_sha256": "2" * 64, "runtime_binding": binding}
+        staged = Mock()
+        staged.__str__ = Mock(
+            return_value="/home/alex/worktrees/.grabowski-platform-snapshot-11111111111111111111111111111111.json"
+        )
+        with (
+            patch.object(operations.operator, "_require_operator_capability"),
+            patch.object(operations.operator, "_require_operator_mutation"),
+            patch.object(operations, "_read_platform_capture_artifact", return_value={}),
+            patch.object(operations, "_platform_runtime_context", return_value=(binding, {}, metadata)),
+            patch.object(operations, "_platform_capture_publication_binding", return_value={"request_sha256": "f" * 64}),
+            patch.object(operations.base.grabowski_client_snapshot, "build_platform_connector_snapshot", return_value=document),
+            patch.object(
+                operations,
+                "_platform_snapshot_readback",
+                side_effect=[{"snapshot_sha256": None}, RuntimeError("readback unavailable")],
+            ),
+            patch.object(operations, "_write_platform_capture_stage", return_value=(staged, "7" * 64)),
+            patch.object(operations, "_invoke_mainpid_privileged_action", return_value={"outcome": "succeeded"}),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "readback unavailable"):
+                operations._run_platform_connector_capture_operation(_parameters())
+
+        staged.unlink.assert_called_once_with(missing_ok=True)
+
+    def test_unknown_broker_outcome_retains_stage_when_post_readback_raises(self) -> None:
+        binding = {
+            "registered_tool_count": 1,
+            "registered_names_sha256": "3" * 64,
+            "release_id": "release-test-1",
+            "repo_head": "4" * 40,
+            "agent_instructions_sha256": "5" * 64,
+        }
+        metadata = {"complete_schema_count": 1, "complete_schema_sha256": "6" * 64}
+        document = {"snapshot_sha256": "2" * 64, "runtime_binding": binding}
+        staged = Mock()
+        staged.__str__ = Mock(
+            return_value="/home/alex/worktrees/.grabowski-platform-snapshot-11111111111111111111111111111111.json"
+        )
+        with (
+            patch.object(operations.operator, "_require_operator_capability"),
+            patch.object(operations.operator, "_require_operator_mutation"),
+            patch.object(operations, "_read_platform_capture_artifact", return_value={}),
+            patch.object(operations, "_platform_runtime_context", return_value=(binding, {}, metadata)),
+            patch.object(operations, "_platform_capture_publication_binding", return_value={"request_sha256": "f" * 64}),
+            patch.object(operations.base.grabowski_client_snapshot, "build_platform_connector_snapshot", return_value=document),
+            patch.object(
+                operations,
+                "_platform_snapshot_readback",
+                side_effect=[{"snapshot_sha256": None}, RuntimeError("readback unavailable")],
+            ),
+            patch.object(operations, "_write_platform_capture_stage", return_value=(staged, "7" * 64)),
+            patch.object(operations, "_invoke_mainpid_privileged_action", return_value={"outcome": "unknown"}),
+        ):
+            result = operations._run_platform_connector_capture_operation(_parameters())
+
+        self.assertEqual(result["outcome"], "unknown")
+        self.assertFalse(result["root_effect_confirmed"])
+        self.assertTrue(result["staged_snapshot_retained"])
+        self.assertEqual(result["postflight_error_class"], "RuntimeError")
+        staged.unlink.assert_not_called()
+
     def test_unknown_root_outcome_stops_before_reconciliation(self) -> None:
         binding = {
             "registered_tool_count": 1,
