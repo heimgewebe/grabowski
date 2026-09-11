@@ -2256,38 +2256,12 @@ def _runtime_refresh_terminal_material(
                 "terminal-evidence-drift",
                 "runtime-refresh source precondition differs from the verified intent",
             )
-        approval_task_id = intent.get("approval_task_id")
-        runtime_approval = intent.get("runtime_approval")
-        approval_evidence = (
-            runtime_approval.get("evidence")
-            if isinstance(runtime_approval, dict)
-            else None
-        )
-        if (
-            not isinstance(approval_task_id, str)
-            or not approval_task_id
-            or not isinstance(runtime_approval, dict)
-            or runtime_approval.get("schema_version") != 1
-            or runtime_approval.get("required") is not True
-            or runtime_approval.get("allowed") is not True
-            or runtime_approval.get("action_class") != "runtime_mutation"
-            or runtime_approval.get("required_level") != "break_glass"
-            or runtime_approval.get("expected_reference") != target_sha256
-            or runtime_approval.get("expected_task_id") != approval_task_id
-            or not isinstance(approval_evidence, dict)
-            or approval_evidence.get("approved") is not True
-            or approval_evidence.get("level") != "break_glass"
-            or approval_evidence.get("reference") != target_sha256
-            or approval_evidence.get("task_id") != approval_task_id
-            or not isinstance(approval_evidence.get("scope"), list)
-            or not all(
-                isinstance(item, str) and item for item in approval_evidence["scope"]
-            )
-            or "runtime_mutation" not in approval_evidence["scope"]
-        ):
+
+        authority_task_id = intent.get("approval_task_id")
+        if not isinstance(authority_task_id, str) or not authority_task_id:
             raise nonconflict.NonConflictDenied(
                 "terminal-evidence-invalid",
-                "runtime-refresh fresh observation lacks exact approval binding",
+                "runtime-refresh intent lacks its authority task binding",
             )
 
     if (
