@@ -826,14 +826,37 @@ def _run_platform_connector_capture_operation(
         }
         base._append_audit(audit)
         raise
-    final_binding, final_runtime_tools, final_metadata = _platform_runtime_context()
-    final = _platform_snapshot_readback(final_binding, final_runtime_tools)
+    try:
+        final_binding, final_runtime_tools, final_metadata = _platform_runtime_context()
+        final = _platform_snapshot_readback(final_binding, final_runtime_tools)
+    except Exception as exc:
+        audit = {
+            "timestamp_unix": int(time.time()),
+            "operation": "named-operation-run",
+            "recipe": PLATFORM_CONNECTOR_CAPTURE_OPERATION,
+            "parameters_sha256": plan["parameters_sha256"],
+            "expected_snapshot_sha256": expected_snapshot_sha256,
+            "root_effect_confirmed": True,
+            "root_audit_sha256": (
+                _root_audit_sha256(invocation) if invocation is not None else None
+            ),
+            "publication_state": reconciliation.get("state"),
+            "post_runtime_stable": post_runtime_stable,
+            "runtime_binding_matches": runtime_binding_matches,
+            "publication_contract_matches": publication_contract_matches,
+            "final_readback_error_class": type(exc).__name__,
+            "success": False,
+        }
+        base._append_audit(audit)
+        raise
     final_runtime_stable = (
         _platform_runtime_identity(final_binding, final_metadata) == runtime_identity
     )
     success = bool(
         reconciliation.get("state") == "platform_converged"
         and final_runtime_stable
+        and final.get("fresh") is True
+        and final.get("state") == "matched"
         and final.get("runtime_binding_matches") is True
         and final.get("publication_contract_matches") is True
         and final.get("publication_state") == "platform_converged"

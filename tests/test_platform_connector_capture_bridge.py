@@ -807,6 +807,128 @@ class PlatformConnectorCaptureBridgeTests(unittest.TestCase):
         self.assertEqual(audit_record["reconciliation_error_class"], "RuntimeError")
         self.assertEqual(audit_record["publication_state"], "awaiting_platform_observation")
 
+    def test_final_stale_snapshot_cannot_report_converged_success(self) -> None:
+        binding = {
+            "registered_tool_count": 1,
+            "registered_names_sha256": "9" * 64,
+            "release_id": "release-test-1",
+            "repo_head": "a" * 40,
+            "agent_instructions_sha256": "b" * 64,
+        }
+        metadata = {
+            "complete_schema_count": 1,
+            "complete_schema_sha256": "c" * 64,
+        }
+        document = {"snapshot_sha256": "8" * 64, "runtime_binding": binding}
+        staged = Mock()
+        staged.__str__ = Mock(
+            return_value="/home/alex/worktrees/.grabowski-platform-snapshot-11111111111111111111111111111111.json"
+        )
+        audit = Mock()
+        with (
+            patch.object(operations.operator, "_require_operator_capability"),
+            patch.object(operations.operator, "_require_operator_mutation"),
+            patch.object(operations, "_read_platform_capture_artifact", return_value={}),
+            patch.object(operations, "_platform_capture_publication_binding", return_value={"request_sha256": "f" * 64}),
+            patch.object(operations.base.grabowski_client_snapshot, "build_platform_connector_snapshot", return_value=document),
+            patch.object(operations, "_platform_runtime_context", return_value=(binding, {}, metadata)),
+            patch.object(
+                operations,
+                "_platform_snapshot_readback",
+                side_effect=[
+                    {"snapshot_sha256": None},
+                    {
+                        "snapshot_sha256": document["snapshot_sha256"],
+                        "runtime_binding_matches": True,
+                        "publication_contract_matches": True,
+                    },
+                    {
+                        "snapshot_sha256": document["snapshot_sha256"],
+                        "state": "stale",
+                        "fresh": False,
+                        "runtime_binding_matches": True,
+                        "publication_state": "platform_converged",
+                        "publication_contract_matches": True,
+                    },
+                ],
+            ),
+            patch.object(operations, "_write_platform_capture_stage", return_value=(staged, "d" * 64)),
+            patch.object(operations, "_invoke_mainpid_privileged_action", return_value={"outcome": "succeeded"}),
+            patch.object(
+                operations.base.grabowski_client_snapshot,
+                "reconcile_platform_publication_for_runtime",
+                return_value={"state": "platform_converged"},
+            ),
+            patch.object(operations.base, "_append_audit", audit),
+        ):
+            result = operations._run_platform_connector_capture_operation(_parameters())
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["outcome"], "failed")
+        self.assertTrue(result["root_effect_confirmed"])
+        self.assertEqual(result["platform_state"], "stale")
+        staged.unlink.assert_called_once_with(missing_ok=True)
+        audit.assert_called_once()
+        self.assertFalse(audit.call_args.args[0]["success"])
+
+    def test_confirmed_root_effect_is_audited_when_final_readback_raises(self) -> None:
+        binding = {
+            "registered_tool_count": 1,
+            "registered_names_sha256": "9" * 64,
+            "release_id": "release-test-1",
+            "repo_head": "a" * 40,
+            "agent_instructions_sha256": "b" * 64,
+        }
+        metadata = {
+            "complete_schema_count": 1,
+            "complete_schema_sha256": "c" * 64,
+        }
+        document = {"snapshot_sha256": "8" * 64, "runtime_binding": binding}
+        staged = Mock()
+        staged.__str__ = Mock(
+            return_value="/home/alex/worktrees/.grabowski-platform-snapshot-11111111111111111111111111111111.json"
+        )
+        audit = Mock()
+        with (
+            patch.object(operations.operator, "_require_operator_capability"),
+            patch.object(operations.operator, "_require_operator_mutation"),
+            patch.object(operations, "_read_platform_capture_artifact", return_value={}),
+            patch.object(operations, "_platform_capture_publication_binding", return_value={"request_sha256": "f" * 64}),
+            patch.object(operations.base.grabowski_client_snapshot, "build_platform_connector_snapshot", return_value=document),
+            patch.object(operations, "_platform_runtime_context", return_value=(binding, {}, metadata)),
+            patch.object(
+                operations,
+                "_platform_snapshot_readback",
+                side_effect=[
+                    {"snapshot_sha256": None},
+                    {
+                        "snapshot_sha256": document["snapshot_sha256"],
+                        "runtime_binding_matches": True,
+                        "publication_contract_matches": True,
+                    },
+                    RuntimeError("final readback exploded"),
+                ],
+            ),
+            patch.object(operations, "_write_platform_capture_stage", return_value=(staged, "d" * 64)),
+            patch.object(operations, "_invoke_mainpid_privileged_action", return_value={"outcome": "succeeded"}),
+            patch.object(
+                operations.base.grabowski_client_snapshot,
+                "reconcile_platform_publication_for_runtime",
+                return_value={"state": "platform_converged"},
+            ),
+            patch.object(operations.base, "_append_audit", audit),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "final readback exploded"):
+                operations._run_platform_connector_capture_operation(_parameters())
+
+        staged.unlink.assert_called_once_with(missing_ok=True)
+        audit.assert_called_once()
+        audit_record = audit.call_args.args[0]
+        self.assertTrue(audit_record["root_effect_confirmed"])
+        self.assertFalse(audit_record["success"])
+        self.assertEqual(audit_record["publication_state"], "platform_converged")
+        self.assertEqual(audit_record["final_readback_error_class"], "RuntimeError")
+
     def test_exact_root_effect_reconciles_once(self) -> None:
         binding = {
             "registered_tool_count": 1,
@@ -853,6 +975,7 @@ class PlatformConnectorCaptureBridgeTests(unittest.TestCase):
                     {
                         "snapshot_sha256": document["snapshot_sha256"],
                         "state": "matched",
+                        "fresh": True,
                         "runtime_binding_matches": True,
                         "publication_state": "platform_converged",
                         "publication_contract_matches": True,
