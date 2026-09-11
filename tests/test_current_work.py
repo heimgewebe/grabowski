@@ -2163,7 +2163,7 @@ class CurrentWorkProjectionTests(unittest.TestCase):
             "key-dirty-expired-active-drift",
             "/home/alex/repos/.worktrees/key-dirty-expired-active-drift",
             dirty=True,
-            lifecycle_state="managed_lifecycle_drift",
+            lifecycle_state="dirty",
             binding_owner="operator:dirty-expired-active-drift",
             binding_phase="active",
             binding_consistent=False,

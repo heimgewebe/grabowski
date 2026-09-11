@@ -337,8 +337,7 @@ def _historical_binding_drift_is_hygiene(item: dict[str, Any]) -> bool:
         and item["retention_expiration_proven"]
     )
     return bool(
-        item["lifecycle_state"] == "managed_lifecycle_drift"
-        and item["binding_present"]
+        item["binding_present"]
         and not item["binding_consistent"]
         and (historical_phase or expired_active_phase)
         and not item["is_main"]
