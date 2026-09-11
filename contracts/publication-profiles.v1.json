@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "27db499fc6cb114159d769b07ee3f135ebfd58921788be620a47ae39d5ce1bab"
+    "sha256": "f65d5f4345da0bba5c28ebd9951e52ecf326429ba2657b89155d7b137c54fdbc"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "2550f48d20fd463c087c23c42860c5a1accc0771772fe98e98df5993bf8bce4f"
+    "sha256": "e04977bdd94bbc79cfbab4b86e8d5793e078c3782f0ea3fcd764efd1af1e3183"
   },
   "counts": {
     "core": 23,
-    "full": 198,
-    "operator": 182
+    "full": 197,
+    "operator": 181
   },
   "profiles": {
     "core": [
@@ -227,7 +227,6 @@
       "grabowski_agent_workspace_reconcile_stale",
       "grabowski_agent_workspace_reconcile_idle_tmux",
       "grabowski_agent_workspace_cleanup",
-      "grabowski_agent_execution_route",
       "grabowski_coding_agent_catalog",
       "grabowski_coding_agent_route",
       "grabowski_agent_competition_start",
@@ -411,7 +410,6 @@
       "grabowski_agent_workspace_reconcile_stale",
       "grabowski_agent_workspace_reconcile_idle_tmux",
       "grabowski_agent_workspace_cleanup",
-      "grabowski_agent_execution_route",
       "grabowski_coding_agent_catalog",
       "grabowski_coding_agent_route",
       "grabowski_agent_competition_start",
