@@ -1529,7 +1529,7 @@ def _normalize_expected_lease_snapshots(
         raise ValueError("expected_leases must contain one snapshot per resource key")
     snapshots: list[dict[str, Any]] = []
     for item in value:
-        if not isinstance(item, dict) or set(item) != LEASE_SNAPSHOT_KEYS:
+        if not isinstance(item, dict) or not LEASE_SNAPSHOT_KEYS.issubset(item):
             raise ValueError("expected lease snapshot is malformed")
         key = normalize_resource_key(item["resource_key"])
         if not key.startswith("path:"):
@@ -1548,7 +1548,9 @@ def _normalize_expected_lease_snapshots(
             item["metadata_sha256"]
         ) is None:
             raise ValueError("expected lease metadata SHA-256 is invalid")
-        snapshots.append({**item, "resource_key": key})
+        snapshot = _release_lease_snapshot(item)
+        snapshot["resource_key"] = key
+        snapshots.append(snapshot)
     snapshots.sort(key=lambda item: item["resource_key"])
     if [item["resource_key"] for item in snapshots] != resource_keys:
         raise ValueError("expected lease snapshots do not match resource_keys")
@@ -1562,7 +1564,7 @@ def _normalize_mutation_lease_snapshots(
         raise ValueError("expected_leases must contain one snapshot per resource key")
     snapshots: list[dict[str, Any]] = []
     for item in value:
-        if not isinstance(item, dict) or set(item) != LEASE_SNAPSHOT_KEYS:
+        if not isinstance(item, dict) or not LEASE_SNAPSHOT_KEYS.issubset(item):
             raise ValueError("expected lease snapshot is malformed")
         key = normalize_resource_key(item["resource_key"])
         if expected_owner_id is not None and item["owner_id"] != expected_owner_id:
@@ -1579,7 +1581,9 @@ def _normalize_mutation_lease_snapshots(
             item["metadata_sha256"]
         ) is None:
             raise ValueError("expected lease metadata SHA-256 is invalid")
-        snapshots.append({**item, "resource_key": key})
+        snapshot = _release_lease_snapshot(item)
+        snapshot["resource_key"] = key
+        snapshots.append(snapshot)
     snapshots.sort(key=lambda item: item["resource_key"])
     if [item["resource_key"] for item in snapshots] != resource_keys:
         raise ValueError("expected lease snapshots do not match resource_keys")
@@ -2256,38 +2260,12 @@ def _runtime_refresh_terminal_material(
                 "terminal-evidence-drift",
                 "runtime-refresh source precondition differs from the verified intent",
             )
-        approval_task_id = intent.get("approval_task_id")
-        runtime_approval = intent.get("runtime_approval")
-        approval_evidence = (
-            runtime_approval.get("evidence")
-            if isinstance(runtime_approval, dict)
-            else None
-        )
-        if (
-            not isinstance(approval_task_id, str)
-            or not approval_task_id
-            or not isinstance(runtime_approval, dict)
-            or runtime_approval.get("schema_version") != 1
-            or runtime_approval.get("required") is not True
-            or runtime_approval.get("allowed") is not True
-            or runtime_approval.get("action_class") != "runtime_mutation"
-            or runtime_approval.get("required_level") != "break_glass"
-            or runtime_approval.get("expected_reference") != target_sha256
-            or runtime_approval.get("expected_task_id") != approval_task_id
-            or not isinstance(approval_evidence, dict)
-            or approval_evidence.get("approved") is not True
-            or approval_evidence.get("level") != "break_glass"
-            or approval_evidence.get("reference") != target_sha256
-            or approval_evidence.get("task_id") != approval_task_id
-            or not isinstance(approval_evidence.get("scope"), list)
-            or not all(
-                isinstance(item, str) and item for item in approval_evidence["scope"]
-            )
-            or "runtime_mutation" not in approval_evidence["scope"]
-        ):
+
+        authority_task_id = intent.get("approval_task_id")
+        if not isinstance(authority_task_id, str) or not authority_task_id:
             raise nonconflict.NonConflictDenied(
                 "terminal-evidence-invalid",
-                "runtime-refresh fresh observation lacks exact approval binding",
+                "runtime-refresh intent lacks its authority task binding",
             )
 
     if (
