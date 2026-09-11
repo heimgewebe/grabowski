@@ -138,14 +138,14 @@ Status: implemented and live in the deployed runtime; follow-up work is deployme
 
 ## GRABOWSKI-CONTROL-PLANE-001
 
-Status: typed user-space control plane implemented; root-owned privileged broker is installed and fail-closed, with broader privileged actions still gated by recovery evidence.
+Status: typed user-space control plane implemented; root-owned privileged broker is installed, and the canonical Trusted-Owner operator has general audited root execution while recovery-specific actions retain their dedicated gates.
 
 - registrierte lokale und SSH-Ziele für `heim-pc`, `heimserver` und `heimberry`,
 - argv-only Fleet-Ausführung mit Batch-SSH, deaktivierten Forwardings und Zeitgrenzen,
 - Operationsrezepte mit Preflight, Action, Postflight und umgekehrtem Rollback,
 - `secret_use` als Standard und begründungspflichtiges Break-Glass-`secret_reveal`,
 - deterministische Connector-Snapshot-Probe,
-- root-eigene Privileged-Action-Templates standardmäßig deaktiviert.
+- allgemeiner `operator_power_argv`-Pfad für den kanonischen Trusted-Owner-Operator aktiviert; spezialisierte Root-Aktionen bleiben eng typisiert und bei Bedarf recovery-gebunden.
 
 
 ## GRABOWSKI-OPERATOR-COMPLETION-001
