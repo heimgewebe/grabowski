@@ -1,6 +1,6 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "68d16ce357af3ae69564960ffb37482aaee5d327ad3d8484d462dc6fd13a2ace",
+  "capability_source_sha256": "fd365b7c9b0be5d12332ddf61bbd7ded16df088b7f97333db21c28fa724d5f9e",
   "contract": "config/runtime-entrypoint.json",
   "contract_sha256": "f65d5f4345da0bba5c28ebd9951e52ecf326429ba2657b89155d7b137c54fdbc",
   "integrity": {
@@ -1011,9 +1011,9 @@
         "host-state-change"
       ],
       "id": "grabowski_power_run",
-      "purpose": "Run one audited root command through the recovery-gated power broker.",
+      "purpose": "Run one audited root command through the canonical root-owned broker.",
       "read_only": false,
-      "reversibility": "command-dependent-with-recovery-evidence",
+      "reversibility": "command-dependent",
       "risk_class": "critical",
       "tool": "grabowski_power_run"
     },
