@@ -408,6 +408,59 @@ class PlatformConnectorCaptureBridgeTests(unittest.TestCase):
         stage.assert_not_called()
         invoke.assert_not_called()
 
+    def test_converged_publication_rejects_different_snapshot_before_root_staging(self) -> None:
+        binding = {
+            "registered_tool_count": 1,
+            "registered_names_sha256": "3" * 64,
+            "release_id": "release-test-1",
+            "repo_head": "4" * 40,
+            "agent_instructions_sha256": "5" * 64,
+        }
+        metadata = {
+            "complete_schema_count": 1,
+            "complete_schema_sha256": "6" * 64,
+        }
+        document = {"snapshot_sha256": "2" * 64, "runtime_binding": binding}
+        stage = Mock()
+        invoke = Mock()
+        with (
+            patch.object(operations.operator, "_require_operator_capability"),
+            patch.object(operations.operator, "_require_operator_mutation"),
+            patch.object(operations, "_read_platform_capture_artifact", return_value={}),
+            patch.object(
+                operations,
+                "_platform_runtime_context",
+                return_value=(binding, {}, metadata),
+            ),
+            patch.object(
+                operations,
+                "_platform_capture_publication_binding",
+                return_value={
+                    "request_sha256": "f" * 64,
+                    "current_state": "platform_converged",
+                },
+            ),
+            patch.object(
+                operations.base.grabowski_client_snapshot,
+                "build_platform_connector_snapshot",
+                return_value=document,
+            ),
+            patch.object(
+                operations,
+                "_platform_snapshot_readback",
+                return_value={"snapshot_sha256": "1" * 64},
+            ),
+            patch.object(operations, "_write_platform_capture_stage", stage),
+            patch.object(operations, "_invoke_mainpid_privileged_action", invoke),
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "already converged to a different trusted snapshot"
+            ):
+                operations._run_platform_connector_capture_operation(_parameters())
+
+        stage.assert_not_called()
+        invoke.assert_not_called()
+
     def test_runtime_drift_while_building_stops_before_root_staging(self) -> None:
         binding = {
             "registered_tool_count": 1,

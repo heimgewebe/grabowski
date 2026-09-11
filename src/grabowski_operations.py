@@ -676,6 +676,14 @@ def _run_platform_connector_capture_operation(
         raise ValueError("active runtime changed while building the platform snapshot")
     before = _platform_snapshot_readback(binding, runtime_tools)
     expected_snapshot_sha256 = document["snapshot_sha256"]
+    if (
+        publication_binding.get("current_state") == "platform_converged"
+        and before.get("snapshot_sha256") != expected_snapshot_sha256
+    ):
+        raise ValueError(
+            "platform publication already converged to a different trusted snapshot; "
+            "prepare a new publication request before replacing platform evidence"
+        )
     invocation: dict[str, Any] | None = None
     staged_path: Path | None = None
     if before.get("snapshot_sha256") != expected_snapshot_sha256:
