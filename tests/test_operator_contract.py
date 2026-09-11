@@ -5579,5 +5579,125 @@ class DurableJobFinalizationReceiptTests(unittest.TestCase):
         self.assertTrue(status["finalization_receipt"]["valid"])
 
 
+class GitServerVerifiedReadTransportTests(unittest.TestCase):
+    def _repo(self, operator, temporary: str) -> Path:
+        repo = Path(temporary) / "repo"
+        operator.subprocess.run(
+            ["git", "init", "-q", "-b", "main", str(repo)], check=True
+        )
+        return repo
+
+    def _mutating_tool(self):
+        return types.SimpleNamespace(
+            is_async=False,
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+
+    def test_generic_git_positive_read_cohort_bypasses_transport_repeatedly(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = self._repo(operator, temporary)
+            for git_arguments in (
+                ["rev-parse", "--show-toplevel"],
+                ["status", "--short"],
+                ["diff", "--check"],
+                ["show", "--stat"],
+                ["log", "-1"],
+            ):
+                arguments = {
+                    "repo": str(repo),
+                    "arguments": git_arguments,
+                    "timeout_seconds": 60,
+                    "branch_attempt": None,
+                }
+                with self.subTest(git_arguments=git_arguments):
+                    self.assertTrue(
+                        operator._grabowski_git_server_verified_read(arguments)
+                    )
+                    with patch.object(
+                        operator.base, "_transport_signed_one_call_evidence", create=True
+                    ) as signed:
+                        self.assertIsNone(
+                            operator._require_transport_roundtrip_for_tool(
+                                tool_name="grabowski_git",
+                                arguments=arguments,
+                                context=None,
+                                tool=self._mutating_tool(),
+                            )
+                        )
+                        self.assertIsNone(
+                            operator._require_transport_roundtrip_for_tool(
+                                tool_name="grabowski_git",
+                                arguments=arguments,
+                                context=None,
+                                tool=self._mutating_tool(),
+                            )
+                        )
+                    signed.assert_not_called()
+
+    def test_generic_git_read_execution_skips_mutation_authority_and_hardens_diff(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = self._repo(operator, temporary)
+            with (
+                patch.object(operator, "_require_operator_capability") as capability,
+                patch.object(operator, "_require_operator_mutation") as mutation,
+            ):
+                first = operator.grabowski_git(str(repo), ["diff", "--check"])
+                second = operator.grabowski_git(str(repo), ["diff", "--check"])
+            self.assertEqual(first["returncode"], 0)
+            self.assertEqual(second["returncode"], 0)
+            self.assertIn("--no-ext-diff", first["argv"])
+            self.assertIn("--no-textconv", first["argv"])
+            self.assertGreaterEqual(capability.call_count, 2)
+            mutation.assert_not_called()
+
+    def test_generic_git_unsafe_or_mutating_shapes_remain_fail_closed(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = self._repo(operator, temporary)
+            cases = (
+                ["commit", "-m", "x"],
+                ["fetch", "origin"],
+                ["checkout", "main"],
+                ["update-ref", "refs/heads/x", "HEAD"],
+                ["diff", "--no-index", "/etc/hosts", "/etc/passwd"],
+                ["diff", "--ext-diff"],
+                ["diff", "--ext"],
+                ["diff", "--no-ind", "/etc/hosts", "/etc/passwd"],
+                ["show", "--show-signature"],
+                ["show", "--show-sig"],
+                ["log", "--output=/tmp/log.txt"],
+                ["status", "--porc"],
+                ["rev-parse", "--parseopt"],
+                ["-c", "diff.external=/tmp/helper", "diff", "--check"],
+            )
+            for git_arguments in cases:
+                arguments = {
+                    "repo": str(repo),
+                    "arguments": git_arguments,
+                    "timeout_seconds": 60,
+                    "branch_attempt": None,
+                }
+                with self.subTest(git_arguments=git_arguments):
+                    self.assertFalse(
+                        operator._grabowski_git_server_verified_read(arguments)
+                    )
+                    self.assertFalse(
+                        operator._operator_gate_read_only(
+                            "grabowski_git", arguments, self._mutating_tool()
+                        )
+                    )
+
+    def test_branch_attempt_never_enters_generic_git_read_cohort(self) -> None:
+        operator = _load_operator_module()
+        arguments = {
+            "repo": "/tmp/repo",
+            "arguments": ["status", "--short"],
+            "branch_attempt": {"schema_version": 1},
+        }
+        self.assertFalse(operator._grabowski_git_server_verified_read(arguments))
+
+
 if __name__ == "__main__":
     unittest.main()
