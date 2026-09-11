@@ -3324,7 +3324,13 @@
     "permission_to_collapse_distinct_security_boundaries",
     "runtime_client_snapshot_observability"
   ],
-  "migration_candidates": [],
+  "migration_candidates": [
+    {
+      "tool": "grabowski_agent_execution_route",
+      "reason": "The public tool identifies itself as a deprecated compatibility adapter; canonical execution routing is grabowski_coding_agent_route, but explicit contrast still points at this adapter and must be migrated before retirement.",
+      "target_operation_family": "agent-routing"
+    }
+  ],
   "operation_catalog": {
     "operation_count": 3,
     "operations": [
