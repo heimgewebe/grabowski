@@ -757,7 +757,29 @@ def _run_platform_connector_capture_operation(
             "root_response_sha256": invocation.get("response_sha256"),
         }
     if staged_path is not None:
-        staged_path.unlink(missing_ok=True)
+        try:
+            staged_path.unlink(missing_ok=True)
+        except Exception as exc:
+            if root_effect_confirmed:
+                audit = {
+                    "timestamp_unix": int(time.time()),
+                    "operation": "named-operation-run",
+                    "recipe": PLATFORM_CONNECTOR_CAPTURE_OPERATION,
+                    "parameters_sha256": plan["parameters_sha256"],
+                    "expected_snapshot_sha256": expected_snapshot_sha256,
+                    "root_effect_confirmed": True,
+                    "root_audit_sha256": (
+                        _root_audit_sha256(invocation) if invocation is not None else None
+                    ),
+                    "publication_state": after_root.get("publication_state"),
+                    "post_runtime_stable": post_runtime_stable,
+                    "runtime_binding_matches": runtime_binding_matches,
+                    "publication_contract_matches": publication_contract_matches,
+                    "stage_cleanup_error_class": type(exc).__name__,
+                    "success": False,
+                }
+                base._append_audit(audit)
+            raise
     if not root_effect_confirmed:
         return {
             "operation": PLATFORM_CONNECTOR_CAPTURE_OPERATION,

@@ -749,6 +749,67 @@ class PlatformConnectorCaptureBridgeTests(unittest.TestCase):
         self.assertTrue(result["staged_snapshot_retained"])
         reconcile.assert_not_called()
 
+    def test_confirmed_root_effect_is_audited_when_stage_cleanup_raises(self) -> None:
+        binding = {
+            "registered_tool_count": 1,
+            "registered_names_sha256": "9" * 64,
+            "release_id": "release-test-1",
+            "repo_head": "a" * 40,
+            "agent_instructions_sha256": "b" * 64,
+        }
+        metadata = {
+            "complete_schema_count": 1,
+            "complete_schema_sha256": "c" * 64,
+        }
+        document = {"snapshot_sha256": "8" * 64, "runtime_binding": binding}
+        staged = Mock()
+        staged.__str__ = Mock(
+            return_value="/home/alex/worktrees/.grabowski-platform-snapshot-11111111111111111111111111111111.json"
+        )
+        staged.unlink.side_effect = OSError("cleanup exploded")
+        reconcile = Mock()
+        audit = Mock()
+        with (
+            patch.object(operations.operator, "_require_operator_capability"),
+            patch.object(operations.operator, "_require_operator_mutation"),
+            patch.object(operations, "_read_platform_capture_artifact", return_value={}),
+            patch.object(operations, "_platform_capture_publication_binding", return_value={"request_sha256": "f" * 64}),
+            patch.object(operations.base.grabowski_client_snapshot, "build_platform_connector_snapshot", return_value=document),
+            patch.object(operations, "_platform_runtime_context", return_value=(binding, {}, metadata)),
+            patch.object(
+                operations,
+                "_platform_snapshot_readback",
+                side_effect=[
+                    {"snapshot_sha256": None},
+                    {
+                        "snapshot_sha256": document["snapshot_sha256"],
+                        "runtime_binding_matches": True,
+                        "publication_contract_matches": True,
+                        "publication_state": "awaiting_platform_observation",
+                    },
+                ],
+            ),
+            patch.object(operations, "_write_platform_capture_stage", return_value=(staged, "d" * 64)),
+            patch.object(operations, "_invoke_mainpid_privileged_action", return_value={"outcome": "succeeded"}),
+            patch.object(
+                operations.base.grabowski_client_snapshot,
+                "reconcile_platform_publication_for_runtime",
+                reconcile,
+            ),
+            patch.object(operations.base, "_append_audit", audit),
+        ):
+            with self.assertRaisesRegex(OSError, "cleanup exploded"):
+                operations._run_platform_connector_capture_operation(_parameters())
+
+        staged.unlink.assert_called_once_with(missing_ok=True)
+        reconcile.assert_not_called()
+        audit.assert_called_once()
+        audit_record = audit.call_args.args[0]
+        self.assertTrue(audit_record["root_effect_confirmed"])
+        self.assertFalse(audit_record["success"])
+        self.assertEqual(audit_record["stage_cleanup_error_class"], "OSError")
+        self.assertEqual(audit_record["publication_state"], "awaiting_platform_observation")
+
     def test_confirmed_root_effect_is_audited_when_reconciliation_raises(self) -> None:
         binding = {
             "registered_tool_count": 1,
