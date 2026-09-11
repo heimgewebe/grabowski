@@ -1529,7 +1529,7 @@ def _normalize_expected_lease_snapshots(
         raise ValueError("expected_leases must contain one snapshot per resource key")
     snapshots: list[dict[str, Any]] = []
     for item in value:
-        if not isinstance(item, dict) or set(item) != LEASE_SNAPSHOT_KEYS:
+        if not isinstance(item, dict) or not LEASE_SNAPSHOT_KEYS.issubset(item):
             raise ValueError("expected lease snapshot is malformed")
         key = normalize_resource_key(item["resource_key"])
         if not key.startswith("path:"):
@@ -1548,7 +1548,9 @@ def _normalize_expected_lease_snapshots(
             item["metadata_sha256"]
         ) is None:
             raise ValueError("expected lease metadata SHA-256 is invalid")
-        snapshots.append({**item, "resource_key": key})
+        snapshot = _release_lease_snapshot(item)
+        snapshot["resource_key"] = key
+        snapshots.append(snapshot)
     snapshots.sort(key=lambda item: item["resource_key"])
     if [item["resource_key"] for item in snapshots] != resource_keys:
         raise ValueError("expected lease snapshots do not match resource_keys")
@@ -1562,7 +1564,7 @@ def _normalize_mutation_lease_snapshots(
         raise ValueError("expected_leases must contain one snapshot per resource key")
     snapshots: list[dict[str, Any]] = []
     for item in value:
-        if not isinstance(item, dict) or set(item) != LEASE_SNAPSHOT_KEYS:
+        if not isinstance(item, dict) or not LEASE_SNAPSHOT_KEYS.issubset(item):
             raise ValueError("expected lease snapshot is malformed")
         key = normalize_resource_key(item["resource_key"])
         if expected_owner_id is not None and item["owner_id"] != expected_owner_id:
@@ -1579,7 +1581,9 @@ def _normalize_mutation_lease_snapshots(
             item["metadata_sha256"]
         ) is None:
             raise ValueError("expected lease metadata SHA-256 is invalid")
-        snapshots.append({**item, "resource_key": key})
+        snapshot = _release_lease_snapshot(item)
+        snapshot["resource_key"] = key
+        snapshots.append(snapshot)
     snapshots.sort(key=lambda item: item["resource_key"])
     if [item["resource_key"] for item in snapshots] != resource_keys:
         raise ValueError("expected lease snapshots do not match resource_keys")
