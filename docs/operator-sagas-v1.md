@@ -273,6 +273,14 @@ This documentation-only change is the next prospective PR-settlement target. Bef
 
 Pilot 1 is established only by a verified Captain merge, authoritative GitHub readback, verified Captain audit binding and reference-based `saga-settle == settled` for that frozen identity. Pilot 2 may then target only that exact settled merge commit while it is still protected `main`; it independently requires a fresh runtime-deployment plan and durable run reference, Captain deployment of exactly that commit, deployment-identity convergence and reference-based `saga-settle == settled`. The final Bureau acceptance evidence, not this prospective paragraph, owns the measured before/after call counts, operator decisions, blocks, partial failures and elapsed times.
 
+### Recovered exact terminal pairing — 2026-09-11
+
+The coordinated T121 assignment `BUR-RUN-20260910T204821Z-24ca394c37` was resumed through its exact journal-bound retry path after its prior lease generation expired. The recovery reused the same run and TaskSpec, migrated its registry binding only through the canonical successor proof, and reacquired the declared T121 path leases. PR #1162 remains useful PR-effect and partial-failure evidence, but it is not the final paired acceptance: protected `main` advanced before its merge commit could begin the required runtime-deployment Saga, so that older commit is never deployed merely to complete the test.
+
+This documentation-only continuation is the fresh PR-settlement target. It may be frozen by `saga-plan` and durable `saga-run` only after it has converged to the then-current protected `main` and its CI/review evidence is exact for one head/base/diff. Pilot 1 requires the normal Captain merge, authoritative GitHub readback, verified Captain audit binding and reference-based `saga-settle == settled` for that unchanged identity.
+
+Only the exact merge commit established by that settlement may start pilot 2, and only while that commit is still protected `main`. Pilot 2 independently requires a fresh runtime-deployment plan and durable run reference, normal Captain deployment, complete deployment-identity and serving-process convergence, verified Captain audit binding and reference-based `saga-settle == settled`. Any intervening protected-main advance invalidates the pair rather than authorizing deployment of an older commit.
+
 ## Non-claims
 
 This document does not by itself establish successful live pilots or Bureau acceptance. It also does not establish automatic post-`integration_ready` controller custody. The latter requires a separate bounded-autonomy decision after the Saga primitive is proven; T121 itself preserves the current Captain boundary by design.
