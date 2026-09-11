@@ -143,6 +143,10 @@ def _rootbroker_cutover_action() -> dict[str, object]:
     return _bound_action(cutover.ROOTBROKER_CUTOVER_ACTION)
 
 
+def _platform_connector_capture_action() -> dict[str, object]:
+    return _bound_action(cutover.PLATFORM_CONNECTOR_CAPTURE_ACTION)
+
+
 def _local_backup_ntfs_actions() -> dict[str, dict[str, object]]:
     return {name: _bound_action(name) for name in cutover.LOCAL_BACKUP_STORAGE_ACTIONS}
 
@@ -189,6 +193,7 @@ def _example_config_text() -> str:
                 cutover.BLOCKADE_LIFECYCLE_ACTION: _lifecycle(),
                 cutover.ROOT_TASK_ACTION: _root_task_action(),
                 cutover.PROCESS_OBSERVER_ACTION: _bound_action(cutover.PROCESS_OBSERVER_ACTION),
+                cutover.PLATFORM_CONNECTOR_CAPTURE_ACTION: _platform_connector_capture_action(),
                 cutover.BOOTSTRAP_RECOVERY_ACTION: _bootstrap_recovery_action(),
                 cutover.OPERATOR_SERVICE_CONTROL_ACTION: _operator_service_control_action(),
                 cutover.ROOTBROKER_CUTOVER_ACTION: _rootbroker_cutover_action(),
@@ -818,6 +823,7 @@ class RootbrokerCutoverTests(unittest.TestCase):
                 cutover.BLOCKADE_LIFECYCLE_ACTION: lifecycle,
                 cutover.OPERATOR_SERVICE_CONTROL_ACTION: service_control,
                 cutover.ROOTBROKER_CUTOVER_ACTION: _rootbroker_cutover_action(),
+                cutover.PLATFORM_CONNECTOR_CAPTURE_ACTION: _platform_connector_capture_action(),
                 **_local_backup_ntfs_actions(),
             },
         }
@@ -825,6 +831,7 @@ class RootbrokerCutoverTests(unittest.TestCase):
         for label, target in {
             "broker_module": cutover.BROKER_MODULE_TARGET,
             "broker_wrapper": cutover.BROKER_WRAPPER_TARGET,
+            "platform_connector_capture": cutover.PLATFORM_CONNECTOR_CAPTURE_TARGET,
             "cutover_helper": cutover.CUTOVER_HELPER_TARGET,
             "operator_service": cutover.OPERATOR_SERVICE_TARGET,
         }.items():
@@ -863,6 +870,10 @@ class RootbrokerCutoverTests(unittest.TestCase):
             cutover.SEAGATE_BACKUP_SMART_READ_ACTION,
             attestation["action_sha256"],
         )
+        self.assertIn(
+            cutover.PLATFORM_CONNECTOR_CAPTURE_ACTION,
+            attestation["action_sha256"],
+        )
         unsigned = dict(attestation)
         digest = unsigned.pop("attestation_sha256")
         self.assertEqual(digest, cutover._sha256(cutover._canonical_json(unsigned)))
@@ -879,12 +890,14 @@ class RootbrokerCutoverTests(unittest.TestCase):
                 cutover.BLOCKADE_LIFECYCLE_ACTION: lifecycle,
                 cutover.OPERATOR_SERVICE_CONTROL_ACTION: _operator_service_control_action(),
                 cutover.ROOTBROKER_CUTOVER_ACTION: _rootbroker_cutover_action(),
+                cutover.PLATFORM_CONNECTOR_CAPTURE_ACTION: _platform_connector_capture_action(),
             },
         }
         source_artifacts = {}
         for target in (
             cutover.BROKER_MODULE_TARGET,
             cutover.BROKER_WRAPPER_TARGET,
+            cutover.PLATFORM_CONNECTOR_CAPTURE_TARGET,
             cutover.CUTOVER_HELPER_TARGET,
             cutover.OPERATOR_SERVICE_TARGET,
         ):

@@ -41,6 +41,10 @@ SEAGATE_BACKUP_SMART_READ_OPERATION = "seagate-backup-smart-read"
 BACKUP_MOUNT_RECONCILE_OPERATION = "backup-mount-reconcile"
 ROOTBROKER_AUTHORITY_REFRESH_OPERATION = "rootbroker-authority-refresh"
 BLOCKADE_AUTHORITY_HARDEN_OPERATION = "blockade-authority-harden"
+PLATFORM_CONNECTOR_CAPTURE_OPERATION = "platform-connector-capture"
+PLATFORM_CONNECTOR_CAPTURE_ACTION = "platform_connector_capture"
+PLATFORM_CAPTURE_STAGE_ROOT = Path("/home/alex/worktrees")
+PLATFORM_CAPTURE_SOURCE_PREFIX = ".grabowski-platform-observed-"
 MAULWURF_RECOVERY_STATUS_OPERATION = "maulwurf-recovery-status"
 MAULWURF_RECOVERY_ON_OPERATION = "maulwurf-recovery-on"
 MAULWURF_RECOVERY_OFF_OPERATION = "maulwurf-recovery-off"
@@ -93,6 +97,7 @@ RESERVED_TYPED_OPERATIONS = frozenset(
         FLEET_MUTATION_OPERATION,
         BLOCKADE_AUTHORITY_HARDEN_OPERATION,
         ROOTBROKER_AUTHORITY_REFRESH_OPERATION,
+        PLATFORM_CONNECTOR_CAPTURE_OPERATION,
         *MAULWURF_RECOVERY_TYPED_OPERATIONS,
         *BACKUP_STORAGE_TYPED_OPERATIONS,
     }
@@ -358,6 +363,383 @@ def _backup_storage_operation_plan(
     }
 
 
+def _platform_capture_path(value: Any, expected_sha256: str) -> Path:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise ValueError("observed_artifact_path is invalid")
+    path = Path(value)
+    if not path.is_absolute() or os.path.normpath(value) != value:
+        raise ValueError("observed_artifact_path must be canonical and absolute")
+    expected_name = f"{PLATFORM_CAPTURE_SOURCE_PREFIX}{expected_sha256}.json"
+    if path.parent != PLATFORM_CAPTURE_STAGE_ROOT or path.name != expected_name:
+        raise ValueError("observed artifact path is outside the fixed platform capture inbox")
+    return path
+
+
+def _platform_connector_capture_plan(
+    parameters: dict[str, str] | None,
+) -> dict[str, Any]:
+    supplied = parameters or {}
+    expected = {
+        "observed_artifact_path",
+        "expected_artifact_sha256",
+        "source_reference",
+        "observation_scope",
+        "observation_id",
+        "publication_request_id",
+        "requested_contract_sha256",
+        "observed_at_unix",
+    }
+    if (
+        not isinstance(supplied, dict)
+        or set(supplied) != expected
+        or any(not isinstance(value, str) for value in supplied.values())
+    ):
+        raise ValueError("platform connector capture parameters do not match the fixed contract")
+    artifact_sha256 = supplied["expected_artifact_sha256"]
+    contract_sha256 = supplied["requested_contract_sha256"]
+    if re.fullmatch(r"[0-9a-f]{64}", artifact_sha256) is None:
+        raise ValueError("expected_artifact_sha256 is invalid")
+    if re.fullmatch(r"[0-9a-f]{64}", contract_sha256) is None:
+        raise ValueError("requested_contract_sha256 is invalid")
+    artifact_path = _platform_capture_path(
+        supplied["observed_artifact_path"], artifact_sha256
+    )
+    if supplied["observation_scope"] not in {"connector_catalog", "new_chat_catalog"}:
+        raise ValueError("platform observation scope is not publication-authoritative")
+    identifier = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\Z")
+    for key in ("observation_id", "publication_request_id"):
+        if identifier.fullmatch(supplied[key]) is None:
+            raise ValueError(f"{key} is invalid")
+    reference = supplied["source_reference"]
+    if (
+        not reference
+        or reference.strip() != reference
+        or len(reference.encode("utf-8")) > 1024
+        or operator._redact(reference) != reference
+    ):
+        raise ValueError("source_reference is invalid or secret-adjacent")
+    observed_at = supplied["observed_at_unix"]
+    if re.fullmatch(r"[0-9]{1,12}", observed_at) is None:
+        raise ValueError("observed_at_unix is invalid")
+    return {
+        "name": PLATFORM_CONNECTOR_CAPTURE_OPERATION,
+        "description": (
+            "Validate one hash-bound ChatGPT-observed complete connector catalog, bind it "
+            "to the active runtime, publish only the prepared snapshot through the fixed "
+            "Rootbroker action, then reconcile the existing platform publication request."
+        ),
+        "parameter_names": sorted(expected),
+        "parameters_sha256": _hash(supplied),
+        "artifact_path": str(artifact_path),
+        "artifact_sha256": artifact_sha256,
+        "source_reference": reference,
+        "observation_scope": supplied["observation_scope"],
+        "observation_id": supplied["observation_id"],
+        "publication_request_id": supplied["publication_request_id"],
+        "requested_contract_sha256": contract_sha256,
+        "observed_at_unix": int(observed_at),
+        "typed_builtin": True,
+        "execution": "controller-observation-to-fixed-rootbroker-publisher",
+        "effect": "platform_observation_publish_and_reconcile",
+        "rollback": (
+            "none; root publication is content-addressed and later reconciliation accepts only "
+            "a fresh request-bound exact contract. Unknown broker outcomes require exact platform "
+            "snapshot readback before another publish intent."
+        ),
+    }
+
+
+def _read_platform_capture_artifact(path: Path, expected_sha256: str) -> dict[str, Any]:
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ValueError("observed platform artifact cannot be opened safely") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or metadata.st_mode & 0o022
+            or metadata.st_size <= 0
+            or metadata.st_size > base.grabowski_connector_contract.MAX_COMPLETE_OBSERVED_ARTIFACT_BYTES
+        ):
+            raise ValueError("observed platform artifact metadata violates the capture contract")
+        data = b""
+        while len(data) < metadata.st_size:
+            chunk = os.read(descriptor, min(64 * 1024, metadata.st_size - len(data)))
+            if not chunk:
+                raise ValueError("observed platform artifact ended early")
+            data += chunk
+        if os.read(descriptor, 1):
+            raise ValueError("observed platform artifact grew while being read")
+        final = os.fstat(descriptor)
+        if final.st_dev != metadata.st_dev or final.st_ino != metadata.st_ino or final.st_size != metadata.st_size:
+            raise ValueError("observed platform artifact changed while being read")
+    finally:
+        os.close(descriptor)
+    if hashlib.sha256(data).hexdigest() != expected_sha256:
+        raise ValueError("observed platform artifact SHA-256 mismatch")
+    try:
+        payload = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("observed platform artifact is not valid UTF-8 JSON") from exc
+    return base.grabowski_connector_contract.compact_complete_observed_artifact(
+        payload,
+        label="ChatGPT-observed complete connector catalog",
+    )
+
+
+def _write_platform_capture_stage(document: dict[str, Any]) -> tuple[Path, str]:
+    root = PLATFORM_CAPTURE_STAGE_ROOT
+    metadata = root.lstat()
+    if (
+        root.is_symlink()
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_mode & 0o022
+    ):
+        raise PermissionError("platform capture staging root is unsafe")
+    data = json.dumps(
+        document, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    if not data or len(data) > base.grabowski_client_snapshot.MAX_PLATFORM_SNAPSHOT_BYTES:
+        raise ValueError("prepared platform snapshot exceeds the bounded rootbroker contract")
+    path = root / f".grabowski-platform-snapshot-{uuid.uuid4().hex}.json"
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        written = 0
+        while written < len(data):
+            count = os.write(descriptor, data[written:])
+            if count <= 0:
+                raise OSError("prepared platform snapshot write made no progress")
+            written += count
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return path, hashlib.sha256(data).hexdigest()
+
+
+def _platform_runtime_context() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    binding, _runtime_names = base.grabowski_client_snapshot._runtime_platform_binding(
+        base.DEPLOYMENT_MANIFEST.parent
+    )
+    runtime_tools = base._runtime_connector_observed_tools()
+    _names, _schemas, metadata = base.grabowski_connector_contract.parse_observed_artifact(
+        runtime_tools, label="active runtime connector artifact"
+    )
+    return binding, runtime_tools, metadata
+
+
+def _platform_capture_publication_binding(
+    plan: dict[str, Any],
+    binding: dict[str, Any],
+    runtime_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    current = base.grabowski_client_snapshot._read_publication_current()
+    if not isinstance(current, dict) or current.get("state") == "no_current":
+        raise ValueError("platform capture requires one current publication request")
+    if current.get("request_id") != plan["publication_request_id"]:
+        raise ValueError("platform capture publication request is not current")
+    if current.get("state") == "pending_activation":
+        raise ValueError("platform capture requires the publication action to be activated first")
+    request = base.grabowski_client_snapshot._read_publication_request(
+        plan["publication_request_id"]
+    )
+    request_contract_sha256 = request["expected_contract"]["tool_contract_sha256"]
+    if current.get("contract_sha256") != request_contract_sha256:
+        raise ValueError("platform publication current/request contract mismatch")
+    if plan["requested_contract_sha256"] != request_contract_sha256:
+        raise ValueError("platform capture requested contract is not the current request contract")
+    if plan["observed_at_unix"] < request["requested_at_unix"]:
+        raise ValueError("platform observation predates the publication request")
+    runtime_contract = base.grabowski_client_snapshot._platform_publication_contract(
+        registered_tool_count=binding["registered_tool_count"],
+        registered_names_sha256=binding["registered_names_sha256"],
+        complete_schema_count=runtime_metadata["complete_schema_count"],
+        complete_schema_sha256=runtime_metadata["complete_schema_sha256"],
+    )
+    if runtime_contract["tool_contract_sha256"] != request_contract_sha256:
+        raise ValueError("active runtime contract differs from the publication request")
+    return {
+        "request_id": request["request_id"],
+        "request_sha256": request["request_sha256"],
+        "current_sha256": current["current_sha256"],
+        "current_state": current["state"],
+        "contract_sha256": request_contract_sha256,
+        "runtime_contract_sha256": runtime_contract["tool_contract_sha256"],
+    }
+
+
+def _platform_snapshot_readback(
+    binding: dict[str, Any], runtime_tools: dict[str, Any]
+) -> dict[str, Any]:
+    return base.grabowski_client_snapshot.platform_snapshot_status(
+        expected_tool_count=binding["registered_tool_count"],
+        expected_names_sha256=binding["registered_names_sha256"],
+        expected_release_id=binding["release_id"],
+        expected_repo_head=binding["repo_head"],
+        expected_agent_instructions_sha256=binding["agent_instructions_sha256"],
+        expected_runtime_tools=runtime_tools,
+    )
+
+
+def _platform_capture_root_target(target: str) -> dict[str, str]:
+    try:
+        payload = json.loads(target)
+    except json.JSONDecodeError as exc:
+        raise ValueError("platform capture root target is invalid JSON") from exc
+    if not isinstance(payload, dict) or set(payload) != {"source_path", "expected_file_sha256"}:
+        raise ValueError("platform capture root target fields are invalid")
+    path = payload.get("source_path")
+    sha256 = payload.get("expected_file_sha256")
+    if (
+        not isinstance(path, str)
+        or re.fullmatch(r"/home/alex/worktrees/\.grabowski-platform-snapshot-[0-9a-f]{32}\.json", path) is None
+        or not isinstance(sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", sha256) is None
+    ):
+        raise ValueError("platform capture root target binding is invalid")
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if target != canonical:
+        raise ValueError("platform capture root target must be canonical JSON")
+    return {"source_path": path, "expected_file_sha256": sha256}
+
+
+def _run_platform_connector_capture_operation(
+    parameters: dict[str, str] | None,
+) -> dict[str, Any]:
+    plan = _platform_connector_capture_plan(parameters)
+    operator._require_operator_capability("privileged_reference")
+    operator._require_operator_mutation("terminal_execute", opaque_command=False)
+    observed_tools = _read_platform_capture_artifact(
+        Path(plan["artifact_path"]), plan["artifact_sha256"]
+    )
+    document = base.grabowski_client_snapshot.build_platform_connector_snapshot(
+        observed_tools=observed_tools,
+        runtime_root=base.DEPLOYMENT_MANIFEST.parent,
+        source_reference=plan["source_reference"],
+        observation_scope=plan["observation_scope"],
+        observation_id=plan["observation_id"],
+        publication_request_id=plan["publication_request_id"],
+        requested_contract_sha256=plan["requested_contract_sha256"],
+        observed_at_unix=plan["observed_at_unix"],
+    )
+    binding, runtime_tools, runtime_metadata = _platform_runtime_context()
+    publication_binding = _platform_capture_publication_binding(
+        plan, binding, runtime_metadata
+    )
+    before = _platform_snapshot_readback(binding, runtime_tools)
+    expected_snapshot_sha256 = document["snapshot_sha256"]
+    invocation: dict[str, Any] | None = None
+    staged_path: Path | None = None
+    if before.get("snapshot_sha256") != expected_snapshot_sha256:
+        latest_publication_binding = _platform_capture_publication_binding(
+            plan, binding, runtime_metadata
+        )
+        if (
+            latest_publication_binding["request_sha256"]
+            != publication_binding["request_sha256"]
+        ):
+            raise ValueError("platform publication request changed before root capture")
+        staged_path, staged_sha256 = _write_platform_capture_stage(document)
+        target = json.dumps(
+            {"source_path": str(staged_path), "expected_file_sha256": staged_sha256},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        invocation = _invoke_mainpid_privileged_action(
+            action=PLATFORM_CONNECTOR_CAPTURE_ACTION,
+            target=target,
+            justification="publish one hash-bound request-scoped ChatGPT connector catalog observation",
+            timeout_seconds=120,
+        )
+    after_root = _platform_snapshot_readback(binding, runtime_tools)
+    root_effect_confirmed = after_root.get("snapshot_sha256") == expected_snapshot_sha256
+    if invocation is not None and invocation.get("outcome") == "unknown" and not root_effect_confirmed:
+        return {
+            "operation": PLATFORM_CONNECTOR_CAPTURE_OPERATION,
+            "success": False,
+            "outcome": "unknown",
+            "effect": plan["effect"],
+            "expected_snapshot_sha256": expected_snapshot_sha256,
+            "root_effect_confirmed": False,
+            "staged_snapshot_path": str(staged_path) if staged_path is not None else None,
+            "staged_snapshot_retained": True,
+            "recommended_next_action": "read the exact platform snapshot before any new publish intent",
+        }
+    if invocation is not None and invocation.get("outcome") == "failed" and not root_effect_confirmed:
+        if staged_path is not None:
+            staged_path.unlink(missing_ok=True)
+        return {
+            "operation": PLATFORM_CONNECTOR_CAPTURE_OPERATION,
+            "success": False,
+            "outcome": "failed",
+            "effect": plan["effect"],
+            "expected_snapshot_sha256": expected_snapshot_sha256,
+            "root_effect_confirmed": False,
+            "root_response_sha256": invocation.get("response_sha256"),
+        }
+    if staged_path is not None:
+        staged_path.unlink(missing_ok=True)
+    if not root_effect_confirmed:
+        return {
+            "operation": PLATFORM_CONNECTOR_CAPTURE_OPERATION,
+            "success": False,
+            "outcome": "failed",
+            "effect": plan["effect"],
+            "expected_snapshot_sha256": expected_snapshot_sha256,
+            "root_effect_confirmed": False,
+        }
+    reconciliation = base.grabowski_client_snapshot.reconcile_platform_publication_for_runtime(
+        registered_tool_count=binding["registered_tool_count"],
+        registered_names_sha256=binding["registered_names_sha256"],
+        complete_schema_count=runtime_metadata["complete_schema_count"],
+        complete_schema_sha256=runtime_metadata["complete_schema_sha256"],
+    )
+    final = _platform_snapshot_readback(binding, runtime_tools)
+    success = reconciliation.get("state") == "platform_converged"
+    audit = {
+        "timestamp_unix": int(time.time()),
+        "operation": "named-operation-run",
+        "recipe": PLATFORM_CONNECTOR_CAPTURE_OPERATION,
+        "parameters_sha256": plan["parameters_sha256"],
+        "expected_snapshot_sha256": expected_snapshot_sha256,
+        "root_effect_confirmed": root_effect_confirmed,
+        "root_audit_sha256": _root_audit_sha256(invocation) if invocation is not None else None,
+        "publication_state": reconciliation.get("state"),
+        "success": success,
+    }
+    base._append_audit(audit)
+    return {
+        "operation": PLATFORM_CONNECTOR_CAPTURE_OPERATION,
+        "success": success,
+        "outcome": "succeeded" if success else "failed",
+        "effect": plan["effect"],
+        "snapshot_sha256": expected_snapshot_sha256,
+        "source_artifact_sha256": plan["artifact_sha256"],
+        "root_effect_confirmed": root_effect_confirmed,
+        "root_audit_sha256": audit["root_audit_sha256"],
+        "reconciliation": reconciliation,
+        "platform_state": final.get("state"),
+        "platform_publication_state": final.get("publication_state"),
+        "platform_publication_contract_matches": final.get("publication_contract_matches"),
+        "does_not_establish": [
+            "cryptographic platform origin",
+            "future connector catalog stability",
+            "benchmark execution authority",
+        ],
+        "audit": audit,
+    }
+
+
 def _rootbroker_authority_refresh_plan(
     parameters: dict[str, str] | None,
 ) -> dict[str, Any]:
@@ -436,10 +818,17 @@ def _invoke_mainpid_privileged_action(
         (str(spec["action"]), str(spec["target"]))
         for spec in BACKUP_STORAGE_TYPED_OPERATIONS.values()
     }
-    if (action, target) not in allowed:
+    platform_capture = action == PLATFORM_CONNECTOR_CAPTURE_ACTION
+    if platform_capture:
+        _platform_capture_root_target(target)
+    elif (action, target) not in allowed:
         raise ValueError("MainPID privileged action is outside the BACKUP storage allowlist")
-    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or not 1 <= timeout_seconds <= 120:
-        raise ValueError("BACKUP storage privileged timeout is invalid")
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, int)
+        or not 1 <= timeout_seconds <= 120
+    ):
+        raise ValueError("MainPID privileged timeout is invalid")
     broker = privileged._privileged_broker_status()
     if not broker.get("ready"):
         raise PermissionError("privileged broker is not ready")
@@ -1017,6 +1406,31 @@ def grabowski_operation_list() -> dict[str, Any]:
         "typed_builtin": True,
         "effect": "authority_contract_refresh",
     }
+    operations[PLATFORM_CONNECTOR_CAPTURE_OPERATION] = {
+        "description": _platform_connector_capture_plan({
+            "observed_artifact_path": "/home/alex/worktrees/.grabowski-platform-observed-" + "0" * 64 + ".json",
+            "expected_artifact_sha256": "0" * 64,
+            "source_reference": "chatgpt-tool-catalog:preview",
+            "observation_scope": "connector_catalog",
+            "observation_id": "preview",
+            "publication_request_id": "preview",
+            "requested_contract_sha256": "0" * 64,
+            "observed_at_unix": "0",
+        })["description"],
+        "parameters": sorted(_platform_connector_capture_plan({
+            "observed_artifact_path": "/home/alex/worktrees/.grabowski-platform-observed-" + "0" * 64 + ".json",
+            "expected_artifact_sha256": "0" * 64,
+            "source_reference": "chatgpt-tool-catalog:preview",
+            "observation_scope": "connector_catalog",
+            "observation_id": "preview",
+            "publication_request_id": "preview",
+            "requested_contract_sha256": "0" * 64,
+            "observed_at_unix": "0",
+        })["parameter_names"]),
+        "step_count": 1,
+        "typed_builtin": True,
+        "effect": "platform_observation_publish_and_reconcile",
+    }
     operations[BLOCKADE_AUTHORITY_HARDEN_OPERATION] = {
         "description": _blockade_authority_harden_operation_plan(None)["description"],
         "parameters": [],
@@ -1050,6 +1464,8 @@ def grabowski_operation_plan(operation: str,
         return _blockade_authority_harden_operation_plan(parameters)
     if operation == ROOTBROKER_AUTHORITY_REFRESH_OPERATION:
         return _rootbroker_authority_refresh_plan(parameters)
+    if operation == PLATFORM_CONNECTOR_CAPTURE_OPERATION:
+        return _platform_connector_capture_plan(parameters)
     if operation in BACKUP_STORAGE_TYPED_OPERATIONS:
         return _backup_storage_operation_plan(operation, parameters)
     return _render(operation, parameters)
@@ -1065,6 +1481,8 @@ def grabowski_operation_run(operation: str,
         return _run_blockade_authority_harden_operation(parameters)
     if operation == ROOTBROKER_AUTHORITY_REFRESH_OPERATION:
         return _run_rootbroker_authority_refresh_operation(parameters)
+    if operation == PLATFORM_CONNECTOR_CAPTURE_OPERATION:
+        return _run_platform_connector_capture_operation(parameters)
     if operation in MAULWURF_RECOVERY_TYPED_OPERATIONS:
         return _run_maulwurf_recovery_operation(operation, parameters)
     if operation in BACKUP_STORAGE_TYPED_OPERATIONS:
