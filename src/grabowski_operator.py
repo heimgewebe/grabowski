@@ -830,6 +830,9 @@ def _git_server_read_environment() -> dict[str, str]:
         "VISUAL",
     ):
         environment.pop(key, None)
+    for key in tuple(environment):
+        if key.startswith("GIT_TRACE"):
+            environment.pop(key, None)
     environment.update(
         {
             "GIT_TERMINAL_PROMPT": "0",
@@ -851,7 +854,7 @@ def _git_server_read_command(
     if subcommand in {"diff", "log", "show"}:
         hardening = ["--no-ext-diff", "--no-textconv"]
         if subcommand in {"log", "show"}:
-            hardening.append("--no-show-signature")
+            hardening.extend(["--no-show-signature", "--pretty=medium"])
         hardened_arguments = [*hardening, *command_arguments]
     return _validate_argv(
         [
@@ -5025,7 +5028,7 @@ def _git_config_entries(repo: Path, pattern: str) -> list[tuple[str, str]]:
         stderr=subprocess.PIPE,
         check=False,
         text=True,
-        env=_git_environment(),
+        env=_git_server_read_environment(),
     )
     if completed.returncode == 1 and not completed.stdout.strip():
         return []

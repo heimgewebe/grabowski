@@ -5655,19 +5655,140 @@ class GitServerVerifiedReadTransportTests(unittest.TestCase):
             self.assertGreaterEqual(capability.call_count, 2)
             mutation.assert_not_called()
 
+    def test_generic_git_read_strips_inherited_trace_sinks(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = self._repo(operator, temporary)
+            trace = Path(temporary) / "git-trace.log"
+            trace2 = Path(temporary) / "git-trace2.json"
+            inherited = {
+                "GIT_TRACE": str(trace),
+                "GIT_TRACE2_EVENT": str(trace2),
+                "GIT_TRACE_FUTURE_SINK": str(Path(temporary) / "future-trace"),
+            }
+            raw_environment = dict(operator.os.environ)
+            raw_environment.update(inherited)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "--show-toplevel"],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=raw_environment,
+            )
+            self.assertTrue(trace.exists())
+            self.assertTrue(trace2.exists())
+            trace.unlink()
+            trace2.unlink()
+
+            with patch.dict(operator.os.environ, inherited, clear=False):
+                environment = operator._git_server_read_environment()
+                result = operator.grabowski_git(
+                    str(repo), ["rev-parse", "--show-toplevel"]
+                )
+            self.assertEqual(result["returncode"], 0)
+            self.assertFalse(any(key.startswith("GIT_TRACE") for key in environment))
+            self.assertFalse(trace.exists())
+            self.assertFalse(trace2.exists())
+
     def test_generic_git_log_and_show_disable_signature_helpers(self) -> None:
         operator = _load_operator_module()
         with tempfile.TemporaryDirectory() as temporary:
             repo = self._repo(operator, temporary)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Test"], check=True
+            )
+            operator.subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    "user.email",
+                    "test@example.invalid",
+                ],
+                check=True,
+            )
+            (repo / "tracked.txt").write_text("signed\n", encoding="utf-8")
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "add", "tracked.txt"], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True
+            )
+            tree = operator.subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            signed_commit = (
+                f"tree {tree}\n"
+                "author Test <test@example.invalid> 0 +0000\n"
+                "committer Test <test@example.invalid> 0 +0000\n"
+                "gpgsig -----BEGIN PGP SIGNATURE-----\n"
+                " fake\n"
+                " -----END PGP SIGNATURE-----\n"
+                "\n"
+                "signed\n"
+            )
+            signed_head = operator.subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "hash-object",
+                    "-t",
+                    "commit",
+                    "-w",
+                    "--stdin",
+                ],
+                input=signed_commit,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "update-ref", "HEAD", signed_head], check=True
+            )
+            marker = Path(temporary) / "signature-helper-ran"
+            helper = Path(temporary) / "signature-helper"
+            helper.write_text(
+                "#!/usr/bin/env python3\n"
+                "from pathlib import Path\n"
+                f"Path({str(marker)!r}).write_text('invoked', encoding='utf-8')\n"
+                "raise SystemExit(1)\n",
+                encoding="utf-8",
+            )
+            helper.chmod(0o755)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "format.pretty", "%G?"], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "gpg.program", str(helper)],
+                check=True,
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "log", "-1"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertTrue(marker.exists())
+            marker.unlink()
+
             for git_arguments in (["show", "--stat"], ["log", "-1"]):
                 with self.subTest(git_arguments=git_arguments):
+                    marker.unlink(missing_ok=True)
                     with patch.object(
                         operator, "_require_operator_mutation"
                     ) as mutation:
                         result = operator.grabowski_git(str(repo), git_arguments)
+                    self.assertEqual(result["returncode"], 0)
                     self.assertIn("--no-ext-diff", result["argv"])
                     self.assertIn("--no-textconv", result["argv"])
                     self.assertIn("--no-show-signature", result["argv"])
+                    self.assertIn("--pretty=medium", result["argv"])
+                    self.assertFalse(marker.exists())
                     mutation.assert_not_called()
 
     def test_generic_git_unsafe_or_mutating_shapes_remain_fail_closed(self) -> None:
