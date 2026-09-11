@@ -6,6 +6,7 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
@@ -165,6 +166,17 @@ class PlatformConnectorCaptureBridgeTests(unittest.TestCase):
         malformed["snapshot_sha256"] = "0" * 64
         with self.assertRaisesRegex(helper.CaptureError, "content hash mismatch"):
             helper._validate_snapshot(malformed)
+
+    def test_stage_writer_removes_partial_file_on_write_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                patch.object(operations, "PLATFORM_CAPTURE_STAGE_ROOT", root),
+                patch.object(operations.os, "write", side_effect=OSError("disk full")),
+            ):
+                with self.assertRaisesRegex(OSError, "disk full"):
+                    operations._write_platform_capture_stage(_snapshot_document())
+            self.assertEqual(list(root.iterdir()), [])
 
     def test_wrong_current_request_stops_before_any_root_staging(self) -> None:
         binding = {
@@ -504,6 +516,7 @@ class PlatformConnectorCaptureBridgeTests(unittest.TestCase):
             return_value="/home/alex/worktrees/.grabowski-platform-snapshot-11111111111111111111111111111111.json"
         )
         reconcile = Mock()
+        audit = Mock()
         with (
             patch.object(operations.operator, "_require_operator_capability"),
             patch.object(operations.operator, "_require_operator_mutation"),
@@ -526,6 +539,7 @@ class PlatformConnectorCaptureBridgeTests(unittest.TestCase):
             patch.object(operations, "_write_platform_capture_stage", return_value=(staged, "7" * 64)),
             patch.object(operations, "_invoke_mainpid_privileged_action", return_value={"outcome": "unknown"}),
             patch.object(operations.base.grabowski_client_snapshot, "reconcile_platform_publication_for_runtime", reconcile),
+            patch.object(operations.base, "_append_audit", audit),
         ):
             result = operations._run_platform_connector_capture_operation(_parameters())
 
@@ -536,6 +550,12 @@ class PlatformConnectorCaptureBridgeTests(unittest.TestCase):
         self.assertFalse(result["publication_contract_matches"])
         staged.unlink.assert_called_once_with(missing_ok=True)
         reconcile.assert_not_called()
+        audit.assert_called_once()
+        audit_record = audit.call_args.args[0]
+        self.assertTrue(audit_record["root_effect_confirmed"])
+        self.assertFalse(audit_record["success"])
+        self.assertFalse(audit_record["publication_contract_matches"])
+        self.assertEqual(result["audit"], audit_record)
 
     def test_definitive_broker_outcome_cleans_stage_when_post_readback_raises(self) -> None:
         binding = {

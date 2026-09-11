@@ -521,8 +521,23 @@ def _write_platform_capture_stage(document: dict[str, Any]) -> tuple[Path, str]:
                 raise OSError("prepared platform snapshot write made no progress")
             written += count
         os.fsync(descriptor)
-    finally:
         os.close(descriptor)
+        descriptor = -1
+    except Exception:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as cleanup_exc:
+            raise RuntimeError(
+                "prepared platform snapshot cleanup failed after construction failure"
+            ) from cleanup_exc
+        raise
     return path, hashlib.sha256(data).hexdigest()
 
 
@@ -748,6 +763,23 @@ def _run_platform_connector_capture_operation(
             "root_effect_confirmed": False,
         }
     if not (post_runtime_stable and runtime_binding_matches and publication_contract_matches):
+        audit = {
+            "timestamp_unix": int(time.time()),
+            "operation": "named-operation-run",
+            "recipe": PLATFORM_CONNECTOR_CAPTURE_OPERATION,
+            "parameters_sha256": plan["parameters_sha256"],
+            "expected_snapshot_sha256": expected_snapshot_sha256,
+            "root_effect_confirmed": True,
+            "root_audit_sha256": (
+                _root_audit_sha256(invocation) if invocation is not None else None
+            ),
+            "publication_state": after_root.get("publication_state"),
+            "post_runtime_stable": post_runtime_stable,
+            "runtime_binding_matches": runtime_binding_matches,
+            "publication_contract_matches": publication_contract_matches,
+            "success": False,
+        }
+        base._append_audit(audit)
         return {
             "operation": PLATFORM_CONNECTOR_CAPTURE_OPERATION,
             "success": False,
@@ -755,10 +787,12 @@ def _run_platform_connector_capture_operation(
             "effect": plan["effect"],
             "expected_snapshot_sha256": expected_snapshot_sha256,
             "root_effect_confirmed": True,
+            "root_audit_sha256": audit["root_audit_sha256"],
             "post_runtime_stable": post_runtime_stable,
             "runtime_binding_matches": runtime_binding_matches,
             "publication_contract_matches": publication_contract_matches,
             "recommended_next_action": "capture a fresh platform observation bound to the current runtime before reconciliation",
+            "audit": audit,
         }
     reconciliation = base.grabowski_client_snapshot.reconcile_platform_publication_for_runtime(
         registered_tool_count=post_binding["registered_tool_count"],
