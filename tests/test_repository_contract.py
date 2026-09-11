@@ -182,11 +182,25 @@ class RepositoryContractTests(unittest.TestCase):
             ],
         )
         tools = set(contract["expected_tools"])
-        self.assertEqual(len(tools), 197)
+        self.assertEqual(len(tools), 196)
         self.assertIn("grabowski_operational_guidance", tools)
         self.assertNotIn("grabowski_agent_workspace_adopt", tools)
         self.assertIn("grabowski_browser_worker_semantic", tools)
         self.assertIn("grabowski_tailscale_status", tools)
+        self.assertNotIn("grabowski_task_reconcile", tools)
+        self.assertTrue(
+            {
+                "grabowski_task_reconcile_check",
+                "grabowski_task_reconcile_refresh",
+                "grabowski_task_reconcile_resume",
+            }.issubset(tools)
+        )
+        profiles = json.loads(
+            (ROOT / "contracts" / "publication-profiles.v1.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(profiles["counts"], {"core": 23, "full": 196, "operator": 180})
+        self.assertNotIn("grabowski_task_reconcile", profiles["profiles"]["full"])
+        self.assertNotIn("grabowski_task_reconcile", profiles["profiles"]["operator"])
         self.assertTrue(
             {
                 "grabowski_juno_status",

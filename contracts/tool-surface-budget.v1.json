@@ -3409,6 +3409,15 @@
       ],
       "reason": "Removed from the public MCP/runtime surface after the explicit migration candidate was reconciled to canonical coding-agent routing; no legacy public alias remains."
     },
+    "grabowski_task_reconcile": {
+      "compatibility": "The internal Python compatibility helper remains available for historical/internal callers only; public callers must use grabowski_task_reconcile_check, grabowski_task_reconcile_refresh, or grabowski_task_reconcile_resume according to intent.",
+      "evidence_refs": [
+        "issue:heimgewebe/grabowski#1172",
+        "tests:tests/test_tasks.py",
+        "tests:tests/test_tool_surface_budget.py"
+      ],
+      "reason": "Removed from the public MCP/runtime surface after consumer migration to the explicit check/refresh/resume split; no legacy public reconcile alias remains."
+    },
     "rlens_bundle_discover": {
       "compatibility": "No compatibility alias. Callers must use the corresponding canonical repoground_* tool.",
       "evidence_refs": [

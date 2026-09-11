@@ -2071,20 +2071,6 @@
       "tool": "grabowski_resource_list"
     },
     {
-      "category": "task",
-      "description": "Reconcile persistent tasks after process loss or host restart.",
-      "effects": [
-        "state-refresh",
-        "lease-release"
-      ],
-      "id": "grabowski_task_reconcile",
-      "purpose": "Legacy compatibility entrypoint; refreshes state only and never resumes processes.",
-      "read_only": false,
-      "reversibility": "conditional",
-      "risk_class": "medium",
-      "tool": "grabowski_task_reconcile"
-    },
-    {
       "category": "artifact",
       "description": "Return regular-file metadata and SHA-256 for one local or fleet artifact.",
       "effects": [],
@@ -2982,7 +2968,6 @@
       "grabowski_resource_release",
       "grabowski_resource_inspect",
       "grabowski_resource_list",
-      "grabowski_task_reconcile",
       "grabowski_artifact_stat",
       "grabowski_artifact_push",
       "grabowski_artifact_pull",
@@ -3574,7 +3559,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "68d16ce357af3ae69564960ffb37482aaee5d327ad3d8484d462dc6fd13a2ace"
+      "sha256": "51034a0fa8da39afa8363c940c971406f9d315b539ff5193e9161c02002e54ea"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3582,7 +3567,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "f65d5f4345da0bba5c28ebd9951e52ecf326429ba2657b89155d7b137c54fdbc"
+      "sha256": "75ac50665221bcd87dc459b3c71e70363eabf265c626c0590c069afd8d88808e"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
@@ -3700,7 +3685,7 @@
       "src/grabowski_systemkatalog.py": "4fefcfd0b5ea3b68d37b6a95d27516799cbf5c2ada14494c3b4c17688f98585d",
       "src/grabowski_task_attention.py": "a16d4b045bef23bf78ad3df0c4c58d91a304dc9a83b6e757fb1b0f88754ad6f3",
       "src/grabowski_task_reconcile.py": "64dc6195c9d0cb3435d192e4715a0d4d5679b9f1904057308366f4e2f2e9bbea",
-      "src/grabowski_tasks.py": "3421c594b7f4ca625b2ff3fe541e1b9a6e8f1f5c22a9031c837f4f60b4586e37",
+      "src/grabowski_tasks.py": "187de0d78bb078ec1bb6491d7086b04899cf40480dd5c478e9ef059009dd2d9d",
       "src/grabowski_terminal_convergence.py": "8f172a65b2af1dbca3d5b226a18e82df3ca5229ca5f4ae8b2ab1792506c69195",
       "src/grabowski_text_artifact_reconcile.py": "b302be1dbb101abbf825732bfe41658c13ac64417c2a6034326e57409daa4772",
       "src/grabowski_transport_assertion.py": "20d75d1f94c1d0273108c36eed8c58aa85e55a30b73546c4ac8af8a835fb8c8e",

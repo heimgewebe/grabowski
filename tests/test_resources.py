@@ -2901,6 +2901,24 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(released["released"][0]["owner_id"], "owner-a")
         self.assertIsNone(resources.inspect_resource(key))
 
+    def test_snapshot_guarded_release_accepts_public_lease_record_superset(self) -> None:
+        key = "component:release-public-snapshot"
+        acquired = resources.acquire_resources(
+            "owner-a", [key], purpose="public snapshot", ttl_seconds=60
+        )
+        public_lease = acquired["leases"][0]
+        self.assertTrue(resources.LEASE_SNAPSHOT_KEYS.issubset(public_lease))
+        self.assertIn("purpose", public_lease)
+        self.assertIn("reclaimed_from_owner", public_lease)
+
+        released = resources.release_resources(
+            "owner-a", [key], expected_leases=[public_lease]
+        )
+
+        self.assertTrue(released["snapshot_guarded"])
+        self.assertEqual(key, released["released"][0]["resource_key"])
+        self.assertIsNone(resources.inspect_resource(key))
+
     def test_snapshot_guarded_release_rejects_same_owner_aba(self) -> None:
         key = "component:release-aba"
         with patch.object(resources, "_now", return_value=100):
