@@ -1134,42 +1134,79 @@ def _observe_locked(
         raise CodingAgentRouterCliError(
             "reset_at must be a timezone-aware timestamp"
         )
+    quality_outcomes = {"success", "quality_failure"}
+    task_class = arguments.task_class
+    if arguments.outcome in quality_outcomes:
+        if not task_class:
+            raise CodingAgentRouterCliError(
+                "quality-bearing observe outcomes require --task-class"
+            )
+        if task_class not in catalog["task_classes"]:
+            raise CodingAgentRouterCliError("observe requires a known task class")
+        if task_class not in route.get("task_classes", []):
+            raise CodingAgentRouterCliError(
+                "observe task class is outside the selected route affinity"
+            )
+    elif rework is not None:
+        raise CodingAgentRouterCliError(
+            "rework_minutes requires a quality-bearing observe outcome"
+        )
+
     state = _load_mutable_state(str(validation["catalog_sha256"]))
     record = state["routes"].setdefault(arguments.route, {})
-    counters: dict[str, int] = {}
-    for field in ("runs", "successes", "failures"):
-        value = record.get(field, 0)
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise CodingAgentRouterCliError(
-                f"existing route counter {field} is invalid"
-            )
-        counters[field] = value
-    record["runs"] = counters["runs"] + 1
+    if not isinstance(record, dict):
+        raise CodingAgentRouterCliError("existing route state is invalid")
     record["last_outcome"] = arguments.outcome
     record["last_observed_at"] = _iso_now()
-    if arguments.outcome == "success":
-        record["successes"] = counters["successes"] + 1
-    else:
-        record["failures"] = counters["failures"] + 1
     if duration is not None:
         record["last_duration_seconds"] = duration
-    if rework is not None:
-        observations = record.get("rework_observations", 0)
-        previous_average = record.get("average_rework_minutes", 0.0)
-        if (
-            isinstance(observations, bool)
-            or not isinstance(observations, int)
-            or observations < 0
-            or isinstance(previous_average, bool)
-            or not isinstance(previous_average, (int, float))
-            or not math.isfinite(float(previous_average))
-            or float(previous_average) < 0
-        ):
-            raise CodingAgentRouterCliError("existing rework history is invalid")
-        record["average_rework_minutes"] = (
-            float(previous_average) * observations + rework
-        ) / (observations + 1)
-        record["rework_observations"] = observations + 1
+
+    quality_record: dict[str, Any] | None = None
+    if arguments.outcome in quality_outcomes:
+        by_task = record.setdefault("by_task_class", {})
+        if not isinstance(by_task, dict):
+            raise CodingAgentRouterCliError("existing route task-class history is invalid")
+        quality_record = by_task.setdefault(task_class, {})
+        if not isinstance(quality_record, dict):
+            raise CodingAgentRouterCliError("existing task-class outcome history is invalid")
+        counters: dict[str, int] = {}
+        for field in ("runs", "successes", "failures"):
+            value = quality_record.get(field, 0)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise CodingAgentRouterCliError(
+                    f"existing task-class route counter {field} is invalid"
+                )
+            counters[field] = value
+        quality_record["runs"] = counters["runs"] + 1
+        quality_record["last_outcome"] = arguments.outcome
+        quality_record["last_observed_at"] = _iso_now()
+        if arguments.outcome == "success":
+            quality_record["successes"] = counters["successes"] + 1
+            quality_record["failures"] = counters["failures"]
+        else:
+            quality_record["successes"] = counters["successes"]
+            quality_record["failures"] = counters["failures"] + 1
+        if duration is not None:
+            quality_record["last_duration_seconds"] = duration
+        if rework is not None:
+            observations = quality_record.get("rework_observations", 0)
+            previous_average = quality_record.get("average_rework_minutes", 0.0)
+            if (
+                isinstance(observations, bool)
+                or not isinstance(observations, int)
+                or observations < 0
+                or isinstance(previous_average, bool)
+                or not isinstance(previous_average, (int, float))
+                or not math.isfinite(float(previous_average))
+                or float(previous_average) < 0
+            ):
+                raise CodingAgentRouterCliError(
+                    "existing task-class rework history is invalid"
+                )
+            quality_record["average_rework_minutes"] = (
+                float(previous_average) * observations + rework
+            ) / (observations + 1)
+            quality_record["rework_observations"] = observations + 1
     if reported_cost is not None:
         record["last_reported_cost_usd"] = reported_cost
     boundary = datetime.now(timezone.utc)
@@ -1211,7 +1248,16 @@ def _observe_locked(
         pool["updated_at"] = _iso_now()
     state["updated_at"] = _iso_now()
     _atomic_write_private_json(router._state_path(), state)
-    return {"recorded": True, "route": arguments.route, "route_state": record}
+    result = {
+        "recorded": True,
+        "route": arguments.route,
+        "route_state": record,
+        "quality_recorded": quality_record is not None,
+    }
+    if quality_record is not None:
+        result["task_class"] = task_class
+        result["task_class_state"] = quality_record
+    return result
 
 
 def _observe(
@@ -1312,6 +1358,7 @@ def parser() -> argparse.ArgumentParser:
 
     observe = commands.add_parser("observe")
     observe.add_argument("--route", required=True)
+    observe.add_argument("--task-class")
     observe.add_argument(
         "--outcome",
         required=True,

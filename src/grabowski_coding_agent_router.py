@@ -1338,12 +1338,18 @@ def _scoped_route_history(
     route_id: str,
     task_class: str,
     state: dict[str, Any],
+    *,
+    comparison_scope: str = "route-and-task-class",
 ) -> tuple[dict[str, Any], str]:
     route_state = state.get("routes", {}).get(route_id, {})
+    if comparison_scope != "route-and-task-class":
+        return {}, "unsupported-comparison-scope"
+    if not isinstance(route_state, dict):
+        return {}, "route+task-class"
     by_task = route_state.get("by_task_class", {})
     if isinstance(by_task, dict) and isinstance(by_task.get(task_class), dict):
         return by_task[task_class], "route+task-class"
-    return route_state if isinstance(route_state, dict) else {}, "route-aggregate"
+    return {}, "route+task-class"
 
 
 def _outcome_adjustment(
@@ -1352,7 +1358,14 @@ def _outcome_adjustment(
     state: dict[str, Any],
     learning: dict[str, Any],
 ) -> tuple[float, list[str]]:
-    history, scope = _scoped_route_history(route_id, task_class, state)
+    history, scope = _scoped_route_history(
+        route_id,
+        task_class,
+        state,
+        comparison_scope=str(
+            learning.get("comparison_scope", "route-and-task-class")
+        ),
+    )
     runs = history.get("runs", 0)
     if isinstance(runs, bool) or not isinstance(runs, int) or runs < 0:
         return 0.0, []
@@ -2549,7 +2562,7 @@ def canonical_execution_route(
         "contrast_programming": {
             "allowed": not direct_review_task,
             "requires_explicit_request": True,
-            "route_tool": "grabowski_agent_execution_route",
+            "route_tool": "grabowski_coding_agent_route",
             "route_selector": "coding-agent-catalog",
             "start_tool": "grabowski_agent_competition_start",
             "concrete_route_id_required_for_canonical_start": True,

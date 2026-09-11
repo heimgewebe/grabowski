@@ -22,7 +22,7 @@ Die kanonische Routingimplementation liegt in `src/grabowski_coding_agent_router
 - interne Implementierung: `canonical_execution_route`;
 - öffentliche Oberfläche: `grabowski_coding_agent_route`.
 
-`grabowski_agent_execution_route` in `src/grabowski_agent_competition.py` ist nur noch ein Kompatibilitätsadapter. Seine historische Workspace-/Kontrastbewertung darf keine eigene Executor-Autorität begründen.
+`grabowski_agent_execution_route` in `src/grabowski_agent_competition.py` bleibt nur als interner Python-Kompatibilitätshelfer für historische Workspace-/Shadow-Kalibrierung und Replay-Tests erhalten. Er ist kein publiziertes MCP-Tool und darf keine eigene Executor-Autorität begründen; öffentliche Routingaufrufe verwenden ausschließlich `grabowski_coding_agent_route`.
 
 Der Rollen- und Effektvertrag liegt ergänzend in `src/grabowski_operator_relay.py`. Er definiert dieselben vier Rollen und die controller-only Wirkungen. Er ist kein zweiter Router.
 
@@ -140,9 +140,9 @@ Wenn `need_review=true` gesetzt ist, kann die Anfrage nicht gleichzeitig `verifi
 
 ## 8. Legacy-Adapter
 
-`grabowski_agent_execution_route` bleibt vorübergehend lesbar, damit bestehende Workspace-Routenevidenz und Shadow-Kalibrierung nicht gebrochen werden.
+`grabowski_agent_execution_route` ist aus der publizierten MCP-/Runtime-Oberfläche entfernt. Der gleichnamige interne Python-Helfer bleibt ausschließlich für historische Workspace-Routenevidenz, Shadow-Kalibrierung und Replay-Tests erhalten. Neue Aufrufer verwenden `grabowski_coding_agent_route`; explizite Contrast-Ausführung bleibt über Katalog und Competition-Surfaces getrennt.
 
-Der Adapter ruft für die Autoritätsentscheidung `canonical_execution_route` auf und übernimmt daraus mindestens:
+Der interne Helfer ruft für die Autoritätsentscheidung `canonical_execution_route` auf und übernimmt daraus mindestens:
 
 - `executor`;
 - `writer_route`;

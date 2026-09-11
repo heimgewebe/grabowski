@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "c89aa9c07dd4ac22cdbfd893aef19d6b4f47f5a7b3deee70057d3b375fc08ccd",
+  "capability_source_sha256": "68d16ce357af3ae69564960ffb37482aaee5d327ad3d8484d462dc6fd13a2ace",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "27db499fc6cb114159d769b07ee3f135ebfd58921788be620a47ae39d5ce1bab",
+  "contract_sha256": "f65d5f4345da0bba5c28ebd9951e52ecf326429ba2657b89155d7b137c54fdbc",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -2428,17 +2428,6 @@
       "reversibility": "restore-from-checkout-archive",
       "risk_class": "high",
       "tool": "grabowski_agent_workspace_cleanup"
-    },
-    {
-      "category": "agent-workspace",
-      "description": "Compatibility adapter over canonical execution routing plus legacy contrast advice.",
-      "effects": [],
-      "id": "grabowski_agent_execution_route",
-      "purpose": "Expose the legacy execution-routing adapter over canonical controller or lane-scoped-writer routing, with optional advisory contrast candidates.",
-      "read_only": true,
-      "reversibility": "not-applicable",
-      "risk_class": "low",
-      "tool": "grabowski_agent_execution_route"
     },
     {
       "category": "agent-workspace",
