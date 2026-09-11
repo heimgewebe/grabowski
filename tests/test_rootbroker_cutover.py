@@ -148,14 +148,20 @@ def _local_backup_ntfs_actions() -> dict[str, dict[str, object]]:
 
 
 def _power_action() -> dict[str, object]:
+    return _bound_action(cutover.POWER_ACTION)
+
+
+def _legacy_power_action() -> dict[str, object]:
     return {
-        "enabled": True,
+        "enabled": False,
         "mode": "argv-json",
         "target_pattern": r"\{.{1,49152}\}",
         "cwd_pattern": r"/[A-Za-z0-9._/@:+-]{0,999}",
         "timeout_seconds": 600,
         "max_argv": 128,
         "allow_shell": False,
+        "policy_intent": "trusted-owner-high-power-admin-catalog",
+        "allowed_argv_prefixes": [["/usr/bin/systemctl", "is-active"]],
         "gate": {
             "kill_switch_path": "/home/alex/.local/state/grabowski/operator-kill-switch",
             "recovery_marker_path": "/var/lib/grabowski/power-worker-recovery-gate.json",
@@ -175,7 +181,7 @@ def _installed_config() -> dict[str, object]:
                 "argv": ["/usr/bin/systemctl", "restart", "{target}"],
                 "timeout_seconds": 120,
             },
-            cutover.POWER_ACTION: _power_action(),
+            cutover.POWER_ACTION: _legacy_power_action(),
         },
     }
 
@@ -186,6 +192,7 @@ def _example_config_text() -> str:
             "schema_version": 2,
             "actions": {
                 cutover.PUBLISH_ACTION: _canonical_publisher(),
+                cutover.POWER_ACTION: _power_action(),
                 cutover.BLOCKADE_LIFECYCLE_ACTION: _lifecycle(),
                 cutover.ROOT_TASK_ACTION: _root_task_action(),
                 cutover.PROCESS_OBSERVER_ACTION: _bound_action(cutover.PROCESS_OBSERVER_ACTION),
@@ -994,6 +1001,7 @@ class RootbrokerCutoverTests(unittest.TestCase):
         merged, evidence = cutover.merge_privileged_config(
             current,
             publisher=_publisher(),
+            power=_power_action(),
         )
 
         self.assertEqual(current, original)
@@ -1001,9 +1009,14 @@ class RootbrokerCutoverTests(unittest.TestCase):
             merged["actions"][cutover.PUBLISH_ACTION],
             _publisher(),
         )
-        expected_power = _power_action()
-        expected_power["gate"]["configured_target"] = cutover.CONFIGURED_TARGET
-        self.assertEqual(merged["actions"][cutover.POWER_ACTION], expected_power)
+        self.assertEqual(
+            merged["actions"][cutover.POWER_ACTION],
+            _power_action(),
+        )
+        self.assertNotIn("gate", merged["actions"][cutover.POWER_ACTION])
+        self.assertNotIn(
+            "allowed_argv_prefixes", merged["actions"][cutover.POWER_ACTION]
+        )
         self.assertEqual(
             merged["actions"]["edit_system_service"],
             original["actions"]["edit_system_service"],
@@ -1015,6 +1028,7 @@ class RootbrokerCutoverTests(unittest.TestCase):
         merged, evidence = cutover.merge_privileged_config(
             _installed_config(),
             publisher=_canonical_publisher(),
+            power=_power_action(),
             lifecycle=_lifecycle(),
             root_task=_root_task_action(),
         )
@@ -1036,6 +1050,7 @@ class RootbrokerCutoverTests(unittest.TestCase):
         merged, evidence = cutover.merge_privileged_config(
             _installed_config(),
             publisher=_canonical_publisher(),
+            power=_power_action(),
             lifecycle=_lifecycle(),
             root_task=_root_task_action(),
             bootstrap_recovery=_bootstrap_recovery_action(),
@@ -1067,6 +1082,7 @@ class RootbrokerCutoverTests(unittest.TestCase):
             cutover.merge_privileged_config(
                 current,
                 publisher=_canonical_publisher(),
+                power=_power_action(),
                 lifecycle=_lifecycle(),
                 root_task=_root_task_action(),
                 bootstrap_recovery=_bootstrap_recovery_action(),
@@ -1091,6 +1107,7 @@ class RootbrokerCutoverTests(unittest.TestCase):
         merged, evidence = cutover.merge_privileged_config(
             current,
             publisher=_canonical_publisher(),
+            power=_power_action(),
             lifecycle=_lifecycle(),
             root_task=_root_task_action(),
             bootstrap_recovery=_bootstrap_recovery_action(),
@@ -1125,6 +1142,7 @@ class RootbrokerCutoverTests(unittest.TestCase):
         merged, evidence = cutover.merge_privileged_config(
             current,
             publisher=_canonical_publisher(),
+            power=_power_action(),
             lifecycle=_lifecycle(),
             root_task=_root_task_action(),
         )
@@ -1151,6 +1169,7 @@ class RootbrokerCutoverTests(unittest.TestCase):
             cutover.merge_privileged_config(
                 current,
                 publisher=_canonical_publisher(),
+                power=_power_action(),
                 lifecycle=_lifecycle(),
                 root_task=_root_task_action(),
             )
@@ -1165,6 +1184,7 @@ class RootbrokerCutoverTests(unittest.TestCase):
             cutover.merge_privileged_config(
                 _installed_config(),
                 publisher=_canonical_publisher(),
+                power=_power_action(),
                 lifecycle=_lifecycle(),
                 root_task=root_task,
             )
@@ -1221,21 +1241,33 @@ class RootbrokerCutoverTests(unittest.TestCase):
                 runner=runner,
             )
 
-    def test_merge_rejects_disabled_operator_power_action(self) -> None:
+    def test_merge_replaces_disabled_legacy_operator_power_action(self) -> None:
         current = _installed_config()
-        current["actions"][cutover.POWER_ACTION]["enabled"] = False
+        self.assertFalse(current["actions"][cutover.POWER_ACTION]["enabled"])
 
-        with self.assertRaisesRegex(cutover.CutoverError, "not enabled"):
-            cutover.merge_privileged_config(current, publisher=_publisher())
+        merged, _evidence = cutover.merge_privileged_config(
+            current,
+            publisher=_publisher(),
+            power=_power_action(),
+        )
 
-    def test_merge_rejects_incoherent_gate_contract(self) -> None:
+        self.assertEqual(merged["actions"][cutover.POWER_ACTION], _power_action())
+        self.assertTrue(merged["actions"][cutover.POWER_ACTION]["enabled"])
+
+    def test_power_policy_is_decoupled_from_recovery_gate_drift(self) -> None:
         current = _installed_config()
         current["actions"][cutover.POWER_ACTION]["gate"][
             "max_recovery_age_seconds"
         ] = 3600
 
-        with self.assertRaisesRegex(cutover.CutoverError, "max_recovery_age_seconds"):
-            cutover.merge_privileged_config(current, publisher=_publisher())
+        merged, _evidence = cutover.merge_privileged_config(
+            current,
+            publisher=_publisher(),
+            power=_power_action(),
+        )
+
+        self.assertEqual(merged["actions"][cutover.POWER_ACTION], _power_action())
+        self.assertNotIn("gate", merged["actions"][cutover.POWER_ACTION])
 
     def test_running_helper_matches_commit_bound_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1467,10 +1499,8 @@ class RootbrokerCutoverTests(unittest.TestCase):
             actions[cutover.PUBLISH_ACTION]["configured_target"],
             cutover.CONFIGURED_TARGET,
         )
-        self.assertEqual(
-            actions[cutover.POWER_ACTION]["gate"]["configured_target"],
-            cutover.CONFIGURED_TARGET,
-        )
+        self.assertEqual(actions[cutover.POWER_ACTION], _power_action())
+        self.assertNotIn("gate", actions[cutover.POWER_ACTION])
         self.assertEqual(
             actions[cutover.BLOCKADE_LIFECYCLE_ACTION]["recovery_gate"]["configured_target"],
             cutover.CONFIGURED_TARGET,
@@ -1490,9 +1520,6 @@ class RootbrokerCutoverTests(unittest.TestCase):
         actions[cutover.PUBLISH_ACTION]["configured_target"] = (
             cutover.LEGACY_CONFIGURED_TARGET
         )
-        actions[cutover.POWER_ACTION]["gate"]["configured_target"] = (
-            cutover.LEGACY_CONFIGURED_TARGET
-        )
         actions[cutover.BLOCKADE_LIFECYCLE_ACTION]["recovery_gate"][
             "configured_target"
         ] = cutover.LEGACY_CONFIGURED_TARGET
@@ -1505,6 +1532,9 @@ class RootbrokerCutoverTests(unittest.TestCase):
         )
         repository = ROOT
 
+        power = cutover._power_action_from_repository(
+            repository, expected_head=HEAD, runner=runner
+        )
         publisher = cutover._publisher_from_repository(
             repository, expected_head=HEAD, runner=runner, automatic=True
         )
@@ -1528,14 +1558,13 @@ class RootbrokerCutoverTests(unittest.TestCase):
         merged, _evidence = cutover.merge_privileged_config(
             _installed_config(),
             publisher=publisher,
+            power=power,
             lifecycle=lifecycle,
             root_task=root_task,
             allow_controlled_updates=True,
         )
-        self.assertEqual(
-            merged["actions"][cutover.POWER_ACTION]["gate"]["configured_target"],
-            cutover.LEGACY_CONFIGURED_TARGET,
-        )
+        self.assertEqual(merged["actions"][cutover.POWER_ACTION], _power_action())
+        self.assertNotIn("gate", merged["actions"][cutover.POWER_ACTION])
         with self.assertRaisesRegex(cutover.CutoverError, "differs from host contract"):
             cutover._publisher_from_repository(
                 repository, expected_head=HEAD, runner=runner, automatic=False
@@ -1651,10 +1680,9 @@ class RootbrokerCutoverTests(unittest.TestCase):
             )
             self.assertFalse(receipt["merge_evidence"]["root_task_preexisting"])
             power = installed_config["actions"][cutover.POWER_ACTION]
-            self.assertEqual(
-                power["gate"]["configured_target"],
-                cutover.CONFIGURED_TARGET,
-            )
+            self.assertEqual(power, _power_action())
+            self.assertNotIn("gate", power)
+            self.assertNotIn("allowed_argv_prefixes", power)
             lifecycle = installed_config["actions"][cutover.BLOCKADE_LIFECYCLE_ACTION]
             self.assertEqual(power["allowed_peer_uid"], lifecycle["allowed_peer_uid"])
             self.assertEqual(power["allowed_peer_unit"], lifecycle["allowed_peer_unit"])

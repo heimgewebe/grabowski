@@ -1444,7 +1444,6 @@ class PrivilegedBrokerTests(unittest.TestCase):
                     "timeout_seconds": 600,
                     "max_argv": 128,
                     "allow_shell": False,
-                    "gate": self._power_gate(self.tmp.name),
                 }
             },
         }
@@ -1464,38 +1463,17 @@ class PrivilegedBrokerTests(unittest.TestCase):
         self.assertIn("chunk = os.read(descriptor", source)
         self.assertNotIn("raw = path.read_bytes()", source)
 
-    def test_power_argv_json_missing_recovery_marker_is_handled_denial(self) -> None:
-        reference = self._power_reference({"argv": ["/usr/bin/id", "-u"], "cwd": "/", "timeout_seconds": 30})
-        parsed = privileged_broker.parse_reference(
-            json.dumps(reference).encode("utf-8"), now=1000
-        )
+    def test_power_gate_missing_recovery_marker_still_denies_gated_actions(self) -> None:
         gate = self._power_gate(self.tmp.name)
         Path(gate["recovery_marker_path"]).unlink()
-        config = {
-            "schema_version": 2,
-            "actions": {
-                "operator_power_argv": {
-                    "enabled": True,
-                    "mode": "argv-json",
-                    "target_pattern": r"\{.{1,49152}\}",
-                    "cwd_pattern": r"/[A-Za-z0-9._/@:+-]{0,999}",
-                    "timeout_seconds": 600,
-                    "max_argv": 128,
-                    "allow_shell": False,
-                    "gate": gate,
-                }
-            },
-        }
         with self.assertRaisesRegex(PermissionError, "recovery marker does not exist"):
-            privileged_broker.resolve_execution(config, parsed)
+            privileged_broker._validate_power_gate(gate)
 
-    def test_power_argv_json_requires_fresh_root_side_gate(self) -> None:
+    def test_power_argv_json_does_not_require_recovery_gate(self) -> None:
         reference = self._power_reference({"argv": ["/usr/bin/id", "-u"], "cwd": "/", "timeout_seconds": 30})
         parsed = privileged_broker.parse_reference(
             json.dumps(reference).encode("utf-8"), now=1000
         )
-        gate = self._power_gate(self.tmp.name)
-        Path(gate["kill_switch_path"]).write_text("stop", encoding="utf-8")
         config = {
             "schema_version": 2,
             "actions": {
@@ -1504,41 +1482,24 @@ class PrivilegedBrokerTests(unittest.TestCase):
                     "mode": "argv-json",
                     "target_pattern": r"\{.{1,49152}\}",
                     "cwd_pattern": r"/[A-Za-z0-9._/@:+-]{0,999}",
-                    "timeout_seconds": 600,
+                    "timeout_seconds": 3600,
                     "max_argv": 128,
-                    "allow_shell": False,
-                    "gate": gate,
+                    "allow_shell": True,
+                    "policy_intent": "trusted-owner-root-autonomy",
+                    "allowed_peer_unit": "grabowski-operator.service",
+                    "allowed_peer_uid": 1000,
                 }
             },
         }
-        with self.assertRaisesRegex(PermissionError, "kill-switch"):
-            privileged_broker.resolve_execution(config, parsed)
-
+        execution = privileged_broker.resolve_execution(config, parsed)
+        self.assertEqual(execution["argv"], ["/usr/bin/id", "-u"])
+        self.assertNotIn("gate", execution)
     def test_power_gate_treats_dangling_kill_switch_symlink_as_engaged(self) -> None:
-        reference = self._power_reference({"argv": ["/usr/bin/id", "-u"], "cwd": "/", "timeout_seconds": 30})
-        parsed = privileged_broker.parse_reference(
-            json.dumps(reference).encode("utf-8"), now=1000
-        )
         gate = self._power_gate(self.tmp.name)
         kill_switch = Path(gate["kill_switch_path"])
         kill_switch.symlink_to(Path(self.tmp.name) / "missing-target")
-        config = {
-            "schema_version": 2,
-            "actions": {
-                "operator_power_argv": {
-                    "enabled": True,
-                    "mode": "argv-json",
-                    "target_pattern": r"\{.{1,49152}\}",
-                    "cwd_pattern": r"/[A-Za-z0-9._/@:+-]{0,999}",
-                    "timeout_seconds": 600,
-                    "max_argv": 128,
-                    "allow_shell": False,
-                    "gate": gate,
-                }
-            },
-        }
         with self.assertRaisesRegex(PermissionError, "kill-switch"):
-            privileged_broker.resolve_execution(config, parsed)
+            privileged_broker._validate_power_gate(gate)
 
     def test_power_argv_json_rejects_shell_when_disabled(self) -> None:
         reference = self._power_reference({"argv": ["/bin/bash", "-lc", "id"], "cwd": "/", "timeout_seconds": 30})
@@ -1556,7 +1517,6 @@ class PrivilegedBrokerTests(unittest.TestCase):
                     "timeout_seconds": 600,
                     "max_argv": 128,
                     "allow_shell": False,
-                    "gate": self._power_gate(self.tmp.name),
                 }
             },
         }
@@ -1584,7 +1544,6 @@ class PrivilegedBrokerTests(unittest.TestCase):
                         ["/usr/bin/systemctl", "is-active"],
                         ["/usr/bin/systemctl", "status"],
                     ],
-                    "gate": self._power_gate(self.tmp.name),
                 }
             },
         }
@@ -1621,7 +1580,6 @@ class PrivilegedBrokerTests(unittest.TestCase):
                     "max_argv": 1,
                     "allow_shell": False,
                     "allowed_argv_prefixes": [["/usr/bin/systemctl", "is-active"]],
-                    "gate": self._power_gate(self.tmp.name),
                 }
             },
         }
@@ -1645,7 +1603,6 @@ class PrivilegedBrokerTests(unittest.TestCase):
                     "max_argv": 128,
                     "allow_shell": False,
                     "allowed_argv_prefixes": [["/usr/bin/systemctl", "is-active"]],
-                    "gate": self._power_gate(self.tmp.name),
                 }
             },
         }
@@ -1669,14 +1626,13 @@ class PrivilegedBrokerTests(unittest.TestCase):
                     "max_argv": 128,
                     "allow_shell": False,
                     "allowed_argv_prefixes": [["/bin/bash", "-lc"]],
-                    "gate": self._power_gate(self.tmp.name),
                 }
             },
         }
         with self.assertRaisesRegex(PermissionError, "shell"):
             privileged_broker.resolve_execution(config, parsed)
 
-    def test_power_run_tool_builds_direct_reference_and_requires_recovery(self) -> None:
+    def test_power_run_tool_builds_direct_reference_without_recovery_gate(self) -> None:
         response = json.dumps(
             {
                 "returncode": 0,
@@ -1721,15 +1677,6 @@ class PrivilegedBrokerTests(unittest.TestCase):
                 "grabowski_privileged_broker_status",
                 return_value={"ready": True},
             ),
-            patch.object(
-                privileged,
-                "_power_recovery_status",
-                return_value={
-                    "ready_for_user_power_worker": True,
-                    "ready_for_privileged_actions": True,
-                    "checked_at_unix": 1000,
-                },
-            ),
             patch.object(privileged.socket, "socket", return_value=fake),
             patch.object(privileged.subprocess, "run") as subprocess_run,
             patch.object(privileged, "_write_power_reference") as write_reference,
@@ -1743,6 +1690,8 @@ class PrivilegedBrokerTests(unittest.TestCase):
             )
 
         self.assertTrue(result["success"])
+        self.assertEqual(result["execution_model"], "canonical-root-broker")
+        self.assertNotIn("recovery_gate", result)
         subprocess_run.assert_not_called()
         write_reference.assert_not_called()
         self.assertEqual(fake.connected, str(privileged.BROKER_SOCKET))
