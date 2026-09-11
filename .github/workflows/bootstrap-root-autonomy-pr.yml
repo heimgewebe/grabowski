@@ -1,0 +1,64 @@
+name: Bootstrap root autonomy PR
+
+on:
+  push:
+    branches:
+      - feat/trusted-operator-root-autonomy-main-sync-20260911
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  create-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create pull request if absent
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const headBranch = 'feat/trusted-operator-root-autonomy-main-sync-20260911';
+            const existing = await github.rest.pulls.list({
+              owner,
+              repo,
+              state: 'all',
+              head: `${owner}:${headBranch}`,
+              per_page: 20,
+            });
+            if (existing.data.length > 0) {
+              core.info(`PR already exists: #${existing.data[0].number}`);
+              return;
+            }
+            const body = `## Ziel
+            Den kanonischen \`grabowski-operator.service\` im Trusted-Owner-Modell als normale, auditierte Root-Capability betreiben, ohne \`alex\` pauschal \`NOPASSWD: ALL\` zu geben.
+
+            ## Änderung
+            - \`operator_power_argv\` aktivieren und von Recovery-Freshness entkoppeln
+            - Shell-Ausführung erlauben und Befehls-Allowlist entfernen
+            - Kernel/root-systemd-geprüfte MainPID-/Peer-Bindung beibehalten
+            - spezialisierte Recovery-, Root-Task- und Blockade-Gates beibehalten
+            - Rootbroker-Cutover auf den vollständigen commitgebundenen Power-Vertrag umstellen
+            - Access-/Capability-/Tool-Surface-Verträge und Dokumentation auf dieselbe Semantik bringen
+
+            ## Vertrauensgrenze
+            Wer den exakt autorisierten kanonischen Operator-Hauptprozess kontrolliert, kontrolliert damit den Host als root. Andere Same-UID-Prozesse, Terminals, Kinder und untrusted Coding-Agenten erhalten diese Autorität nicht.
+
+            ## Validierung
+            - \`8045 passed, 12 skipped, 2131 subtests passed\`
+            - fokussiert: \`231 passed, 68 subtests passed\`
+            - \`make context-check\`: grün
+            - \`make tool-surface-budget\`: grün
+            - \`git diff --check\`: grün
+            - frischer öffentlicher \`main\`-Readback vor Push: \`a8d9020be449d61e3beacbd8a8218bec85bcf13f\`
+            `.replace(/^            /gm, '');
+            const created = await github.rest.pulls.create({
+              owner,
+              repo,
+              title: 'feat(privileged): grant canonical operator root autonomy',
+              head: headBranch,
+              base: 'main',
+              body,
+            });
+            core.info(`Created PR #${created.data.number}: ${created.data.html_url}`);
