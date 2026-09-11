@@ -858,7 +858,7 @@ def _git_server_read_command(
         hardened_arguments = [*hardening, *command_arguments]
     return _validate_argv(
         [
-            "git",
+            _trusted_git_cli_path(),
             "-c",
             "core.pager=cat",
             "-c",
@@ -2499,6 +2499,7 @@ def _limit(text: str, limit: int) -> tuple[str, bool]:
 MANAGED_NODE_RUNTIME_DIRECTORY_NAME = "grabowski-node-runtime-env"
 MANAGED_UV_CACHE_DIRECTORY_NAME = "grabowski-uv-cache"
 TRUSTED_GITHUB_CLI_PATH = Path("/usr/bin/gh")
+TRUSTED_GIT_CLI_PATH = Path("/usr/bin/git")
 
 
 def _managed_runtime_environment(
@@ -2530,26 +2531,37 @@ def _managed_runtime_environment(
     }
 
 
-def _trusted_github_cli_path() -> str:
-    path = TRUSTED_GITHUB_CLI_PATH
+def _trusted_root_owned_executable_path(path: Path, label: str) -> str:
     try:
         executable = os.lstat(path)
         directories = [os.lstat(path.parent.parent), os.lstat(path.parent)]
     except OSError as exc:
-        raise RuntimeError("trusted GitHub CLI path is unavailable") from exc
+        raise RuntimeError(f"trusted {label} path is unavailable") from exc
     unsafe_write_bits = stat.S_IWGRP | stat.S_IWOTH
     if not stat.S_ISREG(executable.st_mode):
-        raise RuntimeError("trusted GitHub CLI path is not a regular file")
+        raise RuntimeError(f"trusted {label} path is not a regular file")
     if executable.st_uid != 0 or executable.st_mode & unsafe_write_bits:
-        raise RuntimeError("trusted GitHub CLI path is not root-owned and immutable to non-root users")
+        raise RuntimeError(
+            f"trusted {label} path is not root-owned and immutable to non-root users"
+        )
     if not executable.st_mode & stat.S_IXUSR:
-        raise RuntimeError("trusted GitHub CLI path is not executable")
+        raise RuntimeError(f"trusted {label} path is not executable")
     for directory in directories:
         if not stat.S_ISDIR(directory.st_mode):
-            raise RuntimeError("trusted GitHub CLI parent path is not a directory")
+            raise RuntimeError(f"trusted {label} parent path is not a directory")
         if directory.st_uid != 0 or directory.st_mode & unsafe_write_bits:
-            raise RuntimeError("trusted GitHub CLI parent path is writable by non-root users")
+            raise RuntimeError(
+                f"trusted {label} parent path is writable by non-root users"
+            )
     return str(path)
+
+
+def _trusted_github_cli_path() -> str:
+    return _trusted_root_owned_executable_path(TRUSTED_GITHUB_CLI_PATH, "GitHub CLI")
+
+
+def _trusted_git_cli_path() -> str:
+    return _trusted_root_owned_executable_path(TRUSTED_GIT_CLI_PATH, "Git CLI")
 
 
 def _safe_environment() -> dict[str, str]:
@@ -5023,7 +5035,7 @@ def _split_git_invocation(arguments: list[str]) -> tuple[str, list[str], list[tu
 
 def _git_config_entries(repo: Path, pattern: str) -> list[tuple[str, str]]:
     completed = subprocess.run(
-        ["git", "-C", str(repo), "config", "--get-regexp", pattern],
+        [_trusted_git_cli_path(), "-C", str(repo), "config", "--get-regexp", pattern],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,

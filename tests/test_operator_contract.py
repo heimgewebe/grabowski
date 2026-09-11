@@ -5791,6 +5791,38 @@ class GitServerVerifiedReadTransportTests(unittest.TestCase):
                     self.assertFalse(marker.exists())
                     mutation.assert_not_called()
 
+    def test_generic_git_read_uses_trusted_git_binary_not_path_shim(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = self._repo(operator, temporary)
+            shim_dir = Path(temporary) / "shim"
+            shim_dir.mkdir()
+            invoked = Path(temporary) / "path-git-invoked"
+            shim = shim_dir / "git"
+            shim.write_text(
+                "#!/usr/bin/python3\n"
+                "from pathlib import Path\n"
+                f"Path({str(invoked)!r}).write_text('invoked', encoding='utf-8')\n"
+                "raise SystemExit(99)\n",
+                encoding="utf-8",
+            )
+            shim.chmod(0o755)
+            inherited_path = operator.os.environ.get("PATH", "")
+            hostile_path = f"{shim_dir}:{inherited_path}" if inherited_path else str(shim_dir)
+
+            with (
+                patch.dict(operator.os.environ, {"PATH": hostile_path}, clear=False),
+                patch.object(operator, "_require_operator_mutation") as mutation,
+            ):
+                result = operator.grabowski_git(
+                    str(repo), ["rev-parse", "--show-toplevel"]
+                )
+
+            self.assertEqual(result["returncode"], 0)
+            self.assertEqual(result["argv"][0], "/usr/bin/git")
+            self.assertFalse(invoked.exists())
+            mutation.assert_not_called()
+
     def test_generic_git_unsafe_or_mutating_shapes_remain_fail_closed(self) -> None:
         operator = _load_operator_module()
         with tempfile.TemporaryDirectory() as temporary:
