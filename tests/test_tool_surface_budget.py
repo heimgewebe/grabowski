@@ -55,6 +55,12 @@ class ToolSurfaceBudgetTests(unittest.TestCase):
         self.assertEqual(report["accepted_addition_count"], 81)
         self.assertEqual(report["operation_count"], 3)
         self.assertEqual(report["retired_tool_count"], 8)
+        self.assertEqual(report["migration_candidate_count"], 1)
+        candidates = self.contract["migration_candidates"]
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["tool"], "grabowski_agent_execution_route")
+        self.assertEqual(candidates[0]["target_operation_family"], "agent-routing")
+        self.assertIn("deprecated compatibility adapter", candidates[0]["reason"])
 
     def test_runtime_tool_projection_accepts_schema_two_without_assets(self) -> None:
         # Projection validates the whole contract, so the fixture must be a
