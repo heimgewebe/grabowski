@@ -1310,6 +1310,22 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertFalse(execution)
         self.assertIn("future-dated", reasons[0])
 
+    def test_task_class_learning_does_not_fallback_to_route_aggregate(self) -> None:
+        state = self._fresh_state()
+        state["routes"]["codex-sol-high"] = {
+            "runs": 10,
+            "first_pass_successes": 0,
+            "failures": 10,
+        }
+        adjustment, reasons = router._outcome_adjustment(
+            "codex-sol-high",
+            "complex-patch",
+            state,
+            self.catalog["policy"]["adaptive_learning"],
+        )
+        self.assertEqual(adjustment, 0.0)
+        self.assertEqual(reasons, [])
+
     def test_catalog_state_history_and_authentication_validation_fail_closed(
         self,
     ) -> None:
@@ -1321,9 +1337,13 @@ class CodingAgentRouterTests(unittest.TestCase):
         invalid_history = {
             "routes": {
                 "codex-sol-high": {
-                    "runs": 5,
-                    "first_pass_successes": 6,
-                    "failures": 0,
+                    "by_task_class": {
+                        "complex-patch": {
+                            "runs": 5,
+                            "first_pass_successes": 6,
+                            "failures": 0,
+                        }
+                    }
                 }
             }
         }
