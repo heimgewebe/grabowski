@@ -135,9 +135,38 @@ class AgentInstructionsTests(unittest.TestCase):
             "bypass",
         ):
             self.assertIn(phrase, narrowing)
+        transport = rules["transport-roundtrip-before-mutation"].lower()
+        for phrase in (
+            "action=execute",
+            "only challenge_receipt_sha256",
+            "exact target",
+            "action=ack",
+            "unchanged target once",
+            "action=begin",
+            "target_tool_name/target_arguments",
+            "compatibility",
+            "read back ambiguous effects",
+        ):
+            self.assertIn(phrase, transport)
         typed = rules["typed-operation-preference"].lower()
         for phrase in ("typed operations", "terminal", "git", "github"):
             self.assertIn(phrase, typed)
+        github = rules["github-connector-first"].lower()
+        for phrase in (
+            "platform github connector first",
+            "github pr reads",
+            "typed pr mutations",
+            "local gh",
+            "observed connector unavailability",
+            "authorization failure",
+            "gha helper workflows",
+            "observer lanes",
+            "coordination leases",
+            "local gh auth/keyring",
+            "expected_head_sha",
+            "read back state",
+        ):
+            self.assertIn(phrase, github)
         direction = rules["goal-fidelity-before-continuation"].lower()
         for phrase in (
             "original user outcome", "fresh evidence", "serious alternative",
