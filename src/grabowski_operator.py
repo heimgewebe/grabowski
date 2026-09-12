@@ -3155,14 +3155,19 @@ def _run(
         stderr=subprocess.PIPE,
         start_new_session=True,
     )
-    try:
-        stdout_raw, stderr_raw = process.communicate(timeout=timeout_seconds)
-        timed_out = False
-        returncode: int | None = process.returncode
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        stdout_raw, stderr_raw = _terminate_process_group(process)
-        returncode = process.returncode
+    (
+        stdout_raw,
+        stderr_raw,
+        timed_out,
+        stdout_pipe_truncated,
+        stderr_pipe_truncated,
+    ) = base._read_limited_process_pipes(
+        process,
+        timeout_seconds=timeout_seconds,
+        max_output_bytes=max_output_bytes,
+        terminate_process_group=_terminate_process_group,
+    )
+    returncode: int | None = process.returncode
 
     argv_secrets = _argv_secret_values(argv)
     stdout = _redact(
@@ -3173,8 +3178,10 @@ def _run(
         stderr_raw.decode("utf-8", errors="replace"),
         argv_secrets,
     )
-    stdout, stdout_truncated = _limit(stdout, max_output_bytes)
-    stderr, stderr_truncated = _limit(stderr, max_output_bytes)
+    stdout, stdout_late_truncated = _limit(stdout, max_output_bytes)
+    stderr, stderr_late_truncated = _limit(stderr, max_output_bytes)
+    stdout_truncated = stdout_pipe_truncated or stdout_late_truncated
+    stderr_truncated = stderr_pipe_truncated or stderr_late_truncated
 
     return {
         "argv": _redact_argv(argv),

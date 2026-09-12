@@ -135,6 +135,8 @@ def _load_operator_module():
     # bound to it rather than restate it: a stand-in that drifts from the real
     # catalog would let a capability regression pass unnoticed here.
     fake_base.ALL_CAPABILITIES = _real_capability_catalog()
+    import grabowski_mcp as real_base
+    fake_base._read_limited_process_pipes = real_base._read_limited_process_pipes
 
     def effective_capabilities(policy):
         forbidden = set(policy.get("forbidden_capabilities", []))
@@ -5821,6 +5823,48 @@ class GitServerVerifiedReadTransportTests(unittest.TestCase):
             self.assertEqual(result["returncode"], 0)
             self.assertEqual(result["argv"][0], "/usr/bin/git")
             self.assertFalse(invoked.exists())
+            mutation.assert_not_called()
+
+    def test_generic_git_read_bounds_output_while_process_runs(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = self._repo(operator, temporary)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Test"], check=True
+            )
+            operator.subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    "user.email",
+                    "test@example.invalid",
+                ],
+                check=True,
+            )
+            payload = "x" * 8192
+            (repo / "large.txt").write_text(payload, encoding="utf-8")
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "add", "large.txt"], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "commit", "-q", "-m", "large"],
+                check=True,
+            )
+
+            with (
+                patch.object(operator, "MAX_OUTPUT_BYTES", 1024),
+                patch.object(operator, "_require_operator_mutation") as mutation,
+            ):
+                result = operator.grabowski_git(
+                    str(repo), ["show", "HEAD:large.txt"]
+                )
+
+            self.assertEqual(result["returncode"], 0)
+            self.assertFalse(result["timed_out"])
+            self.assertTrue(result["stdout_truncated"])
+            self.assertLessEqual(len(result["stdout"].encode("utf-8")), 1024)
             mutation.assert_not_called()
 
     def test_generic_git_unsafe_or_mutating_shapes_remain_fail_closed(self) -> None:
