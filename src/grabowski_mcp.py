@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 import asyncio
 import ast
 import base64
@@ -3071,9 +3071,18 @@ def _read_limited_process_pipes(
     *,
     timeout_seconds: int,
     max_output_bytes: int,
+    terminate_process_group: Callable[
+        [subprocess.Popen[bytes]], tuple[bytes, bytes]
+    ]
+    | None = None,
 ) -> tuple[bytes, bytes, bool, bool, bool]:
     import selectors
 
+    terminate = (
+        _terminate_process_group
+        if terminate_process_group is None
+        else terminate_process_group
+    )
     started = time.monotonic()
     timed_out = False
     stdout_truncated = False
@@ -3107,7 +3116,7 @@ def _read_limited_process_pipes(
         remaining = timeout_seconds - (time.monotonic() - started)
         if remaining <= 0:
             timed_out = True
-            stdout_tail, stderr_tail = _terminate_process_group(process)
+            stdout_tail, stderr_tail = terminate(process)
             append_limited(process.stdout, stdout_tail)
             append_limited(process.stderr, stderr_tail)
             break
@@ -3125,7 +3134,7 @@ def _read_limited_process_pipes(
             process.wait(timeout=0.1)
         except subprocess.TimeoutExpired:
             timed_out = True
-            _terminate_process_group(process)
+            terminate(process)
     else:
         process.wait(timeout=0)
     stdout = bytes(buffers.get(process.stdout, b""))
