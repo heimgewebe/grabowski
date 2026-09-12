@@ -467,7 +467,7 @@ def _enforce_maulwurf_recovery_mode(
         return
     if _maulwurf_recovery_control_call(tool_name, arguments):
         return
-    if _tool_read_only_hint(tool) is True:
+    if _operator_gate_read_only(tool_name, arguments, tool):
         return
     recovery_enabled = _maulwurf_recovery_enabled()
     if not recovery_enabled:
@@ -636,6 +636,258 @@ def _tool_read_only_hint(tool: Any) -> bool | None:
     return hint if isinstance(hint, bool) else None
 
 
+GIT_SERVER_READ_ONLY_SUBCOMMANDS = frozenset(
+    {"diff", "log", "rev-parse", "show"}
+)
+GIT_SERVER_READ_ONLY_OPTIONS = {
+    "diff": frozenset(
+        {
+            "--cached",
+            "--check",
+            "--exit-code",
+            "--name-only",
+            "--name-status",
+            "--no-patch",
+            "--no-renames",
+            "--numstat",
+            "--patch",
+            "--quiet",
+            "--shortstat",
+            "--staged",
+            "--stat",
+            "--summary",
+            "-p",
+            "-s",
+        }
+    ),
+    "log": frozenset(
+        {
+            "--all",
+            "--first-parent",
+            "--name-only",
+            "--name-status",
+            "--no-decorate",
+            "--no-merges",
+            "--oneline",
+            "--reverse",
+            "--shortstat",
+            "--stat",
+            "--summary",
+            "--topo-order",
+        }
+    ),
+    "rev-parse": frozenset(
+        {
+            "--absolute-git-dir",
+            "--abbrev-ref",
+            "--end-of-options",
+            "--git-dir",
+            "--is-bare-repository",
+            "--is-inside-git-dir",
+            "--is-inside-work-tree",
+            "--is-shallow-repository",
+            "--quiet",
+            "--show-cdup",
+            "--show-object-format",
+            "--show-prefix",
+            "--show-superproject-working-tree",
+            "--show-toplevel",
+            "--symbolic",
+            "--symbolic-full-name",
+            "--verify",
+            "-q",
+        }
+    ),
+    "show": frozenset(
+        {
+            "--name-only",
+            "--name-status",
+            "--no-patch",
+            "--oneline",
+            "--shortstat",
+            "--stat",
+            "--summary",
+            "-s",
+        }
+    ),
+}
+
+
+def _git_server_read_option_allowed(subcommand: str, option: str) -> bool:
+    if option in GIT_SERVER_READ_ONLY_OPTIONS[subcommand]:
+        return True
+    if subcommand == "rev-parse":
+        return (
+            re.fullmatch(r"--short=[1-9][0-9]{0,2}", option) is not None
+            or option in {"--abbrev-ref=loose", "--abbrev-ref=strict"}
+            or option in {"--path-format=absolute", "--path-format=relative"}
+        )
+    if subcommand == "log":
+        return (
+            re.fullmatch(r"-[1-9][0-9]{0,5}", option) is not None
+            or re.fullmatch(r"-n[1-9][0-9]{0,5}", option) is not None
+            or re.fullmatch(r"--max-count=[1-9][0-9]{0,5}", option) is not None
+        )
+    return False
+
+
+def _server_verified_git_read_invocation(
+    arguments: Any, branch_attempt: Any = None
+) -> dict[str, Any] | None:
+    """Positively classify the narrow generic Git cohort that cannot mutate.
+
+    The caller cannot assert this effect class. We accept only exact server-owned
+    subcommands, no command-line configuration or repository rebinding, no
+    branch-attempt authority, and no option that can select an external helper or
+    arbitrary filesystem diff. Execution is hardened separately below.
+    """
+    if branch_attempt is not None or not isinstance(arguments, list) or not arguments:
+        return None
+    if not all(isinstance(item, str) and item and "\x00" not in item for item in arguments):
+        return None
+    try:
+        subcommand, command_arguments, configurations = _split_git_invocation(arguments)
+    except (PermissionError, TypeError, ValueError):
+        return None
+    # Keeping the subcommand first makes this cohort intentionally narrower than
+    # the full grabowski_git grammar. Unknown/global-option forms stay fail-closed.
+    if arguments[0] != subcommand or configurations:
+        return None
+    if subcommand not in GIT_SERVER_READ_ONLY_SUBCOMMANDS:
+        return None
+    # A worktree diff can run repository-configured clean filters while merely
+    # inspecting files.  Only index-vs-tree diff forms are effect-free enough
+    # for this transport exemption; worktree diff and status stay gated.
+    if subcommand == "diff" and not any(
+        item in {"--cached", "--staged"} for item in command_arguments
+    ):
+        return None
+    after_separator = False
+    for item in command_arguments:
+        if after_separator:
+            continue
+        if item == "--":
+            after_separator = True
+            continue
+        if item.startswith("-") and not _git_server_read_option_allowed(
+            subcommand, item
+        ):
+            return None
+    return {
+        "subcommand": subcommand,
+        "command_arguments": list(command_arguments),
+    }
+
+
+def _grabowski_git_server_verified_read(arguments: Any) -> bool:
+    if not isinstance(arguments, dict) or set(arguments) - {
+        "repo",
+        "arguments",
+        "timeout_seconds",
+        "branch_attempt",
+    }:
+        return False
+    repo = arguments.get("repo")
+    if not isinstance(repo, str) or not repo or len(repo) > 4096:
+        return False
+    timeout_seconds = arguments.get("timeout_seconds", DEFAULT_TIMEOUT)
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, int)
+        or timeout_seconds < 1
+        or timeout_seconds > TRUSTED_MAX_TIMEOUT
+    ):
+        return False
+    return (
+        _server_verified_git_read_invocation(
+            arguments.get("arguments"), arguments.get("branch_attempt")
+        )
+        is not None
+    )
+
+
+def _operator_gate_read_only(tool_name: Any, arguments: Any, tool: Any) -> bool:
+    if _tool_read_only_hint(tool) is True:
+        return True
+    return tool_name == "grabowski_git" and _grabowski_git_server_verified_read(arguments)
+
+
+def _git_server_read_environment() -> dict[str, str]:
+    environment = _git_environment()
+    for key in (
+        "GIT_EXTERNAL_DIFF",
+        "GIT_DIFF_OPTS",
+        "GIT_EDITOR",
+        "GIT_SEQUENCE_EDITOR",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+        "GIT_SSH",
+        "GIT_SSH_COMMAND",
+        "GIT_PROXY_COMMAND",
+        "GIT_ALLOW_PROTOCOL",
+        "LESS",
+        "EDITOR",
+        "VISUAL",
+    ):
+        environment.pop(key, None)
+    for key in tuple(environment):
+        if key.startswith("GIT_TRACE"):
+            environment.pop(key, None)
+    environment.update(
+        {
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_NO_LAZY_FETCH": "1",
+            "GIT_PAGER": "cat",
+            "PAGER": "cat",
+        }
+    )
+    return environment
+
+
+def _git_server_read_command(
+    repo: Path, read_shape: dict[str, Any]
+) -> list[str]:
+    subcommand = str(read_shape["subcommand"])
+    command_arguments = list(read_shape["command_arguments"])
+    hardened_arguments = command_arguments
+    if subcommand in {"diff", "log", "show"}:
+        hardening = ["--no-ext-diff", "--no-textconv"]
+        if subcommand in {"log", "show"}:
+            hardening.extend(["--no-show-signature", "--pretty=medium"])
+        hardened_arguments = [*hardening, *command_arguments]
+    return _validate_argv(
+        [
+            _trusted_git_cli_path(),
+            "-c",
+            "core.pager=cat",
+            "-c",
+            "pager.status=false",
+            "-c",
+            "pager.diff=false",
+            "-c",
+            "pager.log=false",
+            "-c",
+            "pager.show=false",
+            "-c",
+            "diff.external=",
+            "-c",
+            "diff.trustExitCode=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "protocol.file.allow=never",
+            "-C",
+            str(repo),
+            subcommand,
+            *hardened_arguments,
+        ],
+        cwd=repo,
+    )
+
+
 def _github_pr_view_transport_read_only(arguments: Any) -> bool:
     if not isinstance(arguments, dict) or set(arguments) - {
         "arguments",
@@ -739,7 +991,7 @@ def _deployment_admission_drain_blocking(
     """Classify whether a call must keep the deployment drain open."""
     if tool_name == deployment_observer.OPERATION:
         return True
-    if _tool_read_only_hint(tool) is True:
+    if _operator_gate_read_only(tool_name, arguments, tool):
         return False
     if _maulwurf_recovery_operation_name(tool_name, arguments) in {
         "maulwurf-recovery-status",
@@ -760,6 +1012,8 @@ def _transport_roundtrip_exempt_call(
         and _maulwurf_recovery_operation_name(tool_name, arguments)
         == "maulwurf-recovery-status"
     ):
+        return True
+    if tool_name == "grabowski_git" and _grabowski_git_server_verified_read(arguments):
         return True
     if tool_name == "grabowski_github":
         return _github_pr_view_transport_read_only(arguments)
@@ -1547,6 +1801,7 @@ def _install_deployment_admission_gate() -> None:
                 return await original(*args, **kwargs)
 
         read_only_hint = _tool_read_only_hint(tool)
+        effective_read_only = _operator_gate_read_only(tool_name, arguments, tool)
         maulwurf_recovery_operation = _maulwurf_recovery_operation_name(
             tool_name, arguments
         )
@@ -1573,7 +1828,7 @@ def _install_deployment_admission_gate() -> None:
                 )
             if (
                 _maulwurf_runtime_active()
-                and read_only_hint is not True
+                and not effective_read_only
                 and maulwurf_recovery_operation is None
             ):
                 maulwurf_guard = (
@@ -1587,10 +1842,10 @@ def _install_deployment_admission_gate() -> None:
             )
             enforcement_configured = (
                 grabowski_effect_interceptor.fence_enforcement_required()
-                if read_only_hint is not True and not _maulwurf_runtime_active()
+                if not effective_read_only and not _maulwurf_runtime_active()
                 else False
             )
-            if read_only_hint is not True:
+            if not effective_read_only:
                 active_profile = base._load_policy().get("active_profile")
                 if (
                     active_profile == "failover-mutate"
@@ -1600,7 +1855,7 @@ def _install_deployment_admission_gate() -> None:
                     raise grabowski_effect_interceptor.OperatorFenceEnforcementDenied(
                         "failover_mutation_requires_fence_config"
                     )
-            fence_required = read_only_hint is not True and enforcement_configured
+            fence_required = not effective_read_only and enforcement_configured
             recovery_transport_exempt = (
                 transport_evidence is None
                 and read_only_hint is False
@@ -1608,7 +1863,7 @@ def _install_deployment_admission_gate() -> None:
             )
             if (
                 transport_evidence is None
-                and read_only_hint is not True
+                and not effective_read_only
                 and fence_required
                 and not _transport_roundtrip_exempt_call(tool_name, arguments)
                 and not recovery_transport_exempt
@@ -2244,6 +2499,7 @@ def _limit(text: str, limit: int) -> tuple[str, bool]:
 MANAGED_NODE_RUNTIME_DIRECTORY_NAME = "grabowski-node-runtime-env"
 MANAGED_UV_CACHE_DIRECTORY_NAME = "grabowski-uv-cache"
 TRUSTED_GITHUB_CLI_PATH = Path("/usr/bin/gh")
+TRUSTED_GIT_CLI_PATH = Path("/usr/bin/git")
 
 
 def _managed_runtime_environment(
@@ -2275,26 +2531,37 @@ def _managed_runtime_environment(
     }
 
 
-def _trusted_github_cli_path() -> str:
-    path = TRUSTED_GITHUB_CLI_PATH
+def _trusted_root_owned_executable_path(path: Path, label: str) -> str:
     try:
         executable = os.lstat(path)
         directories = [os.lstat(path.parent.parent), os.lstat(path.parent)]
     except OSError as exc:
-        raise RuntimeError("trusted GitHub CLI path is unavailable") from exc
+        raise RuntimeError(f"trusted {label} path is unavailable") from exc
     unsafe_write_bits = stat.S_IWGRP | stat.S_IWOTH
     if not stat.S_ISREG(executable.st_mode):
-        raise RuntimeError("trusted GitHub CLI path is not a regular file")
+        raise RuntimeError(f"trusted {label} path is not a regular file")
     if executable.st_uid != 0 or executable.st_mode & unsafe_write_bits:
-        raise RuntimeError("trusted GitHub CLI path is not root-owned and immutable to non-root users")
+        raise RuntimeError(
+            f"trusted {label} path is not root-owned and immutable to non-root users"
+        )
     if not executable.st_mode & stat.S_IXUSR:
-        raise RuntimeError("trusted GitHub CLI path is not executable")
+        raise RuntimeError(f"trusted {label} path is not executable")
     for directory in directories:
         if not stat.S_ISDIR(directory.st_mode):
-            raise RuntimeError("trusted GitHub CLI parent path is not a directory")
+            raise RuntimeError(f"trusted {label} parent path is not a directory")
         if directory.st_uid != 0 or directory.st_mode & unsafe_write_bits:
-            raise RuntimeError("trusted GitHub CLI parent path is writable by non-root users")
+            raise RuntimeError(
+                f"trusted {label} parent path is writable by non-root users"
+            )
     return str(path)
+
+
+def _trusted_github_cli_path() -> str:
+    return _trusted_root_owned_executable_path(TRUSTED_GITHUB_CLI_PATH, "GitHub CLI")
+
+
+def _trusted_git_cli_path() -> str:
+    return _trusted_root_owned_executable_path(TRUSTED_GIT_CLI_PATH, "Git CLI")
 
 
 def _safe_environment() -> dict[str, str]:
@@ -2888,14 +3155,19 @@ def _run(
         stderr=subprocess.PIPE,
         start_new_session=True,
     )
-    try:
-        stdout_raw, stderr_raw = process.communicate(timeout=timeout_seconds)
-        timed_out = False
-        returncode: int | None = process.returncode
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        stdout_raw, stderr_raw = _terminate_process_group(process)
-        returncode = process.returncode
+    (
+        stdout_raw,
+        stderr_raw,
+        timed_out,
+        stdout_pipe_truncated,
+        stderr_pipe_truncated,
+    ) = base._read_limited_process_pipes(
+        process,
+        timeout_seconds=timeout_seconds,
+        max_output_bytes=max_output_bytes,
+        terminate_process_group=_terminate_process_group,
+    )
+    returncode: int | None = process.returncode
 
     argv_secrets = _argv_secret_values(argv)
     stdout = _redact(
@@ -2906,8 +3178,10 @@ def _run(
         stderr_raw.decode("utf-8", errors="replace"),
         argv_secrets,
     )
-    stdout, stdout_truncated = _limit(stdout, max_output_bytes)
-    stderr, stderr_truncated = _limit(stderr, max_output_bytes)
+    stdout, stdout_late_truncated = _limit(stdout, max_output_bytes)
+    stderr, stderr_late_truncated = _limit(stderr, max_output_bytes)
+    stdout_truncated = stdout_pipe_truncated or stdout_late_truncated
+    stderr_truncated = stderr_pipe_truncated or stderr_late_truncated
 
     return {
         "argv": _redact_argv(argv),
@@ -4768,12 +5042,12 @@ def _split_git_invocation(arguments: list[str]) -> tuple[str, list[str], list[tu
 
 def _git_config_entries(repo: Path, pattern: str) -> list[tuple[str, str]]:
     completed = subprocess.run(
-        ["git", "-C", str(repo), "config", "--get-regexp", pattern],
+        [_trusted_git_cli_path(), "-C", str(repo), "config", "--get-regexp", pattern],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
         text=True,
-        env=_git_environment(),
+        env=_git_server_read_environment(),
     )
     if completed.returncode == 1 and not completed.stdout.strip():
         return []
@@ -6185,17 +6459,29 @@ def grabowski_git(
     branch_attempt: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run Git with guarded publication and CAS-bound local branch mutation."""
-    path = Path(repo).expanduser().resolve(strict=True)
-    _require_operator_mutation("git_cli", path=str(path), repo=str(path))
+    read_shape = _server_verified_git_read_invocation(arguments, branch_attempt)
+    if read_shape is not None:
+        path = Path(base._resolve_existing(repo, "read"))
+        _require_operator_capability("git_cli")
+    else:
+        path = Path(repo).expanduser().resolve(strict=True)
+        _require_operator_mutation("git_cli", path=str(path), repo=str(path))
     if not path.is_dir():
         raise ValueError(f"Repository path is not a directory: {path}")
-    if (path == EVIDENCE_ROOT or EVIDENCE_ROOT in path.parents) and not _trusted_owner_mode():
+    if (
+        read_shape is None
+        and (path == EVIDENCE_ROOT or EVIDENCE_ROOT in path.parents)
+        and not _trusted_owner_mode()
+    ):
         raise PermissionError("Git mutation of immutable evidence is blocked.")
     _guard_git(arguments, path)
     subcommand, _command_arguments, _configurations = _split_git_invocation(arguments)
     execution_timeout_seconds = _timeout(timeout_seconds)
 
-    if subcommand == "push":
+    if read_shape is not None:
+        command = _git_server_read_command(path, read_shape)
+        environment = _git_server_read_environment()
+    elif subcommand == "push":
         remote, _source, _destination = _parse_safe_push_arguments(_command_arguments)
         command_prefix = [
             "git",
@@ -6224,7 +6510,8 @@ def grabowski_git(
     else:
         command_prefix = ["git", "-C", str(path)]
         environment = _git_environment()
-    command = _validate_argv([*command_prefix, *arguments], cwd=path)
+    if read_shape is None:
+        command = _validate_argv([*command_prefix, *arguments], cwd=path)
 
     branch_context: dict[str, Any] | None = None
     if subcommand in GIT_LOCAL_BRANCH_MUTATION_SUBCOMMANDS:

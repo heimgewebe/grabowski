@@ -135,6 +135,8 @@ def _load_operator_module():
     # bound to it rather than restate it: a stand-in that drifts from the real
     # catalog would let a capability regression pass unnoticed here.
     fake_base.ALL_CAPABILITIES = _real_capability_catalog()
+    import grabowski_mcp as real_base
+    fake_base._read_limited_process_pipes = real_base._read_limited_process_pipes
 
     def effective_capabilities(policy):
         forbidden = set(policy.get("forbidden_capabilities", []))
@@ -5577,6 +5579,341 @@ class DurableJobFinalizationReceiptTests(unittest.TestCase):
         )
         self.assertTrue(status["systemd_visible"])
         self.assertTrue(status["finalization_receipt"]["valid"])
+
+
+class GitServerVerifiedReadTransportTests(unittest.TestCase):
+    def _repo(self, operator, temporary: str) -> Path:
+        repo = Path(temporary) / "repo"
+        operator.subprocess.run(
+            ["git", "init", "-q", "-b", "main", str(repo)], check=True
+        )
+        return repo
+
+    def _mutating_tool(self):
+        return types.SimpleNamespace(
+            is_async=False,
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+
+    def test_generic_git_positive_read_cohort_bypasses_transport_repeatedly(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = self._repo(operator, temporary)
+            for git_arguments in (
+                ["rev-parse", "--show-toplevel"],
+                ["diff", "--cached", "--check"],
+                ["show", "--stat"],
+                ["log", "-1"],
+            ):
+                arguments = {
+                    "repo": str(repo),
+                    "arguments": git_arguments,
+                    "timeout_seconds": 60,
+                    "branch_attempt": None,
+                }
+                with self.subTest(git_arguments=git_arguments):
+                    self.assertTrue(
+                        operator._grabowski_git_server_verified_read(arguments)
+                    )
+                    with patch.object(
+                        operator.base, "_transport_signed_one_call_evidence", create=True
+                    ) as signed:
+                        self.assertIsNone(
+                            operator._require_transport_roundtrip_for_tool(
+                                tool_name="grabowski_git",
+                                arguments=arguments,
+                                context=None,
+                                tool=self._mutating_tool(),
+                            )
+                        )
+                        self.assertIsNone(
+                            operator._require_transport_roundtrip_for_tool(
+                                tool_name="grabowski_git",
+                                arguments=arguments,
+                                context=None,
+                                tool=self._mutating_tool(),
+                            )
+                        )
+                    signed.assert_not_called()
+
+    def test_generic_git_read_execution_skips_mutation_authority_and_hardens_diff(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = self._repo(operator, temporary)
+            with (
+                patch.object(operator, "_require_operator_capability") as capability,
+                patch.object(operator, "_require_operator_mutation") as mutation,
+            ):
+                first = operator.grabowski_git(
+                    str(repo), ["diff", "--cached", "--check"]
+                )
+                second = operator.grabowski_git(
+                    str(repo), ["diff", "--cached", "--check"]
+                )
+            self.assertEqual(first["returncode"], 0)
+            self.assertEqual(second["returncode"], 0)
+            self.assertIn("--no-ext-diff", first["argv"])
+            self.assertIn("--no-textconv", first["argv"])
+            self.assertGreaterEqual(capability.call_count, 2)
+            mutation.assert_not_called()
+
+    def test_generic_git_read_strips_inherited_trace_sinks(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = self._repo(operator, temporary)
+            trace = Path(temporary) / "git-trace.log"
+            trace2 = Path(temporary) / "git-trace2.json"
+            inherited = {
+                "GIT_TRACE": str(trace),
+                "GIT_TRACE2_EVENT": str(trace2),
+                "GIT_TRACE_FUTURE_SINK": str(Path(temporary) / "future-trace"),
+            }
+            raw_environment = dict(operator.os.environ)
+            raw_environment.update(inherited)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "--show-toplevel"],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=raw_environment,
+            )
+            self.assertTrue(trace.exists())
+            self.assertTrue(trace2.exists())
+            trace.unlink()
+            trace2.unlink()
+
+            with patch.dict(operator.os.environ, inherited, clear=False):
+                environment = operator._git_server_read_environment()
+                result = operator.grabowski_git(
+                    str(repo), ["rev-parse", "--show-toplevel"]
+                )
+            self.assertEqual(result["returncode"], 0)
+            self.assertFalse(any(key.startswith("GIT_TRACE") for key in environment))
+            self.assertFalse(trace.exists())
+            self.assertFalse(trace2.exists())
+
+    def test_generic_git_log_and_show_disable_signature_helpers(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = self._repo(operator, temporary)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Test"], check=True
+            )
+            operator.subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    "user.email",
+                    "test@example.invalid",
+                ],
+                check=True,
+            )
+            (repo / "tracked.txt").write_text("signed\n", encoding="utf-8")
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "add", "tracked.txt"], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True
+            )
+            tree = operator.subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            signed_commit = (
+                f"tree {tree}\n"
+                "author Test <test@example.invalid> 0 +0000\n"
+                "committer Test <test@example.invalid> 0 +0000\n"
+                "gpgsig -----BEGIN PGP SIGNATURE-----\n"
+                " fake\n"
+                " -----END PGP SIGNATURE-----\n"
+                "\n"
+                "signed\n"
+            )
+            signed_head = operator.subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "hash-object",
+                    "-t",
+                    "commit",
+                    "-w",
+                    "--stdin",
+                ],
+                input=signed_commit,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "update-ref", "HEAD", signed_head], check=True
+            )
+            marker = Path(temporary) / "signature-helper-ran"
+            helper = Path(temporary) / "signature-helper"
+            helper.write_text(
+                "#!/usr/bin/env python3\n"
+                "from pathlib import Path\n"
+                f"Path({str(marker)!r}).write_text('invoked', encoding='utf-8')\n"
+                "raise SystemExit(1)\n",
+                encoding="utf-8",
+            )
+            helper.chmod(0o755)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "format.pretty", "%G?"], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "gpg.program", str(helper)],
+                check=True,
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "log", "-1"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertTrue(marker.exists())
+            marker.unlink()
+
+            for git_arguments in (["show", "--stat"], ["log", "-1"]):
+                with self.subTest(git_arguments=git_arguments):
+                    marker.unlink(missing_ok=True)
+                    with patch.object(
+                        operator, "_require_operator_mutation"
+                    ) as mutation:
+                        result = operator.grabowski_git(str(repo), git_arguments)
+                    self.assertEqual(result["returncode"], 0)
+                    self.assertIn("--no-ext-diff", result["argv"])
+                    self.assertIn("--no-textconv", result["argv"])
+                    self.assertIn("--no-show-signature", result["argv"])
+                    self.assertIn("--pretty=medium", result["argv"])
+                    self.assertFalse(marker.exists())
+                    mutation.assert_not_called()
+
+    def test_generic_git_read_uses_trusted_git_binary_not_path_shim(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = self._repo(operator, temporary)
+            shim_dir = Path(temporary) / "shim"
+            shim_dir.mkdir()
+            invoked = Path(temporary) / "path-git-invoked"
+            shim = shim_dir / "git"
+            shim.write_text(
+                "#!/usr/bin/python3\n"
+                "from pathlib import Path\n"
+                f"Path({str(invoked)!r}).write_text('invoked', encoding='utf-8')\n"
+                "raise SystemExit(99)\n",
+                encoding="utf-8",
+            )
+            shim.chmod(0o755)
+            inherited_path = operator.os.environ.get("PATH", "")
+            hostile_path = f"{shim_dir}:{inherited_path}" if inherited_path else str(shim_dir)
+
+            with (
+                patch.dict(operator.os.environ, {"PATH": hostile_path}, clear=False),
+                patch.object(operator, "_require_operator_mutation") as mutation,
+            ):
+                result = operator.grabowski_git(
+                    str(repo), ["rev-parse", "--show-toplevel"]
+                )
+
+            self.assertEqual(result["returncode"], 0)
+            self.assertEqual(result["argv"][0], "/usr/bin/git")
+            self.assertFalse(invoked.exists())
+            mutation.assert_not_called()
+
+    def test_generic_git_read_bounds_output_while_process_runs(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = self._repo(operator, temporary)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Test"], check=True
+            )
+            operator.subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    "user.email",
+                    "test@example.invalid",
+                ],
+                check=True,
+            )
+            payload = "x" * 8192
+            (repo / "large.txt").write_text(payload, encoding="utf-8")
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "add", "large.txt"], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "commit", "-q", "-m", "large"],
+                check=True,
+            )
+
+            with (
+                patch.object(operator, "MAX_OUTPUT_BYTES", 1024),
+                patch.object(operator, "_require_operator_mutation") as mutation,
+            ):
+                result = operator.grabowski_git(
+                    str(repo), ["show", "HEAD:large.txt"]
+                )
+
+            self.assertEqual(result["returncode"], 0)
+            self.assertFalse(result["timed_out"])
+            self.assertTrue(result["stdout_truncated"])
+            self.assertLessEqual(len(result["stdout"].encode("utf-8")), 1024)
+            mutation.assert_not_called()
+
+    def test_generic_git_unsafe_or_mutating_shapes_remain_fail_closed(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = self._repo(operator, temporary)
+            cases = (
+                ["commit", "-m", "x"],
+                ["fetch", "origin"],
+                ["checkout", "main"],
+                ["update-ref", "refs/heads/x", "HEAD"],
+                ["diff", "--no-index", "/etc/hosts", "/etc/passwd"],
+                ["diff", "--ext-diff"],
+                ["diff", "--ext"],
+                ["diff", "--no-ind", "/etc/hosts", "/etc/passwd"],
+                ["show", "--show-signature"],
+                ["show", "--show-sig"],
+                ["log", "--output=/tmp/log.txt"],
+                ["status", "--short"],
+                ["status", "--porc"],
+                ["diff", "--check"],
+                ["rev-parse", "--parseopt"],
+                ["-c", "diff.external=/tmp/helper", "diff", "--check"],
+            )
+            for git_arguments in cases:
+                arguments = {
+                    "repo": str(repo),
+                    "arguments": git_arguments,
+                    "timeout_seconds": 60,
+                    "branch_attempt": None,
+                }
+                with self.subTest(git_arguments=git_arguments):
+                    self.assertFalse(
+                        operator._grabowski_git_server_verified_read(arguments)
+                    )
+                    self.assertFalse(
+                        operator._operator_gate_read_only(
+                            "grabowski_git", arguments, self._mutating_tool()
+                        )
+                    )
+
+    def test_branch_attempt_never_enters_generic_git_read_cohort(self) -> None:
+        operator = _load_operator_module()
+        arguments = {
+            "repo": "/tmp/repo",
+            "arguments": ["status", "--short"],
+            "branch_attempt": {"schema_version": 1},
+        }
+        self.assertFalse(operator._grabowski_git_server_verified_read(arguments))
 
 
 if __name__ == "__main__":
