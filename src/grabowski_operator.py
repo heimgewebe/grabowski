@@ -2331,7 +2331,19 @@ _GITHUB_PR_VIEW_ISOLATED_CONFIG_PATH = Path(
     "/nonexistent-grabowski-github-pr-view-config-v1"
 )
 _GITHUB_PR_VIEW_AUTH_TIMEOUT_SECONDS = 5
+_GITHUB_PR_VIEW_KEYRING_PROBE_TIMEOUT_SECONDS = 1
+_GITHUB_PR_VIEW_BUSCTL_PATH = "/usr/bin/busctl"
+_GITHUB_PR_VIEW_DEFAULT_KEYRING_OBJECT = "/org/freedesktop/secrets/aliases/default"
 _GITHUB_PR_VIEW_MAX_TOKEN_BYTES = 4096
+_GITHUB_PR_ISOLATED_AUTH_COMMANDS = frozenset({"list", "create", "edit", "ready", "view"})
+
+
+def _github_pr_uses_isolated_auth(arguments: list[str]) -> bool:
+    return (
+        len(arguments) >= 2
+        and arguments[0] == "pr"
+        and arguments[1] in _GITHUB_PR_ISOLATED_AUTH_COMMANDS
+    )
 
 
 def _github_pr_view_host(source: dict[str, str]) -> str:
@@ -2403,6 +2415,45 @@ def _github_pr_view_auth_lookup_environment(
     return environment
 
 
+def _github_pr_view_default_keyring_locked(
+    source: dict[str, str], host: str
+) -> bool | None:
+    if (
+        not source.get("DBUS_SESSION_BUS_ADDRESS")
+        and not source.get("XDG_RUNTIME_DIR")
+    ):
+        return None
+    try:
+        probe = subprocess.run(
+            [
+                _GITHUB_PR_VIEW_BUSCTL_PATH,
+                "--user",
+                "get-property",
+                "org.freedesktop.secrets",
+                _GITHUB_PR_VIEW_DEFAULT_KEYRING_OBJECT,
+                "org.freedesktop.Secret.Collection",
+                "Locked",
+            ],
+            cwd=HOME,
+            env=_github_pr_view_auth_lookup_environment(source, host),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=_GITHUB_PR_VIEW_KEYRING_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if probe.returncode != 0:
+        return None
+    value = probe.stdout.strip()
+    if value == b"b true":
+        return True
+    if value == b"b false":
+        return False
+    return None
+
+
 def _github_pr_view_auth_token(
     executable: str, source: dict[str, str], host: str
 ) -> str:
@@ -2413,6 +2464,12 @@ def _github_pr_view_auth_token(
     )
     if direct is not None:
         return direct
+    if _github_pr_view_default_keyring_locked(source, host) is True:
+        raise RuntimeError(
+            "trusted GitHub credential lookup blocked: default Secret Service keyring "
+            "is locked; unlock it in an interactive user session or configure a "
+            "non-interactive GitHub credential for trusted-owner mode"
+        )
     process = subprocess.Popen(
         [executable, "auth", "token", "--hostname", host],
         cwd=HOME,
@@ -6488,7 +6545,8 @@ def grabowski_github(
     command = _validate_argv(
         [trusted_github_cli, *arguments], cwd=working_directory
     )
-    if transport_exempt:
+    isolated_auth = transport_exempt or _github_pr_uses_isolated_auth(arguments)
+    if isolated_auth:
         source_environment = _safe_environment()
         github_host = _github_pr_view_host(source_environment)
         github_token = _github_pr_view_auth_token(
