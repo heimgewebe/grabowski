@@ -2339,6 +2339,7 @@ _GITHUB_PR_ISOLATED_AUTH_COMMANDS = frozenset({"list", "create", "edit", "ready"
 _GITHUB_PR_ISOLATED_AUTH_ALIASES = {"ls": "list", "new": "create"}
 _GITHUB_PR_POSITIONAL_TARGET_COMMANDS = frozenset({"edit", "ready", "view"})
 _GITHUB_PR_REPOSITORY_FLAGS = frozenset({"-R", "--repo"})
+_GITHUB_PR_BOOLEAN_VALUES = frozenset({"true", "false", "1", "0", "t", "f"})
 _GITHUB_PR_VALUE_FLAGS: dict[str, frozenset[str]] = {
     "list": frozenset({
         "--app", "-a", "--assignee", "-A", "--author", "-B", "--base",
@@ -2361,15 +2362,15 @@ _GITHUB_PR_VALUE_FLAGS: dict[str, frozenset[str]] = {
     "view": frozenset({"-q", "--jq", "--json", "-t", "--template"}),
 }
 _GITHUB_PR_SWITCH_FLAGS: dict[str, frozenset[str]] = {
-    "list": frozenset({"-d", "--draft", "-w", "--web", "--help"}),
+    "list": frozenset({"-d", "--draft", "-w", "--web", "-h", "--help"}),
     "create": frozenset({
         "-d", "--draft", "--dry-run", "-e", "--editor", "-f", "--fill",
         "--fill-first", "--fill-verbose", "--no-maintainer-edit", "-w", "--web",
-        "--help",
+        "-h", "--help",
     }),
-    "edit": frozenset({"--remove-milestone", "--help"}),
-    "ready": frozenset({"--undo", "--help"}),
-    "view": frozenset({"-c", "--comments", "-w", "--web", "--help"}),
+    "edit": frozenset({"--remove-milestone", "-h", "--help"}),
+    "ready": frozenset({"--undo", "-h", "--help"}),
+    "view": frozenset({"-c", "--comments", "-w", "--web", "-h", "--help"}),
 }
 
 
@@ -2409,14 +2410,17 @@ def _github_pr_positional_url_host(value: str) -> str:
     return _github_pr_view_host({"GH_HOST": host})
 
 
-def _github_pr_target_selectors(arguments: list[str]) -> tuple[str | None, str | None]:
+def _github_pr_target_selectors(
+    arguments: list[str],
+) -> tuple[str | None, str | None, bool]:
     subcommand = _github_pr_isolated_auth_subcommand(arguments)
     if subcommand is None:
-        return None, None
+        return None, None, False
     value_flags = _GITHUB_PR_VALUE_FLAGS[subcommand]
     switch_flags = _GITHUB_PR_SWITCH_FLAGS[subcommand]
     repository: str | None = None
     positional_host: str | None = None
+    help_requested = False
     options_done = False
     index = 2
     while index < len(arguments):
@@ -2447,7 +2451,11 @@ def _github_pr_target_selectors(arguments: list[str]) -> tuple[str | None, str |
                         raise RuntimeError("trusted GitHub PR option value is missing")
                     index += 2
                 continue
-            if flag in switch_flags and not separator:
+            if flag in switch_flags:
+                if separator and attached.casefold() not in _GITHUB_PR_BOOLEAN_VALUES:
+                    raise RuntimeError("trusted GitHub PR boolean option value is invalid")
+                if flag == "--help":
+                    help_requested = not separator or attached.casefold() in {"true", "1", "t"}
                 index += 1
                 continue
             raise RuntimeError("trusted GitHub PR option is unsupported for host resolution")
@@ -2469,10 +2477,22 @@ def _github_pr_target_selectors(arguments: list[str]) -> tuple[str | None, str |
                 else:
                     index += 1
                 continue
+            short_switch, separator, attached = item.partition("=")
+            if separator and short_switch in switch_flags and len(short_switch) == 2:
+                if attached.casefold() not in _GITHUB_PR_BOOLEAN_VALUES:
+                    raise RuntimeError("trusted GitHub PR boolean option value is invalid")
+                if short_switch == "-h":
+                    help_requested = attached.casefold() in {"true", "1", "t"}
+                index += 1
+                continue
             if len(item) > 2 and all(f"-{character}" in switch_flags for character in item[1:]):
+                if "h" in item[1:]:
+                    help_requested = True
                 index += 1
                 continue
             if item in switch_flags:
+                if item == "-h":
+                    help_requested = True
                 index += 1
                 continue
             raise RuntimeError("trusted GitHub PR option is unsupported for host resolution")
@@ -2482,11 +2502,11 @@ def _github_pr_target_selectors(arguments: list[str]) -> tuple[str | None, str |
                 raise RuntimeError("trusted GitHub PR URL host is ambiguous")
             positional_host = host
         index += 1
-    return repository, positional_host
+    return repository, positional_host, help_requested
 
 
 def _github_pr_repository_selector(arguments: list[str]) -> str | None:
-    repository, _positional_host = _github_pr_target_selectors(arguments)
+    repository, _positional_host, _help_requested = _github_pr_target_selectors(arguments)
     return repository
 
 
@@ -2657,7 +2677,7 @@ def _github_pr_target_host(
     *,
     working_directory: Path | None = None,
 ) -> str:
-    repository, positional_host = _github_pr_target_selectors(arguments)
+    repository, positional_host, _help_requested = _github_pr_target_selectors(arguments)
     if positional_host is not None:
         return positional_host
     if repository is None:
@@ -2940,6 +2960,24 @@ def _github_pr_view_environment(
             raise RuntimeError("trusted GitHub repository selector is invalid")
         environment["GH_REPO"] = selector
     return environment
+
+
+def _github_pr_help_environment() -> dict[str, str]:
+    isolated = _github_pr_view_isolated_config_path()
+    return {
+        "HOME": isolated,
+        "XDG_CONFIG_HOME": isolated,
+        "GH_CONFIG_DIR": isolated,
+        "PATH": str(TRUSTED_GITHUB_CLI_PATH.parent),
+        "GH_PAGER": "cat",
+        "PAGER": "cat",
+        "GIT_PAGER": "cat",
+        "GH_PROMPT_DISABLED": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "NO_COLOR": "1",
+    }
+
+
 
 def _resolve_cwd(cwd: str | None) -> Path:
     path = HOME if cwd is None else Path(cwd).expanduser()
@@ -6935,22 +6973,25 @@ def grabowski_github(
     )
     isolated_auth = transport_exempt or _github_pr_uses_isolated_auth(arguments)
     if isolated_auth:
-        source_environment = _safe_environment()
-        github_host = _github_pr_target_host(
-            arguments, source_environment, working_directory=working_directory
-        )
-        github_token = _github_pr_view_auth_token(
-            trusted_github_cli, source_environment, github_host
-        )
-        environment_repository = None
-        explicit_repository, positional_host = _github_pr_target_selectors(arguments)
-        if explicit_repository is None and positional_host is None:
-            gh_repo = source_environment.get("GH_REPO", "").strip()
-            if gh_repo:
-                environment_repository = gh_repo
-        environment = _github_pr_view_environment(
-            host=github_host, token=github_token, repository=environment_repository
-        )
+        explicit_repository, positional_host, help_requested = _github_pr_target_selectors(arguments)
+        if help_requested:
+            environment = _github_pr_help_environment()
+        else:
+            source_environment = _safe_environment()
+            github_host = _github_pr_target_host(
+                arguments, source_environment, working_directory=working_directory
+            )
+            github_token = _github_pr_view_auth_token(
+                trusted_github_cli, source_environment, github_host
+            )
+            environment_repository = None
+            if explicit_repository is None and positional_host is None:
+                gh_repo = source_environment.get("GH_REPO", "").strip()
+                if gh_repo:
+                    environment_repository = gh_repo
+            environment = _github_pr_view_environment(
+                host=github_host, token=github_token, repository=environment_repository
+            )
     else:
         environment = None
     return _run(

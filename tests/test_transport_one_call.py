@@ -1340,6 +1340,84 @@ class OperatorSignedTransportTests(unittest.TestCase):
             self.assertEqual(environment["GH_TOKEN"], "fixture-token")
             self.assertEqual(environment["HOME"], str(operator._GITHUB_PR_VIEW_ISOLATED_CONFIG_PATH))
 
+    def test_isolated_github_boolean_switch_assignments_are_supported(self) -> None:
+        source = {"GH_HOST": "github.com"}
+        for arguments in (
+            ["pr", "list", "--web=false"],
+            ["pr", "create", "--draft=false"],
+            ["pr", "view", "--web=true"],
+            ["pr", "list", "-w=false"],
+        ):
+            with self.subTest(arguments=arguments):
+                self.assertEqual(operator._github_pr_target_host(arguments, source), "github.com")
+        with self.assertRaisesRegex(RuntimeError, "boolean option value is invalid"):
+            operator._github_pr_target_host(
+                ["pr", "list", "--web=maybe"], source
+            )
+
+    def test_github_wrapper_help_bypasses_credential_lookup(self) -> None:
+        for help_flag in ("--help", "-h", "--help=true"):
+            with (
+                self.subTest(help_flag=help_flag),
+                mock.patch.object(operator, "_trusted_owner_mode", return_value=True),
+                mock.patch.object(operator, "_require_operator_mutation"),
+                mock.patch.object(
+                    operator, "_trusted_github_cli_path", return_value="/usr/bin/gh"
+                ),
+                mock.patch.object(operator, "_safe_environment") as safe_environment,
+                mock.patch.object(operator, "_github_pr_view_auth_token") as auth_token,
+                mock.patch.object(operator, "_run", return_value={"returncode": 0}) as run,
+            ):
+                operator.grabowski_github(
+                    ["pr", "create", help_flag], cwd=str(ROOT)
+                )
+            safe_environment.assert_not_called()
+            auth_token.assert_not_called()
+            environment = run.call_args.kwargs["environment"]
+            self.assertEqual(
+                environment["HOME"], str(operator._GITHUB_PR_VIEW_ISOLATED_CONFIG_PATH)
+            )
+            self.assertNotIn("GH_HOST", environment)
+            self.assertNotIn("GH_REPO", environment)
+            self.assertNotIn("GH_TOKEN", environment)
+            self.assertNotIn("GH_ENTERPRISE_TOKEN", environment)
+
+    def test_github_wrapper_false_help_assignment_still_requires_auth(self) -> None:
+        with (
+            mock.patch.object(operator, "_trusted_owner_mode", return_value=True),
+            mock.patch.object(operator, "_require_operator_mutation"),
+            mock.patch.object(
+                operator, "_trusted_github_cli_path", return_value="/usr/bin/gh"
+            ),
+            mock.patch.object(
+                operator, "_github_pr_view_auth_token", return_value="fixture-token"
+            ) as auth_token,
+            mock.patch.object(operator, "_run", return_value={"returncode": 0}) as run,
+        ):
+            operator.grabowski_github(
+                ["pr", "create", "--help=false"], cwd=str(ROOT)
+            )
+        auth_token.assert_called_once()
+        self.assertEqual(run.call_args.kwargs["environment"]["GH_TOKEN"], "fixture-token")
+
+    def test_github_wrapper_help_like_option_value_does_not_bypass_auth(self) -> None:
+        with (
+            mock.patch.object(operator, "_trusted_owner_mode", return_value=True),
+            mock.patch.object(operator, "_require_operator_mutation"),
+            mock.patch.object(
+                operator, "_trusted_github_cli_path", return_value="/usr/bin/gh"
+            ),
+            mock.patch.object(
+                operator, "_github_pr_view_auth_token", return_value="fixture-token"
+            ) as auth_token,
+            mock.patch.object(operator, "_run", return_value={"returncode": 0}) as run,
+        ):
+            operator.grabowski_github(
+                ["pr", "create", "--body", "--help"], cwd=str(ROOT)
+            )
+        auth_token.assert_called_once()
+        self.assertEqual(run.call_args.kwargs["environment"]["GH_TOKEN"], "fixture-token")
+
     def test_github_wrapper_positional_pr_url_drops_ambient_repo(self) -> None:
         url = "https://ghe.example.internal/owner/repo/pull/1031"
         source_environment = {
