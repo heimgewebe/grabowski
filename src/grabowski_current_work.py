@@ -1966,7 +1966,6 @@ def derive_group_convergence_recommendation(group: dict[str, Any]) -> dict[str, 
     action_reasons = set(group.get("action_reasons", []))
     projection_state = group.get("projection_state", "unknown")
     checkout_refs = group.get("checkout_refs", [])
-    has_cleanup_candidate = any(c.get("cleanup_candidate") for c in checkout_refs)
     external_terminal_checkout_refs = [
         c
         for c in checkout_refs
@@ -2007,18 +2006,32 @@ def derive_group_convergence_recommendation(group: dict[str, Any]) -> dict[str, 
         or projection_state == "terminal_archived"
     )
 
-    # 1. closed-not-cleaned: task/obligation explicitly terminal or closed, but checkout/leases/tmux retained
-    if has_terminal_evidence and (
-        has_cleanup_candidate
-        or any(reason.startswith("cleanup-candidate") for reason in action_reasons)
-        or has_terminal_checkout_binding
-        or (projection_state == "terminal_archived" and has_live_surfaces)
-    ):
+    # A retained terminal surface is immediately finishable only when checkout
+    # inventory explicitly classified it as cleanup-ready. Terminal lifecycle
+    # state alone is descriptive evidence, not cleanup authority; in particular,
+    # blocked cleanup candidates must never win finish pressure by prefix match.
+    cleanup_ready = "cleanup-candidate-ready" in action_reasons
+    if has_terminal_evidence and cleanup_ready:
         return {
             "convergence_stage": "closed-not-cleaned",
             "next_convergence_action": "reconcile terminal worktree hygiene and safe lifecycle reconciliation",
             "finishable_chain": True,
             "priority": 1,
+        }
+
+    retained_terminal_surface = has_terminal_evidence and (
+        has_terminal_checkout_binding
+        or "closed-not-cleaned" in action_reasons
+        or (projection_state == "terminal_archived" and has_live_surfaces)
+    )
+    if retained_terminal_surface:
+        return {
+            "convergence_stage": "closed-not-cleaned",
+            "next_convergence_action": (
+                "verify authoritative cleanup eligibility before lifecycle action"
+            ),
+            "finishable_chain": False,
+            "priority": 5,
         }
 
     # Expired managed-active bindings remain actionable lifecycle attention even
@@ -2424,6 +2437,10 @@ def build_current_work_projection(
             "finishable_chain_prioritized": top_rec.get("finishable_chain", False),
             "primary_stage": top_rec["convergence_stage"],
             "closed_not_cleaned_count": sum(1 for c in chain_candidates if c["convergence_stage"] == "closed-not-cleaned"),
+            "cleanup_ready_closed_not_cleaned_count": sum(
+                1 for c in chain_candidates
+                if c["convergence_stage"] == "closed-not-cleaned" and c["finishable_chain"]
+            ),
             "blocking_count": sum(1 for c in chain_candidates if c["convergence_stage"] == "blocking"),
             "resumable_count": sum(1 for c in chain_candidates if c["convergence_stage"] == "resumable"),
             "active_count": sum(1 for c in chain_candidates if c["convergence_stage"] == "active"),
