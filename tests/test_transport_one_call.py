@@ -1247,6 +1247,99 @@ class OperatorSignedTransportTests(unittest.TestCase):
             "github.com",
         )
 
+    def test_isolated_github_aliases_use_canonical_auth_policy(self) -> None:
+        source = {"GH_HOST": "github.com"}
+        for alias, canonical in (("ls", "list"), ("new", "create")):
+            with self.subTest(alias=alias):
+                alias_arguments = [
+                    "pr",
+                    alias,
+                    "--repo",
+                    "ghe.example.internal/owner/repo",
+                ]
+                canonical_arguments = [
+                    "pr",
+                    canonical,
+                    "--repo",
+                    "ghe.example.internal/owner/repo",
+                ]
+                self.assertTrue(operator._github_pr_uses_isolated_auth(alias_arguments))
+                self.assertEqual(
+                    operator._github_pr_repository_selector(alias_arguments),
+                    operator._github_pr_repository_selector(canonical_arguments),
+                )
+                self.assertEqual(
+                    operator._github_pr_target_host(alias_arguments, source),
+                    "ghe.example.internal",
+                )
+
+    def test_isolated_github_positional_pr_url_selects_url_host_first(self) -> None:
+        source = {"GH_HOST": "github.com"}
+        url = "https://ghe.example.internal/owner/repo/pull/1031"
+        for subcommand in ("view", "edit", "ready"):
+            with self.subTest(subcommand=subcommand):
+                with mock.patch.object(operator, "_github_pr_checkout_host") as checkout_host:
+                    host = operator._github_pr_target_host(
+                        ["pr", subcommand, url], source, working_directory=ROOT
+                    )
+                self.assertEqual(host, "ghe.example.internal")
+                checkout_host.assert_not_called()
+
+        self.assertEqual(
+            operator._github_pr_target_host(
+                [
+                    "pr",
+                    "view",
+                    url,
+                    "--repo",
+                    "github.com/other/repo",
+                ],
+                source,
+            ),
+            "ghe.example.internal",
+        )
+
+    def test_isolated_github_positional_pr_url_rejects_unsafe_shapes(self) -> None:
+        unsafe_urls = (
+            "http://ghe.example.internal/owner/repo/pull/1031",
+            "https://user@ghe.example.internal/owner/repo/pull/1031",
+            "https://ghe.example.internal/owner/repo/pull/1031?diff=split",
+            "https://ghe.example.internal/owner/repo/issues/1031",
+        )
+        for url in unsafe_urls:
+            with self.subTest(url=url):
+                with self.assertRaisesRegex(RuntimeError, "PR URL is invalid"):
+                    operator._github_pr_target_host(
+                        ["pr", "view", url], {"GH_HOST": "github.com"}
+                    )
+
+    def test_github_wrapper_alias_uses_isolated_environment(self) -> None:
+        with (
+            mock.patch.object(operator, "_trusted_owner_mode", return_value=True),
+            mock.patch.object(operator, "_require_operator_mutation"),
+            mock.patch.object(
+                operator, "_trusted_github_cli_path", return_value="/usr/bin/gh"
+            ),
+            mock.patch.object(
+                operator, "_github_pr_view_auth_token", return_value="fixture-token"
+            ) as auth_token,
+            mock.patch.object(operator, "_run", return_value={"returncode": 0}) as run,
+        ):
+            operator.grabowski_github(
+                ["pr", "ls", "--repo", "heimgewebe/grabowski"], cwd=str(ROOT)
+            )
+            operator.grabowski_github(
+                ["pr", "new", "--repo", "heimgewebe/grabowski", "--title", "x"],
+                cwd=str(ROOT),
+            )
+        self.assertEqual(auth_token.call_count, 2)
+        self.assertEqual(run.call_count, 2)
+        for call in run.call_args_list:
+            environment = call.kwargs["environment"]
+            self.assertEqual(environment["GH_HOST"], "github.com")
+            self.assertEqual(environment["GH_TOKEN"], "fixture-token")
+            self.assertEqual(environment["HOME"], str(operator._GITHUB_PR_VIEW_ISOLATED_CONFIG_PATH))
+
     def test_isolated_github_repo_uses_last_repeated_selector(self) -> None:
         source = {"GH_HOST": "github.com"}
         self.assertEqual(

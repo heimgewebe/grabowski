@@ -2336,6 +2336,8 @@ _GITHUB_PR_VIEW_BUSCTL_PATH = "/usr/bin/busctl"
 _GITHUB_PR_VIEW_DEFAULT_KEYRING_OBJECT = "/org/freedesktop/secrets/aliases/default"
 _GITHUB_PR_VIEW_MAX_TOKEN_BYTES = 4096
 _GITHUB_PR_ISOLATED_AUTH_COMMANDS = frozenset({"list", "create", "edit", "ready", "view"})
+_GITHUB_PR_ISOLATED_AUTH_ALIASES = {"ls": "list", "new": "create"}
+_GITHUB_PR_POSITIONAL_TARGET_COMMANDS = frozenset({"edit", "ready", "view"})
 _GITHUB_PR_REPOSITORY_FLAGS = frozenset({"-R", "--repo"})
 _GITHUB_PR_VALUE_FLAGS: dict[str, frozenset[str]] = {
     "list": frozenset({
@@ -2371,33 +2373,65 @@ _GITHUB_PR_SWITCH_FLAGS: dict[str, frozenset[str]] = {
 }
 
 
-def _github_pr_uses_isolated_auth(arguments: list[str]) -> bool:
-    return (
-        len(arguments) >= 2
-        and arguments[0] == "pr"
-        and arguments[1] in _GITHUB_PR_ISOLATED_AUTH_COMMANDS
-    )
-
-
-def _github_pr_repository_selector(arguments: list[str]) -> str | None:
-    if not _github_pr_uses_isolated_auth(arguments):
+def _github_pr_isolated_auth_subcommand(arguments: list[str]) -> str | None:
+    if len(arguments) < 2 or arguments[0] != "pr":
         return None
-    subcommand = arguments[1]
+    subcommand = _GITHUB_PR_ISOLATED_AUTH_ALIASES.get(arguments[1], arguments[1])
+    return subcommand if subcommand in _GITHUB_PR_ISOLATED_AUTH_COMMANDS else None
+
+
+def _github_pr_uses_isolated_auth(arguments: list[str]) -> bool:
+    return _github_pr_isolated_auth_subcommand(arguments) is not None
+
+
+def _github_pr_positional_url_host(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise RuntimeError("trusted GitHub PR URL is invalid") from exc
+    if (
+        parsed.scheme.casefold() != "https"
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or re.fullmatch(
+            r"/[^/?#\s]+/[^/?#\s]+/pull/[1-9][0-9]*/?", parsed.path
+        )
+        is None
+    ):
+        raise RuntimeError("trusted GitHub PR URL is invalid")
+    host = parsed.hostname
+    if port not in {None, 443}:
+        host = f"{host}:{port}"
+    return _github_pr_view_host({"GH_HOST": host})
+
+
+def _github_pr_target_selectors(arguments: list[str]) -> tuple[str | None, str | None]:
+    subcommand = _github_pr_isolated_auth_subcommand(arguments)
+    if subcommand is None:
+        return None, None
     value_flags = _GITHUB_PR_VALUE_FLAGS[subcommand]
     switch_flags = _GITHUB_PR_SWITCH_FLAGS[subcommand]
     repository: str | None = None
+    positional_host: str | None = None
+    options_done = False
     index = 2
     while index < len(arguments):
         item = arguments[index]
-        if item == "--":
-            break
-        if item in _GITHUB_PR_REPOSITORY_FLAGS:
+        if not options_done and item == "--":
+            options_done = True
+            index += 1
+            continue
+        if not options_done and item in _GITHUB_PR_REPOSITORY_FLAGS:
             if index + 1 >= len(arguments):
                 raise RuntimeError("trusted GitHub repository selector is invalid")
             repository = arguments[index + 1]
             index += 2
             continue
-        if item.startswith("--"):
+        if not options_done and item.startswith("--"):
             flag, separator, attached = item.partition("=")
             if flag == "--repo":
                 if not separator:
@@ -2417,7 +2451,7 @@ def _github_pr_repository_selector(arguments: list[str]) -> str | None:
                 index += 1
                 continue
             raise RuntimeError("trusted GitHub PR option is unsupported for host resolution")
-        if item.startswith("-") and item != "-":
+        if not options_done and item.startswith("-") and item != "-":
             if item.startswith("-R"):
                 repository = item[2:]
                 if repository.startswith("="):
@@ -2442,7 +2476,17 @@ def _github_pr_repository_selector(arguments: list[str]) -> str | None:
                 index += 1
                 continue
             raise RuntimeError("trusted GitHub PR option is unsupported for host resolution")
+        if subcommand in _GITHUB_PR_POSITIONAL_TARGET_COMMANDS and "://" in item:
+            host = _github_pr_positional_url_host(item)
+            if positional_host is not None and positional_host != host:
+                raise RuntimeError("trusted GitHub PR URL host is ambiguous")
+            positional_host = host
         index += 1
+    return repository, positional_host
+
+
+def _github_pr_repository_selector(arguments: list[str]) -> str | None:
+    repository, _positional_host = _github_pr_target_selectors(arguments)
     return repository
 
 
@@ -2613,7 +2657,9 @@ def _github_pr_target_host(
     *,
     working_directory: Path | None = None,
 ) -> str:
-    repository = _github_pr_repository_selector(arguments)
+    repository, positional_host = _github_pr_target_selectors(arguments)
+    if positional_host is not None:
+        return positional_host
     if repository is None:
         gh_repo = source.get("GH_REPO", "").strip()
         if gh_repo:
