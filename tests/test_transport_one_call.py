@@ -1246,6 +1246,32 @@ class OperatorSignedTransportTests(unittest.TestCase):
             "github.com",
         )
 
+    def test_isolated_github_checkout_selects_enterprise_remote_host(self) -> None:
+        completed = SimpleNamespace(
+            returncode=0,
+            stdout="git@ghe.example.internal:owner/repo.git\n",
+            stderr="",
+        )
+        with mock.patch.object(
+            operator.subprocess, "run", return_value=completed
+        ) as run:
+            host = operator._github_pr_target_host(
+                ["pr", "list"], {}, working_directory=ROOT
+            )
+        self.assertEqual(host, "ghe.example.internal")
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "/usr/bin/git",
+                "-C",
+                str(ROOT),
+                "remote",
+                "get-url",
+                "--all",
+                "origin",
+            ],
+        )
+
     def test_exempt_github_default_keyring_probe_reports_locked(self) -> None:
         probe = SimpleNamespace(returncode=0, stdout=b"b true\n")
         source = {
@@ -1532,6 +1558,39 @@ class OperatorSignedTransportTests(unittest.TestCase):
             "DBUS_SESSION_BUS_ADDRESS",
         ):
             self.assertNotIn(unsafe_key, environment)
+
+    def test_nonexempt_enterprise_checkout_uses_remote_host_for_isolated_auth(self) -> None:
+        source: dict[str, str] = {}
+        with (
+            mock.patch.object(operator, "_trusted_owner_mode", return_value=True),
+            mock.patch.object(operator, "_safe_environment", return_value=source),
+            mock.patch.object(operator, "_require_operator_mutation"),
+            mock.patch.object(
+                operator, "_trusted_github_cli_path", return_value="/usr/bin/gh"
+            ),
+            mock.patch.object(
+                operator,
+                "_github_pr_checkout_host",
+                return_value="ghe.example.internal",
+            ) as checkout_host,
+            mock.patch.object(
+                operator,
+                "_github_pr_view_auth_token",
+                return_value="fixture-enterprise-token",
+            ) as auth_token,
+            mock.patch.object(operator, "_run", return_value={"returncode": 0}) as run,
+        ):
+            operator.grabowski_github(["pr", "list"], cwd=str(ROOT))
+        checkout_host.assert_called_once_with(ROOT.resolve())
+        auth_token.assert_called_once_with(
+            "/usr/bin/gh", source, "ghe.example.internal"
+        )
+        environment = run.call_args.kwargs["environment"]
+        self.assertEqual(environment["GH_HOST"], "ghe.example.internal")
+        self.assertEqual(
+            environment["GH_ENTERPRISE_TOKEN"], "fixture-enterprise-token"
+        )
+        self.assertNotIn("GH_TOKEN", environment)
 
     def test_nonexempt_enterprise_repo_uses_repo_host_for_isolated_auth(self) -> None:
         source = {"GH_HOST": "github.com"}

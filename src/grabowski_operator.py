@@ -2346,7 +2346,44 @@ def _github_pr_uses_isolated_auth(arguments: list[str]) -> bool:
     )
 
 
-def _github_pr_target_host(arguments: list[str], source: dict[str, str]) -> str:
+def _github_pr_checkout_host(working_directory: Path) -> str | None:
+    try:
+        completed = subprocess.run(
+            [
+                "/usr/bin/git",
+                "-C",
+                str(working_directory),
+                "remote",
+                "get-url",
+                "--all",
+                "origin",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            text=True,
+            env=_git_environment(),
+            timeout=_GITHUB_PR_VIEW_AUTH_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("trusted GitHub checkout host lookup failed") from exc
+    if completed.returncode != 0:
+        return None
+    urls = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    if len(urls) != 1:
+        raise RuntimeError("trusted GitHub checkout remote is ambiguous")
+    identity = _remote_target_identity(urls[0])
+    if identity is None:
+        raise RuntimeError("trusted GitHub checkout remote is invalid")
+    return _github_pr_view_host({"GH_HOST": identity[0]})
+
+
+def _github_pr_target_host(
+    arguments: list[str],
+    source: dict[str, str],
+    *,
+    working_directory: Path | None = None,
+) -> str:
     repository: str | None = None
     index = 0
     while index < len(arguments):
@@ -2364,6 +2401,12 @@ def _github_pr_target_host(arguments: list[str], source: dict[str, str]) -> str:
             break
         index += 1
     if repository is None:
+        if source.get("GH_HOST", "").strip():
+            return _github_pr_view_host(source)
+        if working_directory is not None:
+            checkout_host = _github_pr_checkout_host(working_directory)
+            if checkout_host is not None:
+                return checkout_host
         return _github_pr_view_host(source)
     selector = repository.strip()
     parts = selector.split("/")
@@ -2372,7 +2415,6 @@ def _github_pr_target_host(arguments: list[str], source: dict[str, str]) -> str:
     if len(parts) == 3 and all(parts):
         return _github_pr_view_host({"GH_HOST": parts[0]})
     raise RuntimeError("trusted GitHub repository selector is invalid")
-
 
 def _github_pr_view_host(source: dict[str, str]) -> str:
     raw_host = source.get("GH_HOST", _GITHUB_PR_VIEW_DEFAULT_HOST).strip().lower()
@@ -6619,7 +6661,9 @@ def grabowski_github(
     isolated_auth = transport_exempt or _github_pr_uses_isolated_auth(arguments)
     if isolated_auth:
         source_environment = _safe_environment()
-        github_host = _github_pr_target_host(arguments, source_environment)
+        github_host = _github_pr_target_host(
+            arguments, source_environment, working_directory=working_directory
+        )
         github_token = _github_pr_view_auth_token(
             trusted_github_cli, source_environment, github_host
         )
