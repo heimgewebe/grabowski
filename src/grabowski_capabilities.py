@@ -460,10 +460,10 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
     },
     "grabowski_power_run": {
         "category": "privileged-execution",
-        "purpose": "Run one audited root command through the recovery-gated power broker.",
+        "purpose": "Run one audited root command through the canonical root-owned broker.",
         "risk_class": "critical",
         "effects": ["root-command-dependent", "host-state-change"],
-        "reversibility": "command-dependent-with-recovery-evidence",
+        "reversibility": "command-dependent",
     },
     "grabowski_fleet_list": {
         "category": "fleet",

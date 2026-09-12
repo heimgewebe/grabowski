@@ -555,14 +555,6 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
                 "grabowski_privileged_broker_status",
                 return_value={"ready": True},
             ),
-            mock.patch.object(
-                privileged_client, "_power_recovery_status",
-                return_value={
-                    "ready_for_user_power_worker": True,
-                    "ready_for_privileged_actions": True,
-                    "checked_at_unix": 1,
-                },
-            ),
             mock.patch.object(privileged_client.socket, "socket", return_value=fake),
             mock.patch.object(privileged_client.subprocess, "run") as subprocess_run,
             mock.patch.object(privileged_client, "_write_power_reference") as write_reference,

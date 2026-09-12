@@ -1065,15 +1065,15 @@
     },
     {
       "category": "privileged-execution",
-      "description": "Run one audited root command through the recovery-gated power broker.",
+      "description": "Run one audited root command through the canonical root-owned broker.",
       "effects": [
         "root-command-dependent",
         "host-state-change"
       ],
       "id": "grabowski_power_run",
-      "purpose": "Run one audited root command through the recovery-gated power broker.",
+      "purpose": "Run one audited root command through the canonical root-owned broker.",
       "read_only": false,
-      "reversibility": "command-dependent-with-recovery-evidence",
+      "reversibility": "command-dependent",
       "risk_class": "critical",
       "tool": "grabowski_power_run"
     },
@@ -3559,11 +3559,11 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "1fd4e986a104b5d30575e52faa3c4d9ec6b9a1405996de435b10719020b86591"
+      "sha256": "64e25debc7d160de08add1525941b717101c30970bea8d8df60fb6c578f6cb43"
     },
     "policy_example": {
       "path": "config/access.example.json",
-      "sha256": "2cb49727da14b27b9e205bc6529dd0e69db0e744a52ffa9070b9f1489c39610f"
+      "sha256": "363c9d91e13f1d5b1f87cef955a7910e966761f923b53cef1d1da786f68acec7"
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
@@ -3666,7 +3666,7 @@
       "src/grabowski_physical_checkout.py": "bb1b926b61d02b0d690b8e62de5afbceb3b12a5c1714406a6e218ca1fa6527c4",
       "src/grabowski_pr_diff.py": "cf6194a892b34f8f20ddafd3b293a76db57d73dbe6ec6e5324d2fdd39ce7f242",
       "src/grabowski_private_io.py": "6250c583bdc1614a6265123604161d3668587191b94932faf2912b03140e3d6f",
-      "src/grabowski_privileged.py": "70b7c434b60f3dc7a5f08f650f21db9f598a0b2fa9747d7679f396b00a47a7eb",
+      "src/grabowski_privileged.py": "dee9efff822ef2ec1fde16329807c6514595eb9678ff0604f0ddd17f2756c4ef",
       "src/grabowski_privileged_broker.py": "d43c37ffa9fa154ae7ce53b6c3620b72cff62ecf0eabbf14f60639097f526829",
       "src/grabowski_provenance_recovery.py": "b507add38c5fdaf9ad4248f0e2cc5bf7570f1a62415a06e1bf171d44f26e0730",
       "src/grabowski_read_surface.py": "1df8cb96e2c84f52817bbb0f64832de0f66f376de37a683849d41f50e7b08e1f",

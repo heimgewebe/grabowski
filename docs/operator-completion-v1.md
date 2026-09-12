@@ -1,5 +1,7 @@
 # Operator Completion v1
 
+> Historischer Slice-Stand: Der damals noch eng templatebasierte Rootpfad wurde später durch den Trusted-Owner-Vertrag um `grabowski_power_run` als allgemeinen, prozessidentitätsgebundenen Rootpfad erweitert. Aktueller Vertrag: `docs/control-plane.md` und `docs/privileged-broker-bootstrap.md`.
+
 Dieser Slice ergänzt den Control-Plane-Kern um die verbleibenden unprivilegierten Betriebsbausteine. Backup und Recovery-Evidenz sind ausdrücklich nicht Teil dieses Changes.
 
 ## Ressourcen und Tasks
