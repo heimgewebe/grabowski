@@ -374,7 +374,7 @@ OPERATOR_ADMISSION_MAX_TIMEOUT_SECONDS = 120
 # Bootstrap only for marker-aware predecessor runtimes that expose total calls
 # but not the effect-aware classification added by this release.
 OPERATOR_ADMISSION_BOOTSTRAP_DRAIN_SECONDS = 300
-OPERATOR_ADMISSION_EFFECT_CLASSIFICATION = "readOnlyHint-or-exact-github-pr-view-is-read-only-v2"
+OPERATOR_ADMISSION_EFFECT_CLASSIFICATION = "readOnlyHint-or-server-verified-git-read-or-exact-github-pr-view-is-read-only-v3"
 OPERATOR_ADMISSION_PREDECESSOR_EFFECT_CLASSIFICATION = (
     "readOnlyHint-true-is-read-only-v1"
 )
