@@ -1966,7 +1966,6 @@ def derive_group_convergence_recommendation(group: dict[str, Any]) -> dict[str, 
     action_reasons = set(group.get("action_reasons", []))
     projection_state = group.get("projection_state", "unknown")
     checkout_refs = group.get("checkout_refs", [])
-    has_cleanup_candidate = any(c.get("cleanup_candidate") for c in checkout_refs)
     external_terminal_checkout_refs = [
         c
         for c in checkout_refs
