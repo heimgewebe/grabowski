@@ -2404,13 +2404,11 @@ def _github_pr_target_host(
         gh_repo = source.get("GH_REPO", "").strip()
         if gh_repo:
             repository = gh_repo
-        elif source.get("GH_HOST", "").strip():
-            return _github_pr_view_host(source)
         elif working_directory is not None:
             checkout_host = _github_pr_checkout_host(working_directory)
             if checkout_host is not None:
                 return checkout_host
-        else:
+        if repository is None:
             return _github_pr_view_host(source)
     selector = repository.strip()
     parts = selector.split("/")

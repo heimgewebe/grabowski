@@ -1611,7 +1611,7 @@ class OperatorSignedTransportTests(unittest.TestCase):
         self.assertEqual(environment["GH_ENTERPRISE_TOKEN"], "fixture-enterprise-token")
 
     def test_nonexempt_enterprise_checkout_uses_remote_host_for_isolated_auth(self) -> None:
-        source: dict[str, str] = {}
+        source = {"GH_HOST": "github.com"}
         with (
             mock.patch.object(operator, "_trusted_owner_mode", return_value=True),
             mock.patch.object(operator, "_safe_environment", return_value=source),
