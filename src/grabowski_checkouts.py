@@ -2993,15 +2993,6 @@ def _binding_identity_rebind_state(
         )
     if retention["retention_until_unix"] <= observed_at_unix:
         raise RuntimeError("Checkout retention expired before identity rebind")
-    if lifecycle["expected_head"] != retention["expected_head"]:
-        raise RuntimeError(
-            "Checkout lifecycle and retention recorded heads differ before identity rebind"
-        )
-    if lifecycle["expected_branch"] != retention["expected_branch"]:
-        raise RuntimeError(
-            "Checkout lifecycle and retention recorded branches differ before identity rebind"
-        )
-
     static_identity = {
         "checkout_key": record["checkout_key"],
         "repo_common_dir": str(common_dir),
@@ -3024,6 +3015,10 @@ def _binding_identity_rebind_state(
         "binding-expected-branch-mismatch",
         "retention-expected-branch-mismatch",
     ]
+    lifecycle_catchup_drift_reasons = {
+        "binding-expected-branch-mismatch",
+        "binding-retention-head-mismatch",
+    }
     repo_path_drift_reasons = {
         "binding-repo-path-mismatch",
         "retention-repo-path-mismatch",
@@ -3039,6 +3034,31 @@ def _binding_identity_rebind_state(
             raise RuntimeError(
                 "Checkout identity rebind requires an observed branch rename"
             )
+        lineage = _git_read(
+            canonical_repo,
+            ["merge-base", "--is-ancestor", recorded_head, head],
+            check=False,
+        )
+        if lineage.returncode != 0:
+            raise RuntimeError(
+                "Checkout identity rebind current head does not descend from recorded head"
+            )
+        head_lineage = {
+            "recorded_head": recorded_head,
+            "current_head": head,
+            "recorded_head_is_ancestor": True,
+        }
+    elif (
+        drift_reasons
+        and set(drift_reasons).issubset(lifecycle_catchup_drift_reasons)
+        and retention["expected_head"] == head
+        and retention["expected_branch"] == branch
+        and (
+            lifecycle["expected_head"] != retention["expected_head"]
+            or lifecycle["expected_branch"] != retention["expected_branch"]
+        )
+    ):
+        rebind_mode = "lifecycle_catchup"
         lineage = _git_read(
             canonical_repo,
             ["merge-base", "--is-ancestor", recorded_head, head],
@@ -3183,7 +3203,7 @@ def _binding_identity_rebind_state_for_key(
 def grabowski_checkout_binding_identity_rebind_preview(
     checkout_key: str,
 ) -> dict[str, Any]:
-    """Preview one safe lifecycle identity rebind for an existing renamed checkout."""
+    """Preview one fail-closed identity repair for branch, path, or retention-converged lifecycle drift."""
     operator._require_operator_capability("git_cli")
     operator._require_operator_capability("github_cli")
     return _binding_identity_rebind_state_for_key(
@@ -3298,14 +3318,15 @@ def _binding_identity_rebind_apply(
             retention_updated_at = max(
                 applied_at, int(retention_before["updated_at_unix"]) + 1
             )
-            repo_path_mode = planned["rebind_mode"] == "repo_path_canonicalization"
             lifecycle_needs_update = (
-                not repo_path_mode
-                or lifecycle_before["repo_path"] != target_repo_path
+                lifecycle_before["repo_path"] != target_repo_path
+                or lifecycle_before["expected_head"] != target_head
+                or lifecycle_before["expected_branch"] != target_branch
             )
             retention_needs_update = (
-                not repo_path_mode
-                or retention_before["repo_path"] != target_repo_path
+                retention_before["repo_path"] != target_repo_path
+                or retention_before["expected_head"] != target_head
+                or retention_before["expected_branch"] != target_branch
             )
             if lifecycle_needs_update:
                 lifecycle_update = connection.execute(
@@ -3376,11 +3397,14 @@ def _binding_identity_rebind_apply(
                 )
         if lifecycle_after["phase"] != lifecycle_before["phase"]:
             raise RuntimeError("Checkout identity rebind changed lifecycle phase")
-        if planned["rebind_mode"] == "branch_rename":
-            effects = [
-                "lifecycle_expected_identity_update",
-                "retention_expected_identity_update",
-            ]
+        if planned["rebind_mode"] in {"branch_rename", "lifecycle_catchup"}:
+            effects = []
+            if lifecycle_needs_update:
+                effects.append("lifecycle_expected_identity_update")
+            if retention_needs_update:
+                effects.append("retention_expected_identity_update")
+            if not effects:
+                raise RuntimeError("Checkout identity rebind had no bounded effect")
         elif planned["rebind_mode"] == "repo_path_canonicalization":
             effects = []
             if lifecycle_before["repo_path"] != target_repo_path:
@@ -3462,7 +3486,7 @@ def grabowski_checkout_binding_identity_rebind_apply(
     preview_created_at_unix: int,
     confirmation: str,
 ) -> dict[str, Any]:
-    """CAS-rebind lifecycle and retention identity after an exact safe preview."""
+    """CAS-converge stale lifecycle/retention identity after an exact supported preview."""
     operator._require_operator_mutation("resource_lease")
     operator._require_operator_capability("git_cli")
     operator._require_operator_capability("github_cli")
