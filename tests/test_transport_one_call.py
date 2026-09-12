@@ -1299,6 +1299,57 @@ class OperatorSignedTransportTests(unittest.TestCase):
             "ghe.example.internal",
         )
 
+    def test_isolated_github_positional_pr_url_accepts_gh_ui_suffixes(self) -> None:
+        source = {"GH_HOST": "github.com"}
+        for url in (
+            "https://github.com/heimgewebe/grabowski/pull/1177/files",
+            "https://github.com/heimgewebe/grabowski/pull/1177/nonsense/deeper",
+        ):
+            with self.subTest(url=url):
+                self.assertEqual(
+                    operator._github_pr_target_host(["pr", "view", url], source),
+                    "github.com",
+                )
+
+    def test_isolated_github_normalizes_www_github_com_alias(self) -> None:
+        source = {"GH_HOST": "ghe.example.internal"}
+        for host in ("www.github.com", "WWW.GITHUB.COM", "www.github.com:443"):
+            with self.subTest(host=host):
+                expected = "github.com:443" if host.endswith(":443") else "github.com"
+                self.assertEqual(operator._github_pr_view_host({"GH_HOST": host}), expected)
+        self.assertEqual(
+            operator._github_pr_target_host(
+                ["pr", "view", "https://www.github.com/owner/repo/pull/1/files"], source
+            ),
+            "github.com",
+        )
+
+    def test_github_wrapper_www_github_com_url_uses_standard_token_family(self) -> None:
+        source_environment = {"GH_HOST": "ghe.example.internal"}
+        url = "https://www.github.com/owner/repo/pull/1/files"
+        with (
+            mock.patch.object(operator, "_trusted_owner_mode", return_value=True),
+            mock.patch.object(operator, "_require_operator_mutation"),
+            mock.patch.object(
+                operator, "_trusted_github_cli_path", return_value="/usr/bin/gh"
+            ),
+            mock.patch.object(
+                operator, "_safe_environment", return_value=source_environment
+            ),
+            mock.patch.object(
+                operator, "_github_pr_view_auth_token", return_value="fixture-token"
+            ) as auth_token,
+            mock.patch.object(operator, "_run", return_value={"returncode": 0}) as run,
+        ):
+            operator.grabowski_github(["pr", "view", url], cwd=str(ROOT))
+        auth_token.assert_called_once_with(
+            "/usr/bin/gh", source_environment, "github.com"
+        )
+        environment = run.call_args.kwargs["environment"]
+        self.assertEqual(environment["GH_HOST"], "github.com")
+        self.assertEqual(environment["GH_TOKEN"], "fixture-token")
+        self.assertNotIn("GH_ENTERPRISE_TOKEN", environment)
+
     def test_isolated_github_positional_pr_url_rejects_unsafe_shapes(self) -> None:
         unsafe_urls = (
             "http://ghe.example.internal/owner/repo/pull/1031",

@@ -2668,7 +2668,7 @@ def _github_pr_positional_url_host(value: str) -> str:
         or parsed.query
         or parsed.fragment
         or re.fullmatch(
-            r"/[^/?#\s]+/[^/?#\s]+/pull/[1-9][0-9]*/?", parsed.path
+            r"/[^/?#\s]+/[^/?#\s]+/pull/[1-9][0-9]*(?:/[^?#\s]*)?", parsed.path
         )
         is None
     ):
@@ -2980,7 +2980,10 @@ def _github_pr_view_host(source: dict[str, str]) -> str:
     port = match.group(2)
     if port is not None and int(port) > 65535:
         raise RuntimeError("trusted GitHub host port is invalid")
-    return raw_host
+    hostname = match.group(1)
+    if hostname == "www.github.com":
+        hostname = _GITHUB_PR_VIEW_DEFAULT_HOST
+    return f"{hostname}:{port}" if port is not None else hostname
 
 
 def _validated_github_pr_view_token(value: Any) -> str:
