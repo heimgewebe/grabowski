@@ -2346,6 +2346,34 @@ def _github_pr_uses_isolated_auth(arguments: list[str]) -> bool:
     )
 
 
+def _github_pr_target_host(arguments: list[str], source: dict[str, str]) -> str:
+    repository: str | None = None
+    index = 0
+    while index < len(arguments):
+        item = arguments[index]
+        if item in {"--repo", "-R"}:
+            if index + 1 >= len(arguments):
+                raise RuntimeError("trusted GitHub repository selector is invalid")
+            repository = arguments[index + 1]
+            break
+        if item.startswith("--repo="):
+            repository = item.split("=", 1)[1]
+            break
+        if item.startswith("-R") and item != "-R":
+            repository = item[2:]
+            break
+        index += 1
+    if repository is None:
+        return _github_pr_view_host(source)
+    selector = repository.strip()
+    parts = selector.split("/")
+    if len(parts) == 2 and all(parts):
+        return _github_pr_view_host(source)
+    if len(parts) == 3 and all(parts):
+        return _github_pr_view_host({"GH_HOST": parts[0]})
+    raise RuntimeError("trusted GitHub repository selector is invalid")
+
+
 def _github_pr_view_host(source: dict[str, str]) -> str:
     raw_host = source.get("GH_HOST", _GITHUB_PR_VIEW_DEFAULT_HOST).strip().lower()
     if not raw_host or len(raw_host) > 259:
@@ -2454,6 +2482,46 @@ def _github_pr_view_default_keyring_locked(
     return None
 
 
+def _github_pr_view_plaintext_auth_token(
+    executable: str, source: dict[str, str], host: str
+) -> str | None:
+    environment = _github_pr_view_auth_lookup_environment(source, host)
+    for key in (
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "GNOME_KEYRING_CONTROL",
+    ):
+        environment.pop(key, None)
+    try:
+        probe = subprocess.run(
+            [executable, "auth", "token", "--hostname", host],
+            cwd=HOME,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=_GITHUB_PR_VIEW_KEYRING_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if probe.returncode != 0:
+        return None
+    if len(probe.stdout) > _GITHUB_PR_VIEW_MAX_TOKEN_BYTES + 1:
+        return None
+    try:
+        decoded = probe.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    lines = decoded.splitlines()
+    if len(lines) != 1:
+        return None
+    try:
+        return _validated_github_pr_view_token(lines[0])
+    except RuntimeError:
+        return None
+
+
 def _github_pr_view_auth_token(
     executable: str, source: dict[str, str], host: str
 ) -> str:
@@ -2464,6 +2532,9 @@ def _github_pr_view_auth_token(
     )
     if direct is not None:
         return direct
+    plaintext = _github_pr_view_plaintext_auth_token(executable, source, host)
+    if plaintext is not None:
+        return plaintext
     if _github_pr_view_default_keyring_locked(source, host) is True:
         raise RuntimeError(
             "trusted GitHub credential lookup blocked: default Secret Service keyring "
@@ -6548,7 +6619,7 @@ def grabowski_github(
     isolated_auth = transport_exempt or _github_pr_uses_isolated_auth(arguments)
     if isolated_auth:
         source_environment = _safe_environment()
-        github_host = _github_pr_view_host(source_environment)
+        github_host = _github_pr_target_host(arguments, source_environment)
         github_token = _github_pr_view_auth_token(
             trusted_github_cli, source_environment, github_host
         )

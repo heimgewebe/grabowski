@@ -1227,6 +1227,25 @@ class OperatorSignedTransportTests(unittest.TestCase):
             )
         )
 
+    def test_isolated_github_repo_selects_explicit_enterprise_host(self) -> None:
+        source = {"GH_HOST": "github.com"}
+        for arguments in (
+            ["pr", "list", "--repo", "ghe.example.internal/owner/repo"],
+            ["pr", "list", "--repo=ghe.example.internal/owner/repo"],
+            ["pr", "list", "-Rghe.example.internal/owner/repo"],
+        ):
+            with self.subTest(arguments=arguments):
+                self.assertEqual(
+                    operator._github_pr_target_host(arguments, source),
+                    "ghe.example.internal",
+                )
+        self.assertEqual(
+            operator._github_pr_target_host(
+                ["pr", "list", "--repo", "heimgewebe/grabowski"], source
+            ),
+            "github.com",
+        )
+
     def test_exempt_github_default_keyring_probe_reports_locked(self) -> None:
         probe = SimpleNamespace(returncode=0, stdout=b"b true\n")
         source = {
@@ -1254,6 +1273,9 @@ class OperatorSignedTransportTests(unittest.TestCase):
         with (
             mock.patch.object(operator, "_trusted_owner_mode", return_value=True),
             mock.patch.object(
+                operator, "_github_pr_view_plaintext_auth_token", return_value=None
+            ) as plaintext_probe,
+            mock.patch.object(
                 operator, "_github_pr_view_default_keyring_locked", return_value=True
             ) as keyring_probe,
             mock.patch.object(operator.subprocess, "Popen") as popen,
@@ -1264,8 +1286,63 @@ class OperatorSignedTransportTests(unittest.TestCase):
                     {"XDG_RUNTIME_DIR": "/run/user/1000"},
                     "github.com",
                 )
+        plaintext_probe.assert_called_once()
         keyring_probe.assert_called_once()
         popen.assert_not_called()
+
+    def test_exempt_github_auth_uses_plaintext_storage_before_locked_keyring(self) -> None:
+        with (
+            mock.patch.object(operator, "_trusted_owner_mode", return_value=True),
+            mock.patch.object(
+                operator,
+                "_github_pr_view_plaintext_auth_token",
+                return_value="fixture-plaintext-token",
+            ) as plaintext_probe,
+            mock.patch.object(
+                operator, "_github_pr_view_default_keyring_locked"
+            ) as keyring_probe,
+            mock.patch.object(operator.subprocess, "Popen") as popen,
+        ):
+            token = operator._github_pr_view_auth_token(
+                "/usr/bin/gh",
+                {"XDG_RUNTIME_DIR": "/run/user/1000"},
+                "github.com",
+            )
+        self.assertEqual(token, "fixture-plaintext-token")
+        plaintext_probe.assert_called_once()
+        keyring_probe.assert_not_called()
+        popen.assert_not_called()
+
+    def test_exempt_github_plaintext_probe_disables_keyring_environment(self) -> None:
+        probe = SimpleNamespace(returncode=0, stdout=b"fixture-plaintext-token\n")
+        source = {
+            "HOME": "/home/alex",
+            "XDG_CONFIG_HOME": "/home/alex/.config",
+            "GH_CONFIG_DIR": "/home/alex/.config/gh",
+            "XDG_RUNTIME_DIR": "/run/user/1000",
+            "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+            "GNOME_KEYRING_CONTROL": "/run/user/1000/keyring",
+        }
+        with mock.patch.object(
+            operator.subprocess, "run", return_value=probe
+        ) as run:
+            token = operator._github_pr_view_plaintext_auth_token(
+                "/usr/bin/gh", source, "github.com"
+            )
+        self.assertEqual(token, "fixture-plaintext-token")
+        environment = run.call_args.kwargs["env"]
+        for key in (
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "GNOME_KEYRING_CONTROL",
+        ):
+            self.assertNotIn(key, environment)
+        self.assertEqual(environment["HOME"], "/home/alex")
+        self.assertEqual(environment["GH_CONFIG_DIR"], "/home/alex/.config/gh")
+        self.assertEqual(
+            run.call_args.args[0],
+            ["/usr/bin/gh", "auth", "token", "--hostname", "github.com"],
+        )
 
     def test_exempt_github_auth_lookup_uses_local_keyring_without_network_env(self) -> None:
         process = mock.Mock()
@@ -1285,6 +1362,9 @@ class OperatorSignedTransportTests(unittest.TestCase):
             mock.patch.object(operator, "_trusted_owner_mode", return_value=True),
             mock.patch.object(
                 operator, "_github_pr_view_default_keyring_locked", return_value=False
+            ),
+            mock.patch.object(
+                operator, "_github_pr_view_plaintext_auth_token", return_value=None
             ),
             mock.patch.object(operator.subprocess, "Popen", return_value=process) as popen,
         ):
@@ -1326,6 +1406,9 @@ class OperatorSignedTransportTests(unittest.TestCase):
             mock.patch.object(
                 operator, "_github_pr_view_default_keyring_locked", return_value=False
             ),
+            mock.patch.object(
+                operator, "_github_pr_view_plaintext_auth_token", return_value=None
+            ),
             mock.patch.object(operator.subprocess, "Popen", return_value=process) as popen,
             mock.patch.object(operator, "_terminate_process_group") as terminate,
         ):
@@ -1358,6 +1441,9 @@ class OperatorSignedTransportTests(unittest.TestCase):
         process.communicate.return_value = (b"fixture-keyring-token\n", b"")
         with (
             mock.patch.object(operator, "_trusted_owner_mode", return_value=False),
+            mock.patch.object(
+                operator, "_github_pr_view_plaintext_auth_token", return_value=None
+            ),
             mock.patch.object(operator.subprocess, "Popen", return_value=process) as popen,
         ):
             token = operator._github_pr_view_auth_token(
@@ -1446,6 +1532,41 @@ class OperatorSignedTransportTests(unittest.TestCase):
             "DBUS_SESSION_BUS_ADDRESS",
         ):
             self.assertNotIn(unsafe_key, environment)
+
+    def test_nonexempt_enterprise_repo_uses_repo_host_for_isolated_auth(self) -> None:
+        source = {"GH_HOST": "github.com"}
+        with (
+            mock.patch.object(operator, "_trusted_owner_mode", return_value=True),
+            mock.patch.object(operator, "_safe_environment", return_value=source),
+            mock.patch.object(operator, "_require_operator_mutation"),
+            mock.patch.object(
+                operator, "_trusted_github_cli_path", return_value="/usr/bin/gh"
+            ),
+            mock.patch.object(
+                operator,
+                "_github_pr_view_auth_token",
+                return_value="fixture-enterprise-token",
+            ) as auth_token,
+            mock.patch.object(operator, "_run", return_value={"returncode": 0}) as run,
+        ):
+            operator.grabowski_github(
+                [
+                    "pr",
+                    "list",
+                    "--repo",
+                    "ghe.example.internal/owner/repo",
+                ],
+                cwd=str(ROOT),
+            )
+        auth_token.assert_called_once_with(
+            "/usr/bin/gh", source, "ghe.example.internal"
+        )
+        environment = run.call_args.kwargs["environment"]
+        self.assertEqual(environment["GH_HOST"], "ghe.example.internal")
+        self.assertEqual(
+            environment["GH_ENTERPRISE_TOKEN"], "fixture-enterprise-token"
+        )
+        self.assertNotIn("GH_TOKEN", environment)
 
     def test_github_pr_view_does_not_consume_signed_assertion(self) -> None:
         tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=False))
