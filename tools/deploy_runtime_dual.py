@@ -71,6 +71,7 @@ TUNNEL_SERVICE = "tunnel-client-grabowski.service"
 OPERATOR_SERVICE = "grabowski-operator.service"
 OPERATOR_SERVICE_CONTROL_ACTION = "operator_system_service_control"
 ROOTBROKER_CUTOVER_ACTION = "operator_rootbroker_cutover"
+PLATFORM_CONNECTOR_CAPTURE_ACTION = "platform_connector_capture"
 LOCAL_BACKUP_NTFS_CHECK_ACTION = "local_backup_ntfs_check"
 LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION = "local_backup_ntfs_clear_dirty"
 LOCAL_BACKUP_SMART_READ_ACTION = "local_backup_smart_read"
@@ -4737,6 +4738,7 @@ def require_operator_authority_anchored(
     relative_artifacts = {
         "broker_module": Path("src/grabowski_privileged_broker.py"),
         "broker_wrapper": Path("tools/grabowski_privileged_broker.py"),
+        "platform_connector_capture": Path("tools/grabowski_platform_connector_capture.py"),
         "cutover_helper": Path("tools/grabowski_rootbroker_cutover.py"),
         "operator_service": Path("systemd/grabowski-operator.service.example"),
     }
@@ -4777,12 +4779,15 @@ def require_operator_authority_anchored(
     lifecycle = actions.get("operator_blockade_marker_lifecycle")
     service_control = actions.get(OPERATOR_SERVICE_CONTROL_ACTION)
     rootbroker_cutover = actions.get(ROOTBROKER_CUTOVER_ACTION)
+    platform_connector_capture = actions.get(PLATFORM_CONNECTOR_CAPTURE_ACTION)
     backup_storage = {
         name: actions.get(name) for name in LOCAL_BACKUP_STORAGE_ACTIONS
     }
     if not all(
         isinstance(item, dict)
-        for item in (lifecycle, service_control, rootbroker_cutover)
+        for item in (
+            lifecycle, service_control, rootbroker_cutover, platform_connector_capture
+        )
     ):
         core.fail(
             "Ziel-Commit besitzt keinen vollständigen Operator-Authority-Vertrag",
@@ -4804,6 +4809,7 @@ def require_operator_authority_anchored(
     assert isinstance(lifecycle, dict)
     assert isinstance(service_control, dict)
     assert isinstance(rootbroker_cutover, dict)
+    assert isinstance(platform_connector_capture, dict)
     expected_peer = {
         "allowed_peer_uid": lifecycle.get("allowed_peer_uid"),
         "allowed_peer_unit": lifecycle.get("allowed_peer_unit"),
@@ -4817,6 +4823,7 @@ def require_operator_authority_anchored(
         "operator_blockade_marker_lifecycle": lifecycle,
         OPERATOR_SERVICE_CONTROL_ACTION: service_control,
         ROOTBROKER_CUTOVER_ACTION: rootbroker_cutover,
+        PLATFORM_CONNECTOR_CAPTURE_ACTION: platform_connector_capture,
     }
     expected_action_contracts.update(
         {

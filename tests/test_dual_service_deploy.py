@@ -88,12 +88,25 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
             "allowed_peer_uid": 1000,
             "allowed_peer_unit": dual.OPERATOR_SERVICE,
         }
+        platform_connector_capture = {
+            "enabled": True,
+            "mode": "template",
+            "target_pattern": r"\{.{1,4096}\}",
+            "argv": [
+                "/usr/local/libexec/grabowski-platform-connector-capture",
+                "{target}",
+            ],
+            "timeout_seconds": 120,
+            "allowed_peer_uid": 1000,
+            "allowed_peer_unit": dual.OPERATOR_SERVICE,
+        }
         config = {
             "schema_version": 2,
             "actions": {
                 "operator_blockade_marker_lifecycle": lifecycle,
                 dual.OPERATOR_SERVICE_CONTROL_ACTION: service_control,
                 dual.ROOTBROKER_CUTOVER_ACTION: rootbroker_cutover,
+                dual.PLATFORM_CONNECTOR_CAPTURE_ACTION: platform_connector_capture,
             },
         }
         artifact_sources = tuple(
@@ -123,6 +136,9 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
             "broker_wrapper": __import__("hashlib").sha256(
                 blobs[Path("tools/grabowski_privileged_broker.py")]
             ).hexdigest(),
+            "platform_connector_capture": __import__("hashlib").sha256(
+                blobs[Path("tools/grabowski_platform_connector_capture.py")]
+            ).hexdigest(),
             "cutover_helper": __import__("hashlib").sha256(
                 blobs[Path("tools/grabowski_rootbroker_cutover.py")]
             ).hexdigest(),
@@ -147,6 +163,9 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
                 ),
                 dual.ROOTBROKER_CUTOVER_ACTION: dual._canonical_line_sha256(
                     rootbroker_cutover
+                ),
+                dual.PLATFORM_CONNECTOR_CAPTURE_ACTION: dual._canonical_line_sha256(
+                    platform_connector_capture
                 ),
             },
             "power_peer_binding": {
@@ -244,6 +263,38 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
         unsigned.pop("attestation_sha256", None)
         attestation["attestation_sha256"] = dual._canonical_line_sha256(unsigned)
         return attestation, blobs
+
+    def test_platform_connector_capture_binding_is_required(self) -> None:
+        for binding in ("artifact", "action"):
+            with self.subTest(binding=binding):
+                attestation, blobs = self._fixture()
+                if binding == "artifact":
+                    artifact_sha256 = attestation["artifact_sha256"]
+                    assert isinstance(artifact_sha256, dict)
+                    artifact_sha256.pop("platform_connector_capture")
+                    expected = "Artefaktbindung ist unvollständig"
+                else:
+                    action_sha256 = attestation["action_sha256"]
+                    assert isinstance(action_sha256, dict)
+                    action_sha256.pop(dual.PLATFORM_CONNECTOR_CAPTURE_ACTION)
+                    expected = "Aktionsbindung ist unvollständig"
+                unsigned = dict(attestation)
+                unsigned.pop("attestation_sha256", None)
+                attestation["attestation_sha256"] = dual._canonical_line_sha256(unsigned)
+                with (
+                    mock.patch.object(
+                        dual, "_read_root_owned_public_json", return_value=attestation
+                    ),
+                    mock.patch.object(
+                        dual.core,
+                        "git_show",
+                        side_effect=lambda _repo, _head, path: blobs[path],
+                    ),
+                ):
+                    with self.assertRaisesRegex(core.DeployError, expected):
+                        dual.require_operator_authority_anchored(
+                            ROOT, self.HEAD, path=Path("/ignored")
+                        )
 
     def test_backup_storage_action_set_matches_rootbroker_cutover(self) -> None:
         self.assertEqual(
