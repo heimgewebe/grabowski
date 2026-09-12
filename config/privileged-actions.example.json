@@ -30,6 +30,18 @@
       ],
       "timeout_seconds": 30
     },
+    "platform_connector_capture": {
+      "enabled": true,
+      "mode": "template",
+      "target_pattern": "\\{.{1,4096}\\}",
+      "argv": [
+        "/usr/local/libexec/grabowski-platform-connector-capture",
+        "{target}"
+      ],
+      "timeout_seconds": 120,
+      "allowed_peer_unit": "grabowski-operator.service",
+      "allowed_peer_uid": 1000
+    },
     "runtime_bootstrap_recover": {
       "enabled": true,
       "mode": "template",
