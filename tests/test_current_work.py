@@ -1139,7 +1139,7 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertEqual(group["convergence_stage"], "closed-not-cleaned")
         self.assertTrue(result["convergence_summary"]["finishable_chain_prioritized"])
 
-    def test_completed_retained_checkout_is_prioritized_closed_not_cleaned(self) -> None:
+    def test_completed_retained_checkout_is_descriptive_not_finishable_without_cleanup_candidate(self) -> None:
         owner = "operator:managed-terminal"
         result = project(
             checkout_payloads=[
@@ -1162,7 +1162,13 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertEqual(group["projection_state"], "terminal_archived")
         self.assertIn("closed-not-cleaned", group["action_reasons"])
         self.assertEqual(group["convergence_stage"], "closed-not-cleaned")
-        self.assertTrue(result["convergence_summary"]["finishable_chain_prioritized"])
+        self.assertEqual(
+            group["next_convergence_action"],
+            "verify authoritative cleanup eligibility before lifecycle action",
+        )
+        summary = result["convergence_summary"]
+        self.assertFalse(summary["finishable_chain_prioritized"])
+        self.assertEqual(summary["cleanup_ready_closed_not_cleaned_count"], 0)
 
     def test_pagination_is_snapshot_bound_and_deterministic(self) -> None:
         tasks = [task("task1", updated=30), task("task2", updated=20)]
@@ -1877,6 +1883,72 @@ class CurrentWorkProjectionTests(unittest.TestCase):
             result["convergence_summary"]["closed_not_cleaned_count"],
             0,
         )
+
+    def test_completed_retained_checkout_without_cleanup_candidate_is_not_finishable(self) -> None:
+        result = project(
+            checkout_payloads=[
+                {
+                    "repository": REPOSITORY,
+                    "worktrees": [
+                        checkout(
+                            "key-completed-retained",
+                            "/tmp/completed-retained",
+                            lifecycle_state="retained",
+                            binding_owner="operator:test",
+                            binding_phase="completed_retained",
+                            binding_consistent=True,
+                            cleanup_candidate=False,
+                        )
+                    ],
+                }
+            ],
+        )
+        self.assertEqual(result["count"], 1)
+        row = result["work"][0]
+        self.assertEqual(row["projection_state"], "terminal_archived")
+        self.assertIn("closed-not-cleaned", row["action_reasons"])
+        self.assertEqual(row["convergence_stage"], "closed-not-cleaned")
+        self.assertEqual(
+            row["next_convergence_action"],
+            "verify authoritative cleanup eligibility before lifecycle action",
+        )
+        summary = result["convergence_summary"]
+        self.assertFalse(summary["finishable_chain_prioritized"])
+        self.assertEqual(summary["closed_not_cleaned_count"], 1)
+        self.assertEqual(summary["cleanup_ready_closed_not_cleaned_count"], 0)
+
+    def test_completed_retained_cleanup_candidate_is_finishable(self) -> None:
+        result = project(
+            checkout_payloads=[
+                {
+                    "repository": REPOSITORY,
+                    "worktrees": [
+                        checkout(
+                            "key-completed-retained-ready",
+                            "/tmp/completed-retained-ready",
+                            lifecycle_state="retained",
+                            binding_owner="operator:test",
+                            binding_phase="completed_retained",
+                            binding_consistent=True,
+                            cleanup_candidate=True,
+                        )
+                    ],
+                }
+            ],
+        )
+        self.assertEqual(result["count"], 1)
+        row = result["work"][0]
+        self.assertEqual(row["projection_state"], "hygiene")
+        self.assertIn("cleanup-candidate-ready", row["action_reasons"])
+        self.assertEqual(row["convergence_stage"], "closed-not-cleaned")
+        self.assertEqual(
+            row["next_convergence_action"],
+            "reconcile terminal worktree hygiene and safe lifecycle reconciliation",
+        )
+        summary = result["convergence_summary"]
+        self.assertTrue(summary["finishable_chain_prioritized"])
+        self.assertEqual(summary["closed_not_cleaned_count"], 1)
+        self.assertEqual(summary["cleanup_ready_closed_not_cleaned_count"], 1)
 
     def test_orphaned_binding_projects_one_hygiene_current_work_group(self) -> None:
         authority_blocker = {
