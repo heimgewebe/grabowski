@@ -2955,6 +2955,76 @@ class CheckoutLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(binding["checkout_key"], archived["archive"]["checkout_key"])
 
+    def test_binding_identity_rebind_converges_lifecycle_when_retention_is_current(self) -> None:
+        binding, new_head, new_branch = self._renamed_managed_checkout()
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE retention SET expected_head=?, expected_branch=?, updated_at_unix=updated_at_unix+1 "
+                "WHERE checkout_key=?",
+                (new_head, new_branch, binding["checkout_key"]),
+            )
+            connection.commit()
+        preview = checkouts.grabowski_checkout_binding_identity_rebind_preview(
+            binding["checkout_key"]
+        )
+        self.assertEqual("lifecycle_catchup", preview["rebind_mode"])
+        self.assertEqual(
+            [
+                "binding-expected-branch-mismatch",
+                "binding-retention-head-mismatch",
+            ],
+            preview["allowed_drift_reasons"],
+        )
+        retention_updated_at = preview["retention"]["updated_at_unix"]
+        applied = checkouts.grabowski_checkout_binding_identity_rebind_apply(
+            binding["checkout_key"],
+            "owner-a",
+            preview["snapshot_sha256"],
+            preview["observed_at_unix"],
+            preview["confirmation"],
+        )
+        self.assertEqual("applied", applied["status"])
+        self.assertEqual(new_head, applied["after"]["lifecycle"]["expected_head"])
+        self.assertEqual(new_branch, applied["after"]["lifecycle"]["expected_branch"])
+        self.assertEqual(new_head, applied["after"]["retention"]["expected_head"])
+        self.assertEqual(new_branch, applied["after"]["retention"]["expected_branch"])
+        self.assertEqual(
+            retention_updated_at, applied["after"]["retention"]["updated_at_unix"]
+        )
+        self.assertEqual(
+            ["lifecycle_expected_identity_update"],
+            applied["audit"]["effects"],
+        )
+
+    def test_binding_identity_rebind_rejects_unrelated_lifecycle_catchup(self) -> None:
+        binding = self._managed_binding(owner="owner-a")
+        tree = self._git("rev-parse", "HEAD^{tree}", cwd=self.checkout).stdout.strip()
+        unrelated_head = self._git(
+            "commit-tree", tree, "-m", "unrelated catchup", cwd=self.checkout
+        ).stdout.strip()
+        new_branch = "topic-v2"
+        self._git(
+            "update-ref", f"refs/heads/{new_branch}", unrelated_head, cwd=self.checkout
+        )
+        self._git("checkout", new_branch, cwd=self.checkout)
+        self._git(
+            "update-ref",
+            f"refs/remotes/origin/{new_branch}",
+            unrelated_head,
+            cwd=self.checkout,
+        )
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE retention SET expected_head=?, expected_branch=?, updated_at_unix=updated_at_unix+1 "
+                "WHERE checkout_key=?",
+                (unrelated_head, new_branch, binding["checkout_key"]),
+            )
+            connection.commit()
+        with self.assertRaisesRegex(RuntimeError, "descend from recorded head"):
+            checkouts.grabowski_checkout_binding_identity_rebind_preview(
+                binding["checkout_key"]
+            )
+
     def test_binding_identity_rebind_rejects_dirty_checkout(self) -> None:
         binding, _, _ = self._renamed_managed_checkout()
         (self.checkout / "dirty.txt").write_text("dirty\n", encoding="utf-8")
