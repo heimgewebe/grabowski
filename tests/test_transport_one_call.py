@@ -1304,6 +1304,8 @@ class OperatorSignedTransportTests(unittest.TestCase):
         for url in (
             "https://github.com/heimgewebe/grabowski/pull/1177/files",
             "https://github.com/heimgewebe/grabowski/pull/1177/nonsense/deeper",
+            "https://github.com/heimgewebe/grabowski/pull/1177/files?diff=split",
+            "https://github.com/heimgewebe/grabowski/pull/1177/files#discussion_r3997406598",
         ):
             with self.subTest(url=url):
                 self.assertEqual(
@@ -1354,7 +1356,6 @@ class OperatorSignedTransportTests(unittest.TestCase):
         unsafe_urls = (
             "http://ghe.example.internal/owner/repo/pull/1031",
             "https://user@ghe.example.internal/owner/repo/pull/1031",
-            "https://ghe.example.internal/owner/repo/pull/1031?diff=split",
             "https://ghe.example.internal/owner/repo/issues/1031",
         )
         for url in unsafe_urls:

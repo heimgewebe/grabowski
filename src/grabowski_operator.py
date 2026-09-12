@@ -2665,8 +2665,6 @@ def _github_pr_positional_url_host(value: str) -> str:
         or parsed.hostname is None
         or parsed.username is not None
         or parsed.password is not None
-        or parsed.query
-        or parsed.fragment
         or re.fullmatch(
             r"/[^/?#\s]+/[^/?#\s]+/pull/[1-9][0-9]*(?:/[^?#\s]*)?", parsed.path
         )
