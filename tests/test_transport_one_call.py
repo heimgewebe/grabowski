@@ -1315,11 +1315,12 @@ class OperatorSignedTransportTests(unittest.TestCase):
         )
         default_probe = SimpleNamespace(returncode=1, stdout="", stderr="")
         names_probe = SimpleNamespace(returncode=0, stdout="origin\n", stderr="")
+        source = {"GH_HOST": "ghe.example.internal"}
         with mock.patch.object(
             operator.subprocess, "run", side_effect=[default_probe, names_probe, completed]
         ) as run:
             host = operator._github_pr_target_host(
-                ["pr", "list"], {}, working_directory=ROOT
+                ["pr", "list"], source, working_directory=ROOT
             )
         self.assertEqual(host, "ghe.example.internal")
         self.assertEqual(
@@ -1345,10 +1346,19 @@ class OperatorSignedTransportTests(unittest.TestCase):
             stdout="git@ghe.example.internal:owner/repo.git\n",
             stderr="",
         )
-        with mock.patch.object(
-            operator.subprocess, "run", side_effect=[default_probe, names_probe, remote_probe]
-        ) as run:
-            host = operator._github_pr_checkout_host(ROOT)
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory)
+            (config / "hosts.yml").write_text(
+                "ghe.example.internal:\n  user: fixture\n", encoding="utf-8"
+            )
+            with mock.patch.object(
+                operator.subprocess,
+                "run",
+                side_effect=[default_probe, names_probe, remote_probe],
+            ) as run:
+                host = operator._github_pr_checkout_host(
+                    ROOT, {"GH_CONFIG_DIR": str(config)}
+                )
         self.assertEqual(host, "ghe.example.internal")
         self.assertEqual(
             run.call_args_list[2].args[0],
@@ -1363,17 +1373,62 @@ class OperatorSignedTransportTests(unittest.TestCase):
             ],
         )
 
-    def test_isolated_github_checkout_uses_sole_non_origin_remote(self) -> None:
+    def test_isolated_github_default_remote_rejects_unknown_non_github_host(self) -> None:
+        default_probe = SimpleNamespace(
+            returncode=0, stdout="remote.origin.gh-resolved base\n", stderr=""
+        )
+        names_probe = SimpleNamespace(returncode=0, stdout="origin\n", stderr="")
+        remote_probe = SimpleNamespace(
+            returncode=0, stdout="git@gitlab.example:owner/repo.git\n", stderr=""
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                operator.subprocess,
+                "run",
+                side_effect=[default_probe, names_probe, remote_probe],
+            ):
+                with self.assertRaisesRegex(RuntimeError, "default remote host is unknown"):
+                    operator._github_pr_checkout_host(
+                        ROOT, {"GH_CONFIG_DIR": directory}
+                    )
+
+    def test_isolated_github_checkout_uses_known_sole_non_origin_remote(self) -> None:
         default_probe = SimpleNamespace(returncode=1, stdout="", stderr="")
         names_probe = SimpleNamespace(returncode=0, stdout="upstream\n", stderr="")
         remote_probe = SimpleNamespace(
             returncode=0, stdout="git@ghe.example.internal:owner/repo.git\n", stderr=""
         )
-        with mock.patch.object(
-            operator.subprocess, "run", side_effect=[default_probe, names_probe, remote_probe]
-        ):
-            host = operator._github_pr_checkout_host(ROOT)
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory)
+            (config / "hosts.yml").write_text(
+                "ghe.example.internal:\n  user: fixture\n", encoding="utf-8"
+            )
+            with mock.patch.object(
+                operator.subprocess,
+                "run",
+                side_effect=[default_probe, names_probe, remote_probe],
+            ):
+                host = operator._github_pr_checkout_host(
+                    ROOT, {"GH_CONFIG_DIR": str(config)}
+                )
         self.assertEqual(host, "ghe.example.internal")
+
+    def test_isolated_github_checkout_ignores_sole_non_github_remote(self) -> None:
+        default_probe = SimpleNamespace(returncode=1, stdout="", stderr="")
+        names_probe = SimpleNamespace(returncode=0, stdout="origin\n", stderr="")
+        remote_probe = SimpleNamespace(
+            returncode=0, stdout="git@gitlab.example:owner/repo.git\n", stderr=""
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                operator.subprocess,
+                "run",
+                side_effect=[default_probe, names_probe, remote_probe],
+            ):
+                host = operator._github_pr_checkout_host(
+                    ROOT, {"GH_CONFIG_DIR": directory}
+                )
+        self.assertIsNone(host)
 
     def test_isolated_github_checkout_skips_non_github_origin_for_unique_github_remote(self) -> None:
         default_probe = SimpleNamespace(returncode=1, stdout="", stderr="")
@@ -1390,6 +1445,26 @@ class OperatorSignedTransportTests(unittest.TestCase):
             side_effect=[default_probe, names_probe, origin_probe, upstream_probe],
         ):
             host = operator._github_pr_checkout_host(ROOT)
+        self.assertEqual(host, "github.com")
+
+    def test_isolated_github_checkout_collapses_same_host_remotes(self) -> None:
+        default_probe = SimpleNamespace(returncode=1, stdout="", stderr="")
+        names_probe = SimpleNamespace(returncode=0, stdout="origin\nupstream\n", stderr="")
+        origin_probe = SimpleNamespace(
+            returncode=0, stdout="git@github.com:owner/fork.git\n", stderr=""
+        )
+        upstream_probe = SimpleNamespace(
+            returncode=0, stdout="git@github.com:owner/repo.git\n", stderr=""
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                operator.subprocess,
+                "run",
+                side_effect=[default_probe, names_probe, origin_probe, upstream_probe],
+            ):
+                host = operator._github_pr_checkout_host(
+                    ROOT, {"GH_CONFIG_DIR": directory}
+                )
         self.assertEqual(host, "github.com")
 
     def test_exempt_github_default_keyring_probe_reports_locked(self) -> None:
@@ -1702,6 +1777,32 @@ class OperatorSignedTransportTests(unittest.TestCase):
         environment = run.call_args.kwargs["environment"]
         self.assertEqual(environment["GH_REPO"], source["GH_REPO"])
         self.assertEqual(environment["GH_ENTERPRISE_TOKEN"], "fixture-enterprise-token")
+
+    def test_nonexempt_github_env_repo_survives_repo_like_body_value(self) -> None:
+        source = {"GH_REPO": "ghe.example.internal/owner/repo"}
+        with (
+            mock.patch.object(operator, "_trusted_owner_mode", return_value=True),
+            mock.patch.object(operator, "_safe_environment", return_value=source),
+            mock.patch.object(operator, "_require_operator_mutation"),
+            mock.patch.object(
+                operator, "_trusted_github_cli_path", return_value="/usr/bin/gh"
+            ),
+            mock.patch.object(
+                operator,
+                "_github_pr_view_auth_token",
+                return_value="fixture-enterprise-token",
+            ) as auth_token,
+            mock.patch.object(operator, "_run", return_value={"returncode": 0}) as run,
+        ):
+            operator.grabowski_github(
+                ["pr", "create", "--body", "--repo=github.com/other/repo"],
+                cwd=str(ROOT),
+            )
+        auth_token.assert_called_once_with(
+            "/usr/bin/gh", source, "ghe.example.internal"
+        )
+        environment = run.call_args.kwargs["environment"]
+        self.assertEqual(environment["GH_REPO"], source["GH_REPO"])
 
     def test_nonexempt_enterprise_checkout_uses_remote_host_for_isolated_auth(self) -> None:
         source = {"GH_HOST": "github.com"}

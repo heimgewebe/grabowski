@@ -2506,6 +2506,46 @@ def _github_pr_remote_names(working_directory: Path) -> list[str]:
     return names
 
 
+def _github_pr_known_hosts(source: dict[str, str]) -> set[str]:
+    known = {_GITHUB_PR_VIEW_DEFAULT_HOST}
+    explicit = source.get("GH_HOST", "").strip()
+    if explicit:
+        known.add(_github_pr_view_host({"GH_HOST": explicit}))
+    config_dir = source.get("GH_CONFIG_DIR", "").strip()
+    if config_dir:
+        root = Path(config_dir)
+    else:
+        xdg_config = source.get("XDG_CONFIG_HOME", "").strip()
+        if xdg_config:
+            root = Path(xdg_config) / "gh"
+        else:
+            home = source.get("HOME", str(HOME)).strip()
+            root = Path(home) / ".config" / "gh"
+    if not root.is_absolute():
+        raise RuntimeError("trusted GitHub config path is invalid")
+    path = root / "hosts.yml"
+    try:
+        metadata = path.stat()
+    except FileNotFoundError:
+        return known
+    except OSError as exc:
+        raise RuntimeError("trusted GitHub host catalog lookup failed") from exc
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 262_144:
+        raise RuntimeError("trusted GitHub host catalog is invalid")
+    try:
+        content = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise RuntimeError("trusted GitHub host catalog lookup failed") from exc
+    for line in content.splitlines():
+        if not line or line[0].isspace() or line.lstrip().startswith("#"):
+            continue
+        match = re.fullmatch(r"([A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?(?::[1-9][0-9]{0,4})?):(?:\s*#.*)?", line)
+        if match is None:
+            raise RuntimeError("trusted GitHub host catalog is invalid")
+        known.add(_github_pr_view_host({"GH_HOST": match.group(1)}))
+    return known
+
+
 def _github_pr_remote_host(working_directory: Path, remote: str) -> str | None:
     try:
         completed = subprocess.run(
@@ -2539,12 +2579,15 @@ def _github_pr_checkout_host(
     source = {} if source is None else source
     default_remote = _github_pr_default_remote(working_directory)
     names = _github_pr_remote_names(working_directory)
+    known_hosts = _github_pr_known_hosts(source)
     if default_remote is not None:
         if default_remote not in names:
             raise RuntimeError("trusted GitHub default remote is missing")
         host = _github_pr_remote_host(working_directory, default_remote)
         if host is None:
             raise RuntimeError("trusted GitHub default remote is invalid")
+        if not _github_pr_host_uses_standard_token(host) and host not in known_hosts:
+            raise RuntimeError("trusted GitHub default remote host is unknown")
         return host
     if not names:
         return None
@@ -2552,18 +2595,15 @@ def _github_pr_checkout_host(
     hosts = [(name, host) for name, host in hosts if host is not None]
     if not hosts:
         return None
-    if len(hosts) == 1:
-        return hosts[0][1]
-    explicit_host = source.get("GH_HOST", "").strip()
-    normalized_explicit = _github_pr_view_host(source) if explicit_host else None
-    recognized = [
-        (name, host)
-        for name, host in hosts
-        if _github_pr_host_uses_standard_token(host)
-        or (normalized_explicit is not None and host == normalized_explicit)
-    ]
-    if len(recognized) == 1:
-        return recognized[0][1]
+    recognized_hosts = {
+        host
+        for _, host in hosts
+        if _github_pr_host_uses_standard_token(host) or host in known_hosts
+    }
+    if not recognized_hosts:
+        return None
+    if len(recognized_hosts) == 1:
+        return next(iter(recognized_hosts))
     raise RuntimeError("trusted GitHub checkout remote is ambiguous")
 
 
@@ -6857,12 +6897,8 @@ def grabowski_github(
             trusted_github_cli, source_environment, github_host
         )
         environment_repository = None
-        if not any(
-            item in {"--repo", "-R"}
-            or item.startswith("--repo=")
-            or (item.startswith("-R") and item != "-R")
-            for item in arguments
-        ):
+        explicit_repository = _github_pr_repository_selector(arguments)
+        if explicit_repository is None:
             gh_repo = source_environment.get("GH_REPO", "").strip()
             if gh_repo:
                 environment_repository = gh_repo
