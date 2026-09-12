@@ -42,6 +42,24 @@ QUALITY_CLASSES = {"S", "A", "B", "C", "HARNESS", "CONTROLLER"}
 EFFORT_LEVELS = {"low", "medium", "high", "xhigh", "max"}
 PAID_ONLY_MODEL_IDS = frozenset({"claude-fable-5"})
 VERIFICATION_POLICIES = frozenset({"deterministic", "independent_review", "competition"})
+MANDATORY_INDEPENDENT_VERIFICATION_TASK_CLASSES = frozenset(
+    {"architecture", "complex-patch", "deep-debug", "migration"}
+)
+MANDATORY_INDEPENDENT_VERIFICATION_RISK_FLAGS = frozenset(
+    {
+        "concurrency",
+        "cross_repo",
+        "data_migration",
+        "deployment",
+        "destructive",
+        "high-risk",
+        "privilege",
+        "runtime",
+        "schema",
+        "security",
+        "security-sensitive",
+    }
+)
 POOL_STATUSES = {
     "unknown",
     "available",
@@ -2280,6 +2298,18 @@ def canonical_execution_route(
     controller_owned = set(catalog["policy"].get("controller_owned_task_classes", []))
     task = catalog["task_classes"].get(task_value)
     direct_review_task = bool(task and task.get("independent_review") is True)
+    verification_floor_reasons: list[str] = []
+    if task_value in MANDATORY_INDEPENDENT_VERIFICATION_TASK_CLASSES:
+        verification_floor_reasons.append(f"task_class:{task_value}")
+    if novelty_value == "high":
+        verification_floor_reasons.append("novelty:high")
+    verification_floor_reasons.extend(
+        f"risk_flag:{flag}"
+        for flag in sorted(
+            set(flags).intersection(MANDATORY_INDEPENDENT_VERIFICATION_RISK_FLAGS)
+        )
+    )
+    verification_floor_required = bool(verification_floor_reasons)
     if verification_policy is not None and (
         not isinstance(verification_policy, str)
         or verification_policy not in VERIFICATION_POLICIES
@@ -2297,10 +2327,14 @@ def canonical_execution_route(
                 "independent review task requires verification_policy=independent_review"
             )
         verification_policy_value = "independent_review"
-    elif review_value:
+    elif review_value or verification_floor_required:
         if verification_policy not in (None, "independent_review"):
+            if review_value:
+                raise CodingAgentRouterError(
+                    "need_review requires verification_policy=independent_review"
+                )
             raise CodingAgentRouterError(
-                "need_review requires verification_policy=independent_review"
+                "verification floor requires verification_policy=independent_review"
             )
         verification_policy_value = "independent_review"
     else:
@@ -2518,6 +2552,10 @@ def canonical_execution_route(
         "writer_route": writer_route,
         "effect_profile": effect_profile,
         "verification_policy": verification_policy_value,
+        "verification_floor": {
+            "required": verification_floor_required,
+            "reasons": verification_floor_reasons,
+        },
         "risk": risk,
         "executor_reason": executor_reason,
         "catalog_sha256": validation["catalog_sha256"],
@@ -2587,7 +2625,7 @@ def canonical_execution_route(
             "execution_authority",
             "candidate_correctness",
             "merge_readiness",
-            "need_for_external_agents",
+            "external_route_availability",
             "external_primary_authority",
         ],
     }

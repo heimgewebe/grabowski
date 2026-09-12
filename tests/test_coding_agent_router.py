@@ -1866,16 +1866,50 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertEqual(result["executor"], "controller")
         self.assertEqual(result["writer_route"], "grabowski-primary")
 
-    def test_verification_policy_is_an_independent_routing_axis(self) -> None:
-        deterministic = self._route("complex-patch", need_review=False)
-        self.assertEqual(deterministic["verification_policy"], "deterministic")
-        competition = self._route(
-            "complex-patch", need_review=False, verification_policy="competition"
+    def test_verification_floor_blocks_downgrades_but_keeps_low_risk_axis(self) -> None:
+        floored = self._route(
+            "complex-patch", need_review=False, novelty="medium", risk_flags=[]
         )
+        self.assertEqual(floored["verification_policy"], "independent_review")
+        self.assertTrue(floored["verification_floor"]["required"])
+        self.assertEqual(floored["verification_floor"]["reasons"], ["task_class:complex-patch"])
+        for policy in ("deterministic", "competition"):
+            with self.subTest(policy=policy):
+                with self.assertRaisesRegex(router.CodingAgentRouterError, "verification floor requires"):
+                    self._route("complex-patch", need_review=False, novelty="medium", risk_flags=[], verification_policy=policy)
+        high_novelty = self._route("bounded-patch", need_review=False, novelty="high", risk_flags=[])
+        self.assertEqual(high_novelty["verification_policy"], "independent_review")
+        self.assertEqual(high_novelty["verification_floor"]["reasons"], ["novelty:high"])
+        high_risk = self._route("bounded-patch", need_review=False, novelty="medium", risk_flags=["high-risk"])
+        self.assertEqual(high_risk["verification_policy"], "independent_review")
+        self.assertEqual(high_risk["verification_floor"]["reasons"], ["risk_flag:high-risk"])
+        established_critical = self._route(
+            "bounded-patch",
+            need_review=False,
+            novelty="medium",
+            risk_flags=["schema", "concurrency", "deployment"],
+        )
+        self.assertEqual(established_critical["verification_policy"], "independent_review")
+        self.assertEqual(
+            established_critical["verification_floor"]["reasons"],
+            ["risk_flag:concurrency", "risk_flag:deployment", "risk_flag:schema"],
+        )
+        private_context = self._route(
+            "bounded-patch",
+            need_review=False,
+            novelty="medium",
+            risk_flags=["private-context", "user_data"],
+        )
+        self.assertEqual(private_context["verification_policy"], "deterministic")
+        self.assertFalse(private_context["verification_floor"]["required"])
+        deterministic = self._route("bounded-patch", need_review=False, novelty="low", risk_flags=[])
+        self.assertEqual(deterministic["verification_policy"], "deterministic")
+        self.assertFalse(deterministic["verification_floor"]["required"])
+        competition = self._route("bounded-patch", need_review=False, novelty="low", risk_flags=[], verification_policy="competition")
         self.assertEqual(competition["verification_policy"], "competition")
         self.assertEqual(competition["executor"], deterministic["executor"])
         with self.assertRaisesRegex(router.CodingAgentRouterError, "need_review requires"):
-            self._route("complex-patch", need_review=True, verification_policy="competition")
+            self._route("bounded-patch", need_review=True, novelty="low", risk_flags=[], verification_policy="competition")
 
     def test_request_validation_rejects_coercive_values(self) -> None:
         with self.assertRaisesRegex(router.CodingAgentRouterError, "boolean"):

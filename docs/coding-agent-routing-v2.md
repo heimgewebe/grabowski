@@ -132,6 +132,10 @@ Deterministische Prüfungen plus unabhängiger read-only Review, wenn Aufgabe od
 
 Explizite Review-Taskklassen wie `independent-review`, `critical-review` und `security-review` erzwingen diese Policy.
 
+Zusätzlich gilt eine fail-closed Verification-Floor für Implementierungsarbeit: `architecture`, `complex-patch`, `deep-debug` und `migration`, jede Aufgabe mit `novelty=high` sowie etablierte technische Hochrisiko-Flags (`security`, `security-sensitive`, `high-risk`, `runtime`, `deployment`, `schema`, `concurrency`, `data_migration`, `privilege`, `cross_repo`, `destructive`) dürfen nicht unter `independent_review` herabgestuft werden. `need_review=false`, `verification_policy=deterministic` oder `verification_policy=competition` sind kein Bypass. Ein expliziter Widerspruch blockiert; fehlt eine ausführbare unabhängige Reviewerroute, bleibt `review_gap` sichtbar statt still auf deterministische Prüfung zurückzufallen.
+
+Sensitive Kontextflags wie `private-context` und `user_data` lösen absichtlich nicht automatisch eine externe Reviewroute aus: Provider-Unabhängigkeit darf keine Datenfreigabe erzwingen. Dafür ist ein eigener sicherer/redigierter Verifikationspfad nötig. Diese Floor betrifft Verification, nicht Writerautorität: Der Controller darf weiter selbst implementieren, und ein lane-gebundener Scoped Writer bleibt zulässig. Ein zusätzlicher Contrast-/Competition-Lauf ist additive Gegenarbeit und ersetzt den unabhängigen Reviewer nicht.
+
 ### competition
 
 Expliziter Vergleich mehrerer Kandidaten oder Ansätze. Competition bleibt ein Verification-/Vergleichsmodus. Sie ändert weder Lane-Ownership noch Integrationsautorität.
