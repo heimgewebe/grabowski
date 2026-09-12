@@ -2346,7 +2346,52 @@ def _github_pr_uses_isolated_auth(arguments: list[str]) -> bool:
     )
 
 
+def _github_pr_checkout_remote_name(working_directory: Path) -> str:
+    try:
+        completed = subprocess.run(
+            [
+                "/usr/bin/git",
+                "-C",
+                str(working_directory),
+                "config",
+                "--local",
+                "--get-regexp",
+                r"^remote\..*\.gh-resolved$",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            text=True,
+            env=_git_environment(),
+            timeout=_GITHUB_PR_VIEW_AUTH_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("trusted GitHub default remote lookup failed") from exc
+    if completed.returncode not in {0, 1}:
+        raise RuntimeError("trusted GitHub default remote lookup failed")
+    defaults: list[str] = []
+    for line in completed.stdout.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2 or parts[1].strip() != "base":
+            continue
+        key = parts[0].strip()
+        prefix = "remote."
+        suffix = ".gh-resolved"
+        if not key.startswith(prefix) or not key.endswith(suffix):
+            raise RuntimeError("trusted GitHub default remote is invalid")
+        remote = key[len(prefix) : -len(suffix)]
+        if not remote or any(character.isspace() for character in remote):
+            raise RuntimeError("trusted GitHub default remote is invalid")
+        defaults.append(remote)
+    if not defaults:
+        return "origin"
+    if len(defaults) != 1:
+        raise RuntimeError("trusted GitHub default remote is ambiguous")
+    return defaults[0]
+
+
 def _github_pr_checkout_host(working_directory: Path) -> str | None:
+    remote = _github_pr_checkout_remote_name(working_directory)
     try:
         completed = subprocess.run(
             [
@@ -2356,7 +2401,7 @@ def _github_pr_checkout_host(working_directory: Path) -> str | None:
                 "remote",
                 "get-url",
                 "--all",
-                "origin",
+                remote,
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -2398,6 +2443,8 @@ def _github_pr_target_host(
             break
         if item.startswith("-R") and item != "-R":
             repository = item[2:]
+            if repository.startswith("="):
+                repository = repository[1:]
             break
         index += 1
     if repository is None:

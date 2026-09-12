@@ -1233,6 +1233,7 @@ class OperatorSignedTransportTests(unittest.TestCase):
             ["pr", "list", "--repo", "ghe.example.internal/owner/repo"],
             ["pr", "list", "--repo=ghe.example.internal/owner/repo"],
             ["pr", "list", "-Rghe.example.internal/owner/repo"],
+            ["pr", "list", "-R=ghe.example.internal/owner/repo"],
         ):
             with self.subTest(arguments=arguments):
                 self.assertEqual(
@@ -1279,15 +1280,16 @@ class OperatorSignedTransportTests(unittest.TestCase):
             stdout="git@ghe.example.internal:owner/repo.git\n",
             stderr="",
         )
+        default_probe = SimpleNamespace(returncode=1, stdout="", stderr="")
         with mock.patch.object(
-            operator.subprocess, "run", return_value=completed
+            operator.subprocess, "run", side_effect=[default_probe, completed]
         ) as run:
             host = operator._github_pr_target_host(
                 ["pr", "list"], {}, working_directory=ROOT
             )
         self.assertEqual(host, "ghe.example.internal")
         self.assertEqual(
-            run.call_args.args[0],
+            run.call_args_list[1].args[0],
             [
                 "/usr/bin/git",
                 "-C",
@@ -1296,6 +1298,33 @@ class OperatorSignedTransportTests(unittest.TestCase):
                 "get-url",
                 "--all",
                 "origin",
+            ],
+        )
+
+    def test_isolated_github_checkout_uses_gh_default_remote(self) -> None:
+        default_probe = SimpleNamespace(
+            returncode=0, stdout="remote.upstream.gh-resolved base\n", stderr=""
+        )
+        remote_probe = SimpleNamespace(
+            returncode=0,
+            stdout="git@ghe.example.internal:owner/repo.git\n",
+            stderr="",
+        )
+        with mock.patch.object(
+            operator.subprocess, "run", side_effect=[default_probe, remote_probe]
+        ) as run:
+            host = operator._github_pr_checkout_host(ROOT)
+        self.assertEqual(host, "ghe.example.internal")
+        self.assertEqual(
+            run.call_args_list[1].args[0],
+            [
+                "/usr/bin/git",
+                "-C",
+                str(ROOT),
+                "remote",
+                "get-url",
+                "--all",
+                "upstream",
             ],
         )
 
