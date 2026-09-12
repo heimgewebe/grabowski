@@ -97,15 +97,19 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "publication-pending-is-local",
-        "Treat platform_publication_pending as nonblocking by default; fail closed only the operation whose required tool or schema field is not visible in the active client catalog, and seek fresh request-bound catalog evidence rather than blocking unrelated Grabowski work.",
+        "Treat platform_publication_pending as operation-local: proceed unless required tool/schema is absent from active catalog; otherwise seek fresh request-bound evidence.",
     ),
     (
         "transport-roundtrip-before-mutation",
-        "Invoke a mutating MCP tool normally. If a shared_unlabeled call returns a fresh transport challenge, continue with grip_run transport-roundtrip action=execute carrying only challenge_receipt_sha256; the server retains the exact target briefly and atomically binds reservation, consumption, and dispatch. A stable client-declared scope may action=ack and then invoke the unchanged target once. Explicit action=begin with target_tool_name and target_arguments remains available for compatibility. A later ambiguous mutation still requires target readback before retry.",
+        "Invoke mutations normally. On fresh shared_unlabeled challenge, use grip_run transport-roundtrip action=execute with only challenge_receipt_sha256; server retains and binds the exact target. Stable scope may action=ack then invoke unchanged target once. action=begin with target_tool_name/target_arguments remains for compatibility. Read back ambiguous effects before retry.",
     ),
     (
         "typed-operation-preference",
         "Prefer typed operations to generic terminal, Git, or GitHub calls when both can express the effect.",
+    ),
+    (
+        "github-connector-first",
+        "GitHub PR reads and typed PR mutations: platform GitHub connector first; local gh only after observed connector unavailability or authorization failure. Never create GHA helper workflows, observer lanes, or coordination leases for local gh auth/keyring recovery. Merges require expected_head_sha, GitHub rulesets/branch protection, and read back state.",
     ),
     (
         "goal-fidelity-before-continuation",
@@ -117,7 +121,7 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "convergence-before-high-risk-closure",
-        "Bind a risk-adaptive system_convergence_plan at work admission when classification evidence is available. Ordinary work or delivery closeout is not itself a systemic-convergence claim. Before claiming systemic convergence, resolve target criticality when the plan says classification_required; when systemic_closure_gate=hard, call grip_run with convergence-assess on a hash-bound request and require terminally_closed, binding its receipt into the systemic completion evidence. A nonterminal assessment blocks only the systemic-convergence claim and grants no mutation authority.",
+        "At admission bind risk-adaptive system_convergence_plan when classification evidence exists. Work/delivery closeout is not systemic convergence. Before claiming it, resolve criticality if classification_required; if systemic_closure_gate=hard, grip_run convergence-assess a hash-bound request, require terminally_closed, and bind its receipt into completion evidence. A nonterminal assessment blocks only that claim and grants no mutation authority.",
     ),
     (
         "no-authority-escalation",
