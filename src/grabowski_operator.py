@@ -2401,13 +2401,17 @@ def _github_pr_target_host(
             break
         index += 1
     if repository is None:
-        if source.get("GH_HOST", "").strip():
+        gh_repo = source.get("GH_REPO", "").strip()
+        if gh_repo:
+            repository = gh_repo
+        elif source.get("GH_HOST", "").strip():
             return _github_pr_view_host(source)
-        if working_directory is not None:
+        elif working_directory is not None:
             checkout_host = _github_pr_checkout_host(working_directory)
             if checkout_host is not None:
                 return checkout_host
-        return _github_pr_view_host(source)
+        else:
+            return _github_pr_view_host(source)
     selector = repository.strip()
     parts = selector.split("/")
     if len(parts) == 2 and all(parts):
@@ -2445,12 +2449,17 @@ def _validated_github_pr_view_token(value: Any) -> str:
     return token
 
 
+def _github_pr_host_uses_standard_token(host: str) -> bool:
+    hostname = host.rsplit(":", 1)[0]
+    return hostname == _GITHUB_PR_VIEW_DEFAULT_HOST or hostname.endswith(".ghe.com")
+
+
 def _github_pr_view_direct_token(
     source: dict[str, str], host: str
 ) -> str | None:
     keys = (
         ("GH_TOKEN", "GITHUB_TOKEN")
-        if host == _GITHUB_PR_VIEW_DEFAULT_HOST
+        if _github_pr_host_uses_standard_token(host)
         else ("GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
     )
     for key in keys:
@@ -2641,7 +2650,9 @@ def _github_pr_view_isolated_config_path() -> str:
     return str(path)
 
 
-def _github_pr_view_environment(*, host: str, token: str) -> dict[str, str]:
+def _github_pr_view_environment(
+    *, host: str, token: str, repository: str | None = None
+) -> dict[str, str]:
     isolated = _github_pr_view_isolated_config_path()
     credential = _validated_github_pr_view_token(token)
     environment = {
@@ -2660,10 +2671,16 @@ def _github_pr_view_environment(*, host: str, token: str) -> dict[str, str]:
     # Bind exactly one credential family to the server-selected host. The
     # network process receives neither the user's gh config/keyring paths nor
     # proxy/browser/editor/loader overrides.
-    if host == _GITHUB_PR_VIEW_DEFAULT_HOST:
+    if _github_pr_host_uses_standard_token(host):
         environment["GH_TOKEN"] = credential
     else:
         environment["GH_ENTERPRISE_TOKEN"] = credential
+    if repository is not None:
+        selector = repository.strip()
+        parts = selector.split("/")
+        if len(parts) not in {2, 3} or not all(parts):
+            raise RuntimeError("trusted GitHub repository selector is invalid")
+        environment["GH_REPO"] = selector
     return environment
 
 def _resolve_cwd(cwd: str | None) -> Path:
@@ -6667,8 +6684,18 @@ def grabowski_github(
         github_token = _github_pr_view_auth_token(
             trusted_github_cli, source_environment, github_host
         )
+        environment_repository = None
+        if not any(
+            item in {"--repo", "-R"}
+            or item.startswith("--repo=")
+            or (item.startswith("-R") and item != "-R")
+            for item in arguments
+        ):
+            gh_repo = source_environment.get("GH_REPO", "").strip()
+            if gh_repo:
+                environment_repository = gh_repo
         environment = _github_pr_view_environment(
-            host=github_host, token=github_token
+            host=github_host, token=github_token, repository=environment_repository
         )
     else:
         environment = None
