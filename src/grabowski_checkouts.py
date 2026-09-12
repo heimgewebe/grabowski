@@ -3203,7 +3203,7 @@ def _binding_identity_rebind_state_for_key(
 def grabowski_checkout_binding_identity_rebind_preview(
     checkout_key: str,
 ) -> dict[str, Any]:
-    """Preview one safe lifecycle identity rebind for an existing renamed checkout."""
+    """Preview one fail-closed identity repair for branch, path, or retention-converged lifecycle drift."""
     operator._require_operator_capability("git_cli")
     operator._require_operator_capability("github_cli")
     return _binding_identity_rebind_state_for_key(
@@ -3486,7 +3486,7 @@ def grabowski_checkout_binding_identity_rebind_apply(
     preview_created_at_unix: int,
     confirmation: str,
 ) -> dict[str, Any]:
-    """CAS-rebind lifecycle and retention identity after an exact safe preview."""
+    """CAS-converge stale lifecycle/retention identity after an exact supported preview."""
     operator._require_operator_mutation("resource_lease")
     operator._require_operator_capability("git_cli")
     operator._require_operator_capability("github_cli")
