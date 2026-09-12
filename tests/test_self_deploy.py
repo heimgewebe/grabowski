@@ -1227,6 +1227,11 @@ class SelfDeployToolTests(unittest.TestCase):
             "_refresh_canonical_origin_main",
             side_effect=lambda *_args: sequence.append("refresh") or refresh_receipt,
         ) as refresh, patch.object(
+            SELF_DEPLOY.privileged,
+            "ensure_rootbroker_authority",
+            side_effect=lambda *_args: sequence.append("authority")
+            or {"success": True, "outcome": "refreshed"},
+        ) as authority, patch.object(
             SELF_DEPLOY,
             "_materialize_auto_deploy_source",
             side_effect=lambda *_args: sequence.append("materialize")
@@ -1249,8 +1254,9 @@ class SelfDeployToolTests(unittest.TestCase):
             return_value=nullcontext(),
         ), patch.object(SELF_DEPLOY, "_append_deploy_audit"):
             result = SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
-        self.assertEqual(sequence, ["refresh", "materialize"])
+        self.assertEqual(sequence, ["refresh", "authority", "materialize"])
         refresh.assert_called_once_with(expected, refresh_candidate)
+        authority.assert_called_once_with(expected)
         materialize.assert_called_once_with(expected)
         self.assertTrue(result["already_scheduled"])
         self.assertEqual(result["automatic_source"], materialization)
