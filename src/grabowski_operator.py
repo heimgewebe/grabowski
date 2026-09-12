@@ -6943,8 +6943,8 @@ def grabowski_github(
             trusted_github_cli, source_environment, github_host
         )
         environment_repository = None
-        explicit_repository = _github_pr_repository_selector(arguments)
-        if explicit_repository is None:
+        explicit_repository, positional_host = _github_pr_target_selectors(arguments)
+        if explicit_repository is None and positional_host is None:
             gh_repo = source_environment.get("GH_REPO", "").strip()
             if gh_repo:
                 environment_repository = gh_repo

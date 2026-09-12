@@ -1340,6 +1340,46 @@ class OperatorSignedTransportTests(unittest.TestCase):
             self.assertEqual(environment["GH_TOKEN"], "fixture-token")
             self.assertEqual(environment["HOME"], str(operator._GITHUB_PR_VIEW_ISOLATED_CONFIG_PATH))
 
+    def test_github_wrapper_positional_pr_url_drops_ambient_repo(self) -> None:
+        url = "https://ghe.example.internal/owner/repo/pull/1031"
+        source_environment = {
+            "GH_HOST": "github.com",
+            "GH_REPO": "github.com/ambient/repo",
+        }
+        with (
+            mock.patch.object(operator, "_trusted_owner_mode", return_value=True),
+            mock.patch.object(operator, "_require_operator_mutation"),
+            mock.patch.object(
+                operator, "_trusted_github_cli_path", return_value="/usr/bin/gh"
+            ),
+            mock.patch.object(
+                operator, "_safe_environment", return_value=source_environment
+            ),
+            mock.patch.object(
+                operator, "_github_pr_view_auth_token", return_value="fixture-token"
+            ) as auth_token,
+            mock.patch.object(operator, "_run", return_value={"returncode": 0}) as run,
+        ):
+            operator.grabowski_github(["pr", "view", url], cwd=str(ROOT))
+        auth_token.assert_called_once_with(
+            "/usr/bin/gh", source_environment, "ghe.example.internal"
+        )
+        environment = run.call_args.kwargs["environment"]
+        self.assertEqual(environment["GH_HOST"], "ghe.example.internal")
+        self.assertEqual(environment["GH_ENTERPRISE_TOKEN"], "fixture-token")
+        self.assertNotIn("GH_TOKEN", environment)
+        self.assertNotIn("GH_REPO", environment)
+
+    def test_isolated_github_positional_pr_url_in_option_value_is_not_target(self) -> None:
+        source = {"GH_HOST": "github.com"}
+        self.assertEqual(
+            operator._github_pr_target_host(
+                ["pr", "edit", "1031", "--body", "https://ghe.example.internal/owner/repo/pull/2"],
+                source,
+            ),
+            "github.com",
+        )
+
     def test_isolated_github_repo_uses_last_repeated_selector(self) -> None:
         source = {"GH_HOST": "github.com"}
         self.assertEqual(
