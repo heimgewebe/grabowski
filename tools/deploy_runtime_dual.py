@@ -4741,7 +4741,10 @@ def require_operator_authority_anchored(
         "operator_service": Path("systemd/grabowski-operator.service.example"),
     }
     observed_artifacts = attestation.get("artifact_sha256")
-    if not isinstance(observed_artifacts, dict) or set(observed_artifacts) != set(relative_artifacts):
+    if (
+        not isinstance(observed_artifacts, dict)
+        or not set(relative_artifacts).issubset(observed_artifacts)
+    ):
         core.fail(
             "Operator-Authority-Attestation Artefaktbindung ist unvollständig",
             phase="operator-authority-attestation",
@@ -4752,9 +4755,33 @@ def require_operator_authority_anchored(
         ).hexdigest()
         for label, relative in relative_artifacts.items()
     }
-    if observed_artifacts != expected_artifacts:
+    if any(
+        observed_artifacts.get(label) != digest
+        for label, digest in expected_artifacts.items()
+    ):
         core.fail(
             "Operator-Authority-Attestation bindet nicht die Ziel-Artefakte",
+            phase="operator-authority-attestation",
+        )
+    cutover_helper_blob = core.git_show(
+        repo, expected_head, Path("tools/grabowski_rootbroker_cutover.py")
+    )
+    authority_closure_digests = {
+        hashlib.sha256(core.git_show(repo, expected_head, relative)).hexdigest()
+        for relative in _rootbroker_artifact_source_paths(cutover_helper_blob)
+    }
+    observed_artifact_digests = list(observed_artifacts.values())
+    if (
+        any(
+            not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or digest not in authority_closure_digests
+            for digest in observed_artifact_digests
+        )
+        or len(set(observed_artifact_digests)) != len(observed_artifact_digests)
+    ):
+        core.fail(
+            "Operator-Authority-Attestation bindet Artefakte außerhalb der Rootbroker-Closure",
             phase="operator-authority-attestation",
         )
 
@@ -4825,11 +4852,11 @@ def require_operator_authority_anchored(
             if isinstance(action, dict)
         }
     )
-    expected_action_names = {"operator_power_argv", *expected_action_contracts}
+    required_action_names = {"operator_power_argv", *expected_action_contracts}
     observed_actions = attestation.get("action_sha256")
     if (
         not isinstance(observed_actions, dict)
-        or set(observed_actions) != expected_action_names
+        or not required_action_names.issubset(observed_actions)
     ):
         core.fail(
             "Operator-Authority-Attestation Aktionsbindung ist unvollständig",
@@ -4839,8 +4866,15 @@ def require_operator_authority_anchored(
         observed_actions[name] != _canonical_line_sha256(contract)
         for name, contract in expected_action_contracts.items()
     )
+    extra_action_digest_mismatch = any(
+        not isinstance(actions.get(name), dict)
+        or digest != _canonical_line_sha256(actions[name])
+        for name, digest in observed_actions.items()
+        if name not in required_action_names
+    )
     if (
         action_digest_mismatch
+        or extra_action_digest_mismatch
         or re.fullmatch(
             r"[0-9a-f]{64}", str(observed_actions["operator_power_argv"])
         )
