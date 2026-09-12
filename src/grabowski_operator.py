@@ -2643,15 +2643,71 @@ _GITHUB_PR_SWITCH_FLAGS: dict[str, frozenset[str]] = {
 }
 
 
-def _github_pr_isolated_auth_subcommand(arguments: list[str]) -> str | None:
-    if len(arguments) < 2 or arguments[0] != "pr":
+def _github_pr_repository_flag_at(
+    arguments: list[str], index: int
+) -> tuple[str, int] | None:
+    item = arguments[index]
+    if item in _GITHUB_PR_REPOSITORY_FLAGS:
+        if index + 1 >= len(arguments):
+            raise RuntimeError("trusted GitHub repository selector is invalid")
+        repository = arguments[index + 1]
+        if not repository:
+            raise RuntimeError("trusted GitHub repository selector is invalid")
+        return repository, 2
+    if item.startswith("--repo="):
+        repository = item.split("=", 1)[1]
+        if not repository:
+            raise RuntimeError("trusted GitHub repository selector is invalid")
+        return repository, 1
+    if item.startswith("-R") and item != "-R":
+        repository = item[2:]
+        if repository.startswith("="):
+            repository = repository[1:]
+        if not repository:
+            raise RuntimeError("trusted GitHub repository selector is invalid")
+        return repository, 1
+    return None
+
+
+def _github_pr_isolated_auth_arguments(arguments: list[str]) -> list[str] | None:
+    inherited_repositories: list[str] = []
+    index = 0
+    while index < len(arguments) and arguments[index] != "pr":
+        repository_flag = _github_pr_repository_flag_at(arguments, index)
+        if repository_flag is None:
+            return None
+        repository, consumed = repository_flag
+        inherited_repositories.append(repository)
+        index += consumed
+    if index >= len(arguments) or arguments[index] != "pr":
         return None
-    subcommand = _GITHUB_PR_ISOLATED_AUTH_ALIASES.get(arguments[1], arguments[1])
-    return subcommand if subcommand in _GITHUB_PR_ISOLATED_AUTH_COMMANDS else None
+    index += 1
+    while index < len(arguments):
+        repository_flag = _github_pr_repository_flag_at(arguments, index)
+        if repository_flag is None:
+            break
+        repository, consumed = repository_flag
+        inherited_repositories.append(repository)
+        index += consumed
+    if index >= len(arguments):
+        return None
+    subcommand = _GITHUB_PR_ISOLATED_AUTH_ALIASES.get(arguments[index], arguments[index])
+    if subcommand not in _GITHUB_PR_ISOLATED_AUTH_COMMANDS:
+        return None
+    normalized = ["pr", subcommand]
+    for repository in inherited_repositories:
+        normalized.extend(["--repo", repository])
+    normalized.extend(arguments[index + 1 :])
+    return normalized
+
+
+def _github_pr_isolated_auth_subcommand(arguments: list[str]) -> str | None:
+    normalized = _github_pr_isolated_auth_arguments(arguments)
+    return None if normalized is None else normalized[1]
 
 
 def _github_pr_uses_isolated_auth(arguments: list[str]) -> bool:
-    return _github_pr_isolated_auth_subcommand(arguments) is not None
+    return _github_pr_isolated_auth_arguments(arguments) is not None
 
 
 def _github_pr_positional_url_host(value: str) -> str:
@@ -2680,9 +2736,11 @@ def _github_pr_positional_url_host(value: str) -> str:
 def _github_pr_target_selectors(
     arguments: list[str],
 ) -> tuple[str | None, str | None, bool]:
-    subcommand = _github_pr_isolated_auth_subcommand(arguments)
-    if subcommand is None:
+    normalized_arguments = _github_pr_isolated_auth_arguments(arguments)
+    if normalized_arguments is None:
         return None, None, False
+    arguments = normalized_arguments
+    subcommand = arguments[1]
     value_flags = _GITHUB_PR_VALUE_FLAGS[subcommand]
     switch_flags = _GITHUB_PR_SWITCH_FLAGS[subcommand]
     repository: str | None = None
@@ -2696,20 +2754,14 @@ def _github_pr_target_selectors(
             options_done = True
             index += 1
             continue
-        if not options_done and item in _GITHUB_PR_REPOSITORY_FLAGS:
-            if index + 1 >= len(arguments):
-                raise RuntimeError("trusted GitHub repository selector is invalid")
-            repository = arguments[index + 1]
-            index += 2
-            continue
+        if not options_done:
+            repository_flag = _github_pr_repository_flag_at(arguments, index)
+            if repository_flag is not None:
+                repository, consumed = repository_flag
+                index += consumed
+                continue
         if not options_done and item.startswith("--"):
             flag, separator, attached = item.partition("=")
-            if flag == "--repo":
-                if not separator:
-                    raise RuntimeError("trusted GitHub repository selector is invalid")
-                repository = attached
-                index += 1
-                continue
             if flag in value_flags:
                 if separator:
                     index += 1
@@ -2727,14 +2779,6 @@ def _github_pr_target_selectors(
                 continue
             raise RuntimeError("trusted GitHub PR option is unsupported for host resolution")
         if not options_done and item.startswith("-") and item != "-":
-            if item.startswith("-R"):
-                repository = item[2:]
-                if repository.startswith("="):
-                    repository = repository[1:]
-                if not repository:
-                    raise RuntimeError("trusted GitHub repository selector is invalid")
-                index += 1
-                continue
             short_flag = item[:2]
             if short_flag in value_flags:
                 if len(item) == 2:

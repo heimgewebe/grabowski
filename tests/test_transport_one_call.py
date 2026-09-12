@@ -1273,6 +1273,40 @@ class OperatorSignedTransportTests(unittest.TestCase):
                     "ghe.example.internal",
                 )
 
+    def test_isolated_github_inherited_repo_positions_use_canonical_auth_policy(self) -> None:
+        source = {"GH_HOST": "github.com"}
+        repository = "ghe.example.internal/owner/repo"
+        for arguments in (
+            ["-R", repository, "pr", "list"],
+            ["--repo=" + repository, "pr", "list"],
+            ["pr", "-R", repository, "list"],
+            ["pr", "--repo=" + repository, "list"],
+        ):
+            with self.subTest(arguments=arguments):
+                self.assertTrue(operator._github_pr_uses_isolated_auth(arguments))
+                self.assertEqual(
+                    operator._github_pr_repository_selector(arguments), repository
+                )
+                self.assertEqual(
+                    operator._github_pr_target_host(arguments, source),
+                    "ghe.example.internal",
+                )
+        self.assertEqual(
+            operator._github_pr_repository_selector(
+                [
+                    "-R",
+                    "first.example/owner/repo",
+                    "pr",
+                    "--repo",
+                    "second.example/owner/repo",
+                    "list",
+                    "-R",
+                    repository,
+                ]
+            ),
+            repository,
+        )
+
     def test_isolated_github_positional_pr_url_selects_url_host_first(self) -> None:
         source = {"GH_HOST": "github.com"}
         url = "https://ghe.example.internal/owner/repo/pull/1031"
@@ -1351,6 +1385,46 @@ class OperatorSignedTransportTests(unittest.TestCase):
         self.assertEqual(environment["GH_HOST"], "github.com")
         self.assertEqual(environment["GH_TOKEN"], "fixture-token")
         self.assertNotIn("GH_ENTERPRISE_TOKEN", environment)
+
+    def test_github_wrapper_inherited_repo_positions_use_isolated_environment(self) -> None:
+        repository = "ghe.example.internal/owner/repo"
+        source_environment = {
+            "GH_HOST": "github.com",
+            "HTTPS_PROXY": "http://ambient.invalid",
+        }
+        for arguments in (
+            ["-R", repository, "pr", "list"],
+            ["pr", "-R", repository, "list"],
+        ):
+            with self.subTest(arguments=arguments):
+                with (
+                    mock.patch.object(operator, "_trusted_owner_mode", return_value=True),
+                    mock.patch.object(operator, "_safe_environment", return_value=source_environment),
+                    mock.patch.object(operator, "_require_operator_mutation"),
+                    mock.patch.object(
+                        operator, "_trusted_github_cli_path", return_value="/usr/bin/gh"
+                    ),
+                    mock.patch.object(
+                        operator,
+                        "_github_pr_view_auth_token",
+                        return_value="fixture-enterprise-token",
+                    ) as auth_token,
+                    mock.patch.object(
+                        operator, "_run", return_value={"returncode": 0}
+                    ) as run,
+                ):
+                    operator.grabowski_github(arguments, cwd=str(ROOT))
+                auth_token.assert_called_once_with(
+                    "/usr/bin/gh", source_environment, "ghe.example.internal"
+                )
+                environment = run.call_args.kwargs["environment"]
+                self.assertEqual(
+                    environment["GH_ENTERPRISE_TOKEN"], "fixture-enterprise-token"
+                )
+                self.assertNotIn("GH_TOKEN", environment)
+                self.assertNotIn("GH_REPO", environment)
+                self.assertNotIn("HTTPS_PROXY", environment)
+                self.assertEqual(run.call_args.args[0][1:], arguments)
 
     def test_isolated_github_positional_pr_url_rejects_unsafe_shapes(self) -> None:
         unsafe_urls = (
