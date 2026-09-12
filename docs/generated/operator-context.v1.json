@@ -875,10 +875,10 @@
     },
     {
       "category": "checkout-lifecycle",
-      "description": "Preview one safe lifecycle identity rebind for an existing renamed checkout.",
+      "description": "Preview one fail-closed identity repair for branch, path, or retention-converged lifecycle drift.",
       "effects": [],
       "id": "grabowski_checkout_binding_identity_rebind_preview",
-      "purpose": "Preview one clean, coordination-free and remote-secured existing checkout whose current branch name differs from its active lifecycle binding.",
+      "purpose": "Preview one clean, coordination-free and remote-secured existing checkout for a supported identity repair: branch rename, repo-path canonicalization, or lifecycle catch-up when retention already matches current Git identity.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
@@ -886,14 +886,14 @@
     },
     {
       "category": "checkout-lifecycle",
-      "description": "CAS-rebind lifecycle and retention identity after an exact safe preview.",
+      "description": "CAS-converge stale lifecycle/retention identity after an exact supported preview.",
       "effects": [
         "audit-append",
         "resource-lease",
         "state-change"
       ],
       "id": "grabowski_checkout_binding_identity_rebind_apply",
-      "purpose": "CAS-update only lifecycle and retention expected head/branch after exact branch-rename preview and current retention revalidation.",
+      "purpose": "CAS-converge only stale lifecycle/retention repo, head, or branch fields after an exact supported identity-rebind preview and fresh retention/coordination revalidation.",
       "read_only": false,
       "reversibility": "compare-and-swap-state-transition-with-retained-audit-evidence",
       "risk_class": "medium",
@@ -2071,20 +2071,6 @@
       "tool": "grabowski_resource_list"
     },
     {
-      "category": "task",
-      "description": "Reconcile persistent tasks after process loss or host restart.",
-      "effects": [
-        "state-refresh",
-        "lease-release"
-      ],
-      "id": "grabowski_task_reconcile",
-      "purpose": "Legacy compatibility entrypoint; refreshes state only and never resumes processes.",
-      "read_only": false,
-      "reversibility": "conditional",
-      "risk_class": "medium",
-      "tool": "grabowski_task_reconcile"
-    },
-    {
       "category": "artifact",
       "description": "Return regular-file metadata and SHA-256 for one local or fleet artifact.",
       "effects": [],
@@ -2982,7 +2968,6 @@
       "grabowski_resource_release",
       "grabowski_resource_inspect",
       "grabowski_resource_list",
-      "grabowski_task_reconcile",
       "grabowski_artifact_stat",
       "grabowski_artifact_push",
       "grabowski_artifact_pull",
@@ -3574,7 +3559,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "68d16ce357af3ae69564960ffb37482aaee5d327ad3d8484d462dc6fd13a2ace"
+      "sha256": "1fd4e986a104b5d30575e52faa3c4d9ec6b9a1405996de435b10719020b86591"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3582,7 +3567,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "f65d5f4345da0bba5c28ebd9951e52ecf326429ba2657b89155d7b137c54fdbc"
+      "sha256": "75ac50665221bcd87dc459b3c71e70363eabf265c626c0590c069afd8d88808e"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
@@ -3615,7 +3600,7 @@
       "src/grabowski_checkout_identity.py": "377ca0a5396df74023cff263a7ae16da94d1c31a887772c3abb877961f4e5fd5",
       "src/grabowski_checkout_terminal_reconciliation.py": "fbe3f0a0778c006a76ab5d44734c6d06988fd0a0cda2e931b39a5e0a0f4a41b2",
       "src/grabowski_checkout_terminal_sources.py": "56e65c901e7b5ba5a6b9d764617b709cff14dc1d3d852244beff5ac5cadce32b",
-      "src/grabowski_checkouts.py": "e519cc9f2b4ff0b67e6e73d748c89499fe028876b3fcb9c1df989eda9c8a5145",
+      "src/grabowski_checkouts.py": "e6779e6469f6af588b4dfc0c0d51a85d0251cc97e156c6572e80e61bbc6ee330",
       "src/grabowski_chronik.py": "68785720fc9dac258b493011f99d5568ef1ca5543e21eee853e6d8e6c1616c17",
       "src/grabowski_client_snapshot.py": "777d9aa6d4bd964e7fdbb923d82586d186f9e0340e51b8e4b1140cae1e863eec",
       "src/grabowski_coding_agent_catalog_data.py": "2e9b3163bf93f58f5c2848813e51d1cf0f13c59dc071eb678a11657c4bb645a2",
@@ -3700,7 +3685,7 @@
       "src/grabowski_systemkatalog.py": "4fefcfd0b5ea3b68d37b6a95d27516799cbf5c2ada14494c3b4c17688f98585d",
       "src/grabowski_task_attention.py": "a16d4b045bef23bf78ad3df0c4c58d91a304dc9a83b6e757fb1b0f88754ad6f3",
       "src/grabowski_task_reconcile.py": "64dc6195c9d0cb3435d192e4715a0d4d5679b9f1904057308366f4e2f2e9bbea",
-      "src/grabowski_tasks.py": "3421c594b7f4ca625b2ff3fe541e1b9a6e8f1f5c22a9031c837f4f60b4586e37",
+      "src/grabowski_tasks.py": "187de0d78bb078ec1bb6491d7086b04899cf40480dd5c478e9ef059009dd2d9d",
       "src/grabowski_terminal_convergence.py": "8f172a65b2af1dbca3d5b226a18e82df3ca5229ca5f4ae8b2ab1792506c69195",
       "src/grabowski_text_artifact_reconcile.py": "b302be1dbb101abbf825732bfe41658c13ac64417c2a6034326e57409daa4772",
       "src/grabowski_transport_assertion.py": "20d75d1f94c1d0273108c36eed8c58aa85e55a30b73546c4ac8af8a835fb8c8e",

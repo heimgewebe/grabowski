@@ -29,6 +29,9 @@ COMMAND_IDENTITY_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_comman
 BROKER_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_privileged_broker.py")
 BROKER_WRAPPER_TARGET = Path("/usr/local/libexec/grabowski-privileged-broker")
 PROCESS_OBSERVER_TARGET = Path("/usr/local/libexec/grabowski-process-reference-observer")
+PLATFORM_CONNECTOR_CAPTURE_TARGET = Path(
+    "/usr/local/libexec/grabowski-platform-connector-capture"
+)
 REQUEST_CLIENT_TARGET = Path("/usr/local/bin/grabowski-privileged-request")
 BOOTSTRAP_RECOVERY_TARGET = Path(
     "/usr/local/libexec/grabowski-runtime-bootstrap-recover"
@@ -67,6 +70,7 @@ ROOTBROKER_CUTOVER_ACTION = "operator_rootbroker_cutover"
 BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
 ROOT_TASK_ACTION = "operator_root_task_systemd_unit"
 PROCESS_OBSERVER_ACTION = "observe_process_references"
+PLATFORM_CONNECTOR_CAPTURE_ACTION = "platform_connector_capture"
 BOOTSTRAP_RECOVERY_ACTION = "runtime_bootstrap_recover"
 LOCAL_BACKUP_NTFS_CHECK_ACTION = "local_backup_ntfs_check"
 LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION = "local_backup_ntfs_clear_dirty"
@@ -185,6 +189,12 @@ ARTIFACTS = (
     Artifact(
         "tools/grabowski_process_reference_observer.py",
         PROCESS_OBSERVER_TARGET,
+        0o755,
+        True,
+    ),
+    Artifact(
+        "tools/grabowski_platform_connector_capture.py",
+        PLATFORM_CONNECTOR_CAPTURE_TARGET,
         0o755,
         True,
     ),
@@ -1420,6 +1430,53 @@ def _process_observer_action_from_repository(
     return json.loads(json.dumps(observer))
 
 
+def _platform_connector_capture_action_from_repository(
+    repository: Path,
+    *,
+    expected_head: str,
+    runner: RunCommand,
+) -> dict[str, Any]:
+    relative_path = "config/privileged-actions.example.json"
+    data = _repository_blob(
+        repository,
+        commit_id=expected_head,
+        relative_path=relative_path,
+        runner=runner,
+    )
+    example = _decode_json_object(data, label=relative_path)
+    actions = example.get("actions")
+    if not isinstance(actions, dict):
+        raise CutoverError("example privileged action catalog is malformed")
+    action = actions.get(PLATFORM_CONNECTOR_CAPTURE_ACTION)
+    if not isinstance(action, dict):
+        raise CutoverError("example catalog has no platform connector capture action")
+    required = {
+        "enabled",
+        "mode",
+        "target_pattern",
+        "argv",
+        "timeout_seconds",
+        "allowed_peer_uid",
+        "allowed_peer_unit",
+    }
+    if set(action) != required:
+        raise CutoverError("platform connector capture action keys are invalid")
+    if action.get("enabled") is not True or action.get("mode") != "template":
+        raise CutoverError("platform connector capture action must be an enabled template")
+    if action.get("target_pattern") != r"\{.{1,4096}\}":
+        raise CutoverError("platform connector capture target pattern is invalid")
+    if action.get("argv") != [str(PLATFORM_CONNECTOR_CAPTURE_TARGET), "{target}"]:
+        raise CutoverError("platform connector capture argv is invalid")
+    if action.get("timeout_seconds") != 120:
+        raise CutoverError("platform connector capture timeout is invalid")
+    if (
+        action.get("allowed_peer_uid") != 1000
+        or action.get("allowed_peer_unit") != OPERATOR_UNIT
+    ):
+        raise CutoverError("platform connector capture peer binding is invalid")
+    return json.loads(json.dumps(action))
+
+
 def _operator_service_control_action_from_repository(
     repository: Path,
     *,
@@ -1660,6 +1717,7 @@ def merge_privileged_config(
     lifecycle: dict[str, Any] | None = None,
     root_task: dict[str, Any] | None = None,
     process_observer: dict[str, Any] | None = None,
+    platform_connector_capture: dict[str, Any] | None = None,
     bootstrap_recovery: dict[str, Any] | None = None,
     operator_service_control: dict[str, Any] | None = None,
     rootbroker_cutover: dict[str, Any] | None = None,
@@ -1692,6 +1750,19 @@ def merge_privileged_config(
     process_observer_before = actions.get(PROCESS_OBSERVER_ACTION)
     if process_observer is not None:
         merged_actions[PROCESS_OBSERVER_ACTION] = json.loads(json.dumps(process_observer))
+    platform_connector_capture_before = actions.get(PLATFORM_CONNECTOR_CAPTURE_ACTION)
+    if platform_connector_capture is not None:
+        if (
+            not allow_controlled_updates
+            and platform_connector_capture_before is not None
+            and platform_connector_capture_before != platform_connector_capture
+        ):
+            raise CutoverError(
+                "installed platform connector capture action differs from commit-bound contract"
+            )
+        merged_actions[PLATFORM_CONNECTOR_CAPTURE_ACTION] = json.loads(
+            json.dumps(platform_connector_capture)
+        )
     bootstrap_recovery_before = actions.get(BOOTSTRAP_RECOVERY_ACTION)
     if bootstrap_recovery is not None:
         if (
@@ -1842,6 +1913,8 @@ def merge_privileged_config(
         controlled.add(ROOT_TASK_ACTION)
     if process_observer is not None:
         controlled.add(PROCESS_OBSERVER_ACTION)
+    if platform_connector_capture is not None:
+        controlled.add(PLATFORM_CONNECTOR_CAPTURE_ACTION)
     if bootstrap_recovery is not None:
         controlled.add(BOOTSTRAP_RECOVERY_ACTION)
     if operator_service_control is not None:
@@ -1870,6 +1943,17 @@ def merge_privileged_config(
         "process_observer_before_sha256": (
             _sha256(_canonical_json(process_observer_before))
             if isinstance(process_observer_before, dict) else None
+        ),
+        "platform_connector_capture_sha256": (
+            _sha256(_canonical_json(platform_connector_capture))
+            if platform_connector_capture is not None else None
+        ),
+        "platform_connector_capture_preexisting": (
+            platform_connector_capture_before is not None
+        ),
+        "platform_connector_capture_before_sha256": (
+            _sha256(_canonical_json(platform_connector_capture_before))
+            if isinstance(platform_connector_capture_before, dict) else None
         ),
         "bootstrap_recovery_sha256": (
             _sha256(_canonical_json(bootstrap_recovery))
@@ -1925,6 +2009,7 @@ def _operator_authority_attestation(
     required_artifacts = {
         "broker_module": BROKER_MODULE_TARGET,
         "broker_wrapper": BROKER_WRAPPER_TARGET,
+        "platform_connector_capture": PLATFORM_CONNECTOR_CAPTURE_TARGET,
         "cutover_helper": CUTOVER_HELPER_TARGET,
         "operator_service": OPERATOR_SERVICE_TARGET,
     }
@@ -1944,12 +2029,19 @@ def _operator_authority_attestation(
     lifecycle = actions.get(BLOCKADE_LIFECYCLE_ACTION)
     service_control = actions.get(OPERATOR_SERVICE_CONTROL_ACTION)
     rootbroker_cutover = actions.get(ROOTBROKER_CUTOVER_ACTION)
+    platform_connector_capture = actions.get(PLATFORM_CONNECTOR_CAPTURE_ACTION)
     local_backup_storage = {
         name: actions.get(name) for name in LOCAL_BACKUP_STORAGE_ACTIONS
     }
     if not all(
         isinstance(item, dict)
-        for item in (power, lifecycle, service_control, rootbroker_cutover)
+        for item in (
+            power,
+            lifecycle,
+            service_control,
+            rootbroker_cutover,
+            platform_connector_capture,
+        )
     ):
         raise CutoverError("operator authority attestation actions are incomplete")
     present_backup_storage = {
@@ -1965,6 +2057,12 @@ def _operator_authority_attestation(
     assert isinstance(lifecycle, dict)
     assert isinstance(service_control, dict)
     assert isinstance(rootbroker_cutover, dict)
+    assert isinstance(platform_connector_capture, dict)
+    if (
+        platform_connector_capture.get("allowed_peer_uid") != 1000
+        or platform_connector_capture.get("allowed_peer_unit") != OPERATOR_UNIT
+    ):
+        raise CutoverError("platform connector capture authority binding is incoherent")
     peer_binding = {
         "allowed_peer_uid": power.get("allowed_peer_uid"),
         "allowed_peer_unit": power.get("allowed_peer_unit"),
@@ -1994,6 +2092,9 @@ def _operator_authority_attestation(
             ),
             ROOTBROKER_CUTOVER_ACTION: _sha256(
                 _canonical_json(rootbroker_cutover)
+            ),
+            PLATFORM_CONNECTOR_CAPTURE_ACTION: _sha256(
+                _canonical_json(platform_connector_capture)
             ),
             **{
                 name: _sha256(_canonical_json(action))
@@ -2526,6 +2627,9 @@ def _apply_cutover_locked(
     process_observer = _process_observer_action_from_repository(
         repository, expected_head=expected_head, runner=runner
     )
+    platform_connector_capture = _platform_connector_capture_action_from_repository(
+        repository, expected_head=expected_head, runner=runner
+    )
     bootstrap_recovery = _bootstrap_recovery_action_from_repository(
         repository, expected_head=expected_head, runner=runner
     )
@@ -2558,6 +2662,7 @@ def _apply_cutover_locked(
         lifecycle=lifecycle,
         root_task=root_task,
         process_observer=process_observer,
+        platform_connector_capture=platform_connector_capture,
         bootstrap_recovery=bootstrap_recovery,
         operator_service_control=operator_service_control,
         rootbroker_cutover=rootbroker_cutover,
@@ -2879,6 +2984,9 @@ def build_plan(*, repository: Path, expected_head: str, runner: RunCommand = _ru
     process_observer = _process_observer_action_from_repository(
         repository, expected_head=expected_head, runner=runner
     )
+    platform_connector_capture = _platform_connector_capture_action_from_repository(
+        repository, expected_head=expected_head, runner=runner
+    )
     bootstrap_recovery = _bootstrap_recovery_action_from_repository(
         repository, expected_head=expected_head, runner=runner
     )
@@ -2903,6 +3011,7 @@ def build_plan(*, repository: Path, expected_head: str, runner: RunCommand = _ru
         lifecycle=lifecycle,
         root_task=root_task,
         process_observer=process_observer,
+        platform_connector_capture=platform_connector_capture,
         bootstrap_recovery=bootstrap_recovery,
         operator_service_control=operator_service_control,
         rootbroker_cutover=rootbroker_cutover,

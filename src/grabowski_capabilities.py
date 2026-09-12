@@ -355,14 +355,14 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
     },
     "grabowski_checkout_binding_identity_rebind_preview": {
         "category": "checkout-lifecycle",
-        "purpose": "Preview one clean, coordination-free and remote-secured existing checkout whose current branch name differs from its active lifecycle binding.",
+        "purpose": "Preview one clean, coordination-free and remote-secured existing checkout for a supported identity repair: branch rename, repo-path canonicalization, or lifecycle catch-up when retention already matches current Git identity.",
         "risk_class": "low",
         "effects": [],
         "reversibility": "not-applicable",
     },
     "grabowski_checkout_binding_identity_rebind_apply": {
         "category": "checkout-lifecycle",
-        "purpose": "CAS-update only lifecycle and retention expected head/branch after exact branch-rename preview and current retention revalidation.",
+        "purpose": "CAS-converge only stale lifecycle/retention repo, head, or branch fields after an exact supported identity-rebind preview and fresh retention/coordination revalidation.",
         "risk_class": "medium",
         "effects": ["audit-append", "resource-lease", "state-change"],
         "reversibility": "compare-and-swap-state-transition-with-retained-audit-evidence",
@@ -913,13 +913,6 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "purpose": "Resume bounded retry-safe tasks after reconcile verification.",
         "risk_class": "high",
         "effects": ["state-refresh", "lease-release", "possible-process-start"],
-        "reversibility": "conditional",
-    },
-    "grabowski_task_reconcile": {
-        "category": "task",
-        "purpose": "Legacy compatibility entrypoint; refreshes state only and never resumes processes.",
-        "risk_class": "medium",
-        "effects": ["state-refresh", "lease-release"],
         "reversibility": "conditional",
     },
     "grabowski_resource_nonconflict_assess": {

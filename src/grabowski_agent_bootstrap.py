@@ -129,7 +129,6 @@ def call_shape_check(
     result = {
         "schema_version": 1,
         "authority": "deterministic_advisory_linter",
-        "execution_authorized": False,
         "allowed_shape": allowed,
         "recommendation": recommendation,
         "findings": findings,
@@ -176,7 +175,6 @@ def _workspace_metrics_snapshot(limit: int) -> dict[str, Any]:
         "requested_limit": limit,
         "current_cohort": None,
         "current_cohort_sample_size": 0,
-        "execution_authorized": False,
         "automatic_live_routing_enabled": False,
         "recommended_tool": "grabowski_agent_workspace_optimize",
         "does_not_establish": [
@@ -236,7 +234,6 @@ def agent_bootstrap(*, friction_limit: int = 100, outcome_limit: int = 200) -> d
     capsule = {
         "schema_version": 1,
         "authority": "proposal_only_agent_entry_capsule",
-        "execution_authorized": False,
         "adaptive_mode": "shadow" if adaptive_enabled else "disabled_fail_closed",
         "automatic_live_routing_enabled": False,
         "entry_sequence": list(ENTRY_SEQUENCE),
@@ -329,6 +326,7 @@ def agent_bootstrap(*, friction_limit: int = 100, outcome_limit: int = 200) -> d
             "workspace_route_calibration_mode": "shadow_only",
         },
         "does_not_establish": [
+            "execution_authority",
             "automatic_task_creation_authority",
             "automatic_policy_mutation_authority",
             "queue_or_claim_authority",

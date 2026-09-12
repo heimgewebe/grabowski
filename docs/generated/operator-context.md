@@ -105,8 +105,8 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_checkout_binding_reconciliation` | checkout-lifecycle | yes | low | Classify durable checkout lifecycle bindings against current canonical Git worktree observations without creating mutation authority. |
 | `grabowski_checkout_binding_terminal_preview` | checkout-lifecycle | yes | low | Preview one exact evidence-bound terminal reconciliation for either an absent managed checkout or a clean present terminal Work Lane retained without consuming active checkout capacity. |
 | `grabowski_checkout_binding_terminal_apply` | checkout-lifecycle | no | medium | Apply one fresh compare-and-swap terminal reconciliation: absent checkouts to externally_terminal_missing, or clean present terminal Work Lanes from active to completed_retained while preserving the checkout, retention and cleanup authority boundaries. |
-| `grabowski_checkout_binding_identity_rebind_preview` | checkout-lifecycle | yes | low | Preview one clean, coordination-free and remote-secured existing checkout whose current branch name differs from its active lifecycle binding. |
-| `grabowski_checkout_binding_identity_rebind_apply` | checkout-lifecycle | no | medium | CAS-update only lifecycle and retention expected head/branch after exact branch-rename preview and current retention revalidation. |
+| `grabowski_checkout_binding_identity_rebind_preview` | checkout-lifecycle | yes | low | Preview one clean, coordination-free and remote-secured existing checkout for a supported identity repair: branch rename, repo-path canonicalization, or lifecycle catch-up when retention already matches current Git identity. |
+| `grabowski_checkout_binding_identity_rebind_apply` | checkout-lifecycle | no | medium | CAS-converge only stale lifecycle/retention repo, head, or branch fields after an exact supported identity-rebind preview and fresh retention/coordination revalidation. |
 | `grabowski_checkout_retain` | checkout-lifecycle | no | medium | Assign explicit retention ownership to one temporary linked Git checkout. |
 | `grabowski_checkout_archive` | checkout-lifecycle | no | medium | Archive one clean temporary linked Git checkout by creating durable recovery refs without deleting branches. |
 | `grabowski_checkout_cleanup` | checkout-lifecycle | no | high | Plan or apply cleanup for an archived linked checkout; apply requires a persisted dry run. |
@@ -197,7 +197,6 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_resource_release` | resource | no | high | Release owner-bound resource leases with an explicit force override. |
 | `grabowski_resource_inspect` | resource | yes | low | Inspect one typed resource lease without returning private metadata. |
 | `grabowski_resource_list` | resource | yes | low | List bounded typed resource leases with optional owner filtering. |
-| `grabowski_task_reconcile` | task | no | medium | Legacy compatibility entrypoint; refreshes state only and never resumes processes. |
 | `grabowski_artifact_stat` | artifact | yes | low | Read regular-file size and SHA-256 on one registered fleet host. |
 | `grabowski_artifact_push` | artifact | no | high | Push one hash-bound regular file to a registered SSH fleet host. |
 | `grabowski_artifact_pull` | artifact | no | high | Pull one hash-bound regular file from a registered SSH fleet host. |
