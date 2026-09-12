@@ -2437,15 +2437,18 @@ def _github_pr_target_host(
             if index + 1 >= len(arguments):
                 raise RuntimeError("trusted GitHub repository selector is invalid")
             repository = arguments[index + 1]
-            break
+            index += 2
+            continue
         if item.startswith("--repo="):
             repository = item.split("=", 1)[1]
-            break
+            index += 1
+            continue
         if item.startswith("-R") and item != "-R":
             repository = item[2:]
             if repository.startswith("="):
                 repository = repository[1:]
-            break
+            index += 1
+            continue
         index += 1
     if repository is None:
         gh_repo = source.get("GH_REPO", "").strip()

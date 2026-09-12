@@ -1247,6 +1247,22 @@ class OperatorSignedTransportTests(unittest.TestCase):
             "github.com",
         )
 
+    def test_isolated_github_repo_uses_last_repeated_selector(self) -> None:
+        source = {"GH_HOST": "github.com"}
+        self.assertEqual(
+            operator._github_pr_target_host(
+                [
+                    "pr",
+                    "list",
+                    "-R",
+                    "github.com/owner/first",
+                    "--repo=ghe.example.internal/owner/final",
+                ],
+                source,
+            ),
+            "ghe.example.internal",
+        )
+
     def test_isolated_github_env_repo_selects_and_preserves_enterprise_target(self) -> None:
         source = {"GH_REPO": "ghe.example.internal/owner/repo"}
         with mock.patch.object(operator, "_github_pr_checkout_host") as checkout_host:
