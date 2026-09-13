@@ -1277,7 +1277,7 @@ def _route_available(
             return False, "Claude plan authentication is unavailable"
     if harness == "antigravity":
         antigravity = providers.get("antigravity", providers.get("agy", {}))
-        if model_arg not in antigravity.get("models", []):
+        if model_id not in antigravity.get("models", []):
             return False, "Antigravity model is absent"
     if harness == "opencode":
         opencode = providers.get("opencode", {})

@@ -252,8 +252,8 @@
       "resolved_model": "claude-sonnet-5"
     },
     "deepseek-v4-flash": {
-      "availability": "live-verified-free-via-opencode",
-      "evidence": "live-model-list-and-zero-cost-smoke-2026-07-24",
+      "availability": "route-stale-disabled",
+      "evidence": "opencode-model-list-exact-opencode/deepseek-v4-flash-free-slug-absent-2026-09-13",
       "family": "deepseek-v4",
       "name": "DeepSeek V4 Flash",
       "provider_family": "deepseek",
@@ -680,7 +680,7 @@
     "provider-parity-objective",
     "Subscription inclusion never establishes permission to consume purchased credits or API pay-as-you-go."
   ],
-  "observed_at": "2026-09-07",
+  "observed_at": "2026-09-13",
   "policy": {
     "adaptive_learning": {
       "access_probes_are_not_outcomes": true,
@@ -2576,7 +2576,7 @@
       "burn_weight": 0.35,
       "contrast_only": true,
       "delegation_overhead_minutes": 3,
-      "enabled": true,
+      "enabled": false,
       "harness": "opencode",
       "harness_quality": 7,
       "id": "opencode-deepseek-v4-flash-free",
@@ -2595,7 +2595,8 @@
         "bounded-patch",
         "triage"
       ],
-      "tier": "balanced"
+      "tier": "balanced",
+      "disabled_reason": "Live OpenCode inventory no longer advertises the exact opencode/deepseek-v4-flash-free model; keep this route disabled until that exact free model identity is freshly reverified."
     },
     {
       "argv_prefix": [

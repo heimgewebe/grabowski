@@ -86,7 +86,7 @@ class CodingAgentRouterTests(unittest.TestCase):
                 if item == "--model":
                     model = argv[index + 1]
                     if route["harness"] == "antigravity":
-                        agy_models.append(model)
+                        agy_models.append(route["model"])
                     elif route["harness"] == "grok":
                         grok_models.append(model)
         observed = datetime.now(timezone.utc).replace(microsecond=0)
@@ -1366,6 +1366,39 @@ class CodingAgentRouterTests(unittest.TestCase):
         )
         self.assertFalse(available)
         self.assertIn("authentication", reason)
+
+    def test_stale_opencode_deepseek_free_route_remains_fail_closed(self) -> None:
+        route = next(
+            route
+            for route in self.catalog["routes"]
+            if route["id"] == "opencode-deepseek-v4-flash-free"
+        )
+        model = self.catalog["models"]["deepseek-v4-flash"]
+        self.assertFalse(route["enabled"])
+        self.assertIn("no longer advertises", route["disabled_reason"])
+        self.assertEqual(model["availability"], "route-stale-disabled")
+        self.assertIn("slug-absent-2026-09-13", model["evidence"])
+
+    def test_antigravity_availability_uses_canonical_probe_model_identity(self) -> None:
+        route = next(
+            route
+            for route in self.catalog["routes"]
+            if route["id"] == "antigravity-gemini-pro-review-high"
+        )
+        state = self._fresh_state()
+        provider = state["catalog"]["providers"]["antigravity"]
+        model_arg = router._configured_model_arg(route)
+        self.assertIsNotNone(model_arg)
+        self.assertNotEqual(model_arg, route["model"])
+
+        provider["models"] = [route["model"]]
+        available, reason = router._route_available(route, self.catalog, state)
+        self.assertTrue(available, reason)
+
+        provider["models"] = [model_arg]
+        available, reason = router._route_available(route, self.catalog, state)
+        self.assertFalse(available)
+        self.assertEqual(reason, "Antigravity model is absent")
 
     def test_external_reviewers_are_independent_from_controller(self) -> None:
         for task_class in ("complex-patch", "deep-debug", "architecture"):
