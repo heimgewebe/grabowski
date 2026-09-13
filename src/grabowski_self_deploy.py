@@ -4010,6 +4010,16 @@ def grabowski_runtime_deploy_schedule(
                 source_repository,
                 source_lease_owner_id,
             )
+        if canonical_refresh_snapshot is not None:
+            origin_main_refresh = _refresh_canonical_origin_main(
+                expected_head, canonical_refresh_snapshot
+            )
+            if not automatic_source_needed:
+                repository, runner, source_identity = _deployment_source_preflight(
+                    expected_head,
+                    None,
+                    None,
+                )
         authority = privileged.ensure_rootbroker_authority(expected_head)
         if not authority.get("success"):
             raise RuntimeError(
@@ -4022,16 +4032,6 @@ def grabowski_runtime_deploy_schedule(
                 "public GitHub main drifted during Rootbroker authority refresh: "
                 f"expected {expected_head}, found {public_github_main_after}"
             )
-        if canonical_refresh_snapshot is not None:
-            origin_main_refresh = _refresh_canonical_origin_main(
-                expected_head, canonical_refresh_snapshot
-            )
-            if not automatic_source_needed:
-                repository, runner, source_identity = _deployment_source_preflight(
-                    expected_head,
-                    None,
-                    None,
-                )
         if automatic_source_needed:
             # The canonical checkout may have converged while Rootbroker authority
             # and public-main evidence were refreshed.  Reclassify now instead of

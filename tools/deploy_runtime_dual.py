@@ -374,9 +374,15 @@ OPERATOR_ADMISSION_MAX_TIMEOUT_SECONDS = 120
 # Bootstrap only for marker-aware predecessor runtimes that expose total calls
 # but not the effect-aware classification added by this release.
 OPERATOR_ADMISSION_BOOTSTRAP_DRAIN_SECONDS = 300
-OPERATOR_ADMISSION_EFFECT_CLASSIFICATION = "readOnlyHint-or-exact-github-pr-view-is-read-only-v2"
+OPERATOR_ADMISSION_EFFECT_CLASSIFICATION = "readOnlyHint-or-server-verified-git-read-or-exact-github-pr-view-is-read-only-v3"
 OPERATOR_ADMISSION_PREDECESSOR_EFFECT_CLASSIFICATION = (
     "readOnlyHint-true-is-read-only-v1"
+)
+OPERATOR_ADMISSION_PREDECESSOR_EFFECT_CLASSIFICATIONS = frozenset(
+    {
+        OPERATOR_ADMISSION_PREDECESSOR_EFFECT_CLASSIFICATION,
+        "readOnlyHint-or-exact-github-pr-view-is-read-only-v2",
+    }
 )
 OPERATOR_ADMISSION_DYNAMIC_TIMEOUT_WINDOWS = 6
 OPERATOR_ADMISSION_STOP_OPERATIONS = 6
@@ -3757,10 +3763,11 @@ def _operator_admission_call_counts(
             "blocking_tool_calls": active_calls,
             "read_only_active_tool_calls": read_only,
         }
-    # During a rolling upgrade the still-running predecessor advertises v1.
-    # Accept that exact contract, but do not trust its narrower read-only bucket
-    # under v2 semantics: every in-flight predecessor call remains blocking.
-    if classification == OPERATOR_ADMISSION_PREDECESSOR_EFFECT_CLASSIFICATION:
+    # During a rolling upgrade the still-running predecessor may advertise one
+    # of the bounded historical contracts that can directly precede this release.
+    # Accept only those exact versions, but do not trust their narrower read-only
+    # buckets under current semantics: every in-flight predecessor call blocks.
+    if classification in OPERATOR_ADMISSION_PREDECESSOR_EFFECT_CLASSIFICATIONS:
         if (
             not isinstance(blocking, int)
             or isinstance(blocking, bool)
@@ -3779,7 +3786,7 @@ def _operator_admission_call_counts(
             "effect_aware": False,
             "active_tool_calls": active_calls,
             "blocking_tool_calls": active_calls,
-            "read_only_active_tool_calls": read_only,
+            "read_only_active_tool_calls": 0,
         }
     if (
         classification != OPERATOR_ADMISSION_EFFECT_CLASSIFICATION

@@ -15,6 +15,8 @@ Vor jeder Mutation müssen mindestens vorliegen:
 
 ## Adaptive Einstiegskapsel
 
+Für begrenzte read-only Operator-Orientierung zuerst `grabowski_context(profile="concise")` verwenden. Spezialisierte Reads nur nachladen, wenn die konkrete Entscheidung zusätzliche Autorität benötigt. Dieser kompakte Kontext ist keine Mutationsfreigabe; vor Mutation oder Ressourcenkoordination weiterhin die zuständigen Live-Autoritäten für Arbeit, Leases, Audit, Kill-Switch und die jeweilige Aktion lesen.
+
 Bei nicht trivialer, breiter, transportempfindlicher oder mutierender Arbeit zuerst den frischen Runtime- und Connector-Zustand lesen und anschließend `grabowski_agent_bootstrap` verwenden.
 
 Vor einem Toolaufruf mit mehreren Befehlen, mehreren unabhängigen Absichten, großer erwarteter Ausgabe oder möglicher Mutation `grabowski_call_shape_check` verwenden. Ein abgelehnter Shape wird vor Ausführung zerlegt.
