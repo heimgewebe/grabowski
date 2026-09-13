@@ -863,7 +863,7 @@ def _probe(catalog: dict[str, Any]) -> dict[str, Any]:
         and isinstance(before_binding, str)
         and before_binding == after_binding
         and isinstance(before_auth_identity, str)
-        and isinstance(after_auth_identity, str)
+        and before_auth_identity == after_auth_identity
     )
     grok_entitlement_verified = (
         grok_logged_in

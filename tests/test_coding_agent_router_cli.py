@@ -515,6 +515,33 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         self.assertNotIn("grok-com", rejected["verified_quota_pools"])
         self.assertFalse(rejected["providers"]["grok"]["entitlement_verified"])
 
+        rotated = dict(auth)
+        rotated["auth_file_identity_sha256"] = "d" * 64
+        with (
+            mock.patch.object(
+                cli,
+                "_binary_versions",
+                return_value={"grok": {"available": True, "binary": "/grok"}},
+            ),
+            mock.patch.object(cli, "_run_harness_metadata", side_effect=metadata),
+            mock.patch.object(
+                cli,
+                "_grok_subscription_auth_status",
+                side_effect=[dict(auth), rotated],
+            ),
+            mock.patch.object(
+                cli,
+                "_openhands_subscription_auth_status",
+                return_value={"authenticated": False},
+            ),
+            mock.patch.object(cli, "_resolve_executable", return_value=None),
+        ):
+            rejected_rotation = cli._probe(catalog)
+        self.assertNotIn("grok-com", rejected_rotation["verified_quota_pools"])
+        self.assertFalse(
+            rejected_rotation["providers"]["grok"]["entitlement_verified"]
+        )
+
     def test_probe_digest_safety_guard_rejects_sensitive_fields(self) -> None:
         with self.assertRaisesRegex(
             cli.CodingAgentRouterCliError,
