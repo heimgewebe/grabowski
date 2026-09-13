@@ -32,12 +32,55 @@ ENTRY_SEQUENCE = (
     "read_repository_head_dirty_state_and_leases",
     "classify_one_next_operation",
     "discover_existing_capability_or_route",
+    "read_relevant_historical_recall_when_high_value_or_repeat_signal",
     "request_execution_shape_for_nontrivial_or_mutating_work",
     "perform_exactly_one_bounded_effect",
     "read_back_target_state",
     "record_truthful_outcome",
     "continue_only_from_observed_state",
 )
+
+HISTORICAL_RECALL = {
+    "authority": "advisory_historical_evidence_only",
+    "tool": "grabowski_operator_historical_recall",
+    "mode": "selective_before_execution",
+    "trigger_profiles": ["pr", "bureau", "deployment"],
+    "trigger_signals": [
+        "retry",
+        "recovery",
+        "repeated_failure",
+        "re_review",
+        "repeat_deploy",
+    ],
+    "skip_for": [
+        "trivial_read",
+        "status_only_without_repeat_signal",
+        "one_off_discovery_without_repeat_signal",
+    ],
+    "selection_order": [
+        "bind_target_from_fresh_live_context",
+        "prefer_exact_available_chronik_filters",
+        "read_bounded_historical_recall",
+        "discard_nonmatching_or_unbound_history",
+        "continue_from_fresh_live_truth",
+    ],
+    "requirements": [
+        "fresh_live_truth_precedes_history",
+        "history_must_be_evidence_bound",
+        "history_must_remain_historical_only",
+        "fresh_owning_authority_must_be_rechecked_before_effect",
+    ],
+    "does_not_establish": [
+        "current_truth",
+        "safe_retry",
+        "routing_authority",
+        "policy_authority",
+        "merge_readiness",
+        "deployment_authorization",
+        "bureau_publication_authority",
+        "task_completion",
+    ],
+}
 
 REUSE_BEFORE_BUILD = {
     "authority": "discovery_order_only",
@@ -237,6 +280,7 @@ def agent_bootstrap(*, friction_limit: int = 100, outcome_limit: int = 200) -> d
         "adaptive_mode": "shadow" if adaptive_enabled else "disabled_fail_closed",
         "automatic_live_routing_enabled": False,
         "entry_sequence": list(ENTRY_SEQUENCE),
+        "historical_recall": HISTORICAL_RECALL,
         "reuse_before_build": REUSE_BEFORE_BUILD,
         "call_rules": {
             "one_independent_intent_per_call": True,
