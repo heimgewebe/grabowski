@@ -843,6 +843,7 @@ def _probe(catalog: dict[str, Any]) -> dict[str, Any]:
             after_binding if grok_entitlement_verified else None
         ),
         "auth_status": grok_auth_after.get("status"),
+        "auth_file_identity_sha256": router._grok_auth_file_identity(),
         "models": grok_models,
     }
 

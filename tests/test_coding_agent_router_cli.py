@@ -358,6 +358,10 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         self.assertEqual(
             verified["providers"]["grok"]["subscription_tier"], "SuperGrok"
         )
+        self.assertEqual(
+            verified["providers"]["grok"]["auth_file_identity_sha256"],
+            router._grok_auth_file_identity(),
+        )
 
         changed = dict(auth)
         changed["account_binding_sha256"] = "b" * 64

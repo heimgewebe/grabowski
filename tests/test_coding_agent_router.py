@@ -36,6 +36,10 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.catalog_path.write_text(
             json.dumps(self.catalog, sort_keys=True, indent=2) + "\n", encoding="utf-8"
         )
+        self.grok_auth_identity = mock.patch.object(
+            router, "_grok_auth_file_identity", return_value="a" * 64
+        )
+        self.grok_auth_identity_mock = self.grok_auth_identity.start()
         self.state = self._fresh_state()
         self._write_state()
         self.environment = mock.patch.dict(
@@ -74,6 +78,7 @@ class CodingAgentRouterTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.physical_occupancy.stop()
         self.environment.stop()
+        self.grok_auth_identity.stop()
         self.temporary.cleanup()
 
     def _fresh_state(self) -> dict:
@@ -130,6 +135,7 @@ class CodingAgentRouterTests(unittest.TestCase):
                     },
                     "grok": {
                         "logged_in": True,
+                        "auth_file_identity_sha256": router._grok_auth_file_identity(),
                         "models": sorted(set(grok_models)),
                     },
                     "opencode": {
@@ -180,6 +186,27 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.state_path.write_text(
             json.dumps(self.state, sort_keys=True, indent=2) + "\n", encoding="utf-8"
         )
+
+    def test_catalog_freshness_invalidates_on_grok_auth_file_change(self) -> None:
+        self.assertTrue(router._state_catalog_fresh(self.state))
+        self.grok_auth_identity_mock.return_value = "b" * 64
+        self.assertFalse(router._state_catalog_fresh(self.state))
+
+    def test_subscription_pool_blocks_overage_or_purchased_credits(self) -> None:
+        pool = self.catalog["quota_pools"]["grok-com"]
+        self.assertFalse(pool["automatic_overage"])
+        self.assertFalse(pool["credits_allowed"])
+        for field in ("automatic_overage", "credits_allowed"):
+            with self.subTest(field=field):
+                state = self._fresh_state()
+                catalog = json.loads(json.dumps(self.catalog))
+                catalog["quota_pools"]["grok-com"][field] = True
+                allowed, reasons, _penalty, execution_eligible = router._pool_gate(
+                    "grok-com", catalog, state, critical=False
+                )
+                self.assertFalse(allowed)
+                self.assertFalse(execution_eligible)
+                self.assertTrue(reasons)
 
     def _route(self, task_class: str, **kwargs: object) -> dict:
         defaults = {

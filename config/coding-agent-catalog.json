@@ -1080,14 +1080,16 @@
       ],
       "overage_action": "block_and_surface",
       "plan": "SuperGrok",
-      "plan_evidence": "grok-auth-supergrok-oidc-valid; grok-cli-1.0.4-model-list-grok-4.6-2026-08-22",
+      "plan_evidence": "grok-cli-1.0.30-device-auth-supergrok-grok-4.6-smoke-2026-09-13; xai-supergrok-shared-weekly-pool-and-optional-extra-usage-2026-09-13",
       "entitlement_contract": {
         "kind": "grok_oidc_tier_claim_v1",
         "issuer": "https://auth.x.ai",
         "principal_type": "User",
         "tier_code": 1,
         "plan": "SuperGrok"
-      }
+      },
+      "server_reported_usage_cost_semantics": "subscription-pool-consumption-not-incremental-charge-authority",
+      "server_cost_does_not_authorize_overage": true
     },
     "jules-account": {
       "conservative_daily_tasks": 15,

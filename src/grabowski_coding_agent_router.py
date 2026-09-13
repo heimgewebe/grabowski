@@ -995,12 +995,65 @@ def _load_optional_advisory_state() -> tuple[dict[str, Any], str | None]:
         return {}, type(exc).__name__
 
 
+def _grok_auth_file_identity(*, home: Path | None = None) -> str:
+    """Hash only auth-file metadata so login changes invalidate cached readiness."""
+    path = (home or Path.home()) / ".grok" / "auth.json"
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        marker: dict[str, Any] = {"state": "missing"}
+    except OSError:
+        marker = {"state": "unreadable"}
+    else:
+        safe = (
+            stat.S_ISREG(metadata.st_mode)
+            and metadata.st_uid == os.getuid()
+            and metadata.st_nlink == 1
+            and stat.S_IMODE(metadata.st_mode) & 0o077 == 0
+        )
+        marker = {
+            "state": "present" if safe else "unsafe",
+            "device": metadata.st_dev,
+            "inode": metadata.st_ino,
+            "mode": stat.S_IMODE(metadata.st_mode),
+            "uid": metadata.st_uid,
+            "nlink": metadata.st_nlink,
+            "size": metadata.st_size,
+            "mtime_ns": metadata.st_mtime_ns,
+        }
+    return hashlib.sha256(
+        json.dumps(
+            marker, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def _state_catalog_fresh(state: dict[str, Any]) -> bool:
-    observed = _parse_time(state.get("catalog", {}).get("observed_at"))
+    catalog_state = state.get("catalog", {})
+    observed = _parse_time(catalog_state.get("observed_at"))
     if observed is None:
         return False
     age = (_utc_now() - observed).total_seconds()
-    return 0 <= age <= CATALOG_FRESHNESS_SECONDS
+    if not 0 <= age <= CATALOG_FRESHNESS_SECONDS:
+        return False
+    providers = catalog_state.get("providers")
+    # Freshness is not a structural validator. Preserve malformed-state
+    # classification for the normal router validation path, and permit bounded
+    # partial probes that intentionally do not report Grok at all. A snapshot
+    # that *does* report Grok must be bound to the current auth-file identity.
+    if not isinstance(providers, dict):
+        return True
+    if "grok" not in providers:
+        return True
+    grok = providers["grok"]
+    if not isinstance(grok, dict):
+        return True
+    stored_identity = grok.get("auth_file_identity_sha256")
+    return (
+        isinstance(stored_identity, str)
+        and len(stored_identity) == 64
+        and stored_identity == _grok_auth_file_identity()
+    )
 
 
 def _physical_pool_occupancy() -> dict[str, Any]:
@@ -1202,6 +1255,11 @@ def _pool_gate(
         return False, ["cost is unknown or non-zero"], 0.0, False
     if pool.get("payg_fallback_allowed") is not False:
         return False, ["PAYG fallback is not forbidden"], 0.0, False
+    if pool.get("cost_mode") == "subscription_included":
+        if pool.get("automatic_overage") is not False:
+            return False, ["automatic subscription overage is not forbidden"], 0.0, False
+        if pool.get("credits_allowed") is not False:
+            return False, ["purchased subscription credits are not forbidden"], 0.0, False
     if pool.get("blocked_reason"):
         return False, [str(pool["blocked_reason"])], 0.0, False
     if pool.get("runtime_blocked_reason"):
