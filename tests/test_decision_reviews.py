@@ -280,6 +280,45 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
         self.assertEqual(attempt["review_route_id"], "claude-opus-5-high")
         self.assertEqual(attempt["review_provider_family"], "anthropic")
 
+    def test_route_suffix_cannot_override_verified_reviewer_route(self) -> None:
+        normalized = reviews.normalize_binding(binding("independent-reviewer"))
+        receipt = "/tmp/review/review-role-receipt.json"
+        job_argv = [
+            "python3",
+            "-m",
+            reviews.REVIEW_ROLE_MODULE,
+            "--role",
+            "review",
+            "--repository",
+            "/tmp/review",
+            "--expected-head",
+            HEAD,
+            "--expected-base-head",
+            BASE,
+            "--expected-diff-sha256",
+            "e" * 64,
+            "--expected-dirty",
+            "false",
+            "--output",
+            receipt,
+            "--",
+            "claude",
+            "--model",
+            "opus",
+            "--effort",
+            "high",
+            "--permission-mode",
+            "plan",
+            "--model",
+            "sonnet",
+            "Review the frozen revision",
+        ]
+        self.assertIsNone(
+            reviews.review_role_provenance(
+                job_argv, normalized, cwd=Path("/tmp/review")
+            )
+        )
+
     def test_exact_origin_bound_argv_bootstraps_reviewer_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             jobs = Path(tmp)

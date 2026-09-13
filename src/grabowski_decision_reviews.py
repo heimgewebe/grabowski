@@ -394,8 +394,10 @@ def _review_route_evidence(command: list[str]) -> dict[str, Any] | None:
             or not isinstance(prefix, list)
             or not prefix
             or any(not isinstance(item, str) or not item for item in prefix)
-            or len(command) <= len(prefix)
+            or len(command) != len(prefix) + 1
             or command[: len(prefix)] != prefix
+            or not command[-1].strip()
+            or command[-1].startswith("-")
         ):
             continue
         model_id = route.get("model")
