@@ -2000,7 +2000,7 @@ class RepoGroundContextBridgeToolTests(unittest.TestCase):
             "language_structure": {
                 "evidence": {
                     "records": [
-                        {"language": "rust", "symbol": "helper"},
+                        {"language": "rust", "symbol": "hëlper"},
                     ]
                 },
                 "budget": {"used_bytes": 512, "hard_limit_bytes": 4096},
@@ -2017,6 +2017,24 @@ class RepoGroundContextBridgeToolTests(unittest.TestCase):
         with patch.object(mcp, "_repoground_agent_query", return_value=payload):
             result = mcp.repoground_query("demo-repo", "rust helper")
 
+        canonical_evidence = json.dumps(
+            structured_evidence["language_structure"]["evidence"],
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        self.assertEqual(
+            result["budget"]["context_bytes_used"],
+            len(canonical_evidence.encode("utf-8")),
+        )
+        self.assertEqual(
+            result["budget"]["context_unicode_characters_used"],
+            len(canonical_evidence),
+        )
+        self.assertGreater(
+            result["budget"]["context_bytes_used"],
+            result["budget"]["context_unicode_characters_used"],
+        )
         self.assertIs(result["structured_evidence"], structured_evidence)
 
         payload_without_structure = dict(payload)
@@ -2176,6 +2194,111 @@ class RepoGroundContextBridgeToolTests(unittest.TestCase):
         self.assertEqual(result["hit_count"], 1)
         self.assertEqual(result["snippets"][0]["path"], "src/first.py")
         self.assertEqual(result["snippets"][0]["text_excerpt"], "first usable")
+
+    def test_agent_query_budget_accounts_only_emitted_evidence_after_max_snippets(
+        self,
+    ) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        excerpts = [f"{index}:" + ("x" * 1198) for index in range(5)]
+        payload = {
+            "kind": "repobrief.mcp.read_only_frontdoor",
+            "status": "available",
+            "route": "text_retrieval",
+            "intent": {"kind": "text_retrieval"},
+            "retrieval": {"strategy": "or_relaxed", "match_count": 5},
+            "resolved_ranges": [
+                {
+                    "source_path": f"src/{index}.py",
+                    "source_line_range": {
+                        "start_line": index + 1,
+                        "end_line": index + 1,
+                    },
+                    "text_excerpt": excerpt,
+                    "range_ref": {"ref": f"range-{index}"},
+                }
+                for index, excerpt in enumerate(excerpts)
+            ],
+            "budget": {
+                "accounting": (
+                    "sum(UTF-8 bytes of emitted canonical_md text_excerpt values) + "
+                    "canonical JSON UTF-8 bytes of emitted language_structure.evidence; "
+                    "address and envelope metadata are outside the evidence payload budget"
+                ),
+                "max_context_tokens": 1500,
+                "max_context_bytes": 6000,
+                "context_bytes_used": 6000,
+                "context_unicode_characters_used": 6000,
+                "approx_context_chars_used": 6000,
+                "truncated": True,
+                "omissions": [
+                    {"lane": "canonical_md", "selected_bytes": 1200}
+                    for _index in range(5)
+                ],
+            },
+            "availability": {"status": "available", "caveats": []},
+            "mutation_boundary": {"writes": [], "read_paths_do_not_refresh": True},
+        }
+
+        with patch.object(mcp, "_repoground_agent_query", return_value=payload):
+            one = mcp.repoground_query(
+                "demo-repo",
+                "target",
+                k=5,
+                max_snippets=1,
+                max_context_tokens=1500,
+            )
+            five = mcp.repoground_query(
+                "demo-repo",
+                "target",
+                k=5,
+                max_snippets=5,
+                max_context_tokens=1500,
+            )
+
+        self.assertEqual(len(one["snippets"]), 1)
+        self.assertEqual(len(five["snippets"]), 5)
+        self.assertEqual(
+            one["snippets"][0]["text_excerpt"], five["snippets"][0]["text_excerpt"]
+        )
+        self.assertEqual(one["ranges"], five["ranges"][:1])
+        self.assertEqual(one["budget"]["context_bytes_used"], 1200)
+        self.assertEqual(one["budget"]["context_unicode_characters_used"], 1200)
+        self.assertEqual(one["budget"]["approx_context_chars_used"], 1200)
+        self.assertEqual(one["budget"]["pre_projection_context_bytes_used"], 6000)
+        self.assertEqual(
+            one["budget"]["pre_projection_context_unicode_characters_used"], 6000
+        )
+        self.assertEqual(len(one["budget"]["omissions"]), 5)
+        self.assertEqual(one["budget"]["max_context_bytes"], 6000)
+        self.assertEqual(five["budget"]["context_bytes_used"], 6000)
+        self.assertNotIn("pre_projection_context_bytes_used", five["budget"])
+
+        preflight = {
+            "status": "pass",
+            "available": True,
+            "answer_compliance_template": {},
+        }
+        with (
+            patch.object(mcp, "_repoground_agent_preflight", return_value=preflight),
+            patch.object(mcp, "_repoground_agent_query", return_value=payload),
+        ):
+            pack = mcp.repoground_context_pack(
+                "demo-repo",
+                query="target",
+                k=5,
+                max_snippets=1,
+                max_context_tokens=1500,
+            )
+
+        self.assertEqual(pack["bounded_evidence"]["snippet_count"], 1)
+        self.assertEqual(pack["bounded_evidence"]["budget"]["context_bytes_used"], 1200)
+        self.assertEqual(pack["query_context"]["budget"]["context_bytes_used"], 1200)
+        self.assertEqual(
+            pack["bounded_evidence"]["budget"]["pre_projection_context_bytes_used"],
+            6000,
+        )
+        self.assertEqual(pack["ranges"], one["ranges"])
 
     def test_filtered_query_fills_limit_after_empty_projected_result(self) -> None:
         _repo, head = self._git_repo("demo-repo")
