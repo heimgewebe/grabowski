@@ -1117,7 +1117,7 @@
     "openai-agentic": {
       "cost_mode": "subscription_included",
       "marginal_cost_usd": 0,
-      "max_concurrency": 2,
+      "max_concurrency": 3,
       "payg_fallback_allowed": false,
       "quota_mode": "chatgpt-pro-codex-plan-limits",
       "reserve_floor": 0.15,
@@ -1134,7 +1134,8 @@
       ],
       "overage_action": "block_and_surface",
       "plan": "ChatGPT Pro",
-      "plan_evidence": "owner-asserted-2026-07-29; codex-login-status-chatgpt; gpt-5.6-sol-smoke-2026-07-29"
+      "note": "Local admission cap 3 is backed by three overlapping task-bound gpt-5.6-luna low read-only Codex CLI sessions that completed successfully on 2026-09-13. This proves an operating floor of 3 only; it does not claim exact provider concurrency or quota.",
+      "plan_evidence": "owner-asserted-2026-07-29; codex-login-status-chatgpt; gpt-5.6-sol-smoke-2026-07-29; three-concurrent-luna-low-task-smoke-2026-09-13"
     },
     "openai-codex-spark": {
       "automatic_overage": false,
