@@ -5,7 +5,7 @@ on:
     branches:
       - fix/terminal-lane-retention-archive-20260913
     paths:
-      - tools/pr1186_review_remediation.py
+      - tools/pr1186_review_remediation_driver.py
       - .github/workflows/pr1186-review-remediation-writer.yml
   workflow_dispatch:
 
@@ -20,7 +20,7 @@ jobs:
   writer:
     if: github.repository == 'heimgewebe/grabowski'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - name: Checkout exact branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -33,255 +33,33 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Assert expected parent
+      - name: Apply deterministic remediation
         run: |
           set -euo pipefail
           test "$(git branch --show-current)" = "fix/terminal-lane-retention-archive-20260913"
-          test -f tools/pr1186_review_remediation.py
-          python -m py_compile tools/pr1186_review_remediation.py
-
-      - name: Scope patch anchors
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          from pathlib import Path
-          path = Path('tools/pr1186_review_remediation.py')
-          text = path.read_text(encoding='utf-8')
-          fixes = {
-              'replace_once(CHECKOUTS, archive_sig_old, archive_sig_new)': '''archive_source = Path(CHECKOUTS).read_text(encoding="utf-8")
-          archive_start_at = archive_source.index('@mcp.tool(name="grabowski_checkout_archive", annotations=MUTATING)')
-          archive_end_at = archive_source.index('@mcp.tool(name="grabowski_checkout_cleanup", annotations=MUTATING)', archive_start_at)
-          archive_block = archive_source[archive_start_at:archive_end_at]
-          if archive_block.count(archive_sig_old) != 1:
-              raise SystemExit("archive signature marker is not unique inside archive function")
-          archive_block = archive_block.replace(archive_sig_old, archive_sig_new, 1)
-          Path(CHECKOUTS).write_text(
-              archive_source[:archive_start_at] + archive_block + archive_source[archive_end_at:],
-              encoding="utf-8",
-          )''',
-              'replace_once(CHECKOUTS, archive_fence_init_old, archive_fence_init_new)': '''archive_source = Path(CHECKOUTS).read_text(encoding="utf-8")
-          archive_start_at = archive_source.index('@mcp.tool(name="grabowski_checkout_archive", annotations=MUTATING)')
-          archive_end_at = archive_source.index('@mcp.tool(name="grabowski_checkout_cleanup", annotations=MUTATING)', archive_start_at)
-          archive_block = archive_source[archive_start_at:archive_end_at]
-          if archive_block.count(archive_fence_init_old) != 1:
-              raise SystemExit("archive fence-init marker is not unique inside archive function")
-          archive_block = archive_block.replace(archive_fence_init_old, archive_fence_init_new, 1)
-          Path(CHECKOUTS).write_text(
-              archive_source[:archive_start_at] + archive_block + archive_source[archive_end_at:],
-              encoding="utf-8",
-          )''',
-          }
-          for old, new in fixes.items():
-              if text.count(old) != 1:
-                  raise SystemExit(f'archive script hotfix marker count={text.count(old)} for {old}')
-              text = text.replace(old, new, 1)
-
-          cleanup_marker = 'replace_once(CHECKOUTS, cleanup_release_before_audit,'
-          if text.count(cleanup_marker) != 1:
-              raise SystemExit(f'cleanup release hotfix marker count={text.count(cleanup_marker)}')
-          cleanup_start = text.index(cleanup_marker)
-          cleanup_end = text.index('\n\ncleanup_return_old =', cleanup_start)
-          cleanup_replacement = '''cleanup_source = Path(CHECKOUTS).read_text(encoding="utf-8")
-          cleanup_start_at = cleanup_source.index('@mcp.tool(name="grabowski_checkout_cleanup", annotations=MUTATING)')
-          cleanup_block = cleanup_source[cleanup_start_at:]
-          if cleanup_block.count(cleanup_release_before_audit) != 1:
-              raise SystemExit("cleanup release marker is not unique inside cleanup function")
-          cleanup_block = cleanup_block.replace(cleanup_release_before_audit, "    audit = {\\n", 1)
-          Path(CHECKOUTS).write_text(
-              cleanup_source[:cleanup_start_at] + cleanup_block,
-              encoding="utf-8",
-          )'''
-          text = text[:cleanup_start] + cleanup_replacement + text[cleanup_end:]
-
-          assertion_start_marker = 'workspace_source = Path(WORKSPACE).read_text(encoding="utf-8")'
-          if text.count(assertion_start_marker) != 1:
-              raise SystemExit(f'workspace assertion marker count={text.count(assertion_start_marker)}')
-          assertion_start = text.index(assertion_start_marker)
-          assertion_replacement = '''workspace_source = Path(WORKSPACE).read_text(encoding="utf-8")
-          if workspace_source.count(workspace_call_new) != 1:
-              raise SystemExit("workspace archive call is not exactly identity-bound")'''
-          text = text[:assertion_start] + assertion_replacement + '\n'
-          path.write_text(text, encoding='utf-8')
-          PY
-          python -m py_compile tools/pr1186_review_remediation.py
-
-      - name: Apply bounded remediation
-        run: |
-          set -euo pipefail
-          python tools/pr1186_review_remediation.py
-          python - <<'PY'
-          from pathlib import Path
-
-          source_path = Path('src/grabowski_checkouts.py')
-          source = source_path.read_text(encoding='utf-8')
-          old = '    wanted = set(resources.normalize_resource_keys(resource_keys))\n'
-          new = '    raw_resource_keys = list(resource_keys)\n    wanted = (\n        set(resources.normalize_resource_keys(raw_resource_keys))\n        if raw_resource_keys\n        else set()\n    )\n'
-          if source.count(old) != 1:
-              raise SystemExit(f'all-fence listing fix marker count={source.count(old)}')
-          source_path.write_text(source.replace(old, new, 1), encoding='utf-8')
-
-          tests_path = Path('tests/test_checkouts.py')
-          tests = tests_path.read_text(encoding='utf-8')
-
-          def replace_in_test(name: str, old_text: str, new_text: str) -> None:
-              global tests
-              marker = f'    def {name}('
-              if tests.count(marker) != 1:
-                  raise SystemExit(f'test marker count={tests.count(marker)} for {name}')
-              start = tests.index(marker)
-              end = tests.find('\n    def ', start + len(marker))
-              if end < 0:
-                  end = len(tests)
-              block = tests[start:end]
-              if block.count(old_text) != 1:
-                  raise SystemExit(f'test replacement count={block.count(old_text)} for {name}')
-              block = block.replace(old_text, new_text, 1)
-              tests = tests[:start] + block + tests[end:]
-
-          fence_assertion = '''        fences = checkouts._active_checkout_operation_uncertainties()
-          self.assertEqual(len(fences), 1)
-          fence = fences[0]
-          self.assertEqual(fence["operation"], "archive")
-          leases = checkouts._read_resource_leases()
-          self.assertTrue(leases)
-          self.assertEqual(
-              {item["owner_id"] for item in leases},
-              {fence["lease_owner_id"]},
-          )'''
-
-          replace_in_test(
-              'test_archive_transaction_rolls_back_on_lifecycle_transition_failure',
-              '        self.assertEqual(checkouts._read_resource_leases(), [])',
-              fence_assertion,
-          )
-
-          old_name = '    def test_archive_releases_operation_lease_when_manifest_write_fails(self) -> None:'
-          new_name = '    def test_archive_manifest_failure_retains_uncertainty_fence(self) -> None:'
-          if tests.count(old_name) != 1:
-              raise SystemExit('manifest test name marker is not unique')
-          tests = tests.replace(old_name, new_name, 1)
-          replace_in_test(
-              'test_archive_manifest_failure_retains_uncertainty_fence',
-              '        self.assertEqual(checkouts._read_resource_leases(), [])',
-              fence_assertion,
-          )
-
-          audit_recovery = fence_assertion + '''
-          with checkouts.resources._database() as connection:
-              connection.execute(
-                  "UPDATE leases SET expires_at_unix=? WHERE owner_id=?",
-                  (int(time.time()) - 1, fence["lease_owner_id"]),
-              )
-              connection.commit()
-          reconciled = checkouts.grabowski_checkout_uncertainty_reconcile(
-              fence["fence_id"],
-              "reconcile-checkout-operation-outcome",
-          )
-          self.assertEqual(reconciled["state"], "reconciled")
-          self.assertEqual(reconciled["outcome"], "confirmed_success")
-          self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
-          self.assertEqual(checkouts._read_resource_leases(), [])'''
-          replace_in_test(
-              'test_archive_preserves_committed_state_when_audit_append_fails',
-              '        self.assertEqual(checkouts._read_resource_leases(), [])',
-              audit_recovery,
-          )
-
-          def append_to_test(name: str, addition: str) -> None:
-              global tests
-              marker = f'    def {name}('
-              if tests.count(marker) != 1:
-                  raise SystemExit(f'append marker count={tests.count(marker)} for {name}')
-              start = tests.index(marker)
-              end = tests.find('\n    def ', start + len(marker))
-              if end < 0:
-                  end = len(tests)
-              block = tests[start:end].rstrip()
-              tests = tests[:start] + block + '\n' + addition.rstrip() + '\n' + tests[end:]
-
-          append_to_test(
-              'test_partial_archive_failure_remains_durably_fenced_after_lease_expiry',
-              '''        reconciliation = checkouts.grabowski_checkout_uncertainty_reconcile(
-              fence["fence_id"],
-              "reconcile-checkout-operation-outcome",
-          )
-          self.assertEqual(reconciliation["state"], "still_fenced")
-          self.assertEqual(len(checkouts._active_checkout_operation_uncertainties()), 1)''',
-          )
-          append_to_test(
-              'test_cleanup_unknown_outcome_remains_durably_fenced_after_lease_expiry',
-              '''        reconciliation = checkouts.grabowski_checkout_uncertainty_reconcile(
-              fence["fence_id"],
-              "reconcile-checkout-operation-outcome",
-          )
-          self.assertEqual(reconciliation["state"], "reconciled")
-          self.assertEqual(reconciliation["outcome"], "confirmed_no_effect")
-          self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])''',
-          )
-          tests_path.write_text(tests, encoding='utf-8')
-          PY
+          python -m py_compile tools/pr1186_review_remediation.py tools/pr1186_review_remediation_driver.py
+          python tools/pr1186_review_remediation_driver.py
           git diff --check
 
-      - name: Publish capability contract
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import json
-          from pathlib import Path
-
-          contract_path = Path('config/runtime-entrypoint.json')
-          contract = json.loads(contract_path.read_text(encoding='utf-8'))
-          expected = contract['expected_tools']
-          new_tools = [
-              'grabowski_checkout_uncertainty_status',
-              'grabowski_checkout_uncertainty_reconcile',
-          ]
-          if any(name in expected for name in new_tools):
-              raise SystemExit('uncertainty tools unexpectedly already published')
-          anchor = expected.index('grabowski_checkout_cleanup') + 1
-          expected[anchor:anchor] = new_tools
-          contract_path.write_text(
-              json.dumps(contract, ensure_ascii=False, indent=2) + '\n',
-              encoding='utf-8',
-          )
-
-          capabilities_path = Path('src/grabowski_capabilities.py')
-          capabilities = capabilities_path.read_text(encoding='utf-8')
-          marker = '    "grabowski_github": {\n'
-          if capabilities.count(marker) != 1:
-              raise SystemExit('capability insertion anchor is not unique')
-          insertion = '''    "grabowski_checkout_uncertainty_status": {
-              "category": "checkout-lifecycle",
-              "purpose": "Read persistent unknown-outcome fences for checkout archive and cleanup effects.",
-              "risk_class": "low",
-              "effects": [],
-              "reversibility": "not-applicable",
-          },
-          "grabowski_checkout_uncertainty_reconcile": {
-              "category": "checkout-lifecycle",
-              "purpose": "Reconcile one persistent unknown-outcome checkout fence from primary Git and database evidence and release coordination only after the outcome is proven.",
-              "risk_class": "high",
-              "effects": ["audit-append", "resource-lease-release", "state-change"],
-              "reversibility": "evidence-bound-state-transition",
-          },
-          '''
-          capabilities_path.write_text(
-              capabilities.replace(marker, insertion + marker, 1),
-              encoding='utf-8',
-          )
-          PY
-          git diff --check
-
-      - name: Refresh generated operator context
+      - name: Refresh generated contracts
         run: |
           set -euo pipefail
           make context-refresh
           make profiles-refresh
           git diff --check
 
-      - name: Focused regression tests with canonical access fixture
+      - name: Remove temporary remediation machinery
         run: |
           set -euo pipefail
+          rm -f tools/pr1186_review_remediation.py
+          rm -f tools/pr1186_review_remediation_driver.py
+          rm -f .github/workflows/pr1186-review-remediation-writer.yml
+          git diff --check
+
+      - name: Focused regression tests
+        run: |
+          set -euo pipefail
+          python -m py_compile src/grabowski_checkouts.py src/grabowski_agent_workspace.py tests/test_checkouts.py src/grabowski_capabilities.py
           install -d -m 700 "$(pwd)/build"
           test_home="$(mktemp -d "$(pwd)/build/pr1186-test-home.XXXXXX")"
           trap 'rm -rf "$test_home"' EXIT
