@@ -11589,6 +11589,7 @@ def _captain_independent_review_gate(
                 head_sha=head,
                 base_sha=base,
                 diff_sha256=diff,
+                defer_diff_identity=True,
             )
         except Exception as exc:
             errors.append(
@@ -11602,6 +11603,7 @@ def _captain_independent_review_gate(
         "admissible_slots": [],
         "admissible_slot_count": 0,
         "ignored_pass_slots": [],
+        "unverified_pass_slots": [],
         "pass_count": 0,
         "total_pass_count": 0,
         "errors": [],
@@ -11639,6 +11641,17 @@ def _captain_independent_review_gate(
         "reconciliation_status": reconciliation_status,
         "attempt_count": reconciliation_attempt_count,
         "slot_count": reconciliation_slot_count,
+        "deferred_diff_identity_count": (
+            int(reconciliation.get("deferred_diff_identity_count", 0))
+            if isinstance(reconciliation, dict)
+            else 0
+        ),
+        "diff_identity_stage": (
+            "deferred-to-atomic-merge-guard"
+            if isinstance(reconciliation, dict)
+            and int(reconciliation.get("deferred_diff_identity_count", 0)) > 0
+            else "exact-request-digest"
+        ),
         "settlement_stage": "captain-preflight-and-atomic-merge-guard",
         "errors": errors,
     }
@@ -11653,8 +11666,8 @@ def _captain_independent_review_gate(
         "independent-review-policy",
         "pass",
         (
-            "provider-neutral independent review is settled for the exact revision and will be "
-            "reconciled again under the atomic merge guard"
+            "provider-neutral independent review role evidence is settled for the exact PR/head/base; "
+            "diff-identity aliases are authoritative only after live atomic-guard revalidation"
             if requirement["required"]
             else "no independent-review floor applies and no decision-bound review debt is present"
         ),

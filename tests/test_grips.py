@@ -9196,11 +9196,15 @@ def captain_independent_review_reconciliation(
     *,
     status: str = "settled",
     pass_count: int = 1,
+    independent_pass_count: int | None = None,
     infrastructure_error_count: int = 0,
+    deferred_diff_identity_count: int = 0,
     errors: list[str] | None = None,
     slot: str = "independent-reviewer",
 ) -> dict[str, object]:
     attempts = pass_count + infrastructure_error_count
+    if independent_pass_count is None:
+        independent_pass_count = pass_count
     slots = []
     if attempts:
         slots.append(
@@ -9208,6 +9212,7 @@ def captain_independent_review_reconciliation(
                 "slot": slot,
                 "attempt_count": attempts,
                 "pass_count": pass_count,
+                "independent_pass_count": independent_pass_count,
                 "material_reject_count": 0,
                 "infrastructure_error_count": infrastructure_error_count,
                 "unresolved_count": 0,
@@ -9222,6 +9227,7 @@ def captain_independent_review_reconciliation(
         "slot_count": len(slots),
         "slots": slots,
         "attempts": [],
+        "deferred_diff_identity_count": deferred_diff_identity_count,
         "errors": list(errors or []),
     }
 
@@ -9909,6 +9915,47 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         gate = self.gate(result, "independent-review-policy")
         self.assertEqual("blocked", gate["status"])
         self.assertIn("independent_review_pass_missing", gate["details"])
+
+    def test_high_critical_preflight_rejects_unproven_independent_named_pass(self) -> None:
+        parameters = captain_parameters(codex_review_required=False)
+        parameters.pop("codex_review_evidence")
+        with patch.object(
+            merge_guard.decision_reviews,
+            "reconcile",
+            return_value=captain_independent_review_reconciliation(
+                status="settled",
+                pass_count=1,
+                independent_pass_count=0,
+                slot="independent-reviewer",
+            ),
+        ):
+            result = self.run_captain(parameters)
+
+        gate = self.gate(result, "independent-review-policy")
+        self.assertEqual("blocked", gate["status"])
+        self.assertIn("independent_review_pass_missing", gate["details"])
+
+    def test_high_critical_preflight_defers_diff_identity_to_atomic_guard(self) -> None:
+        parameters = captain_parameters(codex_review_required=False)
+        parameters.pop("codex_review_evidence")
+        reconciliation = captain_independent_review_reconciliation(
+            status="settled",
+            pass_count=1,
+            independent_pass_count=1,
+            deferred_diff_identity_count=1,
+        )
+        with patch.object(
+            merge_guard.decision_reviews, "reconcile", return_value=reconciliation
+        ) as reconcile:
+            result = self.run_captain(parameters)
+
+        gate = self.gate(result, "independent-review-policy")
+        self.assertEqual("pass", gate["status"])
+        self.assertEqual(
+            "deferred-to-atomic-merge-guard", gate["details"]["diff_identity_stage"]
+        )
+        self.assertEqual(1, gate["details"]["deferred_diff_identity_count"])
+        self.assertTrue(reconcile.call_args.kwargs["defer_diff_identity"])
 
     def test_high_critical_preflight_blocks_without_independent_pass(self) -> None:
         parameters = captain_parameters(codex_review_required=False)

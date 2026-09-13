@@ -478,10 +478,11 @@ INDEPENDENT_REVIEW_SLOT_PREFIX = "independent-"
 def independent_review_reconciliation_summary(
     reconciliation: Any,
 ) -> dict[str, Any]:
-    """Project decision-bound review slots that are admissible for independence."""
+    """Project role- and route-proven decision-bound review PASS evidence."""
     errors: list[str] = []
     admissible_slots: list[str] = []
     ignored_pass_slots: list[str] = []
+    unverified_pass_slots: list[str] = []
     independent_pass_count = 0
     total_pass_count = 0
     if not isinstance(reconciliation, dict):
@@ -489,6 +490,7 @@ def independent_review_reconciliation_summary(
             "admissible_slots": [],
             "admissible_slot_count": 0,
             "ignored_pass_slots": [],
+            "unverified_pass_slots": [],
             "pass_count": 0,
             "total_pass_count": 0,
             "errors": ["independent_review_reconciliation_invalid"],
@@ -503,6 +505,7 @@ def independent_review_reconciliation_summary(
             continue
         slot = item.get("slot")
         pass_count = item.get("pass_count")
+        proven_count = item.get("independent_pass_count", 0)
         if not isinstance(slot, str) or not slot:
             errors.append("independent_review_slot_name_invalid")
             continue
@@ -513,16 +516,28 @@ def independent_review_reconciliation_summary(
         ):
             errors.append(f"independent_review_slot_pass_count_invalid:{slot}")
             continue
+        if (
+            isinstance(proven_count, bool)
+            or not isinstance(proven_count, int)
+            or proven_count < 0
+            or proven_count > pass_count
+        ):
+            errors.append(f"independent_review_slot_proven_pass_count_invalid:{slot}")
+            continue
         total_pass_count += pass_count
         if slot.startswith(INDEPENDENT_REVIEW_SLOT_PREFIX):
-            admissible_slots.append(slot)
-            independent_pass_count += pass_count
+            if proven_count:
+                admissible_slots.append(slot)
+                independent_pass_count += proven_count
+            if pass_count > proven_count:
+                unverified_pass_slots.append(slot)
         elif pass_count:
             ignored_pass_slots.append(slot)
     return {
         "admissible_slots": sorted(set(admissible_slots)),
         "admissible_slot_count": len(set(admissible_slots)),
         "ignored_pass_slots": sorted(set(ignored_pass_slots)),
+        "unverified_pass_slots": sorted(set(unverified_pass_slots)),
         "pass_count": independent_pass_count,
         "total_pass_count": total_pass_count,
         "errors": sorted(set(errors)),
