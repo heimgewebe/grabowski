@@ -1166,6 +1166,13 @@ def _state_catalog_fresh(state: dict[str, Any]) -> bool:
     if not isinstance(grok, dict):
         return True
     stored_identity = grok.get("auth_file_identity_sha256")
+    if stored_identity is None:
+        return (
+            grok.get("authenticated") is False
+            and grok.get("entitlement_verified") is False
+            and isinstance(grok.get("status"), str)
+            and bool(grok["status"])
+        )
     current_identity = _grok_auth_file_identity()
     return (
         isinstance(stored_identity, str)

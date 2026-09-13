@@ -197,6 +197,34 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.grok_auth_identity_mock.return_value = None
         self.assertFalse(router._state_catalog_fresh(self.state))
 
+    def test_catalog_freshness_keeps_ineligible_grok_from_staling_other_providers(self) -> None:
+        grok = self.state["catalog"]["providers"]["grok"]
+        grok.update(
+            {
+                "authenticated": False,
+                "entitlement_verified": False,
+                "status": "unsafe-file",
+                "auth_file_identity_sha256": None,
+                "models": [],
+            }
+        )
+        self.state["catalog"]["verified_quota_pools"].remove("grok-com")
+        self.grok_auth_identity_mock.return_value = None
+        self.assertTrue(router._state_catalog_fresh(self.state))
+
+    def test_catalog_freshness_rejects_missing_identity_for_eligible_grok(self) -> None:
+        grok = self.state["catalog"]["providers"]["grok"]
+        grok.update(
+            {
+                "authenticated": True,
+                "entitlement_verified": True,
+                "status": "verified",
+                "auth_file_identity_sha256": None,
+            }
+        )
+        self.grok_auth_identity_mock.return_value = None
+        self.assertFalse(router._state_catalog_fresh(self.state))
+
     def test_grok_subscription_pool_requires_zero_additional_cost_contract(self) -> None:
         pool = self.catalog["quota_pools"]["grok-com"]
         self.assertEqual(pool["marginal_cost_usd"], 0)
