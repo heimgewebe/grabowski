@@ -169,9 +169,29 @@ class AgentCompetitionTests(unittest.TestCase):
             "critical-review",
             "security-review",
         }
+        risk_flags = set(kwargs.get("risk_flags", []))
+        verification_floor_required = bool(
+            task_class in {"architecture", "complex-patch", "deep-debug", "migration"}
+            or kwargs.get("novelty") == "high"
+            or risk_flags.intersection(
+                {
+                    "concurrency",
+                    "cross_repo",
+                    "data_migration",
+                    "deployment",
+                    "destructive",
+                    "high-risk",
+                    "privilege",
+                    "runtime",
+                    "schema",
+                    "security",
+                    "security-sensitive",
+                }
+            )
+        )
         verification_policy = (
             "independent_review"
-            if direct_review_required
+            if direct_review_required or verification_floor_required
             else str(kwargs.get("verification_policy", "deterministic"))
         )
         body = {
@@ -629,7 +649,9 @@ class AgentCompetitionTests(unittest.TestCase):
         self.assertEqual(competitive["executor"], "scoped_writer")
         self.assertEqual(competitive["writer_route"], "codex-sol-high")
         self.assertEqual(competitive["effect_profile"], "candidate")
-        self.assertEqual(competitive["verification_policy"], "competition")
+        self.assertEqual(competitive["verification_policy"], "independent_review")
+        self.assertTrue(competitive["contrast_requested"])
+        self.assertEqual(competitive["contrast_candidate_count"], 2)
         self.assertTrue(competitive["execution_mode_deprecated"])
         self.assertEqual(
             competitive["execution_mode_scope"],
@@ -727,10 +749,13 @@ class AgentCompetitionTests(unittest.TestCase):
             )
         self.assertEqual(contrast["execution_mode"], "direct_operator")
         self.assertEqual(len(contrast["external_candidates"]), 1)
-        self.assertEqual(contrast["verification_policy"], "competition")
+        self.assertEqual(contrast["verification_policy"], "independent_review")
+        self.assertTrue(contrast["contrast_requested"])
         self.assertEqual(competition_route["execution_mode"], "direct_operator")
         self.assertEqual(len(competition_route["external_candidates"]), 2)
-        self.assertEqual(competition_route["verification_policy"], "competition")
+        self.assertEqual(competition_route["verification_policy"], "independent_review")
+        self.assertTrue(competition_route["contrast_requested"])
+        self.assertEqual(competition_route["contrast_candidate_count"], 2)
 
     def test_legacy_route_preserves_independent_review_policy_for_review_task(self) -> None:
         result = competition.grabowski_agent_execution_route(

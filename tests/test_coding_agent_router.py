@@ -1617,7 +1617,7 @@ class CodingAgentRouterTests(unittest.TestCase):
 
     def test_delivery_effect_profile_requires_and_binds_scoped_writer(self) -> None:
         for harness, state in self.state["catalog"]["harnesses"].items():
-            state["available"] = harness == "claude"
+            state["available"] = harness in {"claude", "antigravity"}
         self.state["pools"]["claude-pro"] = {"remaining_ratio": 0.9}
         self._write_state()
 
@@ -1875,7 +1875,7 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertEqual(floored["verification_floor"]["reasons"], ["task_class:complex-patch"])
         self.assertTrue(floored["independent_review_required"])
         with self.assertRaisesRegex(
-            router.CodingAgentRouterError, "verification floor forbids"
+            router.CodingAgentRouterError, "verification floor requires"
         ):
             self._route(
                 "complex-patch",
@@ -1884,17 +1884,26 @@ class CodingAgentRouterTests(unittest.TestCase):
                 risk_flags=[],
                 verification_policy="deterministic",
             )
-        competition_on_floor = self._route(
-            "complex-patch",
+        with self.assertRaisesRegex(
+            router.CodingAgentRouterError, "separate contrast surface"
+        ):
+            self._route(
+                "complex-patch",
+                need_review=False,
+                novelty="medium",
+                risk_flags=[],
+                verification_policy="competition",
+            )
+        explicit_review = self._route(
+            "bounded-patch",
             need_review=False,
-            novelty="medium",
+            novelty="low",
             risk_flags=[],
-            verification_policy="competition",
+            verification_policy="independent_review",
         )
-        self.assertEqual(competition_on_floor["verification_policy"], "competition")
-        self.assertTrue(competition_on_floor["independent_review_required"])
-        self.assertTrue(competition_on_floor["verification_floor"]["required"])
-        self.assertEqual(competition_on_floor["review_quorum"]["external_advisory_target"], 1)
+        self.assertTrue(explicit_review["independent_review_required"])
+        self.assertEqual(explicit_review["review_task_class"], "independent-review")
+        self.assertEqual(explicit_review["review_quorum"]["external_advisory_target"], 1)
         high_novelty = self._route("bounded-patch", need_review=False, novelty="high", risk_flags=[])
         self.assertEqual(high_novelty["verification_policy"], "independent_review")
         self.assertEqual(high_novelty["verification_floor"]["reasons"], ["novelty:high"])
@@ -1920,6 +1929,32 @@ class CodingAgentRouterTests(unittest.TestCase):
         )
         self.assertEqual(private_context["verification_policy"], "deterministic")
         self.assertFalse(private_context["verification_floor"]["required"])
+        private_floored = self._route(
+            "bounded-patch",
+            need_review=False,
+            novelty="high",
+            risk_flags=["private-context", "user_data"],
+        )
+        self.assertEqual(private_floored["verification_policy"], "independent_review")
+        self.assertTrue(private_floored["independent_review_required"])
+        self.assertFalse(private_floored["external_review_selection_allowed"])
+        self.assertEqual(
+            private_floored["external_review_block_reasons"],
+            ["sensitive_context:private-context", "sensitive_context:user_data"],
+        )
+        self.assertEqual(private_floored["reviewers"], [])
+        self.assertEqual(private_floored["review_gap"], 1)
+        self.assertEqual(
+            private_floored["review_status"],
+            "external-review-blocked-sensitive-context",
+        )
+        security = self._route(
+            "bounded-patch",
+            need_review=False,
+            novelty="medium",
+            risk_flags=["security-sensitive", "public-context"],
+        )
+        self.assertEqual(security["review_task_class"], "security-review")
         deterministic = self._route("bounded-patch", need_review=False, novelty="low", risk_flags=[])
         self.assertEqual(deterministic["verification_policy"], "deterministic")
         self.assertFalse(deterministic["verification_floor"]["required"])
@@ -1929,6 +1964,23 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertEqual(competition["executor"], deterministic["executor"])
         with self.assertRaisesRegex(router.CodingAgentRouterError, "need_review requires"):
             self._route("bounded-patch", need_review=True, novelty="low", risk_flags=[], verification_policy="competition")
+
+
+    def test_delivery_requires_an_available_independent_reviewer(self) -> None:
+        for harness, state in self.state["catalog"]["harnesses"].items():
+            state["available"] = harness == "claude"
+        self.state["pools"]["claude-pro"] = {"remaining_ratio": 0.9}
+        self._write_state()
+        with self.assertRaisesRegex(
+            router.CodingAgentRouterError, "available independent reviewer"
+        ):
+            self._route(
+                "complex-patch",
+                need_review=True,
+                novelty="medium",
+                risk_flags=[],
+                effect_profile="delivery",
+            )
 
     def test_request_validation_rejects_coercive_values(self) -> None:
         with self.assertRaisesRegex(router.CodingAgentRouterError, "boolean"):

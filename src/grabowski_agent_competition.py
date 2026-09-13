@@ -2159,7 +2159,12 @@ def grabowski_agent_execution_route(
         latency_priority=False,
         need_review=False,
     )
-    if not canonical_route["direct_review_required"] and candidate_plan:
+    contrast_requested = bool(candidate_plan)
+    if (
+        not canonical_route["direct_review_required"]
+        and contrast_requested
+        and canonical_route["verification_policy"] != "independent_review"
+    ):
         canonical_route = coding_router.canonical_execution_route(
             coding_task_value,
             changed_files=changed_file_estimate,
@@ -2179,6 +2184,8 @@ def grabowski_agent_execution_route(
         "writer_route": canonical_route["writer_route"],
         "effect_profile": canonical_route["effect_profile"],
         "verification_policy": canonical_route["verification_policy"],
+        "contrast_requested": contrast_requested,
+        "contrast_candidate_count": len(candidate_plan),
         "risk": canonical_route["risk"],
         "integration_owner": canonical_route["integration_owner"],
         "canonical_route_recommendation_sha256": canonical_route["recommendation_sha256"],
