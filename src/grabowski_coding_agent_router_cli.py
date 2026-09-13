@@ -309,6 +309,7 @@ def _grok_subscription_auth_status(
         "status": "missing",
         "subscription_tier": None,
         "account_binding_sha256": None,
+        "auth_file_identity_sha256": None,
     }
     contract = catalog.get("quota_pools", {}).get("grok-com", {}).get(
         "entitlement_contract"
@@ -347,6 +348,17 @@ def _grok_subscription_auth_status(
             metadata.st_nlink,
             metadata.st_size,
             metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        )
+
+    def directory_identity(metadata: os.stat_result) -> tuple[int, ...]:
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_uid,
+            metadata.st_gid,
+            metadata.st_nlink,
         )
 
     try:
@@ -356,7 +368,9 @@ def _grok_subscription_auth_status(
             status["status"] = "unsafe-home"
             return status
         descriptors.append(os.open(".grok", directory_flags, dir_fd=descriptors[-1]))
-        grok_metadata = os.fstat(descriptors[-1])
+        home_fd = descriptors[-2]
+        grok_fd = descriptors[-1]
+        grok_metadata = os.fstat(grok_fd)
         if (
             not stat.S_ISDIR(grok_metadata.st_mode)
             or grok_metadata.st_uid != os.getuid()
@@ -389,6 +403,25 @@ def _grok_subscription_auth_status(
         if identity(before) != identity(after) or len(raw) != before.st_size:
             status["status"] = "changed-during-read"
             return status
+        grok_after = os.fstat(grok_fd)
+        linked_grok = os.stat(".grok", dir_fd=home_fd, follow_symlinks=False)
+        linked_auth = os.stat("auth.json", dir_fd=grok_fd, follow_symlinks=False)
+        if (
+            directory_identity(grok_metadata) != directory_identity(grok_after)
+            or directory_identity(grok_after) != directory_identity(linked_grok)
+            or identity(after) != identity(linked_auth)
+            or router._grok_auth_directory_metadata_marker(grok_after) is None
+        ):
+            status["status"] = "changed-during-read"
+            return status
+        auth_file_identity = router._grok_auth_storage_metadata_identity(
+            grok_after,
+            after,
+        )
+        if auth_file_identity is None:
+            status["status"] = "unsafe-file"
+            return status
+        status["auth_file_identity_sha256"] = auth_file_identity
         if len(raw) > MAX_GROK_AUTH_BYTES:
             status["status"] = "oversized"
             return status
@@ -487,8 +520,12 @@ def _grok_subscription_auth_status(
             }
         )
         return status
-    except OSError:
+    except FileNotFoundError:
         status["status"] = "missing"
+        status["auth_file_identity_sha256"] = router._grok_missing_auth_file_identity()
+        return status
+    except OSError:
+        status["status"] = "unreadable"
         return status
     finally:
         for descriptor in reversed(descriptors):
@@ -539,16 +576,25 @@ def _configured_model_aliases(
     }
 
 
-def _antigravity_models_from_output(
+def _antigravity_model_inventory_from_output(
     catalog: dict[str, Any], stdout: str
-) -> list[str]:
+) -> dict[str, list[str]]:
     aliases = _configured_model_aliases(catalog, "antigravity")
-    discovered = {
-        aliases[model_field]
+    model_args = {
+        model_field
         for line in stdout.splitlines()
         if (model_field := line.split("\t", 1)[0].strip()) in aliases
     }
-    return sorted(discovered)
+    return {
+        "models": sorted({aliases[model_arg] for model_arg in model_args}),
+        "model_args": sorted(model_args),
+    }
+
+
+def _antigravity_models_from_output(
+    catalog: dict[str, Any], stdout: str
+) -> list[str]:
+    return _antigravity_model_inventory_from_output(catalog, stdout)["models"]
 
 
 def _grok_models_from_output(
@@ -758,15 +804,16 @@ def _probe(catalog: dict[str, Any]) -> dict[str, Any]:
     antigravity = _run_harness_metadata(
         harnesses, "antigravity", ["models"], catalog
     )
+    antigravity_inventory = (
+        _antigravity_model_inventory_from_output(
+            catalog, str(antigravity.get("stdout", ""))
+        )
+        if antigravity.get("ok") is True
+        else {"models": [], "model_args": []}
+    )
     providers["antigravity"] = {
         "available": harnesses.get("antigravity", {}).get("available") is True,
-        "models": (
-            _antigravity_models_from_output(
-                catalog, str(antigravity.get("stdout", ""))
-            )
-            if antigravity.get("ok") is True
-            else []
-        ),
+        **antigravity_inventory,
         "legacy_state_key": "agy",
     }
     opencode = _run_harness_metadata(harnesses, "opencode", ["models"], catalog)
@@ -807,12 +854,16 @@ def _probe(catalog: dict[str, Any]) -> dict[str, Any]:
     )
     before_binding = grok_auth_before.get("account_binding_sha256")
     after_binding = grok_auth_after.get("account_binding_sha256")
+    before_auth_identity = grok_auth_before.get("auth_file_identity_sha256")
+    after_auth_identity = grok_auth_after.get("auth_file_identity_sha256")
     grok_logged_in = (
         grok_status.get("ok") is True
         and grok_auth_before.get("authenticated") is True
         and grok_auth_after.get("authenticated") is True
         and isinstance(before_binding, str)
         and before_binding == after_binding
+        and isinstance(before_auth_identity, str)
+        and before_auth_identity == after_auth_identity
     )
     grok_entitlement_verified = (
         grok_logged_in
@@ -833,6 +884,7 @@ def _probe(catalog: dict[str, Any]) -> dict[str, Any]:
             after_binding if grok_entitlement_verified else None
         ),
         "auth_status": grok_auth_after.get("status"),
+        "auth_file_identity_sha256": after_auth_identity,
         "models": grok_models,
     }
 
