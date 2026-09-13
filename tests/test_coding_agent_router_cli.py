@@ -254,6 +254,57 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         rebound = router._grok_auth_file_identity(home=home)
         self.assertRegex(rebound or "", r"^[0-9a-f]{64}$")
 
+    def test_grok_auth_file_identity_rejects_rotated_directory_entry(self) -> None:
+        home = self.root / "grok-identity-race-home"
+        home.mkdir(mode=0o700)
+        grok = home / ".grok"
+        grok.mkdir(mode=0o700)
+        auth = grok / "auth.json"
+        auth.write_bytes(b'{"fixture":"credential-a"}\n')
+        auth.chmod(0o600)
+        replacement = grok / "auth.json.new"
+        replacement.write_bytes(b'{"fixture":"credential-b"}\n')
+        replacement.chmod(0o600)
+        real_stat = os.stat
+        rotated = False
+
+        def rotate_before_link_read(path, *args, **kwargs):
+            nonlocal rotated
+            if path == "auth.json" and not rotated:
+                rotated = True
+                replacement.replace(auth)
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch.object(router.os, "stat", side_effect=rotate_before_link_read):
+            self.assertIsNone(router._grok_auth_file_identity(home=home))
+        self.assertTrue(rotated)
+
+    def test_grok_subscription_auth_rejects_rotated_directory_entry(self) -> None:
+        catalog, _ = router._load_catalog()
+        home = self._grok_auth_home()
+        auth = home / ".grok" / "auth.json"
+        replacement = auth.with_name("auth.json.new")
+        replacement.write_bytes(auth.read_bytes())
+        replacement.chmod(0o600)
+        real_stat = os.stat
+        rotated = False
+
+        def rotate_before_link_read(path, *args, **kwargs):
+            nonlocal rotated
+            if path == "auth.json" and not rotated:
+                rotated = True
+                replacement.replace(auth)
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch.object(cli.os, "stat", side_effect=rotate_before_link_read):
+            status = cli._grok_subscription_auth_status(
+                catalog, home=home, now_unix=1_100
+            )
+        self.assertTrue(rotated)
+        self.assertEqual(status["status"], "changed-during-read")
+        self.assertFalse(status["authenticated"])
+        self.assertFalse(status["entitlement_verified"])
+
     def test_grok_subscription_auth_requires_exact_private_oidc_tier(self) -> None:
         catalog, _ = router._load_catalog()
         valid_home = self._grok_auth_home()

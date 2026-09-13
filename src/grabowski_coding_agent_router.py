@@ -1090,6 +1090,18 @@ def _grok_auth_file_identity(*, home: Path | None = None) -> str | None:
             metadata.st_nlink,
         )
 
+    def auth_identity(metadata: os.stat_result) -> tuple[int, ...]:
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_uid,
+            metadata.st_nlink,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        )
+
     try:
         descriptors.append(os.open(str(base), directory_flags))
         home_metadata = os.fstat(descriptors[-1])
@@ -1116,9 +1128,11 @@ def _grok_auth_file_identity(*, home: Path | None = None) -> str | None:
         auth_metadata = os.fstat(descriptors[-1])
         grok_after = os.fstat(grok_fd)
         linked_grok = os.stat(".grok", dir_fd=home_fd, follow_symlinks=False)
+        linked_auth = os.stat("auth.json", dir_fd=grok_fd, follow_symlinks=False)
         if (
             directory_identity(grok_before) != directory_identity(grok_after)
             or directory_identity(grok_after) != directory_identity(linked_grok)
+            or auth_identity(auth_metadata) != auth_identity(linked_auth)
         ):
             return None
         return _grok_auth_storage_metadata_identity(grok_after, auth_metadata)

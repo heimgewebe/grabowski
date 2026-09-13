@@ -405,9 +405,11 @@ def _grok_subscription_auth_status(
             return status
         grok_after = os.fstat(grok_fd)
         linked_grok = os.stat(".grok", dir_fd=home_fd, follow_symlinks=False)
+        linked_auth = os.stat("auth.json", dir_fd=grok_fd, follow_symlinks=False)
         if (
             directory_identity(grok_metadata) != directory_identity(grok_after)
             or directory_identity(grok_after) != directory_identity(linked_grok)
+            or identity(after) != identity(linked_auth)
             or router._grok_auth_directory_metadata_marker(grok_after) is None
         ):
             status["status"] = "changed-during-read"
