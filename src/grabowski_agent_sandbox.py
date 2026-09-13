@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import fcntl
 import hashlib
 import os
 from pathlib import Path
@@ -9,6 +10,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import tempfile
 from typing import Iterable
 
 BWRAP = Path(os.environ.get("GRABOWSKI_BWRAP_BIN", "/usr/bin/bwrap"))
@@ -28,6 +30,7 @@ class AgentSandboxError(RuntimeError):
 class PreparedSandboxCommand:
     command: tuple[str, ...]
     extra_read_only: tuple[tuple[Path, Path], ...] = ()
+    extra_read_write: tuple[tuple[Path, Path], ...] = ()
     extra_directories: tuple[Path, ...] = ()
     profile: str | None = None
 
@@ -35,24 +38,11 @@ class PreparedSandboxCommand:
 CLAUDE_PROFILE = "claude-cli-readonly-auth-v1"
 CLAUDE_SANDBOX_EXECUTABLE = Path("/opt/grabowski-external/claude")
 CLAUDE_SANDBOX_CONFIG_DIR = Path("/tmp/.claude")
-CODEX_PROFILE = "codex-cli-private-writable-auth-v1"
+CODEX_PROFILE = "codex-cli-private-durable-auth-v1"
 CODEX_SANDBOX_EXECUTABLE = Path("/opt/grabowski-external/codex")
 CODEX_SANDBOX_CONFIG_DIR = Path("/tmp/.codex")
 CODEX_SANDBOX_CODE_MODE_HOST = Path("/opt/grabowski-external/codex-code-mode-host")
-CODEX_SANDBOX_AUTH_SOURCE = Path("/opt/grabowski-external/codex-auth-bootstrap.json")
-_CODEX_AUTH_BOOTSTRAP_SOURCE = """\
-import os
-import shutil
-import sys
-
-source = "/opt/grabowski-external/codex-auth-bootstrap.json"
-destination = "/tmp/.codex/auth.json"
-flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
-descriptor = os.open(destination, flags, 0o600)
-with open(source, "rb") as source_file, os.fdopen(descriptor, "wb") as destination_file:
-    shutil.copyfileobj(source_file, destination_file)
-os.execv(sys.argv[1], sys.argv[1:])
-"""
+CODEX_SANDBOX_AUTH_STATE_ENV = "GRABOWSKI_CODEX_SANDBOX_AUTH_ROOT"
 
 
 def _private_regular_file(path: Path, field: str) -> Path:
@@ -61,6 +51,95 @@ def _private_regular_file(path: Path, field: str) -> Path:
     if metadata.st_uid != os.getuid() or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) & 0o077:
         raise AgentSandboxError(f"{field} must be one owner-private regular file")
     return resolved
+
+
+def _private_directory(path: Path, field: str, *, create: bool = False) -> Path:
+    candidate = path.expanduser()
+    if not candidate.is_absolute() or candidate.is_symlink():
+        raise AgentSandboxError(f"{field} must be an absolute non-symlink path")
+    if create and not candidate.exists():
+        try:
+            candidate.mkdir(parents=True, mode=0o700, exist_ok=True)
+        except OSError as exc:
+            raise AgentSandboxError(f"{field} cannot be created safely") from exc
+    resolved = _safe_existing_path(candidate, field, directory=True)
+    metadata = resolved.stat()
+    if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise AgentSandboxError(f"{field} must be an owner-private directory")
+    return resolved
+
+
+def _private_lock_descriptor(path: Path, field: str) -> int:
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise AgentSandboxError(f"{field} is not safely openable") from exc
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+    ):
+        os.close(descriptor)
+        raise AgentSandboxError(f"{field} must be one owner-private regular file")
+    return descriptor
+
+
+def _codex_sandbox_auth_root(auth_root: Path) -> Path:
+    raw_state_root = os.environ.get(
+        CODEX_SANDBOX_AUTH_STATE_ENV,
+        str(Path.home() / ".local/state/grabowski/codex-auth"),
+    )
+    state_root = _private_directory(
+        Path(raw_state_root), "Codex sandbox auth root", create=True
+    )
+    lock_descriptor = _private_lock_descriptor(
+        state_root / ".seed.lock", "Codex sandbox auth lock"
+    )
+    try:
+        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+        destination = state_root / "auth.json"
+        if os.path.lexists(destination):
+            _private_regular_file(destination, "Codex sandbox auth")
+            return state_root
+        source = _private_regular_file(auth_root / "auth.json", "Codex auth bootstrap")
+        temp_descriptor, temp_name = tempfile.mkstemp(
+            prefix=".auth-seed-", dir=state_root
+        )
+        temp_path = Path(temp_name)
+        try:
+            os.fchmod(temp_descriptor, 0o600)
+            with source.open("rb") as source_file, os.fdopen(
+                temp_descriptor, "wb", closefd=True
+            ) as destination_file:
+                shutil.copyfileobj(source_file, destination_file)
+                destination_file.flush()
+                os.fsync(destination_file.fileno())
+            temp_descriptor = -1
+            os.replace(temp_path, destination)
+            directory_descriptor = os.open(
+                state_root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+            )
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        finally:
+            if temp_descriptor >= 0:
+                os.close(temp_descriptor)
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+        _private_regular_file(destination, "Codex sandbox auth")
+        return state_root
+    finally:
+        fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+        os.close(lock_descriptor)
 
 
 def _resolved_executable(value: str, field: str) -> Path:
@@ -93,31 +172,22 @@ def prepare_external_agent_command(command: list[str]) -> PreparedSandboxCommand
         auth_root = Path(
             os.environ.get("GRABOWSKI_CODEX_AUTH_ROOT", str(Path.home() / ".codex"))
         ).expanduser()
-        auth = _private_regular_file(auth_root / "auth.json", "Codex auth")
+        sandbox_auth_root = _codex_sandbox_auth_root(auth_root)
         bindings: list[tuple[Path, Path]] = [
             (executable, CODEX_SANDBOX_EXECUTABLE),
-            (auth, CODEX_SANDBOX_AUTH_SOURCE),
         ]
         code_mode_host = executable.parent / "codex-code-mode-host"
         if code_mode_host.exists():
-            bindings.insert(
-                1,
+            bindings.append(
                 (
                     _resolved_executable(str(code_mode_host), "Codex code mode host"),
                     CODEX_SANDBOX_CODE_MODE_HOST,
-                ),
+                )
             )
         return PreparedSandboxCommand(
-            command=(
-                "/usr/bin/python3",
-                "-I",
-                "-S",
-                "-c",
-                _CODEX_AUTH_BOOTSTRAP_SOURCE,
-                str(CODEX_SANDBOX_EXECUTABLE),
-                *command[1:],
-            ),
+            command=(str(CODEX_SANDBOX_EXECUTABLE), *command[1:]),
             extra_read_only=tuple(bindings),
+            extra_read_write=((sandbox_auth_root, CODEX_SANDBOX_CONFIG_DIR),),
             extra_directories=(
                 Path("/opt"),
                 Path("/opt/grabowski-external"),
@@ -336,6 +406,7 @@ def minimal_sandbox_argv(
     writable_paths: Iterable[Path] = (),
     git_common_dir: Path | None = None,
     extra_read_only: Iterable[tuple[Path, Path]] = (),
+    extra_read_write: Iterable[tuple[Path, Path]] = (),
     extra_directories: Iterable[Path] = (),
 ) -> list[str]:
     """Build the sandbox argv without requiring bubblewrap on the build host.
@@ -416,6 +487,24 @@ def minimal_sandbox_argv(
             raise AgentSandboxError(f"duplicate sandbox target: {target}")
         seen_targets.add(target)
         arguments.extend(["--ro-bind", str(source), target])
+    for source_value, target_value in extra_read_write:
+        source = _private_directory(source_value, "extra_read_write source")
+        _validate_writable_tree(source)
+        target_path = Path(target_value)
+        if (
+            not target_path.is_absolute()
+            or "\x00" in str(target_path)
+            or target_path == Path("/tmp")
+            or not target_path.is_relative_to(Path("/tmp"))
+        ):
+            raise AgentSandboxError(
+                "extra_read_write target must be a private path below /tmp"
+            )
+        target = str(target_path)
+        if target in seen_targets:
+            raise AgentSandboxError(f"duplicate sandbox target: {target}")
+        seen_targets.add(target)
+        arguments.extend(["--bind", str(source), target])
     arguments.extend(
         [
             "--clearenv",

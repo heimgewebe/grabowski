@@ -243,6 +243,7 @@ def sandbox_argv(repo: Path, command: list[str], *, declared_command: list[str] 
         workspace_writable=False,
         git_common_dir=common,
         extra_read_only=(*prepared.extra_read_only, *venv_read_only),
+        extra_read_write=prepared.extra_read_write,
         extra_directories=(*prepared.extra_directories, *venv_directories),
     )
 
