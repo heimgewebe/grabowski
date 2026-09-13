@@ -979,6 +979,32 @@ class AgentCompetitionTests(unittest.TestCase):
             )
         self.assertEqual(select.call_args.kwargs["allowed_harnesses"], {"grok"})
 
+    def test_legacy_adapter_uses_canonical_router_risk_flag_vocabulary(self) -> None:
+        self.assertEqual(
+            competition.RISK_FLAGS,
+            set(competition.coding_router.CANONICAL_ROUTING_RISK_FLAGS),
+        )
+        for flag in (
+            "high-risk",
+            "security-sensitive",
+            "private-context",
+            "credential",
+            "customer-data",
+            "secrets",
+            "public-context",
+            "prior-attempt-failed",
+        ):
+            with self.subTest(flag=flag):
+                result = competition.grabowski_agent_execution_route(
+                    "code",
+                    1,
+                    5,
+                    "low",
+                    risk_flags=[flag],
+                    available_external_agents=[],
+                )
+                self.assertIn(flag, result["risk"]["flags"])
+
     def test_route_rejects_coercive_bools_and_unknown_agents(self) -> None:
         with self.assertRaisesRegex(competition.AgentCompetitionError, "must be boolean"):
             competition.grabowski_agent_execution_route("code", 1, 1, "low", connector_instability="false")  # type: ignore[arg-type]

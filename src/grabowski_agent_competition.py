@@ -70,10 +70,7 @@ EXTERNAL_PROVIDER_BUDGET_CAP_ENV = "GRABOWSKI_EXTERNAL_PROVIDER_BUDGET_CAP_USD"
 MODES = {"competitor", "contrast"}
 TASK_KINDS = {"code", "docs", "analysis", "operations"}
 NOVELTY = {"low", "medium", "high"}
-RISK_FLAGS = {
-    "security", "runtime", "deployment", "schema", "concurrency", "data_migration",
-    "privilege", "external_api", "cross_repo", "destructive", "user_data",
-}
+RISK_FLAGS = set(coding_router.CANONICAL_ROUTING_RISK_FLAGS)
 DEFAULT_FORBIDDEN_COMPONENTS = frozenset({
     ".git", ".hg", ".svn", ".venv", "venv", "node_modules", "__pycache__",
     ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", ".nox", "build", "dist", "target",

@@ -1955,12 +1955,21 @@ class CodingAgentRouterTests(unittest.TestCase):
             risk_flags=["security-sensitive", "public-context"],
         )
         self.assertEqual(security["review_task_class"], "security-review")
+        security_direct = self._route(
+            "independent-review",
+            need_review=False,
+            novelty="medium",
+            risk_flags=["security-sensitive", "public-context"],
+        )
+        self.assertEqual(security_direct["review_task_class"], "security-review")
         deterministic = self._route("bounded-patch", need_review=False, novelty="low", risk_flags=[])
         self.assertEqual(deterministic["verification_policy"], "deterministic")
         self.assertFalse(deterministic["verification_floor"]["required"])
+        self.assertIsNone(deterministic["review_task_class"])
         competition = self._route("bounded-patch", need_review=False, novelty="low", risk_flags=[], verification_policy="competition")
         self.assertEqual(competition["verification_policy"], "competition")
         self.assertFalse(competition["independent_review_required"])
+        self.assertIsNone(competition["review_task_class"])
         self.assertEqual(competition["executor"], deterministic["executor"])
         with self.assertRaisesRegex(router.CodingAgentRouterError, "need_review requires"):
             self._route("bounded-patch", need_review=True, novelty="low", risk_flags=[], verification_policy="competition")

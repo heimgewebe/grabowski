@@ -64,6 +64,11 @@ SECURITY_REVIEW_RISK_FLAGS = frozenset({"privilege", "security", "security-sensi
 SENSITIVE_EXTERNAL_REVIEW_RISK_FLAGS = frozenset(
     {"credential", "customer-data", "private-context", "secrets", "user_data"}
 )
+CANONICAL_ROUTING_RISK_FLAGS = frozenset(
+    set(MANDATORY_INDEPENDENT_VERIFICATION_RISK_FLAGS)
+    | set(SENSITIVE_EXTERNAL_REVIEW_RISK_FLAGS)
+    | {"external_api", "prior-attempt-failed", "public-context"}
+)
 POOL_STATUSES = {
     "unknown",
     "available",
@@ -2370,12 +2375,14 @@ def canonical_execution_route(
     external_review_selection_allowed = bool(
         external_review_requested and not external_review_block_reasons
     )
-    review_task_class = (
-        task_value
-        if direct_review_task
-        else "security-review"
+    review_task_class: str | None = (
+        "security-review"
         if security_review_flags
+        else task_value
+        if direct_review_task
         else "independent-review"
+        if independent_review_required
+        else None
     )
     common = {
         "changed_files": changed_value,
@@ -2459,6 +2466,10 @@ def canonical_execution_route(
             excluded["scoped-writer:state"] = [state_error_type]
 
     if external_review_selection_allowed:
+        if review_task_class is None:
+            raise CodingAgentRouterError(
+                "independent review selection requires a review task class"
+            )
         review_status = state_status
         review_state_error_type = state_error_type
         review_primary_group = controller_route["independence_group"]
