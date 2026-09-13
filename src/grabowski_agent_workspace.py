@@ -808,11 +808,18 @@ def _route_decision_v2(input_facts: dict[str, Any]) -> dict[str, Any]:
     external_requested = bool(input_facts["user_requested_external"])
     external_available = list(input_facts["available_external_agents"])
 
-    critical_flags = {
-        "security", "runtime", "deployment", "schema", "concurrency",
-        "data_migration", "privilege", "cross_repo", "destructive", "user_data",
-    }
-    design_flags = {"security", "schema", "concurrency", "data_migration", "cross_repo"}
+    critical_flags = set(
+        coding_agent_router.MANDATORY_INDEPENDENT_VERIFICATION_RISK_FLAGS
+    ) | {"user_data"}
+    design_flags = {
+        "security",
+        "security-sensitive",
+        "high-risk",
+        "schema",
+        "concurrency",
+        "data_migration",
+        "cross_repo",
+    } & critical_flags
     score = 0
     if kind in {"code", "operations"}:
         score += 1

@@ -413,6 +413,40 @@ class AgentWorkspaceTests(unittest.TestCase):
 
         self.assertEqual(normalized["risk_flags"], facts["risk_flags"])
 
+    def test_route_replay_keeps_new_high_risk_flags_contrast_eligible(self) -> None:
+        for risk_flag in ("security-sensitive", "high-risk"):
+            with self.subTest(risk_flag=risk_flag):
+                facts = {
+                    "task_kind": "code",
+                    "changed_file_estimate": 1,
+                    "expected_duration_minutes": 15,
+                    "novelty": "low",
+                    "risk_flags": [risk_flag],
+                    "connector_instability": False,
+                    "concurrent_external_activity": False,
+                    "parallelization_candidate": False,
+                    "decision_fork": False,
+                    "architecture_hypotheses": 1,
+                    "user_requested_external": True,
+                    "available_external_agents": ["claude"],
+                }
+
+                decision = workspace._route_decision_v2(facts)
+
+                self.assertEqual(decision["risk_tier"], "R3")
+                self.assertTrue(decision["design_space"])
+                self.assertTrue(decision["contrast_eligible"])
+                self.assertEqual(
+                    decision["external_candidates"],
+                    [
+                        {
+                            "provider": "claude",
+                            "mode": "contrast",
+                            "timing": "after_direct_operator_plan_or_candidate",
+                        }
+                    ],
+                )
+
     def manifest(self, *, with_writer: bool = True) -> dict:
         if with_writer and not self.git.writer.exists():
             self.git.add_writer()
