@@ -192,21 +192,62 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.grok_auth_identity_mock.return_value = "b" * 64
         self.assertFalse(router._state_catalog_fresh(self.state))
 
-    def test_subscription_pool_blocks_overage_or_purchased_credits(self) -> None:
+    def test_catalog_freshness_fails_closed_on_unsafe_grok_auth_identity(self) -> None:
+        self.assertTrue(router._state_catalog_fresh(self.state))
+        self.grok_auth_identity_mock.return_value = None
+        self.assertFalse(router._state_catalog_fresh(self.state))
+
+    def test_grok_subscription_pool_requires_zero_additional_cost_contract(self) -> None:
         pool = self.catalog["quota_pools"]["grok-com"]
+        self.assertEqual(pool["marginal_cost_usd"], 0)
+        self.assertFalse(pool["payg_fallback_allowed"])
         self.assertFalse(pool["automatic_overage"])
         self.assertFalse(pool["credits_allowed"])
-        for field in ("automatic_overage", "credits_allowed"):
+
+        allowed, reasons, _penalty, execution_eligible = router._pool_gate(
+            "grok-com", self.catalog, self._fresh_state(), critical=False
+        )
+        self.assertTrue(allowed)
+        self.assertFalse(execution_eligible)
+        self.assertIn("quota is opaque", reasons)
+
+        unsafe_cases = {
+            "payg_fallback_allowed": True,
+            "automatic_overage": True,
+            "credits_allowed": True,
+            "marginal_cost_usd": 0.01,
+            "marginal_cost_unknown": None,
+        }
+        for field, value in unsafe_cases.items():
             with self.subTest(field=field):
                 state = self._fresh_state()
                 catalog = json.loads(json.dumps(self.catalog))
-                catalog["quota_pools"]["grok-com"][field] = True
+                target_field = (
+                    "marginal_cost_usd" if field == "marginal_cost_unknown" else field
+                )
+                catalog["quota_pools"]["grok-com"][target_field] = value
                 allowed, reasons, _penalty, execution_eligible = router._pool_gate(
                     "grok-com", catalog, state, critical=False
                 )
                 self.assertFalse(allowed)
                 self.assertFalse(execution_eligible)
                 self.assertTrue(reasons)
+
+    def test_grok_nominal_usage_telemetry_does_not_grant_paid_authority(self) -> None:
+        state = self._fresh_state()
+        state["routes"]["grok-4.6-review-high"] = {
+            "runs": 1,
+            "last_reported_cost_usd": 0.01338648,
+        }
+        allowed, reasons, _penalty, execution_eligible = router._pool_gate(
+            "grok-com", self.catalog, state, critical=False
+        )
+        self.assertTrue(allowed)
+        self.assertFalse(execution_eligible)
+        self.assertIn("quota is opaque", reasons)
+        self.assertFalse(
+            self.catalog["quota_pools"]["grok-com"]["payg_fallback_allowed"]
+        )
 
     def _route(self, task_class: str, **kwargs: object) -> dict:
         defaults = {

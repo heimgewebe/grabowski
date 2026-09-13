@@ -995,15 +995,15 @@ def _load_optional_advisory_state() -> tuple[dict[str, Any], str | None]:
         return {}, type(exc).__name__
 
 
-def _grok_auth_file_identity(*, home: Path | None = None) -> str:
-    """Hash only auth-file metadata so login changes invalidate cached readiness."""
+def _grok_auth_file_identity(*, home: Path | None = None) -> str | None:
+    """Bind readiness to safe non-secret auth-file identity metadata."""
     path = (home or Path.home()) / ".grok" / "auth.json"
     try:
         metadata = path.lstat()
     except FileNotFoundError:
         marker: dict[str, Any] = {"state": "missing"}
     except OSError:
-        marker = {"state": "unreadable"}
+        return None
     else:
         safe = (
             stat.S_ISREG(metadata.st_mode)
@@ -1011,8 +1011,10 @@ def _grok_auth_file_identity(*, home: Path | None = None) -> str:
             and metadata.st_nlink == 1
             and stat.S_IMODE(metadata.st_mode) & 0o077 == 0
         )
+        if not safe:
+            return None
         marker = {
-            "state": "present" if safe else "unsafe",
+            "state": "present",
             "device": metadata.st_dev,
             "inode": metadata.st_ino,
             "mode": stat.S_IMODE(metadata.st_mode),
@@ -1020,6 +1022,7 @@ def _grok_auth_file_identity(*, home: Path | None = None) -> str:
             "nlink": metadata.st_nlink,
             "size": metadata.st_size,
             "mtime_ns": metadata.st_mtime_ns,
+            "ctime_ns": metadata.st_ctime_ns,
         }
     return hashlib.sha256(
         json.dumps(
@@ -1049,10 +1052,13 @@ def _state_catalog_fresh(state: dict[str, Any]) -> bool:
     if not isinstance(grok, dict):
         return True
     stored_identity = grok.get("auth_file_identity_sha256")
+    current_identity = _grok_auth_file_identity()
     return (
         isinstance(stored_identity, str)
         and len(stored_identity) == 64
-        and stored_identity == _grok_auth_file_identity()
+        and isinstance(current_identity, str)
+        and len(current_identity) == 64
+        and stored_identity == current_identity
     )
 
 

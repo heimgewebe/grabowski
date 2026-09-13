@@ -208,6 +208,37 @@ class CodingAgentRouterCliTests(unittest.TestCase):
             },
         )
 
+    def test_grok_auth_file_identity_tracks_login_replace_logout_and_unsafe_file(self) -> None:
+        home = self.root / "grok-identity-home"
+        home.mkdir(mode=0o700)
+        missing = router._grok_auth_file_identity(home=home)
+        self.assertRegex(missing or "", r"^[0-9a-f]{64}$")
+
+        grok = home / ".grok"
+        grok.mkdir(mode=0o700)
+        auth = grok / "auth.json"
+        auth.write_bytes(b'{"fixture":"credential-a"}\n')
+        auth.chmod(0o600)
+        present = router._grok_auth_file_identity(home=home)
+        self.assertRegex(present or "", r"^[0-9a-f]{64}$")
+        self.assertNotEqual(present, missing)
+        self.assertEqual(router._grok_auth_file_identity(home=home), present)
+
+        replacement = grok / "auth.json.new"
+        replacement.write_bytes(b'{"fixture":"credential-a"}\n')
+        replacement.chmod(0o600)
+        replacement.replace(auth)
+        replaced = router._grok_auth_file_identity(home=home)
+        self.assertRegex(replaced or "", r"^[0-9a-f]{64}$")
+        self.assertNotEqual(replaced, present)
+
+        auth.unlink()
+        self.assertEqual(router._grok_auth_file_identity(home=home), missing)
+
+        auth.write_bytes(b'{"fixture":"credential-b"}\n')
+        auth.chmod(0o644)
+        self.assertIsNone(router._grok_auth_file_identity(home=home))
+
     def test_grok_subscription_auth_requires_exact_private_oidc_tier(self) -> None:
         catalog, _ = router._load_catalog()
         valid = cli._grok_subscription_auth_status(
