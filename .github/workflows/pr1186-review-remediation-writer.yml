@@ -40,6 +40,31 @@ jobs:
           test -f tools/pr1186_review_remediation.py
           python -m py_compile tools/pr1186_review_remediation.py
 
+      - name: Scope archive signature patch
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('tools/pr1186_review_remediation.py')
+          text = path.read_text(encoding='utf-8')
+          old = 'replace_once(CHECKOUTS, archive_sig_old, archive_sig_new)'
+          new = '''archive_source = Path(CHECKOUTS).read_text(encoding="utf-8")
+          archive_start_at = archive_source.index('@mcp.tool(name="grabowski_checkout_archive", annotations=MUTATING)')
+          archive_end_at = archive_source.index('@mcp.tool(name="grabowski_checkout_cleanup", annotations=MUTATING)', archive_start_at)
+          archive_block = archive_source[archive_start_at:archive_end_at]
+          if archive_block.count(archive_sig_old) != 1:
+              raise SystemExit("archive signature marker is not unique inside archive function")
+          archive_block = archive_block.replace(archive_sig_old, archive_sig_new, 1)
+          Path(CHECKOUTS).write_text(
+              archive_source[:archive_start_at] + archive_block + archive_source[archive_end_at:],
+              encoding="utf-8",
+          )'''
+          if text.count(old) != 1:
+              raise SystemExit(f'archive script hotfix marker count={text.count(old)}')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
+          python -m py_compile tools/pr1186_review_remediation.py
+
       - name: Apply bounded remediation
         run: |
           set -euo pipefail
