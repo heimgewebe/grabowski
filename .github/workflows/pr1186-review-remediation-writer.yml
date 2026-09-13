@@ -111,6 +111,56 @@ jobs:
           python tools/pr1186_review_remediation.py
           git diff --check
 
+      - name: Publish capability contract
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          contract_path = Path('config/runtime-entrypoint.json')
+          contract = json.loads(contract_path.read_text(encoding='utf-8'))
+          expected = contract['expected_tools']
+          new_tools = [
+              'grabowski_checkout_uncertainty_status',
+              'grabowski_checkout_uncertainty_reconcile',
+          ]
+          if any(name in expected for name in new_tools):
+              raise SystemExit('uncertainty tools unexpectedly already published')
+          anchor = expected.index('grabowski_checkout_cleanup') + 1
+          expected[anchor:anchor] = new_tools
+          contract_path.write_text(
+              json.dumps(contract, ensure_ascii=False, indent=2) + '\n',
+              encoding='utf-8',
+          )
+
+          capabilities_path = Path('src/grabowski_capabilities.py')
+          capabilities = capabilities_path.read_text(encoding='utf-8')
+          marker = '    "grabowski_github": {\n'
+          if capabilities.count(marker) != 1:
+              raise SystemExit('capability insertion anchor is not unique')
+          insertion = '''    "grabowski_checkout_uncertainty_status": {
+              "category": "checkout-lifecycle",
+              "purpose": "Read persistent unknown-outcome fences for checkout archive and cleanup effects.",
+              "risk_class": "low",
+              "effects": [],
+              "reversibility": "not-applicable",
+          },
+          "grabowski_checkout_uncertainty_reconcile": {
+              "category": "checkout-lifecycle",
+              "purpose": "Reconcile one persistent unknown-outcome checkout fence from primary Git and database evidence and release coordination only after the outcome is proven.",
+              "risk_class": "high",
+              "effects": ["audit-append", "resource-lease-release", "state-change"],
+              "reversibility": "evidence-bound-state-transition",
+          },
+          '''
+          capabilities_path.write_text(
+              capabilities.replace(marker, insertion + marker, 1),
+              encoding='utf-8',
+          )
+          PY
+          git diff --check
+
       - name: Refresh generated operator context
         run: |
           set -euo pipefail
@@ -132,7 +182,8 @@ jobs:
           set -euo pipefail
           git config user.name 'grabowski-review-remediation'
           git config user.email 'grabowski-review-remediation@users.noreply.github.com'
-          git add src/grabowski_checkouts.py src/grabowski_agent_workspace.py tests/test_checkouts.py generated tools/pr1186_review_remediation.py .github/workflows/pr1186-review-remediation-writer.yml
+          git status --short
+          git add -A
           git diff --cached --check
           if git diff --cached --quiet; then
             echo 'No remediation diff produced' >&2
