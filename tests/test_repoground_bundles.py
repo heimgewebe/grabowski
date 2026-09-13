@@ -2274,6 +2274,35 @@ class RepoGroundContextBridgeToolTests(unittest.TestCase):
         self.assertEqual(five["budget"]["context_bytes_used"], 6000)
         self.assertNotIn("pre_projection_context_bytes_used", five["budget"])
 
+        legacy_payload = {
+            **payload,
+            "budget": {
+                key: value
+                for key, value in payload["budget"].items()
+                if key != "context_unicode_characters_used"
+            },
+        }
+        with patch.object(
+            mcp, "_repoground_agent_query", return_value=legacy_payload
+        ):
+            legacy = mcp.repoground_query(
+                "demo-repo",
+                "target",
+                k=5,
+                max_snippets=1,
+                max_context_tokens=1500,
+            )
+
+        self.assertEqual(legacy["budget"]["context_bytes_used"], 1200)
+        self.assertEqual(legacy["budget"]["context_unicode_characters_used"], 1200)
+        self.assertEqual(legacy["budget"]["approx_context_chars_used"], 1200)
+        self.assertEqual(
+            legacy["budget"]["pre_projection_approx_context_chars_used"], 6000
+        )
+        self.assertNotIn(
+            "pre_projection_context_unicode_characters_used", legacy["budget"]
+        )
+
         preflight = {
             "status": "pass",
             "available": True,

@@ -9421,6 +9421,10 @@ def _repoground_emitted_evidence_budget(
     bounded = dict(budget)
     previous_bytes = bounded.get("context_bytes_used")
     previous_characters = bounded.get("context_unicode_characters_used")
+    previous_characters_field = "context_unicode_characters_used"
+    if previous_characters is None:
+        previous_characters = bounded.get("approx_context_chars_used")
+        previous_characters_field = "approx_context_chars_used"
     if (
         isinstance(previous_bytes, int)
         and not isinstance(previous_bytes, bool)
@@ -9432,9 +9436,12 @@ def _repoground_emitted_evidence_budget(
         and not isinstance(previous_characters, bool)
         and previous_characters != emitted_characters
     ):
-        bounded["pre_projection_context_unicode_characters_used"] = (
-            previous_characters
+        pre_projection_key = (
+            "pre_projection_context_unicode_characters_used"
+            if previous_characters_field == "context_unicode_characters_used"
+            else "pre_projection_approx_context_chars_used"
         )
+        bounded[pre_projection_key] = previous_characters
     bounded["context_bytes_used"] = emitted_bytes
     bounded["context_unicode_characters_used"] = emitted_characters
     bounded["approx_context_chars_used"] = emitted_characters
