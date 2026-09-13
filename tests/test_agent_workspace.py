@@ -3132,6 +3132,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             "from pathlib import Path\n"
             "auth = Path.home() / '.codex' / 'auth.json'\n"
             "print(auth.read_text(encoding='utf-8').strip())\n"
+            "print(oct(auth.stat().st_mode & 0o777))\n"
             "auth.write_text('sandbox-refreshed\\n', encoding='utf-8')\n",
             encoding="utf-8",
         )
@@ -3163,6 +3164,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn('{"fixture":"host-original"}', completed.stdout)
+        self.assertIn("0o600", completed.stdout)
         self.assertEqual(auth.read_bytes(), original_auth)
 
     def test_codex_profile_rejects_non_private_auth(self) -> None:

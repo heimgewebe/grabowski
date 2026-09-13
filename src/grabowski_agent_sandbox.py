@@ -47,9 +47,10 @@ import sys
 
 source = "/opt/grabowski-external/codex-auth-bootstrap.json"
 destination = "/tmp/.codex/auth.json"
-with open(source, "rb") as source_file, open(destination, "xb") as destination_file:
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+descriptor = os.open(destination, flags, 0o600)
+with open(source, "rb") as source_file, os.fdopen(descriptor, "wb") as destination_file:
     shutil.copyfileobj(source_file, destination_file)
-os.chmod(destination, 0o600)
 os.execv(sys.argv[1], sys.argv[1:])
 """
 
