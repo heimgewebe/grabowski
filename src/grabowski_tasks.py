@@ -8168,6 +8168,40 @@ def grabowski_task_start(
             "runtime_refresh_executor_prelaunch_recovery": executor_prelaunch_recovery,
             "deduplicated_reuse": None,
         }
+    coding_agent_pre_dispatch_admission: dict[str, Any] | None = None
+    if (
+        target["transport"] == "local"
+        and task_effect_classification.get("agent_executable") is not None
+    ):
+        import grabowski_coding_agent_router as coding_agent_router
+
+        candidate_admission = coding_agent_router.coding_agent_pre_dispatch_admission(
+            command
+        )
+        if candidate_admission.get("admitted") is not True:
+            denial_audit = {
+                "timestamp_unix": _now(),
+                "operation": "task-start-coding-agent-admission-denied",
+                "requested_task_id": task_id,
+                "host": host,
+                "transport": target["transport"],
+                "argv_sha256": argv_sha256,
+                "execution_identity_sha256": execution_identity["identity_sha256"],
+                "effect_profile": task_effect_classification["effect_profile"],
+                "agent_executable": task_effect_classification.get("agent_executable"),
+                "coding_agent_pre_dispatch_admission": candidate_admission,
+                "no_task_record_created": True,
+                "no_process_started": True,
+                "no_resource_lease_acquired": True,
+            }
+            base._append_audit(denial_audit)
+            raise RuntimeError(
+                "coding-agent pre-dispatch admission denied: "
+                + str(candidate_admission.get("reason_code", "unknown"))
+            )
+        if candidate_admission.get("applicable") is True:
+            coding_agent_pre_dispatch_admission = candidate_admission
+
     retry_binding = (
         None
         if operation_retry_binding is not None
@@ -8251,6 +8285,15 @@ def grabowski_task_start(
                 ),
                 "task_effect_classification": dict(
                     task_effect_classification
+                ),
+                **(
+                    {
+                        "coding_agent_pre_dispatch_admission": dict(
+                            coding_agent_pre_dispatch_admission
+                        )
+                    }
+                    if coding_agent_pre_dispatch_admission is not None
+                    else {}
                 ),
                 **(
                     {"retry_binding": dict(retry_binding)}
@@ -8535,6 +8578,15 @@ def grabowski_task_start(
         **_launch(record),
         "task_effect_classification": dict(task_effect_classification),
         **(
+            {
+                "coding_agent_pre_dispatch_admission": dict(
+                    coding_agent_pre_dispatch_admission
+                )
+            }
+            if coding_agent_pre_dispatch_admission is not None
+            else {}
+        ),
+        **(
             {TASK_OUTPUT_LAUNCHER_BINDING_KEY: task_output_managed_from_attempt}
             if task_output_managed_from_attempt is not None
             else {}
@@ -8663,6 +8715,7 @@ def grabowski_task_start(
         "runtime_refresh_executor_lease_binding": executor_lease_binding_evidence,
         "runtime_refresh_executor_prelaunch_recovery": executor_prelaunch_recovery,
         "routing_shadow_capture": routing_shadow_capture,
+        "coding_agent_pre_dispatch_admission": coding_agent_pre_dispatch_admission,
         **(
             {"read_routing_advisory": read_routing_advisory}
             if read_routing_advisory is not None
@@ -8681,6 +8734,7 @@ def grabowski_task_start(
         "execution_identity": execution_identity,
         "retry_binding": retry_binding,
         "routing_shadow_capture": routing_shadow_capture,
+        "coding_agent_pre_dispatch_admission": coding_agent_pre_dispatch_admission,
         **(
             {"read_routing_advisory": read_routing_advisory}
             if read_routing_advisory is not None
@@ -8958,6 +9012,42 @@ def grabowski_task_resume(
         retained_retry_binding = _persisted_retry_binding_or_raise(record)
         if retained_retry_binding is not None:
             recovery_launcher_bindings["retry_binding"] = retained_retry_binding
+    coding_agent_pre_dispatch_admission: dict[str, Any] | None = None
+    task_effect_classification = _record_task_effect_classification(record)
+    agent_executable = (
+        task_effect_classification.get("agent_executable")
+        if task_effect_classification is not None
+        else Path(command[0]).name.lower()
+    )
+    if (
+        agent_executable in MUTATING_AGENT_EXECUTABLES
+        and fleet.fleet_host(str(record["host"]))["transport"] == "local"
+    ):
+        import grabowski_coding_agent_router as coding_agent_router
+
+        candidate_admission = coding_agent_router.coding_agent_pre_dispatch_admission(
+            command
+        )
+        if candidate_admission.get("admitted") is not True:
+            denial_audit = {
+                "timestamp_unix": _now(),
+                "operation": "task-resume-coding-agent-admission-denied",
+                "task_id": task_id,
+                "host": record["host"],
+                "attempt_before": int(record["attempt"]),
+                "agent_executable": agent_executable,
+                "coding_agent_pre_dispatch_admission": candidate_admission,
+                "no_attempt_advanced": True,
+                "no_process_started": True,
+                "no_resource_lease_renewed_or_reacquired": True,
+            }
+            base._append_audit(denial_audit)
+            raise RuntimeError(
+                "coding-agent pre-dispatch admission denied on resume: "
+                + str(candidate_admission.get("reason_code", "unknown"))
+            )
+        if candidate_admission.get("applicable") is True:
+            coding_agent_pre_dispatch_admission = candidate_admission
     attempt = int(record["attempt"]) + 1
     task_output_managed_from_attempt = _task_output_managed_from_attempt(record)
     if not _is_root_systemd_backend(record):
@@ -9007,6 +9097,15 @@ def grabowski_task_resume(
             launcher={
                 "pending": True,
                 **(
+                    {
+                        "coding_agent_pre_dispatch_admission": dict(
+                            coding_agent_pre_dispatch_admission
+                        )
+                    }
+                    if coding_agent_pre_dispatch_admission is not None
+                    else {}
+                ),
+                **(
                     {TASK_OUTPUT_LAUNCHER_BINDING_KEY: task_output_managed_from_attempt}
                     if task_output_managed_from_attempt is not None
                     else {}
@@ -9052,6 +9151,13 @@ def grabowski_task_resume(
                 "reconciled" if lease_result.get("preserved") else "reacquired"
             )
     launcher = _launch(candidate)
+    if coding_agent_pre_dispatch_admission is not None:
+        launcher = {
+            **launcher,
+            "coding_agent_pre_dispatch_admission": dict(
+                coding_agent_pre_dispatch_admission
+            ),
+        }
     if task_output_managed_from_attempt is not None:
         launcher = {
             **launcher,
@@ -9095,6 +9201,7 @@ def grabowski_task_resume(
         "resource_lease_mode": lease_mode,
         "resource_lease_maintenance": lease_maintenance,
         "interrupted_recovery_binding": interrupted_recovery_binding,
+        "coding_agent_pre_dispatch_admission": coding_agent_pre_dispatch_admission,
     }
     base._append_audit(audit)
     return {"task": _public(stored), "audit": audit}
