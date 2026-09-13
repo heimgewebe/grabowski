@@ -111,13 +111,114 @@ jobs:
           python tools/pr1186_review_remediation.py
           python - <<'PY'
           from pathlib import Path
-          path = Path('src/grabowski_checkouts.py')
-          text = path.read_text(encoding='utf-8')
+
+          source_path = Path('src/grabowski_checkouts.py')
+          source = source_path.read_text(encoding='utf-8')
           old = '    wanted = set(resources.normalize_resource_keys(resource_keys))\n'
           new = '    raw_resource_keys = list(resource_keys)\n    wanted = (\n        set(resources.normalize_resource_keys(raw_resource_keys))\n        if raw_resource_keys\n        else set()\n    )\n'
-          if text.count(old) != 1:
-              raise SystemExit(f'all-fence listing fix marker count={text.count(old)}')
-          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          if source.count(old) != 1:
+              raise SystemExit(f'all-fence listing fix marker count={source.count(old)}')
+          source_path.write_text(source.replace(old, new, 1), encoding='utf-8')
+
+          tests_path = Path('tests/test_checkouts.py')
+          tests = tests_path.read_text(encoding='utf-8')
+
+          def replace_in_test(name: str, old_text: str, new_text: str) -> None:
+              global tests
+              marker = f'    def {name}('
+              if tests.count(marker) != 1:
+                  raise SystemExit(f'test marker count={tests.count(marker)} for {name}')
+              start = tests.index(marker)
+              end = tests.find('\n    def ', start + len(marker))
+              if end < 0:
+                  end = len(tests)
+              block = tests[start:end]
+              if block.count(old_text) != 1:
+                  raise SystemExit(f'test replacement count={block.count(old_text)} for {name}')
+              block = block.replace(old_text, new_text, 1)
+              tests = tests[:start] + block + tests[end:]
+
+          fence_assertion = '''        fences = checkouts._active_checkout_operation_uncertainties()
+          self.assertEqual(len(fences), 1)
+          fence = fences[0]
+          self.assertEqual(fence["operation"], "archive")
+          leases = checkouts._read_resource_leases()
+          self.assertTrue(leases)
+          self.assertEqual(
+              {item["owner_id"] for item in leases},
+              {fence["lease_owner_id"]},
+          )'''
+
+          replace_in_test(
+              'test_archive_transaction_rolls_back_on_lifecycle_transition_failure',
+              '        self.assertEqual(checkouts._read_resource_leases(), [])',
+              fence_assertion,
+          )
+
+          old_name = '    def test_archive_releases_operation_lease_when_manifest_write_fails(self) -> None:'
+          new_name = '    def test_archive_manifest_failure_retains_uncertainty_fence(self) -> None:'
+          if tests.count(old_name) != 1:
+              raise SystemExit('manifest test name marker is not unique')
+          tests = tests.replace(old_name, new_name, 1)
+          replace_in_test(
+              'test_archive_manifest_failure_retains_uncertainty_fence',
+              '        self.assertEqual(checkouts._read_resource_leases(), [])',
+              fence_assertion,
+          )
+
+          audit_recovery = fence_assertion + '''
+          with checkouts.resources._database() as connection:
+              connection.execute(
+                  "UPDATE leases SET expires_at_unix=? WHERE owner_id=?",
+                  (int(time.time()) - 1, fence["lease_owner_id"]),
+              )
+              connection.commit()
+          reconciled = checkouts.grabowski_checkout_uncertainty_reconcile(
+              fence["fence_id"],
+              "reconcile-checkout-operation-outcome",
+          )
+          self.assertEqual(reconciled["state"], "reconciled")
+          self.assertEqual(reconciled["outcome"], "confirmed_success")
+          self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+          self.assertEqual(checkouts._read_resource_leases(), [])'''
+          replace_in_test(
+              'test_archive_preserves_committed_state_when_audit_append_fails',
+              '        self.assertEqual(checkouts._read_resource_leases(), [])',
+              audit_recovery,
+          )
+
+          def append_to_test(name: str, addition: str) -> None:
+              global tests
+              marker = f'    def {name}('
+              if tests.count(marker) != 1:
+                  raise SystemExit(f'append marker count={tests.count(marker)} for {name}')
+              start = tests.index(marker)
+              end = tests.find('\n    def ', start + len(marker))
+              if end < 0:
+                  end = len(tests)
+              block = tests[start:end].rstrip()
+              tests = tests[:start] + block + '\n' + addition.rstrip() + '\n' + tests[end:]
+
+          append_to_test(
+              'test_partial_archive_failure_remains_durably_fenced_after_lease_expiry',
+              '''        reconciliation = checkouts.grabowski_checkout_uncertainty_reconcile(
+              fence["fence_id"],
+              "reconcile-checkout-operation-outcome",
+          )
+          self.assertEqual(reconciliation["state"], "still_fenced")
+          self.assertEqual(len(checkouts._active_checkout_operation_uncertainties()), 1)''',
+          )
+          append_to_test(
+              'test_cleanup_unknown_outcome_remains_durably_fenced_after_lease_expiry',
+              '''        reconciliation = checkouts.grabowski_checkout_uncertainty_reconcile(
+              fence["fence_id"],
+              "reconcile-checkout-operation-outcome",
+          )
+          self.assertEqual(reconciliation["state"], "reconciled")
+          self.assertEqual(reconciliation["outcome"], "confirmed_no_effect")
+          self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])''',
+          )
+          tests_path.write_text(tests, encoding='utf-8')
           PY
           git diff --check
 
