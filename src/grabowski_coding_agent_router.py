@@ -2181,7 +2181,7 @@ def coding_agent_pre_dispatch_admission(argv: list[str]) -> dict[str, Any]:
                 "state_error": effective.get("_state_error"),
             }
         )
-        blocked = blocked or not allowed
+        blocked = blocked or not allowed or not execution_eligible
 
     return _pre_dispatch_admission_receipt(
         {
