@@ -1978,9 +1978,15 @@ class CheckoutLifecycleTests(unittest.TestCase):
 
         self.assertTrue(self.checkout.exists())
         self.assertGreaterEqual(verify_mock.call_count, 2)
-        fences = checkouts._active_checkout_operation_uncertainties()
-        self.assertEqual(len(fences), 1)
-        self.assertEqual(fences[0]["operation"], "archive")
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+        with checkouts._database() as connection:
+            row = connection.execute(
+                "SELECT * FROM operation_uncertainty ORDER BY created_at_unix DESC LIMIT 1"
+            ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertIsNotNone(row["cleared_at_unix"])
+        clearance = checkouts.json.loads(row["clearance_json"])
+        self.assertEqual(clearance["outcome"], "confirmed_no_effect")
 
     def test_partial_archive_failure_remains_durably_fenced_after_lease_expiry(self) -> None:
         expected_identity = checkouts.physical_checkout.capture_physical_checkout_identity(

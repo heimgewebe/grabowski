@@ -4614,16 +4614,35 @@ def grabowski_checkout_archive(
                 "planned_recovery_refs": planned_refs,
             },
         )
-        recovery_refs = [
-            _create_recovery_ref(
-                top_level,
-                item["ref"],
-                item["target"],
-                expected_physical_identity=archive_physical_identity,
-                expected_physical_checkout=checkout,
-            )
-            for item in planned_refs
-        ]
+        recovery_refs: list[dict[str, Any]] = []
+        for item in planned_refs:
+            try:
+                created_ref = _create_recovery_ref(
+                    top_level,
+                    item["ref"],
+                    item["target"],
+                    expected_physical_identity=archive_physical_identity,
+                    expected_physical_checkout=checkout,
+                )
+            except CheckoutPhysicalIdentityPreconditionError:
+                if recovery_refs:
+                    # At least one recovery ref exists, so archive effects are partial
+                    # and the durable fence must remain until reconciliation.
+                    raise
+                lease_release = _release_checkout_resources(lease)
+                _clear_checkout_operation_uncertainty(
+                    uncertainty_fence["fence_id"],
+                    outcome="confirmed_no_effect",
+                    evidence={
+                        "reason": (
+                            "physical-identity-precondition-failed-before-first-archive-git-mutation"
+                        ),
+                        "archive_id": archive_id,
+                        "lease_release": lease_release,
+                    },
+                )
+                raise
+            recovery_refs.append(created_ref)
         manifest_dir = _archive_directory(archive_id)
         public_refs = [
             {
