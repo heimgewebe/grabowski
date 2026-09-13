@@ -8060,6 +8060,91 @@ class AgentWorkspaceTests(unittest.TestCase):
                 resolved["execution_id"], prior_effect["execution_id"]
             )
 
+    def test_cleanup_reconciles_post_commit_audit_failure_and_clears_fence(self) -> None:
+        manifest = self._closed_cleanup_manifest()
+        checkout_state = self.root / "checkout-state-post-commit-audit-recovery"
+        patches = [
+            mock.patch.object(workspace.checkouts, "CHECKOUT_DB", checkout_state / "checkouts.sqlite3"),
+            mock.patch.object(workspace.checkouts, "ARCHIVE_ROOT", checkout_state / "archives"),
+            mock.patch.object(workspace.checkouts, "CHECKOUT_LOCK", checkout_state / "checkouts.lock"),
+            mock.patch.object(workspace.checkouts.resources, "RESOURCE_DB", checkout_state / "resources.sqlite3"),
+            mock.patch.object(workspace.checkouts.tasks, "TASK_DB", checkout_state / "tasks.sqlite3"),
+            mock.patch.object(workspace.checkouts.operator, "_safe_environment", return_value=os.environ.copy()),
+            mock.patch.object(workspace.checkouts.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.checkouts.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.checkouts, "_processes_under", return_value=[]),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+        ]
+
+        def fail_cleanup_audit(record: dict) -> None:
+            if record.get("operation") == "checkout-cleanup-apply":
+                raise RuntimeError("simulated cleanup audit failure after database commit")
+
+        with (
+            patches[0], patches[1], patches[2], patches[3], patches[4],
+            patches[5], patches[6], patches[7], patches[8], patches[9], patches[10],
+            mock.patch.object(
+                workspace.checkouts.base,
+                "_append_audit",
+                side_effect=fail_cleanup_audit,
+            ),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            archived = workspace.grabowski_agent_workspace_cleanup(
+                manifest["workspace_id"],
+                plan["plan_sha256"],
+                "archive-and-remove-worktree",
+            )
+            self.assertEqual(archived["state"], "archived_waiting_for_cleanup")
+            self._mature_checkout_archive(str(archived["archive_id"]))
+            refreshed = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            self.assertTrue(refreshed["eligible"])
+
+            with self.assertRaisesRegex(
+                RuntimeError, "simulated cleanup audit failure after database commit"
+            ):
+                workspace.grabowski_agent_workspace_cleanup(
+                    manifest["workspace_id"],
+                    refreshed["plan_sha256"],
+                    "archive-and-remove-worktree",
+                )
+
+            self.assertFalse(self.git.writer.exists())
+            fences = workspace.checkouts._active_checkout_operation_uncertainties()
+            self.assertEqual(len(fences), 1)
+            fence = fences[0]
+            self.assertEqual(fence["operation"], "cleanup")
+            with workspace.checkouts.resources._database() as connection:
+                connection.execute(
+                    "UPDATE leases SET expires_at_unix=? WHERE owner_id=?",
+                    (int(time.time()) - 1, fence["lease_owner_id"]),
+                )
+                connection.commit()
+
+            with mock.patch.object(
+                workspace.checkouts, "grabowski_checkout_cleanup"
+            ) as cleanup:
+                reconciled = workspace.grabowski_agent_workspace_cleanup(
+                    manifest["workspace_id"],
+                    refreshed["plan_sha256"],
+                    "archive-and-remove-worktree",
+                )
+            cleanup.assert_not_called()
+            self.assertEqual(reconciled["state"], "cleanup_reconciled")
+            self.assertEqual(
+                workspace.checkouts._active_checkout_operation_uncertainties(), []
+            )
+            cleared = workspace.checkouts._load_checkout_operation_uncertainty(
+                fence["fence_id"]
+            )
+            self.assertIsNotNone(cleared["cleared_at_unix"])
+            self.assertEqual(cleared["clearance"]["outcome"], "confirmed_success")
+
     def test_cleanup_plan_blocks_invalid_close_receipt(self) -> None:
         manifest = self._closed_cleanup_manifest()
         manifest["close_receipt"]["closure_outcome"] = "tampered"

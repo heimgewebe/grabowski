@@ -13272,11 +13272,55 @@ def _workspace_cleanup_finalize_missing(
     archive = _verified_workspace_cleanup_archive(manifest, intent, owner)
     if archive is None:
         return None
+    checkout_key = archive.get("checkout_key")
+    cleanup_plan_id = archive.get("cleanup_plan_id")
+    if not isinstance(checkout_key, str) or not isinstance(cleanup_plan_id, str):
+        raise AgentWorkspaceActionError(
+            "workspace cleanup reconciliation lacks exact checkout cleanup identity"
+        )
+    active_fences = [
+        fence
+        for fence in checkouts._active_checkout_operation_uncertainties()
+        if fence.get("checkout_key") == checkout_key
+    ]
+    uncertainty_reconciliation = None
+    if active_fences:
+        matching_fences = [
+            fence
+            for fence in active_fences
+            if fence.get("operation") == "cleanup"
+            and fence.get("operation_id") == cleanup_plan_id
+            and fence.get("owner_id") == owner
+            and isinstance(fence.get("evidence"), dict)
+            and fence["evidence"].get("archive_id") == archive.get("archive_id")
+            and fence["evidence"].get("plan_id") == cleanup_plan_id
+            and fence["evidence"].get("checkout_key") == checkout_key
+            and fence["evidence"].get("owner_id") == owner
+        ]
+        if len(active_fences) != 1 or len(matching_fences) != 1:
+            raise AgentWorkspaceActionError(
+                "workspace cleanup reconciliation found conflicting checkout uncertainty fence"
+            )
+        uncertainty_reconciliation = (
+            checkouts.grabowski_checkout_uncertainty_reconcile(
+                matching_fences[0]["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+        )
+        if uncertainty_reconciliation.get("state") not in {
+            "reconciled",
+            "already_reconciled",
+        }:
+            reason = uncertainty_reconciliation.get("reason", "outcome-not-proven")
+            raise AgentWorkspaceActionError(
+                f"workspace cleanup uncertainty remains fenced: {reason}"
+            )
     return {
         "archive_id": archive["archive_id"],
-        "checkout_cleanup_plan_id": archive["cleanup_plan_id"],
+        "checkout_cleanup_plan_id": cleanup_plan_id,
         "applied_at_unix": archive["cleaned_at_unix"],
         "reconciled_after_missing_worktree": True,
+        "checkout_uncertainty_reconciliation": uncertainty_reconciliation,
     }
 
 
