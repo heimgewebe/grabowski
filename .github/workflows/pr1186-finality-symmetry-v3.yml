@@ -1,0 +1,139 @@
+name: PR1186 finality symmetry remediation v3
+
+on:
+  push:
+    branches:
+      - fix/terminal-lane-retention-archive-20260913
+
+permissions:
+  contents: write
+
+jobs:
+  remediate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout exact triggering head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Apply exact finality remediation
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          checkout_path = Path("src/grabowski_checkouts.py")
+          checkout_source = checkout_path.read_text(encoding="utf-8")
+
+          archive_readback_old = '''            and Path(str(archive["manifest_path"])).is_file()\n            and isinstance(lifecycle, dict)\n            and lifecycle.get("phase") == "archived"\n            and lifecycle.get("owner_id") == evidence["owner_id"]\n        ):\n'''
+          archive_readback_new = '''            and Path(str(archive["manifest_path"])).is_file()\n            and (\n                lifecycle is None\n                or (\n                    isinstance(lifecycle, dict)\n                    and lifecycle.get("phase") == "archived"\n                    and lifecycle.get("owner_id") == evidence["owner_id"]\n                )\n            )\n        ):\n'''
+          if checkout_source.count(archive_readback_old) != 1:
+              raise SystemExit("archive uncertainty lifecycle preimage mismatch")
+          checkout_source = checkout_source.replace(archive_readback_old, archive_readback_new, 1)
+
+          archive_order_old = '''            except CheckoutPhysicalIdentityPreconditionError:\n                if recovery_refs:\n                    # At least one recovery ref exists, so archive effects are partial\n                    # and the durable fence must remain until reconciliation.\n                    raise\n                lease_release = _release_checkout_resources(lease)\n                _clear_checkout_operation_uncertainty(\n                    uncertainty_fence["fence_id"],\n                    outcome="confirmed_no_effect",\n                    evidence={\n                        "reason": (\n                            "physical-identity-precondition-failed-before-first-archive-git-mutation"\n                        ),\n                        "archive_id": archive_id,\n                        "lease_release": lease_release,\n                    },\n                )\n                raise\n'''
+          archive_order_new = '''            except CheckoutPhysicalIdentityPreconditionError:\n                if recovery_refs:\n                    # At least one recovery ref exists, so archive effects are partial\n                    # and the durable fence must remain until reconciliation.\n                    raise\n                _clear_checkout_operation_uncertainty(\n                    uncertainty_fence["fence_id"],\n                    outcome="confirmed_no_effect",\n                    evidence={\n                        "reason": (\n                            "physical-identity-precondition-failed-before-first-archive-git-mutation"\n                        ),\n                        "archive_id": archive_id,\n                    },\n                )\n                _release_checkout_resources(lease)\n                raise\n'''
+          if checkout_source.count(archive_order_old) != 1:
+              raise SystemExit("archive no-effect ordering preimage mismatch")
+          checkout_source = checkout_source.replace(archive_order_old, archive_order_new, 1)
+
+          cleanup_order_old = '''    except CheckoutPhysicalIdentityPreconditionError:\n        lease_release = _release_checkout_resources(lease)\n        _clear_checkout_operation_uncertainty(\n            uncertainty_fence["fence_id"],\n            outcome="confirmed_no_effect",\n            evidence={\n                "reason": "physical-identity-precondition-failed-before-git-mutation",\n                "lease_release": lease_release,\n            },\n        )\n        raise\n'''
+          cleanup_order_new = '''    except CheckoutPhysicalIdentityPreconditionError:\n        _clear_checkout_operation_uncertainty(\n            uncertainty_fence["fence_id"],\n            outcome="confirmed_no_effect",\n            evidence={\n                "reason": "physical-identity-precondition-failed-before-git-mutation",\n            },\n        )\n        _release_checkout_resources(lease)\n        raise\n'''
+          if checkout_source.count(cleanup_order_old) != 1:
+              raise SystemExit("cleanup no-effect ordering preimage mismatch")
+          checkout_path.write_text(checkout_source.replace(cleanup_order_old, cleanup_order_new, 1), encoding="utf-8")
+
+          workspace_path = Path("src/grabowski_agent_workspace.py")
+          workspace_source = workspace_path.read_text(encoding="utf-8")
+          helper_marker = '''\n\ndef _workspace_cleanup_finalize_missing(\n'''
+          helper = '''\n\ndef _workspace_reconcile_checkout_uncertainty(\n    *,\n    checkout_key: str,\n    owner: str,\n    operation: str,\n    operation_id: str,\n    expected_evidence: dict[str, Any],\n    release_operation_lease: bool = False,\n) -> dict[str, Any] | None:\n    active_fences = [\n        fence\n        for fence in checkouts._active_checkout_operation_uncertainties()\n        if fence.get("checkout_key") == checkout_key\n    ]\n    if not active_fences:\n        return None\n    matching_fences = [\n        fence\n        for fence in active_fences\n        if fence.get("operation") == operation\n        and fence.get("operation_id") == operation_id\n        and fence.get("owner_id") == owner\n        and isinstance(fence.get("evidence"), dict)\n        and all(fence["evidence"].get(key) == value for key, value in expected_evidence.items())\n    ]\n    if len(active_fences) != 1 or len(matching_fences) != 1:\n        raise AgentWorkspaceActionError(\n            f"workspace {operation} reconciliation found conflicting checkout uncertainty fence"\n        )\n    fence = matching_fences[0]\n    if release_operation_lease:\n        # Primary post-state was already verified. The durable fence remains active\n        # while the short-lived operation lease is released, so no authority gap opens.\n        checkouts._release_uncertainty_fence_resources(fence)\n    reconciliation = checkouts.grabowski_checkout_uncertainty_reconcile(\n        fence["fence_id"],\n        "reconcile-checkout-operation-outcome",\n    )\n    if reconciliation.get("state") not in {"reconciled", "already_reconciled"}:\n        readback = reconciliation.get("readback")\n        reason = (\n            readback.get("reason")\n            if isinstance(readback, dict)\n            else reconciliation.get("reason")\n        ) or "outcome-not-proven"\n        raise AgentWorkspaceActionError(\n            f"workspace {operation} uncertainty remains fenced: {reason}"\n        )\n    return reconciliation\n'''
+          if workspace_source.count(helper_marker) != 1:
+              raise SystemExit("workspace uncertainty helper insertion marker mismatch")
+          workspace_source = workspace_source.replace(helper_marker, helper + helper_marker, 1)
+
+          cleanup_block_old = '''    checkout_key = archive.get("checkout_key")\n    cleanup_plan_id = archive.get("cleanup_plan_id")\n    if not isinstance(checkout_key, str) or not isinstance(cleanup_plan_id, str):\n        raise AgentWorkspaceActionError(\n            "workspace cleanup reconciliation lacks exact checkout cleanup identity"\n        )\n    active_fences = [\n        fence\n        for fence in checkouts._active_checkout_operation_uncertainties()\n        if fence.get("checkout_key") == checkout_key\n    ]\n    uncertainty_reconciliation = None\n    if active_fences:\n        matching_fences = [\n            fence\n            for fence in active_fences\n            if fence.get("operation") == "cleanup"\n            and fence.get("operation_id") == cleanup_plan_id\n            and fence.get("owner_id") == owner\n            and isinstance(fence.get("evidence"), dict)\n            and fence["evidence"].get("archive_id") == archive.get("archive_id")\n            and fence["evidence"].get("plan_id") == cleanup_plan_id\n            and fence["evidence"].get("checkout_key") == checkout_key\n            and fence["evidence"].get("owner_id") == owner\n        ]\n        if len(active_fences) != 1 or len(matching_fences) != 1:\n            raise AgentWorkspaceActionError(\n                "workspace cleanup reconciliation found conflicting checkout uncertainty fence"\n            )\n        uncertainty_reconciliation = (\n            checkouts.grabowski_checkout_uncertainty_reconcile(\n                matching_fences[0]["fence_id"],\n                "reconcile-checkout-operation-outcome",\n            )\n        )\n        if uncertainty_reconciliation.get("state") not in {\n            "reconciled",\n            "already_reconciled",\n        }:\n            reason = uncertainty_reconciliation.get("reason", "outcome-not-proven")\n            raise AgentWorkspaceActionError(\n                f"workspace cleanup uncertainty remains fenced: {reason}"\n            )\n'''
+          cleanup_block_new = '''    checkout_key = archive.get("checkout_key")\n    cleanup_plan_id = archive.get("cleanup_plan_id")\n    if not isinstance(checkout_key, str) or not isinstance(cleanup_plan_id, str):\n        raise AgentWorkspaceActionError(\n            "workspace cleanup reconciliation lacks exact checkout cleanup identity"\n        )\n    uncertainty_reconciliation = _workspace_reconcile_checkout_uncertainty(\n        checkout_key=checkout_key,\n        owner=owner,\n        operation="cleanup",\n        operation_id=cleanup_plan_id,\n        expected_evidence={\n            "archive_id": archive.get("archive_id"),\n            "plan_id": cleanup_plan_id,\n            "checkout_key": checkout_key,\n            "owner_id": owner,\n        },\n        release_operation_lease=True,\n    )\n'''
+          if workspace_source.count(cleanup_block_old) != 1:
+              raise SystemExit("cleanup uncertainty refactor preimage mismatch")
+          workspace_source = workspace_source.replace(cleanup_block_old, cleanup_block_new, 1)
+
+          archive_recovery_old = '''                    if recovered_archive is None:\n                        raise\n                    archive_id = str(recovered_archive["archive_id"])\n                    with _lock(identifier):\n'''
+          archive_recovery_new = '''                    if recovered_archive is None:\n                        raise\n                    archive_id = str(recovered_archive["archive_id"])\n                    _workspace_reconcile_checkout_uncertainty(\n                        checkout_key=checkout_key,\n                        owner=owner,\n                        operation="archive",\n                        operation_id=archive_id,\n                        expected_evidence={\n                            "archive_id": archive_id,\n                            "checkout_key": checkout_key,\n                            "owner_id": owner,\n                            "expected_head": str(plan["checkout"]["head"]),\n                            "expected_branch": str(plan["checkout"]["branch"]),\n                        },\n                        release_operation_lease=True,\n                    )\n                    with _lock(identifier):\n'''
+          if workspace_source.count(archive_recovery_old) != 1:
+              raise SystemExit("archive recovery fence insertion preimage mismatch")
+          workspace_path.write_text(workspace_source.replace(archive_recovery_old, archive_recovery_new, 1), encoding="utf-8")
+
+          checkout_test_path = Path("tests/test_checkouts.py")
+          checkout_tests = checkout_test_path.read_text(encoding="utf-8")
+          cleanup_marker = '''    def test_cleanup_retains_resources_when_git_mutation_outcome_is_unknown(self) -> None:\n'''
+          cleanup_test = '''    def test_cleanup_no_effect_clearance_failure_retains_operation_lease(self) -> None:\n        archive = self._archive()["archive"]\n        expected_identity = checkouts.physical_checkout.capture_physical_checkout_identity(self.checkout)\n        dry_run = checkouts.grabowski_checkout_cleanup(\n            str(self.repo), str(self.checkout), "owner-a", dry_run=True,\n            archive_id=archive["archive_id"], expected_head=self.head, expected_branch="topic",\n            expected_physical_identity=expected_identity,\n        )\n        real_acquire = checkouts._acquire_checkout_resources\n        real_verify = checkouts.physical_checkout.verify_physical_checkout_identity\n        acquired = [False]\n        def acquire_then_mark(*args, **kwargs):\n            lease = real_acquire(*args, **kwargs); acquired[0] = True; return lease\n        def verify_then_drift(expected):\n            if not acquired[0]: return real_verify(expected)\n            raise checkouts.physical_checkout.PhysicalCheckoutIdentityError("simulated replacement after resource acquisition")\n        with (\n            patch.object(checkouts, "_acquire_checkout_resources", side_effect=acquire_then_mark),\n            patch.object(checkouts.physical_checkout, "verify_physical_checkout_identity", side_effect=verify_then_drift),\n            patch.object(checkouts, "_clear_checkout_operation_uncertainty", side_effect=sqlite3.OperationalError("simulated fence clearance failure")),\n            patch.object(checkouts, "_release_checkout_resources") as release_mock,\n            patch.object(checkouts.operator, "_run", side_effect=AssertionError("cleanup Git mutation must not run")),\n        ):\n            with self.assertRaisesRegex(sqlite3.OperationalError, "simulated fence clearance failure"):\n                checkouts.grabowski_checkout_cleanup(\n                    str(self.repo), str(self.checkout), "owner-a", dry_run=False,\n                    plan_id=dry_run["dry_run_record"]["plan_id"],\n                    expected_plan_sha256=dry_run["plan"]["plan_sha256"],\n                    expected_physical_identity=expected_identity, confirmation="remove-linked-checkout",\n                )\n        release_mock.assert_not_called()\n        fences = checkouts._active_checkout_operation_uncertainties()\n        self.assertEqual(len(fences), 1); self.assertEqual(fences[0]["operation"], "cleanup")\n\n'''
+          if checkout_tests.count(cleanup_marker) != 1:
+              raise SystemExit("cleanup ordering test marker mismatch")
+          checkout_tests = checkout_tests.replace(cleanup_marker, cleanup_test + cleanup_marker, 1)
+
+          archive_marker = '''    def test_partial_archive_failure_remains_durably_fenced_after_lease_expiry(self) -> None:\n'''
+          archive_tests = '''    def test_archive_no_effect_clearance_failure_retains_operation_lease(self) -> None:\n        expected_identity = checkouts.physical_checkout.capture_physical_checkout_identity(self.checkout)\n        real_acquire = checkouts._acquire_checkout_resources\n        real_verify = checkouts.physical_checkout.verify_physical_checkout_identity\n        acquired = [False]\n        def acquire_then_mark(*args, **kwargs):\n            lease = real_acquire(*args, **kwargs); acquired[0] = True; return lease\n        def verify_then_drift(expected):\n            if not acquired[0]: return real_verify(expected)\n            raise checkouts.physical_checkout.PhysicalCheckoutIdentityError("simulated replacement after resource acquisition")\n        with (\n            patch.object(checkouts, "_acquire_checkout_resources", side_effect=acquire_then_mark),\n            patch.object(checkouts.physical_checkout, "verify_physical_checkout_identity", side_effect=verify_then_drift),\n            patch.object(checkouts, "_clear_checkout_operation_uncertainty", side_effect=sqlite3.OperationalError("simulated fence clearance failure")),\n            patch.object(checkouts, "_release_checkout_resources") as release_mock,\n            patch.object(checkouts.operator, "_run", side_effect=AssertionError("archive Git mutation must not run")),\n        ):\n            with self.assertRaisesRegex(sqlite3.OperationalError, "simulated fence clearance failure"):\n                checkouts.grabowski_checkout_archive(\n                    str(self.repo), str(self.checkout), "owner-a", "identity-bound archive",\n                    int(time.time()) + 3600, self.head, "topic", expected_physical_identity=expected_identity,\n                )\n        release_mock.assert_not_called()\n        fences = checkouts._active_checkout_operation_uncertainties()\n        self.assertEqual(len(fences), 1); self.assertEqual(fences[0]["operation"], "archive")\n\n    def test_archive_uncertainty_readback_accepts_absent_legacy_lifecycle(self) -> None:\n        expected_identity = checkouts.physical_checkout.capture_physical_checkout_identity(self.checkout)\n        def fail_archive_audit(record):\n            if record.get("operation") == "checkout-archive":\n                raise RuntimeError("simulated archive audit failure after durable archive")\n        with patch.object(checkouts.base, "_append_audit", side_effect=fail_archive_audit):\n            with self.assertRaisesRegex(RuntimeError, "simulated archive audit failure"):\n                checkouts.grabowski_checkout_archive(\n                    str(self.repo), str(self.checkout), "owner-a", "diagnostic archive",\n                    int(time.time()) + 3600, self.head, "topic", expected_physical_identity=expected_identity,\n                )\n        fences = checkouts._active_checkout_operation_uncertainties()\n        self.assertEqual(len(fences), 1)\n        self.assertIsNone(checkouts._lifecycle_bindings([fences[0]["checkout_key"]]).get(fences[0]["checkout_key"]))\n        readback = checkouts._archive_uncertainty_readback(fences[0])\n        self.assertEqual(readback["state"], "confirmed_success")\n\n'''
+          if checkout_tests.count(archive_marker) != 1:
+              raise SystemExit("archive tests marker mismatch")
+          checkout_test_path.write_text(checkout_tests.replace(archive_marker, archive_tests + archive_marker, 1), encoding="utf-8")
+
+          workspace_test_path = Path("tests/test_agent_workspace.py")
+          workspace_tests = workspace_test_path.read_text(encoding="utf-8")
+          workspace_marker = '''    def test_cleanup_retention_unknown_requires_recovery_and_blocks_blind_retry(self) -> None:\n'''
+          workspace_test = '''    def test_cleanup_reconciles_post_commit_archive_audit_failure_and_clears_fence(self) -> None:\n        manifest = self._closed_cleanup_manifest()\n        checkout_state = self.root / "checkout-state-archive-audit-recovery"\n        patches = [\n            mock.patch.object(workspace.checkouts, "CHECKOUT_DB", checkout_state / "checkouts.sqlite3"),\n            mock.patch.object(workspace.checkouts, "ARCHIVE_ROOT", checkout_state / "archives"),\n            mock.patch.object(workspace.checkouts, "CHECKOUT_LOCK", checkout_state / "checkouts.lock"),\n            mock.patch.object(workspace.checkouts.resources, "RESOURCE_DB", checkout_state / "resources.sqlite3"),\n            mock.patch.object(workspace.checkouts.tasks, "TASK_DB", checkout_state / "tasks.sqlite3"),\n            mock.patch.object(workspace.checkouts.operator, "_safe_environment", return_value=os.environ.copy()),\n            mock.patch.object(workspace.checkouts.operator, "_require_operator_mutation"),\n            mock.patch.object(workspace.checkouts.operator, "_require_operator_capability"),\n            mock.patch.object(workspace.checkouts, "_processes_under", return_value=[]),\n            mock.patch.object(workspace.operator, "_require_operator_mutation"),\n            mock.patch.object(workspace.operator, "_require_operator_capability"),\n        ]\n        def fail_archive_audit(record: dict) -> None:\n            if record.get("operation") == "checkout-archive":\n                raise RuntimeError("simulated archive audit failure after durable archive")\n        with (\n            patches[0], patches[1], patches[2], patches[3], patches[4], patches[5],\n            patches[6], patches[7], patches[8], patches[9], patches[10],\n            mock.patch.object(workspace.checkouts.base, "_append_audit", side_effect=fail_archive_audit),\n        ):\n            plan = workspace.grabowski_agent_workspace_cleanup_plan([manifest["workspace_id"]])["plans"][0]\n            archived = workspace.grabowski_agent_workspace_cleanup(\n                manifest["workspace_id"], plan["plan_sha256"], "archive-and-remove-worktree"\n            )\n            self.assertEqual(archived["state"], "archived_waiting_for_cleanup")\n            self.assertTrue(self.git.writer.exists())\n            self.assertEqual(workspace.checkouts._active_checkout_operation_uncertainties(), [])\n            effect = archived["lifecycle_effect"]\n            self.assertEqual(effect["status"], "succeeded")\n            self.assertTrue(effect["execution_id"].endswith(":reconcile"))\n            self.assertEqual(effect["supersedes"]["status"], "recovery_required")\n\n'''
+          if workspace_tests.count(workspace_marker) != 1:
+              raise SystemExit("archive recovery workspace test marker mismatch")
+          workspace_test_path.write_text(workspace_tests.replace(workspace_marker, workspace_test + workspace_marker, 1), encoding="utf-8")
+          PY
+
+      - name: Run focused regressions
+        shell: bash
+        run: |
+          set -eu
+          install -d -m 700 "$PWD/build"
+          test_home="$(mktemp -d "$PWD/build/test-home.XXXXXX")"
+          trap 'rm -rf "$test_home"' EXIT
+          install -d -m 700 "$test_home/.config/grabowski"
+          install -m 600 config/access.home-wide-operator.example.json "$test_home/.config/grabowski/access.json"
+          HOME="$test_home" PYTHONPATH=tests python -B -m unittest -v \
+            test_checkouts.CheckoutLifecycleTests.test_cleanup_no_effect_clearance_failure_retains_operation_lease \
+            test_checkouts.CheckoutLifecycleTests.test_archive_no_effect_clearance_failure_retains_operation_lease \
+            test_checkouts.CheckoutLifecycleTests.test_archive_uncertainty_readback_accepts_absent_legacy_lifecycle \
+            test_agent_workspace.AgentWorkspaceTests.test_cleanup_reconciles_post_commit_archive_audit_failure_and_clears_fence \
+            test_agent_workspace.AgentWorkspaceTests.test_cleanup_reconciles_post_commit_audit_failure_and_clears_fence
+
+      - name: Run lifecycle regression suites
+        shell: bash
+        run: |
+          set -eu
+          install -d -m 700 "$PWD/build"
+          test_home="$(mktemp -d "$PWD/build/test-home.XXXXXX")"
+          trap 'rm -rf "$test_home"' EXIT
+          install -d -m 700 "$test_home/.config/grabowski"
+          install -m 600 config/access.home-wide-operator.example.json "$test_home/.config/grabowski/access.json"
+          HOME="$test_home" python -B -m unittest discover -s tests -p 'test_checkouts.py' -v
+          HOME="$test_home" python -B -m unittest discover -s tests -p 'test_agent_workspace.py' -v
+
+      - name: Verify diff hygiene
+        run: git diff --check
+
+      - name: Commit exact remediation and remove temporary workflows
+        shell: bash
+        run: |
+          rm -f \
+            .github/workflows/pr1186-finality-symmetry.yml \
+            .github/workflows/pr1186-finality-symmetry-v2.yml \
+            .github/workflows/pr1186-finality-symmetry-v3.yml \
+            .github/workflows/pr1186-archive-readback-diagnostic.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/grabowski_checkouts.py src/grabowski_agent_workspace.py tests/test_checkouts.py tests/test_agent_workspace.py .github/workflows/
+          git commit -m "fix(lifecycle): reconcile recovery fences crash-safely"
+          git push origin HEAD:fix/terminal-lane-retention-archive-20260913
