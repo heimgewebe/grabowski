@@ -937,11 +937,30 @@ def _validated_historical_target_selection(
     selection = history_result.get("target_selection")
     if not isinstance(selection, dict):
         raise ValueError("Chronik history exact target selection is missing")
+    provider_limit = selection.get("provider_window_limit")
+    provider_returned = selection.get("provider_window_returned")
     if (
         selection.get("mode") != "exact"
         or selection.get("exact_selectors") != selectors
+        or selection.get("selector_count") != len(selectors)
         or selection.get("exact_target_binding") is not True
+        or selection.get("selection_scope") != "bounded_provider_window"
+        or selection.get("global_history_exhaustive") is not False
         or selection.get("coarse_fallback_used") is not False
+        or isinstance(provider_limit, bool)
+        or not isinstance(provider_limit, int)
+        or provider_limit < 1
+        or (
+            provider_returned is not None
+            and (
+                isinstance(provider_returned, bool)
+                or not isinstance(provider_returned, int)
+                or provider_returned < 0
+                or provider_returned > provider_limit
+            )
+        )
+        or selection.get("provider_window_saturated")
+        is not (provider_returned is not None and provider_returned >= provider_limit)
     ):
         raise ValueError("Chronik history exact target selection is unbound")
     if available:

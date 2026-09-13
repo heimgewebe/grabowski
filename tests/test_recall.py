@@ -449,6 +449,37 @@ class RecallTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exact target selector"):
             module.export_chronik_history_recall(history)
 
+    def test_chronik_history_recall_rejects_false_exhaustiveness_metadata(self) -> None:
+        module = self._load_module()
+        history = self._chronik_history_result(module)
+        event = history["events"][0]
+        event["subject"]["pr_number"] = 404
+        event["event_id"] = module._chronik_event_id(event)
+        history["query"]["pr_number"] = 404
+        selection = {
+            "mode": "exact",
+            "exact_selectors": {"pr_number": 404},
+            "selector_count": 1,
+            "exact_target_binding": True,
+            "selection_scope": "bounded_provider_window",
+            "match_status": "matched",
+            "provider_window_limit": 100,
+            "provider_window_returned": 1,
+            "provider_window_saturated": False,
+            "global_history_exhaustive": True,
+            "coarse_fallback_used": False,
+        }
+        history["target_selection"] = selection
+        history["history"]["query"] = dict(history["query"])
+        history["history"]["target_selection"] = dict(selection)
+        history["history"]["event_ids"] = [event["event_id"]]
+        unsigned = dict(history)
+        unsigned.pop("result_sha256", None)
+        history["result_sha256"] = module._sha256_json(unsigned)
+
+        with self.assertRaisesRegex(ValueError, "exact target selection is unbound"):
+            module.export_chronik_history_recall(history)
+
     def test_chronik_history_recall_preserves_exact_no_match_without_coarse_fallback(self) -> None:
         module = self._load_module()
         history = self._chronik_history_result(module)
