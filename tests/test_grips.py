@@ -3357,6 +3357,86 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual(30, result["output"]["sample_size"])
         sample_completed.assert_called_once_with(30)
 
+    def test_operator_obligation_close_archives_github_evidence_before_persisting(self) -> None:
+        evidence_item = {
+            "acceptance_id": "merge",
+            "status": "passed",
+            "source": "github",
+            "reference": "github-pr-v2:heimgewebe/grabowski#943@" + "1" * 40
+            + ":base=" + "2" * 40
+            + ":merge=" + "3" * 40
+            + ":checks=2/2-effective-success",
+            "sha256": "d" * 64,
+        }
+        parameters = {
+            "obligation_id": "goo-github-archive-close-0001",
+            "outcome": "completed",
+            "evidence": [evidence_item],
+        }
+        close_output = {
+            "open_file_sha256": "a" * 64,
+            "close_file_sha256": "b" * 64,
+            "state": "completed",
+            "replayed": False,
+            "response_may_end": True,
+            "work_complete": True,
+            "completion_classification": {
+                "reason": "acceptance_satisfied",
+                "convergence_required": False,
+            },
+        }
+        archive_result = {
+            "status": "archived",
+            "archived_count": 1,
+            "archived_sha256s": ["d" * 64],
+            "skipped_count": 0,
+        }
+        with patch.object(
+            grips, "_revalidate_operator_obligation_systemic_convergence"
+        ), patch.object(
+            grips.grabowski_operator_obligation_evidence,
+            "archive_close_github_evidence",
+            return_value=archive_result,
+        ) as archive, patch.object(
+            grips.grabowski_operator_obligation,
+            "close_obligation",
+            return_value=close_output,
+        ) as close:
+            result = grips._run_operator_obligation_close(
+                unittest.mock.Mock(), parameters, {"checks": []}, unittest.mock.Mock()
+            )
+
+        self.assertEqual("passed", result["receipt_status"])
+        archive.assert_called_once_with([evidence_item])
+        close.assert_called_once()
+
+    def test_operator_obligation_close_blocks_when_github_archive_cannot_be_bound(self) -> None:
+        parameters = {
+            "obligation_id": "goo-github-archive-close-0002",
+            "outcome": "completed",
+            "evidence": [{"source": "github"}],
+        }
+        with patch.object(
+            grips, "_revalidate_operator_obligation_systemic_convergence"
+        ), patch.object(
+            grips.grabowski_operator_obligation_evidence,
+            "archive_close_github_evidence",
+            side_effect=grips.grabowski_operator_obligation_evidence.EvidenceAssessmentError(
+                "github source history unavailable before durable close archival"
+            ),
+        ), patch.object(
+            grips.grabowski_operator_obligation, "close_obligation"
+        ) as close:
+            result = grips._run_operator_obligation_close(
+                unittest.mock.Mock(), parameters, {"checks": []}, unittest.mock.Mock()
+            )
+
+        self.assertEqual("blocked", result["receipt_status"])
+        self.assertEqual(
+            ["durable_github_evidence_unavailable"], result["blocked_reasons"]
+        )
+        close.assert_not_called()
+
     def test_operator_obligation_close_revalidates_systemic_convergence_live(self) -> None:
         obligation_id = "goo-grip-systemic-live-0001"
         with tempfile.TemporaryDirectory() as tmp, patch.dict(

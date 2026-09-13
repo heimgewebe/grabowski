@@ -19,6 +19,18 @@ import grabowski_operator_obligation_evidence as evidence
 
 
 class OperatorObligationEvidenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._github_archive_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._github_archive_tmp.cleanup)
+        self._github_archive_env = patch.dict(
+            os.environ,
+            {
+                "GRABOWSKI_EVIDENCE_GITHUB_ARCHIVE_ROOT": self._github_archive_tmp.name
+            },
+        )
+        self._github_archive_env.start()
+        self.addCleanup(self._github_archive_env.stop)
+
     @staticmethod
     def _stored_evidence(
         *,
@@ -1054,6 +1066,252 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
                 "receipt",
                 {"reference": "grip:any:receipt:" + "a" * 64},
             )
+
+    def test_prepare_github_archive_reverifies_after_source_retention(self) -> None:
+        repo = "heimgewebe/grabowski"
+        head = "1" * 40
+        base = "2" * 40
+        merge = "3" * 40
+        checks = [
+            self._github_v2_workflow_check(
+                database_id=101,
+                name="validate",
+                started_at="2026-08-25T14:31:01Z",
+                workflow_run_id=32860034363,
+            )
+        ]
+        payload = self._github_v2_payload(
+            head=head, base=base, merge=merge, checks=checks
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(payload, pr=943),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": repo, "pr": 943}
+            )
+            item = prepared["evidence"]
+            assert item is not None
+            archive_path = evidence._github_archive_path(item["sha256"])
+            self.assertFalse(archive_path.exists())
+            archived = evidence.archive_close_github_evidence([item])
+        self.assertEqual(1, archived["archived_count"])
+        self.assertTrue(archive_path.is_file())
+
+        with patch.object(
+            evidence,
+            "_github_v2_snapshot",
+            side_effect=evidence.GitHubSourceUnavailable(
+                "github check history unavailable"
+            ),
+        ):
+            observed = evidence._github_observation(item)
+
+        assert observed is not None
+        self.assertEqual("verified", observed["status"])
+        self.assertEqual(item["sha256"], observed["sha256"])
+        self.assertEqual(
+            "verified",
+            evidence.assess_evidence_item(item, observation=observed)["classification"],
+        )
+
+    def test_prepare_github_archive_tamper_fails_closed(self) -> None:
+        repo = "heimgewebe/grabowski"
+        head = "1" * 40
+        base = "2" * 40
+        merge = "3" * 40
+        checks = [
+            self._github_v2_workflow_check(
+                database_id=101,
+                name="validate",
+                started_at="2026-08-25T14:31:01Z",
+                workflow_run_id=32860034363,
+            )
+        ]
+        payload = self._github_v2_payload(
+            head=head, base=base, merge=merge, checks=checks
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(payload, pr=943),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": repo, "pr": 943}
+            )
+            item = prepared["evidence"]
+            assert item is not None
+            evidence.archive_close_github_evidence([item])
+        archive_path = evidence._github_archive_path(item["sha256"])
+        archive_path.write_text("{}\n", encoding="utf-8")
+
+        with patch.object(
+            evidence,
+            "_github_v2_snapshot",
+            side_effect=evidence.GitHubSourceUnavailable(
+                "github check history unavailable"
+            ),
+        ):
+            observed = evidence._github_observation(item)
+
+        assert observed is not None
+        self.assertEqual("mismatch", observed["status"])
+
+    def test_prepare_github_live_mismatch_wins_over_valid_archive(self) -> None:
+        repo = "heimgewebe/grabowski"
+        head = "1" * 40
+        base = "2" * 40
+        merge = "3" * 40
+        checks = [
+            self._github_v2_workflow_check(
+                database_id=101,
+                name="validate",
+                started_at="2026-08-25T14:31:01Z",
+                workflow_run_id=32860034363,
+            )
+        ]
+        payload = self._github_v2_payload(
+            head=head, base=base, merge=merge, checks=checks
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(payload, pr=943),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": repo, "pr": 943}
+            )
+            item = prepared["evidence"]
+            assert item is not None
+            evidence.archive_close_github_evidence([item])
+        archived = json.loads(
+            evidence._github_archive_path(item["sha256"]).read_text(encoding="utf-8")
+        )
+        material = archived["material"]
+        live_mismatch = {
+            "state": "MERGED",
+            "isDraft": False,
+            "baseRefOid": base,
+            "headRefOid": "9" * 40,
+            "merge_oid": merge,
+            "effective_checks": material["effective_checks"],
+        }
+        with patch.object(
+            evidence, "_github_v2_snapshot", return_value=live_mismatch
+        ):
+            observed = evidence._github_observation(item)
+
+        assert observed is not None
+        self.assertEqual("mismatch", observed["status"])
+
+    def test_github_without_server_archive_stays_stale_after_retention(self) -> None:
+        reference = (
+            "github-pr-v2:heimgewebe/grabowski#943@"
+            + "1" * 40
+            + ":base="
+            + "2" * 40
+            + ":merge="
+            + "3" * 40
+            + ":checks=1/1-effective-success"
+        )
+        item = self._stored_evidence(
+            acceptance_id="merge",
+            source="github",
+            reference=reference,
+            sha256="a" * 64,
+        )
+        with patch.object(
+            evidence,
+            "_github_v2_snapshot",
+            side_effect=evidence.GitHubSourceUnavailable(
+                "github check history unavailable"
+            ),
+        ):
+            observed = evidence._github_observation(item)
+
+        assert observed is not None
+        self.assertEqual("stale", observed["status"])
+
+
+    def test_retention_fallback_rejects_visible_pr_identity_mismatch(self) -> None:
+        reference = (
+            "github-pr-v2:heimgewebe/grabowski#943@"
+            + "1" * 40
+            + ":base="
+            + "2" * 40
+            + ":merge="
+            + "3" * 40
+            + ":checks=1/1-effective-success"
+        )
+        item = self._stored_evidence(
+            acceptance_id="merge",
+            source="github",
+            reference=reference,
+            sha256="a" * 64,
+        )
+        source_error = evidence.GitHubSourceUnavailable(
+            "github check history unavailable",
+            snapshot_identity={
+                "state": "MERGED",
+                "isDraft": False,
+                "headRefOid": "9" * 40,
+                "baseRefOid": "2" * 40,
+                "merge_oid": "3" * 40,
+            },
+        )
+        with patch.object(
+            evidence, "_github_v2_snapshot", side_effect=source_error
+        ), patch.object(
+            evidence, "_github_archived_observation"
+        ) as archive:
+            observed = evidence._github_observation(item)
+
+        assert observed is not None
+        self.assertEqual("mismatch", observed["status"])
+        archive.assert_not_called()
+
+    def test_generic_adapter_failure_never_uses_archive_fallback(self) -> None:
+        repo = "heimgewebe/grabowski"
+        head = "1" * 40
+        base = "2" * 40
+        merge = "3" * 40
+        checks = [
+            self._github_v2_workflow_check(
+                database_id=101,
+                name="validate",
+                started_at="2026-08-25T14:31:01Z",
+                workflow_run_id=32860034363,
+            )
+        ]
+        payload = self._github_v2_payload(
+            head=head, base=base, merge=merge, checks=checks
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(payload, pr=943),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": repo, "pr": 943}
+            )
+            item = prepared["evidence"]
+            assert item is not None
+            evidence.archive_close_github_evidence([item])
+        self.assertTrue(evidence._github_archive_path(item["sha256"]).is_file())
+
+        with patch.object(
+            evidence,
+            "_github_v2_snapshot",
+            side_effect=evidence.EvidenceAssessmentError(
+                "trusted source adapter budget exhausted"
+            ),
+        ):
+            observed = evidence._github_observation(item)
+
+        assert observed is not None
+        self.assertEqual("stale", observed["status"])
+
 
     def test_prepare_github_accepts_empty_terminal_pr_backlink_when_run_head_is_exact(self) -> None:
         head = "1" * 40

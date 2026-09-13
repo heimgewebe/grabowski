@@ -14,6 +14,7 @@ import time
 from typing import Any, Mapping
 
 import grabowski_operator_obligation as obligations
+import grabowski_private_io as private_io
 
 SCHEMA_VERSION = 1
 KIND = "grabowski.operator_obligation_evidence_assessment"
@@ -51,6 +52,9 @@ MAX_ADAPTER_FILE_BYTES = 4 * 1024 * 1024
 MAX_ADAPTER_COMMAND_OUTPUT_BYTES = 2 * 1024 * 1024
 ADAPTER_COMMAND_TIMEOUT_SECONDS = 15
 MAX_ADAPTER_COLLECTION_SECONDS = 12.0
+GITHUB_ARCHIVE_KIND = "grabowski.operator_obligation_evidence.github_pr_v2_archive"
+GITHUB_ARCHIVE_SCHEMA_VERSION = 1
+MAX_GITHUB_ARCHIVE_BYTES = 512 * 1024
 GITHUB_PR_REFERENCE_RE = re.compile(
     r"^github-pr:(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)"
     r"#(?P<pr>[1-9][0-9]{0,9})@(?P<head>[0-9a-f]{40})"
@@ -197,6 +201,21 @@ GITHUB_REMOTE_RE = re.compile(
 
 class EvidenceAssessmentError(ValueError):
     pass
+
+
+class GitHubSourceUnavailable(EvidenceAssessmentError):
+    """The authoritative GitHub PR/check history can no longer be read."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        snapshot_identity: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.snapshot_identity = (
+            dict(snapshot_identity) if snapshot_identity is not None else None
+        )
 
 
 def _canonical(value: Any) -> bytes:
@@ -377,6 +396,155 @@ def _github_observation_material(parsed: Mapping[str, Any]) -> dict[str, Any]:
         "check_semantics": "stable_workflow_identity_latest_run_v1",
         "effective_checks": effective_checks,
     }
+
+
+def _github_archive_root() -> Path:
+    configured = os.environ.get("GRABOWSKI_EVIDENCE_GITHUB_ARCHIVE_ROOT")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".local/state/grabowski/github-evidence-archive"
+
+
+def _github_archive_path(evidence_sha256: str) -> Path:
+    if not _is_sha256(evidence_sha256):
+        raise EvidenceAssessmentError("github archive digest must be sha256")
+    root = _github_archive_root().resolve(strict=False)
+    return root / evidence_sha256[:2] / f"{evidence_sha256}.json"
+
+
+def _github_archive_payload(
+    reference: str, material: Mapping[str, Any]
+) -> dict[str, Any]:
+    evidence_sha256 = _sha256(material)
+    base = {
+        "schema_version": GITHUB_ARCHIVE_SCHEMA_VERSION,
+        "kind": GITHUB_ARCHIVE_KIND,
+        "reference": reference,
+        "evidence_sha256": evidence_sha256,
+        "material": dict(material),
+    }
+    return {**base, "archive_sha256": _sha256(base)}
+
+
+def _persist_github_archive(reference: str, material: Mapping[str, Any]) -> str:
+    evidence_sha256 = _sha256(material)
+    target = _github_archive_path(evidence_sha256)
+    root = _github_archive_root().resolve(strict=False)
+    shard = target.parent
+    try:
+        obligations._ensure_private_directory(root, create=True)
+        obligations._ensure_private_directory(shard, create=True)
+        payload = _github_archive_payload(reference, material)
+        created = private_io.publish_private_create_only_json(
+            shard,
+            target,
+            payload,
+            max_bytes=MAX_GITHUB_ARCHIVE_BYTES,
+            label="github evidence archive",
+        )
+        if not created:
+            existing = json.loads(
+                _read_regular_bytes(target, maximum=MAX_GITHUB_ARCHIVE_BYTES)
+            )
+            if existing != payload:
+                raise EvidenceAssessmentError(
+                    "github evidence archive digest already binds different material"
+                )
+    except (
+        OSError,
+        RuntimeError,
+        ValueError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as exc:
+        if isinstance(exc, EvidenceAssessmentError):
+            raise
+        raise EvidenceAssessmentError("github evidence archive unavailable") from exc
+    return evidence_sha256
+
+
+def _github_archived_observation(
+    evidence: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    reference = _text(evidence.get("reference"), "reference")
+    parsed = _github_reference(reference)
+    if parsed is None or parsed.get("version") != 2:
+        return None
+    evidence_sha256 = evidence.get("sha256")
+    if not _is_sha256(evidence_sha256):
+        return None
+    target = _github_archive_path(str(evidence_sha256))
+    if not target.exists():
+        return None
+    try:
+        payload = json.loads(
+            _read_regular_bytes(target, maximum=MAX_GITHUB_ARCHIVE_BYTES)
+        )
+    except (
+        EvidenceAssessmentError,
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ):
+        return _trusted_observation(evidence, status="mismatch")
+    if not isinstance(payload, Mapping):
+        return _trusted_observation(evidence, status="mismatch")
+    required = {
+        "schema_version",
+        "kind",
+        "reference",
+        "evidence_sha256",
+        "material",
+        "archive_sha256",
+    }
+    if set(payload) != required:
+        return _trusted_observation(evidence, status="mismatch")
+    material = payload.get("material")
+    if not isinstance(material, Mapping):
+        return _trusted_observation(evidence, status="mismatch")
+    base = {key: payload[key] for key in required - {"archive_sha256"}}
+    if (
+        payload.get("schema_version") != GITHUB_ARCHIVE_SCHEMA_VERSION
+        or payload.get("kind") != GITHUB_ARCHIVE_KIND
+        or payload.get("reference") != reference
+        or payload.get("evidence_sha256") != evidence_sha256
+        or payload.get("archive_sha256") != _sha256(base)
+        or _sha256(material) != evidence_sha256
+    ):
+        return _trusted_observation(evidence, status="mismatch")
+    effective_checks = material.get("effective_checks")
+    if (
+        material.get("schema_version") != 2
+        or material.get("kind")
+        != "grabowski.operator_obligation_evidence.github_pr_v2"
+        or material.get("repo") != parsed["repo"]
+        or material.get("pr") != parsed["pr"]
+        or material.get("head") != parsed["head"]
+        or material.get("base") != parsed["base"]
+        or material.get("merge") != parsed["merge"]
+        or material.get("checks_passed") != parsed["passed"]
+        or material.get("checks_total") != parsed["total"]
+        or material.get("check_semantics")
+        != "stable_workflow_identity_latest_run_v1"
+        or not isinstance(effective_checks, list)
+        or len(effective_checks) != parsed["total"]
+        or any(
+            not isinstance(check, Mapping) or not _github_v2_check_success(check)
+            for check in effective_checks
+        )
+    ):
+        return _trusted_observation(evidence, status="mismatch")
+    try:
+        expected = _github_observation_material(
+            {**parsed, "effective_checks": effective_checks}
+        )
+    except EvidenceAssessmentError:
+        return _trusted_observation(evidence, status="mismatch")
+    if dict(material) != expected:
+        return _trusted_observation(evidence, status="mismatch")
+    return _trusted_observation(
+        evidence, status="verified", sha256=str(evidence_sha256)
+    )
 
 
 def _github_utc(value: Any) -> datetime | None:
@@ -705,7 +873,7 @@ def _github_actions_run_pr_bindings(
             deadline_monotonic=deadline_monotonic,
         )
         if returncode != 0:
-            raise EvidenceAssessmentError("github Actions runs source unavailable")
+            raise GitHubSourceUnavailable("github Actions runs source unavailable")
         for line in stdout.splitlines():
             if not line.strip():
                 continue
@@ -731,7 +899,7 @@ def _github_actions_run_pr_bindings(
             bindings[run_id] = binding
             pending.discard(run_id)
     if pending:
-        return None
+        raise GitHubSourceUnavailable("github Actions run history unavailable")
     return bindings
 
 
@@ -768,7 +936,7 @@ def _github_actions_run_pr_bindings_by_id(
             deadline_monotonic=deadline_monotonic,
         )
         if returncode != 0:
-            raise EvidenceAssessmentError('github Actions run source unavailable')
+            raise GitHubSourceUnavailable('github Actions run source unavailable')
         try:
             payload = json.loads(stdout)
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -983,7 +1151,7 @@ def _github_v2_snapshot(
         deadline_monotonic=deadline_monotonic,
     )
     if returncode != 0:
-        raise EvidenceAssessmentError("github GraphQL source unavailable")
+        raise GitHubSourceUnavailable("github GraphQL source unavailable")
     try:
         payload = json.loads(stdout)
     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -1053,39 +1221,56 @@ def _github_v2_snapshot(
                 # Retain them in success evaluation; ignore only workflow runs
                 # from other events such as the post-merge push.
                 merge_gate_checks.append(check)
-    if merge_group_checks:
-        if (
-            not merged
-            or not isinstance(merge_oid, str)
-            or SHA40_RE.fullmatch(merge_oid) is None
-            or not _github_v2_merge_group_bindings_valid(
+    snapshot_identity = {
+        "state": pull_request.get("state"),
+        "isDraft": pull_request.get("isDraft"),
+        "baseRefOid": base,
+        "headRefOid": head,
+        "merge_oid": merge_oid,
+    }
+    if not head_check_nodes and not merge_gate_checks:
+        raise GitHubSourceUnavailable(
+            "github check history unavailable",
+            snapshot_identity=snapshot_identity,
+        )
+    try:
+        if merge_group_checks:
+            if (
+                not merged
+                or not isinstance(merge_oid, str)
+                or SHA40_RE.fullmatch(merge_oid) is None
+                or not _github_v2_merge_group_bindings_valid(
+                    repo,
+                    pr,
+                    head_ref=head_ref,
+                    head_sha=head,
+                    base_ref=base_ref,
+                    base_sha=base,
+                    merge_sha=merge_oid,
+                    checks=merge_group_checks,
+                    deadline_monotonic=deadline_monotonic,
+                )
+            ):
+                return None
+            effective_checks = _effective_github_v2_checks(merge_gate_checks)
+        else:
+            if not _github_v2_rerun_pr_bindings_valid(
                 repo,
                 pr,
                 head_ref=head_ref,
                 head_sha=head,
                 base_ref=base_ref,
                 base_sha=base,
-                merge_sha=merge_oid,
-                checks=merge_group_checks,
+                merged=merged,
+                checks=head_check_nodes,
                 deadline_monotonic=deadline_monotonic,
-            )
-        ):
-            return None
-        effective_checks = _effective_github_v2_checks(merge_gate_checks)
-    else:
-        if not _github_v2_rerun_pr_bindings_valid(
-            repo,
-            pr,
-            head_ref=head_ref,
-            head_sha=head,
-            base_ref=base_ref,
-            base_sha=base,
-            merged=merged,
-            checks=head_check_nodes,
-            deadline_monotonic=deadline_monotonic,
-        ):
-            return None
-        effective_checks = _effective_github_v2_checks(head_check_nodes)
+            ):
+                return None
+            effective_checks = _effective_github_v2_checks(head_check_nodes)
+    except GitHubSourceUnavailable as exc:
+        raise GitHubSourceUnavailable(
+            str(exc), snapshot_identity=snapshot_identity
+        ) from exc
     if effective_checks is None or not effective_checks:
         return None
     return {
@@ -1106,6 +1291,21 @@ def _github_check_success(check: Mapping[str, Any]) -> bool:
     return False
 
 
+def _github_source_error_identity_matches(
+    parsed: Mapping[str, Any], error: GitHubSourceUnavailable
+) -> bool:
+    identity = error.snapshot_identity
+    if identity is None:
+        return True
+    return (
+        identity.get("state") == "MERGED"
+        and identity.get("isDraft") is False
+        and identity.get("headRefOid") == parsed.get("head")
+        and identity.get("baseRefOid") == parsed.get("base")
+        and identity.get("merge_oid") == parsed.get("merge")
+    )
+
+
 def _github_observation(
     evidence: Mapping[str, Any], *, deadline_monotonic: float | None = None
 ) -> dict[str, Any] | None:
@@ -1120,6 +1320,13 @@ def _github_observation(
                 int(parsed["pr"]),
                 deadline_monotonic=deadline_monotonic,
             )
+        except GitHubSourceUnavailable as exc:
+            if not _github_source_error_identity_matches(parsed, exc):
+                return _trusted_observation(evidence, status="mismatch")
+            archived = _github_archived_observation(evidence)
+            if archived is not None:
+                return archived
+            return _trusted_observation(evidence, status="stale")
         except EvidenceAssessmentError:
             return _trusted_observation(evidence, status="stale")
         if snapshot is None:
@@ -1680,12 +1887,97 @@ def _prepare_github(
         f"github-pr-v2:{repo}#{pr}@{head}:base={base}:merge={merge_oid}:"
         f"checks={successful}/{len(effective_checks)}-effective-success"
     )
+    material = _github_observation_material(parsed)
     return _prepared(
         acceptance_id,
         "github",
         reference,
-        _sha256(_github_observation_material(parsed)),
+        _sha256(material),
     )
+
+
+def archive_close_github_evidence(
+    evidence_items: Any,
+    *,
+    deadline_monotonic: float | None = None,
+) -> dict[str, Any]:
+    """Durably bind fresh GitHub v2 evidence at the mutating close boundary."""
+
+    if not isinstance(evidence_items, list):
+        raise EvidenceAssessmentError("close evidence must be a list before archival")
+    if deadline_monotonic is None:
+        deadline_monotonic = time.monotonic() + MAX_ADAPTER_COLLECTION_SECONDS
+    archived: list[str] = []
+    skipped = 0
+    for item in evidence_items:
+        if not isinstance(item, Mapping) or item.get("source") != "github":
+            skipped += 1
+            continue
+        reference = _text(item.get("reference"), "github close evidence reference")
+        parsed = _github_reference(reference)
+        if parsed is None:
+            raise EvidenceAssessmentError("github close evidence reference is invalid")
+        if parsed.get("version", 1) != 2:
+            skipped += 1
+            continue
+        stored_sha256 = item.get("sha256")
+        if not _is_sha256(stored_sha256):
+            raise EvidenceAssessmentError("github close evidence sha256 is invalid")
+
+        existing = _github_archived_observation(item)
+        if existing is not None and existing.get("status") != "verified":
+            raise EvidenceAssessmentError("github close evidence archive is invalid")
+
+        if time.monotonic() >= deadline_monotonic:
+            raise EvidenceAssessmentError("github close evidence archival deadline exhausted")
+        try:
+            snapshot = _github_v2_snapshot(
+                str(parsed["repo"]),
+                int(parsed["pr"]),
+                deadline_monotonic=deadline_monotonic,
+            )
+        except GitHubSourceUnavailable as exc:
+            if existing is not None and existing.get("status") == "verified":
+                archived.append(str(stored_sha256))
+                continue
+            raise EvidenceAssessmentError(
+                "github source history unavailable before durable close archival"
+            ) from exc
+        if snapshot is None:
+            raise EvidenceAssessmentError("github close evidence live shape is invalid")
+        effective_checks = snapshot.get("effective_checks")
+        if not isinstance(effective_checks, list) or not effective_checks:
+            raise EvidenceAssessmentError("github close evidence has no live effective checks")
+        successful = sum(
+            int(_github_v2_check_success(check)) for check in effective_checks
+        )
+        if (
+            snapshot.get("state") != "MERGED"
+            or snapshot.get("isDraft") is not False
+            or snapshot.get("headRefOid") != parsed["head"]
+            or snapshot.get("baseRefOid") != parsed["base"]
+            or snapshot.get("merge_oid") != parsed["merge"]
+            or len(effective_checks) != parsed["total"]
+            or successful != parsed["passed"]
+            or successful != len(effective_checks)
+        ):
+            raise EvidenceAssessmentError("github close evidence live identity mismatch")
+        material = _github_observation_material(
+            {**parsed, "effective_checks": effective_checks}
+        )
+        digest = _sha256(material)
+        if digest != stored_sha256:
+            raise EvidenceAssessmentError("github close evidence digest mismatch")
+        persisted = _persist_github_archive(reference, material)
+        if persisted != stored_sha256:
+            raise EvidenceAssessmentError("github close evidence archive digest mismatch")
+        archived.append(persisted)
+    return {
+        "status": "archived" if archived else "not_applicable",
+        "archived_count": len(archived),
+        "archived_sha256s": sorted(archived),
+        "skipped_count": skipped,
+    }
 
 
 def _prepare_git(
