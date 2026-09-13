@@ -1063,7 +1063,12 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertTrue(fallback_review["external_primary_reviewer_forbidden"])
         self.assertEqual(fallback_review["review_authority"], "controller-primary")
         self.assertNotEqual(fallback_review["reviewers"][0]["provider_family"], "openai")
-        self.assertEqual(fallback_review["review_gap"], 0)
+        self.assertFalse(
+            fallback_review["reviewers"][0][
+                "execution_eligible_if_separately_authorized"
+            ]
+        )
+        self.assertEqual(fallback_review["review_gap"], 1)
 
         for pool_id in (
             "grok-com",
@@ -1496,7 +1501,12 @@ class CodingAgentRouterTests(unittest.TestCase):
             result = self._route(task_class, need_review=True)
             self.assertEqual(result["decision"], "controller")
             self.assertEqual(result["primary_role"], "controller-integrator")
-            self.assertEqual(result["review_gap"], 0)
+            self.assertEqual(result["review_gap"], 1)
+            self.assertFalse(
+                result["reviewers"][0][
+                    "execution_eligible_if_separately_authorized"
+                ]
+            )
             self.assertNotEqual(
                 result["reviewers"][0]["provider_family"],
                 "openai",
@@ -1506,7 +1516,12 @@ class CodingAgentRouterTests(unittest.TestCase):
             self.assertEqual(review["decision"], "controller")
             self.assertEqual(review["primary_role"], "controller-reviewer")
             self.assertTrue(review["direct_review_required"])
-            self.assertEqual(review["review_gap"], 0)
+            self.assertEqual(review["review_gap"], 1)
+            self.assertFalse(
+                review["reviewers"][0][
+                    "execution_eligible_if_separately_authorized"
+                ]
+            )
             self.assertEqual(review["review_quorum"]["direct_operator"], 1)
             self.assertEqual(review["review_quorum"]["external_authoritative_target"], 0)
             self.assertEqual(review["review_quorum"]["external_advisory_target"], 1)
@@ -1738,6 +1753,124 @@ class CodingAgentRouterTests(unittest.TestCase):
         explicit = self._route("bounded-patch", effect_profile="candidate")
         self.assertEqual(implicit, explicit)
         self.assertEqual("candidate", implicit["effect_profile"])
+
+    def test_advisory_only_reviewer_remains_visible_but_keeps_review_gap_open(
+        self,
+    ) -> None:
+        original_rank_routes = router._rank_routes
+
+        def rank_routes_with_advisory_reviewer(
+            task_class: str,
+            catalog: dict,
+            state: dict,
+            route_derivations: dict | None = None,
+            **inputs: object,
+        ) -> tuple[list[dict], dict[str, list[str]]]:
+            if inputs.get("reviewer") is True:
+                return (
+                    [
+                        {
+                            "route": "advisory-review",
+                            "execution_eligible_if_separately_authorized": False,
+                        }
+                    ],
+                    {},
+                )
+            return original_rank_routes(
+                task_class,
+                catalog,
+                state,
+                route_derivations=route_derivations,
+                **inputs,
+            )
+
+        with mock.patch.object(
+            router, "_rank_routes", side_effect=rank_routes_with_advisory_reviewer
+        ):
+            result = self._route(
+                "bounded-patch",
+                changed_files=2,
+                duration_minutes=30,
+                novelty="medium",
+                verification_policy="independent_review",
+                effect_profile="candidate",
+            )
+
+        self.assertEqual(result["reviewers"][0]["route"], "advisory-review")
+        self.assertEqual(result["review_status"], "recommended")
+        self.assertEqual(result["review_gap"], 1)
+
+    def test_delivery_promotes_executable_reviewer_fallback(
+        self,
+    ) -> None:
+        for harness, state in self.state["catalog"]["harnesses"].items():
+            state["available"] = harness == "claude"
+        self.state["pools"]["claude-pro"] = {"remaining_ratio": 0.9}
+        self._write_state()
+        original_rank_routes = router._rank_routes
+
+        def rank_routes_with_mixed_reviewers(
+            task_class: str,
+            catalog: dict,
+            state: dict,
+            route_derivations: dict | None = None,
+            **inputs: object,
+        ) -> tuple[list[dict], dict[str, list[str]]]:
+            if inputs.get("reviewer") is True:
+                return (
+                    [
+                        {
+                            "route": "advisory-review",
+                            "execution_eligible_if_separately_authorized": False,
+                        },
+                        {
+                            "route": "executable-review",
+                            "execution_eligible_if_separately_authorized": True,
+                        },
+                    ],
+                    {},
+                )
+            return original_rank_routes(
+                task_class,
+                catalog,
+                state,
+                route_derivations=route_derivations,
+                **inputs,
+            )
+
+        with mock.patch.object(
+            router, "_rank_routes", side_effect=rank_routes_with_mixed_reviewers
+        ):
+            candidate = self._route(
+                "bounded-patch",
+                changed_files=2,
+                duration_minutes=30,
+                novelty="medium",
+                verification_policy="independent_review",
+                effect_profile="candidate",
+            )
+            delivery = self._route(
+                "bounded-patch",
+                changed_files=2,
+                duration_minutes=30,
+                novelty="medium",
+                verification_policy="independent_review",
+                effect_profile="delivery",
+            )
+
+        self.assertEqual(candidate["reviewers"][0]["route"], "advisory-review")
+        self.assertEqual(
+            candidate["review_fallbacks"][0]["route"], "executable-review"
+        )
+        self.assertEqual(candidate["review_gap"], 0)
+        self.assertEqual(delivery["reviewers"][0]["route"], "executable-review")
+        self.assertTrue(
+            delivery["reviewers"][0][
+                "execution_eligible_if_separately_authorized"
+            ]
+        )
+        self.assertEqual(delivery["review_fallbacks"][0]["route"], "advisory-review")
+        self.assertEqual(delivery["review_gap"], 0)
 
     def test_delivery_effect_profile_requires_and_binds_scoped_writer(self) -> None:
         for harness, state in self.state["catalog"]["harnesses"].items():

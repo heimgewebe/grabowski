@@ -2595,6 +2595,7 @@ def canonical_execution_route(
     scoped_writer_state_error_type: str | None = None
     reviewers: list[dict[str, Any]] = []
     review_fallbacks: list[dict[str, Any]] = []
+    review_ranked_candidates: list[dict[str, Any]] = []
     excluded: dict[str, list[str]] = {}
     review_status = "not-requested"
     review_state_error_type: str | None = None
@@ -2692,6 +2693,7 @@ def canonical_execution_route(
                     }
                 )
                 if ranked:
+                    review_ranked_candidates = list(ranked)
                     selected_reviewer = ranked[0]
                     if direct_review_task:
                         primary_review_exceptions = set(
@@ -2723,16 +2725,37 @@ def canonical_execution_route(
         review_status = "external-review-blocked-sensitive-context"
         excluded["reviewer:policy"] = list(external_review_block_reasons)
 
+    executable_review_candidates = [
+        candidate
+        for candidate in review_ranked_candidates
+        if candidate.get("execution_eligible_if_separately_authorized") is True
+    ]
+    if (
+        effect_profile == "delivery"
+        and independent_review_required
+        and executable_review_candidates
+        and (
+            not reviewers
+            or reviewers[0].get("execution_eligible_if_separately_authorized")
+            is not True
+        )
+    ):
+        selected_delivery_reviewer = executable_review_candidates[0]
+        reviewers = [selected_delivery_reviewer]
+        review_fallbacks = [
+            candidate
+            for candidate in review_ranked_candidates
+            if candidate.get("route") != selected_delivery_reviewer.get("route")
+        ][:5]
+
     selected_reviewer = reviewers[0] if reviewers else None
     review_gap_value = max(
-        0, (1 if independent_review_required else 0) - len(reviewers)
+        0,
+        (1 if independent_review_required else 0)
+        - len(executable_review_candidates),
     )
     delivery_review_ready = (
-        not independent_review_required
-        or any(
-            reviewer.get("execution_eligible_if_separately_authorized") is True
-            for reviewer in reviewers
-        )
+        not independent_review_required or bool(executable_review_candidates)
     )
     external_primary_review = bool(
         direct_review_task
