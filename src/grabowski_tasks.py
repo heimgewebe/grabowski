@@ -11461,9 +11461,10 @@ def _chronik_parse_timestamp(value: str, *, label: str) -> datetime:
 
 def _chronik_history_event_matches_query(
     event: dict[str, Any],
-    normalized: dict[str, str],
+    normalized: dict[str, Any],
     *,
     since_timestamp: datetime | None,
+    match_exact_selectors: bool = True,
 ) -> bool:
     schema_version = event.get("schema_version")
     if schema_version not in {"agent-run-event.v0", "agent-run-event.v1"}:
@@ -11506,6 +11507,16 @@ def _chronik_history_event_matches_query(
         return False
     if normalized["subject_component"] and subject.get("component") != normalized["subject_component"]:
         return False
+    if match_exact_selectors:
+        pr_number = normalized.get("pr_number")
+        if pr_number is not None and subject.get("pr_number") != pr_number:
+            return False
+        bureau_task_id = normalized.get("bureau_task_id")
+        if bureau_task_id and subject.get("bureau_task_id") != bureau_task_id:
+            return False
+        agent_run_id = normalized.get("agent_run_id")
+        if agent_run_id and source.get("run_id") != agent_run_id:
+            return False
     if normalized["operation"] and data.get("operation") != normalized["operation"]:
         return False
     if normalized["task_class"] and data.get("task_class") != normalized["task_class"]:
@@ -11891,6 +11902,59 @@ def _validate_chronik_ledger_snapshot(payload: Any) -> dict[str, Any]:
     }
 
 
+def _chronik_exact_selector_map(normalized: dict[str, Any]) -> dict[str, Any]:
+    selectors: dict[str, Any] = {}
+    if normalized.get("pr_number") is not None:
+        selectors["pr_number"] = normalized["pr_number"]
+    if normalized.get("bureau_task_id"):
+        selectors["bureau_task_id"] = normalized["bureau_task_id"]
+    if normalized.get("agent_run_id"):
+        selectors["agent_run_id"] = normalized["agent_run_id"]
+    return selectors
+
+
+def _chronik_target_selection(
+    exact_selectors: dict[str, Any],
+    *,
+    provider_limit: int,
+    provider_returned: int | None = None,
+    selected_returned: int | None = None,
+    provider_available: bool = False,
+) -> dict[str, Any]:
+    exact = bool(exact_selectors)
+    if not exact:
+        return {
+            "mode": "coarse",
+            "exact_selectors": {},
+            "selector_count": 0,
+            "exact_target_binding": False,
+            "selection_scope": "provider_query",
+            "match_status": "not_requested",
+            "coarse_fallback_used": False,
+        }
+    if not provider_available:
+        match_status = "unavailable"
+    elif selected_returned:
+        match_status = "matched"
+    else:
+        match_status = "no_match_in_bounded_provider_window"
+    return {
+        "mode": "exact",
+        "exact_selectors": dict(exact_selectors),
+        "selector_count": len(exact_selectors),
+        "exact_target_binding": True,
+        "selection_scope": "bounded_provider_window",
+        "match_status": match_status,
+        "provider_window_limit": provider_limit,
+        "provider_window_returned": provider_returned,
+        "provider_window_saturated": (
+            provider_returned is not None and provider_returned >= provider_limit
+        ),
+        "global_history_exhaustive": False,
+        "coarse_fallback_used": False,
+    }
+
+
 @mcp.tool(name="grabowski_chronik_history", annotations=READ_ONLY)
 def grabowski_chronik_history(
     repo: str = "",
@@ -11900,13 +11964,19 @@ def grabowski_chronik_history(
     operation: str = "",
     task_class: str = "",
     outcome: str = "",
+    pr_number: int | None = None,
+    bureau_task_id: str = "",
+    agent_run_id: str = "",
     since: str = "",
     limit: int = 20,
 ) -> dict[str, Any]:
     """Read bounded historical coding events without asserting current truth.
 
-    The optional component filter is bound to Chronik's canonical producer/source component.
-    subject_component independently filters task-context subject.component.
+    The optional component filter is bound to Chronik's canonical producer/source
+    component; subject_component independently filters task-context subject.component.
+    Exact PR, Bureau-task and agent-run selectors are ANDed inside Grabowski after
+    validating a bounded coarse Chronik provider window. They never fall back to
+    coarse history when no exact match is present.
     """
     operator._require_operator_capability("durable_job")
     if (
@@ -11915,7 +11985,13 @@ def grabowski_chronik_history(
         or not 1 <= limit <= CHRONIK_HISTORY_MAX_LIMIT
     ):
         raise ValueError(f"limit must be between 1 and {CHRONIK_HISTORY_MAX_LIMIT}")
-    normalized = {
+    if pr_number is not None and (
+        isinstance(pr_number, bool)
+        or not isinstance(pr_number, int)
+        or not 1 <= pr_number <= 2_147_483_647
+    ):
+        raise ValueError("pr_number must be a positive integer")
+    normalized: dict[str, Any] = {
         "repo": _chronik_bounded_text(repo, label="repo"),
         "host": _chronik_bounded_text(host, label="host"),
         "component": _chronik_bounded_text(component, label="component"),
@@ -11923,29 +11999,65 @@ def grabowski_chronik_history(
         "operation": _chronik_bounded_text(operation, label="operation"),
         "task_class": _chronik_bounded_text(task_class, label="task_class"),
         "outcome": _chronik_bounded_text(outcome, label="outcome"),
+        "pr_number": pr_number,
+        "bureau_task_id": _chronik_bounded_text(
+            bureau_task_id, label="bureau_task_id", maximum=160
+        ),
+        "agent_run_id": _chronik_bounded_text(
+            agent_run_id, label="agent_run_id", maximum=160
+        ),
         "since": _chronik_bounded_text(since, label="since"),
     }
     if bool(normalized["repo"]) == bool(normalized["host"]):
         raise ValueError("exactly one of repo or host is required")
+    if normalized["pr_number"] is not None and not normalized["repo"]:
+        raise ValueError("pr_number requires a repository target")
+    if (
+        normalized["agent_run_id"]
+        and chronik._RUN_ID_PATTERN.fullmatch(normalized["agent_run_id"]) is None
+    ):
+        raise ValueError("agent_run_id is invalid")
     since_timestamp = (
         _chronik_parse_timestamp(normalized["since"], label="since")
         if normalized["since"]
         else None
     )
+    exact_selectors = _chronik_exact_selector_map(normalized)
+    provider_limit = CHRONIK_HISTORY_MAX_LIMIT if exact_selectors else limit
     arguments = ["query"]
     target_key = "repo" if normalized["repo"] else "host"
     arguments.append(f"--{target_key}={normalized[target_key]}")
     for key in ("component", "subject_component", "operation", "task_class", "outcome", "since"):
         if normalized[key]:
             arguments.append(f"--{key.replace('_', '-')}={normalized[key]}")
-    arguments.append(f"--limit={limit}")
+    arguments.append(f"--limit={provider_limit}")
     configuration = chronik.coding_memory_configuration()
-    query = {key: value for key, value in normalized.items() if value}
+    provider_query = {
+        key: normalized[key]
+        for key in (
+            "repo",
+            "host",
+            "component",
+            "subject_component",
+            "operation",
+            "task_class",
+            "outcome",
+            "since",
+        )
+        if normalized[key]
+    }
+    provider_query["limit"] = provider_limit
+    query = dict(provider_query)
+    query.update(exact_selectors)
     query["limit"] = limit
+    target_selection = _chronik_target_selection(
+        exact_selectors, provider_limit=provider_limit
+    )
     base_payload: dict[str, Any] = {
         "schema_version": 1,
         "kind": "grabowski_chronik_history",
         "query": query,
+        "target_selection": target_selection,
         "cli_present": bool(configuration["available"]),
         "available": False,
         "historical_only": True,
@@ -11991,7 +12103,7 @@ def grabowski_chronik_history(
         bound_query = {
             key: value for key, value in raw_query.items() if value not in (None, "")
         }
-        if bound_query != query:
+        if bound_query != provider_query:
             raise ValueError("Chronik coding-memory history query is unbound")
         if history.get("target") != expected_target:
             raise ValueError("Chronik coding-memory history target is unbound")
@@ -12000,17 +12112,20 @@ def grabowski_chronik_history(
         raw_claims = history.get("does_not_establish")
         if not isinstance(raw_events, list):
             raise ValueError("Chronik coding-memory history events must be a list of objects")
-        if len(raw_events) > limit:
-            raise ValueError("Chronik coding-memory history exceeded the requested limit")
+        if len(raw_events) > provider_limit:
+            raise ValueError("Chronik coding-memory history exceeded the provider window")
         for index, event in enumerate(raw_events, start=1):
             chronik._validate_agent_run_event_shape(
                 event, label=f"Chronik coding-memory history event {index}"
             )
             if not _chronik_history_event_matches_query(
-                event, normalized, since_timestamp=since_timestamp
+                event,
+                normalized,
+                since_timestamp=since_timestamp,
+                match_exact_selectors=False,
             ):
                 raise ValueError(
-                    f"Chronik coding-memory history event {index} is not bound to the requested query"
+                    f"Chronik coding-memory history event {index} is not bound to the requested query/provider window"
                 )
         if not isinstance(raw_event_ids, list) or not all(
             isinstance(event_id, str) for event_id in raw_event_ids
@@ -12021,6 +12136,26 @@ def grabowski_chronik_history(
         if raw_claims != list(chronik.CODING_MEMORY_DOES_NOT_ESTABLISH):
             raise ValueError("Chronik coding-memory history truth exclusions are invalid")
         ledger_snapshot = _validate_chronik_ledger_snapshot(history.get("ledger_snapshot"))
+        selected_events = (
+            [
+                event
+                for event in raw_events
+                if _chronik_history_event_matches_query(
+                    event, normalized, since_timestamp=since_timestamp
+                )
+            ]
+            if exact_selectors
+            else list(raw_events)
+        )
+        selected_events = selected_events[:limit]
+        selected_event_ids = [event["event_id"] for event in selected_events]
+        target_selection = _chronik_target_selection(
+            exact_selectors,
+            provider_limit=provider_limit,
+            provider_returned=len(raw_events),
+            selected_returned=len(selected_events),
+            provider_available=True,
+        )
     except ValueError as exc:
         payload = {
             **base_payload,
@@ -12034,9 +12169,11 @@ def grabowski_chronik_history(
         safe_claims = list(chronik.CODING_MEMORY_DOES_NOT_ESTABLISH)
         history_metadata = {
             "schema_version": "chronik-coding-history.v1",
-            "query": dict(raw_query),
+            "query": dict(query),
+            "provider_query": dict(raw_query),
             "target": dict(expected_target),
-            "event_ids": list(raw_event_ids),
+            "target_selection": dict(target_selection),
+            "event_ids": list(selected_event_ids),
             "historical_only": True,
             "does_not_establish": safe_claims,
             "ledger_snapshot": ledger_snapshot,
@@ -12044,7 +12181,8 @@ def grabowski_chronik_history(
         payload = {
             **base_payload,
             "available": True,
-            "events": [dict(event) for event in raw_events],
+            "target_selection": target_selection,
+            "events": [dict(event) for event in selected_events],
             "history": history_metadata,
         }
     return _chronik_receipt(payload, field="result_sha256")
@@ -12106,6 +12244,9 @@ def grabowski_operator_historical_recall(
     operation: str = "",
     task_class: str = "",
     outcome: str = "",
+    pr_number: int | None = None,
+    bureau_task_id: str = "",
+    agent_run_id: str = "",
     since: str = "",
     limit: int = 20,
 ) -> dict[str, Any]:
@@ -12125,6 +12266,9 @@ def grabowski_operator_historical_recall(
         operation=operation,
         task_class=task_class,
         outcome=outcome,
+        pr_number=pr_number,
+        bureau_task_id=bureau_task_id,
+        agent_run_id=agent_run_id,
         since=since,
         limit=limit,
     )
