@@ -1484,6 +1484,14 @@ def _active_checkout_operation_uncertainties(
     if connection is None:
         return []
     try:
+        table = connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type='table' AND name='operation_uncertainty'
+            """
+        ).fetchone()
+        if table is None:
+            return []
         rows = connection.execute(
             """
             SELECT * FROM operation_uncertainty
@@ -1491,8 +1499,6 @@ def _active_checkout_operation_uncertainties(
             ORDER BY created_at_unix ASC, fence_id ASC
             """
         ).fetchall()
-    except sqlite3.OperationalError:
-        return []
     finally:
         connection.close()
     fences = [_operation_uncertainty_public(row) for row in rows]

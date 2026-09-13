@@ -1705,6 +1705,32 @@ class CheckoutLifecycleTests(unittest.TestCase):
                     checkouts._github_repository_slug_from_remote_url(remote)
                 )
 
+    def test_uncertainty_reader_treats_missing_legacy_table_as_empty(self) -> None:
+        self.checkout_db.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.checkout_db) as connection:
+            connection.execute("CREATE TABLE legacy_only(id INTEGER)")
+            connection.commit()
+
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+
+    def test_uncertainty_reader_propagates_operational_read_failures(self) -> None:
+        class FailingConnection:
+            closed = False
+
+            def execute(self, *_args, **_kwargs):
+                raise sqlite3.OperationalError("database is locked")
+
+            def close(self):
+                self.closed = True
+
+        connection = FailingConnection()
+        with patch.object(
+            checkouts, "_readonly_connection", return_value=connection
+        ):
+            with self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
+                checkouts._active_checkout_operation_uncertainties()
+        self.assertTrue(connection.closed)
+
     def test_cleanup_requires_prior_dry_run_and_uses_plain_worktree_remove(self) -> None:
         self._publish_remote()
         archive = self._archive()["archive"]
