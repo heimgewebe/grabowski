@@ -1158,7 +1158,10 @@ class CodingAgentRouterTests(unittest.TestCase):
             item for item in self.catalog["routes"] if item["id"] == "codex-sol-high"
         )
         argv = [*route["argv_prefix"], "exec", "--sandbox", "read-only", "prompt"]
-        admission = router.coding_agent_pre_dispatch_admission(argv)
+        with mock.patch.object(
+            router, "_pool_gate", return_value=(True, ["remaining=0.80"], 0.20, True)
+        ):
+            admission = router.coding_agent_pre_dispatch_admission(argv)
 
         self.assertTrue(admission["applicable"])
         self.assertTrue(admission["admitted"])
@@ -1177,12 +1180,36 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertRegex(admission["admission_sha256"], r"^[0-9a-f]{64}$")
         self.assertNotIn("prompt", json.dumps(admission, sort_keys=True))
 
+    def test_pre_dispatch_admission_rejects_advisory_only_execution_pool(self) -> None:
+        route = next(
+            item for item in self.catalog["routes"] if item["id"] == "codex-sol-high"
+        )
+        argv = [*route["argv_prefix"], "exec", "--sandbox", "read-only", "prompt"]
+        with mock.patch.object(
+            router,
+            "_pool_gate",
+            return_value=(True, ["quota is opaque"], 0.55, False),
+        ):
+            admission = router.coding_agent_pre_dispatch_admission(argv)
+
+        self.assertTrue(admission["applicable"])
+        self.assertFalse(admission["admitted"])
+        self.assertEqual(admission["reason_code"], "quota_pool_blocked")
+        pool = admission["quota_pools"][0]
+        self.assertTrue(pool["allowed"])
+        self.assertFalse(pool["execution_eligible"])
+        self.assertEqual(pool["reasons"], ["quota is opaque"])
+        self.assertEqual(admission["reservation"]["status"], "not_reserved")
+
     def test_pre_dispatch_admission_rechecks_capacity_after_route_was_ready(self) -> None:
         route = next(
             item for item in self.catalog["routes"] if item["id"] == "codex-sol-high"
         )
         argv = [*route["argv_prefix"], "exec", "--sandbox", "read-only", "prompt"]
-        self.assertTrue(router.coding_agent_pre_dispatch_admission(argv)["admitted"])
+        with mock.patch.object(
+            router, "_pool_gate", return_value=(True, ["remaining=0.80"], 0.20, True)
+        ):
+            self.assertTrue(router.coding_agent_pre_dispatch_admission(argv)["admitted"])
         saturated = {
             "status": "current",
             "observed_at_unix": 456,
