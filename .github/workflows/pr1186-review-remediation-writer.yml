@@ -85,3 +85,5 @@ jobs:
           fi
           git commit -m 'fix(lifecycle): durably fence ambiguous checkout effects'
           git push origin HEAD:fix/terminal-lane-retention-archive-20260913
+
+# trigger: exact remediation run
