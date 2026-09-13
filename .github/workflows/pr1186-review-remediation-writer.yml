@@ -1,0 +1,77 @@
+name: PR 1186 review remediation writer
+
+on:
+  push:
+    branches:
+      - fix/terminal-lane-retention-archive-20260913
+    paths:
+      - tools/pr1186_review_remediation.py
+      - .github/workflows/pr1186-review-remediation-writer.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pr1186-review-remediation-writer
+  cancel-in-progress: false
+
+jobs:
+  writer:
+    if: github.repository == 'heimgewebe/grabowski'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: fix/terminal-lane-retention-archive-20260913
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Assert expected parent
+        run: |
+          set -euo pipefail
+          test "$(git branch --show-current)" = "fix/terminal-lane-retention-archive-20260913"
+          test -f tools/pr1186_review_remediation.py
+          python -m py_compile tools/pr1186_review_remediation.py
+
+      - name: Apply bounded remediation
+        run: |
+          set -euo pipefail
+          python tools/pr1186_review_remediation.py
+          git diff --check
+
+      - name: Refresh generated operator context
+        run: |
+          set -euo pipefail
+          make context-refresh
+          make profiles-refresh
+          git diff --check
+
+      - name: Focused regression tests
+        run: |
+          set -euo pipefail
+          python -m unittest discover -s tests -p 'test_checkouts.py' -v
+          python -m unittest discover -s tests -p 'test_agent_workspace.py' -v
+
+      - name: Full repository validation
+        run: make validate
+
+      - name: Commit exact validated result
+        run: |
+          set -euo pipefail
+          git config user.name 'grabowski-review-remediation'
+          git config user.email 'grabowski-review-remediation@users.noreply.github.com'
+          git add src/grabowski_checkouts.py src/grabowski_agent_workspace.py tests/test_checkouts.py generated tools/pr1186_review_remediation.py .github/workflows/pr1186-review-remediation-writer.yml
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            echo 'No remediation diff produced' >&2
+            exit 1
+          fi
+          git commit -m 'fix(lifecycle): durably fence ambiguous checkout effects'
+          git push origin HEAD:fix/terminal-lane-retention-archive-20260913
