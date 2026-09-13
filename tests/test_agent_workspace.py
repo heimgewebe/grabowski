@@ -3072,6 +3072,61 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertIn(str(sandbox.CLAUDE_SANDBOX_CONFIG_DIR / ".credentials.json"), argv)
         self.assertNotIn(str(Path.home()), argv)
 
+    def test_codex_profile_binds_binary_and_private_auth_without_home(self) -> None:
+        auth_root = self.root / "codex-auth"
+        auth_root.mkdir(mode=0o700)
+        auth = auth_root / "auth.json"
+        auth.write_text("{}\n", encoding="utf-8")
+        auth.chmod(0o600)
+        executable = self.root / "codex-bin"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
+        command = ["codex", "exec", "-m", "gpt-6-astra", "-c", '''model_reasoning_effort="ultra"''']
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GRABOWSKI_CODEX_BIN": str(executable),
+                "GRABOWSKI_CODEX_AUTH_ROOT": str(auth_root),
+            },
+            clear=False,
+        ):
+            prepared = sandbox.prepare_external_agent_command(command)
+            argv = sandbox.minimal_sandbox_argv(
+                workspace=self.git.repo,
+                command=list(prepared.command),
+                workspace_writable=False,
+                extra_read_only=prepared.extra_read_only,
+                extra_directories=prepared.extra_directories,
+            )
+        self.assertEqual(prepared.profile, sandbox.CODEX_PROFILE)
+        self.assertEqual(prepared.command[0], str(sandbox.CODEX_SANDBOX_EXECUTABLE))
+        self.assertEqual(list(prepared.command[1:]), command[1:])
+        self.assertIn(str(executable.resolve()), argv)
+        self.assertIn(str(sandbox.CODEX_SANDBOX_EXECUTABLE), argv)
+        self.assertIn(str(auth.resolve()), argv)
+        self.assertIn(str(sandbox.CODEX_SANDBOX_CONFIG_DIR / "auth.json"), argv)
+        self.assertNotIn(str(Path.home()), argv)
+
+    def test_codex_profile_rejects_non_private_auth(self) -> None:
+        auth_root = self.root / "codex-auth-public"
+        auth_root.mkdir()
+        auth = auth_root / "auth.json"
+        auth.write_text("{}\n", encoding="utf-8")
+        auth.chmod(0o644)
+        executable = self.root / "codex-bin-public"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GRABOWSKI_CODEX_BIN": str(executable),
+                "GRABOWSKI_CODEX_AUTH_ROOT": str(auth_root),
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(sandbox.AgentSandboxError, "owner-private"):
+                sandbox.prepare_external_agent_command(["codex", "--version"])
+
     def test_claude_profile_rejects_non_private_credentials(self) -> None:
         auth_root = self.root / "claude-auth-public"
         auth_root.mkdir()

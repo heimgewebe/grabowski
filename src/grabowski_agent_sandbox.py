@@ -35,6 +35,9 @@ class PreparedSandboxCommand:
 CLAUDE_PROFILE = "claude-cli-readonly-auth-v1"
 CLAUDE_SANDBOX_EXECUTABLE = Path("/opt/grabowski-external/claude")
 CLAUDE_SANDBOX_CONFIG_DIR = Path("/tmp/.claude")
+CODEX_PROFILE = "codex-cli-readonly-auth-v1"
+CODEX_SANDBOX_EXECUTABLE = Path("/opt/grabowski-external/codex")
+CODEX_SANDBOX_CONFIG_DIR = Path("/tmp/.codex")
 
 
 def _private_regular_file(path: Path, field: str) -> Path:
@@ -66,8 +69,29 @@ def prepare_external_agent_command(command: list[str]) -> PreparedSandboxCommand
     """Resolve supported external agents into explicit, read-only sandbox bindings."""
     if not command:
         raise AgentSandboxError("sandbox command must be non-empty")
-    if Path(command[0]).name != "claude":
+    executable_name = Path(command[0]).name
+    if executable_name not in {"claude", "codex"}:
         return PreparedSandboxCommand(tuple(command))
+    if executable_name == "codex":
+        executable_override = os.environ.get("GRABOWSKI_CODEX_BIN")
+        executable = _resolved_executable(executable_override or command[0], "Codex executable")
+        auth_root = Path(
+            os.environ.get("GRABOWSKI_CODEX_AUTH_ROOT", str(Path.home() / ".codex"))
+        ).expanduser()
+        auth = _private_regular_file(auth_root / "auth.json", "Codex auth")
+        return PreparedSandboxCommand(
+            command=(str(CODEX_SANDBOX_EXECUTABLE), *command[1:]),
+            extra_read_only=(
+                (executable, CODEX_SANDBOX_EXECUTABLE),
+                (auth, CODEX_SANDBOX_CONFIG_DIR / "auth.json"),
+            ),
+            extra_directories=(
+                Path("/opt"),
+                Path("/opt/grabowski-external"),
+                CODEX_SANDBOX_CONFIG_DIR,
+            ),
+            profile=CODEX_PROFILE,
+        )
     executable_override = os.environ.get("GRABOWSKI_CLAUDE_BIN")
     executable = _resolved_executable(executable_override or command[0], "Claude executable")
     auth_root = Path(
