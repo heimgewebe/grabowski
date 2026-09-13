@@ -279,6 +279,71 @@ class AgentBootstrapTests(unittest.TestCase):
         )
 
 
+    def test_bootstrap_selectively_consumes_historical_recall_before_execution_shape(self) -> None:
+        module = self.load_module()
+        history_step = "read_relevant_historical_recall_when_high_value_or_repeat_signal"
+        self.assertIn(history_step, module.ENTRY_SEQUENCE)
+        self.assertLess(
+            module.ENTRY_SEQUENCE.index("discover_existing_capability_or_route"),
+            module.ENTRY_SEQUENCE.index(history_step),
+        )
+        self.assertLess(
+            module.ENTRY_SEQUENCE.index(history_step),
+            module.ENTRY_SEQUENCE.index(
+                "request_execution_shape_for_nontrivial_or_mutating_work"
+            ),
+        )
+
+        policy = module.HISTORICAL_RECALL
+        self.assertEqual(policy["tool"], "grabowski_operator_historical_recall")
+        self.assertEqual(policy["mode"], "selective_before_execution")
+        self.assertEqual(policy["trigger_profiles"], ["pr", "bureau", "deployment"])
+        self.assertIn("recovery", policy["trigger_signals"])
+        self.assertIn("repeated_failure", policy["trigger_signals"])
+        self.assertEqual(
+            policy["skip_for"],
+            [
+                "trivial_read",
+                "status_only_without_repeat_signal",
+                "one_off_discovery_without_repeat_signal",
+            ],
+        )
+        self.assertIn("fresh_live_truth_precedes_history", policy["requirements"])
+        self.assertIn(
+            "fresh_owning_authority_must_be_rechecked_before_effect",
+            policy["requirements"],
+        )
+        self.assertEqual(
+            policy["does_not_establish"],
+            [
+                "current_truth",
+                "safe_retry",
+                "routing_authority",
+                "policy_authority",
+                "merge_readiness",
+                "deployment_authorization",
+                "bureau_publication_authority",
+                "task_completion",
+            ],
+        )
+
+        module.grabowski_friction.friction_summary = lambda **_: {
+            "event_log_integrity": {"integrity_valid": True},
+            "decision_log": {"integrity_valid": True},
+            "fingerprint_sha256": "a" * 64,
+        }
+        module.grabowski_friction.execution_governor_summary = lambda **_: {
+            "ledger_integrity_valid": True,
+            "candidates": [],
+            "minimum_evidence": 5,
+            "decay_seconds": 604800,
+            "live_promotions": [],
+            "summary_sha256": "b" * 64,
+        }
+        capsule = module.agent_bootstrap()
+        self.assertEqual(capsule["historical_recall"], policy)
+
+
     def test_reuse_before_build_orders_discovery_before_new_infrastructure(self) -> None:
         module = self.load_module()
         self.assertEqual(
