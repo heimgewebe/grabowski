@@ -161,6 +161,12 @@ def execution_capability(
         _EXECUTION_CONTEXT.reset(token)
 
 
+def execution_capability_active() -> bool:
+    """Return whether this in-process call owns an atomic execution capability."""
+
+    return _EXECUTION_CONTEXT.get() is not None
+
+
 def execution_capability_snapshot(session: Any) -> dict[str, str | None]:
     if not isinstance(session, dict):
         raise TransportExecutionCapabilityMismatch(
