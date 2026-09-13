@@ -1307,6 +1307,7 @@ CAPTAIN_GATE_IDS = (
     "evidence-digest-bound",
     "execution-authority-present",
     "review-evidence-present",
+    "independent-review-policy",
     "codex-review-settled",
     "diff-bound",
     "ci-green",
@@ -11538,6 +11539,129 @@ def _captain_review_evidence_gate(parameters: dict[str, Any], actions: list[dict
     )
 
 
+def _captain_independent_review_gate(
+    parameters: dict[str, Any], actions: list[dict[str, Any]]
+) -> dict[str, Any]:
+    targets = [
+        action.get("target")
+        for action in actions
+        if action.get("action") == "pr-merge"
+        and isinstance(action.get("target"), dict)
+    ]
+    if not targets:
+        return _captain_gate(
+            "independent-review-policy",
+            "pass",
+            "independent review is not applicable because no pr-merge action is requested",
+            {"required": False},
+        )
+    if len(targets) != 1:
+        return _captain_gate(
+            "independent-review-policy",
+            "blocked",
+            "one independent-review reconciliation can bind exactly one pr-merge action",
+            ["pr_merge_independent_review_target_count_invalid"],
+        )
+    requirement = grabowski_merge_guard.independent_review_requirement(parameters)
+    errors = list(requirement["errors"])
+    target = targets[0]
+    repo = target.get("repo")
+    pr = target.get("pr")
+    head = parameters.get("expected_head")
+    base = parameters.get("expected_base_sha")
+    diff = parameters.get("diff_sha256")
+    if not isinstance(repo, str) or not repo.strip():
+        errors.append("independent_review_repo_invalid")
+    if isinstance(pr, bool) or not isinstance(pr, int) or pr <= 0:
+        errors.append("independent_review_pr_invalid")
+    if not _is_hex_sha(head, lengths=(40,)):
+        errors.append("independent_review_head_invalid")
+    if not _is_hex_sha(base, lengths=(40,)):
+        errors.append("independent_review_base_invalid")
+    if not _is_sha256_hex(diff):
+        errors.append("independent_review_diff_invalid")
+    reconciliation: dict[str, Any] | None = None
+    if not errors:
+        try:
+            reconciliation = grabowski_merge_guard.decision_reviews.reconcile(
+                repo=repo,
+                pr=pr,
+                head_sha=head,
+                base_sha=base,
+                diff_sha256=diff,
+            )
+        except Exception as exc:
+            errors.append(
+                f"independent_review_reconciliation_unavailable:{type(exc).__name__}"
+            )
+    pass_count = 0
+    reconciliation_status = None
+    reconciliation_attempt_count = 0
+    reconciliation_slot_count = 0
+    independent_summary = {
+        "admissible_slots": [],
+        "admissible_slot_count": 0,
+        "ignored_pass_slots": [],
+        "pass_count": 0,
+        "total_pass_count": 0,
+        "errors": [],
+    }
+    if isinstance(reconciliation, dict):
+        reconciliation_status = reconciliation.get("status")
+        reconciliation_attempt_count = int(reconciliation.get("attempt_count", 0))
+        reconciliation_slot_count = int(reconciliation.get("slot_count", 0))
+        independent_summary = (
+            grabowski_merge_guard.independent_review_reconciliation_summary(
+                reconciliation
+            )
+        )
+        pass_count = int(independent_summary["pass_count"])
+        errors.extend(independent_summary["errors"])
+        raw_errors = reconciliation.get("errors", [])
+        if isinstance(raw_errors, list):
+            errors.extend(str(item) for item in raw_errors if isinstance(item, str))
+        else:
+            errors.append("independent_review_reconciliation_errors_invalid")
+        if reconciliation_status not in {"settled", "not_applicable", "blocked"}:
+            errors.append("independent_review_reconciliation_status_invalid")
+    if requirement["required"] and (
+        reconciliation_status != "settled" or pass_count < 1
+    ):
+        errors.append("independent_review_pass_missing")
+    errors = sorted(set(errors))
+    details = {
+        **requirement,
+        **{
+            key: value
+            for key, value in independent_summary.items()
+            if key != "errors"
+        },
+        "reconciliation_status": reconciliation_status,
+        "attempt_count": reconciliation_attempt_count,
+        "slot_count": reconciliation_slot_count,
+        "settlement_stage": "captain-preflight-and-atomic-merge-guard",
+        "errors": errors,
+    }
+    if errors:
+        return _captain_gate(
+            "independent-review-policy",
+            "blocked",
+            "independent review is missing, rejected, stale, unresolved or unavailable for the exact revision",
+            errors,
+        )
+    return _captain_gate(
+        "independent-review-policy",
+        "pass",
+        (
+            "provider-neutral independent review is settled for the exact revision and will be "
+            "reconciled again under the atomic merge guard"
+            if requirement["required"]
+            else "no independent-review floor applies and no decision-bound review debt is present"
+        ),
+        details,
+    )
+
+
 def _captain_codex_review_gate(
     parameters: dict[str, Any], actions: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -11931,6 +12055,7 @@ def _captain_authority_gates(
         _captain_evidence_digest_gate(parameters, actions),
         _captain_execution_authority_gate(parameters, actions),
         _captain_review_evidence_gate(parameters, actions),
+        _captain_independent_review_gate(parameters, actions),
         _captain_codex_review_gate(parameters, actions),
         _captain_diff_bound_gate(parameters),
         _captain_ci_gate(parameters, actions),
