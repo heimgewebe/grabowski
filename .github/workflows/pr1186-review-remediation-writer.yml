@@ -109,6 +109,16 @@ jobs:
         run: |
           set -euo pipefail
           python tools/pr1186_review_remediation.py
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('src/grabowski_checkouts.py')
+          text = path.read_text(encoding='utf-8')
+          old = '    wanted = set(resources.normalize_resource_keys(resource_keys))\n'
+          new = '    raw_resource_keys = list(resource_keys)\n    wanted = (\n        set(resources.normalize_resource_keys(raw_resource_keys))\n        if raw_resource_keys\n        else set()\n    )\n'
+          if text.count(old) != 1:
+              raise SystemExit(f'all-fence listing fix marker count={text.count(old)}')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
           git diff --check
 
       - name: Publish capability contract
@@ -168,11 +178,16 @@ jobs:
           make profiles-refresh
           git diff --check
 
-      - name: Focused regression tests
+      - name: Focused regression tests with canonical access fixture
         run: |
           set -euo pipefail
-          python -m unittest discover -s tests -p 'test_checkouts.py' -v
-          python -m unittest discover -s tests -p 'test_agent_workspace.py' -v
+          install -d -m 700 "$(pwd)/build"
+          test_home="$(mktemp -d "$(pwd)/build/pr1186-test-home.XXXXXX")"
+          trap 'rm -rf "$test_home"' EXIT
+          install -d -m 700 "$test_home/.config/grabowski"
+          install -m 600 config/access.home-wide-operator.example.json "$test_home/.config/grabowski/access.json"
+          HOME="$test_home" python -m unittest discover -s tests -p 'test_checkouts.py' -v
+          HOME="$test_home" python -m unittest discover -s tests -p 'test_agent_workspace.py' -v
 
       - name: Full repository validation
         run: make validate
