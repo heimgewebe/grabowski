@@ -3173,7 +3173,7 @@ class DeploymentAdmissionTests(unittest.TestCase):
         self.assertTrue(counts["effect_aware"])
         self.assertEqual(1, counts["blocking_tool_calls"])
         for mutation in (
-            {"effect_classification": "unknown-v2"},
+            {"effect_classification": "unknown-v4"},
             {"read_only_active_tool_calls": 2},
             {"drain_blocking_tool_calls": True},
         ):
@@ -3193,7 +3193,7 @@ class DeploymentAdmissionTests(unittest.TestCase):
         counts = dual._operator_admission_call_counts(predecessor)
         self.assertFalse(counts["effect_aware"])
         self.assertEqual(2, counts["blocking_tool_calls"])
-        self.assertEqual(2, counts["read_only_active_tool_calls"])
+        self.assertEqual(0, counts["read_only_active_tool_calls"])
 
         idle_predecessor = {
             **predecessor,
@@ -3204,6 +3204,28 @@ class DeploymentAdmissionTests(unittest.TestCase):
         idle_counts = dual._operator_admission_call_counts(idle_predecessor)
         self.assertFalse(idle_counts["effect_aware"])
         self.assertEqual(0, idle_counts["blocking_tool_calls"])
+
+        malformed = {**predecessor, "read_only_active_tool_calls": 1}
+        with self.assertRaises(core.DeployError):
+            dual._operator_admission_call_counts(malformed)
+
+    def test_operator_admission_accepts_v2_predecessor_conservatively(self) -> None:
+        predecessor = {
+            "active_tool_calls": 2,
+            "drain_blocking_tool_calls": 0,
+            "read_only_active_tool_calls": 2,
+            "effect_classification": (
+                "readOnlyHint-or-exact-github-pr-view-is-read-only-v2"
+            ),
+        }
+        self.assertIn(
+            predecessor["effect_classification"],
+            dual.OPERATOR_ADMISSION_PREDECESSOR_EFFECT_CLASSIFICATIONS,
+        )
+        counts = dual._operator_admission_call_counts(predecessor)
+        self.assertFalse(counts["effect_aware"])
+        self.assertEqual(2, counts["blocking_tool_calls"])
+        self.assertEqual(0, counts["read_only_active_tool_calls"])
 
         malformed = {**predecessor, "read_only_active_tool_calls": 1}
         with self.assertRaises(core.DeployError):
