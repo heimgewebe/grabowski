@@ -17137,8 +17137,15 @@ class CaptainExecutionIntentTests(unittest.TestCase):
             Path(self._resource_tempdir.name) / "resources.sqlite3",
         )
         self._resource_db_patch.start()
+        self._decision_review_patch = patch.object(
+            merge_guard.decision_reviews,
+            "reconcile",
+            return_value=captain_independent_review_reconciliation(),
+        )
+        self._decision_review_patch.start()
 
     def tearDown(self) -> None:
+        self._decision_review_patch.stop()
         self._resource_db_patch.stop()
         self._resource_tempdir.cleanup()
 
