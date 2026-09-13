@@ -539,16 +539,25 @@ def _configured_model_aliases(
     }
 
 
-def _antigravity_models_from_output(
+def _antigravity_model_inventory_from_output(
     catalog: dict[str, Any], stdout: str
-) -> list[str]:
+) -> dict[str, list[str]]:
     aliases = _configured_model_aliases(catalog, "antigravity")
-    discovered = {
-        aliases[model_field]
+    model_args = {
+        model_field
         for line in stdout.splitlines()
         if (model_field := line.split("\t", 1)[0].strip()) in aliases
     }
-    return sorted(discovered)
+    return {
+        "models": sorted({aliases[model_arg] for model_arg in model_args}),
+        "model_args": sorted(model_args),
+    }
+
+
+def _antigravity_models_from_output(
+    catalog: dict[str, Any], stdout: str
+) -> list[str]:
+    return _antigravity_model_inventory_from_output(catalog, stdout)["models"]
 
 
 def _grok_models_from_output(
@@ -758,15 +767,16 @@ def _probe(catalog: dict[str, Any]) -> dict[str, Any]:
     antigravity = _run_harness_metadata(
         harnesses, "antigravity", ["models"], catalog
     )
+    antigravity_inventory = (
+        _antigravity_model_inventory_from_output(
+            catalog, str(antigravity.get("stdout", ""))
+        )
+        if antigravity.get("ok") is True
+        else {"models": [], "model_args": []}
+    )
     providers["antigravity"] = {
         "available": harnesses.get("antigravity", {}).get("available") is True,
-        "models": (
-            _antigravity_models_from_output(
-                catalog, str(antigravity.get("stdout", ""))
-            )
-            if antigravity.get("ok") is True
-            else []
-        ),
+        **antigravity_inventory,
         "legacy_state_key": "agy",
     }
     opencode = _run_harness_metadata(harnesses, "opencode", ["models"], catalog)

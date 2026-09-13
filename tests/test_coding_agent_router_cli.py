@@ -256,17 +256,25 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         ):
             cli._configured_models({}, "grok")
 
-    def test_antigravity_model_discovery_canonicalizes_configured_cli_ids(self) -> None:
+    def test_antigravity_model_discovery_preserves_canonical_and_cli_ids(self) -> None:
         catalog, _ = router._load_catalog()
+        output = (
+            "gemini-3.1-pro-high\tGemini 3.1 Pro (High)\n"
+            "gemini-3.6-flash\tGemini 3.6 Flash\n"
+            "invented-model\tGemini 3.1 Pro (High)\n"
+            "Gemini 3.1 Pro (High)\n"
+        )
+        inventory = cli._antigravity_model_inventory_from_output(catalog, output)
         self.assertEqual(
-            cli._antigravity_models_from_output(
-                catalog,
-                "gemini-3.1-pro-high\tGemini 3.1 Pro (High)\n"
-                "gemini-3.6-flash\tGemini 3.6 Flash\n"
-                "invented-model\tGemini 3.1 Pro (High)\n"
-                "Gemini 3.1 Pro (High)\n",
-            ),
-            ["gemini-3.1-pro", "gemini-3.6-flash"],
+            inventory,
+            {
+                "models": ["gemini-3.1-pro", "gemini-3.6-flash"],
+                "model_args": ["gemini-3.1-pro-high", "gemini-3.6-flash"],
+            },
+        )
+        self.assertEqual(
+            cli._antigravity_models_from_output(catalog, output),
+            inventory["models"],
         )
 
     def test_grok_model_discovery_accepts_legacy_and_inline_sections_only(self) -> None:
@@ -428,6 +436,8 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         self.assertEqual(probe["model_invocations"], 0)
         self.assertEqual(probe["paid_api_requests_authorized"], 0)
         self.assertEqual(probe["verified_quota_pools"], [])
+        self.assertEqual(probe["providers"]["antigravity"]["models"], [])
+        self.assertEqual(probe["providers"]["antigravity"]["model_args"], [])
         self.assertIn("OPENROUTER_API_KEY", probe["api_key_environment_scrubbed"])
         digest_input = dict(probe)
         digest = digest_input.pop("catalog_probe_sha256")

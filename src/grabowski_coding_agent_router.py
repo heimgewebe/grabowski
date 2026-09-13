@@ -1279,6 +1279,11 @@ def _route_available(
         antigravity = providers.get("antigravity", providers.get("agy", {}))
         if model_id not in antigravity.get("models", []):
             return False, "Antigravity model is absent"
+        observed_model_args = antigravity.get("model_args")
+        if not isinstance(observed_model_args, list):
+            return False, "Antigravity route model identity is unverified"
+        if model_arg not in observed_model_args:
+            return False, "Antigravity route model is absent"
     if harness == "opencode":
         opencode = providers.get("opencode", {})
         quota_pools = route.get("quota_pools", [])

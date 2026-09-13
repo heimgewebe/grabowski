@@ -79,6 +79,7 @@ class CodingAgentRouterTests(unittest.TestCase):
     def _fresh_state(self) -> dict:
         routes = self.catalog["routes"]
         agy_models: list[str] = []
+        agy_model_args: list[str] = []
         grok_models: list[str] = []
         for route in routes:
             argv = route.get("argv_prefix", [])
@@ -87,6 +88,7 @@ class CodingAgentRouterTests(unittest.TestCase):
                     model = argv[index + 1]
                     if route["harness"] == "antigravity":
                         agy_models.append(route["model"])
+                        agy_model_args.append(model)
                     elif route["harness"] == "grok":
                         grok_models.append(model)
         observed = datetime.now(timezone.utc).replace(microsecond=0)
@@ -122,7 +124,10 @@ class CodingAgentRouterTests(unittest.TestCase):
                             "claude-sonnet-5",
                         ],
                     },
-                    "antigravity": {"models": sorted(set(agy_models))},
+                    "antigravity": {
+                        "models": sorted(set(agy_models)),
+                        "model_args": sorted(set(agy_model_args)),
+                    },
                     "grok": {
                         "logged_in": True,
                         "models": sorted(set(grok_models)),
@@ -1379,26 +1384,39 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertEqual(model["availability"], "route-stale-disabled")
         self.assertIn("slug-absent-2026-09-13", model["evidence"])
 
-    def test_antigravity_availability_uses_canonical_probe_model_identity(self) -> None:
-        route = next(
+    def test_antigravity_availability_binds_canonical_and_cli_model_identities(self) -> None:
+        high = next(
             route
             for route in self.catalog["routes"]
             if route["id"] == "antigravity-gemini-pro-review-high"
         )
+        low = next(
+            route
+            for route in self.catalog["routes"]
+            if route["id"] == "antigravity-gemini-pro-low"
+        )
+        self.assertEqual(high["model"], low["model"])
+        high_arg = router._configured_model_arg(high)
+        low_arg = router._configured_model_arg(low)
+        self.assertIsNotNone(high_arg)
+        self.assertIsNotNone(low_arg)
+        self.assertNotEqual(high_arg, low_arg)
+
         state = self._fresh_state()
         provider = state["catalog"]["providers"]["antigravity"]
-        model_arg = router._configured_model_arg(route)
-        self.assertIsNotNone(model_arg)
-        self.assertNotEqual(model_arg, route["model"])
+        provider["models"] = [high["model"]]
+        provider["model_args"] = [high_arg]
 
-        provider["models"] = [route["model"]]
-        available, reason = router._route_available(route, self.catalog, state)
+        available, reason = router._route_available(high, self.catalog, state)
         self.assertTrue(available, reason)
-
-        provider["models"] = [model_arg]
-        available, reason = router._route_available(route, self.catalog, state)
+        available, reason = router._route_available(low, self.catalog, state)
         self.assertFalse(available)
-        self.assertEqual(reason, "Antigravity model is absent")
+        self.assertEqual(reason, "Antigravity route model is absent")
+
+        provider.pop("model_args")
+        available, reason = router._route_available(high, self.catalog, state)
+        self.assertFalse(available)
+        self.assertEqual(reason, "Antigravity route model identity is unverified")
 
     def test_external_reviewers_are_independent_from_controller(self) -> None:
         for task_class in ("complex-patch", "deep-debug", "architecture"):
