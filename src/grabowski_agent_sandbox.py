@@ -35,10 +35,23 @@ class PreparedSandboxCommand:
 CLAUDE_PROFILE = "claude-cli-readonly-auth-v1"
 CLAUDE_SANDBOX_EXECUTABLE = Path("/opt/grabowski-external/claude")
 CLAUDE_SANDBOX_CONFIG_DIR = Path("/tmp/.claude")
-CODEX_PROFILE = "codex-cli-readonly-auth-v1"
+CODEX_PROFILE = "codex-cli-private-writable-auth-v1"
 CODEX_SANDBOX_EXECUTABLE = Path("/opt/grabowski-external/codex")
 CODEX_SANDBOX_CONFIG_DIR = Path("/tmp/.codex")
 CODEX_SANDBOX_CODE_MODE_HOST = Path("/opt/grabowski-external/codex-code-mode-host")
+CODEX_SANDBOX_AUTH_SOURCE = Path("/opt/grabowski-external/codex-auth-bootstrap.json")
+_CODEX_AUTH_BOOTSTRAP_SOURCE = """\
+import os
+import shutil
+import sys
+
+source = "/opt/grabowski-external/codex-auth-bootstrap.json"
+destination = "/tmp/.codex/auth.json"
+with open(source, "rb") as source_file, open(destination, "xb") as destination_file:
+    shutil.copyfileobj(source_file, destination_file)
+os.chmod(destination, 0o600)
+os.execv(sys.argv[1], sys.argv[1:])
+"""
 
 
 def _private_regular_file(path: Path, field: str) -> Path:
@@ -67,7 +80,7 @@ def _resolved_executable(value: str, field: str) -> Path:
 
 
 def prepare_external_agent_command(command: list[str]) -> PreparedSandboxCommand:
-    """Resolve supported external agents into explicit, read-only sandbox bindings."""
+    """Resolve supported external agents into explicit sandbox bindings."""
     if not command:
         raise AgentSandboxError("sandbox command must be non-empty")
     executable_name = Path(command[0]).name
@@ -82,7 +95,7 @@ def prepare_external_agent_command(command: list[str]) -> PreparedSandboxCommand
         auth = _private_regular_file(auth_root / "auth.json", "Codex auth")
         bindings: list[tuple[Path, Path]] = [
             (executable, CODEX_SANDBOX_EXECUTABLE),
-            (auth, CODEX_SANDBOX_CONFIG_DIR / "auth.json"),
+            (auth, CODEX_SANDBOX_AUTH_SOURCE),
         ]
         code_mode_host = executable.parent / "codex-code-mode-host"
         if code_mode_host.exists():
@@ -94,7 +107,15 @@ def prepare_external_agent_command(command: list[str]) -> PreparedSandboxCommand
                 ),
             )
         return PreparedSandboxCommand(
-            command=(str(CODEX_SANDBOX_EXECUTABLE), *command[1:]),
+            command=(
+                "/usr/bin/python3",
+                "-I",
+                "-S",
+                "-c",
+                _CODEX_AUTH_BOOTSTRAP_SOURCE,
+                str(CODEX_SANDBOX_EXECUTABLE),
+                *command[1:],
+            ),
             extra_read_only=tuple(bindings),
             extra_directories=(
                 Path("/opt"),

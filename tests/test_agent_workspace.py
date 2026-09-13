@@ -3102,15 +3102,68 @@ class AgentWorkspaceTests(unittest.TestCase):
                 extra_directories=prepared.extra_directories,
             )
         self.assertEqual(prepared.profile, sandbox.CODEX_PROFILE)
-        self.assertEqual(prepared.command[0], str(sandbox.CODEX_SANDBOX_EXECUTABLE))
-        self.assertEqual(list(prepared.command[1:]), command[1:])
+        self.assertEqual(prepared.command[:4], ("/usr/bin/python3", "-I", "-S", "-c"))
+        self.assertEqual(prepared.command[4], sandbox._CODEX_AUTH_BOOTSTRAP_SOURCE)
+        self.assertEqual(prepared.command[5], str(sandbox.CODEX_SANDBOX_EXECUTABLE))
+        self.assertEqual(list(prepared.command[6:]), command[1:])
         self.assertIn(str(executable.resolve()), argv)
         self.assertIn(str(sandbox.CODEX_SANDBOX_EXECUTABLE), argv)
         self.assertIn(str(code_mode_host.resolve()), argv)
         self.assertIn(str(sandbox.CODEX_SANDBOX_CODE_MODE_HOST), argv)
         self.assertIn(str(auth.resolve()), argv)
-        self.assertIn(str(sandbox.CODEX_SANDBOX_CONFIG_DIR / "auth.json"), argv)
+        self.assertIn(str(sandbox.CODEX_SANDBOX_AUTH_SOURCE), argv)
+        self.assertNotIn(str(sandbox.CODEX_SANDBOX_CONFIG_DIR / "auth.json"), argv)
         self.assertNotIn(str(Path.home()), argv)
+
+    def test_codex_profile_uses_writable_private_auth_copy(self) -> None:
+        try:
+            sandbox.require_bwrap()
+        except sandbox.AgentSandboxError as exc:
+            self.skipTest(str(exc))
+        auth_root = self.root / "codex-auth-copy"
+        auth_root.mkdir(mode=0o700)
+        auth = auth_root / "auth.json"
+        original_auth = b'{"fixture":"host-original"}\n'
+        auth.write_bytes(original_auth)
+        auth.chmod(0o600)
+        executable = self.root / "codex-copy-bin"
+        executable.write_text(
+            "#!/usr/bin/python3\n"
+            "from pathlib import Path\n"
+            "auth = Path.home() / '.codex' / 'auth.json'\n"
+            "print(auth.read_text(encoding='utf-8').strip())\n"
+            "auth.write_text('sandbox-refreshed\\n', encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GRABOWSKI_CODEX_BIN": str(executable),
+                "GRABOWSKI_CODEX_AUTH_ROOT": str(auth_root),
+            },
+            clear=False,
+        ):
+            prepared = sandbox.prepare_external_agent_command(["codex"])
+            argv = sandbox.runtime_sandbox_argv(
+                sandbox.minimal_sandbox_argv(
+                    workspace=self.git.repo,
+                    command=list(prepared.command),
+                    workspace_writable=False,
+                    extra_read_only=prepared.extra_read_only,
+                    extra_directories=prepared.extra_directories,
+                )
+            )
+            completed = subprocess.run(
+                argv,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn('{"fixture":"host-original"}', completed.stdout)
+        self.assertEqual(auth.read_bytes(), original_auth)
 
     def test_codex_profile_rejects_non_private_auth(self) -> None:
         auth_root = self.root / "codex-auth-public"
