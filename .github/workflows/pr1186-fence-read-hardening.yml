@@ -1,0 +1,84 @@
+name: PR1186 uncertainty-fence read hardening
+
+on:
+  push:
+    branches:
+      - fix/terminal-lane-retention-archive-20260913
+
+permissions:
+  contents: write
+
+jobs:
+  remediate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact triggering head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Apply exact P1 remediation
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          source_path = Path("src/grabowski_checkouts.py")
+          source = source_path.read_text(encoding="utf-8")
+          old = '''    try:\n        rows = connection.execute(\n            """\n            SELECT * FROM operation_uncertainty\n            WHERE cleared_at_unix IS NULL\n            ORDER BY created_at_unix ASC, fence_id ASC\n            """\n        ).fetchall()\n    except sqlite3.OperationalError:\n        return []\n    finally:\n        connection.close()\n'''
+          new = '''    try:\n        table = connection.execute(\n            """\n            SELECT 1 FROM sqlite_master\n            WHERE type='table' AND name='operation_uncertainty'\n            """\n        ).fetchone()\n        if table is None:\n            return []\n        rows = connection.execute(\n            """\n            SELECT * FROM operation_uncertainty\n            WHERE cleared_at_unix IS NULL\n            ORDER BY created_at_unix ASC, fence_id ASC\n            """\n        ).fetchall()\n    finally:\n        connection.close()\n'''
+          if source.count(old) != 1:
+              raise SystemExit("uncertainty reader preimage mismatch")
+          source_path.write_text(source.replace(old, new, 1), encoding="utf-8")
+
+          test_path = Path("tests/test_checkouts.py")
+          tests = test_path.read_text(encoding="utf-8")
+          marker = '''    def test_cleanup_requires_prior_dry_run_and_uses_plain_worktree_remove(self) -> None:\n'''
+          addition = '''    def test_uncertainty_reader_treats_missing_legacy_table_as_empty(self) -> None:\n        self.checkout_db.parent.mkdir(parents=True, exist_ok=True)\n        with sqlite3.connect(self.checkout_db) as connection:\n            connection.execute("CREATE TABLE legacy_only(id INTEGER)")\n            connection.commit()\n\n        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])\n\n    def test_uncertainty_reader_propagates_operational_read_failures(self) -> None:\n        class FailingConnection:\n            closed = False\n\n            def execute(self, *_args, **_kwargs):\n                raise sqlite3.OperationalError("database is locked")\n\n            def close(self):\n                self.closed = True\n\n        connection = FailingConnection()\n        with patch.object(\n            checkouts, "_readonly_connection", return_value=connection\n        ):\n            with self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):\n                checkouts._active_checkout_operation_uncertainties()\n        self.assertTrue(connection.closed)\n\n'''
+          if tests.count(marker) != 1:
+              raise SystemExit("uncertainty regression insertion marker mismatch")
+          test_path.write_text(tests.replace(marker, addition + marker, 1), encoding="utf-8")
+          PY
+
+      - name: Run focused regressions
+        shell: bash
+        run: |
+          set -eu
+          install -d -m 700 "$PWD/build"
+          test_home="$(mktemp -d "$PWD/build/test-home.XXXXXX")"
+          trap 'rm -rf "$test_home"' EXIT
+          install -d -m 700 "$test_home/.config/grabowski"
+          install -m 600 config/access.home-wide-operator.example.json "$test_home/.config/grabowski/access.json"
+          HOME="$test_home" PYTHONPATH=tests python -B -m unittest -v \
+            test_checkouts.CheckoutLifecycleTests.test_uncertainty_reader_treats_missing_legacy_table_as_empty \
+            test_checkouts.CheckoutLifecycleTests.test_uncertainty_reader_propagates_operational_read_failures
+
+      - name: Run checkout regression suite
+        shell: bash
+        run: |
+          set -eu
+          install -d -m 700 "$PWD/build"
+          test_home="$(mktemp -d "$PWD/build/test-home.XXXXXX")"
+          trap 'rm -rf "$test_home"' EXIT
+          install -d -m 700 "$test_home/.config/grabowski"
+          install -m 600 config/access.home-wide-operator.example.json "$test_home/.config/grabowski/access.json"
+          HOME="$test_home" python -B -m unittest discover -s tests -p 'test_checkouts.py' -v
+
+      - name: Verify diff hygiene
+        run: git diff --check
+
+      - name: Commit exact remediation and remove temporary workflow
+        shell: bash
+        run: |
+          rm .github/workflows/pr1186-fence-read-hardening.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/grabowski_checkouts.py tests/test_checkouts.py .github/workflows/pr1186-fence-read-hardening.yml
+          git commit -m "fix(checkouts): fail closed on fence read errors"
+          git push origin HEAD:fix/terminal-lane-retention-archive-20260913
