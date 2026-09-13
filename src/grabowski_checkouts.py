@@ -274,18 +274,22 @@ def _safe_path(raw: str | Path, *, must_exist: bool) -> Path:
     return path.resolve(strict=must_exist)
 
 
+class CheckoutPhysicalIdentityPreconditionError(RuntimeError):
+    """Physical checkout identity failed before the destructive Git mutation."""
+
+
 def _verify_expected_physical_checkout_identity(
     checkout: Path, expected: dict[str, Any]
 ) -> dict[str, Any]:
     root = expected.get("root") if isinstance(expected, dict) else None
     if not isinstance(root, dict) or root.get("path") != str(checkout):
-        raise RuntimeError(
+        raise CheckoutPhysicalIdentityPreconditionError(
             "Checkout physical identity precondition does not belong to checkout path"
         )
     try:
         return physical_checkout.verify_physical_checkout_identity(expected)
     except physical_checkout.PhysicalCheckoutIdentityError as exc:
-        raise RuntimeError(
+        raise CheckoutPhysicalIdentityPreconditionError(
             f"Checkout physical identity precondition failed: {exc}"
         ) from exc
 
@@ -4506,23 +4510,25 @@ def grabowski_checkout_cleanup(
                 checkout if stored_physical_identity is not None else None
             ),
         )
-        applied = _now()
-        with _database() as connection:
-            connection.execute(
-                "UPDATE dry_runs SET applied_at_unix=? WHERE plan_id=?",
-                (applied, plan_id),
-            )
-            connection.execute(
-                """
-                UPDATE archives
-                SET cleaned_at_unix=?, cleanup_plan_id=?
-                WHERE archive_id=?
-                """,
-                (applied, plan_id, stored["archive_id"]),
-            )
-            connection.commit()
-    finally:
-        lease_release = _release_checkout_resources(lease)
+    except CheckoutPhysicalIdentityPreconditionError:
+        _release_checkout_resources(lease)
+        raise
+    applied = _now()
+    with _database() as connection:
+        connection.execute(
+            "UPDATE dry_runs SET applied_at_unix=? WHERE plan_id=?",
+            (applied, plan_id),
+        )
+        connection.execute(
+            """
+            UPDATE archives
+            SET cleaned_at_unix=?, cleanup_plan_id=?
+            WHERE archive_id=?
+            """,
+            (applied, plan_id, stored["archive_id"]),
+        )
+        connection.commit()
+    lease_release = _release_checkout_resources(lease)
     audit = {
         "timestamp_unix": applied,
         "operation": "checkout-cleanup-apply",

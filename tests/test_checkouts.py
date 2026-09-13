@@ -1780,6 +1780,116 @@ class CheckoutLifecycleTests(unittest.TestCase):
         release_mock.assert_called_once()
         self.assertEqual(verify_mock.call_count, 2)
 
+    def test_cleanup_retains_resources_when_git_mutation_outcome_is_unknown(self) -> None:
+        archive = self._archive()["archive"]
+        expected_identity = checkouts.physical_checkout.capture_physical_checkout_identity(
+            self.checkout
+        )
+        dry_run = checkouts.grabowski_checkout_cleanup(
+            str(self.repo),
+            str(self.checkout),
+            "owner-a",
+            dry_run=True,
+            archive_id=archive["archive_id"],
+            expected_head=self.head,
+            expected_branch="topic",
+            expected_physical_identity=expected_identity,
+        )
+        fake_lease = {"owner_id": "checkout-operation:test", "leases": []}
+        with (
+            patch.object(
+                checkouts, "_acquire_checkout_resources", return_value=fake_lease
+            ) as acquire_mock,
+            patch.object(
+                checkouts,
+                "_git_mutate",
+                side_effect=RuntimeError("simulated ambiguous git outcome"),
+            ) as mutate_mock,
+            patch.object(checkouts, "_release_checkout_resources") as release_mock,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "simulated ambiguous git outcome"
+            ):
+                checkouts.grabowski_checkout_cleanup(
+                    str(self.repo),
+                    str(self.checkout),
+                    "owner-a",
+                    dry_run=False,
+                    plan_id=dry_run["dry_run_record"]["plan_id"],
+                    expected_plan_sha256=dry_run["plan"]["plan_sha256"],
+                    expected_physical_identity=expected_identity,
+                    confirmation="remove-linked-checkout",
+                )
+
+        acquire_mock.assert_called_once()
+        mutate_mock.assert_called_once()
+        release_mock.assert_not_called()
+        self.assertTrue(self.checkout.exists())
+
+    def test_cleanup_retains_resources_when_database_update_is_unknown(self) -> None:
+        archive = self._archive()["archive"]
+        expected_identity = checkouts.physical_checkout.capture_physical_checkout_identity(
+            self.checkout
+        )
+        dry_run = checkouts.grabowski_checkout_cleanup(
+            str(self.repo),
+            str(self.checkout),
+            "owner-a",
+            dry_run=True,
+            archive_id=archive["archive_id"],
+            expected_head=self.head,
+            expected_branch="topic",
+            expected_physical_identity=expected_identity,
+        )
+        fake_lease = {"owner_id": "checkout-operation:test", "leases": []}
+        fake_result = {
+            "argv": ["git", "worktree", "remove"],
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "timed_out": False,
+        }
+        database_patch = patch.object(
+            checkouts,
+            "_database",
+            side_effect=RuntimeError("simulated database failure after git success"),
+        )
+
+        def mutate_then_break_database(*args, **kwargs):
+            database_patch.start()
+            return fake_result
+
+        try:
+            with (
+                patch.object(
+                    checkouts, "_acquire_checkout_resources", return_value=fake_lease
+                ) as acquire_mock,
+                patch.object(
+                    checkouts, "_git_mutate", side_effect=mutate_then_break_database
+                ) as mutate_mock,
+                patch.object(checkouts, "_release_checkout_resources") as release_mock,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "simulated database failure after git success"
+                ):
+                    checkouts.grabowski_checkout_cleanup(
+                        str(self.repo),
+                        str(self.checkout),
+                        "owner-a",
+                        dry_run=False,
+                        plan_id=dry_run["dry_run_record"]["plan_id"],
+                        expected_plan_sha256=dry_run["plan"]["plan_sha256"],
+                        expected_physical_identity=expected_identity,
+                        confirmation="remove-linked-checkout",
+                    )
+        finally:
+            database_patch.stop()
+
+        acquire_mock.assert_called_once()
+        mutate_mock.assert_called_once()
+        release_mock.assert_not_called()
+        self.assertTrue(self.checkout.exists())
+
     def test_cleanup_plan_remains_valid_when_only_archive_age_advances(self) -> None:
         archive = self._archive()["archive"]
         assert isinstance(archive, dict)
