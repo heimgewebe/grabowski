@@ -89,7 +89,7 @@ def _private_lock_descriptor(path: Path, field: str) -> int:
     return descriptor
 
 
-def _codex_sandbox_auth_root(auth_root: Path) -> Path:
+def _codex_sandbox_auth_file(auth_root: Path) -> Path:
     raw_state_root = os.environ.get(
         CODEX_SANDBOX_AUTH_STATE_ENV,
         str(Path.home() / ".local/state/grabowski/codex-auth"),
@@ -105,7 +105,7 @@ def _codex_sandbox_auth_root(auth_root: Path) -> Path:
         destination = state_root / "auth.json"
         if os.path.lexists(destination):
             _private_regular_file(destination, "Codex sandbox auth")
-            return state_root
+            return destination
         source = _private_regular_file(auth_root / "auth.json", "Codex auth bootstrap")
         temp_descriptor, temp_name = tempfile.mkstemp(
             prefix=".auth-seed-", dir=state_root
@@ -136,7 +136,7 @@ def _codex_sandbox_auth_root(auth_root: Path) -> Path:
             except FileNotFoundError:
                 pass
         _private_regular_file(destination, "Codex sandbox auth")
-        return state_root
+        return destination
     finally:
         fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
         os.close(lock_descriptor)
@@ -172,7 +172,7 @@ def prepare_external_agent_command(command: list[str]) -> PreparedSandboxCommand
         auth_root = Path(
             os.environ.get("GRABOWSKI_CODEX_AUTH_ROOT", str(Path.home() / ".codex"))
         ).expanduser()
-        sandbox_auth_root = _codex_sandbox_auth_root(auth_root)
+        sandbox_auth_file = _codex_sandbox_auth_file(auth_root)
         bindings: list[tuple[Path, Path]] = [
             (executable, CODEX_SANDBOX_EXECUTABLE),
         ]
@@ -187,7 +187,7 @@ def prepare_external_agent_command(command: list[str]) -> PreparedSandboxCommand
         return PreparedSandboxCommand(
             command=(str(CODEX_SANDBOX_EXECUTABLE), *command[1:]),
             extra_read_only=tuple(bindings),
-            extra_read_write=((sandbox_auth_root, CODEX_SANDBOX_CONFIG_DIR),),
+            extra_read_write=((sandbox_auth_file, CODEX_SANDBOX_CONFIG_DIR / "auth.json"),),
             extra_directories=(
                 Path("/opt"),
                 Path("/opt/grabowski-external"),
@@ -488,8 +488,7 @@ def minimal_sandbox_argv(
         seen_targets.add(target)
         arguments.extend(["--ro-bind", str(source), target])
     for source_value, target_value in extra_read_write:
-        source = _private_directory(source_value, "extra_read_write source")
-        _validate_writable_tree(source)
+        source = _private_regular_file(source_value, "extra_read_write source")
         target_path = Path(target_value)
         if (
             not target_path.is_absolute()
@@ -498,7 +497,7 @@ def minimal_sandbox_argv(
             or not target_path.is_relative_to(Path("/tmp"))
         ):
             raise AgentSandboxError(
-                "extra_read_write target must be a private path below /tmp"
+                "extra_read_write target must be a private file path below /tmp"
             )
         target = str(target_path)
         if target in seen_targets:

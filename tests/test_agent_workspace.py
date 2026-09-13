@@ -3118,9 +3118,13 @@ class AgentWorkspaceTests(unittest.TestCase):
             if item == "--bind"
         ]
         self.assertIn(
-            (str(state_root.resolve()), str(sandbox.CODEX_SANDBOX_CONFIG_DIR)),
+            (
+                str((state_root / "auth.json").resolve()),
+                str(sandbox.CODEX_SANDBOX_CONFIG_DIR / "auth.json"),
+            ),
             writable_bindings,
         )
+        self.assertNotIn(str((state_root / ".seed.lock").resolve()), argv)
         sandbox_auth = state_root / "auth.json"
         self.assertEqual(sandbox_auth.read_bytes(), auth.read_bytes())
         self.assertEqual(stat.S_IMODE(sandbox_auth.stat().st_mode), 0o600)
@@ -3144,11 +3148,14 @@ class AgentWorkspaceTests(unittest.TestCase):
             "#!/usr/bin/python3\n"
             "from pathlib import Path\n"
             "auth = Path.home() / '.codex' / 'auth.json'\n"
+            "config = Path.home() / '.codex' / 'config.toml'\n"
             "current = auth.read_text(encoding='utf-8').strip()\n"
             "print(current)\n"
             "print(oct(auth.stat().st_mode & 0o777))\n"
+            "print(f'config_exists={config.exists()}')\n"
             "if 'host-original' in current:\n"
-            "    auth.write_text('sandbox-refreshed\\n', encoding='utf-8')\n",
+            "    auth.write_text('sandbox-refreshed\\n', encoding='utf-8')\n"
+            "    config.write_text('writer-planted = true\\n', encoding='utf-8')\n",
             encoding="utf-8",
         )
         executable.chmod(0o755)
@@ -3190,7 +3197,10 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertIn("sandbox-refreshed", second.stdout)
         self.assertIn("0o600", first.stdout)
         self.assertIn("0o600", second.stdout)
+        self.assertIn("config_exists=False", first.stdout)
+        self.assertIn("config_exists=False", second.stdout)
         self.assertEqual((state_root / "auth.json").read_text(), "sandbox-refreshed\n")
+        self.assertFalse((state_root / "config.toml").exists())
         self.assertEqual(auth.read_bytes(), original_auth)
 
     def test_codex_profile_rejects_non_private_auth(self) -> None:
