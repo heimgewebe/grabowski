@@ -679,6 +679,31 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertEqual(group["projection_state"], "hygiene")
         self.assertIn("cleanup-candidate-ready", group["action_reasons"])
 
+    def test_cleanup_candidate_with_retention_is_hygiene_not_blocking(self) -> None:
+        result = project(
+            checkout_payloads=[
+                {
+                    "repository": REPOSITORY,
+                    "worktrees": [
+                        checkout(
+                            "cleanup-retained",
+                            "/home/alex/repos/.worktrees/cleanup-retained",
+                            cleanup_candidate=True,
+                            lifecycle_state="cleanup_candidate",
+                            retention_active=True,
+                        )
+                    ],
+                }
+            ]
+        )
+        group = result["work"][0]
+        self.assertEqual(group["projection_state"], "hygiene")
+        self.assertEqual(group["work_class"], "hygiene")
+        self.assertIn("cleanup-candidate-retention-active", group["action_reasons"])
+        self.assertNotIn(
+            "cleanup-candidate-coordination-blocked", group["action_reasons"]
+        )
+
     def test_cleanup_candidate_remote_secured_ready_is_hygiene(self) -> None:
         record = checkout(
             "cleanup-ready",
@@ -763,7 +788,7 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertEqual(attached[0]["binding_status"], "ambiguous")
         self.assertEqual(set(attached[0]["related_work_ids"]), {"task:taska", "task:taskb"})
 
-    def test_managed_active_checkout_with_retention_is_active(self) -> None:
+    def test_managed_active_checkout_with_retention_only_is_hygiene(self) -> None:
         owner = "operator:managed-active"
         result = project(
             checkout_payloads=[
@@ -784,7 +809,8 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         )
         group = result["work"][0]
         self.assertEqual(group["work_id"], f"operation:{owner}")
-        self.assertEqual(group["projection_state"], "active")
+        self.assertEqual(group["projection_state"], "hygiene")
+        self.assertEqual(group["work_class"], "hygiene")
         binding_ref = next(
             ref for ref in group["authority_refs"]
             if ref["source"] == "checkout-lifecycle-binding"
@@ -855,7 +881,7 @@ class CurrentWorkProjectionTests(unittest.TestCase):
             "monitor active work execution and reconcile managed active lifecycle attention",
         )
 
-    def test_managed_active_mixed_stale_and_live_checkout_remains_operational(self) -> None:
+    def test_managed_active_mixed_stale_and_retained_checkout_is_hygiene(self) -> None:
         owner = "operator:managed-mixed"
         stale = checkout(
             "managed-stale",
@@ -881,15 +907,11 @@ class CurrentWorkProjectionTests(unittest.TestCase):
                     ]
                 )
                 group = result["work"][0]
-                self.assertEqual(group["projection_state"], "active")
-                self.assertEqual(group["work_class"], "operational")
+                self.assertEqual(group["projection_state"], "hygiene")
+                self.assertEqual(group["work_class"], "hygiene")
                 self.assertTrue(group["action_required"])
                 self.assertIn(
                     "managed-active-lifecycle-attention", group["action_reasons"]
-                )
-                self.assertEqual(
-                    group["next_convergence_action"],
-                    "monitor active work execution and reconcile managed active lifecycle attention",
                 )
 
     def test_dirty_and_retained_active_group_work_class_is_order_independent(self) -> None:
@@ -919,8 +941,8 @@ class CurrentWorkProjectionTests(unittest.TestCase):
                     ]
                 )
                 group = result["work"][0]
-                self.assertEqual(group["projection_state"], "active")
-                self.assertEqual(group["work_class"], "operational")
+                self.assertEqual(group["projection_state"], "hygiene")
+                self.assertEqual(group["work_class"], "hygiene")
                 self.assertTrue(group["action_required"])
                 self.assertIn("dirty-checkout-visible", group["action_reasons"])
                 self.assertIn(

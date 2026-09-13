@@ -1699,7 +1699,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         )
         with mock.patch.object(workspace.operator, "_require_operator_mutation"):
             with self.assertRaisesRegex(
-                workspace.AgentWorkspaceError, "owned exclusively by Work Lane closeout"
+                workspace.AgentWorkspaceError, "requires a valid terminal Work Lane closeout"
             ):
                 workspace.grabowski_agent_workspace_cleanup(
                     manifest["workspace_id"],
@@ -1708,7 +1708,7 @@ class AgentWorkspaceTests(unittest.TestCase):
                 )
         self.assertTrue(self.git.writer.exists())
 
-    def test_lane_backed_complete_close_survives_later_lane_terminalization(self) -> None:
+    def test_lane_backed_complete_close_becomes_archive_eligible_after_valid_lane_terminalization(self) -> None:
         lane = self.lane_receipt()
         manifest = self.lane_manifest(lane)
         owner_id = f"lane:{lane['lane_id']}"
@@ -1741,14 +1741,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             workspace._close_integrity_status(manifest, close_receipt)["valid"]
         )
 
-        with workspace.work_acquire._lane_lock(lane["lane_id"]) as path:
-            terminal_lane = workspace.work_acquire._read_state(path)
-            terminal_lane["state"] = "closed"
-            terminal_lane["terminal_closeout"] = {"state": "complete"}
-            workspace.work_acquire._write_state(path, terminal_lane)
-        workspace.resources.release_resources(
-            owner_id, lane["inputs"]["resource_keys"]
-        )
+        terminal_lane = self.terminalize_lane_no_change(lane, manifest)
 
         with (
             mock.patch.object(workspace, "_git_snapshot", return_value={"dirty": False}),
@@ -1760,9 +1753,19 @@ class AgentWorkspaceTests(unittest.TestCase):
             mock.patch.object(workspace, "_tmux_has_session", return_value=False),
         ):
             status = workspace._status_data(workspace._manifest(manifest["workspace_id"]))
-            cleanup_plan = workspace._workspace_cleanup_plan_data(
-                workspace._manifest(manifest["workspace_id"])
-            )
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=False),
+            mock.patch.object(workspace.checkouts, "_processes_under", return_value=[]),
+            mock.patch.object(
+                workspace,
+                "_workspace_cleanup_task_public",
+                return_value={"state": "completed", "terminal": True},
+            ),
+        ):
+            cleanup_plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
 
         self.assertFalse(status["lane_binding_status"]["valid"])
         self.assertFalse(status["creation_ready"])
@@ -1771,25 +1774,125 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertFalse(status["closeable"])
         self.assertFalse(status["success_ready"])
         self.assertTrue(cleanup_plan["closed"])
-        self.assertEqual(cleanup_plan["lifecycle_state"], "lane_owned_preserved")
-        self.assertFalse(cleanup_plan["eligible"])
-        self.assertIn(
+        self.assertEqual(cleanup_plan["lifecycle_state"], "archive_eligible")
+        self.assertTrue(cleanup_plan["eligible"], cleanup_plan)
+        self.assertTrue(cleanup_plan["archive_eligible"])
+        self.assertNotIn(
             "lane_owned_checkout_preserved",
             {item["code"] for item in cleanup_plan["blockers"]},
         )
+        terminal_evidence = cleanup_plan["stale_reconciliation"][
+            "terminal_lane_reconciliation"
+        ]
+        self.assertTrue(terminal_evidence["valid"], terminal_evidence)
+        self.assertEqual(
+            terminal_evidence["terminal_receipt_sha256"],
+            terminal_lane["receipt_sha256"],
+        )
+        self.assertEqual(terminal_evidence["live_owner_lease_count"], 0)
         with mock.patch.object(workspace.operator, "_require_operator_mutation"):
             with self.assertRaisesRegex(
                 workspace.AgentWorkspaceError, "work lane binding is not live and exact"
             ):
                 workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
-            with self.assertRaisesRegex(
-                workspace.AgentWorkspaceError, "owned exclusively by Work Lane closeout"
-            ):
-                workspace.grabowski_agent_workspace_cleanup(
-                    manifest["workspace_id"],
-                    cleanup_plan["plan_sha256"],
-                    confirmation="archive-and-remove-worktree",
-                )
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=False),
+            mock.patch.object(
+                workspace.checkouts.operator, "_safe_environment", return_value=os.environ.copy()
+            ),
+            mock.patch.object(workspace.checkouts.base, "_append_audit"),
+            mock.patch.object(workspace.checkouts, "_processes_under", return_value=[]),
+            mock.patch.object(
+                workspace,
+                "_workspace_cleanup_task_public",
+                return_value={"state": "completed", "terminal": True},
+            ),
+        ):
+            archived = workspace.grabowski_agent_workspace_cleanup(
+                manifest["workspace_id"],
+                cleanup_plan["plan_sha256"],
+                confirmation="archive-and-remove-worktree",
+            )
+        self.assertEqual(archived["state"], "archived_waiting_for_cleanup")
+        self.assertTrue(archived["requires_fresh_cleanup_plan"])
+        self.assertTrue(self.git.writer.exists())
+
+    def test_terminal_lane_missing_checkout_is_historical_not_operationally_owned(self) -> None:
+        lane = self.lane_receipt(idempotency_key="terminal-lane-missing-checkout")
+        manifest = self.lane_manifest(lane)
+        owner_id = f"lane:{lane['lane_id']}"
+        close_receipt = signed_receipt(
+            {
+                "schema_version": 1,
+                "workspace_id": manifest["workspace_id"],
+                "state": "complete",
+                "closure_outcome": "successful",
+                "resources_released": False,
+                "lane_resources_preserved": True,
+                "workspace_resources_owned": False,
+                "released_resource_keys": [],
+                "remaining_resource_keys": sorted(lane["inputs"]["resource_keys"]),
+                "checkout_lifecycle_decision": {
+                    "selected_action": "preserve_lane_owned",
+                    "ownership_satisfied": True,
+                    "owner_id": owner_id,
+                },
+            }
+        )
+        manifest["close_receipt"] = close_receipt
+        workspace._atomic_json(
+            workspace._workspace_dir(manifest["workspace_id"])
+            / "close-receipt.json",
+            close_receipt,
+        )
+        workspace._write_manifest(manifest)
+        self.terminalize_lane_no_change(lane, manifest)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.git.repo),
+                "worktree",
+                "remove",
+                "--force",
+                str(self.git.writer),
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertFalse(self.git.writer.exists())
+
+        with (
+            mock.patch.object(
+                workspace,
+                "_task_public",
+                return_value={"state": "completed", "terminal": True},
+            ),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=False),
+        ):
+            cleanup_plan = workspace._workspace_cleanup_plan_data(
+                workspace._manifest(manifest["workspace_id"])
+            )
+
+        self.assertTrue(cleanup_plan["closed"])
+        self.assertTrue(cleanup_plan["already_absent"], cleanup_plan)
+        self.assertFalse(cleanup_plan["eligible"])
+        self.assertEqual(
+            cleanup_plan["lifecycle_state"], "terminal_lane_historical_absent"
+        )
+        self.assertNotIn(
+            "lane_owned_checkout_preserved",
+            {item["code"] for item in cleanup_plan["blockers"]},
+        )
+        self.assertTrue(
+            cleanup_plan["stale_reconciliation"]["terminal_lane_reconciliation"][
+                "valid"
+            ]
+        )
 
 
     def test_stale_lane_backed_workspace_accepts_exact_terminal_lane_preimage(self) -> None:

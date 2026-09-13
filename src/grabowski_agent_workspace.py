@@ -11075,6 +11075,11 @@ def _workspace_cleanup_plan_data(
         )
     )
     stale_reconciliation = _stale_workspace_reconciliation_plan(manifest, liveness)
+    terminal_lane_cleanup_reconciliation = (
+        stale_reconciliation.get("terminal_lane_reconciliation")
+        if fully_closed and _lane_backed(manifest)
+        else {"required": False, "valid": True}
+    )
     blockers: list[dict[str, Any]] = []
     cleanup_receipt = manifest.get("workspace_cleanup_receipt")
     cleanup_intent = manifest.get("workspace_cleanup_intent")
@@ -11104,13 +11109,18 @@ def _workspace_cleanup_plan_data(
         blockers.append({"code": "workspace_not_closed"})
     elif not _resource_close_contract_satisfied(manifest, close_receipt):
         blockers.append({"code": "workspace_resource_close_contract_unsatisfied"})
-    if fully_closed and _lane_backed(manifest):
+    if (
+        fully_closed
+        and _lane_backed(manifest)
+        and terminal_lane_cleanup_reconciliation.get("valid") is not True
+    ):
         blockers.append(
             {
                 "code": "lane_owned_checkout_preserved",
                 "lane_id": manifest.get("resources", {})
                 .get("lane_binding", {})
                 .get("lane_id"),
+                "error": terminal_lane_cleanup_reconciliation.get("error"),
             }
         )
     if fully_closed:
@@ -11436,7 +11446,11 @@ def _workspace_cleanup_plan_data(
     cleanup_intent_state = (
         cleanup_intent.get("state") if isinstance(cleanup_intent, dict) else None
     )
-    if fully_closed and _lane_backed(manifest):
+    if (
+        fully_closed
+        and _lane_backed(manifest)
+        and terminal_lane_cleanup_reconciliation.get("valid") is not True
+    ):
         lifecycle_state = "lane_owned_preserved"
     elif cleanup_receipt_valid:
         lifecycle_state = "cleaned"
@@ -11446,6 +11460,13 @@ def _workspace_cleanup_plan_data(
         lifecycle_state = "cleanup_outcome_unknown"
     elif cleanup_intent_state == "recovery_required":
         lifecycle_state = "cleanup_recovery_required"
+    elif (
+        fully_closed
+        and _lane_backed(manifest)
+        and terminal_lane_cleanup_reconciliation.get("valid") is True
+        and not checkout_state["exists"]
+    ):
+        lifecycle_state = "terminal_lane_historical_absent"
     else:
         lifecycle_state = "archive_eligible"
     archive_eligible = bool(base_eligible and lifecycle_state == "archive_eligible")
@@ -11460,6 +11481,7 @@ def _workspace_cleanup_plan_data(
         "archive_state_unverified": "verify-archive-state",
         "cleaned": "none",
         "lane_owned_preserved": "none",
+        "terminal_lane_historical_absent": "none",
     }.get(lifecycle_state, "reconcile-cleanup-state")
     body = {
         "schema_version": 1,
@@ -12461,6 +12483,21 @@ def _workspace_lifecycle_classification(
             ]
         except Exception as exc:
             lease_read_error = _error_summary(exc)
+    lifecycle_expected_owner_id = _workspace_cleanup_owner(identifier)
+    if _lane_backed(manifest):
+        terminal_lane = _terminal_lane_reconciliation_binding(manifest)
+        if terminal_lane.get("valid") is True:
+            expected_lane_owner_id = f"lane:{terminal_lane['lane_id']}"
+            manifest_owner_id = (
+                resource_values.get("owner_id")
+                if isinstance(resource_values, dict)
+                else None
+            )
+            if manifest_owner_id != expected_lane_owner_id:
+                raise AgentWorkspaceError(
+                    "terminal lane workspace owner does not match exact lane identity"
+                )
+            lifecycle_expected_owner_id = expected_lane_owner_id
     sources = {
         "task": lifecycle_collectors.SourceReadback(
             observed=True,
@@ -12504,7 +12541,7 @@ def _workspace_lifecycle_classification(
             observed_at_unix=observed_at_unix,
             sources=sources,
             exact_resource_keys=exact_resource_keys,
-            expected_owner_id=_workspace_cleanup_owner(identifier),
+            expected_owner_id=lifecycle_expected_owner_id,
             checkout_path=str(manifest["writer_worktree"]),
             process_scope=str(manifest["writer_worktree"]),
         )
@@ -13077,9 +13114,23 @@ def grabowski_agent_workspace_cleanup(
     with _lock(identifier):
         manifest = _manifest(identifier)
         if _lane_backed(manifest):
-            raise AgentWorkspaceError(
-                "lane-backed workspace cleanup is owned exclusively by Work Lane closeout"
+            terminal_lane = _terminal_lane_reconciliation_binding(manifest)
+            if terminal_lane.get("valid") is not True:
+                raise AgentWorkspaceError(
+                    "lane-backed workspace cleanup requires a valid terminal Work Lane closeout"
+                )
+            resources_value = manifest.get("resources")
+            lane_owner = (
+                resources_value.get("owner_id")
+                if isinstance(resources_value, dict)
+                else None
             )
+            expected_lane_owner = f"lane:{terminal_lane['lane_id']}"
+            if lane_owner != expected_lane_owner:
+                raise AgentWorkspaceError(
+                    "lane-backed workspace cleanup owner does not match exact lane identity"
+                )
+            owner = lane_owner
         existing_receipt = manifest.get("workspace_cleanup_receipt")
         cleanup_integrity = _workspace_cleanup_integrity_status(
             manifest, existing_receipt
