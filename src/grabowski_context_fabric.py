@@ -200,6 +200,58 @@ PROFILES: dict[str, dict[str, Any]] = {
     },
 }
 
+HISTORICAL_RECALL_POLICY: dict[str, Any] = {
+    "recommended_tool": "grabowski_operator_historical_recall",
+    "provider_source_tool": "grabowski_chronik_history",
+    "requirement": "conditional",
+    "mode": "selective_advisory",
+    "skip_for": (
+        "trivial_read",
+        "status_only_without_repeat_signal",
+        "one_off_discovery_without_repeat_signal",
+    ),
+    "requirements": (
+        "fresh_live_authority_first",
+        "history_must_be_evidence_bound",
+        "returned_historical_context_must_match_current_target",
+        "unmatched_or_unbound_history_must_be_discarded",
+        "fresh_owning_authority_must_be_rechecked_before_effect",
+    ),
+    "does_not_establish": (
+        "current_truth",
+        "safe_retry",
+        "routing_authority",
+        "policy_authority",
+        "merge_readiness",
+        "deployment_authorization",
+        "bureau_publication_authority",
+        "task_completion",
+    ),
+    "profiles": {
+        "pr": {
+            "read_when": (
+                "re_reviewing_or_retrying_bound_pr",
+                "repeated_check_or_review_failure",
+                "repeated_review_or_merge_method_precedent_signal",
+            ),
+        },
+        "bureau": {
+            "read_when": (
+                "recovery_or_retry_of_bound_run",
+                "repeated_lifecycle_failure",
+                "same_goal_has_prior_attempts",
+            ),
+        },
+        "deployment": {
+            "read_when": (
+                "repeat_deploy_or_runtime_verify",
+                "recovery_or_rollback_planning",
+                "repeated_runtime_failure",
+            ),
+        },
+    },
+}
+
 SOURCES: dict[str, dict[str, Any]] = {
     "grabowski_github_pr_view": {
         "authority": "github_pull_request_registry",
@@ -877,6 +929,25 @@ def plan_context(profile: Any, binding: Any = None) -> dict[str, Any]:
         }
         for name in (*definition["required_sources"], *definition["optional_sources"])
     ]
+    recall_profile = HISTORICAL_RECALL_POLICY["profiles"][profile_name]
+    historical_recall = {
+        "recommended_tool": HISTORICAL_RECALL_POLICY["recommended_tool"],
+        "provider_source_tool": HISTORICAL_RECALL_POLICY["provider_source_tool"],
+        "requirement": HISTORICAL_RECALL_POLICY["requirement"],
+        "mode": HISTORICAL_RECALL_POLICY["mode"],
+        "read_when": list(recall_profile["read_when"]),
+        "skip_for": list(HISTORICAL_RECALL_POLICY["skip_for"]),
+        "requirements": list(HISTORICAL_RECALL_POLICY["requirements"]),
+        "target_selection": {
+            "binding": normalized,
+            "binding_complete": not missing,
+            "read_eligible": not missing,
+            "filter_binding": "use_available_exact_filters_then_confirm_returned_historical_context",
+            "unmatched_history": "discard",
+        },
+        "history_may_replace_required_live_authority": False,
+        "does_not_establish": list(HISTORICAL_RECALL_POLICY["does_not_establish"]),
+    }
     return {
         "schema_version": SCHEMA_VERSION,
         "kind": PLAN_KIND,
@@ -894,6 +965,7 @@ def plan_context(profile: Any, binding: Any = None) -> dict[str, Any]:
         "binding_complete": not missing,
         "ready": not missing,
         "sources": source_plan,
+        "historical_recall": historical_recall,
         "freshness_bands": {
             "fresh_seconds": definition["fresh_seconds"],
             "aging_seconds": definition["aging_seconds"],
