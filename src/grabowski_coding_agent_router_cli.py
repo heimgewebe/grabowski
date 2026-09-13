@@ -351,6 +351,16 @@ def _grok_subscription_auth_status(
             metadata.st_ctime_ns,
         )
 
+    def directory_identity(metadata: os.stat_result) -> tuple[int, ...]:
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_uid,
+            metadata.st_gid,
+            metadata.st_nlink,
+        )
+
     try:
         descriptors.append(os.open(str(base), directory_flags))
         home_metadata = os.fstat(descriptors[-1])
@@ -358,7 +368,9 @@ def _grok_subscription_auth_status(
             status["status"] = "unsafe-home"
             return status
         descriptors.append(os.open(".grok", directory_flags, dir_fd=descriptors[-1]))
-        grok_metadata = os.fstat(descriptors[-1])
+        home_fd = descriptors[-2]
+        grok_fd = descriptors[-1]
+        grok_metadata = os.fstat(grok_fd)
         if (
             not stat.S_ISDIR(grok_metadata.st_mode)
             or grok_metadata.st_uid != os.getuid()
@@ -391,7 +403,19 @@ def _grok_subscription_auth_status(
         if identity(before) != identity(after) or len(raw) != before.st_size:
             status["status"] = "changed-during-read"
             return status
-        auth_file_identity = router._grok_auth_metadata_identity(after)
+        grok_after = os.fstat(grok_fd)
+        linked_grok = os.stat(".grok", dir_fd=home_fd, follow_symlinks=False)
+        if (
+            directory_identity(grok_metadata) != directory_identity(grok_after)
+            or directory_identity(grok_after) != directory_identity(linked_grok)
+            or router._grok_auth_directory_metadata_marker(grok_after) is None
+        ):
+            status["status"] = "changed-during-read"
+            return status
+        auth_file_identity = router._grok_auth_storage_metadata_identity(
+            grok_after,
+            after,
+        )
         if auth_file_identity is None:
             status["status"] = "unsafe-file"
             return status

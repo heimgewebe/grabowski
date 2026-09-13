@@ -239,6 +239,21 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         auth.chmod(0o644)
         self.assertIsNone(router._grok_auth_file_identity(home=home))
 
+        auth.chmod(0o600)
+        grok.chmod(0o770)
+        self.assertIsNone(router._grok_auth_file_identity(home=home))
+
+        grok.chmod(0o700)
+        safe_directory = home / ".grok.safe"
+        grok.replace(safe_directory)
+        grok.symlink_to(safe_directory, target_is_directory=True)
+        self.assertIsNone(router._grok_auth_file_identity(home=home))
+
+        grok.unlink()
+        safe_directory.replace(grok)
+        rebound = router._grok_auth_file_identity(home=home)
+        self.assertRegex(rebound or "", r"^[0-9a-f]{64}$")
+
     def test_grok_subscription_auth_requires_exact_private_oidc_tier(self) -> None:
         catalog, _ = router._load_catalog()
         valid_home = self._grok_auth_home()
@@ -289,6 +304,15 @@ class CodingAgentRouterCliTests(unittest.TestCase):
             now_unix=1_100,
         )
         self.assertEqual(unsafe["status"], "unsafe-file")
+
+        unsafe_directory_home = self._grok_auth_home()
+        (unsafe_directory_home / ".grok").chmod(0o770)
+        unsafe_directory = cli._grok_subscription_auth_status(
+            catalog,
+            home=unsafe_directory_home,
+            now_unix=1_100,
+        )
+        self.assertEqual(unsafe_directory["status"], "unsafe-directory")
 
         ambiguous = cli._grok_subscription_auth_status(
             catalog,

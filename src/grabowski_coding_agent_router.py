@@ -1007,6 +1007,27 @@ def _grok_missing_auth_file_identity() -> str:
     return _grok_auth_identity_sha256({"state": "missing"})
 
 
+def _grok_auth_directory_metadata_marker(
+    metadata: os.stat_result,
+) -> dict[str, int] | None:
+    safe = (
+        stat.S_ISDIR(metadata.st_mode)
+        and metadata.st_uid == os.getuid()
+        and metadata.st_nlink >= 1
+        and stat.S_IMODE(metadata.st_mode) & 0o022 == 0
+    )
+    if not safe:
+        return None
+    return {
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "mode": stat.S_IMODE(metadata.st_mode),
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "nlink": metadata.st_nlink,
+    }
+
+
 def _grok_auth_metadata_identity(metadata: os.stat_result) -> str | None:
     safe = (
         stat.S_ISREG(metadata.st_mode)
@@ -1031,16 +1052,83 @@ def _grok_auth_metadata_identity(metadata: os.stat_result) -> str | None:
     )
 
 
+def _grok_auth_storage_metadata_identity(
+    directory_metadata: os.stat_result,
+    auth_metadata: os.stat_result,
+) -> str | None:
+    directory_marker = _grok_auth_directory_metadata_marker(directory_metadata)
+    if directory_marker is None:
+        return None
+    auth_identity = _grok_auth_metadata_identity(auth_metadata)
+    if auth_identity is None:
+        return None
+    return _grok_auth_identity_sha256(
+        {
+            "state": "present",
+            "directory": directory_marker,
+            "auth_file_identity_sha256": auth_identity,
+        }
+    )
+
+
 def _grok_auth_file_identity(*, home: Path | None = None) -> str | None:
-    """Bind readiness to safe non-secret auth-file identity metadata."""
-    path = (home or Path.home()) / ".grok" / "auth.json"
+    """Bind readiness to safe non-secret auth path identity metadata."""
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        return None
+    base = home or Path.home()
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptors: list[int] = []
+
+    def directory_identity(metadata: os.stat_result) -> tuple[int, ...]:
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_uid,
+            metadata.st_gid,
+            metadata.st_nlink,
+        )
+
     try:
-        metadata = path.lstat()
+        descriptors.append(os.open(str(base), directory_flags))
+        home_metadata = os.fstat(descriptors[-1])
+        if not stat.S_ISDIR(home_metadata.st_mode) or home_metadata.st_uid != os.getuid():
+            return None
+        home_fd = descriptors[-1]
+        descriptors.append(os.open(".grok", directory_flags, dir_fd=home_fd))
+        grok_fd = descriptors[-1]
+        grok_before = os.fstat(grok_fd)
+        if _grok_auth_directory_metadata_marker(grok_before) is None:
+            return None
+        try:
+            descriptors.append(os.open("auth.json", file_flags, dir_fd=grok_fd))
+        except FileNotFoundError:
+            grok_after = os.fstat(grok_fd)
+            linked_grok = os.stat(".grok", dir_fd=home_fd, follow_symlinks=False)
+            if (
+                directory_identity(grok_before) != directory_identity(grok_after)
+                or directory_identity(grok_after) != directory_identity(linked_grok)
+                or _grok_auth_directory_metadata_marker(grok_after) is None
+            ):
+                return None
+            return _grok_missing_auth_file_identity()
+        auth_metadata = os.fstat(descriptors[-1])
+        grok_after = os.fstat(grok_fd)
+        linked_grok = os.stat(".grok", dir_fd=home_fd, follow_symlinks=False)
+        if (
+            directory_identity(grok_before) != directory_identity(grok_after)
+            or directory_identity(grok_after) != directory_identity(linked_grok)
+        ):
+            return None
+        return _grok_auth_storage_metadata_identity(grok_after, auth_metadata)
     except FileNotFoundError:
         return _grok_missing_auth_file_identity()
     except OSError:
         return None
-    return _grok_auth_metadata_identity(metadata)
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
 
 
 def _state_catalog_fresh(state: dict[str, Any]) -> bool:
