@@ -2009,6 +2009,197 @@ def select_contrast_routes(
     }
 
 
+def _route_prefix_matches_command(argv: list[str], prefix: Any) -> bool:
+    if (
+        not isinstance(prefix, list)
+        or not prefix
+        or any(not isinstance(item, str) or not item for item in prefix)
+        or len(argv) < len(prefix)
+    ):
+        return False
+    if Path(argv[0]).name.lower() != Path(prefix[0]).name.lower():
+        return False
+    return argv[1 : len(prefix)] == prefix[1:]
+
+
+def _pre_dispatch_admission_receipt(material: dict[str, Any]) -> dict[str, Any]:
+    return {**material, "admission_sha256": _canonical_sha256(material)}
+
+
+def coding_agent_pre_dispatch_admission(argv: list[str]) -> dict[str, Any]:
+    """Revalidate one catalogued coding-agent command immediately before release.
+
+    This observation-only gate narrows route-to-launch TOCTOU. It deliberately
+    does not reserve provider capacity or prove that this command was routed.
+    """
+    if (
+        not isinstance(argv, list)
+        or not argv
+        or any(not isinstance(item, str) or not item for item in argv)
+    ):
+        raise CodingAgentRouterError("coding-agent admission argv is invalid")
+
+    catalog, validation = _load_catalog()
+    base = {
+        "schema_version": 1,
+        "kind": "coding_agent_pre_dispatch_admission",
+        "policy_scope": "hard_execution_gates_only",
+        "argv_sha256": _canonical_sha256(argv),
+        "catalog_sha256": validation["catalog_sha256"],
+        "reservation": {
+            "status": "not_reserved",
+            "atomic": False,
+            "scope": "observation_only",
+        },
+        "does_not_establish": [
+            "atomic_capacity_reservation",
+            "future_capacity_after_observation",
+            "race_free_dispatch",
+            "prior_route_selection",
+            "provider_quota_exactness",
+            "reserve_floor_policy_revalidation",
+        ],
+    }
+    matched = [
+        route
+        for route in catalog["routes"]
+        if route.get("controller") is not True
+        and _route_prefix_matches_command(argv, route.get("argv_prefix"))
+    ]
+    if not matched:
+        return _pre_dispatch_admission_receipt(
+            {
+                **base,
+                "applicable": False,
+                "admitted": True,
+                "reason_code": "no_catalog_route_match",
+                "matched_route_ids": [],
+                "quota_pools": [],
+                "physical_occupancy_status": "not_observed",
+            }
+        )
+
+    enabled = [route for route in matched if route.get("enabled") is True]
+    if not enabled:
+        return _pre_dispatch_admission_receipt(
+            {
+                **base,
+                "applicable": True,
+                "admitted": False,
+                "reason_code": "matched_routes_disabled",
+                "matched_route_ids": sorted(route["id"] for route in matched),
+                "quota_pools": [],
+                "physical_occupancy_status": "not_observed",
+            }
+        )
+
+    capacity_contracts: dict[str, dict[str, Any]] = {}
+    for route in enabled:
+        contract = {
+            "harness": route["harness"],
+            "model": route["model"],
+            "quota_pools": _route_quota_pools(route, catalog),
+        }
+        capacity_contracts.setdefault(_canonical_sha256(contract), contract)
+    enabled_ids = sorted(route["id"] for route in enabled)
+    if len(capacity_contracts) != 1:
+        return _pre_dispatch_admission_receipt(
+            {
+                **base,
+                "applicable": True,
+                "admitted": False,
+                "reason_code": "ambiguous_capacity_contract",
+                "matched_route_ids": enabled_ids,
+                "quota_pools": [],
+                "physical_occupancy_status": "not_observed",
+            }
+        )
+
+    capacity_contract = next(iter(capacity_contracts.values()))
+    state, state_status, state_error_type = _current_contrast_state(catalog, validation)
+    if state is None:
+        return _pre_dispatch_admission_receipt(
+            {
+                **base,
+                "applicable": True,
+                "admitted": False,
+                "reason_code": "router_state_not_current",
+                "matched_route_ids": enabled_ids,
+                "capacity_contract": capacity_contract,
+                "quota_pools": [],
+                "router_state_status": state_status,
+                "state_error_type": state_error_type,
+                "physical_occupancy_status": "not_observed",
+            }
+        )
+
+    physical = _physical_pool_occupancy()
+    runtime_state = {**state, "_physical_pool_occupancy": physical}
+    route_unavailability: list[dict[str, str]] = []
+    for route in enabled:
+        available, reason = _route_available(route, catalog, runtime_state)
+        if not available:
+            route_unavailability.append({"route_id": route["id"], "reason": reason})
+    if route_unavailability:
+        return _pre_dispatch_admission_receipt(
+            {
+                **base,
+                "applicable": True,
+                "admitted": False,
+                "reason_code": "route_unavailable",
+                "matched_route_ids": enabled_ids,
+                "capacity_contract": capacity_contract,
+                "route_unavailability": route_unavailability,
+                "quota_pools": [],
+                "router_state_status": state_status,
+                "state_error_type": state_error_type,
+                "physical_occupancy_status": physical.get("status"),
+                "physical_observed_at_unix": physical.get("observed_at_unix"),
+            }
+        )
+
+    pool_evidence: list[dict[str, Any]] = []
+    blocked = False
+    for pool_id in capacity_contract["quota_pools"]:
+        allowed, reasons, scarcity, execution_eligible = _pool_gate(
+            pool_id, catalog, runtime_state, critical=True
+        )
+        effective = _effective_pool(pool_id, catalog, runtime_state)
+        pool_evidence.append(
+            {
+                "pool_id": pool_id,
+                "allowed": allowed,
+                "reasons": reasons,
+                "scarcity": scarcity,
+                "execution_eligible": execution_eligible,
+                "max_concurrency": effective.get("max_concurrency"),
+                "state_active_sessions": effective.get("state_active_sessions"),
+                "observed_physical_sessions": effective.get("observed_physical_sessions"),
+                "physical_lifecycle_sessions": effective.get("physical_lifecycle_sessions"),
+                "active_sessions": effective.get("active_sessions"),
+                "active_sessions_source": effective.get("active_sessions_source"),
+                "state_error": effective.get("_state_error"),
+            }
+        )
+        blocked = blocked or not allowed or not execution_eligible
+
+    return _pre_dispatch_admission_receipt(
+        {
+            **base,
+            "applicable": True,
+            "admitted": not blocked,
+            "reason_code": "quota_pool_blocked" if blocked else "admitted",
+            "matched_route_ids": enabled_ids,
+            "capacity_contract": capacity_contract,
+            "quota_pools": pool_evidence,
+            "router_state_status": state_status,
+            "state_error_type": state_error_type,
+            "physical_occupancy_status": physical.get("status"),
+            "physical_observed_at_unix": physical.get("observed_at_unix"),
+        }
+    )
+
+
 def _advisory_route_execution_contract(
     route_id: str,
     *,
