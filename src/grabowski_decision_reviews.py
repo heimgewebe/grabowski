@@ -272,6 +272,16 @@ def _validated_origin_binding(directory: Path) -> tuple[dict[str, Any], dict[str
     provenance = _normalize_review_role_provenance(
         scope.get("decision_review_provenance"), binding, cwd=origin_cwd
     )
+    if provenance is None:
+        exact_argv = metadata.get("argv")
+        if (
+            isinstance(exact_argv, list)
+            and all(isinstance(item, str) for item in exact_argv)
+            and sha256_json(exact_argv) == origin.get("argv_sha256")
+        ):
+            provenance = review_role_provenance(
+                exact_argv, binding, cwd=Path(origin_cwd)
+            )
     return metadata, binding, provenance
 
 

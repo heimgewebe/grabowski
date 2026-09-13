@@ -64,6 +64,8 @@ def make_job(
     review_result: dict | None,
     diff_sha256: str = DIFF,
     review_role: bool = False,
+    origin_provenance: bool = True,
+    metadata_argv_override: list[str] | None = None,
 ) -> Path:
     unit = f"grabowski-job-{suffix}"
     directory = jobs / unit
@@ -115,7 +117,7 @@ def make_job(
         "runtime_seconds": 60,
         "decision_bound_review": normalized_binding,
     }
-    if review_role:
+    if review_role and origin_provenance:
         provenance = reviews.review_role_provenance(
             job_argv, normalized_binding, cwd=Path("/tmp/review")
         )
@@ -156,7 +158,7 @@ def make_job(
         "scope": scope,
         "origin": origin,
         "origin_sha256": origin_sha,
-        "argv": job_argv,
+        "argv": job_argv if metadata_argv_override is None else metadata_argv_override,
         "argv_sha256": argv_sha,
         "cwd": "/tmp/review",
         "created_at_unix": 1_787_000_000,
@@ -277,6 +279,41 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
         self.assertTrue(attempt["independence_verified"])
         self.assertEqual(attempt["review_route_id"], "claude-opus-5-high")
         self.assertEqual(attempt["review_provider_family"], "anthropic")
+
+    def test_exact_origin_bound_argv_bootstraps_reviewer_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp)
+            make_job(
+                jobs,
+                suffix="a00000000024",
+                slot="independent-reviewer",
+                terminal_status="succeeded",
+                review_result=None,
+                review_role=True,
+                origin_provenance=False,
+            )
+            reconciled = self.reconcile(jobs)
+        self.assertEqual(reconciled["status"], "settled")
+        self.assertEqual(reconciled["slots"][0]["independent_pass_count"], 1)
+        self.assertTrue(reconciled["attempts"][0]["independence_verified"])
+
+    def test_redacted_or_changed_metadata_argv_cannot_bootstrap_independence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp)
+            make_job(
+                jobs,
+                suffix="a00000000025",
+                slot="independent-reviewer",
+                terminal_status="succeeded",
+                review_result=None,
+                review_role=True,
+                origin_provenance=False,
+                metadata_argv_override=["python3", "-m", reviews.REVIEW_ROLE_MODULE, "<REDACTED>"],
+            )
+            reconciled = self.reconcile(jobs)
+        self.assertEqual(reconciled["status"], "blocked")
+        self.assertEqual(reconciled["slots"][0]["independent_pass_count"], 0)
+        self.assertIn("decision_review_slot_without_pass:independent-reviewer", reconciled["errors"])
 
     def test_preflight_can_defer_unproven_diff_identity_without_claiming_alias(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
