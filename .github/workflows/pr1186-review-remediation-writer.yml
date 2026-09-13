@@ -92,6 +92,15 @@ jobs:
               encoding="utf-8",
           )'''
           text = text[:cleanup_start] + cleanup_replacement + text[cleanup_end:]
+
+          assertion_start_marker = 'workspace_source = Path(WORKSPACE).read_text(encoding="utf-8")'
+          if text.count(assertion_start_marker) != 1:
+              raise SystemExit(f'workspace assertion marker count={text.count(assertion_start_marker)}')
+          assertion_start = text.index(assertion_start_marker)
+          assertion_replacement = '''workspace_source = Path(WORKSPACE).read_text(encoding="utf-8")
+          if workspace_source.count(workspace_call_new) != 1:
+              raise SystemExit("workspace archive call is not exactly identity-bound")'''
+          text = text[:assertion_start] + assertion_replacement + '\n'
           path.write_text(text, encoding='utf-8')
           PY
           python -m py_compile tools/pr1186_review_remediation.py
