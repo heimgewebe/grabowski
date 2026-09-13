@@ -309,6 +309,7 @@ def _grok_subscription_auth_status(
         "status": "missing",
         "subscription_tier": None,
         "account_binding_sha256": None,
+        "auth_file_identity_sha256": None,
     }
     contract = catalog.get("quota_pools", {}).get("grok-com", {}).get(
         "entitlement_contract"
@@ -347,6 +348,7 @@ def _grok_subscription_auth_status(
             metadata.st_nlink,
             metadata.st_size,
             metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
         )
 
     try:
@@ -389,6 +391,11 @@ def _grok_subscription_auth_status(
         if identity(before) != identity(after) or len(raw) != before.st_size:
             status["status"] = "changed-during-read"
             return status
+        auth_file_identity = router._grok_auth_metadata_identity(after)
+        if auth_file_identity is None:
+            status["status"] = "unsafe-file"
+            return status
+        status["auth_file_identity_sha256"] = auth_file_identity
         if len(raw) > MAX_GROK_AUTH_BYTES:
             status["status"] = "oversized"
             return status
@@ -487,8 +494,12 @@ def _grok_subscription_auth_status(
             }
         )
         return status
-    except OSError:
+    except FileNotFoundError:
         status["status"] = "missing"
+        status["auth_file_identity_sha256"] = router._grok_missing_auth_file_identity()
+        return status
+    except OSError:
+        status["status"] = "unreadable"
         return status
     finally:
         for descriptor in reversed(descriptors):
@@ -817,12 +828,16 @@ def _probe(catalog: dict[str, Any]) -> dict[str, Any]:
     )
     before_binding = grok_auth_before.get("account_binding_sha256")
     after_binding = grok_auth_after.get("account_binding_sha256")
+    before_auth_identity = grok_auth_before.get("auth_file_identity_sha256")
+    after_auth_identity = grok_auth_after.get("auth_file_identity_sha256")
     grok_logged_in = (
         grok_status.get("ok") is True
         and grok_auth_before.get("authenticated") is True
         and grok_auth_after.get("authenticated") is True
         and isinstance(before_binding, str)
         and before_binding == after_binding
+        and isinstance(before_auth_identity, str)
+        and isinstance(after_auth_identity, str)
     )
     grok_entitlement_verified = (
         grok_logged_in
@@ -843,7 +858,7 @@ def _probe(catalog: dict[str, Any]) -> dict[str, Any]:
             after_binding if grok_entitlement_verified else None
         ),
         "auth_status": grok_auth_after.get("status"),
-        "auth_file_identity_sha256": router._grok_auth_file_identity(),
+        "auth_file_identity_sha256": after_auth_identity,
         "models": grok_models,
     }
 

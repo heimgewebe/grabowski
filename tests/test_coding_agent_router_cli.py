@@ -241,9 +241,10 @@ class CodingAgentRouterCliTests(unittest.TestCase):
 
     def test_grok_subscription_auth_requires_exact_private_oidc_tier(self) -> None:
         catalog, _ = router._load_catalog()
+        valid_home = self._grok_auth_home()
         valid = cli._grok_subscription_auth_status(
             catalog,
-            home=self._grok_auth_home(),
+            home=valid_home,
             now_unix=1_100,
         )
         self.assertEqual(valid["status"], "valid")
@@ -251,6 +252,21 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         self.assertTrue(valid["entitlement_verified"])
         self.assertEqual(valid["subscription_tier"], "SuperGrok")
         self.assertRegex(valid["account_binding_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            valid["auth_file_identity_sha256"],
+            router._grok_auth_file_identity(home=valid_home),
+        )
+
+        missing_home = self.root / "grok-auth-missing-home"
+        missing_home.mkdir(mode=0o700)
+        missing = cli._grok_subscription_auth_status(
+            catalog, home=missing_home, now_unix=1_100
+        )
+        self.assertEqual(missing["status"], "missing")
+        self.assertEqual(
+            missing["auth_file_identity_sha256"],
+            router._grok_auth_file_identity(home=missing_home),
+        )
 
         wrong_tier = cli._grok_subscription_auth_status(
             catalog,
@@ -352,6 +368,7 @@ class CodingAgentRouterCliTests(unittest.TestCase):
             "status": "valid",
             "subscription_tier": "SuperGrok",
             "account_binding_sha256": "a" * 64,
+            "auth_file_identity_sha256": "c" * 64,
         }
 
         def metadata(_harnesses, harness, arguments, _catalog):
@@ -381,8 +398,12 @@ class CodingAgentRouterCliTests(unittest.TestCase):
                 return_value={"authenticated": False},
             ),
             mock.patch.object(cli, "_resolve_executable", return_value=None),
+            mock.patch.object(
+                router, "_grok_auth_file_identity", return_value="d" * 64
+            ) as live_auth_identity,
         ):
             verified = cli._probe(catalog)
+        live_auth_identity.assert_not_called()
         self.assertIn("grok-com", verified["verified_quota_pools"])
         self.assertTrue(verified["providers"]["grok"]["logged_in"])
         self.assertTrue(verified["providers"]["grok"]["entitlement_verified"])
@@ -391,7 +412,7 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         )
         self.assertEqual(
             verified["providers"]["grok"]["auth_file_identity_sha256"],
-            router._grok_auth_file_identity(),
+            "c" * 64,
         )
 
         changed = dict(auth)
