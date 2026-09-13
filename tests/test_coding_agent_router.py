@@ -1276,9 +1276,12 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertEqual(admission["reason_code"], "no_catalog_route_match")
         self.assertEqual(admission["physical_occupancy_status"], "not_observed")
 
-    def test_protected_physical_agent_consumes_provider_concurrency(self) -> None:
+    def test_protected_physical_agent_does_not_consume_provider_concurrency(self) -> None:
         state = self._fresh_state()
-        state["pools"]["claude-pro"] = {"active_sessions": 0}
+        state["pools"]["claude-pro"] = {
+            "active_sessions": 0,
+            "remaining_ratio": 1.0,
+        }
         state["_physical_pool_occupancy"] = {
             "status": "current",
             "tracked_provider_pools": sorted(
@@ -1292,9 +1295,40 @@ class CodingAgentRouterTests(unittest.TestCase):
         effective = router._effective_pool("claude-pro", self.catalog, state)
         self.assertEqual(effective["state_active_sessions"], 0)
         self.assertEqual(effective["observed_physical_sessions"], 1)
-        self.assertEqual(effective["active_sessions"], 1)
+        self.assertEqual(effective["physical_lifecycle_sessions"]["protected"], 1)
+        self.assertEqual(effective["active_sessions"], 0)
+        self.assertEqual(
+            effective["active_sessions_source"], "advisory-active-max-plus-unbound"
+        )
         allowed, reasons, _, execution = router._pool_gate(
             "claude-pro", self.catalog, state, critical=False
+        )
+        self.assertTrue(allowed)
+        self.assertTrue(execution)
+        self.assertNotIn("pool concurrency is saturated", reasons)
+
+    def test_active_and_unbound_physical_agents_still_consume_provider_concurrency(self) -> None:
+        state = self._fresh_state()
+        state["pools"]["openai-agentic"] = {
+            "active_sessions": 1,
+            "remaining_ratio": 1.0,
+        }
+        state["_physical_pool_occupancy"] = {
+            "status": "current",
+            "tracked_provider_pools": sorted(
+                current_work.PHYSICAL_CODING_AGENT_PROVIDER_POOLS
+            ),
+            "provider_pool_sessions": {"openai-agentic": 7},
+            "provider_pool_lifecycle_sessions": {
+                "openai-agentic": {"active": 2, "protected": 4, "unbound": 1}
+            },
+        }
+        effective = router._effective_pool("openai-agentic", self.catalog, state)
+        self.assertEqual(effective["state_active_sessions"], 1)
+        self.assertEqual(effective["observed_physical_sessions"], 7)
+        self.assertEqual(effective["active_sessions"], 3)
+        allowed, reasons, _, execution = router._pool_gate(
+            "openai-agentic", self.catalog, state, critical=False
         )
         self.assertFalse(allowed)
         self.assertFalse(execution)

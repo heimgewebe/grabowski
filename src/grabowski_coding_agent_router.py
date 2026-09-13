@@ -1139,15 +1139,11 @@ def _effective_pool(
                 }
             counts[lifecycle_state] = value
         observed_physical = sum(counts.values())
-        effective_active = (
-            max(active_sessions, counts["active"])
-            + counts["protected"]
-            + counts["unbound"]
-        )
+        effective_active = max(active_sessions, counts["active"]) + counts["unbound"]
         pool["observed_physical_sessions"] = observed_physical
         pool["physical_lifecycle_sessions"] = counts
         pool["active_sessions"] = effective_active
-        pool["active_sessions_source"] = "advisory-active-max-plus-protected-and-unbound"
+        pool["active_sessions_source"] = "advisory-active-max-plus-unbound"
     else:
         pool["active_sessions"] = active_sessions
         pool["active_sessions_source"] = "advisory-state-only"
