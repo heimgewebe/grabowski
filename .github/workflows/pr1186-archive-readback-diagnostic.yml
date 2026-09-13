@@ -1,0 +1,64 @@
+name: PR1186 archive uncertainty diagnostic
+
+on:
+  push:
+    branches:
+      - fix/terminal-lane-retention-archive-20260913
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Reproduce archive post-commit audit failure and print typed readback
+        shell: bash
+        run: |
+          set -eu
+          install -d -m 700 "$PWD/build"
+          test_home="$(mktemp -d "$PWD/build/test-home.XXXXXX")"
+          trap 'rm -rf "$test_home"' EXIT
+          install -d -m 700 "$test_home/.config/grabowski"
+          install -m 600 config/access.home-wide-operator.example.json "$test_home/.config/grabowski/access.json"
+          HOME="$test_home" PYTHONPATH=tests python - <<'PY'
+          import json
+          import time
+          from unittest.mock import patch
+          import test_checkouts
+
+          case = test_checkouts.CheckoutLifecycleTests(methodName="test_cleanup_requires_prior_dry_run_and_uses_plain_worktree_remove")
+          case.setUp()
+          try:
+              expected_identity = test_checkouts.checkouts.physical_checkout.capture_physical_checkout_identity(case.checkout)
+              def fail_archive_audit(record):
+                  if record.get("operation") == "checkout-archive":
+                      raise RuntimeError("simulated archive audit failure after durable archive")
+              with patch.object(test_checkouts.checkouts.base, "_append_audit", side_effect=fail_archive_audit):
+                  try:
+                      test_checkouts.checkouts.grabowski_checkout_archive(
+                          str(case.repo), str(case.checkout), "owner-a",
+                          "diagnostic archive", int(time.time()) + 3600,
+                          case.head, "topic", expected_physical_identity=expected_identity,
+                      )
+                  except RuntimeError as exc:
+                      print("ARCHIVE_EXCEPTION", repr(exc))
+              fences = test_checkouts.checkouts._active_checkout_operation_uncertainties()
+              print("FENCE_COUNT", len(fences))
+              if len(fences) != 1:
+                  raise SystemExit("expected exactly one archive uncertainty fence")
+              fence = fences[0]
+              print("FENCE", json.dumps(fence, sort_keys=True, default=str))
+              print("READBACK", json.dumps(test_checkouts.checkouts._archive_uncertainty_readback(fence), sort_keys=True, default=str))
+              archive = test_checkouts.checkouts._load_archive(fence["operation_id"])
+              print("ARCHIVE", json.dumps(archive, sort_keys=True, default=str))
+              lifecycle = test_checkouts.checkouts._lifecycle_bindings([fence["checkout_key"]]).get(fence["checkout_key"])
+              print("LIFECYCLE", json.dumps(lifecycle, sort_keys=True, default=str))
+          finally:
+              case.tearDown()
+          PY
