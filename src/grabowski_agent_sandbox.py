@@ -38,6 +38,7 @@ CLAUDE_SANDBOX_CONFIG_DIR = Path("/tmp/.claude")
 CODEX_PROFILE = "codex-cli-readonly-auth-v1"
 CODEX_SANDBOX_EXECUTABLE = Path("/opt/grabowski-external/codex")
 CODEX_SANDBOX_CONFIG_DIR = Path("/tmp/.codex")
+CODEX_SANDBOX_CODE_MODE_HOST = Path("/opt/grabowski-external/codex-code-mode-host")
 
 
 def _private_regular_file(path: Path, field: str) -> Path:
@@ -79,12 +80,22 @@ def prepare_external_agent_command(command: list[str]) -> PreparedSandboxCommand
             os.environ.get("GRABOWSKI_CODEX_AUTH_ROOT", str(Path.home() / ".codex"))
         ).expanduser()
         auth = _private_regular_file(auth_root / "auth.json", "Codex auth")
+        bindings: list[tuple[Path, Path]] = [
+            (executable, CODEX_SANDBOX_EXECUTABLE),
+            (auth, CODEX_SANDBOX_CONFIG_DIR / "auth.json"),
+        ]
+        code_mode_host = executable.parent / "codex-code-mode-host"
+        if code_mode_host.exists():
+            bindings.insert(
+                1,
+                (
+                    _resolved_executable(str(code_mode_host), "Codex code mode host"),
+                    CODEX_SANDBOX_CODE_MODE_HOST,
+                ),
+            )
         return PreparedSandboxCommand(
             command=(str(CODEX_SANDBOX_EXECUTABLE), *command[1:]),
-            extra_read_only=(
-                (executable, CODEX_SANDBOX_EXECUTABLE),
-                (auth, CODEX_SANDBOX_CONFIG_DIR / "auth.json"),
-            ),
+            extra_read_only=tuple(bindings),
             extra_directories=(
                 Path("/opt"),
                 Path("/opt/grabowski-external"),

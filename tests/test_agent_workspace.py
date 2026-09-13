@@ -3081,6 +3081,9 @@ class AgentWorkspaceTests(unittest.TestCase):
         executable = self.root / "codex-bin"
         executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         executable.chmod(0o755)
+        code_mode_host = self.root / "codex-code-mode-host"
+        code_mode_host.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        code_mode_host.chmod(0o755)
         command = ["codex", "exec", "-m", "gpt-6-astra", "-c", '''model_reasoning_effort="ultra"''']
         with mock.patch.dict(
             os.environ,
@@ -3103,6 +3106,8 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(list(prepared.command[1:]), command[1:])
         self.assertIn(str(executable.resolve()), argv)
         self.assertIn(str(sandbox.CODEX_SANDBOX_EXECUTABLE), argv)
+        self.assertIn(str(code_mode_host.resolve()), argv)
+        self.assertIn(str(sandbox.CODEX_SANDBOX_CODE_MODE_HOST), argv)
         self.assertIn(str(auth.resolve()), argv)
         self.assertIn(str(sandbox.CODEX_SANDBOX_CONFIG_DIR / "auth.json"), argv)
         self.assertNotIn(str(Path.home()), argv)
