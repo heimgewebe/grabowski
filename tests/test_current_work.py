@@ -811,6 +811,8 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertEqual(group["work_id"], f"operation:{owner}")
         self.assertEqual(group["projection_state"], "hygiene")
         self.assertEqual(group["work_class"], "hygiene")
+        self.assertTrue(group["action_required"])
+        self.assertIn("managed-active-retention-only", group["action_reasons"])
         binding_ref = next(
             ref for ref in group["authority_refs"]
             if ref["source"] == "checkout-lifecycle-binding"

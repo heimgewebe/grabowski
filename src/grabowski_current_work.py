@@ -1422,7 +1422,12 @@ def _add_checkouts(
             ):
                 _set_projection_state(group, "active")
             else:
-                _set_projection_state(group, "hygiene")
+                _hygiene(
+                    group,
+                    "managed-active-retention-only"
+                    if item["retention_active"]
+                    else "managed-active-lifecycle-attention",
+                )
         elif item["coordination_blocking"]:
             _set_projection_state(group, "active")
         elif item["processes"] and not exact:

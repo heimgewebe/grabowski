@@ -507,7 +507,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         )
         lifecycle_manifest = {
             "workspace_id": "gaw-test-lane-binding",
-            "binding": {"kind": source_kind, "id": source_id},
+            "binding": {"kind": "work_lane", "id": lane_id},
             "repository": str(self.git.repo),
             "writer_worktree": str(self.git.writer),
             "writer_branch": "feat/writer",
@@ -646,6 +646,14 @@ class AgentWorkspaceTests(unittest.TestCase):
             no_change_proven=True,
         )
         assessment = workspace.work_acquire.lane_closeout.assess(observation)
+        lifecycle = lane["worktree_receipt"]["lifecycle"]
+        completed = workspace.checkouts._mark_checkout_completed_retained(
+            checkout_key=str(lifecycle["checkout_key"]),
+            owner_id=f"lane:{lane['lane_id']}",
+            expected_head=self.git.base,
+            expected_branch="feat/writer",
+        )
+        self.assertEqual(completed["phase"], "completed_retained")
         with workspace.work_acquire._lane_lock(lane["lane_id"]) as path:
             current = workspace.work_acquire._read_state(path)
             self.assertIsInstance(current, dict)
@@ -1774,7 +1782,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertFalse(status["closeable"])
         self.assertFalse(status["success_ready"])
         self.assertTrue(cleanup_plan["closed"])
-        self.assertEqual(cleanup_plan["lifecycle_state"], "archive_eligible")
+        self.assertEqual(cleanup_plan["lifecycle_state"], "archive_eligible", cleanup_plan)
         self.assertTrue(cleanup_plan["eligible"], cleanup_plan)
         self.assertTrue(cleanup_plan["archive_eligible"])
         self.assertNotIn(
@@ -1790,6 +1798,42 @@ class AgentWorkspaceTests(unittest.TestCase):
             terminal_lane["receipt_sha256"],
         )
         self.assertEqual(terminal_evidence["live_owner_lease_count"], 0)
+
+        lifecycle_bindings = workspace.checkouts._lifecycle_bindings
+
+        def reopened_lifecycle(checkout_keys: list[str]) -> dict:
+            observed = lifecycle_bindings(checkout_keys)
+            return {
+                key: {**record, "phase": "active"}
+                for key, record in observed.items()
+            }
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=False),
+            mock.patch.object(workspace.checkouts, "_processes_under", return_value=[]),
+            mock.patch.object(
+                workspace,
+                "_workspace_cleanup_task_public",
+                return_value={"state": "completed", "terminal": True},
+            ),
+            mock.patch.object(
+                workspace.checkouts,
+                "_lifecycle_bindings",
+                side_effect=reopened_lifecycle,
+            ),
+        ):
+            drift_plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+        self.assertFalse(drift_plan["eligible"], drift_plan)
+        self.assertEqual(drift_plan["lifecycle_state"], "lane_owned_preserved")
+        drift_blocker = next(
+            item for item in drift_plan["blockers"]
+            if item["code"] == "lane_owned_checkout_preserved"
+        )
+        self.assertIn("current checkout lifecycle", drift_blocker["error"])
+
         with mock.patch.object(workspace.operator, "_require_operator_mutation"):
             with self.assertRaisesRegex(
                 workspace.AgentWorkspaceError, "work lane binding is not live and exact"
@@ -1819,6 +1863,42 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(archived["state"], "archived_waiting_for_cleanup")
         self.assertTrue(archived["requires_fresh_cleanup_plan"])
         self.assertTrue(self.git.writer.exists())
+        persisted = workspace._manifest(manifest["workspace_id"])
+        cleanup_intent = persisted["workspace_cleanup_intent"]
+        expected_physical = cleanup_intent["checkout_physical_identity"]
+        self.assertEqual(
+            expected_physical["physical_identity_sha256"],
+            cleanup_plan["checkout"]["physical_identity"]["physical_identity_sha256"],
+        )
+        replacement_physical = {
+            **expected_physical,
+            "physical_identity_sha256": "f" * 64,
+        }
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=False),
+            mock.patch.object(workspace.checkouts, "_processes_under", return_value=[]),
+            mock.patch.object(
+                workspace,
+                "_workspace_cleanup_task_public",
+                return_value={"state": "completed", "terminal": True},
+            ),
+            mock.patch.object(
+                workspace.physical_checkout,
+                "capture_physical_checkout_identity",
+                return_value=replacement_physical,
+            ),
+        ):
+            replaced_plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+        self.assertFalse(replaced_plan["eligible"], replaced_plan)
+        self.assertEqual(replaced_plan["lifecycle_state"], "lane_owned_preserved")
+        replaced_blocker = next(
+            item for item in replaced_plan["blockers"]
+            if item["code"] == "lane_owned_checkout_preserved"
+        )
+        self.assertIn("physical checkout identity changed", replaced_blocker["error"])
 
     def test_terminal_lane_missing_checkout_is_historical_not_operationally_owned(self) -> None:
         lane = self.lane_receipt(idempotency_key="terminal-lane-missing-checkout")
