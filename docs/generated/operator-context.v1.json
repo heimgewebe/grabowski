@@ -1531,7 +1531,7 @@
     },
     {
       "category": "coding-memory",
-      "description": "Read bounded historical coding events without asserting current truth.\n\nThe optional component filter is bound to Chronik's canonical producer/source component.\nsubject_component independently filters task-context subject.component.",
+      "description": "Read bounded historical coding events without asserting current truth.\n\nThe optional component filter is bound to Chronik's canonical producer/source\ncomponent; subject_component independently filters task-context subject.component.\nExact PR, Bureau-task and agent-run selectors are ANDed inside Grabowski after\nvalidating a bounded coarse Chronik provider window. They never fall back to\ncoarse history when no exact match is present.",
       "effects": [],
       "id": "grabowski_chronik_history",
       "purpose": "Read bounded historical coding events without asserting current truth.",
@@ -3713,7 +3713,7 @@
       "src/grabowski_systemkatalog.py": "4fefcfd0b5ea3b68d37b6a95d27516799cbf5c2ada14494c3b4c17688f98585d",
       "src/grabowski_task_attention.py": "a16d4b045bef23bf78ad3df0c4c58d91a304dc9a83b6e757fb1b0f88754ad6f3",
       "src/grabowski_task_reconcile.py": "64dc6195c9d0cb3435d192e4715a0d4d5679b9f1904057308366f4e2f2e9bbea",
-      "src/grabowski_tasks.py": "187de0d78bb078ec1bb6491d7086b04899cf40480dd5c478e9ef059009dd2d9d",
+      "src/grabowski_tasks.py": "b616d105e72f21a3230b0f045cb97596f5c0cf9440eab3d2ae947e4fffaa160a",
       "src/grabowski_terminal_convergence.py": "8f172a65b2af1dbca3d5b226a18e82df3ca5229ca5f4ae8b2ab1792506c69195",
       "src/grabowski_text_artifact_reconcile.py": "b302be1dbb101abbf825732bfe41658c13ac64417c2a6034326e57409daa4772",
       "src/grabowski_transport_assertion.py": "20d75d1f94c1d0273108c36eed8c58aa85e55a30b73546c4ac8af8a835fb8c8e",
