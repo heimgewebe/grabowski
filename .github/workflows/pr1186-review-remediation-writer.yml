@@ -40,7 +40,7 @@ jobs:
           test -f tools/pr1186_review_remediation.py
           python -m py_compile tools/pr1186_review_remediation.py
 
-      - name: Scope archive patch anchors
+      - name: Scope patch anchors
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -75,6 +75,23 @@ jobs:
               if text.count(old) != 1:
                   raise SystemExit(f'archive script hotfix marker count={text.count(old)} for {old}')
               text = text.replace(old, new, 1)
+
+          cleanup_marker = 'replace_once(CHECKOUTS, cleanup_release_before_audit,'
+          if text.count(cleanup_marker) != 1:
+              raise SystemExit(f'cleanup release hotfix marker count={text.count(cleanup_marker)}')
+          cleanup_start = text.index(cleanup_marker)
+          cleanup_end = text.index('\n\ncleanup_return_old =', cleanup_start)
+          cleanup_replacement = '''cleanup_source = Path(CHECKOUTS).read_text(encoding="utf-8")
+          cleanup_start_at = cleanup_source.index('@mcp.tool(name="grabowski_checkout_cleanup", annotations=MUTATING)')
+          cleanup_block = cleanup_source[cleanup_start_at:]
+          if cleanup_block.count(cleanup_release_before_audit) != 1:
+              raise SystemExit("cleanup release marker is not unique inside cleanup function")
+          cleanup_block = cleanup_block.replace(cleanup_release_before_audit, "    audit = {\\n", 1)
+          Path(CHECKOUTS).write_text(
+              cleanup_source[:cleanup_start_at] + cleanup_block,
+              encoding="utf-8",
+          )'''
+          text = text[:cleanup_start] + cleanup_replacement + text[cleanup_end:]
           path.write_text(text, encoding='utf-8')
           PY
           python -m py_compile tools/pr1186_review_remediation.py
