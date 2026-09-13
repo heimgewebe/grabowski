@@ -579,7 +579,17 @@ archive_sig_new = '''    expected_head: str,
 ) -> dict[str, Any]:
 '''
 # This signature occurs on archive only in the exact current file.
-replace_once(CHECKOUTS, archive_sig_old, archive_sig_new)
+archive_source = Path(CHECKOUTS).read_text(encoding="utf-8")
+archive_start_at = archive_source.index('@mcp.tool(name="grabowski_checkout_archive", annotations=MUTATING)')
+archive_end_at = archive_source.index('@mcp.tool(name="grabowski_checkout_cleanup", annotations=MUTATING)', archive_start_at)
+archive_block = archive_source[archive_start_at:archive_end_at]
+if archive_block.count(archive_sig_old) != 1:
+    raise SystemExit("archive signature marker is not unique inside archive function")
+archive_block = archive_block.replace(archive_sig_old, archive_sig_new, 1)
+Path(CHECKOUTS).write_text(
+    archive_source[:archive_start_at] + archive_block + archive_source[archive_end_at:],
+    encoding="utf-8",
+)
 
 archive_identity_marker = '''    _require_retention_owner(record["checkout_key"], owner)
     lifecycle_before = _lifecycle_bindings([record["checkout_key"]]).get(
@@ -602,7 +612,17 @@ archive_fence_init_new = '''    result: dict[str, Any] | None = None
     uncertainty_fence: dict[str, Any] | None = None
     try:
 '''
-replace_once(CHECKOUTS, archive_fence_init_old, archive_fence_init_new)
+archive_source = Path(CHECKOUTS).read_text(encoding="utf-8")
+archive_start_at = archive_source.index('@mcp.tool(name="grabowski_checkout_archive", annotations=MUTATING)')
+archive_end_at = archive_source.index('@mcp.tool(name="grabowski_checkout_cleanup", annotations=MUTATING)', archive_start_at)
+archive_block = archive_source[archive_start_at:archive_end_at]
+if archive_block.count(archive_fence_init_old) != 1:
+    raise SystemExit("archive fence-init marker is not unique inside archive function")
+archive_block = archive_block.replace(archive_fence_init_old, archive_fence_init_new, 1)
+Path(CHECKOUTS).write_text(
+    archive_source[:archive_start_at] + archive_block + archive_source[archive_end_at:],
+    encoding="utf-8",
+)
 
 archive_refs_old = '''        archive_id = _new_archive_id()
         path_hash = record["checkout_key"][:16]
@@ -781,7 +801,16 @@ replace_once(CHECKOUTS, cleanup_precondition_old, cleanup_precondition_new)
 cleanup_release_before_audit = '''    lease_release = _release_checkout_resources(lease)
     audit = {
 '''
-replace_once(CHECKOUTS, cleanup_release_before_audit, '''    audit = {\n''')
+cleanup_source = Path(CHECKOUTS).read_text(encoding="utf-8")
+cleanup_start_at = cleanup_source.index('@mcp.tool(name="grabowski_checkout_cleanup", annotations=MUTATING)')
+cleanup_block = cleanup_source[cleanup_start_at:]
+if cleanup_block.count(cleanup_release_before_audit) != 1:
+    raise SystemExit("cleanup release marker is not unique inside cleanup function")
+cleanup_block = cleanup_block.replace(cleanup_release_before_audit, "    audit = {\n", 1)
+Path(CHECKOUTS).write_text(
+    cleanup_source[:cleanup_start_at] + cleanup_block,
+    encoding="utf-8",
+)
 
 cleanup_return_old = '''    base._append_audit(audit)
     return {
@@ -989,5 +1018,5 @@ test_code = '''    def test_archive_rechecks_physical_identity_after_resource_ac
 replace_once(TESTS, test_marker, test_code)
 
 workspace_source = Path(WORKSPACE).read_text(encoding="utf-8")
-if workspace_source.count('expected_physical_identity=intent["checkout_physical_identity"]') != 1:
+if workspace_source.count(workspace_call_new) != 1:
     raise SystemExit("workspace archive call is not exactly identity-bound")

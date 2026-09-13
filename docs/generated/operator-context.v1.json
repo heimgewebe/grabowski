@@ -944,6 +944,32 @@
       "tool": "grabowski_checkout_cleanup"
     },
     {
+      "category": "checkout-lifecycle",
+      "description": "Read durable unknown-outcome fences for checkout lifecycle effects.",
+      "effects": [],
+      "id": "grabowski_checkout_uncertainty_status",
+      "purpose": "Read persistent unknown-outcome fences for checkout archive and cleanup effects.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_checkout_uncertainty_status"
+    },
+    {
+      "category": "checkout-lifecycle",
+      "description": "Read back one unknown checkout effect and release its fence only when proven.",
+      "effects": [
+        "audit-append",
+        "resource-lease-release",
+        "state-change"
+      ],
+      "id": "grabowski_checkout_uncertainty_reconcile",
+      "purpose": "Reconcile one persistent unknown-outcome checkout fence from primary Git and database evidence and release coordination only after the outcome is proven.",
+      "read_only": false,
+      "reversibility": "evidence-bound-state-transition",
+      "risk_class": "high",
+      "tool": "grabowski_checkout_uncertainty_reconcile"
+    },
+    {
       "category": "remote-version-control",
       "description": "Run GitHub CLI with redacted output.",
       "effects": [
@@ -2881,6 +2907,8 @@
       "grabowski_checkout_retain",
       "grabowski_checkout_archive",
       "grabowski_checkout_cleanup",
+      "grabowski_checkout_uncertainty_status",
+      "grabowski_checkout_uncertainty_reconcile",
       "grabowski_github",
       "grabowski_user_service",
       "grabowski_tmux_list",
@@ -3559,7 +3587,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "1fd4e986a104b5d30575e52faa3c4d9ec6b9a1405996de435b10719020b86591"
+      "sha256": "a8a8a832c4de2da9809a80296909d87df651e3c759cba44a081c0dfa91e9f1ba"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3567,7 +3595,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "75ac50665221bcd87dc459b3c71e70363eabf265c626c0590c069afd8d88808e"
+      "sha256": "4e25bada445a7995325a9406df2fe81a4f7b5940faa2df15588120d4a13956e5"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
@@ -3600,7 +3628,7 @@
       "src/grabowski_checkout_identity.py": "377ca0a5396df74023cff263a7ae16da94d1c31a887772c3abb877961f4e5fd5",
       "src/grabowski_checkout_terminal_reconciliation.py": "fbe3f0a0778c006a76ab5d44734c6d06988fd0a0cda2e931b39a5e0a0f4a41b2",
       "src/grabowski_checkout_terminal_sources.py": "56e65c901e7b5ba5a6b9d764617b709cff14dc1d3d852244beff5ac5cadce32b",
-      "src/grabowski_checkouts.py": "a655ad46334065337dcc747c6a855d35d72a28c8763d08fc65a71a75cf62adb5",
+      "src/grabowski_checkouts.py": "7018fca6677b4d32d78cbd2eca09827cfbf473e27d787f651de6f88eb34c4e9f",
       "src/grabowski_chronik.py": "68785720fc9dac258b493011f99d5568ef1ca5543e21eee853e6d8e6c1616c17",
       "src/grabowski_client_snapshot.py": "777d9aa6d4bd964e7fdbb923d82586d186f9e0340e51b8e4b1140cae1e863eec",
       "src/grabowski_coding_agent_catalog_data.py": "2e9b3163bf93f58f5c2848813e51d1cf0f13c59dc071eb678a11657c4bb645a2",

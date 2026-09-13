@@ -1,28 +1,5 @@
 {
   "accepted_additions": {
-    "grabowski_tailscale_status": {
-      "evidence_refs": [
-        "tests:test_read_surface.py",
-        "docs:typed-read-surface.md",
-        "gate:G5-dual-operator-read-matrix"
-      ],
-      "exception_detail": {
-        "claim": "The tool exposes only a bounded projection of local Tailscale status through one fixed argv and never accepts caller-selected commands, URLs or mutation controls.",
-        "evidence": "Fixed local tailscale status --json execution, bounded peer and health projections, explicit account/key/address redaction, no terminal_execute gate, and focused projection/argv tests."
-      },
-      "justification_kind": "distinct_authority_boundary",
-      "operation_alternative_considered": "Generic terminal or fleet execution was rejected because either would grant a much broader command authority merely to observe node and peer reachability.",
-      "rationale": "Independent operator health requires Tailscale reachability evidence even in observe-only profiles. A typed fixed-shape read closes that diagnostic gap without granting shell or Tailscale mutation authority.",
-      "tool_contract": {
-        "authority_class": "read",
-        "category": "diagnostics",
-        "effects": [],
-        "read_only": true,
-        "reversibility": "not-applicable",
-        "risk_class": "low",
-        "tool": "grabowski_tailscale_status"
-      }
-    },
     "grabowski_agent_workspace_reconcile_idle_tmux": {
       "evidence_refs": [
         "contract:idle-tmux-stale-abandonment-v1",
@@ -171,33 +148,6 @@
         "tool": "grabowski_audit_trace"
       }
     },
-    "grabowski_browser_worker_stored_form_action": {
-      "evidence_refs": [
-        "docs:browser-stored-form-action.md",
-        "tests:test_workers.py",
-        "bureau:event-666"
-      ],
-      "exception_detail": {
-        "claim": "The tool owns a distinct browser-managed local form authority with no general JavaScript, field-content disclosure or arbitrary-navigation surface.",
-        "evidence": "Exact origin and remote-IP binding, owner-held port lease, pre-action audit intent, action-scope confirmation, fixed CDP methods, cleanup fallbacks, redacted receipts and focused negative tests."
-      },
-      "justification_kind": "distinct_authority_boundary",
-      "operation_alternative_considered": "A generic browser or terminal operation was rejected because it would permit caller-controlled script execution or expose browser-managed field contents. This tool owns only the fixed CDP sequence required for one local-device form action and returns receipt-safe booleans and hashes.",
-      "rationale": "Expose one exact, target-bound browser-managed form action instead of arbitrary caller-supplied CDP or JavaScript authority; bind the action to a running worker, its owner-held loopback port, a canonical local origin, the browser-observed remote address, hashed selectors and an explicit call-scope confirmation.",
-      "tool_contract": {
-        "authority_class": "mutation",
-        "category": "browser-worker",
-        "effects": [
-          "browser-input",
-          "form-submit",
-          "local-device-state-change"
-        ],
-        "read_only": false,
-        "reversibility": "target-dependent; fields cleared on failed or unobserved submission",
-        "risk_class": "high",
-        "tool": "grabowski_browser_worker_stored_form_action"
-      }
-    },
     "grabowski_browser_worker_semantic": {
       "evidence_refs": [
         "docs:browser-control-plane-v1.md",
@@ -224,6 +174,33 @@
         "reversibility": "read-not-applicable; local-ui-and-network-navigation-state-dependent",
         "risk_class": "high",
         "tool": "grabowski_browser_worker_semantic"
+      }
+    },
+    "grabowski_browser_worker_stored_form_action": {
+      "evidence_refs": [
+        "docs:browser-stored-form-action.md",
+        "tests:test_workers.py",
+        "bureau:event-666"
+      ],
+      "exception_detail": {
+        "claim": "The tool owns a distinct browser-managed local form authority with no general JavaScript, field-content disclosure or arbitrary-navigation surface.",
+        "evidence": "Exact origin and remote-IP binding, owner-held port lease, pre-action audit intent, action-scope confirmation, fixed CDP methods, cleanup fallbacks, redacted receipts and focused negative tests."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "A generic browser or terminal operation was rejected because it would permit caller-controlled script execution or expose browser-managed field contents. This tool owns only the fixed CDP sequence required for one local-device form action and returns receipt-safe booleans and hashes.",
+      "rationale": "Expose one exact, target-bound browser-managed form action instead of arbitrary caller-supplied CDP or JavaScript authority; bind the action to a running worker, its owner-held loopback port, a canonical local origin, the browser-observed remote address, hashed selectors and an explicit call-scope confirmation.",
+      "tool_contract": {
+        "authority_class": "mutation",
+        "category": "browser-worker",
+        "effects": [
+          "browser-input",
+          "form-submit",
+          "local-device-state-change"
+        ],
+        "read_only": false,
+        "reversibility": "target-dependent; fields cleared on failed or unobserved submission",
+        "risk_class": "high",
+        "tool": "grabowski_browser_worker_stored_form_action"
       }
     },
     "grabowski_bureau_candidate_assess": {
@@ -454,6 +431,56 @@
         "tool": "grabowski_bureau_task_review"
       }
     },
+    "grabowski_checkout_binding_identity_rebind_apply": {
+      "evidence_refs": [
+        "github:heimgewebe/grabowski#852",
+        "tests:tests/test_checkouts.py",
+        "tests:tests/test_grips.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool owns only the CAS update of expected_head and expected_branch in matching active lifecycle and retention rows for one preview-proven existing checkout.",
+        "evidence": "Exact preview digest and confirmation, unchanged owner, clean checkout, branch-only drift, ancestry and remote proof, zero coordination blockers, current retention checks before lease/after lease/before commit, SQLite preimage CAS, bounded audit and post-readback prevent broader authority."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "Reusing terminal apply was rejected because terminal apply changes lifecycle phase for an absent checkout and explicitly preserves branch identity; archive, cleanup and generic state mutation were rejected as broader or differently scoped authority.",
+      "rationale": "Correcting stored identity for a still-existing checkout is a separate mutation class. It changes no Git ref, checkout branch, owner, archive, filesystem content or lifecycle phase and must not inherit terminalization authority implicitly.",
+      "tool_contract": {
+        "authority_class": "mutation",
+        "category": "checkout-lifecycle",
+        "effects": [
+          "audit-append",
+          "resource-lease",
+          "state-change"
+        ],
+        "read_only": false,
+        "reversibility": "compare-and-swap-state-transition-with-retained-audit-evidence",
+        "risk_class": "medium",
+        "tool": "grabowski_checkout_binding_identity_rebind_apply"
+      }
+    },
+    "grabowski_checkout_binding_identity_rebind_preview": {
+      "evidence_refs": [
+        "github:heimgewebe/grabowski#852",
+        "tests:tests/test_checkouts.py",
+        "tests:tests/test_grips.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool owns only read-only proof for one existing active managed checkout whose current named branch differs from the stored lifecycle identity.",
+        "evidence": "The checkout key resolves the target server-side; clean state, unchanged owner, branch-only drift, recorded-head ancestry, exact remote security, live retention and zero coordination blockers are snapshot-bound before any mutation authority exists."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "Reusing missing-checkout terminal preview was rejected because terminal reconciliation proves absence and source terminality, while identity rebind proves a live existing checkout and a branch-name identity correction.",
+      "rationale": "Branch identity reconciliation has different evidence, postconditions and mutation authority from checkout terminalization, so it requires an independently inspectable preview surface.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "checkout-lifecycle",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_checkout_binding_identity_rebind_preview"
+      }
+    },
     "grabowski_checkout_binding_reconciliation": {
       "evidence_refs": [
         "issue:heimgewebe/grabowski#434",
@@ -491,7 +518,7 @@
       "operation_alternative_considered": "Archive and cleanup tools were rejected because they create recovery or removal authority; generic state or terminal tools cannot bind source-specific terminal receipts, checkout identity, leases and lifecycle CAS as one fail-closed transition.",
       "rationale": "External terminal reconciliation is a distinct evidence-only mutation boundary. It either records an absent checkout as externally terminal or releases active capacity for a retained terminal Work Lane by moving it to completed_retained; both modes preserve retention, refs and cleanup authority boundaries, and the present mode preserves the checkout itself.",
       "tool_contract": {
-        "tool": "grabowski_checkout_binding_terminal_apply",
+        "authority_class": "mutation",
         "category": "checkout-lifecycle",
         "effects": [
           "audit-append",
@@ -502,7 +529,7 @@
         "read_only": false,
         "reversibility": "compare-and-swap-state-transition-with-retained-evidence",
         "risk_class": "medium",
-        "authority_class": "mutation"
+        "tool": "grabowski_checkout_binding_terminal_apply"
       }
     },
     "grabowski_checkout_binding_terminal_preview": {
@@ -519,63 +546,61 @@
       "operation_alternative_considered": "Extending generic checkout inventory or binding reconciliation was rejected because neither call shape binds a fresh source-terminal receipt and exact apply preimage with an expiry contract.",
       "rationale": "A dedicated preview keeps source-specific terminal evidence and the exact compare-and-swap preimage inspectable without granting mutation, archive or cleanup authority.",
       "tool_contract": {
-        "tool": "grabowski_checkout_binding_terminal_preview",
+        "authority_class": "read",
         "category": "checkout-lifecycle",
         "effects": [],
         "read_only": true,
         "reversibility": "not-applicable",
         "risk_class": "low",
-        "authority_class": "read"
+        "tool": "grabowski_checkout_binding_terminal_preview"
       }
     },
-    "grabowski_checkout_binding_identity_rebind_preview": {
+    "grabowski_checkout_uncertainty_reconcile": {
       "evidence_refs": [
-        "github:heimgewebe/grabowski#852",
-        "tests:tests/test_checkouts.py",
-        "tests:tests/test_grips.py"
+        "review:pr-1186-codex-p1-unknown-outcome-fence",
+        "tests:tests/test_checkouts.py"
       ],
       "exception_detail": {
-        "claim": "The tool owns only read-only proof for one existing active managed checkout whose current named branch differs from the stored lifecycle identity.",
-        "evidence": "The checkout key resolves the target server-side; clean state, unchanged owner, branch-only drift, recorded-head ancestry, exact remote security, live retention and zero coordination blockers are snapshot-bound before any mutation authority exists."
+        "claim": "The tool can clear only one persisted uncertainty fence after operation-specific primary readback proves success, no effect, or reconciled success.",
+        "evidence": "Exact confirmation token, git_cli and resource_lease guards, operation-specific readback, audit append, and regression coverage."
       },
       "justification_kind": "distinct_authority_boundary",
-      "operation_alternative_considered": "Reusing missing-checkout terminal preview was rejected because terminal reconciliation proves absence and source terminality, while identity rebind proves a live existing checkout and a branch-name identity correction.",
-      "rationale": "Branch identity reconciliation has different evidence, postconditions and mutation authority from checkout terminalization, so it requires an independently inspectable preview surface.",
+      "operation_alternative_considered": "Generic resource release and terminal execution were rejected because either could drop coordination without proving the ambiguous archive or cleanup outcome.",
+      "rationale": "Releasing a durable unknown-outcome fence is a distinct high-risk transition that must be bound to primary Git and database readback rather than lease expiry.",
       "tool_contract": {
-        "tool": "grabowski_checkout_binding_identity_rebind_preview",
-        "category": "checkout-lifecycle",
-        "effects": [],
-        "read_only": true,
-        "reversibility": "not-applicable",
-        "risk_class": "low",
-        "authority_class": "read"
-      }
-    },
-    "grabowski_checkout_binding_identity_rebind_apply": {
-      "evidence_refs": [
-        "github:heimgewebe/grabowski#852",
-        "tests:tests/test_checkouts.py",
-        "tests:tests/test_grips.py"
-      ],
-      "exception_detail": {
-        "claim": "The tool owns only the CAS update of expected_head and expected_branch in matching active lifecycle and retention rows for one preview-proven existing checkout.",
-        "evidence": "Exact preview digest and confirmation, unchanged owner, clean checkout, branch-only drift, ancestry and remote proof, zero coordination blockers, current retention checks before lease/after lease/before commit, SQLite preimage CAS, bounded audit and post-readback prevent broader authority."
-      },
-      "justification_kind": "distinct_authority_boundary",
-      "operation_alternative_considered": "Reusing terminal apply was rejected because terminal apply changes lifecycle phase for an absent checkout and explicitly preserves branch identity; archive, cleanup and generic state mutation were rejected as broader or differently scoped authority.",
-      "rationale": "Correcting stored identity for a still-existing checkout is a separate mutation class. It changes no Git ref, checkout branch, owner, archive, filesystem content or lifecycle phase and must not inherit terminalization authority implicitly.",
-      "tool_contract": {
-        "tool": "grabowski_checkout_binding_identity_rebind_apply",
+        "authority_class": "mutation",
         "category": "checkout-lifecycle",
         "effects": [
           "audit-append",
-          "resource-lease",
+          "resource-lease-release",
           "state-change"
         ],
         "read_only": false,
-        "reversibility": "compare-and-swap-state-transition-with-retained-audit-evidence",
-        "risk_class": "medium",
-        "authority_class": "mutation"
+        "reversibility": "evidence-bound-state-transition",
+        "risk_class": "high",
+        "tool": "grabowski_checkout_uncertainty_reconcile"
+      }
+    },
+    "grabowski_checkout_uncertainty_status": {
+      "evidence_refs": [
+        "review:pr-1186-codex-p1-unknown-outcome-fence",
+        "tests:tests/test_checkouts.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool exposes only bounded durable checkout-operation uncertainty records and has no mutation authority.",
+        "evidence": "Read-only MCP annotation, bounded active-fence projection, and focused checkout uncertainty regressions."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "Generic terminal, database reads, or checkout inventory were rejected because they expose broader authority or do not represent durable unknown-outcome fence identity.",
+      "rationale": "Unknown checkout mutation outcomes need a bounded durable-fence read that does not grant generic database, filesystem or Git access.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "checkout-lifecycle",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_checkout_uncertainty_status"
       }
     },
     "grabowski_chronik_history": {
@@ -788,6 +813,30 @@
         "tool": "grabowski_current_work"
       }
     },
+    "grabowski_host_capability_resolve": {
+      "evidence_refs": [
+        "heim-pc:pull-request-105",
+        "systemkatalog:pull-request-170",
+        "tests:tests/test_operator_context.py",
+        "contract:docs/agent-facing-contract.md"
+      ],
+      "exception_detail": {
+        "claim": "The tool exposes one read-only resolution shape over the installed, byte-identical host operator-entry capabilityLocators contract without copying capability policy or gaining execution authority.",
+        "evidence": "Exact declared-intent matching, locator-only authority kind, bounded no-follow contract reads, installed/canonical SHA equality, HOME-template validation, no-match and drift fail-closed tests, and a real transcription locator smoke against the installed heim-pc contract."
+      },
+      "justification_kind": "material_call_shape",
+      "operation_alternative_considered": "Generic file or terminal reads were rejected because callers would have to discover the host contract, verify its canonical byte identity, validate templates and ambiguity, parse locator authority boundaries, and could silently duplicate provider or model selection logic.",
+      "rationale": "Host-local capabilities need one stable typed lookup before implementation selection. The resolver returns only the owning locator and authority from the host contract; it performs no child command and grants no cloud, metered, file-access or runtime-readiness authority.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "knowledge",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_host_capability_resolve"
+      }
+    },
     "grabowski_juno_pair": {
       "evidence_refs": [
         "docs:juno-ipad-agent.md",
@@ -887,6 +936,29 @@
         "reversibility": "receipt-retention-dependent",
         "risk_class": "high",
         "tool": "grabowski_merge_delivery_record"
+      }
+    },
+    "grabowski_operational_guidance": {
+      "evidence_refs": [
+        "bureau:GRABOWSKI-OPERATOR-SURFACE-V1-T191",
+        "tests:test_operational_guidance.py",
+        "contract:operational-runbook.v1"
+      ],
+      "exception_detail": {
+        "claim": "The tool exposes only bounded, cited operational guidance derived from existing Systemkatalog and RepoGround evidence in shadow mode and never grants task, policy, retry, recovery or execution authority.",
+        "evidence": "Bounded runbook parsing, revision-bound source selection, deterministic ranking, stale/ambiguous/no-match outcomes, explicit evidence refs, read-only MCP annotations, bundle_registry capability guard and focused negative tests."
+      },
+      "justification_kind": "material_call_shape",
+      "operation_alternative_considered": "Direct Systemkatalog and RepoGround calls were retained as the underlying truth sources, but requiring callers to reconstruct the operational-runbook contract, source ranking, ambiguity handling and stale-evidence boundaries would duplicate decision logic outside Grabowski and lose a typed guidance result.",
+      "rationale": "Operational guidance has a materially distinct bounded evidence-synthesis response shape. Publishing one read-only tool centralizes deterministic runbook selection while preserving the underlying source authorities and adds no state store or mutation path.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "knowledge",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_operational_guidance"
       }
     },
     "grabowski_operator_blockade_disarm": {
@@ -1037,6 +1109,56 @@
         "tool": "grabowski_operator_optimization_report"
       }
     },
+    "grabowski_recovery_provenance_assess": {
+      "evidence_refs": [
+        "contract:provenance-recovery-lane-v1",
+        "tests:test_provenance_recovery.py",
+        "tests:test_release_lifecycle.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool reports only whether the narrow provenance repair lane would admit one exact commit, and grants nothing.",
+        "evidence": "Read-only gate evaluation over audit chain, kill switch, backup freshness, privileged broker readiness, revision-bound source identity, target-commit contract validity under the target's own canonical schema, and absence of a competing deployment mutation."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "grabowski_recovery_status was rejected because it evaluates the power-worker gate, which itself depends on deployment_provenance; a lane that exists precisely because that flag is false cannot be assessed through a surface gated on it.",
+      "rationale": "When deployment provenance is invalid, every ordinary read that reports repair readiness is downstream of the broken flag. A separate read surface lets an operator inspect a blocked repair lane without deriving anything from the runtime under repair.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "recovery",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_recovery_provenance_assess"
+      }
+    },
+    "grabowski_recovery_provenance_repair": {
+      "evidence_refs": [
+        "contract:provenance-recovery-lane-v1",
+        "tests:test_provenance_recovery.py",
+        "tests:test_release_lifecycle.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool owns exactly one transition: replacing an integrity-invalid deployed runtime with a build of one exact, verified commit.",
+        "evidence": "Refuses unless the runtime is actually integrity-invalid; requires valid writable audit chain, clear kill switch, fresh local backup evidence, a healthy privileged broker, a clean revision-bound source whose HEAD and origin/main equal the named commit, a target contract that validates under the target commit's own canonical schema and deploys that schema, and no competing deployment mutation. Grants no shell, command or power-worker authority; normal gates apply again after repair."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "grabowski_runtime_deploy_schedule and grabowski_power_run were both rejected: each derives authority from the deployment provenance this lane exists to repair, so reusing either would either stay deadlocked or require weakening a gate that must keep applying to ordinary effects.",
+      "rationale": "A fail-closed integrity gate must not close over its own repair path. This is the single narrowest authority that can restore a valid runtime, deliberately separated from general deployment and power authority so that a broken release unlocks nothing except its own replacement.",
+      "tool_contract": {
+        "authority_class": "mutation",
+        "category": "recovery",
+        "effects": [
+          "audit-record",
+          "durable-job-start",
+          "runtime-deployment"
+        ],
+        "read_only": false,
+        "reversibility": "previous-release-retained",
+        "risk_class": "high",
+        "tool": "grabowski_recovery_provenance_repair"
+      }
+    },
     "grabowski_runtime_refresh_lease_release": {
       "evidence_refs": [
         "bureau:GRABOWSKI-OPERATOR-SURFACE-V1-T134",
@@ -1063,6 +1185,52 @@
         "reversibility": "resource-reacquire",
         "risk_class": "high",
         "tool": "grabowski_runtime_refresh_lease_release"
+      }
+    },
+    "grabowski_systemkatalog_query": {
+      "evidence_refs": [
+        "systemkatalog:heimgewebe/systemkatalog#164",
+        "bureau:candidate-36ef5b573fc8730e48f6d82b",
+        "tests:tests/test_systemkatalog_surface.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool exposes one bounded query shape over the canonical, revision-bound Systemkatalog v2 contract without copying catalog truth.",
+        "evidence": "Exact operation and value schema, clean canonical checkout and origin binding, query-script digest, bounded subprocess, strict v2 envelope validation, manifest/source-evidence validation and fail-closed tests."
+      },
+      "justification_kind": "material_call_shape",
+      "operation_alternative_considered": "Generic file and terminal tools were rejected because they require callers to discover private paths, compose argv, parse JSON and independently reconstruct commit, manifest and source-evidence validation.",
+      "rationale": "Stable ecosystem semantics need one query-specific typed response whose shape differs materially from generic file, terminal, RepoGround and runtime-status surfaces. One endpoint covers all Systemkatalog operations and adds no service, cache or writable truth.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "knowledge",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_systemkatalog_query"
+      }
+    },
+    "grabowski_tailscale_status": {
+      "evidence_refs": [
+        "tests:test_read_surface.py",
+        "docs:typed-read-surface.md",
+        "gate:G5-dual-operator-read-matrix"
+      ],
+      "exception_detail": {
+        "claim": "The tool exposes only a bounded projection of local Tailscale status through one fixed argv and never accepts caller-selected commands, URLs or mutation controls.",
+        "evidence": "Fixed local tailscale status --json execution, bounded peer and health projections, explicit account/key/address redaction, no terminal_execute gate, and focused projection/argv tests."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "Generic terminal or fleet execution was rejected because either would grant a much broader command authority merely to observe node and peer reachability.",
+      "rationale": "Independent operator health requires Tailscale reachability evidence even in observe-only profiles. A typed fixed-shape read closes that diagnostic gap without granting shell or Tailscale mutation authority.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "diagnostics",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_tailscale_status"
       }
     },
     "grabowski_task_archive_list": {
@@ -1228,18 +1396,18 @@
       "operation_alternative_considered": "Generic arbitrary Juno Python was rejected because it could read or write characteristic values, subscribe, pair or invoke unrelated native APIs; extending scan to implicit connections was rejected because connection is a distinct radio-side effect.",
       "rationale": "GATT metadata discovery needs an explicit exact-target connection boundary with a mandatory disconnect and no device-control authority.",
       "tool_contract": {
-        "tool": "ipad_bluetooth_inspect",
-        "category": "device-worker",
         "authority_class": "mutation",
-        "risk_class": "medium",
-        "read_only": false,
+        "category": "device-worker",
         "effects": [
           "device-bluetooth-connect",
           "device-gatt-metadata-read",
           "device-job-execute",
           "receipt-create"
         ],
-        "reversibility": "temporary-connection-explicitly-disconnected"
+        "read_only": false,
+        "reversibility": "temporary-connection-explicitly-disconnected",
+        "risk_class": "medium",
+        "tool": "ipad_bluetooth_inspect"
       }
     },
     "ipad_bluetooth_read": {
@@ -1255,11 +1423,8 @@
       "operation_alternative_considered": "Generic arbitrary Juno Python was rejected because it can write, subscribe, pair or invoke unrelated native APIs; extending metadata inspection with implicit value reads was rejected because private-content return is a distinct authority boundary.",
       "rationale": "Characteristic values are private device content and active CoreBluetooth reads can also trigger system pairing UI when security is required; the surface therefore requires explicit exact targets, bounded receipt-bound reads, and affirmative pairing-risk acknowledgement while remaining separate from all control authority.",
       "tool_contract": {
-        "tool": "ipad_bluetooth_read",
-        "category": "device-worker",
         "authority_class": "mutation",
-        "risk_class": "high",
-        "read_only": false,
+        "category": "device-worker",
         "effects": [
           "device-bluetooth-connect",
           "device-gatt-value-read",
@@ -1267,7 +1432,10 @@
           "device-private-content-return",
           "receipt-create"
         ],
-        "reversibility": "temporary-connection-explicitly-disconnected"
+        "read_only": false,
+        "reversibility": "temporary-connection-explicitly-disconnected",
+        "risk_class": "high",
+        "tool": "ipad_bluetooth_read"
       }
     },
     "ipad_bluetooth_scan": {
@@ -1283,17 +1451,17 @@
       "operation_alternative_considered": "Generic arbitrary Juno Python was rejected because it grants materially broader native API authority and cannot enforce a scan-only result schema.",
       "rationale": "Nearby BLE observation is useful device metadata, but it should be available through one typed scan boundary rather than arbitrary code execution.",
       "tool_contract": {
-        "tool": "ipad_bluetooth_scan",
-        "category": "device-worker",
         "authority_class": "mutation",
-        "risk_class": "medium",
-        "read_only": false,
+        "category": "device-worker",
         "effects": [
           "device-bluetooth-scan",
           "device-job-execute",
           "receipt-create"
         ],
-        "reversibility": "not-applicable-device-job-and-receipt-retained"
+        "read_only": false,
+        "reversibility": "not-applicable-device-job-and-receipt-retained",
+        "risk_class": "medium",
+        "tool": "ipad_bluetooth_scan"
       }
     },
     "ipad_capability_manifest": {
@@ -1450,31 +1618,6 @@
         "tool": "ipad_file_stat"
       }
     },
-    "ipad_native_permission_status": {
-      "evidence_refs": [
-        "docs:juno-ipad-agent.md",
-        "tests:test_juno_tools.py"
-      ],
-      "exception_detail": {
-        "claim": "The tool exposes only bounded native iPad authorization metadata and no private user content.",
-        "evidence": "Fixed capability set, exact agent/session binding, device-job receipts, host semantic validation, strict top-level and nested schemas, and tests that reject capability or result drift."
-      },
-      "justification_kind": "distinct_authority_boundary",
-      "operation_alternative_considered": "Generic arbitrary Juno Python was rejected because callers could access broader native APIs and could not enforce the fixed permission-only result schema.",
-      "rationale": "Native permission state is a distinct device boundary from document-provider storage and must be inspectable without granting a generic native-call primitive.",
-      "tool_contract": {
-        "authority_class": "mutation",
-        "category": "device-worker",
-        "effects": [
-          "device-job-execute",
-          "receipt-create"
-        ],
-        "read_only": false,
-        "reversibility": "not-applicable-device-job-and-receipt-retained",
-        "risk_class": "medium",
-        "tool": "ipad_native_permission_status"
-      }
-    },
     "ipad_native_permission_request": {
       "evidence_refs": [
         "docs:juno-ipad-agent.md",
@@ -1499,6 +1642,31 @@
         "reversibility": "manual-permission-change-in-ipados-settings",
         "risk_class": "high",
         "tool": "ipad_native_permission_request"
+      }
+    },
+    "ipad_native_permission_status": {
+      "evidence_refs": [
+        "docs:juno-ipad-agent.md",
+        "tests:test_juno_tools.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool exposes only bounded native iPad authorization metadata and no private user content.",
+        "evidence": "Fixed capability set, exact agent/session binding, device-job receipts, host semantic validation, strict top-level and nested schemas, and tests that reject capability or result drift."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "Generic arbitrary Juno Python was rejected because callers could access broader native APIs and could not enforce the fixed permission-only result schema.",
+      "rationale": "Native permission state is a distinct device boundary from document-provider storage and must be inspectable without granting a generic native-call primitive.",
+      "tool_contract": {
+        "authority_class": "mutation",
+        "category": "device-worker",
+        "effects": [
+          "device-job-execute",
+          "receipt-create"
+        ],
+        "read_only": false,
+        "reversibility": "not-applicable-device-job-and-receipt-retained",
+        "risk_class": "medium",
+        "tool": "ipad_native_permission_status"
       }
     },
     "ipad_permission_probe": {
@@ -1861,126 +2029,6 @@
         "reversibility": "not-applicable",
         "risk_class": "low",
         "tool": "repoground_range_get"
-      }
-    },
-    "grabowski_host_capability_resolve": {
-      "evidence_refs": [
-        "heim-pc:pull-request-105",
-        "systemkatalog:pull-request-170",
-        "tests:tests/test_operator_context.py",
-        "contract:docs/agent-facing-contract.md"
-      ],
-      "exception_detail": {
-        "claim": "The tool exposes one read-only resolution shape over the installed, byte-identical host operator-entry capabilityLocators contract without copying capability policy or gaining execution authority.",
-        "evidence": "Exact declared-intent matching, locator-only authority kind, bounded no-follow contract reads, installed/canonical SHA equality, HOME-template validation, no-match and drift fail-closed tests, and a real transcription locator smoke against the installed heim-pc contract."
-      },
-      "justification_kind": "material_call_shape",
-      "operation_alternative_considered": "Generic file or terminal reads were rejected because callers would have to discover the host contract, verify its canonical byte identity, validate templates and ambiguity, parse locator authority boundaries, and could silently duplicate provider or model selection logic.",
-      "rationale": "Host-local capabilities need one stable typed lookup before implementation selection. The resolver returns only the owning locator and authority from the host contract; it performs no child command and grants no cloud, metered, file-access or runtime-readiness authority.",
-      "tool_contract": {
-        "authority_class": "read",
-        "category": "knowledge",
-        "effects": [],
-        "read_only": true,
-        "reversibility": "not-applicable",
-        "risk_class": "low",
-        "tool": "grabowski_host_capability_resolve"
-      }
-    },
-    "grabowski_systemkatalog_query": {
-      "evidence_refs": [
-        "systemkatalog:heimgewebe/systemkatalog#164",
-        "bureau:candidate-36ef5b573fc8730e48f6d82b",
-        "tests:tests/test_systemkatalog_surface.py"
-      ],
-      "exception_detail": {
-        "claim": "The tool exposes one bounded query shape over the canonical, revision-bound Systemkatalog v2 contract without copying catalog truth.",
-        "evidence": "Exact operation and value schema, clean canonical checkout and origin binding, query-script digest, bounded subprocess, strict v2 envelope validation, manifest/source-evidence validation and fail-closed tests."
-      },
-      "justification_kind": "material_call_shape",
-      "operation_alternative_considered": "Generic file and terminal tools were rejected because they require callers to discover private paths, compose argv, parse JSON and independently reconstruct commit, manifest and source-evidence validation.",
-      "rationale": "Stable ecosystem semantics need one query-specific typed response whose shape differs materially from generic file, terminal, RepoGround and runtime-status surfaces. One endpoint covers all Systemkatalog operations and adds no service, cache or writable truth.",
-      "tool_contract": {
-        "authority_class": "read",
-        "category": "knowledge",
-        "effects": [],
-        "read_only": true,
-        "reversibility": "not-applicable",
-        "risk_class": "low",
-        "tool": "grabowski_systemkatalog_query"
-      }
-    },
-    "grabowski_recovery_provenance_assess": {
-      "evidence_refs": [
-        "contract:provenance-recovery-lane-v1",
-        "tests:test_provenance_recovery.py",
-        "tests:test_release_lifecycle.py"
-      ],
-      "exception_detail": {
-        "claim": "The tool reports only whether the narrow provenance repair lane would admit one exact commit, and grants nothing.",
-        "evidence": "Read-only gate evaluation over audit chain, kill switch, backup freshness, privileged broker readiness, revision-bound source identity, target-commit contract validity under the target's own canonical schema, and absence of a competing deployment mutation."
-      },
-      "justification_kind": "distinct_authority_boundary",
-      "operation_alternative_considered": "grabowski_recovery_status was rejected because it evaluates the power-worker gate, which itself depends on deployment_provenance; a lane that exists precisely because that flag is false cannot be assessed through a surface gated on it.",
-      "rationale": "When deployment provenance is invalid, every ordinary read that reports repair readiness is downstream of the broken flag. A separate read surface lets an operator inspect a blocked repair lane without deriving anything from the runtime under repair.",
-      "tool_contract": {
-        "authority_class": "read",
-        "category": "recovery",
-        "effects": [],
-        "read_only": true,
-        "reversibility": "not-applicable",
-        "risk_class": "low",
-        "tool": "grabowski_recovery_provenance_assess"
-      }
-    },
-    "grabowski_recovery_provenance_repair": {
-      "evidence_refs": [
-        "contract:provenance-recovery-lane-v1",
-        "tests:test_provenance_recovery.py",
-        "tests:test_release_lifecycle.py"
-      ],
-      "exception_detail": {
-        "claim": "The tool owns exactly one transition: replacing an integrity-invalid deployed runtime with a build of one exact, verified commit.",
-        "evidence": "Refuses unless the runtime is actually integrity-invalid; requires valid writable audit chain, clear kill switch, fresh local backup evidence, a healthy privileged broker, a clean revision-bound source whose HEAD and origin/main equal the named commit, a target contract that validates under the target commit's own canonical schema and deploys that schema, and no competing deployment mutation. Grants no shell, command or power-worker authority; normal gates apply again after repair."
-      },
-      "justification_kind": "distinct_authority_boundary",
-      "operation_alternative_considered": "grabowski_runtime_deploy_schedule and grabowski_power_run were both rejected: each derives authority from the deployment provenance this lane exists to repair, so reusing either would either stay deadlocked or require weakening a gate that must keep applying to ordinary effects.",
-      "rationale": "A fail-closed integrity gate must not close over its own repair path. This is the single narrowest authority that can restore a valid runtime, deliberately separated from general deployment and power authority so that a broken release unlocks nothing except its own replacement.",
-      "tool_contract": {
-        "authority_class": "mutation",
-        "category": "recovery",
-        "effects": [
-          "audit-record",
-          "durable-job-start",
-          "runtime-deployment"
-        ],
-        "read_only": false,
-        "reversibility": "previous-release-retained",
-        "risk_class": "high",
-        "tool": "grabowski_recovery_provenance_repair"
-      }
-    },
-    "grabowski_operational_guidance": {
-      "evidence_refs": [
-        "bureau:GRABOWSKI-OPERATOR-SURFACE-V1-T191",
-        "tests:test_operational_guidance.py",
-        "contract:operational-runbook.v1"
-      ],
-      "exception_detail": {
-        "claim": "The tool exposes only bounded, cited operational guidance derived from existing Systemkatalog and RepoGround evidence in shadow mode and never grants task, policy, retry, recovery or execution authority.",
-        "evidence": "Bounded runbook parsing, revision-bound source selection, deterministic ranking, stale/ambiguous/no-match outcomes, explicit evidence refs, read-only MCP annotations, bundle_registry capability guard and focused negative tests."
-      },
-      "justification_kind": "material_call_shape",
-      "operation_alternative_considered": "Direct Systemkatalog and RepoGround calls were retained as the underlying truth sources, but requiring callers to reconstruct the operational-runbook contract, source ranking, ambiguity handling and stale-evidence boundaries would duplicate decision logic outside Grabowski and lose a typed guidance result.",
-      "rationale": "Operational guidance has a materially distinct bounded evidence-synthesis response shape. Publishing one read-only tool centralizes deterministic runbook selection while preserving the underlying source authorities and adds no state store or mutation path.",
-      "tool_contract": {
-        "authority_class": "read",
-        "category": "knowledge",
-        "effects": [],
-        "read_only": true,
-        "reversibility": "not-applicable",
-        "risk_class": "low",
-        "tool": "grabowski_operational_guidance"
       }
     }
   },

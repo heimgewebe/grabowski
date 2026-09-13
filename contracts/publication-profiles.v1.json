@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "75ac50665221bcd87dc459b3c71e70363eabf265c626c0590c069afd8d88808e"
+    "sha256": "4e25bada445a7995325a9406df2fe81a4f7b5940faa2df15588120d4a13956e5"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "06596f58e051d68a8f4778dce6ac81f22903f22882118537f91a955899abecdc"
+    "sha256": "8678eaef30000f9ec1850bd7613639359857532cefef69d2c723ee977e90dd3c"
   },
   "counts": {
     "core": 23,
-    "full": 196,
-    "operator": 180
+    "full": 198,
+    "operator": 182
   },
   "profiles": {
     "core": [
@@ -110,6 +110,8 @@
       "grabowski_checkout_retain",
       "grabowski_checkout_archive",
       "grabowski_checkout_cleanup",
+      "grabowski_checkout_uncertainty_status",
+      "grabowski_checkout_uncertainty_reconcile",
       "grabowski_github",
       "grabowski_user_service",
       "grabowski_tmux_list",
@@ -297,6 +299,8 @@
       "grabowski_checkout_retain",
       "grabowski_checkout_archive",
       "grabowski_checkout_cleanup",
+      "grabowski_checkout_uncertainty_status",
+      "grabowski_checkout_uncertainty_reconcile",
       "grabowski_github",
       "grabowski_user_service",
       "grabowski_tmux_list",
