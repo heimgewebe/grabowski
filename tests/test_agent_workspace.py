@@ -397,6 +397,22 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.addCleanup(self.renew_patch.stop)
         self.addCleanup(self.temp.cleanup)
 
+    def test_route_risk_flags_match_canonical_router_vocabulary(self) -> None:
+        self.assertEqual(
+            workspace.ROUTE_RISK_FLAGS,
+            workspace.coding_agent_router.CANONICAL_ROUTING_RISK_FLAGS,
+        )
+        facts = complete_route_evidence()["input_facts"]
+        facts["risk_flags"] = sorted(
+            workspace.coding_agent_router.CANONICAL_ROUTING_RISK_FLAGS
+        )
+
+        normalized = workspace._normalize_route_input_facts(
+            facts, schema_version=2
+        )
+
+        self.assertEqual(normalized["risk_flags"], facts["risk_flags"])
+
     def manifest(self, *, with_writer: bool = True) -> dict:
         if with_writer and not self.git.writer.exists():
             self.git.add_writer()

@@ -1619,6 +1619,8 @@ class CodingAgentRouterTests(unittest.TestCase):
         for harness, state in self.state["catalog"]["harnesses"].items():
             state["available"] = harness in {"claude", "antigravity"}
         self.state["pools"]["claude-pro"] = {"remaining_ratio": 0.9}
+        self.state["pools"]["antigravity-gemini"] = {"remaining_ratio": 0.9}
+        self.state["pools"]["antigravity-account"] = {"remaining_ratio": 0.9}
         self._write_state()
 
         result = self._route(
@@ -2009,6 +2011,54 @@ class CodingAgentRouterTests(unittest.TestCase):
                 risk_flags=[],
                 effect_profile="delivery",
             )
+
+    def test_delivery_rejects_advisory_only_independent_reviewer(self) -> None:
+        for harness, state in self.state["catalog"]["harnesses"].items():
+            state["available"] = harness in {"claude", "antigravity"}
+        self.state["pools"]["claude-pro"] = {"remaining_ratio": 0.9}
+        self._write_state()
+        original_rank_routes = router._rank_routes
+
+        def rank_routes_with_advisory_reviewer(
+            task_class: str,
+            catalog: dict,
+            state: dict,
+            route_derivations: dict | None = None,
+            **inputs: object,
+        ) -> tuple[list[dict], dict[str, list[str]]]:
+            if inputs.get("reviewer") is True:
+                return (
+                    [
+                        {
+                            "route": "advisory-review",
+                            "execution_eligible_if_separately_authorized": False,
+                        }
+                    ],
+                    {},
+                )
+            return original_rank_routes(
+                task_class,
+                catalog,
+                state,
+                route_derivations=route_derivations,
+                **inputs,
+            )
+
+        with mock.patch.object(
+            router, "_rank_routes", side_effect=rank_routes_with_advisory_reviewer
+        ):
+            with self.assertRaisesRegex(
+                router.CodingAgentRouterError,
+                "requires an available independent reviewer route",
+            ):
+                self._route(
+                    "bounded-patch",
+                    changed_files=2,
+                    duration_minutes=30,
+                    novelty="medium",
+                    verification_policy="independent_review",
+                    effect_profile="delivery",
+                )
 
     def test_request_validation_rejects_coercive_values(self) -> None:
         with self.assertRaisesRegex(router.CodingAgentRouterError, "boolean"):

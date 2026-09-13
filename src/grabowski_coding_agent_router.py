@@ -2536,6 +2536,13 @@ def canonical_execution_route(
     review_gap_value = max(
         0, (1 if independent_review_required else 0) - len(reviewers)
     )
+    delivery_review_ready = (
+        not independent_review_required
+        or any(
+            reviewer.get("execution_eligible_if_separately_authorized") is True
+            for reviewer in reviewers
+        )
+    )
     external_primary_review = bool(
         direct_review_task
         and isinstance(selected_reviewer, dict)
@@ -2586,7 +2593,7 @@ def canonical_execution_route(
         raise CodingAgentRouterError(
             "effect_profile=delivery requires an eligible scoped_writer route"
         )
-    if effect_profile == "delivery" and review_gap_value:
+    if effect_profile == "delivery" and not delivery_review_ready:
         raise CodingAgentRouterError(
             "effect_profile=delivery requires an available independent reviewer route"
         )
