@@ -1847,6 +1847,40 @@ class CheckoutLifecycleTests(unittest.TestCase):
         release_mock.assert_called_once()
         self.assertEqual(verify_mock.call_count, 2)
 
+    def test_cleanup_no_effect_clearance_failure_retains_operation_lease(self) -> None:
+        archive = self._archive()["archive"]
+        expected_identity = checkouts.physical_checkout.capture_physical_checkout_identity(self.checkout)
+        dry_run = checkouts.grabowski_checkout_cleanup(
+            str(self.repo), str(self.checkout), "owner-a", dry_run=True,
+            archive_id=archive["archive_id"], expected_head=self.head, expected_branch="topic",
+            expected_physical_identity=expected_identity,
+        )
+        real_acquire = checkouts._acquire_checkout_resources
+        real_verify = checkouts.physical_checkout.verify_physical_checkout_identity
+        acquired = [False]
+        def acquire_then_mark(*args, **kwargs):
+            lease = real_acquire(*args, **kwargs); acquired[0] = True; return lease
+        def verify_then_drift(expected):
+            if not acquired[0]: return real_verify(expected)
+            raise checkouts.physical_checkout.PhysicalCheckoutIdentityError("simulated replacement after resource acquisition")
+        with (
+            patch.object(checkouts, "_acquire_checkout_resources", side_effect=acquire_then_mark),
+            patch.object(checkouts.physical_checkout, "verify_physical_checkout_identity", side_effect=verify_then_drift),
+            patch.object(checkouts, "_clear_checkout_operation_uncertainty", side_effect=sqlite3.OperationalError("simulated fence clearance failure")),
+            patch.object(checkouts, "_release_checkout_resources") as release_mock,
+            patch.object(checkouts.operator, "_run", side_effect=AssertionError("cleanup Git mutation must not run")),
+        ):
+            with self.assertRaisesRegex(sqlite3.OperationalError, "simulated fence clearance failure"):
+                checkouts.grabowski_checkout_cleanup(
+                    str(self.repo), str(self.checkout), "owner-a", dry_run=False,
+                    plan_id=dry_run["dry_run_record"]["plan_id"],
+                    expected_plan_sha256=dry_run["plan"]["plan_sha256"],
+                    expected_physical_identity=expected_identity, confirmation="remove-linked-checkout",
+                )
+        release_mock.assert_not_called()
+        fences = checkouts._active_checkout_operation_uncertainties()
+        self.assertEqual(len(fences), 1); self.assertEqual(fences[0]["operation"], "cleanup")
+
     def test_cleanup_retains_resources_when_git_mutation_outcome_is_unknown(self) -> None:
         archive = self._archive()["archive"]
         expected_identity = checkouts.physical_checkout.capture_physical_checkout_identity(
@@ -2013,6 +2047,49 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertIsNotNone(row["cleared_at_unix"])
         clearance = checkouts.json.loads(row["clearance_json"])
         self.assertEqual(clearance["outcome"], "confirmed_no_effect")
+
+    def test_archive_no_effect_clearance_failure_retains_operation_lease(self) -> None:
+        expected_identity = checkouts.physical_checkout.capture_physical_checkout_identity(self.checkout)
+        real_acquire = checkouts._acquire_checkout_resources
+        real_verify = checkouts.physical_checkout.verify_physical_checkout_identity
+        acquired = [False]
+        def acquire_then_mark(*args, **kwargs):
+            lease = real_acquire(*args, **kwargs); acquired[0] = True; return lease
+        def verify_then_drift(expected):
+            if not acquired[0]: return real_verify(expected)
+            raise checkouts.physical_checkout.PhysicalCheckoutIdentityError("simulated replacement after resource acquisition")
+        with (
+            patch.object(checkouts, "_acquire_checkout_resources", side_effect=acquire_then_mark),
+            patch.object(checkouts.physical_checkout, "verify_physical_checkout_identity", side_effect=verify_then_drift),
+            patch.object(checkouts, "_clear_checkout_operation_uncertainty", side_effect=sqlite3.OperationalError("simulated fence clearance failure")),
+            patch.object(checkouts, "_release_checkout_resources") as release_mock,
+            patch.object(checkouts.operator, "_run", side_effect=AssertionError("archive Git mutation must not run")),
+        ):
+            with self.assertRaisesRegex(sqlite3.OperationalError, "simulated fence clearance failure"):
+                checkouts.grabowski_checkout_archive(
+                    str(self.repo), str(self.checkout), "owner-a", "identity-bound archive",
+                    int(time.time()) + 3600, self.head, "topic", expected_physical_identity=expected_identity,
+                )
+        release_mock.assert_not_called()
+        fences = checkouts._active_checkout_operation_uncertainties()
+        self.assertEqual(len(fences), 1); self.assertEqual(fences[0]["operation"], "archive")
+
+    def test_archive_uncertainty_readback_accepts_absent_legacy_lifecycle(self) -> None:
+        expected_identity = checkouts.physical_checkout.capture_physical_checkout_identity(self.checkout)
+        def fail_archive_audit(record):
+            if record.get("operation") == "checkout-archive":
+                raise RuntimeError("simulated archive audit failure after durable archive")
+        with patch.object(checkouts.base, "_append_audit", side_effect=fail_archive_audit):
+            with self.assertRaisesRegex(RuntimeError, "simulated archive audit failure"):
+                checkouts.grabowski_checkout_archive(
+                    str(self.repo), str(self.checkout), "owner-a", "diagnostic archive",
+                    int(time.time()) + 3600, self.head, "topic", expected_physical_identity=expected_identity,
+                )
+        fences = checkouts._active_checkout_operation_uncertainties()
+        self.assertEqual(len(fences), 1)
+        self.assertIsNone(checkouts._lifecycle_bindings([fences[0]["checkout_key"]]).get(fences[0]["checkout_key"]))
+        readback = checkouts._archive_uncertainty_readback(fences[0])
+        self.assertEqual(readback["state"], "confirmed_success")
 
     def test_partial_archive_failure_remains_durably_fenced_after_lease_expiry(self) -> None:
         expected_identity = checkouts.physical_checkout.capture_physical_checkout_identity(

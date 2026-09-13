@@ -1751,9 +1751,14 @@ def _archive_uncertainty_readback(fence: dict[str, Any]) -> dict[str, Any]:
             and archive.get("branch") == evidence["expected_branch"]
             and archive.get("owner_id") == evidence["owner_id"]
             and Path(str(archive["manifest_path"])).is_file()
-            and isinstance(lifecycle, dict)
-            and lifecycle.get("phase") == "archived"
-            and lifecycle.get("owner_id") == evidence["owner_id"]
+            and (
+                lifecycle is None
+                or (
+                    isinstance(lifecycle, dict)
+                    and lifecycle.get("phase") == "archived"
+                    and lifecycle.get("owner_id") == evidence["owner_id"]
+                )
+            )
         ):
             return {
                 "state": "confirmed_success",
@@ -4635,7 +4640,6 @@ def grabowski_checkout_archive(
                     # At least one recovery ref exists, so archive effects are partial
                     # and the durable fence must remain until reconciliation.
                     raise
-                lease_release = _release_checkout_resources(lease)
                 _clear_checkout_operation_uncertainty(
                     uncertainty_fence["fence_id"],
                     outcome="confirmed_no_effect",
@@ -4644,9 +4648,9 @@ def grabowski_checkout_archive(
                             "physical-identity-precondition-failed-before-first-archive-git-mutation"
                         ),
                         "archive_id": archive_id,
-                        "lease_release": lease_release,
                     },
                 )
+                _release_checkout_resources(lease)
                 raise
             recovery_refs.append(created_ref)
         manifest_dir = _archive_directory(archive_id)
@@ -5108,15 +5112,14 @@ def grabowski_checkout_cleanup(
             ),
         )
     except CheckoutPhysicalIdentityPreconditionError:
-        lease_release = _release_checkout_resources(lease)
         _clear_checkout_operation_uncertainty(
             uncertainty_fence["fence_id"],
             outcome="confirmed_no_effect",
             evidence={
                 "reason": "physical-identity-precondition-failed-before-git-mutation",
-                "lease_release": lease_release,
             },
         )
+        _release_checkout_resources(lease)
         raise
     applied = _now()
     with _database() as connection:

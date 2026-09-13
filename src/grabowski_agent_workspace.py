@@ -13261,6 +13261,57 @@ def _verified_workspace_cleanup_archive(
     return archive if head_ref_valid else None
 
 
+def _workspace_reconcile_checkout_uncertainty(
+    *,
+    checkout_key: str,
+    owner: str,
+    operation: str,
+    operation_id: str,
+    expected_evidence: dict[str, Any],
+    release_operation_lease: bool = False,
+) -> dict[str, Any] | None:
+    active_fences = [
+        fence
+        for fence in checkouts._active_checkout_operation_uncertainties()
+        if fence.get("checkout_key") == checkout_key
+    ]
+    if not active_fences:
+        return None
+    matching_fences = [
+        fence
+        for fence in active_fences
+        if fence.get("operation") == operation
+        and fence.get("operation_id") == operation_id
+        and fence.get("owner_id") == owner
+        and isinstance(fence.get("evidence"), dict)
+        and all(fence["evidence"].get(key) == value for key, value in expected_evidence.items())
+    ]
+    if len(active_fences) != 1 or len(matching_fences) != 1:
+        raise AgentWorkspaceActionError(
+            f"workspace {operation} reconciliation found conflicting checkout uncertainty fence"
+        )
+    fence = matching_fences[0]
+    if release_operation_lease:
+        # Primary post-state was already verified. The durable fence remains active
+        # while the short-lived operation lease is released, so no authority gap opens.
+        checkouts._release_uncertainty_fence_resources(fence)
+    reconciliation = checkouts.grabowski_checkout_uncertainty_reconcile(
+        fence["fence_id"],
+        "reconcile-checkout-operation-outcome",
+    )
+    if reconciliation.get("state") not in {"reconciled", "already_reconciled"}:
+        readback = reconciliation.get("readback")
+        reason = (
+            readback.get("reason")
+            if isinstance(readback, dict)
+            else reconciliation.get("reason")
+        ) or "outcome-not-proven"
+        raise AgentWorkspaceActionError(
+            f"workspace {operation} uncertainty remains fenced: {reason}"
+        )
+    return reconciliation
+
+
 def _workspace_cleanup_finalize_missing(
     manifest: dict[str, Any], expected_plan_sha256: str, owner: str
 ) -> dict[str, Any] | None:
@@ -13278,43 +13329,19 @@ def _workspace_cleanup_finalize_missing(
         raise AgentWorkspaceActionError(
             "workspace cleanup reconciliation lacks exact checkout cleanup identity"
         )
-    active_fences = [
-        fence
-        for fence in checkouts._active_checkout_operation_uncertainties()
-        if fence.get("checkout_key") == checkout_key
-    ]
-    uncertainty_reconciliation = None
-    if active_fences:
-        matching_fences = [
-            fence
-            for fence in active_fences
-            if fence.get("operation") == "cleanup"
-            and fence.get("operation_id") == cleanup_plan_id
-            and fence.get("owner_id") == owner
-            and isinstance(fence.get("evidence"), dict)
-            and fence["evidence"].get("archive_id") == archive.get("archive_id")
-            and fence["evidence"].get("plan_id") == cleanup_plan_id
-            and fence["evidence"].get("checkout_key") == checkout_key
-            and fence["evidence"].get("owner_id") == owner
-        ]
-        if len(active_fences) != 1 or len(matching_fences) != 1:
-            raise AgentWorkspaceActionError(
-                "workspace cleanup reconciliation found conflicting checkout uncertainty fence"
-            )
-        uncertainty_reconciliation = (
-            checkouts.grabowski_checkout_uncertainty_reconcile(
-                matching_fences[0]["fence_id"],
-                "reconcile-checkout-operation-outcome",
-            )
-        )
-        if uncertainty_reconciliation.get("state") not in {
-            "reconciled",
-            "already_reconciled",
-        }:
-            reason = uncertainty_reconciliation.get("reason", "outcome-not-proven")
-            raise AgentWorkspaceActionError(
-                f"workspace cleanup uncertainty remains fenced: {reason}"
-            )
+    uncertainty_reconciliation = _workspace_reconcile_checkout_uncertainty(
+        checkout_key=checkout_key,
+        owner=owner,
+        operation="cleanup",
+        operation_id=cleanup_plan_id,
+        expected_evidence={
+            "archive_id": archive.get("archive_id"),
+            "plan_id": cleanup_plan_id,
+            "checkout_key": checkout_key,
+            "owner_id": owner,
+        },
+        release_operation_lease=True,
+    )
     return {
         "archive_id": archive["archive_id"],
         "checkout_cleanup_plan_id": cleanup_plan_id,
@@ -13822,6 +13849,20 @@ def grabowski_agent_workspace_cleanup(
                     if recovered_archive is None:
                         raise
                     archive_id = str(recovered_archive["archive_id"])
+                    _workspace_reconcile_checkout_uncertainty(
+                        checkout_key=checkout_key,
+                        owner=owner,
+                        operation="archive",
+                        operation_id=archive_id,
+                        expected_evidence={
+                            "archive_id": archive_id,
+                            "checkout_key": checkout_key,
+                            "owner_id": owner,
+                            "expected_head": str(plan["checkout"]["head"]),
+                            "expected_branch": str(plan["checkout"]["branch"]),
+                        },
+                        release_operation_lease=True,
+                    )
                     with _lock(identifier):
                         current_manifest = _manifest(identifier)
                         current_intent = current_manifest.get(

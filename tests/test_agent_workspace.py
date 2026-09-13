@@ -7895,6 +7895,42 @@ class AgentWorkspaceTests(unittest.TestCase):
             )
             self.assertEqual(receipt["archive_id"], result["archive"]["archive_id"])
 
+    def test_cleanup_reconciles_post_commit_archive_audit_failure_and_clears_fence(self) -> None:
+        manifest = self._closed_cleanup_manifest()
+        checkout_state = self.root / "checkout-state-archive-audit-recovery"
+        patches = [
+            mock.patch.object(workspace.checkouts, "CHECKOUT_DB", checkout_state / "checkouts.sqlite3"),
+            mock.patch.object(workspace.checkouts, "ARCHIVE_ROOT", checkout_state / "archives"),
+            mock.patch.object(workspace.checkouts, "CHECKOUT_LOCK", checkout_state / "checkouts.lock"),
+            mock.patch.object(workspace.checkouts.resources, "RESOURCE_DB", checkout_state / "resources.sqlite3"),
+            mock.patch.object(workspace.checkouts.tasks, "TASK_DB", checkout_state / "tasks.sqlite3"),
+            mock.patch.object(workspace.checkouts.operator, "_safe_environment", return_value=os.environ.copy()),
+            mock.patch.object(workspace.checkouts.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.checkouts.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.checkouts, "_processes_under", return_value=[]),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+        ]
+        def fail_archive_audit(record: dict) -> None:
+            if record.get("operation") == "checkout-archive":
+                raise RuntimeError("simulated archive audit failure after durable archive")
+        with (
+            patches[0], patches[1], patches[2], patches[3], patches[4], patches[5],
+            patches[6], patches[7], patches[8], patches[9], patches[10],
+            mock.patch.object(workspace.checkouts.base, "_append_audit", side_effect=fail_archive_audit),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan([manifest["workspace_id"]])["plans"][0]
+            archived = workspace.grabowski_agent_workspace_cleanup(
+                manifest["workspace_id"], plan["plan_sha256"], "archive-and-remove-worktree"
+            )
+            self.assertEqual(archived["state"], "archived_waiting_for_cleanup")
+            self.assertTrue(self.git.writer.exists())
+            self.assertEqual(workspace.checkouts._active_checkout_operation_uncertainties(), [])
+            effect = archived["lifecycle_effect"]
+            self.assertEqual(effect["status"], "succeeded")
+            self.assertTrue(effect["execution_id"].endswith(":reconcile"))
+            self.assertEqual(effect["supersedes"]["status"], "recovery_required")
+
     def test_cleanup_retention_unknown_requires_recovery_and_blocks_blind_retry(self) -> None:
         manifest = self._closed_cleanup_manifest()
         checkout_state = self.root / "checkout-state-recovery"
