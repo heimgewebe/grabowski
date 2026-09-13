@@ -48,12 +48,14 @@ jobs:
 
       - name: Run focused regressions
         run: |
-          python -B -m pytest -q -p no:cacheprovider \
-            tests/test_agent_workspace.py::AgentWorkspaceTests::test_cleanup_reconciles_ambiguous_post_apply_without_second_mutation \
-            tests/test_agent_workspace.py::AgentWorkspaceTests::test_cleanup_reconciles_post_commit_audit_failure_and_clears_fence
+          PYTHONPATH=tests python -B -m unittest -v \
+            test_agent_workspace.AgentWorkspaceTests.test_cleanup_reconciles_ambiguous_post_apply_without_second_mutation \
+            test_agent_workspace.AgentWorkspaceTests.test_cleanup_reconciles_post_commit_audit_failure_and_clears_fence
 
       - name: Run lifecycle regression suites
-        run: python -B -m pytest -q -p no:cacheprovider tests/test_checkouts.py tests/test_agent_workspace.py
+        run: |
+          python -B -m unittest discover -s tests -p 'test_checkouts.py' -v
+          python -B -m unittest discover -s tests -p 'test_agent_workspace.py' -v
 
       - name: Verify diff hygiene
         run: git diff --check
