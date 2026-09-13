@@ -17,6 +17,7 @@ import uuid
 from typing import Any, Iterable, Mapping
 
 import grabowski_mcp as base
+import grabowski_physical_checkout as physical_checkout
 import grabowski_resources as resources
 import grabowski_tasks as tasks
 try:
@@ -56,7 +57,7 @@ BINDING_IDENTITY_REBIND_CONFIRMATION = "rebind-checkout-lifecycle-identity"
 MAX_RETENTION_SECONDS = 365 * 24 * 60 * 60
 # Compatibility telemetry remains in schema 2; cleanup itself is immediately eligible.
 CHECKOUT_CLEANUP_GRACE_SECONDS = 0
-CLEANUP_PLAN_SCHEMA_VERSION = 2
+CLEANUP_PLAN_SCHEMA_VERSION = 3
 CLEANUP_PLAN_HASH_EXCLUDED_FIELDS = (
     "archive_age_seconds",
     "remote_secured",
@@ -273,6 +274,22 @@ def _safe_path(raw: str | Path, *, must_exist: bool) -> Path:
     return path.resolve(strict=must_exist)
 
 
+def _verify_expected_physical_checkout_identity(
+    checkout: Path, expected: dict[str, Any]
+) -> dict[str, Any]:
+    root = expected.get("root") if isinstance(expected, dict) else None
+    if not isinstance(root, dict) or root.get("path") != str(checkout):
+        raise RuntimeError(
+            "Checkout physical identity precondition does not belong to checkout path"
+        )
+    try:
+        return physical_checkout.verify_physical_checkout_identity(expected)
+    except physical_checkout.PhysicalCheckoutIdentityError as exc:
+        raise RuntimeError(
+            f"Checkout physical identity precondition failed: {exc}"
+        ) from exc
+
+
 def _resolve_repo(raw: str | Path) -> Path:
     repo = _safe_path(raw, must_exist=True)
     if not repo.is_dir():
@@ -331,8 +348,24 @@ def _operation_lock():
         os.close(descriptor)
 
 
-def _git_mutate(repo: Path, arguments: list[str], *, timeout_seconds: int = 60) -> dict[str, Any]:
+def _git_mutate(
+    repo: Path,
+    arguments: list[str],
+    *,
+    timeout_seconds: int = 60,
+    expected_physical_identity: dict[str, Any] | None = None,
+    expected_physical_checkout: Path | None = None,
+) -> dict[str, Any]:
+    if (expected_physical_identity is None) != (expected_physical_checkout is None):
+        raise ValueError(
+            "expected_physical_identity and expected_physical_checkout must be supplied together"
+        )
     with _operation_lock():
+        if expected_physical_identity is not None:
+            assert expected_physical_checkout is not None
+            _verify_expected_physical_checkout_identity(
+                expected_physical_checkout, expected_physical_identity
+            )
         result = operator._run(
             ["git", "-C", str(repo), *arguments],
             cwd=repo,
@@ -4211,11 +4244,17 @@ def _cleanup_plan(
     archive_id: str | None,
     expected_head: str | None,
     expected_branch: str | None,
+    expected_physical_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     top_level, common_dir, record = _worktree_for_path(repo_path, checkout)
     status = _require_clean_linked(record)
     if expected_head is not None or expected_branch is not None:
         _require_expected(record, expected_head or str(record.get("head")), expected_branch)
+    verified_physical_identity = None
+    if expected_physical_identity is not None:
+        verified_physical_identity = _verify_expected_physical_checkout_identity(
+            checkout, expected_physical_identity
+        )
     archive = _load_archive(archive_id) if archive_id is not None else _latest_archive_for_key(record["checkout_key"])
     if archive is None:
         raise RuntimeError("Cleanup requires a prior checkout archive")
@@ -4263,6 +4302,7 @@ def _cleanup_plan(
         "owner_id": owner,
         "head": record.get("head"),
         "branch": record.get("branch"),
+        "expected_physical_identity": verified_physical_identity,
         "status": status,
         "retention": retention,
         "retention_active": retention_active,
@@ -4350,6 +4390,7 @@ def grabowski_checkout_cleanup(
     archive_id: str | None = None,
     expected_head: str | None = None,
     expected_branch: str | None = None,
+    expected_physical_identity: dict[str, Any] | None = None,
     plan_id: str | None = None,
     expected_plan_sha256: str | None = None,
     confirmation: str = "",
@@ -4372,6 +4413,7 @@ def grabowski_checkout_cleanup(
             archive_id=archive,
             expected_head=expected_head,
             expected_branch=expected_branch,
+            expected_physical_identity=expected_physical_identity,
         )
         persisted = _persist_dry_run(plan)
         audit = {
@@ -4405,6 +4447,23 @@ def grabowski_checkout_cleanup(
     if stored["expires_at_unix"] <= _now():
         raise RuntimeError("Cleanup dry-run has expired")
     stored_plan = json.loads(stored["plan_json"])
+    stored_physical_identity = stored_plan.get("expected_physical_identity")
+    if stored_physical_identity is None:
+        if expected_physical_identity is not None:
+            raise RuntimeError(
+                "Cleanup dry-run was not bound to a physical checkout identity"
+            )
+    else:
+        if expected_physical_identity is None:
+            raise RuntimeError(
+                "Cleanup apply requires the physical checkout identity from dry-run"
+            )
+        if _canonical_json(expected_physical_identity) != _canonical_json(
+            stored_physical_identity
+        ):
+            raise RuntimeError(
+                "Cleanup physical identity differs from the dry-run precondition"
+            )
     current_plan = _cleanup_plan(
         repo_path=repo_path,
         checkout=checkout,
@@ -4412,6 +4471,7 @@ def grabowski_checkout_cleanup(
         archive_id=stored["archive_id"],
         expected_head=stored_plan["head"],
         expected_branch=stored_plan["branch"],
+        expected_physical_identity=stored_physical_identity,
     )
     if current_plan["plan_sha256"] != expected_hash:
         raise RuntimeError("Cleanup dry-run is stale; rerun dry_run first")
@@ -4436,27 +4496,33 @@ def grabowski_checkout_cleanup(
             "checkout_path": str(checkout),
         },
     )
-    result = _git_mutate(
-        Path(current_plan["repo"]),
-        ["worktree", "remove", str(checkout)],
-        timeout_seconds=120,
-    )
-    applied = _now()
-    with _database() as connection:
-        connection.execute(
-            "UPDATE dry_runs SET applied_at_unix=? WHERE plan_id=?",
-            (applied, plan_id),
+    try:
+        result = _git_mutate(
+            Path(current_plan["repo"]),
+            ["worktree", "remove", str(checkout)],
+            timeout_seconds=120,
+            expected_physical_identity=stored_physical_identity,
+            expected_physical_checkout=(
+                checkout if stored_physical_identity is not None else None
+            ),
         )
-        connection.execute(
-            """
-            UPDATE archives
-            SET cleaned_at_unix=?, cleanup_plan_id=?
-            WHERE archive_id=?
-            """,
-            (applied, plan_id, stored["archive_id"]),
-        )
-        connection.commit()
-    lease_release = _release_checkout_resources(lease)
+        applied = _now()
+        with _database() as connection:
+            connection.execute(
+                "UPDATE dry_runs SET applied_at_unix=? WHERE plan_id=?",
+                (applied, plan_id),
+            )
+            connection.execute(
+                """
+                UPDATE archives
+                SET cleaned_at_unix=?, cleanup_plan_id=?
+                WHERE archive_id=?
+                """,
+                (applied, plan_id, stored["archive_id"]),
+            )
+            connection.commit()
+    finally:
+        lease_release = _release_checkout_resources(lease)
     audit = {
         "timestamp_unix": applied,
         "operation": "checkout-cleanup-apply",
@@ -4468,6 +4534,11 @@ def grabowski_checkout_cleanup(
         "checkout_path": str(checkout),
         "owner_id": owner,
         "branch_preserved": True,
+        "expected_physical_identity_sha256": (
+            stored_physical_identity.get("physical_identity_sha256")
+            if isinstance(stored_physical_identity, dict)
+            else None
+        ),
         "recovery_refs": current_plan["recovery_refs"],
         "resource_keys": [item["resource_key"] for item in lease["leases"]],
         "result": result,

@@ -1704,6 +1704,82 @@ class CheckoutLifecycleTests(unittest.TestCase):
         )
         self.assertNotIn("--force", applied["result"]["argv"])
 
+    def test_cleanup_rechecks_physical_identity_after_resource_acquisition(self) -> None:
+        archive = self._archive()["archive"]
+        expected_identity = checkouts.physical_checkout.capture_physical_checkout_identity(
+            self.checkout
+        )
+        dry_run = checkouts.grabowski_checkout_cleanup(
+            str(self.repo),
+            str(self.checkout),
+            "owner-a",
+            dry_run=True,
+            archive_id=archive["archive_id"],
+            expected_head=self.head,
+            expected_branch="topic",
+            expected_physical_identity=expected_identity,
+        )
+        self.assertEqual(
+            dry_run["plan"]["expected_physical_identity"], expected_identity
+        )
+        acquire = checkouts._acquire_checkout_resources
+        release = checkouts._release_checkout_resources
+        verify = checkouts.physical_checkout.verify_physical_checkout_identity
+        acquired = [False]
+
+        def acquire_then_mark(*args, **kwargs):
+            lease = acquire(*args, **kwargs)
+            acquired[0] = True
+            return lease
+
+        def verify_then_change(expected):
+            if not acquired[0]:
+                return verify(expected)
+            raise checkouts.physical_checkout.PhysicalCheckoutIdentityError(
+                "simulated replacement after resource acquisition"
+            )
+
+        with (
+            patch.object(
+                checkouts,
+                "_acquire_checkout_resources",
+                side_effect=acquire_then_mark,
+            ) as acquire_mock,
+            patch.object(
+                checkouts, "_release_checkout_resources", wraps=release
+            ) as release_mock,
+            patch.object(
+                checkouts.physical_checkout,
+                "verify_physical_checkout_identity",
+                side_effect=verify_then_change,
+            ) as verify_mock,
+            patch.object(
+                checkouts.operator,
+                "_run",
+                side_effect=AssertionError(
+                    "git worktree remove must not run after identity replacement"
+                ),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "physical identity precondition failed"
+            ):
+                checkouts.grabowski_checkout_cleanup(
+                    str(self.repo),
+                    str(self.checkout),
+                    "owner-a",
+                    dry_run=False,
+                    plan_id=dry_run["dry_run_record"]["plan_id"],
+                    expected_plan_sha256=dry_run["plan"]["plan_sha256"],
+                    expected_physical_identity=expected_identity,
+                    confirmation="remove-linked-checkout",
+                )
+
+        self.assertTrue(self.checkout.exists())
+        acquire_mock.assert_called_once()
+        release_mock.assert_called_once()
+        self.assertEqual(verify_mock.call_count, 2)
+
     def test_cleanup_plan_remains_valid_when_only_archive_age_advances(self) -> None:
         archive = self._archive()["archive"]
         assert isinstance(archive, dict)
@@ -1735,7 +1811,7 @@ class CheckoutLifecycleTests(unittest.TestCase):
                 confirmation="remove-linked-checkout",
             )
 
-        self.assertEqual(dry_run["plan"]["schema_version"], 2)
+        self.assertEqual(dry_run["plan"]["schema_version"], 3)
         self.assertEqual(
             dry_run["plan"]["archive_created_at_unix"],
             archive["created_at_unix"],

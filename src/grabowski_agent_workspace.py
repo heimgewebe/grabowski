@@ -13979,6 +13979,7 @@ def grabowski_agent_workspace_cleanup(
             archive_id=str(archive_id),
             expected_head=str(plan["checkout"]["head"]),
             expected_branch=str(plan["checkout"]["branch"]),
+            expected_physical_identity=intent["checkout_physical_identity"],
         )
         cleanup_plan = dry_run["plan"]
         if not cleanup_plan.get("safe_to_apply"):
@@ -14016,6 +14017,7 @@ def grabowski_agent_workspace_cleanup(
                     archive_id=str(archive_id),
                     plan_id=str(dry_run_record["plan_id"]),
                     expected_plan_sha256=str(cleanup_plan["plan_sha256"]),
+                    expected_physical_identity=intent["checkout_physical_identity"],
                     confirmation="remove-linked-checkout",
                 )
                 post_state = _workspace_retention_post_state(
