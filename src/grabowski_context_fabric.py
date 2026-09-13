@@ -910,6 +910,53 @@ def _validated_claim_budget(value: Any) -> int:
     return value
 
 
+def _historical_recall_target_selection(
+    profile_name: str, normalized: dict[str, Any], missing: list[str]
+) -> dict[str, Any]:
+    binding_complete = not missing
+    if profile_name == "pr":
+        selector: dict[str, Any] = {}
+        if "repository" in normalized:
+            selector["repo"] = normalized["repository"]
+        if "pull_request" in normalized:
+            selector["pr_number"] = normalized["pull_request"]
+        exact_target_binding = {"repo", "pr_number"}.issubset(selector)
+        return {
+            "binding": dict(normalized),
+            "binding_complete": binding_complete,
+            "selector_kind": "pull_request",
+            "selector": selector,
+            "selector_source": "derived_from_profile_binding",
+            "exact_target_binding": exact_target_binding,
+            "read_eligible": binding_complete and exact_target_binding,
+            "unsupported_reason": None,
+            "unmatched_history": "discard_without_coarse_fallback",
+        }
+    if profile_name == "bureau":
+        return {
+            "binding": dict(normalized),
+            "binding_complete": binding_complete,
+            "selector_kind": "unavailable_from_profile_binding",
+            "selector": {},
+            "selector_source": "bureau_run_binding_is_not_chronik_agent_run_or_task_identity",
+            "exact_target_binding": False,
+            "read_eligible": False,
+            "unsupported_reason": "exact_bureau_history_selector_not_derivable_from_bureau_run_binding",
+            "unmatched_history": "discard_without_coarse_fallback",
+        }
+    return {
+        "binding": dict(normalized),
+        "binding_complete": binding_complete,
+        "selector_kind": "unavailable_from_profile_binding",
+        "selector": {},
+        "selector_source": "chronik_event_contract_has_no_release_id",
+        "exact_target_binding": False,
+        "read_eligible": False,
+        "unsupported_reason": "exact_deployment_history_selector_not_supported_by_chronik_event_contract",
+        "unmatched_history": "discard_without_coarse_fallback",
+    }
+
+
 def plan_context(profile: Any, binding: Any = None) -> dict[str, Any]:
     """Return the read plan and fail-closed preconditions for one profile."""
     profile_name = _validated_profile(profile)
@@ -938,13 +985,9 @@ def plan_context(profile: Any, binding: Any = None) -> dict[str, Any]:
         "read_when": list(recall_profile["read_when"]),
         "skip_for": list(HISTORICAL_RECALL_POLICY["skip_for"]),
         "requirements": list(HISTORICAL_RECALL_POLICY["requirements"]),
-        "target_selection": {
-            "binding": normalized,
-            "binding_complete": not missing,
-            "read_eligible": not missing,
-            "filter_binding": "use_available_exact_filters_then_confirm_returned_historical_context",
-            "unmatched_history": "discard",
-        },
+        "target_selection": _historical_recall_target_selection(
+            profile_name, normalized, missing
+        ),
         "history_may_replace_required_live_authority": False,
         "does_not_establish": list(HISTORICAL_RECALL_POLICY["does_not_establish"]),
     }
