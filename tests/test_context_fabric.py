@@ -179,10 +179,20 @@ class PlanTests(ContextFabricTestCase):
         self.assertEqual(recall["mode"], "selective_advisory")
         self.assertIn("re_reviewing_or_retrying_bound_pr", recall["read_when"])
         self.assertIn("trivial_read", recall["skip_for"])
-        self.assertEqual(recall["target_selection"]["binding"], PR_BINDING)
-        self.assertTrue(recall["target_selection"]["binding_complete"])
-        self.assertTrue(recall["target_selection"]["read_eligible"])
-        self.assertEqual(recall["target_selection"]["unmatched_history"], "discard")
+        selection = recall["target_selection"]
+        self.assertEqual(selection["binding"], PR_BINDING)
+        self.assertTrue(selection["binding_complete"])
+        self.assertEqual(selection["selector_kind"], "pull_request")
+        self.assertEqual(
+            selection["selector"],
+            {"repo": "heimgewebe/grabowski", "pr_number": PR_BINDING["pull_request"]},
+        )
+        self.assertEqual(selection["selector_source"], "derived_from_profile_binding")
+        self.assertTrue(selection["exact_target_binding"])
+        self.assertTrue(selection["read_eligible"])
+        self.assertEqual(
+            selection["unmatched_history"], "discard_without_coarse_fallback"
+        )
         self.assertFalse(recall["history_may_replace_required_live_authority"])
         self.assertIn("current_truth", recall["does_not_establish"])
         self.assertIn("safe_retry", recall["does_not_establish"])
@@ -201,6 +211,35 @@ class PlanTests(ContextFabricTestCase):
         self.assertFalse(plan["ready"])
         self.assertFalse(recall["target_selection"]["binding_complete"])
         self.assertFalse(recall["target_selection"]["read_eligible"])
+
+    def test_bureau_history_does_not_conflate_bureau_run_with_chronik_agent_run(self) -> None:
+        plan = self.module.plan_context("bureau", dict(BUREAU_BINDING))
+        selection = plan["historical_recall"]["target_selection"]
+        self.assertTrue(plan["ready"])
+        self.assertTrue(selection["binding_complete"])
+        self.assertFalse(selection["exact_target_binding"])
+        self.assertFalse(selection["read_eligible"])
+        self.assertEqual(selection["selector"], {})
+        self.assertIn("not_chronik_agent_run", selection["selector_source"])
+        self.assertEqual(
+            selection["unsupported_reason"],
+            "exact_bureau_history_selector_not_derivable_from_bureau_run_binding",
+        )
+
+    def test_deployment_history_is_ineligible_without_chronik_release_identity(self) -> None:
+        plan = self.module.plan_context("deployment", dict(DEPLOYMENT_BINDING))
+        selection = plan["historical_recall"]["target_selection"]
+        self.assertTrue(plan["ready"])
+        self.assertFalse(selection["exact_target_binding"])
+        self.assertFalse(selection["read_eligible"])
+        self.assertEqual(selection["selector"], {})
+        self.assertEqual(
+            selection["selector_source"], "chronik_event_contract_has_no_release_id"
+        )
+        self.assertEqual(
+            selection["unsupported_reason"],
+            "exact_deployment_history_selector_not_supported_by_chronik_event_contract",
+        )
 
     def test_historical_recall_triggers_are_profile_specific_and_repeat_bound(self) -> None:
         bureau = self.module.plan_context("bureau", dict(BUREAU_BINDING))["historical_recall"]
