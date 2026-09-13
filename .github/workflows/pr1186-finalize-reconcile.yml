@@ -47,15 +47,29 @@ jobs:
           PY
 
       - name: Run focused regressions
+        shell: bash
         run: |
-          PYTHONPATH=tests python -B -m unittest -v \
+          set -eu
+          install -d -m 700 "$PWD/build"
+          test_home="$(mktemp -d "$PWD/build/test-home.XXXXXX")"
+          trap 'rm -rf "$test_home"' EXIT
+          install -d -m 700 "$test_home/.config/grabowski"
+          install -m 600 config/access.home-wide-operator.example.json "$test_home/.config/grabowski/access.json"
+          HOME="$test_home" PYTHONPATH=tests python -B -m unittest -v \
             test_agent_workspace.AgentWorkspaceTests.test_cleanup_reconciles_ambiguous_post_apply_without_second_mutation \
             test_agent_workspace.AgentWorkspaceTests.test_cleanup_reconciles_post_commit_audit_failure_and_clears_fence
 
       - name: Run lifecycle regression suites
+        shell: bash
         run: |
-          python -B -m unittest discover -s tests -p 'test_checkouts.py' -v
-          python -B -m unittest discover -s tests -p 'test_agent_workspace.py' -v
+          set -eu
+          install -d -m 700 "$PWD/build"
+          test_home="$(mktemp -d "$PWD/build/test-home.XXXXXX")"
+          trap 'rm -rf "$test_home"' EXIT
+          install -d -m 700 "$test_home/.config/grabowski"
+          install -m 600 config/access.home-wide-operator.example.json "$test_home/.config/grabowski/access.json"
+          HOME="$test_home" python -B -m unittest discover -s tests -p 'test_checkouts.py' -v
+          HOME="$test_home" python -B -m unittest discover -s tests -p 'test_agent_workspace.py' -v
 
       - name: Verify diff hygiene
         run: git diff --check
