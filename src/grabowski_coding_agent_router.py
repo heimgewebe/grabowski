@@ -2327,23 +2327,28 @@ def canonical_execution_route(
                 "independent review task requires verification_policy=independent_review"
             )
         verification_policy_value = "independent_review"
-    elif review_value or verification_floor_required:
+    elif review_value:
         if verification_policy not in (None, "independent_review"):
-            if review_value:
-                raise CodingAgentRouterError(
-                    "need_review requires verification_policy=independent_review"
-                )
             raise CodingAgentRouterError(
-                "verification floor requires verification_policy=independent_review"
+                "need_review requires verification_policy=independent_review"
             )
         verification_policy_value = "independent_review"
+    elif verification_floor_required:
+        if verification_policy == "deterministic":
+            raise CodingAgentRouterError(
+                "verification floor forbids verification_policy=deterministic"
+            )
+        verification_policy_value = verification_policy or "independent_review"
     else:
         verification_policy_value = verification_policy or "deterministic"
+    independent_review_required = bool(
+        direct_review_task or review_value or verification_floor_required
+    )
     if effect_profile == "delivery" and verification_policy_value != "independent_review":
         raise CodingAgentRouterError(
             "effect_profile=delivery requires verification_policy=independent_review"
         )
-    external_review_requested = verification_policy_value == "independent_review"
+    external_review_requested = independent_review_required
     review_task_class = task_value if direct_review_task else "independent-review"
     common = {
         "changed_files": changed_value,
@@ -2552,6 +2557,7 @@ def canonical_execution_route(
         "writer_route": writer_route,
         "effect_profile": effect_profile,
         "verification_policy": verification_policy_value,
+        "independent_review_required": independent_review_required,
         "verification_floor": {
             "required": verification_floor_required,
             "reasons": verification_floor_reasons,

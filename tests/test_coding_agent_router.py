@@ -1873,10 +1873,28 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertEqual(floored["verification_policy"], "independent_review")
         self.assertTrue(floored["verification_floor"]["required"])
         self.assertEqual(floored["verification_floor"]["reasons"], ["task_class:complex-patch"])
-        for policy in ("deterministic", "competition"):
-            with self.subTest(policy=policy):
-                with self.assertRaisesRegex(router.CodingAgentRouterError, "verification floor requires"):
-                    self._route("complex-patch", need_review=False, novelty="medium", risk_flags=[], verification_policy=policy)
+        self.assertTrue(floored["independent_review_required"])
+        with self.assertRaisesRegex(
+            router.CodingAgentRouterError, "verification floor forbids"
+        ):
+            self._route(
+                "complex-patch",
+                need_review=False,
+                novelty="medium",
+                risk_flags=[],
+                verification_policy="deterministic",
+            )
+        competition_on_floor = self._route(
+            "complex-patch",
+            need_review=False,
+            novelty="medium",
+            risk_flags=[],
+            verification_policy="competition",
+        )
+        self.assertEqual(competition_on_floor["verification_policy"], "competition")
+        self.assertTrue(competition_on_floor["independent_review_required"])
+        self.assertTrue(competition_on_floor["verification_floor"]["required"])
+        self.assertEqual(competition_on_floor["review_quorum"]["external_advisory_target"], 1)
         high_novelty = self._route("bounded-patch", need_review=False, novelty="high", risk_flags=[])
         self.assertEqual(high_novelty["verification_policy"], "independent_review")
         self.assertEqual(high_novelty["verification_floor"]["reasons"], ["novelty:high"])
@@ -1907,6 +1925,7 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertFalse(deterministic["verification_floor"]["required"])
         competition = self._route("bounded-patch", need_review=False, novelty="low", risk_flags=[], verification_policy="competition")
         self.assertEqual(competition["verification_policy"], "competition")
+        self.assertFalse(competition["independent_review_required"])
         self.assertEqual(competition["executor"], deterministic["executor"])
         with self.assertRaisesRegex(router.CodingAgentRouterError, "need_review requires"):
             self._route("bounded-patch", need_review=True, novelty="low", risk_flags=[], verification_policy="competition")
