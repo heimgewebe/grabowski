@@ -13058,10 +13058,12 @@ def _workspace_archive_recovery_readback(
 
 
 def _workspace_retention_post_state(
-    manifest: dict[str, Any], archive_id: str
+    manifest: dict[str, Any], archive_id: str, *, expected_owner: str
 ) -> dict[str, str]:
     archive = checkouts._load_archive(archive_id)
-    archive_post_state = _workspace_archive_post_state(manifest, archive_id)
+    archive_post_state = _workspace_archive_post_state(
+        manifest, archive_id, expected_owner=expected_owner
+    )
     if archive.get("cleaned_at_unix") is None or archive.get("cleanup_plan_id") is None:
         raise AgentWorkspaceActionError(
             "retention convergence archive is not marked cleaned"
@@ -13513,7 +13515,9 @@ def grabowski_agent_workspace_cleanup(
                     reference=_workspace_lifecycle_effect_reference(effect),
                 )
             post_state = _workspace_retention_post_state(
-                manifest, str(reconciliation["archive_id"])
+                manifest,
+                str(reconciliation["archive_id"]),
+                expected_owner=owner,
             )
             effect_receipt = _workspace_lifecycle_effect_finish(
                 effect,
@@ -13935,7 +13939,9 @@ def grabowski_agent_workspace_cleanup(
                     confirmation="remove-linked-checkout",
                 )
                 post_state = _workspace_retention_post_state(
-                    current_manifest, str(archive_id)
+                    current_manifest,
+                    str(archive_id),
+                    expected_owner=owner,
                 )
                 retention_effect_receipt = _workspace_lifecycle_effect_finish(
                     retention_effect,

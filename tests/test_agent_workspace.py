@@ -1987,6 +1987,45 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertFalse(evidence["valid"], evidence)
         self.assertIn("deferred resource release lacks durable convergence evidence", evidence["error"])
 
+    def test_retention_post_state_threads_lane_owner_into_archive_verification(self) -> None:
+        manifest = self.manifest()
+        manifest["writer_worktree"] = str(self.root / "removed-writer")
+        lane_owner = "lane:" + "a" * 32
+        archive = {
+            "cleaned_at_unix": 123,
+            "cleanup_plan_id": "plan-1",
+            "recovery_refs": [{"ref": "refs/test/recovery", "target": self.git.base}],
+        }
+        archive_post_state = {
+            "checkout_archive": "1" * 64,
+            "checkout_archive_manifest": "2" * 64,
+            "checkout_recovery_refs": "3" * 64,
+        }
+        with (
+            mock.patch.object(workspace.checkouts, "_load_archive", return_value=archive),
+            mock.patch.object(
+                workspace,
+                "_workspace_archive_post_state",
+                return_value=archive_post_state,
+            ) as verify_archive,
+            mock.patch.object(
+                workspace.checkouts,
+                "_verify_recovery_refs",
+                return_value=[{"present": True}],
+            ),
+        ):
+            result = workspace._workspace_retention_post_state(
+                manifest, "archive-1", expected_owner=lane_owner
+            )
+
+        verify_archive.assert_called_once_with(
+            manifest, "archive-1", expected_owner=lane_owner
+        )
+        self.assertEqual(
+            result["checkout_archive_manifest"],
+            archive_post_state["checkout_archive_manifest"],
+        )
+
     def test_terminal_lane_missing_checkout_is_historical_not_operationally_owned(self) -> None:
         lane = self.lane_receipt(idempotency_key="terminal-lane-missing-checkout")
         manifest = self.lane_manifest(lane)
