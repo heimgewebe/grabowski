@@ -1340,6 +1340,8 @@ class OperatorSignedTransportTests(unittest.TestCase):
             "https://github.com/heimgewebe/grabowski/pull/1177/nonsense/deeper",
             "https://github.com/heimgewebe/grabowski/pull/1177/files?diff=split",
             "https://github.com/heimgewebe/grabowski/pull/1177/files#discussion_r3997406598",
+            "https://github.com/heimgewebe/grabowski/pull/1177.diff",
+            "https://github.com/heimgewebe/grabowski/pull/1177.patch",
         ):
             with self.subTest(url=url):
                 self.assertEqual(
@@ -1480,6 +1482,19 @@ class OperatorSignedTransportTests(unittest.TestCase):
             operator._github_pr_target_host(
                 ["pr", "list", "--web=maybe"], source
             )
+
+    def test_isolated_github_mixed_short_flag_clusters_are_supported(self) -> None:
+        source = {"GH_HOST": "github.com"}
+        for arguments in (
+            ["pr", "create", "-dt", "Title"],
+            ["pr", "create", "-dtTitle"],
+        ):
+            with self.subTest(arguments=arguments):
+                self.assertEqual(
+                    operator._github_pr_target_host(arguments, source), "github.com"
+                )
+        with self.assertRaisesRegex(RuntimeError, "option value is missing"):
+            operator._github_pr_target_host(["pr", "create", "-dt"], source)
 
     def test_github_wrapper_help_bypasses_credential_lookup(self) -> None:
         for help_flag in ("--help", "-h", "--help=true"):

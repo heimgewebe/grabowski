@@ -74,6 +74,8 @@
       "max_argv": 128,
       "allow_shell": true,
       "policy_intent": "trusted-owner-root-autonomy",
+      "kill_switch_path": "/var/lib/grabowski/operator-blockade/operator-kill-switch",
+      "legacy_kill_switch_path": "/home/alex/.local/state/grabowski/operator-kill-switch",
       "allowed_peer_unit": "grabowski-operator.service",
       "allowed_peer_uid": 1000
     },

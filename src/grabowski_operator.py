@@ -2722,7 +2722,7 @@ def _github_pr_positional_url_host(value: str) -> str:
         or parsed.username is not None
         or parsed.password is not None
         or re.fullmatch(
-            r"/[^/?#\s]+/[^/?#\s]+/pull/[1-9][0-9]*(?:/[^?#\s]*)?", parsed.path
+            r"/[^/?#\s]+/[^/?#\s]+/pull/[1-9][0-9]*(?:/[^?#\s]*|\.(?:diff|patch))?", parsed.path
         )
         is None
     ):
@@ -2779,34 +2779,41 @@ def _github_pr_target_selectors(
                 continue
             raise RuntimeError("trusted GitHub PR option is unsupported for host resolution")
         if not options_done and item.startswith("-") and item != "-":
-            short_flag = item[:2]
-            if short_flag in value_flags:
-                if len(item) == 2:
-                    if index + 1 >= len(arguments):
-                        raise RuntimeError("trusted GitHub PR option value is missing")
-                    index += 2
-                else:
+            short_flag, separator, attached = item.partition("=")
+            if separator and len(short_flag) == 2:
+                if short_flag in value_flags:
                     index += 1
-                continue
-            short_switch, separator, attached = item.partition("=")
-            if separator and short_switch in switch_flags and len(short_switch) == 2:
-                if attached.casefold() not in _GITHUB_PR_BOOLEAN_VALUES:
-                    raise RuntimeError("trusted GitHub PR boolean option value is invalid")
-                if short_switch == "-h":
-                    help_requested = attached.casefold() in {"true", "1", "t"}
+                    continue
+                if short_flag in switch_flags:
+                    if attached.casefold() not in _GITHUB_PR_BOOLEAN_VALUES:
+                        raise RuntimeError("trusted GitHub PR boolean option value is invalid")
+                    if short_flag == "-h":
+                        help_requested = attached.casefold() in {"true", "1", "t"}
+                    index += 1
+                    continue
+
+            short_cluster = item[1:]
+            consumes_next = False
+            for option_index, character in enumerate(short_cluster):
+                flag = f"-{character}"
+                if flag in switch_flags:
+                    if flag == "-h":
+                        help_requested = True
+                    continue
+                if flag in value_flags:
+                    if option_index + 1 == len(short_cluster):
+                        if index + 1 >= len(arguments):
+                            raise RuntimeError("trusted GitHub PR option value is missing")
+                        consumes_next = True
+                    # Any remaining characters are the value attached to this
+                    # option, matching gh/Cobra short-flag cluster semantics.
+                    break
+                raise RuntimeError("trusted GitHub PR option is unsupported for host resolution")
+            else:
                 index += 1
                 continue
-            if len(item) > 2 and all(f"-{character}" in switch_flags for character in item[1:]):
-                if "h" in item[1:]:
-                    help_requested = True
-                index += 1
-                continue
-            if item in switch_flags:
-                if item == "-h":
-                    help_requested = True
-                index += 1
-                continue
-            raise RuntimeError("trusted GitHub PR option is unsupported for host resolution")
+            index += 2 if consumes_next else 1
+            continue
         if subcommand in _GITHUB_PR_POSITIONAL_TARGET_COMMANDS and "://" in item:
             host = _github_pr_positional_url_host(item)
             if positional_host is not None and positional_host != host:

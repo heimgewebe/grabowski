@@ -1228,6 +1228,8 @@ def _power_action_from_repository(
         "max_argv",
         "allow_shell",
         "policy_intent",
+        "kill_switch_path",
+        "legacy_kill_switch_path",
         "allowed_peer_unit",
         "allowed_peer_uid",
     }
@@ -1247,6 +1249,10 @@ def _power_action_from_repository(
         raise CutoverError("operator power shell execution must be enabled")
     if power.get("policy_intent") != "trusted-owner-root-autonomy":
         raise CutoverError("operator power policy intent is invalid")
+    if power.get("kill_switch_path") != str(CANONICAL_KILL_SWITCH):
+        raise CutoverError("operator power kill switch is invalid")
+    if power.get("legacy_kill_switch_path") != str(LEGACY_KILL_SWITCH):
+        raise CutoverError("operator power legacy kill switch is invalid")
     if power.get("allowed_peer_unit") != OPERATOR_UNIT:
         raise CutoverError("operator power peer unit is invalid")
     if power.get("allowed_peer_uid") != 1000:

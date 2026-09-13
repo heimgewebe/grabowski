@@ -1444,6 +1444,7 @@ class PrivilegedBrokerTests(unittest.TestCase):
                     "timeout_seconds": 600,
                     "max_argv": 128,
                     "allow_shell": False,
+                    "kill_switch_path": str(Path(self.tmp.name) / "power-kill-switch"),
                 }
             },
         }
@@ -1485,6 +1486,7 @@ class PrivilegedBrokerTests(unittest.TestCase):
                     "timeout_seconds": 3600,
                     "max_argv": 128,
                     "allow_shell": True,
+                    "kill_switch_path": str(Path(self.tmp.name) / "power-kill-switch"),
                     "policy_intent": "trusted-owner-root-autonomy",
                     "allowed_peer_unit": "grabowski-operator.service",
                     "allowed_peer_uid": 1000,
@@ -1494,6 +1496,37 @@ class PrivilegedBrokerTests(unittest.TestCase):
         execution = privileged_broker.resolve_execution(config, parsed)
         self.assertEqual(execution["argv"], ["/usr/bin/id", "-u"])
         self.assertNotIn("gate", execution)
+
+    def test_power_argv_json_rechecks_kill_switch_on_each_resolve(self) -> None:
+        kill_switch = Path(self.tmp.name) / "power-kill-switch-recheck"
+        reference = self._power_reference(
+            {"argv": ["/usr/bin/id", "-u"], "cwd": "/", "timeout_seconds": 30}
+        )
+        parsed = privileged_broker.parse_reference(
+            json.dumps(reference).encode("utf-8"), now=1000
+        )
+        config = {
+            "schema_version": 2,
+            "actions": {
+                "operator_power_argv": {
+                    "enabled": True,
+                    "mode": "argv-json",
+                    "target_pattern": r"\{.{1,49152}\}",
+                    "cwd_pattern": r"/[A-Za-z0-9._/@:+-]{0,999}",
+                    "timeout_seconds": 600,
+                    "max_argv": 128,
+                    "allow_shell": False,
+                    "kill_switch_path": str(kill_switch),
+                }
+            },
+        }
+
+        execution = privileged_broker.resolve_execution(config, parsed)
+        self.assertEqual(execution["kill_switch_path"], str(kill_switch))
+        kill_switch.symlink_to(Path(self.tmp.name) / "missing-kill-switch-target")
+        with self.assertRaisesRegex(PermissionError, "kill-switch"):
+            privileged_broker.resolve_execution(config, parsed)
+
     def test_power_gate_treats_dangling_kill_switch_symlink_as_engaged(self) -> None:
         gate = self._power_gate(self.tmp.name)
         kill_switch = Path(gate["kill_switch_path"])
@@ -1517,6 +1550,7 @@ class PrivilegedBrokerTests(unittest.TestCase):
                     "timeout_seconds": 600,
                     "max_argv": 128,
                     "allow_shell": False,
+                    "kill_switch_path": str(Path(self.tmp.name) / "power-kill-switch"),
                 }
             },
         }
@@ -1539,6 +1573,7 @@ class PrivilegedBrokerTests(unittest.TestCase):
                     "timeout_seconds": 600,
                     "max_argv": 128,
                     "allow_shell": False,
+                    "kill_switch_path": str(Path(self.tmp.name) / "power-kill-switch"),
                     "policy_intent": "trusted-owner-high-power-admin-catalog",
                     "allowed_argv_prefixes": [
                         ["/usr/bin/systemctl", "is-active"],
@@ -1579,6 +1614,7 @@ class PrivilegedBrokerTests(unittest.TestCase):
                     "timeout_seconds": 600,
                     "max_argv": 1,
                     "allow_shell": False,
+                    "kill_switch_path": str(Path(self.tmp.name) / "power-kill-switch"),
                     "allowed_argv_prefixes": [["/usr/bin/systemctl", "is-active"]],
                 }
             },
@@ -1602,6 +1638,7 @@ class PrivilegedBrokerTests(unittest.TestCase):
                     "timeout_seconds": 600,
                     "max_argv": 128,
                     "allow_shell": False,
+                    "kill_switch_path": str(Path(self.tmp.name) / "power-kill-switch"),
                     "allowed_argv_prefixes": [["/usr/bin/systemctl", "is-active"]],
                 }
             },
@@ -1625,6 +1662,7 @@ class PrivilegedBrokerTests(unittest.TestCase):
                     "timeout_seconds": 600,
                     "max_argv": 128,
                     "allow_shell": False,
+                    "kill_switch_path": str(Path(self.tmp.name) / "power-kill-switch"),
                     "allowed_argv_prefixes": [["/bin/bash", "-lc"]],
                 }
             },

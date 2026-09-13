@@ -1548,6 +1548,10 @@ class RootbrokerCutoverTests(unittest.TestCase):
         power = cutover._power_action_from_repository(
             repository, expected_head=HEAD, runner=runner
         )
+        self.assertEqual(power["kill_switch_path"], str(cutover.CANONICAL_KILL_SWITCH))
+        self.assertEqual(
+            power["legacy_kill_switch_path"], str(cutover.LEGACY_KILL_SWITCH)
+        )
         publisher = cutover._publisher_from_repository(
             repository, expected_head=HEAD, runner=runner, automatic=True
         )

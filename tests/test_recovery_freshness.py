@@ -95,7 +95,12 @@ class RecoveryFreshnessContractTests(unittest.TestCase):
         self.assertTrue(power["enabled"])
         self.assertTrue(power["allow_shell"])
         self.assertEqual(power["policy_intent"], "trusted-owner-root-autonomy")
+        self.assertEqual(power["kill_switch_path"], publisher["kill_switch_path"])
+        self.assertEqual(
+            power["legacy_kill_switch_path"], publisher["legacy_kill_switch_path"]
+        )
         self.assertNotIn("gate", power)
+        self.assertNotIn("start_gate", power)
         self.assertNotIn("allowed_argv_prefixes", power)
 
     def test_canonical_inspector_reports_typed_fail_closed_reasons(self) -> None:
