@@ -1962,6 +1962,25 @@ class CodingAgentRouterTests(unittest.TestCase):
             risk_flags=["security-sensitive", "public-context"],
         )
         self.assertEqual(security_direct["review_task_class"], "security-review")
+        direct_review = self._route(
+            "independent-review",
+            need_review=False,
+            novelty="low",
+            risk_flags=[],
+        )
+        self.assertEqual(direct_review["verification_policy"], "independent_review")
+        self.assertTrue(direct_review["independent_review_required"])
+        with self.assertRaisesRegex(
+            router.CodingAgentRouterError,
+            "independent review task requires verification_policy=independent_review",
+        ):
+            self._route(
+                "independent-review",
+                need_review=False,
+                novelty="low",
+                risk_flags=[],
+                verification_policy="deterministic",
+            )
         deterministic = self._route("bounded-patch", need_review=False, novelty="low", risk_flags=[])
         self.assertEqual(deterministic["verification_policy"], "deterministic")
         self.assertFalse(deterministic["verification_floor"]["required"])
