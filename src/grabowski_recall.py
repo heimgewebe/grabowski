@@ -940,7 +940,15 @@ def _validated_historical_target_selection(
     provider_limit = selection.get("provider_window_limit")
     provider_returned = selection.get("provider_window_returned")
     if (
-        selection.get("mode") != "exact"
+        (
+            available
+            and (
+                isinstance(provider_returned, bool)
+                or not isinstance(provider_returned, int)
+            )
+        )
+        or (not available and provider_returned is not None)
+        or selection.get("mode") != "exact"
         or selection.get("exact_selectors") != selectors
         or selection.get("selector_count") != len(selectors)
         or selection.get("exact_target_binding") is not True

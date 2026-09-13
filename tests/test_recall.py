@@ -480,6 +480,16 @@ class RecallTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exact target selection is unbound"):
             module.export_chronik_history_recall(history)
 
+        selection["global_history_exhaustive"] = False
+        selection["provider_window_returned"] = None
+        history["target_selection"] = dict(selection)
+        history["history"]["target_selection"] = dict(selection)
+        unsigned = dict(history)
+        unsigned.pop("result_sha256", None)
+        history["result_sha256"] = module._sha256_json(unsigned)
+        with self.assertRaisesRegex(ValueError, "exact target selection is unbound"):
+            module.export_chronik_history_recall(history)
+
     def test_chronik_history_recall_preserves_exact_no_match_without_coarse_fallback(self) -> None:
         module = self._load_module()
         history = self._chronik_history_result(module)
