@@ -25,7 +25,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Verify and merge exact main
+      - name: Verify, merge and regenerate derived contracts
         shell: bash
         run: |
           set -eu
@@ -42,11 +42,19 @@ jobs:
           rc=$?
           set -e
           if [ "$rc" -ne 0 ]; then
-            echo "Merge conflicts:"
-            git status --short
-            git diff --name-only --diff-filter=U
-            exit "$rc"
+            conflicts="$(git diff --name-only --diff-filter=U)"
+            if [ "$conflicts" != "contracts/publication-profiles.v1.json" ]; then
+              echo "Unexpected merge conflicts:"
+              printf '%s\n' "$conflicts"
+              git status --short
+              exit "$rc"
+            fi
+            echo "Resolving expected generated-profile conflict via canonical regeneration"
+            git checkout --ours contracts/publication-profiles.v1.json
+            git add contracts/publication-profiles.v1.json
+            test -z "$(git diff --name-only --diff-filter=U)"
           fi
+          make context-refresh
           rm .github/workflows/pr1186-integrate-main.yml
           git add -A
           git commit -m "Merge current main into PR #1186"
