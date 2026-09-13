@@ -10836,6 +10836,17 @@ def _terminal_lane_reconciliation_binding(manifest: dict[str, Any]) -> dict[str,
             ) from exc
         if live_owner_leases:
             raise AgentWorkspaceError("terminal work lane still has live resource leases")
+        if assessment.get("lease_release_ready") is not True:
+            raise AgentWorkspaceError(
+                "terminal work lane closeout is not resource-release-ready"
+            )
+        if (
+            assessment.get("closeout_state")
+            in work_acquire.DEFERRED_RESOURCE_RELEASE_CLOSEOUT_STATES
+        ):
+            raise AgentWorkspaceError(
+                "terminal work lane deferred resource release lacks durable convergence evidence"
+            )
         source = inputs.get("source")
         binding = manifest.get("binding")
         expected_identity = {

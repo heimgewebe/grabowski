@@ -1900,6 +1900,93 @@ class AgentWorkspaceTests(unittest.TestCase):
         )
         self.assertIn("physical checkout identity changed", replaced_blocker["error"])
 
+    def test_terminal_lane_blocked_followup_is_not_cleanup_authority(self) -> None:
+        lane = self.lane_receipt(idempotency_key="terminal-lane-blocked-followup")
+        manifest = self.lane_manifest(lane)
+        observation = workspace.work_acquire.lane_closeout.LaneCloseoutObservation(
+            lane_id=lane["lane_id"],
+            repository=str(self.git.repo),
+            workspace=str(self.git.writer),
+            branch="feat/writer",
+            base_revision=self.git.base,
+            writer_state="completed",
+            task_active=False,
+            process_active=False,
+            lease_active=True,
+            git_dirty=False,
+            head_sha=self.git.base,
+            ahead_commits=0,
+            durable_followup_id="followup-1",
+        )
+        assessment = workspace.work_acquire.lane_closeout.assess(observation)
+        self.assertEqual(assessment["closeout_state"], "blocked_with_durable_followup")
+        self.assertFalse(assessment["lease_release_ready"])
+        with workspace.work_acquire._lane_lock(lane["lane_id"]) as path:
+            current = workspace.work_acquire._read_state(path)
+            self.assertIsInstance(current, dict)
+            current["terminal_closeout"] = {
+                "schema_version": 1,
+                "kind": "grabowski.work_lane_terminal_closeout",
+                "closeout_state": assessment["closeout_state"],
+                "assessment_sha256": assessment["assessment_sha256"],
+                "expected_receipt_sha256": lane["receipt_sha256"],
+                "assessment": assessment,
+            }
+            workspace.work_acquire._write_state(path, current)
+        workspace.resources.release_resources(
+            f"lane:{lane['lane_id']}", lane["inputs"]["resource_keys"]
+        )
+
+        evidence = workspace._terminal_lane_reconciliation_binding(manifest)
+
+        self.assertFalse(evidence["valid"], evidence)
+        self.assertIn("not resource-release-ready", evidence["error"])
+
+    def test_terminal_lane_deferred_candidate_release_needs_durable_convergence(self) -> None:
+        lane = self.lane_receipt(idempotency_key="terminal-lane-candidate-deferred")
+        manifest = self.lane_manifest(lane)
+        observation = workspace.work_acquire.lane_closeout.LaneCloseoutObservation(
+            lane_id=lane["lane_id"],
+            repository=str(self.git.repo),
+            workspace=str(self.git.writer),
+            branch="feat/writer",
+            base_revision=self.git.base,
+            writer_state="completed",
+            task_active=False,
+            process_active=False,
+            lease_active=True,
+            git_dirty=False,
+            head_sha=self.git.base,
+            candidate_id="a" * 64,
+            adoption_receipt_sha256="b" * 64,
+            adoption_commit_sha=self.git.base,
+        )
+        assessment = workspace.work_acquire.lane_closeout.assess(observation)
+        self.assertEqual(assessment["closeout_state"], "candidate_adopted")
+        self.assertTrue(assessment["lease_release_ready"])
+        with workspace.work_acquire._lane_lock(lane["lane_id"]) as path:
+            current = workspace.work_acquire._read_state(path)
+            self.assertIsInstance(current, dict)
+            current["terminal_closeout"] = {
+                "schema_version": 1,
+                "kind": "grabowski.work_lane_terminal_closeout",
+                "closeout_state": assessment["closeout_state"],
+                "assessment_sha256": assessment["assessment_sha256"],
+                "expected_receipt_sha256": lane["receipt_sha256"],
+                "assessment": assessment,
+            }
+            workspace.work_acquire._write_state(path, current)
+        # Mere absence/expiry of the deferred owner leases is not durable
+        # evidence that publication-side convergence completed.
+        workspace.resources.release_resources(
+            f"lane:{lane['lane_id']}", lane["inputs"]["resource_keys"]
+        )
+
+        evidence = workspace._terminal_lane_reconciliation_binding(manifest)
+
+        self.assertFalse(evidence["valid"], evidence)
+        self.assertIn("deferred resource release lacks durable convergence evidence", evidence["error"])
+
     def test_terminal_lane_missing_checkout_is_historical_not_operationally_owned(self) -> None:
         lane = self.lane_receipt(idempotency_key="terminal-lane-missing-checkout")
         manifest = self.lane_manifest(lane)
