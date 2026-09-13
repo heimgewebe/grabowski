@@ -1493,8 +1493,23 @@ class OperatorSignedTransportTests(unittest.TestCase):
                 self.assertEqual(
                     operator._github_pr_target_host(arguments, source), "github.com"
                 )
+        repository = "ghe.example.internal/owner/repo"
+        for arguments in (
+            ["pr", "list", "-dR" + repository],
+            ["pr", "list", "-dR", repository],
+        ):
+            with self.subTest(arguments=arguments):
+                self.assertEqual(
+                    operator._github_pr_repository_selector(arguments), repository
+                )
+                self.assertEqual(
+                    operator._github_pr_target_host(arguments, source),
+                    "ghe.example.internal",
+                )
         with self.assertRaisesRegex(RuntimeError, "option value is missing"):
             operator._github_pr_target_host(["pr", "create", "-dt"], source)
+        with self.assertRaisesRegex(RuntimeError, "repository selector is invalid"):
+            operator._github_pr_target_host(["pr", "list", "-dR"], source)
 
     def test_github_wrapper_help_bypasses_credential_lookup(self) -> None:
         for help_flag in ("--help", "-h", "--help=true"):

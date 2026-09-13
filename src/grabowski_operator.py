@@ -2796,6 +2796,21 @@ def _github_pr_target_selectors(
             consumes_next = False
             for option_index, character in enumerate(short_cluster):
                 flag = f"-{character}"
+                if flag == "-R":
+                    repository = short_cluster[option_index + 1 :]
+                    if repository.startswith("="):
+                        repository = repository[1:]
+                    if not repository:
+                        if index + 1 >= len(arguments):
+                            raise RuntimeError("trusted GitHub repository selector is invalid")
+                        repository = arguments[index + 1]
+                        if not repository:
+                            raise RuntimeError("trusted GitHub repository selector is invalid")
+                        consumes_next = True
+                    # -R is inherited by every gh PR subcommand and, like other
+                    # value-taking short options, consumes the rest of a cluster
+                    # (or the following argv item) as its repository selector.
+                    break
                 if flag in switch_flags:
                     if flag == "-h":
                         help_requested = True
