@@ -167,6 +167,74 @@ class PlanTests(ContextFabricTestCase):
         self.assertEqual(required, ["grabowski_deployment_identity"])
         self.assertIn("deployment_authorization", plan["does_not_establish"])
 
+    def test_plan_exposes_selective_historical_recall_without_promoting_history(self) -> None:
+        plan = self.module.plan_context("pr", dict(PR_BINDING))
+        recall = plan["historical_recall"]
+        self.assertEqual(
+            recall["recommended_tool"],
+            "grabowski_operator_historical_recall",
+        )
+        self.assertEqual(recall["provider_source_tool"], "grabowski_chronik_history")
+        self.assertEqual(recall["requirement"], "conditional")
+        self.assertEqual(recall["mode"], "selective_advisory")
+        self.assertIn("re_reviewing_or_retrying_bound_pr", recall["read_when"])
+        self.assertIn("trivial_read", recall["skip_for"])
+        self.assertEqual(recall["target_selection"]["binding"], PR_BINDING)
+        self.assertTrue(recall["target_selection"]["binding_complete"])
+        self.assertTrue(recall["target_selection"]["read_eligible"])
+        self.assertEqual(recall["target_selection"]["unmatched_history"], "discard")
+        self.assertFalse(recall["history_may_replace_required_live_authority"])
+        self.assertIn("current_truth", recall["does_not_establish"])
+        self.assertIn("safe_retry", recall["does_not_establish"])
+        self.assertIn("routing_authority", recall["does_not_establish"])
+
+        chronik_source = next(
+            item for item in plan["sources"]
+            if item["source_tool"] == "grabowski_chronik_history"
+        )
+        self.assertEqual(chronik_source["requirement"], "optional")
+        self.assertEqual(chronik_source["temporal_marker"], "historical")
+
+    def test_historical_recall_plan_is_ineligible_until_binding_is_complete(self) -> None:
+        plan = self.module.plan_context("pr", {"repository": "heimgewebe/grabowski"})
+        recall = plan["historical_recall"]
+        self.assertFalse(plan["ready"])
+        self.assertFalse(recall["target_selection"]["binding_complete"])
+        self.assertFalse(recall["target_selection"]["read_eligible"])
+
+    def test_historical_recall_triggers_are_profile_specific_and_repeat_bound(self) -> None:
+        bureau = self.module.plan_context("bureau", dict(BUREAU_BINDING))["historical_recall"]
+        deployment = self.module.plan_context(
+            "deployment", dict(DEPLOYMENT_BINDING)
+        )["historical_recall"]
+        pr = self.module.plan_context("pr", dict(PR_BINDING))["historical_recall"]
+
+        self.assertEqual(
+            bureau["read_when"],
+            [
+                "recovery_or_retry_of_bound_run",
+                "repeated_lifecycle_failure",
+                "same_goal_has_prior_attempts",
+            ],
+        )
+        self.assertEqual(
+            deployment["read_when"],
+            [
+                "repeat_deploy_or_runtime_verify",
+                "recovery_or_rollback_planning",
+                "repeated_runtime_failure",
+            ],
+        )
+        self.assertEqual(
+            pr["read_when"],
+            [
+                "re_reviewing_or_retrying_bound_pr",
+                "repeated_check_or_review_failure",
+                "repeated_review_or_merge_method_precedent_signal",
+            ],
+        )
+
+
     def test_plan_rejects_unknown_profile(self) -> None:
         with self.assertRaises(ValueError):
             self.module.plan_context("merge")

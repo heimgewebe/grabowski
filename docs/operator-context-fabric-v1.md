@@ -33,6 +33,12 @@ An observation that claims a `claim_type` its declared authority does not own is
 | `bureau` | `grabowski_bureau_pickup_status` | `grabowski_bureau_candidate_assess`, `grabowski_bureau_task_publish_preview`, `grabowski_chronik_history` |
 | `deployment` | `grabowski_deployment_identity` | `grabowski_runtime_health`, `grabowski_service_status`, `grabowski_contract_drift`, `grabowski_chronik_history` |
 
+## Selective historical recall
+
+`grabowski_context_fabric_plan` now exposes a conditional `historical_recall` plan for all three profiles. The normal consumer surface is `grabowski_operator_historical_recall`; the lower-level `grabowski_chronik_history` source remains optional evidence for composition. Recall is intended only when prior outcomes can materially change the next decision, such as a re-review or retry of a bound PR, Bureau recovery/retry or repeated lifecycle failure, and repeat deployment/runtime verification or recovery planning. Trivial reads, status-only work without a repeat signal and one-off discovery do not require a history read.
+
+The caller must bind the current target from fresh live authority first, use the exact Chronik filters that are available, and then confirm the structured historical context against that current target. Unbound or non-matching history is discarded. Historical recall never replaces the required live authority and cannot establish current truth, safe retry, routing or policy authority, merge readiness, deployment authorization, Bureau publication authority or task completion. Before any effect, the owning live authority is read again through the normal gate.
+
 ## Claim shape
 
 Every emitted claim carries `claim_type`, `authority`, `authority_tool`, `truth_owner`, `scope`, `binding`, `binding_sha256`, `temporal_marker`, `observed_at` or the historical marker, `age_seconds`, `status`, `freshness`, `observation_requirement`, `sensitivity`, `evidence_refs`, `conflicts` and `does_not_establish`. A claim without at least one concrete evidence reference is rejected.

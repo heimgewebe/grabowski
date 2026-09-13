@@ -20,6 +20,8 @@ Heimlern use is `offline_proposal_only`. Recall exports may be consumed later fo
 
 The direct `grabowski_chronik_history` tool remains a lower-level provider and diagnostic surface. Normal operator consumers should prefer `grabowski_operator_historical_recall` so Chronik history is not treated as a separate control plane.
 
+The canonical agent bootstrap includes a selective historical-recall gate after fresh live-state and capability discovery and before execution-shape selection. It is intended for PR re-review/retry, Bureau recovery or repeated lifecycle failures, and repeat deployment/runtime verification or recovery planning. Trivial reads, status-only work without a repeat signal and one-off discovery skip the gate. Context Fabric plans expose the same conditional guidance. The caller uses the exact available Chronik filters and must confirm returned structured historical context against the current live-bound target; unbound or non-matching history is discarded.
+
 Chronik-backed recall reports `source_trust=grabowski_validated_chronik_history`, `evidence_binding=hash_bound_chronik_event` and `historical_only=true`. Its learned-rule field is explicitly `historical_observation_not_rule`: it summarizes an observed historical outcome and does not create policy or operator instruction authority.
 
 Every successful result carries a `result_reference` with the validated Chronik `result_sha256`, the ledger snapshot SHA-256 and a digest of the bound event-id set. An unavailable but valid Chronik receipt still exposes its `result_sha256`; it does not invent a ledger snapshot.
