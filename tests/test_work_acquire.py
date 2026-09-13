@@ -1714,6 +1714,40 @@ class WorkAcquireTests(unittest.TestCase):
         acquire.assert_not_called()
         ensure.assert_not_called()
 
+    def test_terminal_closeout_persists_managed_checkout_physical_identity(self) -> None:
+        params = self.parameters()
+        inputs, receipt = self.store_lane(params)
+        lane_id = str(inputs["lane_id"])
+        with work_acquire._lane_lock(lane_id) as path:
+            current = work_acquire._read_state(path)
+            self.assertIsInstance(current, dict)
+            assert current is not None
+            current["worktree_receipt"] = {
+                "lifecycle": {"checkout_path": str(self.target)}
+            }
+            receipt = work_acquire._write_state(path, current)
+        assessment = self.terminal_assessment(lane_id, 200)
+        physical = {
+            "schema_version": 1,
+            "kind": "grabowski.physical_checkout_identity",
+            "root": {"path": str(self.target), "device": 1, "inode": 2},
+            "git_dir": {"path": str(self.root / "git-dir"), "device": 1, "inode": 3},
+            "common_dir": {"path": str(self.repo / ".git"), "device": 1, "inode": 4},
+            "physical_identity_sha256": "f" * 64,
+        }
+        with (
+            patch.object(work_acquire.physical_checkout, "capture_physical_checkout_identity", return_value=physical) as capture,
+            patch.object(work_acquire, "_converge_terminal_checkout_lifecycle", return_value=None),
+            patch.object(work_acquire, "_converge_terminal_resource_leases", return_value=None),
+        ):
+            stored = work_acquire.persist_terminal_closeout(
+                lane_id, assessment, expected_receipt_sha256=str(receipt["receipt_sha256"])
+            )
+
+        capture.assert_called_once_with(str(self.target))
+        self.assertEqual(stored["terminal_closeout"]["checkout_physical_identity"], physical)
+        self.assertNotIn("terminal_closeout_pending", stored)
+
     def test_candidate_adopted_defers_resource_release_until_publication_closeout(self) -> None:
         params = self.parameters()
         inputs, receipt = self.store_lane(params)

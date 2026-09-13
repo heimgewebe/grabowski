@@ -10869,6 +10869,26 @@ def _terminal_lane_reconciliation_binding(manifest: dict[str, Any]) -> dict[str,
             raise AgentWorkspaceError(
                 "terminal work lane lifecycle source mismatches durable lane receipt"
             )
+        terminal_physical_identity = terminal.get("checkout_physical_identity")
+        terminal_physical_root = (
+            terminal_physical_identity.get("root")
+            if isinstance(terminal_physical_identity, dict)
+            else None
+        )
+        if (
+            not isinstance(terminal_physical_identity, dict)
+            or not isinstance(terminal_physical_root, dict)
+            or terminal_physical_root.get("path") != manifest.get("writer_worktree")
+            or not isinstance(
+                terminal_physical_identity.get("physical_identity_sha256"), str
+            )
+            or SHA256_RE.fullmatch(
+                terminal_physical_identity["physical_identity_sha256"]
+            ) is None
+        ):
+            raise AgentWorkspaceError(
+                "terminal work lane lacks original physical checkout identity"
+            )
         binding = manifest.get("binding")
         expected_identity = {
             "repo": manifest.get("repository"),
@@ -10912,6 +10932,7 @@ def _terminal_lane_reconciliation_binding(manifest: dict[str, Any]) -> dict[str,
             if isinstance(deferred_resource_closeout, dict)
             else None
         ),
+        "checkout_physical_identity": dict(terminal_physical_identity),
         "live_owner_lease_count": 0,
     }
 
@@ -11009,6 +11030,24 @@ def _terminal_lane_cleanup_continuity(
             or SHA256_RE.fullmatch(physical_identity["physical_identity_sha256"]) is None
         ):
             raise AgentWorkspaceError("current checkout physical identity is unavailable")
+        terminal_physical = terminal_lane.get("checkout_physical_identity")
+        if not isinstance(terminal_physical, dict):
+            raise AgentWorkspaceError(
+                "terminal work lane lacks original physical checkout identity"
+            )
+        try:
+            terminal_verified = physical_checkout.verify_physical_checkout_identity(
+                terminal_physical
+            )
+        except Exception as exc:
+            raise AgentWorkspaceError(
+                f"terminal checkout physical identity changed: {_error_summary(exc)}"
+            ) from exc
+        if (
+            terminal_verified.get("physical_identity_sha256")
+            != physical_identity.get("physical_identity_sha256")
+        ):
+            raise AgentWorkspaceError("terminal checkout physical identity changed")
         expected_physical = (
             cleanup_intent.get("checkout_physical_identity")
             if isinstance(cleanup_intent, dict)
@@ -11017,6 +11056,13 @@ def _terminal_lane_cleanup_continuity(
         if archived_intent:
             if not isinstance(expected_physical, dict):
                 raise AgentWorkspaceError("archived cleanup intent lacks physical checkout identity")
+            if (
+                expected_physical.get("physical_identity_sha256")
+                != terminal_physical.get("physical_identity_sha256")
+            ):
+                raise AgentWorkspaceError(
+                    "archived cleanup intent physical identity differs from terminal lane"
+                )
             verified = physical_checkout.verify_physical_checkout_identity(expected_physical)
             if (
                 verified.get("physical_identity_sha256")

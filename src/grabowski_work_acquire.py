@@ -17,6 +17,7 @@ import grabowski_execution_plan as execution_plan_contract
 import grabowski_lane_closeout as lane_closeout
 import grabowski_operator_obligation as operator_obligation
 import grabowski_operator_core as operator
+import grabowski_physical_checkout as physical_checkout
 import grabowski_resources as resources
 import grabowski_work_admission as work_admission
 import grabowski_worktree_ensure as worktree_ensure
@@ -354,12 +355,65 @@ def _terminal_closeout_assessment(record: dict[str, Any]) -> dict[str, Any] | No
     assessment = terminal.get("assessment")
     if not isinstance(assessment, dict):
         raise RuntimeError("work-lane terminal closeout assessment is missing")
+    checkout_physical_identity = terminal.get("checkout_physical_identity")
+    if checkout_physical_identity is not None and not isinstance(
+        checkout_physical_identity, dict
+    ):
+        raise RuntimeError("work-lane terminal closeout physical identity is invalid")
     validated = lane_closeout.validate_terminal_assessment(assessment)
     if (validated.get("lane_id") != record.get("lane_id")
         or terminal.get("closeout_state") != validated.get("closeout_state")
         or terminal.get("assessment_sha256") != validated.get("assessment_sha256")):
         raise RuntimeError("work-lane terminal closeout binding is invalid")
     return validated
+
+
+def _terminal_checkout_physical_identity(
+    record: dict[str, Any],
+    *,
+    expected: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Capture or verify the exact managed checkout bound to terminal evidence.
+
+    Work Lanes without a managed checkout lifecycle remain valid for generic
+    terminalization. Managed checkout lanes must preserve the physical root,
+    git-dir and common-dir device/inode identity across terminal retries.
+    """
+    worktree_receipt = record.get("worktree_receipt")
+    lifecycle = (
+        worktree_receipt.get("lifecycle")
+        if isinstance(worktree_receipt, dict)
+        else None
+    )
+    if not isinstance(lifecycle, dict):
+        if expected is not None:
+            raise RuntimeError(
+                "terminal physical checkout identity exists without managed lifecycle"
+            )
+        return None
+    checkout_path = lifecycle.get("checkout_path")
+    inputs = record.get("inputs")
+    if (
+        not isinstance(checkout_path, str)
+        or not checkout_path
+        or not isinstance(inputs, dict)
+        or inputs.get("target_path") != checkout_path
+    ):
+        raise RuntimeError("terminal managed checkout path binding is invalid")
+    try:
+        observed = (
+            physical_checkout.capture_physical_checkout_identity(checkout_path)
+            if expected is None
+            else physical_checkout.verify_physical_checkout_identity(expected)
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"terminal managed checkout physical identity is invalid: {type(exc).__name__}: {exc}"
+        ) from exc
+    root = observed.get("root")
+    if not isinstance(root, dict) or root.get("path") != checkout_path:
+        raise RuntimeError("terminal managed checkout physical root drifted")
+    return observed
 
 
 def _terminal_closeout_pending_assessment(
@@ -1020,8 +1074,24 @@ def persist_terminal_closeout(
             return result
 
         pending = _terminal_closeout_pending_assessment(record)
+        terminal_physical_identity: dict[str, Any] | None
         if pending is not None:
             pending_wrapper = record["terminal_closeout_pending"]
+            pending_physical = pending_wrapper.get("checkout_physical_identity")
+            has_managed_lifecycle = isinstance(
+                (record.get("worktree_receipt") or {}).get("lifecycle")
+                if isinstance(record.get("worktree_receipt"), dict)
+                else None,
+                dict,
+            )
+            if has_managed_lifecycle and not isinstance(pending_physical, dict):
+                raise RuntimeError(
+                    "terminal closeout pending lacks managed checkout physical identity"
+                )
+            terminal_physical_identity = _terminal_checkout_physical_identity(
+                record,
+                expected=(pending_physical if isinstance(pending_physical, dict) else None),
+            )
             if record.get("receipt_sha256") != expected_receipt_sha256:
                 raise RuntimeError(
                     "terminal closeout retry CAS must match the current durable pending receipt"
@@ -1039,6 +1109,7 @@ def persist_terminal_closeout(
         else:
             if record.get("receipt_sha256") != expected_receipt_sha256:
                 raise RuntimeError("work-lane terminal closeout CAS preimage changed")
+            terminal_physical_identity = _terminal_checkout_physical_identity(record)
             pending_wrapper = {
                 "schema_version": 1,
                 "kind": TERMINAL_PENDING_KIND,
@@ -1046,6 +1117,11 @@ def persist_terminal_closeout(
                 "assessment_sha256": validated["assessment_sha256"],
                 "expected_receipt_sha256": expected_receipt_sha256,
                 "assessment": validated,
+                **(
+                    {"checkout_physical_identity": terminal_physical_identity}
+                    if terminal_physical_identity is not None
+                    else {}
+                ),
             }
             record = _write_state(
                 receipt_path,
@@ -1074,6 +1150,11 @@ def persist_terminal_closeout(
             "assessment_sha256": effective["assessment_sha256"],
             "expected_receipt_sha256": pending_wrapper["expected_receipt_sha256"],
             "assessment": effective,
+            **(
+                {"checkout_physical_identity": terminal_physical_identity}
+                if terminal_physical_identity is not None
+                else {}
+            ),
         }
         final_record = dict(record)
         final_record.pop("terminal_closeout_pending", None)

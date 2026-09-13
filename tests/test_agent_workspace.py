@@ -668,6 +668,11 @@ class AgentWorkspaceTests(unittest.TestCase):
             expected_branch="feat/writer",
         )
         self.assertEqual(completed["phase"], "completed_retained")
+        terminal_physical_identity = (
+            workspace.physical_checkout.capture_physical_checkout_identity(
+                self.git.writer
+            )
+        )
         with workspace.work_acquire._lane_lock(lane["lane_id"]) as path:
             current = workspace.work_acquire._read_state(path)
             self.assertIsInstance(current, dict)
@@ -680,6 +685,7 @@ class AgentWorkspaceTests(unittest.TestCase):
                     expected_receipt_sha256 or lane["receipt_sha256"]
                 ),
                 "assessment": assessment,
+                "checkout_physical_identity": terminal_physical_identity,
             }
             terminal = workspace.work_acquire._write_state(path, current)
         if release_resources:
@@ -1914,6 +1920,45 @@ class AgentWorkspaceTests(unittest.TestCase):
         )
         self.assertIn("physical checkout identity changed", replaced_blocker["error"])
 
+    def test_terminal_lane_cleanup_rejects_recreated_checkout_before_first_plan(self) -> None:
+        lane = self.lane_receipt(idempotency_key="terminal-lane-recreated-checkout")
+        manifest = self.lane_manifest(lane)
+        terminal = self.terminalize_lane_no_change(lane, manifest)
+        terminal_evidence = workspace._terminal_lane_reconciliation_binding(manifest)
+        self.assertTrue(terminal_evidence["valid"], terminal_evidence)
+        original_physical = terminal["terminal_closeout"]["checkout_physical_identity"]
+        lifecycle = lane["worktree_receipt"]["lifecycle"]
+
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(self.git.writer)],
+            cwd=self.git.repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        subprocess.run(
+            ["git", "worktree", "add", str(self.git.writer), "feat/writer"],
+            cwd=self.git.repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        replacement_physical = workspace.physical_checkout.capture_physical_checkout_identity(
+            self.git.writer
+        )
+        self.assertNotEqual(
+            original_physical["physical_identity_sha256"],
+            replacement_physical["physical_identity_sha256"],
+        )
+        checkout_state = {
+            "exists": True,
+            "checkout_key": lifecycle["checkout_key"],
+            "head": self.git.base,
+            "branch": "feat/writer",
+            "physical_identity": replacement_physical,
+        }
+
+        continuity = workspace._terminal_lane_cleanup_continuity(
+            manifest, terminal_evidence, checkout_state, None
+        )
+
+        self.assertFalse(continuity["valid"], continuity)
+        self.assertIn("terminal checkout physical identity changed", continuity["error"])
+
     def test_terminal_lane_blocked_followup_is_not_cleanup_authority(self) -> None:
         lane = self.lane_receipt(idempotency_key="terminal-lane-blocked-followup")
         manifest = self.lane_manifest(lane)
@@ -2068,6 +2113,11 @@ class AgentWorkspaceTests(unittest.TestCase):
             expected_branch="feat/writer",
         )
         self.assertEqual("completed_retained", completed["phase"])
+        terminal_physical_identity = (
+            workspace.physical_checkout.capture_physical_checkout_identity(
+                self.git.writer
+            )
+        )
         with workspace.work_acquire._lane_lock(lane["lane_id"]) as path:
             current = workspace.work_acquire._read_state(path)
             self.assertIsInstance(current, dict)
@@ -2078,6 +2128,7 @@ class AgentWorkspaceTests(unittest.TestCase):
                 "assessment_sha256": assessment["assessment_sha256"],
                 "expected_receipt_sha256": lane["receipt_sha256"],
                 "assessment": assessment,
+                "checkout_physical_identity": terminal_physical_identity,
             }
             workspace.work_acquire._write_state(path, current)
         workspace.resources.release_resources(
