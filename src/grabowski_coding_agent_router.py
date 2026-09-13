@@ -1139,11 +1139,31 @@ def _effective_pool(
                 }
             counts[lifecycle_state] = value
         observed_physical = sum(counts.values())
-        effective_active = max(active_sessions, counts["active"]) + counts["unbound"]
+        protected_for_admission = counts["protected"]
+        active_sessions_source = "advisory-active-max-plus-protected-and-unbound"
+        if (
+            pool_id == "openai-agentic"
+            and protected_for_admission == int(static_pool["max_concurrency"])
+            and protected_for_admission > 0
+        ):
+            # ``max_concurrency`` is a local managed-admission cap for this pool,
+            # not a provider-attested maximum. If protected interactive Codex
+            # shells alone exactly fill that cap, discount exactly one so they
+            # cannot permanently starve managed work. Counts above the cap stay
+            # fully conservative rather than widening this exception.
+            protected_for_admission -= 1
+            active_sessions_source = (
+                "advisory-active-max-plus-one-protected-discount-and-unbound"
+            )
+        effective_active = (
+            max(active_sessions, counts["active"])
+            + protected_for_admission
+            + counts["unbound"]
+        )
         pool["observed_physical_sessions"] = observed_physical
         pool["physical_lifecycle_sessions"] = counts
         pool["active_sessions"] = effective_active
-        pool["active_sessions_source"] = "advisory-active-max-plus-unbound"
+        pool["active_sessions_source"] = active_sessions_source
     else:
         pool["active_sessions"] = active_sessions
         pool["active_sessions_source"] = "advisory-state-only"
