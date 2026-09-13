@@ -132,8 +132,17 @@ class BlockadeTests(unittest.TestCase):
         )
         self.assertEqual([POSTURE_ORDER[name] for name in POSTURES], [0, 1, 2, 3])
         self.assertEqual(
-            set(ACTION_CLASSES),
-            {"read", "status", "audit_read", "mutate", "recovery_disarm"},
+            ACTION_CLASSES,
+            ("read", "status", "audit_read", "mutate", "recovery_disarm"),
+        )
+
+    def test_invalid_action_class_reports_bounded_allowed_set(self) -> None:
+        with self.assertRaises(BlockadeValidationError) as raised:
+            ActionContext("write")
+        self.assertEqual(
+            str(raised.exception),
+            "unsupported action_class: write; "
+            "allowed=read,status,audit_read,mutate,recovery_disarm",
         )
 
     def test_record_round_trip_and_hash_are_deterministic(self) -> None:

@@ -5460,6 +5460,12 @@ def _transport_signed_one_call_evidence(
     arguments_sha256: str,
     runtime_binding: dict[str, str],
 ) -> dict[str, Any] | None:
+    # Atomic transport execution already owns one server-created, exact-target
+    # capability.  Do not consume the outer signed carrier a second time inside
+    # that in-process dispatch.  The operator gate must still consume the
+    # reserved roundtrip verification for this exact tool + argument digest.
+    if grabowski_transport_roundtrip.execution_capability_active():
+        return None
     version = _transport_context_header(ctx, _TRANSPORT_INGRESS_VERSION_HEADER)
     if version is None:
         return None

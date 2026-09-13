@@ -466,6 +466,13 @@ class DisarmValidation:
 
 @dataclass(frozen=True)
 class ActionContext:
+    """Input to blockade evaluation, not a complete mutation preflight.
+
+    ``fresh_preflight`` only satisfies the blockade subsystem's own
+    ``preflight_required`` posture. It neither checks nor acquires resource
+    leases and does not establish mutation authority.
+    """
+
     action_class: str
     path: str | None = None
     capability: str | None = None
@@ -480,8 +487,9 @@ class ActionContext:
 
     def __post_init__(self) -> None:
         if self.action_class not in ACTION_CLASSES:
+            allowed = ",".join(ACTION_CLASSES)
             raise BlockadeValidationError(
-                f"unsupported action_class: {self.action_class}"
+                f"unsupported action_class: {self.action_class}; allowed={allowed}"
             )
         if self.path is not None:
             object.__setattr__(
