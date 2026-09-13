@@ -1184,6 +1184,130 @@ class CodingAgentRouterTests(unittest.TestCase):
         finally:
             self.physical_occupancy.start()
 
+
+    def test_pre_dispatch_admission_accepts_live_concrete_route_without_reserving(self) -> None:
+        route = next(
+            item for item in self.catalog["routes"] if item["id"] == "codex-sol-high"
+        )
+        argv = [*route["argv_prefix"], "exec", "--sandbox", "read-only", "prompt"]
+        with mock.patch.object(
+            router, "_pool_gate", return_value=(True, ["remaining=0.80"], 0.20, True)
+        ):
+            admission = router.coding_agent_pre_dispatch_admission(argv)
+
+        self.assertTrue(admission["applicable"])
+        self.assertTrue(admission["admitted"])
+        self.assertEqual(admission["reason_code"], "admitted")
+        self.assertEqual(admission["policy_scope"], "hard_execution_gates_only")
+        self.assertEqual(admission["matched_route_ids"], ["codex-sol-high"])
+        self.assertEqual(
+            admission["capacity_contract"]["quota_pools"], ["openai-agentic"]
+        )
+        self.assertEqual(admission["reservation"]["status"], "not_reserved")
+        self.assertFalse(admission["reservation"]["atomic"])
+        self.assertIn("atomic_capacity_reservation", admission["does_not_establish"])
+        self.assertIn(
+            "reserve_floor_policy_revalidation", admission["does_not_establish"]
+        )
+        self.assertRegex(admission["admission_sha256"], r"^[0-9a-f]{64}$")
+        self.assertNotIn("prompt", json.dumps(admission, sort_keys=True))
+
+    def test_pre_dispatch_admission_rejects_advisory_only_execution_pool(self) -> None:
+        route = next(
+            item for item in self.catalog["routes"] if item["id"] == "codex-sol-high"
+        )
+        argv = [*route["argv_prefix"], "exec", "--sandbox", "read-only", "prompt"]
+        with mock.patch.object(
+            router,
+            "_pool_gate",
+            return_value=(True, ["quota is opaque"], 0.55, False),
+        ):
+            admission = router.coding_agent_pre_dispatch_admission(argv)
+
+        self.assertTrue(admission["applicable"])
+        self.assertFalse(admission["admitted"])
+        self.assertEqual(admission["reason_code"], "quota_pool_blocked")
+        pool = admission["quota_pools"][0]
+        self.assertTrue(pool["allowed"])
+        self.assertFalse(pool["execution_eligible"])
+        self.assertEqual(pool["reasons"], ["quota is opaque"])
+        self.assertEqual(admission["reservation"]["status"], "not_reserved")
+
+    def test_pre_dispatch_admission_rechecks_capacity_after_route_was_ready(self) -> None:
+        route = next(
+            item for item in self.catalog["routes"] if item["id"] == "codex-sol-high"
+        )
+        argv = [*route["argv_prefix"], "exec", "--sandbox", "read-only", "prompt"]
+        with mock.patch.object(
+            router, "_pool_gate", return_value=(True, ["remaining=0.80"], 0.20, True)
+        ):
+            self.assertTrue(router.coding_agent_pre_dispatch_admission(argv)["admitted"])
+        saturated = {
+            "status": "current",
+            "observed_at_unix": 456,
+            "tracked_provider_pools": sorted(
+                current_work.PHYSICAL_CODING_AGENT_PROVIDER_POOLS
+            ),
+            "provider_pool_sessions": {"openai-agentic": 3},
+            "provider_pool_lifecycle_sessions": {
+                "openai-agentic": {"active": 3, "protected": 0, "unbound": 0}
+            },
+            "lifecycle_counts": {
+                "active": 3,
+                "protected": 0,
+                "unbound": 0,
+                "infrastructure": 0,
+            },
+            "strong_identity_count": 3,
+            "identity_partial_count": 0,
+        }
+        with mock.patch.object(
+            router, "_physical_pool_occupancy", return_value=saturated
+        ):
+            admission = router.coding_agent_pre_dispatch_admission(argv)
+        self.assertTrue(admission["applicable"])
+        self.assertFalse(admission["admitted"])
+        self.assertEqual(admission["reason_code"], "quota_pool_blocked")
+        pool = admission["quota_pools"][0]
+        self.assertEqual(pool["pool_id"], "openai-agentic")
+        self.assertEqual(pool["active_sessions"], 3)
+        self.assertIn("pool concurrency is saturated", pool["reasons"])
+        self.assertEqual(admission["physical_observed_at_unix"], 456)
+
+    def test_pre_dispatch_admission_fails_tracked_pool_closed_when_occupancy_unknown(self) -> None:
+        route = next(
+            item for item in self.catalog["routes"] if item["id"] == "codex-sol-high"
+        )
+        argv = [*route["argv_prefix"], "exec", "--sandbox", "read-only", "prompt"]
+        degraded = {
+            "status": "unavailable",
+            "tracked_provider_pools": sorted(
+                current_work.PHYSICAL_CODING_AGENT_PROVIDER_POOLS
+            ),
+            "provider_pool_sessions": {},
+            "provider_pool_lifecycle_sessions": {},
+            "error_type": "RuntimeError",
+        }
+        with mock.patch.object(
+            router, "_physical_pool_occupancy", return_value=degraded
+        ):
+            admission = router.coding_agent_pre_dispatch_admission(argv)
+        self.assertFalse(admission["admitted"])
+        self.assertEqual(admission["reason_code"], "quota_pool_blocked")
+        self.assertIn(
+            "physical coding-agent occupancy is unavailable",
+            admission["quota_pools"][0]["reasons"][0],
+        )
+
+    def test_pre_dispatch_admission_leaves_non_catalog_agent_command_ungated(self) -> None:
+        admission = router.coding_agent_pre_dispatch_admission(
+            ["/opt/codex", "exec", "--sandbox", "workspace-write", "prompt"]
+        )
+        self.assertFalse(admission["applicable"])
+        self.assertTrue(admission["admitted"])
+        self.assertEqual(admission["reason_code"], "no_catalog_route_match")
+        self.assertEqual(admission["physical_occupancy_status"], "not_observed")
+
     def test_protected_physical_agent_consumes_provider_concurrency(self) -> None:
         state = self._fresh_state()
         state["pools"]["claude-pro"] = {"active_sessions": 0}
