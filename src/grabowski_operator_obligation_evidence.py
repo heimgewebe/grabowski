@@ -873,7 +873,7 @@ def _github_actions_run_pr_bindings(
             deadline_monotonic=deadline_monotonic,
         )
         if returncode != 0:
-            raise GitHubSourceUnavailable("github Actions runs source unavailable")
+            raise EvidenceAssessmentError("github Actions runs source unavailable")
         for line in stdout.splitlines():
             if not line.strip():
                 continue
@@ -936,7 +936,7 @@ def _github_actions_run_pr_bindings_by_id(
             deadline_monotonic=deadline_monotonic,
         )
         if returncode != 0:
-            raise GitHubSourceUnavailable('github Actions run source unavailable')
+            raise EvidenceAssessmentError('github Actions run source unavailable')
         try:
             payload = json.loads(stdout)
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -1151,7 +1151,7 @@ def _github_v2_snapshot(
         deadline_monotonic=deadline_monotonic,
     )
     if returncode != 0:
-        raise GitHubSourceUnavailable("github GraphQL source unavailable")
+        raise EvidenceAssessmentError("github GraphQL source unavailable")
     try:
         payload = json.loads(stdout)
     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -1254,19 +1254,37 @@ def _github_v2_snapshot(
                 return None
             effective_checks = _effective_github_v2_checks(merge_gate_checks)
         else:
-            if not _github_v2_rerun_pr_bindings_valid(
-                repo,
-                pr,
-                head_ref=head_ref,
-                head_sha=head,
-                base_ref=base_ref,
-                base_sha=base,
-                merged=merged,
-                checks=head_check_nodes,
-                deadline_monotonic=deadline_monotonic,
-            ):
-                return None
             effective_checks = _effective_github_v2_checks(head_check_nodes)
+            if effective_checks is None or not effective_checks:
+                return None
+            try:
+                rerun_bindings_valid = _github_v2_rerun_pr_bindings_valid(
+                    repo,
+                    pr,
+                    head_ref=head_ref,
+                    head_sha=head,
+                    base_ref=base_ref,
+                    base_sha=base,
+                    merged=merged,
+                    checks=head_check_nodes,
+                    deadline_monotonic=deadline_monotonic,
+                )
+            except GitHubSourceUnavailable:
+                # A missing historical run may legitimately have aged out, but
+                # a still-visible failed/cancelled newer attempt is authoritative
+                # contradictory evidence and must never be hidden by an archive.
+                if any(not _github_v2_check_success(check) for check in effective_checks):
+                    return {
+                        "state": pull_request.get("state"),
+                        "isDraft": pull_request.get("isDraft"),
+                        "baseRefOid": base,
+                        "headRefOid": head,
+                        "merge_oid": merge_oid,
+                        "effective_checks": effective_checks,
+                    }
+                raise
+            if not rerun_bindings_valid:
+                return None
     except GitHubSourceUnavailable as exc:
         raise GitHubSourceUnavailable(
             str(exc), snapshot_identity=snapshot_identity

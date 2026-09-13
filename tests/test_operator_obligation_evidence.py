@@ -1313,6 +1313,70 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         self.assertEqual("stale", observed["status"])
 
 
+    def test_github_transport_failure_never_uses_archive_fallback(self) -> None:
+        item = self._stored_evidence(
+            acceptance_id="merge",
+            source="github",
+            reference=(
+                "github-pr-v2:heimgewebe/grabowski#943@"
+                + "1" * 40
+                + ":base="
+                + "2" * 40
+                + ":merge="
+                + "3" * 40
+                + ":checks=1/1-effective-success"
+            ),
+            sha256="a" * 64,
+        )
+        with patch.object(
+            evidence, "_run_command", return_value=(1, b"", b"authentication failed")
+        ), patch.object(evidence, "_github_archived_observation") as archive:
+            observed = evidence._github_observation(item)
+
+        assert observed is not None
+        self.assertEqual("stale", observed["status"])
+        archive.assert_not_called()
+
+    def test_visible_failed_rerun_wins_when_historical_binding_is_missing(self) -> None:
+        checks = [
+            self._github_v2_workflow_check(
+                database_id=101,
+                name="validate",
+                started_at="2026-08-25T14:31:01Z",
+                workflow_run_id=32860034363,
+                run_number=12,
+                run_attempt=1,
+            ),
+            self._github_v2_workflow_check(
+                database_id=102,
+                name="validate",
+                started_at="2026-08-25T14:41:01Z",
+                conclusion="FAILURE",
+                workflow_run_id=32860039999,
+                run_number=12,
+                run_attempt=2,
+            ),
+        ]
+        payload = self._github_v2_payload(
+            head="1" * 40, base="2" * 40, merge="3" * 40, checks=checks
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(payload, pr=943),
+        ), patch.object(
+            evidence,
+            "_github_v2_rerun_pr_bindings_valid",
+            side_effect=evidence.GitHubSourceUnavailable(
+                "github Actions run history unavailable"
+            ),
+        ):
+            snapshot = evidence._github_v2_snapshot("heimgewebe/grabowski", 943)
+
+        assert snapshot is not None
+        self.assertEqual(1, len(snapshot["effective_checks"]))
+        self.assertEqual("FAILURE", snapshot["effective_checks"][0]["conclusion"])
+
     def test_prepare_github_accepts_empty_terminal_pr_backlink_when_run_head_is_exact(self) -> None:
         head = "1" * 40
         base = "2" * 40

@@ -14668,9 +14668,29 @@ def _run_operator_obligation_close(
             "skipped_count": 0,
         }
         if dispatch_parameters.get("outcome") == "completed":
-            archive_result = grabowski_operator_obligation_evidence.archive_close_github_evidence(
-                dispatch_parameters.get("evidence")
+            try:
+                current = grabowski_operator_obligation.status_obligation(
+                    str(dispatch_parameters.get("obligation_id"))
+                )
+            except FileNotFoundError:
+                current = {}
+            exact_replay = (
+                current.get("state") == "completed"
+                and current.get("evidence") == dispatch_parameters.get("evidence")
+                and current.get("completion_classification")
+                == dispatch_parameters.get("closure_classification")
             )
+            if exact_replay:
+                archive_result = {
+                    "status": "exact_close_replay",
+                    "archived_count": 0,
+                    "archived_sha256s": [],
+                    "skipped_count": 0,
+                }
+            else:
+                archive_result = grabowski_operator_obligation_evidence.archive_close_github_evidence(
+                    dispatch_parameters.get("evidence")
+                )
         output = grabowski_operator_obligation.close_obligation(dispatch_parameters)
     except grabowski_operator_obligation_evidence.EvidenceAssessmentError as exc:
         _check(receipt, "durable_github_evidence", "fail", str(exc))

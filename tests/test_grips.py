@@ -3410,6 +3410,58 @@ class GripFoundationTests(unittest.TestCase):
         archive.assert_called_once_with([evidence_item])
         close.assert_called_once()
 
+    def test_operator_obligation_close_exact_replay_skips_live_github_archive(self) -> None:
+        evidence_item = {
+            "acceptance_id": "merge",
+            "status": "passed",
+            "source": "github",
+            "reference": "github-pr-v2:heimgewebe/grabowski#943@" + "1" * 40
+            + ":base=" + "2" * 40
+            + ":merge=" + "3" * 40
+            + ":checks=2/2-effective-success",
+            "sha256": "d" * 64,
+        }
+        classification = {"convergence_required": False, "reason": "process_only"}
+        parameters = {
+            "obligation_id": "goo-github-archive-replay-0001",
+            "outcome": "completed",
+            "evidence": [evidence_item],
+            "closure_classification": classification,
+        }
+        close_output = {
+            "open_file_sha256": "a" * 64,
+            "close_file_sha256": "b" * 64,
+            "state": "completed",
+            "replayed": True,
+            "response_may_end": True,
+            "work_complete": True,
+            "completion_classification": classification,
+        }
+        current = {
+            "state": "completed",
+            "evidence": [evidence_item],
+            "completion_classification": classification,
+        }
+        with patch.object(
+            grips, "_revalidate_operator_obligation_systemic_convergence"
+        ), patch.object(
+            grips.grabowski_operator_obligation, "status_obligation", return_value=current
+        ), patch.object(
+            grips.grabowski_operator_obligation_evidence,
+            "archive_close_github_evidence",
+        ) as archive, patch.object(
+            grips.grabowski_operator_obligation,
+            "close_obligation",
+            return_value=close_output,
+        ):
+            result = grips._run_operator_obligation_close(
+                unittest.mock.Mock(), parameters, {"checks": []}, unittest.mock.Mock()
+            )
+
+        self.assertEqual("passed", result["receipt_status"])
+        self.assertTrue(result["replayed"])
+        archive.assert_not_called()
+
     def test_operator_obligation_close_blocks_when_github_archive_cannot_be_bound(self) -> None:
         parameters = {
             "obligation_id": "goo-github-archive-close-0002",
