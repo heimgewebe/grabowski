@@ -9383,6 +9383,76 @@ def _repoground_apply_local_context_budget(
     }
 
 
+def _repoground_emitted_evidence_budget(
+    budget: dict[str, Any],
+    snippet_view: dict[str, Any],
+    structured_evidence: Any,
+) -> dict[str, Any]:
+    """Bind public query-budget telemetry to evidence emitted by this wrapper.
+
+    RepoGround may consider or pre-budget more candidates than max_snippets
+    ultimately exposes. Keep any differing upstream totals explicitly as
+    pre-projection telemetry, while the public context_*_used fields describe
+    only the evidence that is actually returned to the caller.
+    """
+    emitted_bytes = 0
+    emitted_characters = 0
+    for snippet in _repoground_list_of_dicts(snippet_view.get("snippets")):
+        text = snippet.get("text_excerpt")
+        if isinstance(text, str):
+            emitted_bytes += len(text.encode("utf-8"))
+            emitted_characters += len(text)
+
+    language_structure = (
+        structured_evidence.get("language_structure")
+        if isinstance(structured_evidence, dict)
+        else None
+    )
+    if isinstance(language_structure, dict) and "evidence" in language_structure:
+        canonical_evidence = json.dumps(
+            language_structure["evidence"],
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        emitted_bytes += len(canonical_evidence.encode("utf-8"))
+        emitted_characters += len(canonical_evidence)
+
+    bounded = dict(budget)
+    previous_bytes = bounded.get("context_bytes_used")
+    previous_characters = bounded.get("context_unicode_characters_used")
+    previous_characters_field = "context_unicode_characters_used"
+    if previous_characters is None:
+        previous_characters = bounded.get("approx_context_chars_used")
+        previous_characters_field = "approx_context_chars_used"
+    if (
+        isinstance(previous_bytes, int)
+        and not isinstance(previous_bytes, bool)
+        and previous_bytes != emitted_bytes
+    ):
+        bounded["pre_projection_context_bytes_used"] = previous_bytes
+    if (
+        isinstance(previous_characters, int)
+        and not isinstance(previous_characters, bool)
+        and previous_characters != emitted_characters
+    ):
+        pre_projection_key = (
+            "pre_projection_context_unicode_characters_used"
+            if previous_characters_field == "context_unicode_characters_used"
+            else "pre_projection_approx_context_chars_used"
+        )
+        bounded[pre_projection_key] = previous_characters
+    bounded["context_bytes_used"] = emitted_bytes
+    bounded["context_unicode_characters_used"] = emitted_characters
+    bounded["approx_context_chars_used"] = emitted_characters
+    bounded["accounting"] = (
+        "sum(UTF-8 bytes of emitted canonical_md text_excerpt values) + canonical "
+        "JSON UTF-8 bytes of emitted language_structure.evidence; address and "
+        "envelope metadata are outside the evidence payload budget"
+    )
+    return bounded
+
+
 def _repoground_context_evidence_status(
     query: str | None,
     query_context: dict[str, Any],
@@ -9748,6 +9818,11 @@ def repoground_query(
             "approx_context_chars_used": snippets["approx_context_chars_used"],
             "truncated": snippets["truncated"],
         }
+    budget = _repoground_emitted_evidence_budget(
+        budget,
+        snippets,
+        repoground_result.get("structured_evidence"),
+    )
     query_result = (
         repoground_result.get("query_result")
         if isinstance(repoground_result, dict)
