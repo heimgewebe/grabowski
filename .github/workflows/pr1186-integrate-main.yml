@@ -1,0 +1,81 @@
+name: PR1186 integrate current main
+
+on:
+  push:
+    branches:
+      - fix/terminal-lane-retention-archive-20260913
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TARGET_MAIN_SHA: 3944af0d853a73f6055341e0972f955b6b7f7454
+    steps:
+      - name: Checkout exact triggering head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Verify and merge exact main
+        shell: bash
+        run: |
+          set -eu
+          git fetch origin main
+          live_main="$(git rev-parse origin/main)"
+          if [ "$live_main" != "$TARGET_MAIN_SHA" ]; then
+            echo "main moved: expected $TARGET_MAIN_SHA, got $live_main"
+            exit 42
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          set +e
+          git merge --no-commit --no-ff "$TARGET_MAIN_SHA"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "Merge conflicts:"
+            git status --short
+            git diff --name-only --diff-filter=U
+            exit "$rc"
+          fi
+          rm .github/workflows/pr1186-integrate-main.yml
+          git add -A
+          git commit -m "Merge current main into PR #1186"
+
+      - name: Run focused finality regressions
+        shell: bash
+        run: |
+          set -eu
+          install -d -m 700 "$PWD/build"
+          test_home="$(mktemp -d "$PWD/build/test-home.XXXXXX")"
+          trap 'rm -rf "$test_home"' EXIT
+          install -d -m 700 "$test_home/.config/grabowski"
+          install -m 600 config/access.home-wide-operator.example.json "$test_home/.config/grabowski/access.json"
+          HOME="$test_home" PYTHONPATH=tests python -B -m unittest -v \
+            test_checkouts.CheckoutLifecycleTests.test_cleanup_no_effect_clearance_failure_retains_operation_lease \
+            test_checkouts.CheckoutLifecycleTests.test_archive_no_effect_clearance_failure_retains_operation_lease \
+            test_checkouts.CheckoutLifecycleTests.test_archive_uncertainty_readback_accepts_absent_legacy_lifecycle \
+            test_agent_workspace.AgentWorkspaceTests.test_cleanup_reconciles_post_commit_archive_audit_failure_and_clears_fence \
+            test_agent_workspace.AgentWorkspaceTests.test_cleanup_reconciles_post_commit_audit_failure_and_clears_fence
+
+      - name: Validate merged repository
+        run: make validate
+
+      - name: Verify final tree hygiene
+        shell: bash
+        run: |
+          git diff --check HEAD^ HEAD
+          test ! -e .github/workflows/pr1186-integrate-main.yml
+          test -z "$(git status --porcelain)"
+
+      - name: Push merge only after all gates pass
+        run: git push origin HEAD:fix/terminal-lane-retention-archive-20260913
