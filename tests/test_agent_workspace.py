@@ -505,9 +505,10 @@ class AgentWorkspaceTests(unittest.TestCase):
             ttl_seconds=3600,
             metadata={"lane_id": lane_id},
         )
+        lifecycle_source = workspace.work_acquire._lifecycle_source(normalized)
         lifecycle_manifest = {
             "workspace_id": "gaw-test-lane-binding",
-            "binding": {"kind": "work_lane", "id": lane_id},
+            "binding": dict(lifecycle_source),
             "repository": str(self.git.repo),
             "writer_worktree": str(self.git.writer),
             "writer_branch": "feat/writer",
@@ -580,7 +581,8 @@ class AgentWorkspaceTests(unittest.TestCase):
             "decision": "ISOLATE_AND_EXECUTE",
             "inputs": normalized,
             "inputs_sha256": workspace.work_acquire._sha(normalized),
-            "authority": authority,
+            "authority": {**authority, "lifecycle_source": lifecycle_source},
+            "lifecycle_source": lifecycle_source,
             "worktree_receipt": {
                 "result_state": "CREATED",
                 "post_state": post_state,
@@ -591,6 +593,18 @@ class AgentWorkspaceTests(unittest.TestCase):
         }
         with workspace.work_acquire._lane_lock(lane_id) as path:
             return workspace.work_acquire._write_state(path, record)
+
+    def test_lane_receipt_uses_exact_work_acquire_lifecycle_source(self) -> None:
+        lane = self.lane_receipt(
+            source_kind="direct-user",
+            source_id="direct-user-test",
+            idempotency_key="direct-user-lifecycle-source",
+        )
+        lifecycle = lane["worktree_receipt"]["lifecycle"]
+        expected = {"kind": "work_lane", "id": lane["lane_id"]}
+        self.assertEqual(lifecycle["source"], expected)
+        self.assertEqual(lane["lifecycle_source"], expected)
+        self.assertEqual(lane["authority"]["lifecycle_source"], expected)
 
     def lane_manifest(self, lane: dict) -> dict:
         manifest = self.manifest()
@@ -2024,6 +2038,69 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(
             result["checkout_archive_manifest"],
             archive_post_state["checkout_archive_manifest"],
+        )
+
+    def test_terminal_lane_deferred_candidate_release_accepts_durable_convergence(self) -> None:
+        lane = self.lane_receipt(idempotency_key="terminal-lane-candidate-converged")
+        manifest = self.lane_manifest(lane)
+        observation = workspace.work_acquire.lane_closeout.LaneCloseoutObservation(
+            lane_id=lane["lane_id"],
+            repository=str(self.git.repo),
+            workspace=str(self.git.writer),
+            branch="feat/writer",
+            base_revision=self.git.base,
+            writer_state="completed",
+            task_active=False,
+            process_active=False,
+            lease_active=True,
+            git_dirty=False,
+            head_sha=self.git.base,
+            candidate_id="c" * 64,
+            adoption_receipt_sha256="d" * 64,
+            adoption_commit_sha=self.git.base,
+        )
+        assessment = workspace.work_acquire.lane_closeout.assess(observation)
+        lifecycle = lane["worktree_receipt"]["lifecycle"]
+        completed = workspace.checkouts._mark_checkout_completed_retained(
+            checkout_key=str(lifecycle["checkout_key"]),
+            owner_id=f"lane:{lane['lane_id']}",
+            expected_head=self.git.base,
+            expected_branch="feat/writer",
+        )
+        self.assertEqual("completed_retained", completed["phase"])
+        with workspace.work_acquire._lane_lock(lane["lane_id"]) as path:
+            current = workspace.work_acquire._read_state(path)
+            self.assertIsInstance(current, dict)
+            current["terminal_closeout"] = {
+                "schema_version": 1,
+                "kind": "grabowski.work_lane_terminal_closeout",
+                "closeout_state": assessment["closeout_state"],
+                "assessment_sha256": assessment["assessment_sha256"],
+                "expected_receipt_sha256": lane["receipt_sha256"],
+                "assessment": assessment,
+            }
+            workspace.work_acquire._write_state(path, current)
+        workspace.resources.release_resources(
+            f"lane:{lane['lane_id']}", lane["inputs"]["resource_keys"]
+        )
+        convergence = workspace.work_acquire.converge_terminal_resource_closeout(
+            lane["lane_id"], expected_closeout_states={"candidate_adopted"}
+        )
+        self.assertFalse(convergence["replayed"])
+        self.assertEqual(0, convergence["live_owner_lease_count"])
+        self.assertIsInstance(convergence["resource_lease_closeout"], dict)
+
+        evidence = workspace._terminal_lane_reconciliation_binding(manifest)
+
+        self.assertTrue(evidence["valid"], evidence)
+        self.assertEqual(evidence["source"], {"kind": "thread_focus", "id": "thread-1"})
+        self.assertEqual(
+            evidence["lifecycle_source"],
+            {"kind": "thread_focus", "id": "thread-1"},
+        )
+        self.assertEqual(
+            evidence["deferred_resource_closeout_evidence_sha256"],
+            convergence["resource_lease_closeout"]["evidence_sha256"],
         )
 
     def test_terminal_lane_missing_checkout_is_historical_not_operationally_owned(self) -> None:

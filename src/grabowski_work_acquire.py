@@ -26,6 +26,7 @@ MUTATING = operator.MUTATING
 SCHEMA_VERSION = 1
 LANE_KIND = "grabowski.work_lane"
 TERMINAL_PENDING_KIND = "grabowski.work_lane_terminal_closeout_pending"
+TERMINAL_RESOURCE_CLOSEOUT_KIND = "grabowski.work_lane_terminal_resource_closeout"
 ACTOR_RE = re.compile(r"[A-Za-z0-9._:@/-]{1,256}\Z")
 SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
 IDEMPOTENCY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
@@ -405,6 +406,12 @@ def _terminal_closeout_audit_event(
         raise RuntimeError("work-lane terminal closeout wrapper is missing")
     expected_preimage = terminal.get("expected_receipt_sha256")
     receipt_sha256 = record.get("receipt_sha256")
+    resource_closeout = record.get("resource_lease_closeout")
+    if (
+        isinstance(resource_closeout, dict)
+        and resource_closeout.get("kind") == TERMINAL_RESOURCE_CLOSEOUT_KIND
+    ):
+        receipt_sha256 = resource_closeout.get("terminal_receipt_sha256")
     if (
         not isinstance(expected_preimage, str)
         or re.fullmatch(r"[0-9a-f]{64}", expected_preimage) is None
@@ -676,16 +683,206 @@ def _converge_terminal_resource_leases(
     }
 
 
+def _terminal_resource_key_list(
+    values: Any, *, label: str, allow_empty: bool
+) -> list[str]:
+    """Canonicalize resource keys already observed from the owner lease store.
+
+    Deferred convergence can encounter legacy lease keys that predate the current
+    resource-key grammar. They remain legitimate exact owner generations to
+    release, so evidence validates bounded opaque identities instead of trying to
+    reinterpret them through the current acquisition normalizer.
+    """
+    if not isinstance(values, list):
+        raise TerminalLeaseConvergenceError(f"{label} must be a list")
+    normalized: list[str] = []
+    for value in values:
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+            or "\x00" in value
+            or len(value.encode("utf-8")) > 4096
+        ):
+            raise TerminalLeaseConvergenceError(f"{label} contains an invalid resource key")
+        normalized.append(value)
+    result = sorted(set(normalized))
+    if len(result) != len(normalized):
+        raise TerminalLeaseConvergenceError(f"{label} contains duplicate resource keys")
+    if not result and not allow_empty:
+        raise TerminalLeaseConvergenceError(f"{label} may not be empty")
+    if len(result) > 4096:
+        raise TerminalLeaseConvergenceError(f"{label} exceeds resource-key limit")
+    return result
+
+
+def _terminal_resource_closeout_evidence(
+    record: dict[str, Any],
+    *,
+    assessment: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Validate durable deferred resource-convergence evidence in one lane receipt."""
+    raw = record.get("resource_lease_closeout")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise TerminalLeaseConvergenceError(
+            "terminal Work Lane resource closeout evidence is invalid"
+        )
+    inputs = record.get("inputs")
+    if not isinstance(inputs, dict):
+        raise TerminalLeaseConvergenceError(
+            "terminal Work Lane inputs are missing from resource closeout evidence"
+        )
+    raw_registered = inputs.get("resource_keys")
+    if not isinstance(raw_registered, list) or any(
+        not isinstance(key, str) for key in raw_registered
+    ):
+        raise TerminalLeaseConvergenceError(
+            "terminal Work Lane registered resource keys are invalid"
+        )
+    registered = resources.normalize_resource_keys(raw_registered)
+    released_raw = raw.get("released_resource_keys")
+    released = _terminal_resource_key_list(
+        released_raw,
+        label="terminal Work Lane released resource keys",
+        allow_empty=True,
+    )
+    if released != released_raw:
+        raise TerminalLeaseConvergenceError(
+            "terminal Work Lane released resource keys are not canonical"
+        )
+    lane_id = record.get("lane_id")
+    owner_id = inputs.get("lease_owner_id")
+    if (
+        raw.get("schema_version") != 1
+        or raw.get("kind") != TERMINAL_RESOURCE_CLOSEOUT_KIND
+        or raw.get("lane_id") != lane_id
+        or raw.get("owner_id") != owner_id
+        or raw.get("closeout_state") != assessment.get("closeout_state")
+        or raw.get("assessment_sha256") != assessment.get("assessment_sha256")
+        or raw.get("registered_resource_key_count") != len(registered)
+        or raw.get("registered_resource_keys_sha256") != _sha(registered)
+        or raw.get("live_owner_lease_count") != 0
+    ):
+        raise TerminalLeaseConvergenceError(
+            "terminal Work Lane resource closeout evidence binding is invalid"
+        )
+    terminal_receipt_sha256 = raw.get("terminal_receipt_sha256")
+    if (
+        not isinstance(terminal_receipt_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", terminal_receipt_sha256) is None
+    ):
+        raise TerminalLeaseConvergenceError(
+            "terminal Work Lane resource closeout terminal receipt binding is invalid"
+        )
+    preimage = {
+        key: value
+        for key, value in record.items()
+        if key not in {"receipt_sha256", "resource_lease_closeout"}
+    }
+    if _sha(preimage) != terminal_receipt_sha256:
+        raise TerminalLeaseConvergenceError(
+            "terminal Work Lane resource closeout terminal receipt preimage drifted"
+        )
+    state = raw.get("state")
+    batch_count = raw.get("release_batch_count")
+    snapshot_guarded = raw.get("snapshot_guarded")
+    converged_at = raw.get("converged_at_unix")
+    if (
+        state not in {"released", "already_absent"}
+        or isinstance(batch_count, bool)
+        or not isinstance(batch_count, int)
+        or batch_count < 0
+        or not isinstance(snapshot_guarded, bool)
+        or isinstance(converged_at, bool)
+        or not isinstance(converged_at, int)
+        or converged_at < 0
+    ):
+        raise TerminalLeaseConvergenceError(
+            "terminal Work Lane resource closeout evidence result is invalid"
+        )
+    if state == "released":
+        if not released or batch_count < 1 or snapshot_guarded is not True:
+            raise TerminalLeaseConvergenceError(
+                "terminal Work Lane released resource closeout evidence is incomplete"
+            )
+    elif released or batch_count != 0 or snapshot_guarded is not False:
+        raise TerminalLeaseConvergenceError(
+            "terminal Work Lane already-absent resource closeout evidence is inconsistent"
+        )
+    material = {
+        key: value for key, value in raw.items() if key != "evidence_sha256"
+    }
+    if raw.get("evidence_sha256") != _sha(material):
+        raise TerminalLeaseConvergenceError(
+            "terminal Work Lane resource closeout evidence digest is invalid"
+        )
+    return dict(raw)
+
+
+def _build_terminal_resource_closeout_evidence(
+    record: dict[str, Any],
+    *,
+    assessment: dict[str, Any],
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    inputs = record.get("inputs")
+    if not isinstance(inputs, dict):
+        raise TerminalLeaseConvergenceError(
+            "terminal Work Lane inputs are missing during resource convergence"
+        )
+    raw_registered = inputs.get("resource_keys")
+    if not isinstance(raw_registered, list) or any(
+        not isinstance(key, str) for key in raw_registered
+    ):
+        raise TerminalLeaseConvergenceError(
+            "terminal Work Lane registered resource keys are invalid"
+        )
+    registered = resources.normalize_resource_keys(raw_registered)
+    released_raw = result.get("released_resource_keys")
+    released = _terminal_resource_key_list(
+        released_raw,
+        label="terminal Work Lane convergence released resource keys",
+        allow_empty=True,
+    )
+    material = {
+        "schema_version": 1,
+        "kind": TERMINAL_RESOURCE_CLOSEOUT_KIND,
+        "lane_id": record.get("lane_id"),
+        "closeout_state": assessment.get("closeout_state"),
+        "assessment_sha256": assessment.get("assessment_sha256"),
+        "terminal_receipt_sha256": record.get("receipt_sha256"),
+        "owner_id": inputs.get("lease_owner_id"),
+        "state": result.get("state"),
+        "registered_resource_key_count": len(registered),
+        "registered_resource_keys_sha256": _sha(registered),
+        "released_resource_keys": released,
+        "release_batch_count": result.get("release_batch_count"),
+        "snapshot_guarded": result.get("snapshot_guarded"),
+        "live_owner_lease_count": result.get("live_owner_lease_count"),
+        "converged_at_unix": int(time.time()),
+    }
+    evidence = {**material, "evidence_sha256": _sha(material)}
+    probe = {**record, "resource_lease_closeout": evidence}
+    validated = _terminal_resource_closeout_evidence(
+        probe, assessment=assessment
+    )
+    assert validated is not None
+    return validated
+
+
 def converge_terminal_resource_closeout(
     lane_id: str,
     *,
     expected_closeout_states: set[str] | frozenset[str],
 ) -> dict[str, Any]:
-    """Converge one already-terminal lane's live owner leases to zero.
+    """Converge and durably attest one terminal lane's owner leases at zero.
 
-    This is the deferred-release hook for workflows such as candidate adoption
-    that must keep coordination authority until a later publication readback.
-    The caller must bind the accepted terminal closeout states explicitly.
+    Deferred closeout states retain coordination authority until their caller has
+    completed the later publication/readback step and invokes this function. The
+    resulting evidence is persisted in the lane receipt so later cleanup can
+    distinguish explicit post-publication convergence from mere lease expiry.
     """
     _text(lane_id, "lane_id", pattern=re.compile(r"[0-9a-f]{32}\Z"))
     if (
@@ -707,6 +904,24 @@ def converge_terminal_resource_closeout(
         closeout_state = assessment.get("closeout_state")
         if closeout_state not in expected_closeout_states:
             raise RuntimeError("work-lane terminal closeout state is not accepted for resource release")
+        existing = _terminal_resource_closeout_evidence(
+            record, assessment=assessment
+        )
+        if existing is not None:
+            _owner_id, _registered_keys, live_owner_leases = (
+                _terminal_lane_resource_observation(record)
+            )
+            if live_owner_leases:
+                raise TerminalLeaseConvergenceError(
+                    "terminal Work Lane owner leases reappeared after durable resource closeout"
+                )
+            return {
+                **existing,
+                "durable_receipt_path": str(receipt_path),
+                "durable_receipt_sha256": record["receipt_sha256"],
+                "resource_lease_closeout": existing,
+                "replayed": True,
+            }
         result = _converge_terminal_resource_leases(
             record, assessment=assessment, permit_deferred=True
         )
@@ -714,11 +929,28 @@ def converge_terminal_resource_closeout(
             raise TerminalLeaseConvergenceError(
                 "terminal Work Lane resource closeout did not converge"
             )
+        evidence = _build_terminal_resource_closeout_evidence(
+            record, assessment=assessment, result=result
+        )
+        stored = _write_state(
+            receipt_path,
+            {
+                **record,
+                "resource_lease_closeout": evidence,
+            },
+        )
+        durable = _terminal_resource_closeout_evidence(
+            stored, assessment=assessment
+        )
+        assert durable is not None
         return {
             **result,
             "lane_id": lane_id,
             "closeout_state": closeout_state,
             "durable_receipt_path": str(receipt_path),
+            "durable_receipt_sha256": stored["receipt_sha256"],
+            "resource_lease_closeout": durable,
+            "replayed": False,
         }
 
 

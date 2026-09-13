@@ -10840,14 +10840,35 @@ def _terminal_lane_reconciliation_binding(manifest: dict[str, Any]) -> dict[str,
             raise AgentWorkspaceError(
                 "terminal work lane closeout is not resource-release-ready"
             )
+        deferred_resource_closeout = None
         if (
             assessment.get("closeout_state")
             in work_acquire.DEFERRED_RESOURCE_RELEASE_CLOSEOUT_STATES
         ):
-            raise AgentWorkspaceError(
-                "terminal work lane deferred resource release lacks durable convergence evidence"
+            deferred_resource_closeout = (
+                work_acquire._terminal_resource_closeout_evidence(
+                    receipt, assessment=assessment
+                )
             )
+            if deferred_resource_closeout is None:
+                raise AgentWorkspaceError(
+                    "terminal work lane deferred resource release lacks durable convergence evidence"
+                )
         source = inputs.get("source")
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        worktree_receipt = receipt.get("worktree_receipt")
+        lane_lifecycle = (
+            worktree_receipt.get("lifecycle")
+            if isinstance(worktree_receipt, dict)
+            else None
+        )
+        if (
+            not isinstance(lane_lifecycle, dict)
+            or lane_lifecycle.get("source") != lifecycle_source
+        ):
+            raise AgentWorkspaceError(
+                "terminal work lane lifecycle source mismatches durable lane receipt"
+            )
         binding = manifest.get("binding")
         expected_identity = {
             "repo": manifest.get("repository"),
@@ -10884,6 +10905,13 @@ def _terminal_lane_reconciliation_binding(manifest: dict[str, Any]) -> dict[str,
         "closeout_state": assessment["closeout_state"],
         "assessment_sha256": assessment["assessment_sha256"],
         "terminal_head_sha": assessment.get("terminal_head_sha"),
+        "source": dict(source),
+        "lifecycle_source": dict(lifecycle_source),
+        "deferred_resource_closeout_evidence_sha256": (
+            deferred_resource_closeout.get("evidence_sha256")
+            if isinstance(deferred_resource_closeout, dict)
+            else None
+        ),
         "live_owner_lease_count": 0,
     }
 
@@ -10940,7 +10968,13 @@ def _terminal_lane_cleanup_continuity(
             if lifecycle.get(key) != value
         }
         lifecycle_source = lifecycle.get("source")
-        expected_source = {"kind": "work_lane", "id": lane_id}
+        expected_source = terminal_lane.get("lifecycle_source")
+        if (
+            not isinstance(expected_source, dict)
+            or not isinstance(expected_source.get("kind"), str)
+            or not isinstance(expected_source.get("id"), str)
+        ):
+            raise AgentWorkspaceError("terminal lane lifecycle source identity is unavailable")
         if lifecycle_source != expected_source:
             mismatches["source"] = {
                 "expected": expected_source,
