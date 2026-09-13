@@ -40,6 +40,14 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
                 self.assertFalse(pool["automatic_overage"])
                 self.assertEqual(pool["overage_action"], "block_and_surface")
 
+    def test_openai_agentic_concurrency_is_a_proven_floor_not_provider_ceiling(self) -> None:
+        pool = self.catalog["quota_pools"]["openai-agentic"]
+        self.assertEqual(pool["max_concurrency"], 3)
+        self.assertIn("three-concurrent-luna-low-task-smoke-2026-09-13", pool["plan_evidence"])
+        self.assertIn("operating floor of 3 only", pool["note"])
+        self.assertIn("does not claim exact provider concurrency or quota", pool["note"])
+        self.assertIn("exact-provider-quota", self.catalog["nonclaims"])
+
     def test_supergrok_pool_requires_exact_oidc_entitlement_claim(self) -> None:
         contract = self.catalog["quota_pools"]["grok-com"]["entitlement_contract"]
         self.assertEqual(
