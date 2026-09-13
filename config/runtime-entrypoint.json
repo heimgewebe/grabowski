@@ -71,6 +71,8 @@
     "grabowski_checkout_retain",
     "grabowski_checkout_archive",
     "grabowski_checkout_cleanup",
+    "grabowski_checkout_uncertainty_status",
+    "grabowski_checkout_uncertainty_reconcile",
     "grabowski_github",
     "grabowski_user_service",
     "grabowski_tmux_list",

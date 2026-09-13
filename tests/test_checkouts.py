@@ -880,9 +880,18 @@ class CheckoutLifecycleTests(unittest.TestCase):
         )
         stored = checkouts._lifecycle_bindings([binding["checkout_key"]])
         self.assertEqual(stored[binding["checkout_key"]]["phase"], "active")
-        self.assertEqual(checkouts._read_resource_leases(), [])
+        fences = checkouts._active_checkout_operation_uncertainties()
+        self.assertEqual(len(fences), 1)
+        fence = fences[0]
+        self.assertEqual(fence["operation"], "archive")
+        leases = checkouts._read_resource_leases()
+        self.assertTrue(leases)
+        self.assertEqual(
+            {item["owner_id"] for item in leases},
+            {fence["lease_owner_id"]},
+        )
 
-    def test_archive_releases_operation_lease_when_manifest_write_fails(self) -> None:
+    def test_archive_manifest_failure_retains_uncertainty_fence(self) -> None:
         with patch.object(
             checkouts,
             "_write_json_evidence",
@@ -891,7 +900,16 @@ class CheckoutLifecycleTests(unittest.TestCase):
             with self.assertRaisesRegex(OSError, "simulated manifest failure"):
                 self._archive(aged=False)
 
-        self.assertEqual(checkouts._read_resource_leases(), [])
+        fences = checkouts._active_checkout_operation_uncertainties()
+        self.assertEqual(len(fences), 1)
+        fence = fences[0]
+        self.assertEqual(fence["operation"], "archive")
+        leases = checkouts._read_resource_leases()
+        self.assertTrue(leases)
+        self.assertEqual(
+            {item["owner_id"] for item in leases},
+            {fence["lease_owner_id"]},
+        )
 
     def test_archive_preserves_committed_state_when_audit_append_fails(self) -> None:
         common_dir = self._common_dir()
@@ -923,6 +941,29 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertTrue(all(item["ref"] for item in archive["recovery_refs"]))
         stored = checkouts._lifecycle_bindings([binding["checkout_key"]])
         self.assertEqual(stored[binding["checkout_key"]]["phase"], "archived")
+        fences = checkouts._active_checkout_operation_uncertainties()
+        self.assertEqual(len(fences), 1)
+        fence = fences[0]
+        self.assertEqual(fence["operation"], "archive")
+        leases = checkouts._read_resource_leases()
+        self.assertTrue(leases)
+        self.assertEqual(
+            {item["owner_id"] for item in leases},
+            {fence["lease_owner_id"]},
+        )
+        with checkouts.resources._database() as connection:
+            connection.execute(
+                "UPDATE leases SET expires_at_unix=? WHERE owner_id=?",
+                (int(time.time()) - 1, fence["lease_owner_id"]),
+            )
+            connection.commit()
+        reconciled = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+        self.assertEqual(reconciled["state"], "reconciled")
+        self.assertEqual(reconciled["outcome"], "confirmed_success")
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
         self.assertEqual(checkouts._read_resource_leases(), [])
 
     def test_disjoint_source_file_lease_does_not_block_archive(self) -> None:
@@ -1889,6 +1930,175 @@ class CheckoutLifecycleTests(unittest.TestCase):
         mutate_mock.assert_called_once()
         release_mock.assert_not_called()
         self.assertTrue(self.checkout.exists())
+
+    def test_archive_rechecks_physical_identity_after_resource_acquisition(self) -> None:
+        expected_identity = checkouts.physical_checkout.capture_physical_checkout_identity(
+            self.checkout
+        )
+        real_acquire = checkouts._acquire_checkout_resources
+        real_verify = checkouts.physical_checkout.verify_physical_checkout_identity
+        acquired = [False]
+
+        def acquire_then_mark(*args, **kwargs):
+            lease = real_acquire(*args, **kwargs)
+            acquired[0] = True
+            return lease
+
+        def verify_then_drift(expected):
+            if not acquired[0]:
+                return real_verify(expected)
+            raise checkouts.physical_checkout.PhysicalCheckoutIdentityError(
+                "simulated replacement after resource acquisition"
+            )
+
+        with (
+            patch.object(checkouts, "_acquire_checkout_resources", side_effect=acquire_then_mark),
+            patch.object(
+                checkouts.physical_checkout,
+                "verify_physical_checkout_identity",
+                side_effect=verify_then_drift,
+            ) as verify_mock,
+            patch.object(
+                checkouts.operator,
+                "_run",
+                side_effect=AssertionError("archive Git mutation must not run"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "physical identity precondition failed"):
+                checkouts.grabowski_checkout_archive(
+                    str(self.repo),
+                    str(self.checkout),
+                    "owner-a",
+                    "identity-bound archive",
+                    int(time.time()) + 3600,
+                    self.head,
+                    "topic",
+                    expected_physical_identity=expected_identity,
+                )
+
+        self.assertTrue(self.checkout.exists())
+        self.assertGreaterEqual(verify_mock.call_count, 2)
+        fences = checkouts._active_checkout_operation_uncertainties()
+        self.assertEqual(len(fences), 1)
+        self.assertEqual(fences[0]["operation"], "archive")
+
+    def test_partial_archive_failure_remains_durably_fenced_after_lease_expiry(self) -> None:
+        expected_identity = checkouts.physical_checkout.capture_physical_checkout_identity(
+            self.checkout
+        )
+        original_create_ref = checkouts._create_recovery_ref
+        calls = [0]
+
+        def create_first_then_fail(repo, ref, target, **kwargs):
+            calls[0] += 1
+            if calls[0] == 1:
+                return original_create_ref(repo, ref, target, **kwargs)
+            raise RuntimeError("simulated second archive ref failure")
+
+        with patch.object(
+            checkouts, "_create_recovery_ref", side_effect=create_first_then_fail
+        ):
+            with self.assertRaisesRegex(RuntimeError, "second archive ref failure"):
+                checkouts.grabowski_checkout_archive(
+                    str(self.repo),
+                    str(self.checkout),
+                    "owner-a",
+                    "partial archive",
+                    int(time.time()) + 3600,
+                    self.head,
+                    "topic",
+                    expected_physical_identity=expected_identity,
+                )
+
+        fences = checkouts._active_checkout_operation_uncertainties()
+        self.assertEqual(len(fences), 1)
+        fence = fences[0]
+        with checkouts.resources._database() as connection:
+            connection.execute(
+                "UPDATE leases SET expires_at_unix=? WHERE owner_id=?",
+                (int(time.time()) - 1, fence["lease_owner_id"]),
+            )
+            connection.commit()
+        with self.assertRaisesRegex(RuntimeError, "durably fenced"):
+            checkouts._acquire_checkout_resources(
+                owner_id="owner-a",
+                repo_common_dir=self._common_dir(),
+                checkout_path=self.checkout,
+                purpose="must remain blocked",
+                retention_until_unix=int(time.time()) + 3600,
+                repo_path=self.repo,
+                branch="topic",
+                metadata={"test": "durable-archive-fence"},
+            )
+        reconciliation = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+        self.assertEqual(reconciliation["state"], "still_fenced")
+        self.assertEqual(
+            len(checkouts._active_checkout_operation_uncertainties()), 1
+        )
+
+    def test_cleanup_unknown_outcome_remains_durably_fenced_after_lease_expiry(self) -> None:
+        archive = self._archive()["archive"]
+        expected_identity = checkouts.physical_checkout.capture_physical_checkout_identity(
+            self.checkout
+        )
+        dry_run = checkouts.grabowski_checkout_cleanup(
+            str(self.repo),
+            str(self.checkout),
+            "owner-a",
+            dry_run=True,
+            archive_id=archive["archive_id"],
+            expected_head=self.head,
+            expected_branch="topic",
+            expected_physical_identity=expected_identity,
+        )
+        with patch.object(
+            checkouts,
+            "_git_mutate",
+            side_effect=RuntimeError("simulated ambiguous cleanup mutation"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "ambiguous cleanup mutation"):
+                checkouts.grabowski_checkout_cleanup(
+                    str(self.repo),
+                    str(self.checkout),
+                    "owner-a",
+                    dry_run=False,
+                    plan_id=dry_run["dry_run_record"]["plan_id"],
+                    expected_plan_sha256=dry_run["plan"]["plan_sha256"],
+                    expected_physical_identity=expected_identity,
+                    confirmation="remove-linked-checkout",
+                )
+
+        fences = checkouts._active_checkout_operation_uncertainties()
+        self.assertEqual(len(fences), 1)
+        fence = fences[0]
+        self.assertEqual(fence["operation"], "cleanup")
+        with checkouts.resources._database() as connection:
+            connection.execute(
+                "UPDATE leases SET expires_at_unix=? WHERE owner_id=?",
+                (int(time.time()) - 1, fence["lease_owner_id"]),
+            )
+            connection.commit()
+        with self.assertRaisesRegex(RuntimeError, "durably fenced"):
+            checkouts._acquire_checkout_resources(
+                owner_id="owner-a",
+                repo_common_dir=self._common_dir(),
+                checkout_path=self.checkout,
+                purpose="must remain blocked",
+                retention_until_unix=int(time.time()) + 3600,
+                repo_path=self.repo,
+                branch="topic",
+                metadata={"test": "durable-cleanup-fence"},
+            )
+        reconciliation = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+        self.assertEqual(reconciliation["state"], "reconciled")
+        self.assertEqual(reconciliation["outcome"], "confirmed_no_effect")
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
 
     def test_cleanup_plan_remains_valid_when_only_archive_age_advances(self) -> None:
         archive = self._archive()["archive"]

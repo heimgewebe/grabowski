@@ -13693,6 +13693,7 @@ def grabowski_agent_workspace_cleanup(
                         ),
                         expected_head=str(plan["checkout"]["head"]),
                         expected_branch=str(plan["checkout"]["branch"]),
+                        expected_physical_identity=intent["checkout_physical_identity"],
                     )
                     archive_id = str(archive_result["archive"]["archive_id"])
                     with _lock(identifier):
