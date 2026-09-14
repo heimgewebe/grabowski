@@ -277,6 +277,7 @@ def main(argv: list[str] | None = None) -> int:
                 writable_paths=writable_paths,
                 git_common_dir=common,
                 extra_read_only=prepared.extra_read_only,
+                extra_read_write=prepared.extra_read_write,
                 extra_directories=prepared.extra_directories,
             )
         ),
