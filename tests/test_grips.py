@@ -8239,7 +8239,13 @@ class GripFoundationTests(unittest.TestCase):
         self.assertIn("advanced during exact-base head CAS", result["output"]["error"])
         self.assertEqual(1, cas.call_count)
         checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("pass", checks["exact_base_head_cas"])
         self.assertEqual("fail", checks["base_identity_after"])
+        cas_check = next(
+            item for item in result["receipt"]["checks"] if item["id"] == "exact_base_head_cas"
+        )
+        self.assertIn("merge_sha=" + "b" * 40, cas_check["detail"])
+        self.assertIn("evidence_sha256=", cas_check["detail"])
 
     def test_pr_base_converge_unknown_cas_outcome_forbids_replay_or_successor(
         self,

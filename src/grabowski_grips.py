@@ -6491,29 +6491,6 @@ def _run_pr_base_converge(
 
     cas_status = str(cas_evidence.get("status") or "")
     cas_evidence_sha256 = sha256_json(cas_evidence)
-    if int(cas_result.get("returncode", 1)) == 0:
-        cas_remote_readback = cas_evidence.get("remote_readback")
-        if not isinstance(cas_remote_readback, dict):
-            _check(
-                receipt,
-                "base_identity_after",
-                "fail",
-                "successful CAS omitted authoritative remote base readback",
-            )
-            raise GripActionError(
-                "exact-base PR-head CAS succeeded without authoritative post-push base readback"
-            )
-        cas_base_after = str(cas_remote_readback.get("base_sha") or "").lower()
-        if cas_base_after != expected_base_sha:
-            _check(
-                receipt,
-                "base_identity_after",
-                "fail",
-                f"cas_live_sha={cas_base_after} expected_sha={expected_base_sha}",
-            )
-            raise GripActionError(
-                "live base advanced during exact-base head CAS; the applied head contains only the bound base and requires fresh same-PR convergence"
-            )
     if int(cas_result.get("returncode", 1)) != 0:
         _check(
             receipt,
@@ -6534,6 +6511,28 @@ def _run_pr_base_converge(
         "pass",
         f"status={cas_status}; merge_sha={cas_evidence.get('merge_sha')}; evidence_sha256={cas_evidence_sha256}",
     )
+    cas_remote_readback = cas_evidence.get("remote_readback")
+    if not isinstance(cas_remote_readback, dict):
+        _check(
+            receipt,
+            "base_identity_after",
+            "fail",
+            "successful CAS omitted authoritative remote base readback",
+        )
+        raise GripActionError(
+            "exact-base PR-head CAS succeeded without authoritative post-push base readback"
+        )
+    cas_base_after = str(cas_remote_readback.get("base_sha") or "").lower()
+    if cas_base_after != expected_base_sha:
+        _check(
+            receipt,
+            "base_identity_after",
+            "fail",
+            f"cas_live_sha={cas_base_after} expected_sha={expected_base_sha}",
+        )
+        raise GripActionError(
+            "live base advanced during exact-base head CAS; the applied head contains only the bound base and requires fresh same-PR convergence"
+        )
     new_head = str(cas_evidence.get("merge_sha") or "").lower()
     if len(new_head) != 40 or any(char not in "0123456789abcdef" for char in new_head):
         _check(receipt, "head_readback", "fail", f"head={new_head!r}")
