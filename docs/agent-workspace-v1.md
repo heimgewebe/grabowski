@@ -132,7 +132,7 @@ install -d -m 700 ~/.local/state/grabowski/codex-auth
 CODEX_HOME=~/.local/state/grabowski/codex-auth codex login --device-auth
 ```
 
-Danach bindet die Sandbox nur `auth.json` und den owner-privaten Lock read-write ein. Die Codex-Aufrufe werden über diesen Lock serialisiert; `config.toml`, Session-/History-Daten und sonstiger `.codex`-Zustand bleiben pro Sandbox frisch. Das normale Host-Login unter `~/.codex` bleibt getrennt und wird von Workspace-Codex nicht verändert.
+Danach bindet die Sandbox nur `auth.json` und den owner-privaten Lock read-write ein. Die Codex-Aufrufe werden über diesen Lock serialisiert; `config.toml`, Session-/History-Daten und sonstiger `.codex`-Zustand bleiben pro Sandbox frisch. Das normale Host-Login unter `~/.codex` bleibt getrennt und wird von Workspace-Codex nicht verändert. Zusätzlich erzwingt das Profil für Codex' innere `workspace-write`-Sandbox `sandbox_workspace_write.exclude_slash_tmp=true` und `sandbox_workspace_write.exclude_tmpdir_env_var=true`. Dadurch darf der Codex-Hauptprozess den gebundenen Credential-Store weiterhin für OAuth-Refresh aktualisieren, modellgenerierte Shell-Kommandos erhalten `/tmp` dagegen nicht als schreibbaren Root. Caller dürfen diese beiden Ausschlüsse oder die übergeordnete `sandbox_workspace_write`-Konfiguration nicht überschreiben.
 
 ## Abgrenzung
 
