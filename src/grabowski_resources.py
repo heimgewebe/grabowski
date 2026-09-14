@@ -28,6 +28,12 @@ except ModuleNotFoundError:
 mcp = operator.mcp
 READ_ONLY = operator.READ_ONLY
 MUTATING = operator.MUTATING
+BUREAU_TASK_PUBLICATION_AUTHORITY_KIND = (
+    "grabowski.bureau_task_publication_authority"
+)
+SERVER_OWNED_AUTHORITY_METADATA_KINDS = frozenset(
+    {"grabowski.work_lane", BUREAU_TASK_PUBLICATION_AUTHORITY_KIND}
+)
 DEFAULT_RESOURCE_LIST_LIMIT = 200
 RESOURCE_DB = Path(
     os.environ.get(
@@ -7184,13 +7190,15 @@ def grabowski_resource_acquire(
     manifests. Work Lane identity metadata is server-owned and can only be
     created through the Work Lane acquisition path.
     """
-    if (
-        isinstance(metadata, dict)
-        and metadata.get("kind") == "grabowski.work_lane"
-    ):
-        raise ValueError(
-            "metadata.kind grabowski.work_lane is a server-owned authority surface"
-        )
+    if isinstance(metadata, dict):
+        metadata_kind = metadata.get("kind")
+        if (
+            isinstance(metadata_kind, str)
+            and metadata_kind in SERVER_OWNED_AUTHORITY_METADATA_KINDS
+        ):
+            raise ValueError(
+                f"metadata.kind {metadata_kind} is a server-owned authority surface"
+            )
     normalized_resource_keys = _public_repository_scope_keys(resource_keys, metadata)
     operator._require_operator_mutation("resource_lease")
     result = acquire_resources(
