@@ -561,6 +561,41 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
             hashlib.sha256(audit.read_bytes()).hexdigest(), manifest["files"][0]["sha256"]
         )
 
+    def test_present_thread_focus_rejects_review_evidence_appearing_after_empty_scan(self) -> None:
+        binding = self._present_binding(
+            source_kind="thread_focus", source_id="thread-focus-id"
+        )
+        evidence = self._thread_focus_source_evidence(binding)
+        real_paths = reconciliation._thread_focus_review_evidence_paths
+        injected = False
+
+        def paths_with_late_audit(
+            checkout: Path, status: dict[str, object]
+        ) -> tuple[list[str], list[str]]:
+            nonlocal injected
+            result = real_paths(checkout, status)
+            if not injected:
+                evidence_root = self.checkout / ".review-audits"
+                evidence_root.mkdir()
+                (evidence_root / "late.json").write_text("{}\n", encoding="utf-8")
+                injected = True
+            return result
+
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(
+                checkouts, "_remote_secured_observation", return_value=self._remote_secured()
+            ),
+            patch.object(
+                reconciliation,
+                "_thread_focus_review_evidence_paths",
+                side_effect=paths_with_late_audit,
+            ),
+        ):
+            preview = reconciliation.preview(str(binding["checkout_key"]))
+        self.assertFalse(preview["safe_to_apply"])
+        self.assertIn("review-evidence-root-membership-drift", preview["blockers"])
+
     def test_present_thread_focus_rejects_review_evidence_membership_change_during_hash(self) -> None:
         binding = self._present_binding(
             source_kind="thread_focus", source_id="thread-focus-id"

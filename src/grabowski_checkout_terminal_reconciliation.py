@@ -477,21 +477,26 @@ def _thread_focus_review_evidence_observation(
     checkout = Path(record["path"])
     paths, blockers = _thread_focus_review_evidence_paths(checkout, status)
     if not paths:
-        core = {
-            "schema_version": 1,
-            "kind": "thread_focus_review_evidence_manifest",
-            "root": _REVIEW_EVIDENCE_DIR,
-            "file_count": 0,
-            "total_bytes": 0,
-            "files": [],
-        }
-        return {
-            **core,
-            "manifest_sha256": checkouts._sha256_json(core),
-            "classification": "blocked" if blockers else "not_applicable",
-            "eligible": False,
-            "blockers": sorted(set(blockers)),
-        }
+        try:
+            (checkout / _REVIEW_EVIDENCE_DIR).lstat()
+        except FileNotFoundError:
+            core = {
+                "schema_version": 1,
+                "kind": "thread_focus_review_evidence_manifest",
+                "root": _REVIEW_EVIDENCE_DIR,
+                "file_count": 0,
+                "total_bytes": 0,
+                "files": [],
+            }
+            return {
+                **core,
+                "manifest_sha256": checkouts._sha256_json(core),
+                "classification": "blocked" if blockers else "not_applicable",
+                "eligible": False,
+                "blockers": sorted(set(blockers)),
+            }
+        except OSError:
+            blockers.append("review-evidence-root-unobservable")
 
     root_descriptor, root_identity, root_blockers = _open_review_evidence_root(checkout)
     blockers.extend(root_blockers)
@@ -548,8 +553,10 @@ def _thread_focus_review_evidence_observation(
     return {
         **core,
         "manifest_sha256": checkouts._sha256_json(core),
-        "classification": "review_evidence_only" if not blockers else "blocked",
-        "eligible": not blockers,
+        "classification": (
+            "blocked" if blockers else "review_evidence_only" if paths else "not_applicable"
+        ),
+        "eligible": bool(paths) and not blockers,
         "blockers": sorted(set(blockers)),
     }
 
