@@ -1377,6 +1377,28 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         self.assertEqual(1, len(snapshot["effective_checks"]))
         self.assertEqual("FAILURE", snapshot["effective_checks"][0]["conclusion"])
 
+    def test_merge_group_run_retention_is_distinct_from_transport_failure(self) -> None:
+        with patch.object(
+            evidence,
+            "_run_command",
+            return_value=(1, b"", b"gh: Not Found (HTTP 404)"),
+        ):
+            with self.assertRaises(evidence.GitHubSourceUnavailable):
+                evidence._github_actions_run_pr_bindings_by_id(
+                    "heimgewebe/grabowski", {32860034363}
+                )
+
+        with patch.object(
+            evidence,
+            "_run_command",
+            return_value=(1, b"", b"authentication failed"),
+        ):
+            with self.assertRaises(evidence.EvidenceAssessmentError) as caught:
+                evidence._github_actions_run_pr_bindings_by_id(
+                    "heimgewebe/grabowski", {32860034363}
+                )
+        self.assertNotIsInstance(caught.exception, evidence.GitHubSourceUnavailable)
+
     def test_prepare_github_accepts_empty_terminal_pr_backlink_when_run_head_is_exact(self) -> None:
         head = "1" * 40
         base = "2" * 40

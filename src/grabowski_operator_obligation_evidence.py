@@ -923,7 +923,7 @@ def _github_actions_run_pr_bindings_by_id(
     )
     bindings: dict[int, dict[str, Any]] = {}
     for run_id in sorted(wanted):
-        returncode, stdout, _stderr = _run_command(
+        returncode, stdout, stderr = _run_command(
             [
                 'gh',
                 'api',
@@ -936,6 +936,10 @@ def _github_actions_run_pr_bindings_by_id(
             deadline_monotonic=deadline_monotonic,
         )
         if returncode != 0:
+            if re.search(rb"\bHTTP (?:404|410)\b", stderr, re.IGNORECASE):
+                raise GitHubSourceUnavailable(
+                    'github Actions run history unavailable'
+                )
             raise EvidenceAssessmentError('github Actions run source unavailable')
         try:
             payload = json.loads(stdout)

@@ -3472,6 +3472,19 @@ class GripFoundationTests(unittest.TestCase):
                     allow_mutation=True,
                 )
             replay_parameters = {**parameters, "evidence": [evidence_b, evidence_a]}
+            replay_classification = (
+                grips.grabowski_operator_obligation.exact_completion_replay_classification(
+                    replay_parameters
+                )
+            )
+            self.assertIsNotNone(replay_classification)
+            changed_evidence = [dict(evidence_b), dict(evidence_a)]
+            changed_evidence[0]["sha256"] = "f" * 64
+            self.assertIsNone(
+                grips.grabowski_operator_obligation.exact_completion_replay_classification(
+                    {**parameters, "evidence": changed_evidence}
+                )
+            )
             with patch.object(
                 grips.grabowski_operator_obligation_evidence,
                 "archive_close_github_evidence",
