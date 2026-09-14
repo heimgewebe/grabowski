@@ -268,6 +268,23 @@ def _thread_focus_review_evidence_paths(
         if entry
     ):
         blockers.append("review-evidence-submodules-present")
+
+    index_flags = checkouts._git_read(
+        checkout, ["ls-files", "-v", "-z"], check=False
+    )
+    if index_flags.returncode != 0:
+        blockers.append("review-evidence-index-flags-unobservable")
+    else:
+        index_tags = [
+            entry[0]
+            for entry in index_flags.stdout.split("\0")
+            if entry
+        ]
+        if any(tag.islower() for tag in index_tags):
+            blockers.append("review-evidence-assume-unchanged-present")
+        if any(tag.upper() == "S" for tag in index_tags):
+            blockers.append("review-evidence-skip-worktree-present")
+
     for label, arguments in (
         ("unstaged", ["diff", "--quiet", "--no-ext-diff", "--"]),
         ("staged", ["diff", "--cached", "--quiet", "--no-ext-diff", "--"]),
