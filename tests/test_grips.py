@@ -16301,6 +16301,193 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 now_unix=151,
             )
 
+    def test_server_bureau_run_lease_delegation_is_request_bound_and_short_lived(self) -> None:
+        class Session:
+            pass
+
+        run_id = "BUR-RUN-20260914T120000Z-aaaaaaaaaa"
+        owner = f"bureau-run:{run_id}"
+        resource_keys = ["component:test-bureau-delegation"]
+        snapshots = [
+            {
+                "resource_key": resource_keys[0],
+                "owner_id": owner,
+                "acquired_at_unix": 90,
+                "updated_at_unix": 90,
+                "expires_at_unix": 150,
+                "metadata_sha256": "b" * 64,
+            }
+        ]
+        evidence = {
+            "schema_version": 1,
+            "kind": "grabowski_live_bureau_run_lease_delegation_evidence",
+            "run_id": run_id,
+            "task_id": "TASK-1",
+            "worker_id": "worker-1",
+            "lease_owner_id": owner,
+            "resource_keys": resource_keys,
+            "resource_keys_sha256": merge_guard._sha256_json(resource_keys),
+            "lease_snapshots": snapshots,
+            "lease_bindings_sha256": merge_guard._sha256_json(snapshots),
+            "coordination_sha256": "e" * 64,
+            "minimum_expires_at_unix": 150,
+            "observed_at_unix": 100,
+        }
+        actor = merge_guard.issue_server_runtime_actor_identity(
+            Session(), profile="trusted-owner", now_unix=100
+        )
+        delegation = merge_guard.issue_server_bureau_run_lease_delegation(
+            actor,
+            evidence,
+            captain_request_sha256_value="c" * 64,
+            now_unix=100,
+        )
+
+        verified = merge_guard.verify_server_bureau_run_lease_delegation(
+            delegation,
+            actor_identity=actor,
+            captain_request_sha256_value="c" * 64,
+            now_unix=100,
+        )
+        self.assertEqual(run_id, verified["run_id"])
+        self.assertEqual(owner, verified["lease_owner_id"])
+        self.assertEqual(150, verified["expires_at_unix"])
+        self.assertEqual(snapshots, verified["lease_snapshots"])
+        with self.assertRaisesRegex(ValueError, "captain request mismatch"):
+            merge_guard.verify_server_bureau_run_lease_delegation(
+                delegation,
+                actor_identity=actor,
+                captain_request_sha256_value="d" * 64,
+                now_unix=100,
+            )
+        with self.assertRaisesRegex(ValueError, "not current"):
+            merge_guard.verify_server_bureau_run_lease_delegation(
+                delegation,
+                actor_identity=actor,
+                captain_request_sha256_value="c" * 64,
+                now_unix=151,
+            )
+
+    def test_atomic_merge_guard_rejects_unsigned_bureau_run_owner(self) -> None:
+        class Session:
+            pass
+
+        run_id = "BUR-RUN-20260914T120000Z-aaaaaaaaaa"
+        owner = f"bureau-run:{run_id}"
+        parameters = authorized_captain_run_parameters()
+        parameters["execution_intent"]["context"]["lease_owner_id"] = owner
+        parameters["execution_intent"] = captain_execution_intent(
+            parameters, context=parameters["execution_intent"]["context"]
+        )
+        parameters["_server_runtime_actor_identity"] = (
+            merge_guard.issue_server_runtime_actor_identity(
+                Session(), profile="trusted-owner"
+            )
+        )
+        gh = FakeGh()
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        guard = result["output"]["executions"][0]["merge_lease_guard"]
+        self.assertEqual("blocked_before_guard", guard["status"])
+        self.assertIn(
+            "merge_guard_server_bureau_run_lease_delegation_required",
+            guard["errors"],
+        )
+        self.assertEqual([], gh.calls)
+
+    def test_atomic_merge_guard_accepts_live_server_delegated_bureau_run_lease(self) -> None:
+        class Session:
+            pass
+
+        local_repo = merge_guard.merge_guard_repository_root(Path.cwd())
+        changed_path_key = f"path:{local_repo / 'src/changed.py'}"
+        run_id = "BUR-RUN-20260914T120000Z-aaaaaaaaaa"
+        owner = f"bureau-run:{run_id}"
+        extra_key = "component:test-bureau-scope-expansion"
+        resources.acquire_resources(
+            owner,
+            [changed_path_key, extra_key],
+            purpose="live Bureau changed-path lease",
+            ttl_seconds=600,
+            metadata={"run_id": run_id},
+        )
+        resource_evidence = resources.bureau_run_lease_delegation_evidence(owner)
+        self.assertEqual(
+            {changed_path_key, extra_key}, set(resource_evidence["resource_keys"])
+        )
+        evidence = {
+            **resource_evidence,
+            "task_id": "TASK-1",
+            "worker_id": "worker-1",
+            "coordination_sha256": "e" * 64,
+        }
+        parameters = authorized_captain_run_parameters()
+        parameters["execution_intent"]["context"]["lease_owner_id"] = owner
+        parameters["execution_intent"] = captain_execution_intent(
+            parameters, context=parameters["execution_intent"]["context"]
+        )
+        actor = merge_guard.issue_server_runtime_actor_identity(
+            Session(), profile="trusted-owner"
+        )
+        parameters["_server_runtime_actor_identity"] = actor
+        delegation = merge_guard.issue_server_bureau_run_lease_delegation(
+            actor,
+            evidence,
+            captain_request_sha256_value=merge_guard.captain_request_sha256(
+                parameters
+            ),
+        )
+        parameters["_server_bureau_run_lease_delegation"] = delegation
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": CAPTAIN_BASE_SHA,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            }
+        )
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        guard = result["output"]["executions"][0]["merge_lease_guard"]
+        self.assertEqual(
+            "server-runtime-bureau-run-delegation-v1", guard["lease_owner_source"]
+        )
+        self.assertEqual(
+            "bureau_run", guard["lease_owner_binding"]["delegation_kind"]
+        )
+        remaining = resources.inspect_resource(changed_path_key)
+        self.assertIsNotNone(remaining)
+        assert remaining is not None
+        self.assertEqual(owner, remaining["owner_id"])
+        self.assertNotIn(
+            delegation["proof_sha256"], json.dumps(guard, sort_keys=True)
+        )
+        self.assertEqual(
+            1, len([call for call in gh.calls if call[:2] == ("pr", "merge")])
+        )
+
     def test_atomic_merge_guard_rejects_unsigned_direct_operator_owner(self) -> None:
         class Session:
             pass

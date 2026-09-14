@@ -219,6 +219,9 @@ _SERVER_TASK_DELEGATION_KEYS = frozenset(
 _SERVER_OPERATOR_DELEGATION_SCHEMA_VERSION = 1
 _SERVER_OPERATOR_DELEGATION_KIND = "grabowski_server_operator_lease_delegation"
 _SERVER_OPERATOR_DELEGATION_TTL_SECONDS = 300
+_SERVER_BUREAU_DELEGATION_SCHEMA_VERSION = 1
+_SERVER_BUREAU_DELEGATION_KIND = "grabowski_server_bureau_run_lease_delegation"
+_SERVER_BUREAU_DELEGATION_TTL_SECONDS = 300
 _LEASE_SNAPSHOT_KEYS = frozenset(
     {
         "resource_key",
@@ -246,15 +249,39 @@ _SERVER_OPERATOR_DELEGATION_KEYS = frozenset(
         "proof_sha256",
     }
 )
+_SERVER_BUREAU_DELEGATION_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "actor_owner_id",
+        "actor_identity_sha256",
+        "run_id",
+        "task_id",
+        "worker_id",
+        "lease_owner_id",
+        "resource_keys",
+        "resource_keys_sha256",
+        "lease_snapshots",
+        "lease_bindings_sha256",
+        "coordination_sha256",
+        "captain_request_sha256",
+        "issued_at_unix",
+        "expires_at_unix",
+        "proof_sha256",
+    }
+)
 _SERVER_RESERVED_PARAMETER_KEYS = frozenset(
     {
         "_server_runtime_actor_identity",
         "_server_task_lease_delegation",
         "_server_operator_lease_delegation",
+        "_server_bureau_run_lease_delegation",
     }
 )
 _TASK_OWNER_RE = re.compile(r"task:([0-9a-f]{24})\Z")
 _DIRECT_OPERATOR_OWNER_RE = re.compile(r"operator:[A-Za-z0-9._:@-]{1,119}\Z")
+_BUREAU_RUN_RE = re.compile(r"BUR-RUN-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{10}\Z")
+_BUREAU_RUN_OWNER_RE = re.compile(r"bureau-run:(BUR-RUN-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{10})\Z")
 
 
 def _normalize_codex_comment_body(value: str) -> str:
@@ -899,6 +926,200 @@ def verify_server_operator_lease_delegation(
         "resource_keys_sha256": value["resource_keys_sha256"],
         "lease_snapshots": lease_snapshots,
         "lease_bindings_sha256": value["lease_bindings_sha256"],
+        "captain_request_sha256": captain_request_sha256_value,
+        "delegation_sha256": _sha256_json(value),
+        "issued_at_unix": issued_at,
+        "expires_at_unix": expires_at,
+    }
+
+
+def issue_server_bureau_run_lease_delegation(
+    actor_identity: dict[str, Any],
+    lease_evidence: dict[str, Any],
+    *,
+    captain_request_sha256_value: str,
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    actor = verify_server_runtime_actor_identity(actor_identity, now_unix=now_unix)
+    if _SHA256_RE.fullmatch(captain_request_sha256_value) is None:
+        raise ValueError("captain request digest is invalid")
+    expected_evidence_keys = {
+        "schema_version", "kind", "run_id", "task_id", "worker_id",
+        "lease_owner_id", "resource_keys", "resource_keys_sha256",
+        "lease_snapshots", "lease_bindings_sha256", "coordination_sha256",
+        "minimum_expires_at_unix", "observed_at_unix",
+    }
+    if not isinstance(lease_evidence, dict) or set(lease_evidence) != expected_evidence_keys:
+        raise ValueError("Bureau delegation evidence shape is invalid")
+    if lease_evidence.get("schema_version") != 1 or lease_evidence.get("kind") != "grabowski_live_bureau_run_lease_delegation_evidence":
+        raise ValueError("Bureau delegation evidence contract is invalid")
+    run_id = lease_evidence.get("run_id")
+    if not isinstance(run_id, str) or _BUREAU_RUN_RE.fullmatch(run_id) is None:
+        raise ValueError("Bureau delegation run_id is invalid")
+    lease_owner_id = lease_evidence.get("lease_owner_id")
+    if lease_owner_id != f"bureau-run:{run_id}":
+        raise ValueError("Bureau delegation lease owner is invalid")
+    task_id = lease_evidence.get("task_id")
+    worker_id = lease_evidence.get("worker_id")
+    if not isinstance(task_id, str) or not task_id or not isinstance(worker_id, str) or not worker_id:
+        raise ValueError("Bureau delegation task/worker binding is invalid")
+    resource_keys = lease_evidence.get("resource_keys")
+    if (not isinstance(resource_keys, list) or not resource_keys or len(resource_keys) > 64
+        or any(not isinstance(key, str) or not key for key in resource_keys)
+        or resource_keys != sorted(set(resource_keys))):
+        raise ValueError("Bureau delegation resource keys are invalid")
+    if lease_evidence.get("resource_keys_sha256") != _sha256_json(resource_keys):
+        raise ValueError("Bureau delegation resource key digest is invalid")
+    raw_snapshots = lease_evidence.get("lease_snapshots")
+    if (not isinstance(raw_snapshots, list) or len(raw_snapshots) != len(resource_keys)
+        or any(not isinstance(item, dict) or set(item) != _LEASE_SNAPSHOT_KEYS for item in raw_snapshots)):
+        raise ValueError("Bureau delegation lease snapshots are invalid")
+    snapshots = [dict(item) for item in raw_snapshots]
+    if [item["resource_key"] for item in snapshots] != resource_keys or any(
+        item["owner_id"] != lease_owner_id for item in snapshots
+    ):
+        raise ValueError("Bureau delegation lease snapshot binding is invalid")
+    for snapshot in snapshots:
+        if (
+            not isinstance(snapshot["metadata_sha256"], str)
+            or _SHA256_RE.fullmatch(snapshot["metadata_sha256"]) is None
+        ):
+            raise ValueError("Bureau delegation metadata digest is invalid")
+        for field in ("acquired_at_unix", "updated_at_unix", "expires_at_unix"):
+            field_value = snapshot[field]
+            if (
+                not isinstance(field_value, int)
+                or isinstance(field_value, bool)
+                or field_value < 0
+            ):
+                raise ValueError(f"Bureau delegation {field} is invalid")
+    if lease_evidence.get("lease_bindings_sha256") != _sha256_json(snapshots):
+        raise ValueError("Bureau delegation lease binding digest is invalid")
+    coordination_sha256 = lease_evidence.get("coordination_sha256")
+    if not isinstance(coordination_sha256, str) or _SHA256_RE.fullmatch(coordination_sha256) is None:
+        raise ValueError("Bureau delegation coordination digest is invalid")
+    current = int(time.time()) if now_unix is None else int(now_unix)
+    minimum_expiry = lease_evidence.get("minimum_expires_at_unix")
+    observed_at = lease_evidence.get("observed_at_unix")
+    if (
+        not isinstance(minimum_expiry, int)
+        or isinstance(minimum_expiry, bool)
+        or minimum_expiry != min(item["expires_at_unix"] for item in snapshots)
+    ):
+        raise ValueError("Bureau delegation minimum lease expiry is invalid")
+    if (
+        not isinstance(observed_at, int)
+        or isinstance(observed_at, bool)
+        or observed_at < 0
+        or observed_at > current + 5
+    ):
+        raise ValueError("Bureau delegation observation time is invalid")
+    expires_at = min(current + _SERVER_BUREAU_DELEGATION_TTL_SECONDS, int(actor["expires_at_unix"]), minimum_expiry)
+    if expires_at <= current:
+        raise ValueError("Bureau delegation has no live validity window")
+    payload = {
+        "schema_version": _SERVER_BUREAU_DELEGATION_SCHEMA_VERSION,
+        "kind": _SERVER_BUREAU_DELEGATION_KIND,
+        "actor_owner_id": actor["owner_id"],
+        "actor_identity_sha256": actor["identity_sha256"],
+        "run_id": run_id,
+        "task_id": task_id,
+        "worker_id": worker_id,
+        "lease_owner_id": lease_owner_id,
+        "resource_keys": resource_keys,
+        "resource_keys_sha256": lease_evidence["resource_keys_sha256"],
+        "lease_snapshots": snapshots,
+        "lease_bindings_sha256": lease_evidence["lease_bindings_sha256"],
+        "coordination_sha256": coordination_sha256,
+        "captain_request_sha256": captain_request_sha256_value,
+        "issued_at_unix": current,
+        "expires_at_unix": expires_at,
+    }
+    payload["proof_sha256"] = hmac.new(_SERVER_ACTOR_SECRET, _canonical_json(payload).encode("utf-8"), hashlib.sha256).hexdigest()
+    return payload
+
+
+def verify_server_bureau_run_lease_delegation(
+    value: Any,
+    *,
+    actor_identity: dict[str, Any],
+    captain_request_sha256_value: str,
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    actor = verify_server_runtime_actor_identity(actor_identity, now_unix=now_unix)
+    if not isinstance(value, dict) or set(value) != _SERVER_BUREAU_DELEGATION_KEYS:
+        raise ValueError("server Bureau lease delegation shape is invalid")
+    if value.get("schema_version") != _SERVER_BUREAU_DELEGATION_SCHEMA_VERSION or value.get("kind") != _SERVER_BUREAU_DELEGATION_KIND:
+        raise ValueError("server Bureau lease delegation contract is invalid")
+    run_id = value.get("run_id")
+    if not isinstance(run_id, str) or _BUREAU_RUN_RE.fullmatch(run_id) is None or value.get("lease_owner_id") != f"bureau-run:{run_id}":
+        raise ValueError("server Bureau lease delegation owner is invalid")
+    if value.get("actor_owner_id") != actor["owner_id"] or value.get("actor_identity_sha256") != actor["identity_sha256"]:
+        raise ValueError("server Bureau lease delegation actor mismatch")
+    if value.get("captain_request_sha256") != captain_request_sha256_value:
+        raise ValueError("server Bureau lease delegation captain request mismatch")
+    resource_keys = value.get("resource_keys")
+    if (not isinstance(resource_keys, list) or not resource_keys or len(resource_keys) > 64
+        or resource_keys != sorted(set(resource_keys)) or value.get("resource_keys_sha256") != _sha256_json(resource_keys)):
+        raise ValueError("server Bureau lease delegation resource keys are invalid")
+    snapshots = value.get("lease_snapshots")
+    if (
+        not isinstance(snapshots, list)
+        or len(snapshots) != len(resource_keys)
+        or any(
+            not isinstance(item, dict) or set(item) != _LEASE_SNAPSHOT_KEYS
+            for item in snapshots
+        )
+        or [item["resource_key"] for item in snapshots] != resource_keys
+        or any(item["owner_id"] != value["lease_owner_id"] for item in snapshots)
+        or value.get("lease_bindings_sha256") != _sha256_json(snapshots)
+    ):
+        raise ValueError("server Bureau lease delegation snapshots are invalid")
+    for snapshot in snapshots:
+        if (
+            not isinstance(snapshot["metadata_sha256"], str)
+            or _SHA256_RE.fullmatch(snapshot["metadata_sha256"]) is None
+        ):
+            raise ValueError("server Bureau lease delegation metadata digest is invalid")
+        for field in ("acquired_at_unix", "updated_at_unix", "expires_at_unix"):
+            field_value = snapshot[field]
+            if (
+                not isinstance(field_value, int)
+                or isinstance(field_value, bool)
+                or field_value < 0
+            ):
+                raise ValueError(f"server Bureau lease delegation {field} is invalid")
+    coordination_sha256 = value.get("coordination_sha256")
+    if not isinstance(coordination_sha256, str) or _SHA256_RE.fullmatch(coordination_sha256) is None:
+        raise ValueError("server Bureau lease delegation coordination digest is invalid")
+    issued_at = value.get("issued_at_unix")
+    expires_at = value.get("expires_at_unix")
+    if not isinstance(issued_at, int) or isinstance(issued_at, bool) or not isinstance(expires_at, int) or isinstance(expires_at, bool):
+        raise ValueError("server Bureau lease delegation timing is invalid")
+    if (
+        expires_at <= issued_at
+        or expires_at - issued_at > _SERVER_BUREAU_DELEGATION_TTL_SECONDS
+        or expires_at > min(item["expires_at_unix"] for item in snapshots)
+    ):
+        raise ValueError("server Bureau lease delegation lifetime is invalid")
+    current = int(time.time()) if now_unix is None else int(now_unix)
+    if issued_at > current + 5 or expires_at < current:
+        raise ValueError("server Bureau lease delegation is not current")
+    unsigned = {key: value[key] for key in value if key != "proof_sha256"}
+    expected_proof = hmac.new(_SERVER_ACTOR_SECRET, _canonical_json(unsigned).encode("utf-8"), hashlib.sha256).hexdigest()
+    proof = value.get("proof_sha256")
+    if not isinstance(proof, str) or not hmac.compare_digest(proof, expected_proof):
+        raise ValueError("server Bureau lease delegation proof is invalid")
+    return {
+        "run_id": run_id,
+        "task_id": value["task_id"],
+        "worker_id": value["worker_id"],
+        "lease_owner_id": value["lease_owner_id"],
+        "resource_keys": list(resource_keys),
+        "resource_keys_sha256": value["resource_keys_sha256"],
+        "lease_snapshots": [dict(item) for item in snapshots],
+        "lease_bindings_sha256": value["lease_bindings_sha256"],
+        "coordination_sha256": coordination_sha256,
         "captain_request_sha256": captain_request_sha256_value,
         "delegation_sha256": _sha256_json(value),
         "issued_at_unix": issued_at,
@@ -2809,6 +3030,7 @@ class CaptainMergeGuardRunner:
         server_actor_identity: dict[str, Any] | None = None,
         server_task_lease_delegation: dict[str, Any] | None = None,
         server_operator_lease_delegation: dict[str, Any] | None = None,
+        server_bureau_run_lease_delegation: dict[str, Any] | None = None,
     ) -> None:
         self.action = action
         self.parameters = parameters
@@ -2843,6 +3065,8 @@ class CaptainMergeGuardRunner:
         self.server_task_lease_delegation_error = False
         self.server_operator_lease_delegation: dict[str, Any] | None = None
         self.server_operator_lease_delegation_error = False
+        self.server_bureau_run_lease_delegation: dict[str, Any] | None = None
+        self.server_bureau_run_lease_delegation_error = False
         if server_actor_identity is not None:
             try:
                 verified_actor = verify_server_runtime_actor_identity(server_actor_identity)
@@ -2906,6 +3130,28 @@ class CaptainMergeGuardRunner:
                                 self.lease_owner_source = (
                                     "server-runtime-operator-delegation-v1"
                                 )
+                if server_bureau_run_lease_delegation is not None:
+                    if server_task_lease_delegation is not None or server_operator_lease_delegation is not None:
+                        self.lease_owner_id = ""
+                        self.server_bureau_run_lease_delegation_error = True
+                    else:
+                        try:
+                            verified_bureau_delegation = verify_server_bureau_run_lease_delegation(
+                                server_bureau_run_lease_delegation,
+                                actor_identity=server_actor_identity,
+                                captain_request_sha256_value=captain_request_sha256(parameters),
+                            )
+                        except ValueError:
+                            self.lease_owner_id = ""
+                            self.server_bureau_run_lease_delegation_error = True
+                        else:
+                            if verified_bureau_delegation["lease_owner_id"] != lease_owner_id:
+                                self.lease_owner_id = ""
+                                self.server_bureau_run_lease_delegation_error = True
+                            else:
+                                self.server_bureau_run_lease_delegation = verified_bureau_delegation
+                                self.lease_owner_id = str(verified_bureau_delegation["lease_owner_id"])
+                                self.lease_owner_source = "server-runtime-bureau-run-delegation-v1"
         self.owner_id: str | None = None
         self.resource_keys: list[str] = []
         self.held_resource_keys: list[str] = []
@@ -2928,6 +3174,8 @@ class CaptainMergeGuardRunner:
             does_not_establish.append("task_creator_identity")
         if self.server_operator_lease_delegation is not None:
             does_not_establish.append("identity_of_original_lease_creator")
+        if self.server_bureau_run_lease_delegation is not None:
+            does_not_establish.append("identity_of_original_bureau_lease_creator")
         self.receipt: dict[str, Any] = {
             "schema_version": 1,
             "kind": "grabowski_captain_merge_lease_guard",
@@ -2965,6 +3213,7 @@ class CaptainMergeGuardRunner:
                     (
                         self.server_task_lease_delegation
                         or self.server_operator_lease_delegation
+                        or self.server_bureau_run_lease_delegation
                         or {}
                     ).get("delegation_sha256")
                 ),
@@ -2972,6 +3221,7 @@ class CaptainMergeGuardRunner:
                     (
                         self.server_task_lease_delegation
                         or self.server_operator_lease_delegation
+                        or self.server_bureau_run_lease_delegation
                         or {}
                     ).get("expires_at_unix")
                 ),
@@ -2981,13 +3231,18 @@ class CaptainMergeGuardRunner:
                     else (
                         "direct_operator"
                         if self.server_operator_lease_delegation is not None
-                        else None
+                        else (
+                            "bureau_run"
+                            if self.server_bureau_run_lease_delegation is not None
+                            else None
+                        )
                     )
                 ),
                 "delegated_resource_keys_sha256": (
                     (
                         self.server_task_lease_delegation
                         or self.server_operator_lease_delegation
+                        or self.server_bureau_run_lease_delegation
                         or {}
                     ).get("resource_keys_sha256")
                 ),
@@ -4238,6 +4493,8 @@ class CaptainMergeGuardRunner:
             errors.append("merge_guard_server_task_lease_delegation_invalid")
         if self.server_operator_lease_delegation_error:
             errors.append("merge_guard_server_operator_lease_delegation_invalid")
+        if self.server_bureau_run_lease_delegation_error:
+            errors.append("merge_guard_server_bureau_run_lease_delegation_invalid")
         if (
             _TASK_OWNER_RE.fullmatch(self.requested_lease_owner_id) is not None
             and self.server_task_lease_delegation is None
@@ -4249,6 +4506,11 @@ class CaptainMergeGuardRunner:
             and self.server_operator_lease_delegation is None
         ):
             errors.append("merge_guard_server_operator_lease_delegation_required")
+        if (
+            _BUREAU_RUN_OWNER_RE.fullmatch(self.requested_lease_owner_id) is not None
+            and self.server_bureau_run_lease_delegation is None
+        ):
+            errors.append("merge_guard_server_bureau_run_lease_delegation_required")
         if _OWNER_RE.fullmatch(self.lease_owner_id) is None:
             errors.append("merge_guard_lease_owner_invalid")
         if _SHA40_RE.fullmatch(expected_head) is None:
@@ -4801,6 +5063,7 @@ class CaptainMergeGuardRunner:
                 metadata=metadata,
                 delegated_task=self.server_task_lease_delegation,
                 delegated_operator=self.server_operator_lease_delegation,
+                delegated_bureau=self.server_bureau_run_lease_delegation,
             )
         except Exception as exc:
             self.receipt["status"] = "blocked_by_live_lease"
