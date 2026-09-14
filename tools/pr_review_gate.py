@@ -1173,6 +1173,7 @@ def classify_complexity(
         "high_critical": bool(high_critical_reasons),
         "high_critical_reasons": high_critical_reasons,
         "external_review_required": False,
+        "independent_review_required": review_tier == "high_critical",
         "claude_cli_required": False,
         "self_review_required": True,
         "minimum_self_review_iterations": minimum_self_review_iterations,
@@ -3227,6 +3228,7 @@ def build_self_review_audit(
         "review_policy_version": REVIEW_POLICY_VERSION,
         "diff_sha256": _normalize_sha256(state.get("pr_diff_sha256")),
         "review_tier": complexity.get("review_tier"),
+        "independent_review_required": complexity.get("independent_review_required") is True,
         "minimum_review_iterations": complexity.get("minimum_self_review_iterations"),
         "actual_review_iterations": actual_iterations,
         "all_findings_triaged": (
@@ -4085,6 +4087,7 @@ def evaluate_review_gate(
             "claude_cli_required": complexity["claude_cli_required"],
             "claude_cli_waived": claude_cli_waived,
             "external_review_required": external_required,
+            "independent_review_required": complexity["independent_review_required"],
             "external_reviews_received": _external_review_count(external_review),
             "platform_review_required": platform_review_required,
             "platform_review_seen": platform_review_seen,

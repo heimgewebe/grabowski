@@ -2335,6 +2335,111 @@ class OperatorContractTests(unittest.TestCase):
                 persisted["origin"]["scope"]["decision_bound_review"], expected
             )
 
+    def test_job_start_origin_binds_server_derived_independent_reviewer_provenance(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            jobs = state / "jobs"
+            locks = state / "decision-review-locks"
+            cwd = root / "cwd"
+            cwd.mkdir(parents=True)
+            output = root / "role-receipt.json"
+            fake_uuid = types.SimpleNamespace(hex="a11ce0000001ffffffffffffffffffff")
+            launcher = {
+                "returncode": 0,
+                "stdout": "started",
+                "stderr": "",
+                "argv": [],
+                "argv_sha256": "0" * 64,
+                "command": "systemd-run",
+                "cwd": str(root),
+                "timed_out": False,
+                "duration_seconds": 0.01,
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+            }
+            decision_binding = {
+                "schema_version": 1,
+                "kind": operator.decision_reviews.BINDING_KIND,
+                "repo": "heimgewebe/vibe-lab",
+                "pr": 350,
+                "head_sha": "a" * 40,
+                "base_sha": "b" * 40,
+                "diff_sha256": "c" * 64,
+                "slot": "independent-claude-review",
+            }
+            review_command = [
+                "claude",
+                "--model",
+                "opus",
+                "--effort",
+                "high",
+                "--permission-mode",
+                "plan",
+                "Review the frozen revision",
+            ]
+            argv = [
+                operator.decision_reviews.REVIEW_ROLE_PYTHON,
+                "-I",
+                "-m",
+                operator.decision_reviews.REVIEW_ROLE_MODULE,
+                "--role",
+                "review",
+                "--repository",
+                str(cwd),
+                "--expected-head",
+                "a" * 40,
+                "--expected-base-head",
+                "b" * 40,
+                "--expected-diff-sha256",
+                "e" * 64,
+                "--expected-dirty",
+                "false",
+                "--output",
+                str(output),
+                "--",
+                *review_command,
+            ]
+            with patch.object(operator, "STATE_DIR", state), patch.object(
+                operator, "JOBS_DIR", jobs
+            ), patch.object(
+                operator.decision_reviews, "LOCKS_ROOT", locks
+            ), patch.object(operator.uuid, "uuid4", return_value=fake_uuid), patch.object(
+                operator, "_run", return_value=launcher
+            ):
+                job = operator.grabowski_job_start(
+                    argv,
+                    cwd=str(cwd),
+                    runtime_seconds=60,
+                    decision_review_binding=decision_binding,
+                )
+
+            provenance = job["scope"]["decision_review_provenance"]
+            self.assertEqual(provenance["kind"], "grabowski_decision_review_provenance")
+            self.assertEqual(provenance["role"], "review")
+            self.assertEqual(
+                provenance["runner_python"],
+                operator.decision_reviews.REVIEW_ROLE_PYTHON,
+            )
+            self.assertIs(provenance["runner_isolated"], True)
+            self.assertEqual(provenance["runner_module"], "grabowski_agent_role")
+            self.assertEqual(
+                provenance["sandbox"],
+                "bubblewrap-minimal-root-read-only-worktree-v1",
+            )
+            self.assertEqual(provenance["review_route"]["route_id"], "claude-opus-5-high")
+            self.assertEqual(provenance["review_route"]["provider_family"], "anthropic")
+            self.assertEqual(
+                provenance,
+                job["origin"]["scope"]["decision_review_provenance"],
+            )
+            persisted = json.loads(Path(job["metadata_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(
+                provenance,
+                persisted["origin"]["scope"]["decision_review_provenance"],
+            )
+
     def test_broad_github_wrapper_blocks_merge_bypass_paths(self) -> None:
         operator = _load_operator_module()
         self.assertEqual(
