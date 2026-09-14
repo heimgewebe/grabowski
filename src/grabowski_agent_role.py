@@ -243,6 +243,7 @@ def sandbox_argv(repo: Path, command: list[str], *, declared_command: list[str] 
         workspace_writable=False,
         git_common_dir=common,
         extra_read_only=(*prepared.extra_read_only, *venv_read_only),
+        extra_read_write=prepared.extra_read_write,
         extra_directories=(*prepared.extra_directories, *venv_directories),
     )
 
@@ -325,7 +326,7 @@ def _sandbox_probe_python() -> str:
 def toolchain_probe(repo: Path, command: list[str]) -> dict[str, Any]:
     """Resolve declared prerequisites inside the exact read-only role sandbox."""
     prepared = prepare_external_agent_command(command)
-    executable = prepared.command[0]
+    executable = prepared.probe_executable or prepared.command[0]
     module = declared_python_module(command)
     result: dict[str, Any] = {
         "executable": executable,
