@@ -3690,13 +3690,34 @@ def _server_verified_task_read_route(
             "git_subcommand": subcommand,
             "recommended_route": None,
         }
+    if (
+        subcommand == "status"
+        and len(_command_arguments) == 2
+        and set(_command_arguments) == {"--short", "--branch"}
+    ):
+        return {
+            **base,
+            "status": "verified",
+            "reason": "guarded_local_git_read",
+            "git_subcommand": subcommand,
+            "recommended_route": "grabowski_git_status",
+            "authority": "grabowski_git_status",
+        }
+    if operator._server_verified_git_read_invocation(arguments) is None:
+        return {
+            **base,
+            "status": "unverified",
+            "reason": "guarded_git_read_has_no_executable_synchronous_route",
+            "git_subcommand": subcommand,
+            "recommended_route": None,
+        }
     return {
         **base,
         "status": "verified",
         "reason": "guarded_local_git_read",
         "git_subcommand": subcommand,
         "recommended_route": "grabowski_git",
-        "authority": "grabowski_git_guard",
+        "authority": "grabowski_git_transport_exemption",
     }
 
 
