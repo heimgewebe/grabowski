@@ -842,13 +842,13 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         group = result["work"][0]
         self.assertEqual(group["projection_state"], "active")
         self.assertEqual(group["work_class"], "operational")
-        self.assertTrue(group["action_required"])
-        self.assertIn(
+        self.assertFalse(group["action_required"])
+        self.assertNotIn(
             "managed-active-lifecycle-attention", group["action_reasons"]
         )
         self.assertEqual(
             group["next_convergence_action"],
-            "monitor active work execution and reconcile managed active lifecycle attention",
+            "monitor active work execution",
         )
 
     def test_managed_active_checkout_with_process_remains_active(self) -> None:
@@ -874,13 +874,13 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         group = result["work"][0]
         self.assertEqual(group["projection_state"], "active")
         self.assertEqual(group["work_class"], "operational")
-        self.assertTrue(group["action_required"])
-        self.assertIn(
+        self.assertFalse(group["action_required"])
+        self.assertNotIn(
             "managed-active-lifecycle-attention", group["action_reasons"]
         )
         self.assertEqual(
             group["next_convergence_action"],
-            "monitor active work execution and reconcile managed active lifecycle attention",
+            "monitor active work execution",
         )
 
     def test_managed_active_mixed_stale_and_retained_checkout_remains_active(self) -> None:
@@ -911,8 +911,8 @@ class CurrentWorkProjectionTests(unittest.TestCase):
                 group = result["work"][0]
                 self.assertEqual(group["projection_state"], "active")
                 self.assertEqual(group["work_class"], "operational")
-                self.assertTrue(group["action_required"])
-                self.assertIn(
+                self.assertFalse(group["action_required"])
+                self.assertNotIn(
                     "managed-active-lifecycle-attention", group["action_reasons"]
                 )
 
@@ -947,7 +947,7 @@ class CurrentWorkProjectionTests(unittest.TestCase):
                 self.assertEqual(group["work_class"], "operational")
                 self.assertTrue(group["action_required"])
                 self.assertIn("dirty-checkout-visible", group["action_reasons"])
-                self.assertIn(
+                self.assertNotIn(
                     "managed-active-lifecycle-attention", group["action_reasons"]
                 )
 
