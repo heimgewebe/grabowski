@@ -458,7 +458,17 @@ def _review_evidence_root_unchanged(
         and not stat.S_ISLNK(linked.st_mode)
         and linked.st_dev == opened.st_dev
         and linked.st_ino == opened.st_ino
+        and linked.st_mtime_ns == opened.st_mtime_ns
+        and linked.st_ctime_ns == opened.st_ctime_ns
     )
+
+
+def _review_evidence_root_members(root_descriptor: int) -> tuple[list[str], list[str]]:
+    try:
+        names = sorted(os.listdir(root_descriptor))
+    except OSError:
+        return [], ["review-evidence-root-members-unobservable"]
+    return [f"{_REVIEW_EVIDENCE_DIR}/{name}" for name in names], []
 
 
 def _thread_focus_review_evidence_observation(
@@ -487,12 +497,21 @@ def _thread_focus_review_evidence_observation(
     blockers.extend(root_blockers)
     files: list[dict[str, Any]] = []
     total_bytes = 0
+    expected_root_members = sorted(
+        path for path in paths if _review_evidence_filename(path) is not None
+    )
     try:
         if (
             root_descriptor >= 0
             and not root_blockers
             and len(paths) <= _REVIEW_EVIDENCE_MAX_FILES
         ):
+            initial_root_members, member_blockers = _review_evidence_root_members(
+                root_descriptor
+            )
+            blockers.extend(member_blockers)
+            if initial_root_members != expected_root_members:
+                blockers.append("review-evidence-root-membership-drift")
             for raw_path in paths:
                 evidence, file_blockers = _hash_review_evidence_file(
                     root_descriptor,
@@ -504,6 +523,12 @@ def _thread_focus_review_evidence_observation(
                     continue
                 total_bytes += int(evidence["bytes"])
                 files.append(evidence)
+            final_root_members, member_blockers = _review_evidence_root_members(
+                root_descriptor
+            )
+            blockers.extend(member_blockers)
+            if final_root_members != expected_root_members:
+                blockers.append("review-evidence-root-membership-drift")
             if not _review_evidence_root_unchanged(checkout, root_identity):
                 blockers.append("review-evidence-root-changed-during-read")
     finally:
