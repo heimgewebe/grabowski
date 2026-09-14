@@ -634,6 +634,34 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
         self.assertIn("review-evidence-root-membership-drift", preview["blockers"])
         self.assertIn("review-evidence-root-changed-during-read", preview["blockers"])
 
+    def test_present_thread_focus_rejects_tracked_submodule(self) -> None:
+        self._git(
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{self.head},vendor/submodule",
+            cwd=self.checkout,
+        )
+        self._git("commit", "-m", "tracked gitlink", cwd=self.checkout)
+        (self.checkout / "vendor" / "submodule").mkdir(parents=True)
+        self.head = self._git("rev-parse", "HEAD", cwd=self.checkout).stdout.strip()
+        binding = self._present_binding(
+            source_kind="thread_focus", source_id="thread-focus-id"
+        )
+        evidence_root = self.checkout / ".review-audits"
+        evidence_root.mkdir()
+        (evidence_root / "review.json").write_text("{}\n", encoding="utf-8")
+        evidence = self._thread_focus_source_evidence(binding)
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(
+                checkouts, "_remote_secured_observation", return_value=self._remote_secured()
+            ),
+        ):
+            preview = reconciliation.preview(str(binding["checkout_key"]))
+        self.assertFalse(preview["safe_to_apply"])
+        self.assertIn("review-evidence-submodules-present", preview["blockers"])
+
     def test_present_thread_focus_rejects_unrelated_ignored_content(self) -> None:
         binding = self._present_binding(
             source_kind="thread_focus", source_id="thread-focus-id"

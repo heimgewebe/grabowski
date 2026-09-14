@@ -36,8 +36,10 @@ trennt Inventar, Archivierung und Cleanup.
   gehasht; andere ignorierte Inhalte außerhalb dieses Verzeichnisses blockieren den
   Pfad ebenso wie andere untracked Pfade. Tracked/staged Änderungen,
   Unterverzeichnisse, Symlinks, Hardlinks, zu große oder während der Beobachtung
-  driftende Dateien bleiben blockierend. Die
-  Dateien werden über einen no-follow Directory-Descriptor gelesen, einzeln SHA-256-
+  driftende Dateien bleiben blockierend. Getrackte Gitlinks/Submodule blockieren diese
+  enge Admission ebenfalls, weil lokale Submodulinhalte vom Superprojekt nicht
+  vollständig beobachtbar sind. Die Dateien werden über einen no-follow
+  Directory-Descriptor gelesen, einzeln SHA-256-
   gebunden und als begrenztes Manifest in den Preview-Digest aufgenommen. Ein
   historischer Lifecycle-Head darf dabei nur auf den bereits separat retaineden
   aktuellen Head catch-up-en; bei einem fehlenden Checkout ist dieser Catch-up

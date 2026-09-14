@@ -257,6 +257,17 @@ def _thread_focus_review_evidence_paths(
     checkout: Path, status: dict[str, Any]
 ) -> tuple[list[str], list[str]]:
     blockers: list[str] = []
+    tracked_entries = checkouts._git_read(
+        checkout, ["ls-files", "--stage", "-z"], check=False
+    )
+    if tracked_entries.returncode != 0:
+        blockers.append("review-evidence-tracked-layout-unobservable")
+    elif any(
+        entry.startswith("160000 ")
+        for entry in tracked_entries.stdout.split("\0")
+        if entry
+    ):
+        blockers.append("review-evidence-submodules-present")
     for label, arguments in (
         ("unstaged", ["diff", "--quiet", "--no-ext-diff", "--"]),
         ("staged", ["diff", "--cached", "--quiet", "--no-ext-diff", "--"]),
