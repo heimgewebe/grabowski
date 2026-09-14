@@ -121,6 +121,19 @@ Writer-Branch, Writer-Worktree und gegebenenfalls der materialisierte Patch werd
 
 Agent Workspace v1 erzeugt keine vier Kopien des aktuellen ChatGPT-Kontexts. Captain ist eine Operatoransicht; Writer, Tests und Review sind Prozess-Slots für explizit gebundene Kommandos. **Wichtig:** Die unten beschriebene `direct-first-routing-v3.0`-Logik ist der eingefrorene Admission- und Replay-Vertrag dieses v1-Workspace, nicht mehr die kanonische Ausführungsrichtlinie von Grabowski. Die kanonische Routingentscheidung kommt aus `grabowski_coding_agent_route`: Der Controller bleibt Integrationsowner, während ein explizit lane-gebundener Scoped Writer autoritativ innerhalb seines Ressourcenbereichs implementieren darf. Agent Workspace v1 akzeptiert bis zu seiner lane-backed Ablösung weiterhin nur seine ältere Direct-first-Evidenz und leitet daraus keine neue Writer-Autorität ab.
 
+### Codex-Authentifizierungsgrenze
+
+Workspace-Codex verwendet einen **eigenen kanonischen Credential-Store** statt einer Kopie des normalen Host-Logins. Standard ist `~/.local/state/grabowski/codex-auth`; `GRABOWSKI_CODEX_AUTH_ROOT` kann einen anderen absoluten, owner-privaten Pfad wählen. Der Store muss unabhängig angemeldet sein: `~/.codex/auth.json` darf weder direkt verwendet noch dorthin kopiert werden, weil OAuth-Refresh-Tokens rotieren und zwei persistierte Kopien derselben Credential-Generation auseinanderlaufen können.
+
+Provisionierung erfolgt einmalig außerhalb der Sandbox:
+
+```bash
+install -d -m 700 ~/.local/state/grabowski/codex-auth
+CODEX_HOME=~/.local/state/grabowski/codex-auth codex login --device-auth
+```
+
+Danach bindet die Sandbox nur `auth.json` und den owner-privaten Lock read-write ein. Die Codex-Aufrufe werden über diesen Lock serialisiert; `config.toml`, Session-/History-Daten und sonstiger `.codex`-Zustand bleiben pro Sandbox frisch. Das normale Host-Login unter `~/.codex` bleibt getrennt und wird von Workspace-Codex nicht verändert.
+
 ## Abgrenzung
 
 Nicht Bestandteil von v1:
