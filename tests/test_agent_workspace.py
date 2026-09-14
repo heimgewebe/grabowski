@@ -3072,6 +3072,456 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertIn(str(sandbox.CLAUDE_SANDBOX_CONFIG_DIR / ".credentials.json"), argv)
         self.assertNotIn(str(Path.home()), argv)
 
+    def test_codex_profile_binds_binary_and_dedicated_auth_without_home(self) -> None:
+        auth_root = self.root / "codex-dedicated-auth"
+        auth_root.mkdir(mode=0o700)
+        auth = auth_root / "auth.json"
+        auth.write_text("{}\n", encoding="utf-8")
+        auth.chmod(0o600)
+        executable = self.root / "codex-bin"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
+        code_mode_host = self.root / "codex-code-mode-host"
+        code_mode_host.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        code_mode_host.chmod(0o755)
+        command = [
+            "codex",
+            "exec",
+            "-m",
+            "gpt-6-astra",
+            "-c",
+            'model_reasoning_effort="ultra"',
+        ]
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GRABOWSKI_CODEX_BIN": str(executable),
+                "GRABOWSKI_CODEX_AUTH_ROOT": str(auth_root),
+            },
+            clear=False,
+        ):
+            prepared = sandbox.prepare_external_agent_command(command)
+            argv = sandbox.minimal_sandbox_argv(
+                workspace=self.git.repo,
+                command=list(prepared.command),
+                workspace_writable=False,
+                extra_read_only=prepared.extra_read_only,
+                extra_read_write=prepared.extra_read_write,
+                extra_directories=prepared.extra_directories,
+            )
+        self.assertEqual(prepared.profile, sandbox.CODEX_PROFILE)
+        self.assertEqual(
+            prepared.probe_executable, str(sandbox.CODEX_SANDBOX_EXECUTABLE)
+        )
+        self.assertEqual(
+            prepared.command[:4], ("/usr/bin/python3", "-I", "-S", "-c")
+        )
+        self.assertIn(str(sandbox.CODEX_SANDBOX_AUTH_LOCK), prepared.command)
+        self.assertIn(str(sandbox.CODEX_SANDBOX_EXECUTABLE), prepared.command)
+        expected_codex_args = [
+            "-c",
+            "sandbox_workspace_write.exclude_slash_tmp=true",
+            "-c",
+            "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+            *command[1:],
+        ]
+        self.assertEqual(
+            list(prepared.command[-len(expected_codex_args) :]), expected_codex_args
+        )
+        self.assertIn(str(executable.resolve()), argv)
+        self.assertIn(str(sandbox.CODEX_SANDBOX_EXECUTABLE), argv)
+        self.assertIn(str(code_mode_host.resolve()), argv)
+        self.assertIn(str(sandbox.CODEX_SANDBOX_CODE_MODE_HOST), argv)
+        writable_bindings = [
+            (argv[index + 1], argv[index + 2])
+            for index, item in enumerate(argv)
+            if item == "--bind"
+        ]
+        self.assertIn(
+            (
+                str(auth.resolve()),
+                str(sandbox.CODEX_SANDBOX_CONFIG_DIR / "auth.json"),
+            ),
+            writable_bindings,
+        )
+        self.assertIn(
+            (
+                str((auth_root / ".auth.lock").resolve()),
+                str(sandbox.CODEX_SANDBOX_AUTH_LOCK),
+            ),
+            writable_bindings,
+        )
+        self.assertEqual(auth.read_text(), "{}\n")
+        self.assertEqual(stat.S_IMODE(auth.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE((auth_root / ".auth.lock").stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(auth_root.stat().st_mode), 0o700)
+        self.assertNotIn(str(Path.home() / ".codex"), argv)
+
+    def test_codex_profile_protects_durable_auth_from_inner_workspace_write(
+        self,
+    ) -> None:
+        auth_root = self.root / "codex-dedicated-auth-protected-tmp"
+        auth_root.mkdir(mode=0o700)
+        auth = auth_root / "auth.json"
+        auth.write_text("{}\n", encoding="utf-8")
+        auth.chmod(0o600)
+        executable = self.root / "codex-bin-protected-tmp"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GRABOWSKI_CODEX_BIN": str(executable),
+                "GRABOWSKI_CODEX_AUTH_ROOT": str(auth_root),
+            },
+            clear=False,
+        ):
+            prepared = sandbox.prepare_external_agent_command(
+                ["codex", "exec", "--sandbox", "workspace-write", "prompt"]
+            )
+        codex_index = prepared.command.index(str(sandbox.CODEX_SANDBOX_EXECUTABLE))
+        self.assertEqual(
+            prepared.command[codex_index + 1 : codex_index + 5],
+            (
+                "-c",
+                "sandbox_workspace_write.exclude_slash_tmp=true",
+                "-c",
+                "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+            ),
+        )
+        self.assertIn("--sandbox", prepared.command)
+        self.assertIn("workspace-write", prepared.command)
+
+    def test_codex_profile_rejects_tmp_write_policy_override(self) -> None:
+        auth_root = self.root / "codex-dedicated-auth-policy-override"
+        auth_root.mkdir(mode=0o700)
+        auth = auth_root / "auth.json"
+        auth.write_text("{}\n", encoding="utf-8")
+        auth.chmod(0o600)
+        executable = self.root / "codex-bin-policy-override"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GRABOWSKI_CODEX_BIN": str(executable),
+                "GRABOWSKI_CODEX_AUTH_ROOT": str(auth_root),
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(
+                sandbox.AgentSandboxError, "controlled by Grabowski"
+            ):
+                sandbox.prepare_external_agent_command(
+                    [
+                        "codex",
+                        "-c",
+                        "sandbox_workspace_write.exclude_slash_tmp=false",
+                        "exec",
+                        "--sandbox",
+                        "workspace-write",
+                        "prompt",
+                    ]
+                )
+
+    def test_codex_profile_preserves_refreshed_dedicated_auth_across_sandboxes(
+        self,
+    ) -> None:
+        try:
+            sandbox.require_bwrap()
+        except sandbox.AgentSandboxError as exc:
+            self.skipTest(str(exc))
+        auth_root = self.root / "codex-dedicated-auth-persistent"
+        auth_root.mkdir(mode=0o700)
+        auth = auth_root / "auth.json"
+        auth.write_text("dedicated-original\n", encoding="utf-8")
+        auth.chmod(0o600)
+        executable = self.root / "codex-persistent-bin"
+        executable.write_text(
+            "#!/usr/bin/python3\n"
+            "from pathlib import Path\n"
+            "auth = Path.home() / '.codex' / 'auth.json'\n"
+            "config = Path.home() / '.codex' / 'config.toml'\n"
+            "current = auth.read_text(encoding='utf-8').strip()\n"
+            "print(current)\n"
+            "print(oct(auth.stat().st_mode & 0o777))\n"
+            "print(f'config_exists={config.exists()}')\n"
+            "if current == 'dedicated-original':\n"
+            "    auth.write_text('sandbox-refreshed\\n', encoding='utf-8')\n"
+            "    config.write_text('writer-planted = true\\n', encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+
+        def run_once() -> subprocess.CompletedProcess[str]:
+            prepared = sandbox.prepare_external_agent_command(["codex"])
+            argv = sandbox.runtime_sandbox_argv(
+                sandbox.minimal_sandbox_argv(
+                    workspace=self.git.repo,
+                    command=list(prepared.command),
+                    workspace_writable=False,
+                    extra_read_only=prepared.extra_read_only,
+                    extra_read_write=prepared.extra_read_write,
+                    extra_directories=prepared.extra_directories,
+                )
+            )
+            return subprocess.run(
+                argv,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GRABOWSKI_CODEX_BIN": str(executable),
+                "GRABOWSKI_CODEX_AUTH_ROOT": str(auth_root),
+            },
+            clear=False,
+        ):
+            first = run_once()
+            second = run_once()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("dedicated-original", first.stdout)
+        self.assertIn("sandbox-refreshed", second.stdout)
+        self.assertIn("0o600", first.stdout)
+        self.assertIn("0o600", second.stdout)
+        self.assertIn("config_exists=False", first.stdout)
+        self.assertIn("config_exists=False", second.stdout)
+        self.assertEqual(auth.read_text(), "sandbox-refreshed\n")
+        self.assertFalse((auth_root / "config.toml").exists())
+
+    def test_codex_profile_serializes_concurrent_refreshes(self) -> None:
+        try:
+            sandbox.require_bwrap()
+        except sandbox.AgentSandboxError as exc:
+            self.skipTest(str(exc))
+        auth_root = self.root / "codex-dedicated-auth-concurrent"
+        auth_root.mkdir(mode=0o700)
+        auth = auth_root / "auth.json"
+        auth.write_text("start\n", encoding="utf-8")
+        auth.chmod(0o600)
+        executable = self.root / "codex-concurrent-bin"
+        executable.write_text(
+            "#!/usr/bin/python3\n"
+            "from pathlib import Path\n"
+            "import time\n"
+            "auth = Path.home() / '.codex' / 'auth.json'\n"
+            "current = auth.read_text(encoding='utf-8').strip()\n"
+            "print(current, flush=True)\n"
+            "if current == 'start':\n"
+            "    time.sleep(0.5)\n"
+            "    auth.write_text('rotated\\n', encoding='utf-8')\n"
+            "elif current == 'rotated':\n"
+            "    auth.write_text('rotated-again\\n', encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+
+        def argv_once() -> list[str]:
+            prepared = sandbox.prepare_external_agent_command(["codex"])
+            return sandbox.runtime_sandbox_argv(
+                sandbox.minimal_sandbox_argv(
+                    workspace=self.git.repo,
+                    command=list(prepared.command),
+                    workspace_writable=False,
+                    extra_read_only=prepared.extra_read_only,
+                    extra_read_write=prepared.extra_read_write,
+                    extra_directories=prepared.extra_directories,
+                )
+            )
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GRABOWSKI_CODEX_BIN": str(executable),
+                "GRABOWSKI_CODEX_AUTH_ROOT": str(auth_root),
+            },
+            clear=False,
+        ):
+            first_argv = argv_once()
+            second_argv = argv_once()
+            first = subprocess.Popen(
+                first_argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            second = subprocess.Popen(
+                second_argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            first_stdout, first_stderr = first.communicate(timeout=10)
+            second_stdout, second_stderr = second.communicate(timeout=10)
+        self.assertEqual(first.returncode, 0, first_stderr)
+        self.assertEqual(second.returncode, 0, second_stderr)
+        self.assertEqual({first_stdout.strip(), second_stdout.strip()}, {"start", "rotated"})
+        self.assertEqual(auth.read_text(), "rotated-again\n")
+
+    def test_codex_toolchain_probe_targets_codex_not_lock_wrapper(self) -> None:
+        auth_root = self.root / "codex-dedicated-auth-probe"
+        auth_root.mkdir(mode=0o700)
+        auth = auth_root / "auth.json"
+        auth.write_text("{}\n", encoding="utf-8")
+        auth.chmod(0o600)
+        executable = self.root / "codex-probe-bin"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
+        calls: list[list[str]] = []
+
+        def probe(
+            repo: Path, command: list[str], declared_command: list[str]
+        ) -> tuple[dict[str, object], None, int]:
+            del repo, declared_command
+            calls.append(command)
+            return (
+                {
+                    "executable_found": True,
+                    "resolved_executable": str(sandbox.CODEX_SANDBOX_EXECUTABLE),
+                },
+                None,
+                0,
+            )
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "GRABOWSKI_CODEX_BIN": str(executable),
+                    "GRABOWSKI_CODEX_AUTH_ROOT": str(auth_root),
+                },
+                clear=False,
+            ),
+            mock.patch.object(
+                role, "_probe_json_for_declared_command", side_effect=probe
+            ),
+        ):
+            result = role.toolchain_probe(self.git.repo, ["codex", "--version"])
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["executable"], str(sandbox.CODEX_SANDBOX_EXECUTABLE))
+        self.assertEqual(calls[0][-1], str(sandbox.CODEX_SANDBOX_EXECUTABLE))
+        self.assertNotEqual(calls[0][-1], "/usr/bin/python3")
+
+    def test_codex_profile_requires_dedicated_auth_root(self) -> None:
+        missing_root = self.root / "missing-codex-dedicated-auth"
+        executable = self.root / "codex-bin-missing-auth"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GRABOWSKI_CODEX_BIN": str(executable),
+                "GRABOWSKI_CODEX_AUTH_ROOT": str(missing_root),
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(
+                sandbox.AgentSandboxError, "provision an independent login"
+            ):
+                sandbox.prepare_external_agent_command(["codex", "--version"])
+
+    def test_codex_profile_rejects_normal_host_auth_root(self) -> None:
+        executable = self.root / "codex-bin-host-auth"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GRABOWSKI_CODEX_BIN": str(executable),
+                "GRABOWSKI_CODEX_AUTH_ROOT": str(Path.home() / ".codex"),
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(
+                sandbox.AgentSandboxError, "must be separate from the normal host"
+            ):
+                sandbox.prepare_external_agent_command(["codex", "--version"])
+
+    def test_codex_profile_rejects_copied_host_credential(self) -> None:
+        fake_home = self.root / "fake-home"
+        host_root = fake_home / ".codex"
+        host_root.mkdir(parents=True, mode=0o700)
+        host_auth = host_root / "auth.json"
+        host_auth.write_text("same-rotating-credential\n", encoding="utf-8")
+        host_auth.chmod(0o600)
+        auth_root = self.root / "codex-dedicated-auth-copy"
+        auth_root.mkdir(mode=0o700)
+        auth = auth_root / "auth.json"
+        auth.write_bytes(host_auth.read_bytes())
+        auth.chmod(0o600)
+        executable = self.root / "codex-bin-copied-auth"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
+        with (
+            mock.patch.object(sandbox.Path, "home", return_value=fake_home),
+            mock.patch.dict(
+                os.environ,
+                {
+                    "GRABOWSKI_CODEX_BIN": str(executable),
+                    "GRABOWSKI_CODEX_AUTH_ROOT": str(auth_root),
+                },
+                clear=False,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                sandbox.AgentSandboxError, "provision an independent login instead of copying"
+            ):
+                sandbox.prepare_external_agent_command(["codex", "--version"])
+
+    def test_codex_profile_rejects_host_symlink_to_dedicated_credential(self) -> None:
+        fake_home = self.root / "fake-home-symlink"
+        host_root = fake_home / ".codex"
+        host_root.mkdir(parents=True, mode=0o700)
+        auth_root = self.root / "codex-dedicated-auth-link"
+        auth_root.mkdir(mode=0o700)
+        auth = auth_root / "auth.json"
+        auth.write_text("dedicated-rotating-credential\n", encoding="utf-8")
+        auth.chmod(0o600)
+        (host_root / "auth.json").symlink_to(auth)
+        executable = self.root / "codex-bin-linked-auth"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
+        with (
+            mock.patch.object(sandbox.Path, "home", return_value=fake_home),
+            mock.patch.dict(
+                os.environ,
+                {
+                    "GRABOWSKI_CODEX_BIN": str(executable),
+                    "GRABOWSKI_CODEX_AUTH_ROOT": str(auth_root),
+                },
+                clear=False,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                sandbox.AgentSandboxError, "instead of copying or linking"
+            ):
+                sandbox.prepare_external_agent_command(["codex", "--version"])
+
+    def test_codex_profile_rejects_non_private_auth(self) -> None:
+        auth_root = self.root / "codex-dedicated-auth-public"
+        auth_root.mkdir(mode=0o700)
+        auth = auth_root / "auth.json"
+        auth.write_text("{}\n", encoding="utf-8")
+        auth.chmod(0o644)
+        executable = self.root / "codex-bin-public"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GRABOWSKI_CODEX_BIN": str(executable),
+                "GRABOWSKI_CODEX_AUTH_ROOT": str(auth_root),
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(sandbox.AgentSandboxError, "owner-private"):
+                sandbox.prepare_external_agent_command(["codex", "--version"])
+
     def test_claude_profile_rejects_non_private_credentials(self) -> None:
         auth_root = self.root / "claude-auth-public"
         auth_root.mkdir()
@@ -9295,6 +9745,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         prepared = types.SimpleNamespace(
             command=("true",),
             extra_read_only=(),
+            extra_read_write=(),
             extra_directories=(),
             profile="test",
         )
