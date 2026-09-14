@@ -14657,10 +14657,18 @@ def _run_operator_obligation_close(
         _check(receipt, "completion_classification", "skip", "outcome is not completed")
         _check(receipt, "systemic_convergence_gate", "skip", "outcome is not completed")
     try:
-        _revalidate_operator_obligation_systemic_convergence(
-            dispatch_parameters,
-            runner,
-        )
+        replay_classification = None
+        if dispatch_parameters.get("outcome") == "completed":
+            replay_classification = (
+                grabowski_operator_obligation.exact_completion_replay_classification(
+                    dispatch_parameters
+                )
+            )
+        if replay_classification is None:
+            _revalidate_operator_obligation_systemic_convergence(
+                dispatch_parameters,
+                runner,
+            )
         archive_result = {
             "status": "not_applicable",
             "archived_count": 0,
@@ -14668,19 +14676,7 @@ def _run_operator_obligation_close(
             "skipped_count": 0,
         }
         if dispatch_parameters.get("outcome") == "completed":
-            try:
-                current = grabowski_operator_obligation.status_obligation(
-                    str(dispatch_parameters.get("obligation_id"))
-                )
-            except FileNotFoundError:
-                current = {}
-            exact_replay = (
-                current.get("state") == "completed"
-                and current.get("evidence") == dispatch_parameters.get("evidence")
-                and current.get("completion_classification")
-                == dispatch_parameters.get("closure_classification")
-            )
-            if exact_replay:
+            if replay_classification is not None:
                 archive_result = {
                     "status": "exact_close_replay",
                     "archived_count": 0,
