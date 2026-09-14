@@ -2038,6 +2038,16 @@ def _exact_base_content_git_head_cas_update_pr_head(
         if head_after == merge_sha:
             evidence["effect_proven"] = True
             evidence["effect_not_applied_proven"] = False
+            if base_after is None:
+                evidence["status"] = "outcome_unknown"
+                return {
+                    "returncode": 2,
+                    "stdout": "",
+                    "stderr": (
+                        "exact-base head CAS was applied but authoritative "
+                        "post-push base readback is unavailable"
+                    ),
+                }, evidence
             evidence["status"] = (
                 "pushed_and_read_back"
                 if push["returncode"] == 0

@@ -6522,7 +6522,22 @@ def _run_pr_base_converge(
         raise GripActionError(
             "exact-base PR-head CAS succeeded without authoritative post-push base readback"
         )
-    cas_base_after = str(cas_remote_readback.get("base_sha") or "").lower()
+    cas_base_value = cas_remote_readback.get("base_sha")
+    cas_base_after = cas_base_value if isinstance(cas_base_value, str) else ""
+    if (
+        len(cas_base_after) != 40
+        or any(char not in "0123456789abcdef" for char in cas_base_after)
+    ):
+        _check(
+            receipt,
+            "base_identity_after",
+            "fail",
+            "authoritative post-push base readback unavailable or malformed",
+        )
+        raise GripActionError(
+            "exact-base PR-head CAS applied but authoritative post-push base readback "
+            "is unavailable or malformed; base movement is unknown"
+        )
     if cas_base_after != expected_base_sha:
         _check(
             receipt,

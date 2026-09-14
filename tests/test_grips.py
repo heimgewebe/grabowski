@@ -752,6 +752,7 @@ def fake_pr_base_converge_cas(
     returncode: int = 0,
     merge_sha: str = "b" * 40,
     remote_base_sha: str | None = None,
+    remote_base_available: bool = True,
 ):
     def effect(*args: object, **kwargs: object):
         del args, kwargs
@@ -768,7 +769,11 @@ def fake_pr_base_converge_cas(
                 "effect_proven": returncode == 0,
                 "effect_not_applied_proven": status == "not_applied_proven",
                 "remote_readback": {
-                    "base_sha": remote_base_sha or gh.live_base_sha,
+                    "base_sha": (
+                    (remote_base_sha or gh.live_base_sha)
+                    if remote_base_available
+                    else None
+                ),
                     "head_sha": merge_sha if returncode == 0 else gh.head_sha,
                     "pr_head_sha": merge_sha if returncode == 0 else gh.head_sha,
                 },
@@ -8246,6 +8251,48 @@ class GripFoundationTests(unittest.TestCase):
         )
         self.assertIn("merge_sha=" + "b" * 40, cas_check["detail"])
         self.assertIn("evidence_sha256=", cas_check["detail"])
+
+
+    def test_pr_base_converge_treats_unavailable_or_malformed_post_push_base_as_unknown(
+        self,
+    ) -> None:
+        cases = (
+            ("missing", {"remote_base_available": False}),
+            ("malformed", {"remote_base_sha": "not-a-sha"}),
+        )
+        for name, cas_kwargs in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                gh = FakePrBaseConvergeGh()
+                with patch.object(
+                    merge_guard,
+                    "_exact_base_content_git_head_cas_update_pr_head",
+                    side_effect=fake_pr_base_converge_cas(gh, **cas_kwargs),
+                ) as cas:
+                    result = grips.run_grip(
+                        "pr-base-converge",
+                        {
+                            "repo": tmp,
+                            "pr_number": 77,
+                            "base": "main",
+                            "expected_head": "a" * 40,
+                            "expected_base_sha": "e" * 40,
+                        },
+                        allow_mutation=True,
+                        github_runner=gh,
+                    )
+            self.assertEqual("failed", result["receipt"]["status"])
+            self.assertIn("unavailable or malformed", result["output"]["error"])
+            self.assertIn("base movement is unknown", result["output"]["error"])
+            self.assertNotIn(
+                "advanced during exact-base head CAS", result["output"]["error"]
+            )
+            self.assertEqual(1, cas.call_count)
+            checks = {
+                item["id"]: item["status"]
+                for item in result["receipt"]["checks"]
+            }
+            self.assertEqual("pass", checks["exact_base_head_cas"])
+            self.assertEqual("fail", checks["base_identity_after"])
 
     def test_pr_base_converge_unknown_cas_outcome_forbids_replay_or_successor(
         self,
