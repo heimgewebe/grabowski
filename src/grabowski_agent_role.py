@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import shlex
 from pathlib import Path, PurePosixPath
 import stat
 import subprocess
@@ -16,12 +17,53 @@ SHA40 = __import__("re").compile(r"^[0-9a-f]{40}$")
 SHA256 = __import__("re").compile(r"^[0-9a-f]{64}$")
 MAX_ROLE_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_REVIEW_JSON_BYTES = 1024 * 1024
+MAX_GROK_REVIEW_STREAM_BYTES = 2 * 1024 * 1024
 MAX_UNTRACKED_FILE_BYTES = 16 * 1024 * 1024
 MAX_UNTRACKED_TOTAL_BYTES = 64 * 1024 * 1024
 SANDBOX_LABEL = "bubblewrap-minimal-root-read-only-worktree-v1"
 TOOLCHAIN_PROBE_OUTPUT_LIMIT = 64 * 1024
 TOOLCHAIN_PROBE_CONTRACT = "role-toolchain-probe-v2"
 REVIEW_DOCUMENT_CONTRACT = "review-document-wrapper-v2"
+GROK_REVIEW_STREAM_CONTRACT = "grok-streaming-json-readonly-review-v1"
+GROK_REVIEW_TOOL_NAMES = frozenset({"run_terminal_command"})
+GROK_REVIEW_TOOLS = "run_terminal_cmd"
+GROK_REVIEW_MAX_TURNS = 8
+GROK_REVIEW_ALLOW_RULES = (
+    "Bash(git status --short --branch*)",
+    "Bash(git diff --no-ext-diff --no-textconv*)",
+    "Bash(git cat-file blob*)",
+    "Bash(git rev-parse*)",
+    "Bash(git merge-base*)",
+    "Bash(git ls-files*)",
+)
+GROK_REVIEW_DENY_RULES = (
+    "Bash(*;*)",
+    "Bash(*&&*)",
+    "Bash(*||*)",
+    "Bash(*|*)",
+    "Bash(*`*)",
+    "Bash(*$*)",
+    "Bash(*>*)",
+    "Bash(*<*)",
+    "Bash(*.grok*)",
+    "Bash(*auth.json*)",
+    "Bash(*--ext-diff*)",
+    "Bash(*--textconv*)",
+    "Bash(*--no-index*)",
+    "Bash(*--output*)",
+)
+GROK_REVIEW_PROMPT_SUFFIX = (
+    "\n\nGrabowski review contract: inspect the repository with at least one of the "
+    "available read-only tools before deciding. Do not modify files or state. "
+    "Your final response must end with exactly one JSON object containing "
+    "verdict (PASS, NEEDS_CHANGE, or BLOCK) and findings (an array of objects). "
+    "PASS requires an empty findings array; non-PASS requires at least one finding. "
+    "Do not wrap the final JSON object in Markdown or code fences. "
+    "For repository inspection, use only these safe command forms: "
+    "git status --short --branch; git diff --no-ext-diff --no-textconv ...; "
+    "git cat-file blob REV:path; git rev-parse ...; git merge-base ...; "
+    "git ls-files ...."
+)
 PYTHON_EXECUTABLE_NAMES = frozenset(
     {"python", "python3"} | {f"python3.{minor}" for minor in range(0, 20)}
 )
@@ -429,6 +471,214 @@ def _normalize_review_object(
     return verdict, findings, None, normalized_empty_object
 
 
+def _grok_streaming_review_command(
+    prepared_command: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Run Grok reviews as bounded read-only tool sessions with event evidence."""
+    command = list(prepared_command)
+    if command.count("-p") != 1:
+        raise RuntimeError("Grok review command must contain exactly one single-turn prompt")
+    prompt_index = command.index("-p")
+    if prompt_index != len(command) - 2:
+        raise RuntimeError("Grok review prompt must be the final command argument")
+    controlled = {
+        "--always-approve",
+        "--allow",
+        "--deny",
+        "--disable-web-search",
+        "--no-subagents",
+        "--sandbox",
+        "--tools",
+        "--output-format",
+        "--max-turns",
+        "--json-schema",
+    }
+    if any(item in controlled for item in command):
+        raise RuntimeError("Grok review execution framing is controlled by Grabowski")
+    prompt = command[-1] + GROK_REVIEW_PROMPT_SUFFIX
+    command[-1] = prompt
+    review_flags = [
+        "--disable-web-search",
+        "--no-subagents",
+        "--sandbox",
+        "read-only",
+        "--tools",
+        GROK_REVIEW_TOOLS,
+    ]
+    for rule in GROK_REVIEW_ALLOW_RULES:
+        review_flags.extend(["--allow", rule])
+    for rule in GROK_REVIEW_DENY_RULES:
+        review_flags.extend(["--deny", rule])
+    review_flags.extend(
+        [
+            "--output-format",
+            "streaming-json",
+            "--max-turns",
+            str(GROK_REVIEW_MAX_TURNS),
+        ]
+    )
+    command[prompt_index:prompt_index] = review_flags
+    return tuple(command)
+
+
+def _review_sandbox_argv(
+    repo: Path, command: list[str]
+) -> tuple[list[str], str | None]:
+    if Path(command[0]).name != "grok":
+        return sandbox_argv(repo, command), None
+    prepared = prepare_external_agent_command(command)
+    actual = list(_grok_streaming_review_command(prepared.command))
+    return (
+        sandbox_argv(repo, actual, declared_command=command),
+        GROK_REVIEW_STREAM_CONTRACT,
+    )
+
+
+def _terminal_json_object(text: str) -> dict[str, Any] | None:
+    """Return the unique JSON object suffix of terminal assistant text."""
+    stripped = text.rstrip()
+    candidates: list[dict[str, Any]] = []
+    decoder = json.JSONDecoder()
+    for index, character in enumerate(stripped):
+        if character != "{":
+            continue
+        try:
+            value, consumed = decoder.raw_decode(stripped[index:])
+        except json.JSONDecodeError:
+            continue
+        if stripped[index + consumed :].strip():
+            continue
+        if isinstance(value, dict):
+            candidates.append(value)
+    if len(candidates) != 1:
+        return None
+    return candidates[0]
+
+
+def _safe_grok_git_read_command(command: str) -> bool:
+    """Accept only shell-free, read-only Git command forms used by Grok reviews."""
+    if not command or any(marker in command for marker in ("\n", "\r", ";", "&&", "||", "|", "`", "$", ">", "<")):
+        return False
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError:
+        return False
+    if len(argv) < 2 or argv[0] != "git":
+        return False
+    subcommand = argv[1]
+    if subcommand == "status":
+        return argv == ["git", "status", "--short", "--branch"]
+    if subcommand == "diff":
+        if argv[:4] != ["git", "diff", "--no-ext-diff", "--no-textconv"]:
+            return False
+        forbidden_diff_options = ("--ext-diff", "--textconv", "--no-index")
+        if any(item in forbidden_diff_options or item.startswith("--output") for item in argv[4:]):
+            return False
+        return True
+    if subcommand == "cat-file":
+        return len(argv) >= 4 and argv[:3] == ["git", "cat-file", "blob"]
+    return subcommand in {"rev-parse", "merge-base", "ls-files"}
+
+
+def _extract_grok_stream_review_document(
+    raw: bytes,
+) -> tuple[bytes | None, str | None, dict[str, Any]]:
+    metadata: dict[str, Any] = {
+        "review_provider_stream_contract": GROK_REVIEW_STREAM_CONTRACT,
+        "review_provider_stream_bytes": len(raw),
+        "review_provider_stream_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        return None, f"Grok review stream is not valid UTF-8: {exc}", metadata
+    events: list[dict[str, Any]] = []
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as exc:
+            return None, f"Grok review stream line {line_number} is invalid JSON: {exc}", metadata
+        if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+            return None, f"Grok review stream line {line_number} is not a typed object", metadata
+        events.append(event)
+    metadata["review_provider_stream_events"] = len(events)
+    if not events:
+        return None, "Grok review stream is empty", metadata
+
+    tool_names: dict[str, str] = {}
+    tool_commands: dict[str, str] = {}
+    completed_tools: list[str] = []
+    completed_commands: list[str] = []
+    last_completed_index = -1
+    end_events: list[tuple[int, dict[str, Any]]] = []
+    for index, event in enumerate(events):
+        event_type = event.get("type")
+        if event_type == "tool_call":
+            call_id = event.get("toolCallId")
+            tool_name = event.get("toolName")
+            if not isinstance(call_id, str) or not isinstance(tool_name, str):
+                return None, "Grok review tool_call is missing identity", metadata
+            if tool_name not in GROK_REVIEW_TOOL_NAMES:
+                return None, f"Grok review used disallowed tool: {tool_name}", metadata
+            raw_input = event.get("rawInput")
+            tool_command = raw_input.get("command") if isinstance(raw_input, dict) else None
+            if not isinstance(tool_command, str) or not _safe_grok_git_read_command(tool_command):
+                return None, "Grok review requested a non-read-only Git command", metadata
+            tool_names[call_id] = tool_name
+            tool_commands[call_id] = tool_command
+        elif event_type == "tool_call_update" and event.get("status") in {"failed", "cancelled"}:
+            call_id = event.get("toolCallId")
+            if isinstance(call_id, str) and call_id in tool_names:
+                return None, "Grok review repository tool call did not complete", metadata
+        elif event_type == "tool_call_update" and event.get("status") == "completed":
+            call_id = event.get("toolCallId")
+            if not isinstance(call_id, str) or call_id not in tool_names:
+                return None, "Grok review completed an unknown tool call", metadata
+            tool_name = tool_names[call_id]
+            raw_output = event.get("rawOutput")
+            if not isinstance(raw_output, dict) or raw_output.get("exit_code") != 0:
+                return None, "Grok review Git command did not succeed", metadata
+            observed_command = raw_output.get("command")
+            if observed_command != tool_commands[call_id]:
+                return None, "Grok review Git command changed between request and completion", metadata
+            completed_tools.append(tool_name)
+            completed_commands.append(tool_commands[call_id])
+            last_completed_index = index
+        elif event_type == "end":
+            end_events.append((index, event))
+    metadata["review_provider_completed_tool_calls"] = len(completed_tools)
+    metadata["review_provider_completed_tools"] = completed_tools
+    metadata["review_provider_completed_commands"] = completed_commands
+    if not completed_tools:
+        return None, "Grok review completed no read-only repository tool call", metadata
+    if len(end_events) != 1 or end_events[0][0] != len(events) - 1:
+        return None, "Grok review stream must end with exactly one end event", metadata
+    end_event = end_events[0][1]
+    if end_event.get("stopReason") != "end_turn":
+        return None, "Grok review stream did not finish with end_turn", metadata
+    turns = end_event.get("num_turns")
+    if not isinstance(turns, int) or isinstance(turns, bool) or turns < 2:
+        return None, "Grok review stream did not establish a tool-using multi-turn review", metadata
+    metadata["review_provider_num_turns"] = turns
+
+    terminal_text = "".join(
+        event.get("data", "")
+        for event in events[last_completed_index + 1 : -1]
+        if event.get("type") == "text" and isinstance(event.get("data"), str)
+    )
+    metadata["review_provider_terminal_text_sha256"] = hashlib.sha256(
+        terminal_text.encode("utf-8")
+    ).hexdigest()
+    review = _terminal_json_object(terminal_text)
+    if review is None:
+        return None, "Grok review terminal text has no unique JSON object suffix", metadata
+    metadata["review_provider_terminal_object_sha256"] = digest(review)
+    return canonical(review).encode("utf-8"), None, metadata
+
+
 def parse_review_document(
     raw: bytes,
 ) -> tuple[str | None, list[dict[str, Any]] | None, str | None, dict[str, Any]]:
@@ -515,11 +765,23 @@ def main(argv: list[str] | None = None) -> int:
         or before_dirty != expected_dirty
     ):
         raise RuntimeError("writer binding changed before read-only role start")
+    review_provider_contract: str | None = None
+    if args.role == "review":
+        role_sandbox_argv, review_provider_contract = _review_sandbox_argv(repo, command)
+    else:
+        role_sandbox_argv = sandbox_argv(repo, command)
+    review_content_limit = 0
+    if args.role == "review":
+        review_content_limit = (
+            MAX_GROK_REVIEW_STREAM_BYTES
+            if review_provider_contract == GROK_REVIEW_STREAM_CONTRACT
+            else MAX_REVIEW_JSON_BYTES
+        )
     completed = run_bounded_capture(
-        runtime_sandbox_argv(sandbox_argv(repo, command)),
+        runtime_sandbox_argv(role_sandbox_argv),
         stdout_limit=MAX_ROLE_OUTPUT_BYTES,
         stderr_limit=MAX_ROLE_OUTPUT_BYTES,
-        stdout_content_limit=MAX_REVIEW_JSON_BYTES if args.role == "review" else 0,
+        stdout_content_limit=review_content_limit,
     )
     after_head, after_diff, after_dirty = current_binding(repo, args.expected_base_head)
     payload: dict[str, Any] = {
@@ -565,9 +827,29 @@ def main(argv: list[str] | None = None) -> int:
             payload["findings"] = []
             payload["error"] = f"review stdout exceeds {MAX_REVIEW_JSON_BYTES} bytes"
         else:
-            verdict, findings, review_error, document_metadata = parse_review_document(
-                completed.stdout_content
-            )
+            review_document = completed.stdout_content
+            provider_error: str | None = None
+            if review_provider_contract == GROK_REVIEW_STREAM_CONTRACT:
+                review_document, provider_error, provider_metadata = (
+                    _extract_grok_stream_review_document(completed.stdout_content)
+                )
+                payload.update(provider_metadata)
+            if provider_error is not None or review_document is None:
+                verdict = None
+                findings = None
+                review_error = provider_error
+                document_metadata = {
+                    "review_document_contract": REVIEW_DOCUMENT_CONTRACT,
+                    "review_document_bytes": 0,
+                    "review_document_sha256": None,
+                    "review_document_normalizations": [],
+                    "review_findings_normalized": False,
+                    "review_receipt_generated_by": "grabowski_agent_role",
+                }
+            else:
+                verdict, findings, review_error, document_metadata = parse_review_document(
+                    review_document
+                )
             payload.update(document_metadata)
             if review_error is not None or verdict is None or findings is None:
                 payload["returncode"] = 126
