@@ -119,21 +119,25 @@ def _codex_sandbox_auth_files(auth_root: Path) -> tuple[Path, Path]:
         dedicated_root / "auth.json", "Codex dedicated auth"
     )
     normal_host_auth = normal_host_root / "auth.json"
-    if normal_host_auth.exists() and not normal_host_auth.is_symlink():
+    normal_host_auth_file: Path | None = None
+    if os.path.lexists(normal_host_auth):
         try:
-            normal_host_auth_file = _safe_existing_path(
-                normal_host_auth, "normal host Codex auth", directory=False
-            )
-        except (AgentSandboxError, OSError):
+            resolved_host_auth = normal_host_auth.resolve(strict=True)
+            if stat.S_ISREG(resolved_host_auth.stat().st_mode):
+                normal_host_auth_file = resolved_host_auth
+        except OSError:
             normal_host_auth_file = None
-        if (
-            normal_host_auth_file is not None
-            and normal_host_auth_file.read_bytes() == auth_file.read_bytes()
-        ):
-            raise AgentSandboxError(
-                "Codex dedicated auth matches the normal host credential; provision an "
-                "independent login instead of copying ~/.codex/auth.json"
-            )
+    if (
+        normal_host_auth_file is not None
+        and (
+            os.path.samefile(normal_host_auth_file, auth_file)
+            or normal_host_auth_file.read_bytes() == auth_file.read_bytes()
+        )
+    ):
+        raise AgentSandboxError(
+            "Codex dedicated auth matches the normal host credential; provision an "
+            "independent login instead of copying or linking ~/.codex/auth.json"
+        )
     lock_path = dedicated_root / ".auth.lock"
     lock_descriptor = _private_lock_descriptor(lock_path, "Codex dedicated auth lock")
     os.close(lock_descriptor)

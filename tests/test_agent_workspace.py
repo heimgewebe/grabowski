@@ -3397,6 +3397,35 @@ class AgentWorkspaceTests(unittest.TestCase):
             ):
                 sandbox.prepare_external_agent_command(["codex", "--version"])
 
+    def test_codex_profile_rejects_host_symlink_to_dedicated_credential(self) -> None:
+        fake_home = self.root / "fake-home-symlink"
+        host_root = fake_home / ".codex"
+        host_root.mkdir(parents=True, mode=0o700)
+        auth_root = self.root / "codex-dedicated-auth-link"
+        auth_root.mkdir(mode=0o700)
+        auth = auth_root / "auth.json"
+        auth.write_text("dedicated-rotating-credential\n", encoding="utf-8")
+        auth.chmod(0o600)
+        (host_root / "auth.json").symlink_to(auth)
+        executable = self.root / "codex-bin-linked-auth"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
+        with (
+            mock.patch.object(sandbox.Path, "home", return_value=fake_home),
+            mock.patch.dict(
+                os.environ,
+                {
+                    "GRABOWSKI_CODEX_BIN": str(executable),
+                    "GRABOWSKI_CODEX_AUTH_ROOT": str(auth_root),
+                },
+                clear=False,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                sandbox.AgentSandboxError, "instead of copying or linking"
+            ):
+                sandbox.prepare_external_agent_command(["codex", "--version"])
+
     def test_codex_profile_rejects_non_private_auth(self) -> None:
         auth_root = self.root / "codex-dedicated-auth-public"
         auth_root.mkdir(mode=0o700)
