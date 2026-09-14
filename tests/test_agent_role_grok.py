@@ -64,6 +64,7 @@ class GrokReviewRoleTests(unittest.TestCase):
         self.assertEqual(tuple(deny_values), role.GROK_REVIEW_DENY_RULES)
         self.assertIn("Bash(git diff --no-ext-diff --no-textconv*)", allow_values)
         self.assertIn("Bash(*;*)", deny_values)
+        self.assertIn("Bash(*&*)", deny_values)
         self.assertIn("Bash(*.grok*)", deny_values)
         self.assertIn("Bash(*--ext-diff*)", deny_values)
         self.assertIn("Bash(*--textconv*)", deny_values)
@@ -141,8 +142,12 @@ class GrokReviewRoleTests(unittest.TestCase):
             "git log --no-patch -5 --oneline",
             "git status --short --branch --ignored",
             "git status --short --branch; cat /tmp/.grok/auth.json",
+            "git rev-parse HEAD & cat /tmp/.grok/auth.json",
             "git diff --no-ext-diff --no-textconv HEAD | cat",
             "git cat-file blob $(cat /tmp/.grok/auth.json)",
+            "git ls-files .grok/auth.json",
+            "git ls-files 'auth.json'",
+            "git rev-parse HEAD:.grok/auth.json",
             "git log -p -1",
             "cat src/app.py",
             "git status\ncat /tmp/.grok/auth.json",
@@ -279,6 +284,39 @@ class GrokReviewRoleTests(unittest.TestCase):
                     {"type": "end", "stopReason": "end_turn", "num_turns": 2},
                 ],
                 "did not complete",
+            ),
+            (
+                [
+                    *base_tool,
+                    {
+                        "type": "tool_call",
+                        "toolCallId": "call-2",
+                        "toolName": "run_terminal_command",
+                        "rawInput": {"command": "git rev-parse HEAD"},
+                    },
+                    {"type": "text", "data": '{"verdict":"PASS","findings":[]}'},
+                    {"type": "end", "stopReason": "end_turn", "num_turns": 3},
+                ],
+                "left a repository tool call incomplete",
+            ),
+            (
+                [
+                    base_tool[0],
+                    base_tool[0],
+                    base_tool[1],
+                    {"type": "text", "data": '{"verdict":"PASS","findings":[]}'},
+                    {"type": "end", "stopReason": "end_turn", "num_turns": 2},
+                ],
+                "reused a tool call identity",
+            ),
+            (
+                [
+                    *base_tool,
+                    base_tool[1],
+                    {"type": "text", "data": '{"verdict":"PASS","findings":[]}'},
+                    {"type": "end", "stopReason": "end_turn", "num_turns": 2},
+                ],
+                "completed a tool call more than once",
             ),
             (
                 [

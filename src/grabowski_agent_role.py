@@ -38,6 +38,7 @@ GROK_REVIEW_ALLOW_RULES = (
 )
 GROK_REVIEW_DENY_RULES = (
     "Bash(*;*)",
+    "Bash(*&*)",
     "Bash(*&&*)",
     "Bash(*||*)",
     "Bash(*|*)",
@@ -557,7 +558,9 @@ def _terminal_json_object(text: str) -> dict[str, Any] | None:
 
 def _safe_grok_git_read_command(command: str) -> bool:
     """Accept only shell-free, read-only Git command forms used by Grok reviews."""
-    if not command or any(marker in command for marker in ("\n", "\r", ";", "&&", "||", "|", "`", "$", ">", "<")):
+    if not command or any(marker in command for marker in ("\n", "\r", ";", "&", "&&", "||", "|", "`", "$", ">", "<")):
+        return False
+    if ".grok" in command or "auth.json" in command:
         return False
     try:
         argv = shlex.split(command, posix=True)
@@ -612,6 +615,7 @@ def _extract_grok_stream_review_document(
     tool_commands: dict[str, str] = {}
     completed_tools: list[str] = []
     completed_commands: list[str] = []
+    completed_call_ids: set[str] = set()
     last_completed_index = -1
     end_events: list[tuple[int, dict[str, Any]]] = []
     for index, event in enumerate(events):
@@ -619,8 +623,10 @@ def _extract_grok_stream_review_document(
         if event_type == "tool_call":
             call_id = event.get("toolCallId")
             tool_name = event.get("toolName")
-            if not isinstance(call_id, str) or not isinstance(tool_name, str):
+            if not isinstance(call_id, str) or not call_id or not isinstance(tool_name, str):
                 return None, "Grok review tool_call is missing identity", metadata
+            if call_id in tool_names:
+                return None, "Grok review reused a tool call identity", metadata
             if tool_name not in GROK_REVIEW_TOOL_NAMES:
                 return None, f"Grok review used disallowed tool: {tool_name}", metadata
             raw_input = event.get("rawInput")
@@ -631,12 +637,15 @@ def _extract_grok_stream_review_document(
             tool_commands[call_id] = tool_command
         elif event_type == "tool_call_update" and event.get("status") in {"failed", "cancelled"}:
             call_id = event.get("toolCallId")
-            if isinstance(call_id, str) and call_id in tool_names:
-                return None, "Grok review repository tool call did not complete", metadata
+            if not isinstance(call_id, str) or call_id not in tool_names:
+                return None, "Grok review failed or cancelled an unknown tool call", metadata
+            return None, "Grok review repository tool call did not complete", metadata
         elif event_type == "tool_call_update" and event.get("status") == "completed":
             call_id = event.get("toolCallId")
             if not isinstance(call_id, str) or call_id not in tool_names:
                 return None, "Grok review completed an unknown tool call", metadata
+            if call_id in completed_call_ids:
+                return None, "Grok review completed a tool call more than once", metadata
             tool_name = tool_names[call_id]
             raw_output = event.get("rawOutput")
             if not isinstance(raw_output, dict) or raw_output.get("exit_code") != 0:
@@ -646,6 +655,7 @@ def _extract_grok_stream_review_document(
                 return None, "Grok review Git command changed between request and completion", metadata
             completed_tools.append(tool_name)
             completed_commands.append(tool_commands[call_id])
+            completed_call_ids.add(call_id)
             last_completed_index = index
         elif event_type == "end":
             end_events.append((index, event))
@@ -654,6 +664,8 @@ def _extract_grok_stream_review_document(
     metadata["review_provider_completed_commands"] = completed_commands
     if not completed_tools:
         return None, "Grok review completed no read-only repository tool call", metadata
+    if set(tool_names) != completed_call_ids:
+        return None, "Grok review left a repository tool call incomplete", metadata
     if len(end_events) != 1 or end_events[0][0] != len(events) - 1:
         return None, "Grok review stream must end with exactly one end event", metadata
     end_event = end_events[0][1]
