@@ -11162,5 +11162,111 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertNotIn("command", result["result"]["writer_attempts"][1])
 
 
+    def test_prearchive_recovery_reuses_exact_persisted_archive_fence(self) -> None:
+        manifest = {"workspace_id": "ws-recovery"}
+        plan = {
+            "repository": "/repo",
+            "writer_worktree": "/repo/wt",
+            "checkout": {
+                "checkout_key": "key",
+                "head": "a" * 40,
+                "branch": "topic",
+            },
+        }
+        archive = {"archive_id": "archive-123"}
+        fence = {
+            "checkout_key": "key",
+            "operation": "archive",
+            "operation_id": "archive-123",
+            "owner_id": "owner",
+            "evidence": {
+                "archive_id": "archive-123",
+                "checkout_key": "key",
+                "owner_id": "owner",
+                "repo": "/repo",
+                "checkout_path": "/repo/wt",
+                "expected_head": "a" * 40,
+                "expected_branch": "topic",
+            },
+        }
+        with (
+            mock.patch.object(
+                workspace.checkouts,
+                "_active_checkout_operation_uncertainties",
+                return_value=[fence],
+            ),
+            mock.patch.object(
+                workspace.checkouts,
+                "_load_archive",
+                return_value=archive,
+            ),
+            mock.patch.object(
+                workspace,
+                "_workspace_archive_post_state",
+            ) as post_state,
+            mock.patch.object(
+                workspace,
+                "_workspace_reconcile_checkout_uncertainty",
+                return_value={"outcome": "confirmed_success"},
+            ) as reconcile,
+        ):
+            recovered = workspace._workspace_recover_persisted_archive_uncertainty(
+                manifest,
+                plan,
+                owner="owner",
+            )
+        self.assertEqual(recovered, archive)
+        post_state.assert_called_once()
+        self.assertTrue(reconcile.call_args.kwargs["release_operation_lease"])
+
+    def test_prearchive_recovery_fails_closed_on_conflicting_fence(self) -> None:
+        plan = {
+            "repository": "/repo",
+            "writer_worktree": "/repo/wt",
+            "checkout": {
+                "checkout_key": "key",
+                "head": "a" * 40,
+                "branch": "topic",
+            },
+        }
+        exact = {
+            "checkout_key": "key",
+            "operation": "archive",
+            "operation_id": "archive-123",
+            "owner_id": "owner",
+            "evidence": {
+                "archive_id": "archive-123",
+                "checkout_key": "key",
+                "owner_id": "owner",
+                "repo": "/repo",
+                "checkout_path": "/repo/wt",
+                "expected_head": "a" * 40,
+                "expected_branch": "topic",
+            },
+        }
+        conflict = {
+            **exact,
+            "operation_id": "archive-456",
+            "evidence": {
+                **exact["evidence"],
+                "archive_id": "archive-456",
+            },
+        }
+        with mock.patch.object(
+            workspace.checkouts,
+            "_active_checkout_operation_uncertainties",
+            return_value=[exact, conflict],
+        ):
+            with self.assertRaisesRegex(
+                workspace.AgentWorkspaceActionError,
+                "conflicting checkout uncertainty fence",
+            ):
+                workspace._workspace_recover_persisted_archive_uncertainty(
+                    {},
+                    plan,
+                    owner="owner",
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -13261,6 +13261,111 @@ def _verified_workspace_cleanup_archive(
     return archive if head_ref_valid else None
 
 
+def _workspace_recover_persisted_archive_uncertainty(
+    manifest: dict[str, Any],
+    cleanup_plan: dict[str, Any],
+    *,
+    owner: str,
+) -> dict[str, Any] | None:
+    "Reconcile one exact prior archive outcome before another archive effect."
+    checkout = cleanup_plan.get("checkout")
+    if not isinstance(checkout, dict):
+        raise AgentWorkspaceActionError(
+            "workspace archive recovery lacks checkout identity"
+        )
+    checkout_key = checkout.get("checkout_key")
+    expected_head = checkout.get("head")
+    expected_branch = checkout.get("branch")
+    repo = cleanup_plan.get("repository")
+    checkout_path = cleanup_plan.get("writer_worktree")
+    if not all(
+        isinstance(value, str)
+        for value in (
+            checkout_key,
+            expected_head,
+            expected_branch,
+            repo,
+            checkout_path,
+        )
+    ):
+        raise AgentWorkspaceActionError(
+            "workspace archive recovery lacks exact checkout identity"
+        )
+    active = [
+        fence
+        for fence in checkouts._active_checkout_operation_uncertainties()
+        if fence.get("checkout_key") == checkout_key
+    ]
+    if not active:
+        return None
+    matching: list[dict[str, Any]] = []
+    for fence in active:
+        evidence = fence.get("evidence")
+        operation_id = fence.get("operation_id")
+        if (
+            fence.get("operation") == "archive"
+            and fence.get("owner_id") == owner
+            and isinstance(operation_id, str)
+            and isinstance(evidence, dict)
+            and evidence.get("archive_id") == operation_id
+            and evidence.get("checkout_key") == checkout_key
+            and evidence.get("owner_id") == owner
+            and evidence.get("repo") == repo
+            and evidence.get("checkout_path") == checkout_path
+            and evidence.get("expected_head") == expected_head
+            and evidence.get("expected_branch") == expected_branch
+        ):
+            matching.append(fence)
+    if len(active) != 1 or len(matching) != 1:
+        raise AgentWorkspaceActionError(
+            "workspace archive recovery found conflicting checkout uncertainty fence"
+        )
+    fence = matching[0]
+    archive_id = str(fence["operation_id"])
+    expected_evidence = dict(fence["evidence"])
+    try:
+        archive = checkouts._load_archive(archive_id)
+    except ValueError:
+        reconciliation = _workspace_reconcile_checkout_uncertainty(
+            checkout_key=checkout_key,
+            owner=owner,
+            operation="archive",
+            operation_id=archive_id,
+            expected_evidence=expected_evidence,
+            release_operation_lease=False,
+        )
+        if (
+            isinstance(reconciliation, dict)
+            and reconciliation.get("outcome") == "confirmed_no_effect"
+        ):
+            return None
+        raise AgentWorkspaceActionError(
+            "workspace archive uncertainty did not prove a reusable archive "
+            "or confirmed no-effect"
+        )
+    _workspace_archive_post_state(
+        manifest,
+        archive_id,
+        expected_checkout_key=checkout_key,
+        expected_head=expected_head,
+        expected_branch=expected_branch,
+        expected_owner=owner,
+    )
+    reconciliation = _workspace_reconcile_checkout_uncertainty(
+        checkout_key=checkout_key,
+        owner=owner,
+        operation="archive",
+        operation_id=archive_id,
+        expected_evidence=expected_evidence,
+        release_operation_lease=True,
+    )
+    if not isinstance(reconciliation, dict):
+        raise AgentWorkspaceActionError(
+            "workspace archive recovery lost its durable uncertainty fence"
+        )
+    return archive
+
+
 def _workspace_reconcile_checkout_uncertainty(
     *,
     checkout_key: str,
@@ -13728,6 +13833,33 @@ def grabowski_agent_workspace_cleanup(
             raise AgentWorkspaceActionError(
                 "workspace cleanup plan lacks a checkout identity"
             )
+        if archive_id is None:
+            effect_mutation_ambiguous = True
+            recovered_archive = _workspace_recover_persisted_archive_uncertainty(
+                current_manifest,
+                plan,
+                owner=owner,
+            )
+            effect_mutation_ambiguous = False
+            if recovered_archive is not None:
+                archive_id = str(recovered_archive["archive_id"])
+                intent["archive_id"] = archive_id
+                with _lock(identifier):
+                    current_manifest = _manifest(identifier)
+                    current_intent = current_manifest.get(
+                        "workspace_cleanup_intent"
+                    )
+                    if (
+                        not isinstance(current_intent, dict)
+                        or current_intent.get("intent_id") != intent["intent_id"]
+                    ):
+                        raise AgentWorkspaceActionError(
+                            "workspace cleanup intent changed during "
+                            "pre-archive recovery"
+                        )
+                    current_intent["archive_id"] = archive_id
+                    current_manifest["workspace_cleanup_intent"] = current_intent
+                    _write_manifest(current_manifest)
         if archive_id is None:
             previous_archive = checkouts._latest_archive_for_key(checkout_key)
             previous_archive_id = (

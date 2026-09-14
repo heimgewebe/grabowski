@@ -666,6 +666,27 @@ def _lifecycle_bindings(keys: Iterable[str]) -> dict[str, dict[str, Any]]:
     return {row["checkout_key"]: _lifecycle_public(row) for row in rows}
 
 
+def _strict_lifecycle_binding(checkout_key: str) -> dict[str, Any] | None:
+    "Read one lifecycle binding without collapsing SQLite failures into legacy absence."
+    connection = _readonly_connection(CHECKOUT_DB)
+    if connection is None:
+        return None
+    try:
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='lifecycle_bindings'"
+        ).fetchone()
+        if table is None:
+            return None
+        row = connection.execute(
+            "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
+            (checkout_key,),
+        ).fetchone()
+    finally:
+        connection.close()
+    return None if row is None else _lifecycle_public(row)
+
+
 def _phase_limit(phase: str) -> int:
     normalized = _lifecycle_phase(phase)
     if normalized == "active":
@@ -1725,6 +1746,72 @@ def _release_uncertainty_fence_resources(fence: dict[str, Any]) -> dict[str, Any
     )
 
 
+def _archive_manifest_matches_uncertainty(
+    archive: dict[str, Any], evidence: dict[str, Any]
+) -> bool:
+    "Verify manifest contents before durable archive uncertainty may clear."
+    try:
+        archive_id = _validate_archive_id(str(evidence["archive_id"]))
+        archive_root = ARCHIVE_ROOT.expanduser()
+        if archive_root.is_symlink() or not archive_root.is_dir():
+            return False
+        archive_dir = archive_root.resolve(strict=True) / archive_id
+        if archive_dir.is_symlink() or not archive_dir.is_dir():
+            return False
+        archive_dir = archive_dir.resolve(strict=True)
+        manifest_path = Path(str(archive.get("manifest_path", "")))
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            return False
+        if manifest_path.resolve(strict=True) != archive_dir / "manifest.json":
+            return False
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (KeyError, OSError, UnicodeError, ValueError):
+        return False
+    if not isinstance(manifest, dict) or archive.get("archive_id") != archive_id:
+        return False
+    recovery_refs = archive.get("recovery_refs")
+    if not isinstance(recovery_refs, list) or not recovery_refs:
+        return False
+    normalized_refs: list[dict[str, str]] = []
+    for item in recovery_refs:
+        if not isinstance(item, dict):
+            return False
+        ref = item.get("ref")
+        target = item.get("target")
+        if not isinstance(ref, str) or not isinstance(target, str):
+            return False
+        normalized_refs.append({"ref": ref, "target": target})
+    return bool(
+        manifest.get("schema_version") == 1
+        and manifest.get("archive_id") == archive_id
+        and manifest.get("checkout_key")
+        == archive.get("checkout_key")
+        == evidence.get("checkout_key")
+        and manifest.get("repo")
+        == archive.get("repo_path")
+        == evidence.get("repo")
+        and manifest.get("git_common_dir")
+        == archive.get("repo_common_dir")
+        == evidence.get("git_common_dir")
+        and manifest.get("checkout_path")
+        == archive.get("checkout_path")
+        == evidence.get("checkout_path")
+        and manifest.get("head")
+        == archive.get("head")
+        == evidence.get("expected_head")
+        and manifest.get("branch")
+        == archive.get("branch")
+        == evidence.get("expected_branch")
+        and manifest.get("owner_id")
+        == archive.get("owner_id")
+        == evidence.get("owner_id")
+        and manifest.get("purpose") == archive.get("purpose")
+        and manifest.get("retention_until_unix") == archive.get("retention_until_unix")
+        and manifest.get("recovery_refs") == recovery_refs
+        and normalized_refs == evidence.get("planned_recovery_refs")
+    )
+
+
 def _archive_uncertainty_readback(fence: dict[str, Any]) -> dict[str, Any]:
     evidence = fence["evidence"]
     repo = _resolve_repo(str(evidence["repo"]))
@@ -1738,9 +1825,7 @@ def _archive_uncertainty_readback(fence: dict[str, Any]) -> dict[str, Any]:
         archive = None
     archive_dir = ARCHIVE_ROOT.expanduser() / archive_id
     if archive is not None:
-        lifecycle = _lifecycle_bindings([str(evidence["checkout_key"])]).get(
-            str(evidence["checkout_key"])
-        )
+        lifecycle = _strict_lifecycle_binding(str(evidence["checkout_key"]))
         if (
             verified_refs
             and all(bool(item["present"]) for item in verified_refs)
@@ -1750,7 +1835,7 @@ def _archive_uncertainty_readback(fence: dict[str, Any]) -> dict[str, Any]:
             and archive.get("head") == evidence["expected_head"]
             and archive.get("branch") == evidence["expected_branch"]
             and archive.get("owner_id") == evidence["owner_id"]
-            and Path(str(archive["manifest_path"])).is_file()
+            and _archive_manifest_matches_uncertainty(archive, evidence)
             and (
                 lifecycle is None
                 or (

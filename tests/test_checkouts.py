@@ -3659,5 +3659,90 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertNotIn('"worktree", "remove", "-f"', source)
 
 
+    def _archive_uncertainty_fixture(
+        self,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        result = self._archive(aged=False)
+        archive = result["archive"]
+        manifest = result["manifest"]
+        assert isinstance(archive, dict)
+        assert isinstance(manifest, dict)
+        refs = manifest["recovery_refs"]
+        assert isinstance(refs, list)
+        fence = {
+            "evidence": {
+                "repo": archive["repo_path"],
+                "git_common_dir": archive["repo_common_dir"],
+                "checkout_path": archive["checkout_path"],
+                "checkout_key": archive["checkout_key"],
+                "owner_id": archive["owner_id"],
+                "archive_id": archive["archive_id"],
+                "expected_head": archive["head"],
+                "expected_branch": archive["branch"],
+                "planned_recovery_refs": [
+                    {"ref": item["ref"], "target": item["target"]}
+                    for item in refs
+                    if isinstance(item, dict)
+                ],
+            }
+        }
+        return result, fence
+
+    def test_archive_uncertainty_rejects_mismatched_manifest_contents(self) -> None:
+        result, fence = self._archive_uncertainty_fixture()
+        self.assertEqual(
+            checkouts._archive_uncertainty_readback(fence)["state"],
+            "confirmed_success",
+        )
+        archive = result["archive"]
+        assert isinstance(archive, dict)
+        manifest_path = Path(str(archive["manifest_path"]))
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        payload["owner_id"] = "different-owner"
+        manifest_path.write_text(
+            json.dumps(payload, sort_keys=True),
+            encoding="utf-8",
+        )
+        readback = checkouts._archive_uncertainty_readback(fence)
+        self.assertEqual(readback["state"], "still_fenced")
+        self.assertEqual(readback["reason"], "archive-readback-mismatch")
+
+    def test_strict_lifecycle_binding_propagates_operational_failure(self) -> None:
+        class FailingConnection:
+            closed = False
+
+            def execute(self, *_args, **_kwargs):
+                raise sqlite3.OperationalError("database is locked")
+
+            def close(self):
+                self.closed = True
+
+        connection = FailingConnection()
+        with patch.object(
+            checkouts,
+            "_readonly_connection",
+            return_value=connection,
+        ):
+            with self.assertRaisesRegex(
+                sqlite3.OperationalError,
+                "database is locked",
+            ):
+                checkouts._strict_lifecycle_binding("checkout-key")
+        self.assertTrue(connection.closed)
+
+    def test_archive_uncertainty_propagates_strict_lifecycle_failure(self) -> None:
+        _result, fence = self._archive_uncertainty_fixture()
+        with patch.object(
+            checkouts,
+            "_strict_lifecycle_binding",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            with self.assertRaisesRegex(
+                sqlite3.OperationalError,
+                "database is locked",
+            ):
+                checkouts._archive_uncertainty_readback(fence)
+
+
 if __name__ == "__main__":
     unittest.main()
