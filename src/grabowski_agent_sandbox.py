@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import fcntl
 import hashlib
 import os
 from pathlib import Path
@@ -10,7 +9,6 @@ import shutil
 import signal
 import stat
 import subprocess
-import tempfile
 from typing import Iterable
 
 BWRAP = Path(os.environ.get("GRABOWSKI_BWRAP_BIN", "/usr/bin/bwrap"))
@@ -39,11 +37,10 @@ class PreparedSandboxCommand:
 CLAUDE_PROFILE = "claude-cli-readonly-auth-v1"
 CLAUDE_SANDBOX_EXECUTABLE = Path("/opt/grabowski-external/claude")
 CLAUDE_SANDBOX_CONFIG_DIR = Path("/tmp/.claude")
-CODEX_PROFILE = "codex-cli-private-durable-auth-v1"
+CODEX_PROFILE = "codex-cli-dedicated-durable-auth-v1"
 CODEX_SANDBOX_EXECUTABLE = Path("/opt/grabowski-external/codex")
 CODEX_SANDBOX_CONFIG_DIR = Path("/tmp/.codex")
 CODEX_SANDBOX_CODE_MODE_HOST = Path("/opt/grabowski-external/codex-code-mode-host")
-CODEX_SANDBOX_AUTH_STATE_ENV = "GRABOWSKI_CODEX_SANDBOX_AUTH_ROOT"
 CODEX_SANDBOX_AUTH_LOCK = Path("/tmp/.grabowski-codex-auth.lock")
 _CODEX_AUTH_SERIALIZED_LAUNCH_SOURCE = """\
 import fcntl
@@ -102,60 +99,45 @@ def _private_lock_descriptor(path: Path, field: str) -> int:
 
 
 def _codex_sandbox_auth_files(auth_root: Path) -> tuple[Path, Path]:
-    source = _private_regular_file(auth_root / "auth.json", "Codex auth bootstrap")
-    source_bytes = source.read_bytes()
-    bootstrap_identity = hashlib.sha256(source_bytes).hexdigest()
-    raw_state_root = os.environ.get(
-        CODEX_SANDBOX_AUTH_STATE_ENV,
-        str(Path.home() / ".local/state/grabowski/codex-auth"),
-    )
-    state_root = _private_directory(
-        Path(raw_state_root), "Codex sandbox auth root", create=True
-    )
-    state_namespace = _private_directory(
-        state_root / f"bootstrap-{bootstrap_identity}",
-        "Codex sandbox auth namespace",
-        create=True,
-    )
-    lock_path = state_namespace / ".auth.lock"
-    lock_descriptor = _private_lock_descriptor(lock_path, "Codex sandbox auth lock")
-    try:
-        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
-        destination = state_namespace / "auth.json"
-        if os.path.lexists(destination):
-            _private_regular_file(destination, "Codex sandbox auth")
-            return destination, lock_path
-        temp_descriptor, temp_name = tempfile.mkstemp(
-            prefix=".auth-seed-", dir=state_namespace
+    candidate = auth_root.expanduser()
+    normal_host_root = (Path.home() / ".codex").absolute()
+    candidate_absolute = candidate.absolute()
+    if candidate_absolute == normal_host_root or candidate_absolute.is_relative_to(
+        normal_host_root
+    ):
+        raise AgentSandboxError(
+            "Codex dedicated auth root must be separate from the normal host ~/.codex"
         )
-        temp_path = Path(temp_name)
+    if not candidate.exists():
+        raise AgentSandboxError(
+            "Codex dedicated auth root is missing; create it owner-private (mode 0700) "
+            "and provision an independent login with "
+            f"CODEX_HOME={candidate} codex login --device-auth"
+        )
+    dedicated_root = _private_directory(candidate, "Codex dedicated auth root")
+    auth_file = _private_regular_file(
+        dedicated_root / "auth.json", "Codex dedicated auth"
+    )
+    normal_host_auth = normal_host_root / "auth.json"
+    if normal_host_auth.exists() and not normal_host_auth.is_symlink():
         try:
-            os.fchmod(temp_descriptor, 0o600)
-            with os.fdopen(temp_descriptor, "wb", closefd=True) as destination_file:
-                destination_file.write(source_bytes)
-                destination_file.flush()
-                os.fsync(destination_file.fileno())
-            temp_descriptor = -1
-            os.replace(temp_path, destination)
-            directory_descriptor = os.open(
-                state_namespace, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+            normal_host_auth_file = _safe_existing_path(
+                normal_host_auth, "normal host Codex auth", directory=False
             )
-            try:
-                os.fsync(directory_descriptor)
-            finally:
-                os.close(directory_descriptor)
-        finally:
-            if temp_descriptor >= 0:
-                os.close(temp_descriptor)
-            try:
-                temp_path.unlink()
-            except FileNotFoundError:
-                pass
-        _private_regular_file(destination, "Codex sandbox auth")
-        return destination, lock_path
-    finally:
-        fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
-        os.close(lock_descriptor)
+        except (AgentSandboxError, OSError):
+            normal_host_auth_file = None
+        if (
+            normal_host_auth_file is not None
+            and normal_host_auth_file.read_bytes() == auth_file.read_bytes()
+        ):
+            raise AgentSandboxError(
+                "Codex dedicated auth matches the normal host credential; provision an "
+                "independent login instead of copying ~/.codex/auth.json"
+            )
+    lock_path = dedicated_root / ".auth.lock"
+    lock_descriptor = _private_lock_descriptor(lock_path, "Codex dedicated auth lock")
+    os.close(lock_descriptor)
+    return auth_file, lock_path
 
 
 def _resolved_executable(value: str, field: str) -> Path:
@@ -186,7 +168,10 @@ def prepare_external_agent_command(command: list[str]) -> PreparedSandboxCommand
         executable_override = os.environ.get("GRABOWSKI_CODEX_BIN")
         executable = _resolved_executable(executable_override or command[0], "Codex executable")
         auth_root = Path(
-            os.environ.get("GRABOWSKI_CODEX_AUTH_ROOT", str(Path.home() / ".codex"))
+            os.environ.get(
+                "GRABOWSKI_CODEX_AUTH_ROOT",
+                str(Path.home() / ".local/state/grabowski/codex-auth"),
+            )
         ).expanduser()
         sandbox_auth_file, sandbox_auth_lock = _codex_sandbox_auth_files(auth_root)
         bindings: list[tuple[Path, Path]] = [
