@@ -3535,6 +3535,8 @@ class TaskTests(unittest.TestCase):
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_validate_command", return_value=argv
         ), patch.object(tasks.operator, "_guard_git"), patch.object(
+            tasks.operator, "_git_config_values", return_value=[]
+        ), patch.object(
             tasks, "_dispatch", return_value=_launcher()
         ) as dispatch_mock, patch.object(tasks.base, "_append_audit") as audit_mock, patch.object(
             tasks.resources, "acquire_resources"
@@ -3594,6 +3596,8 @@ class TaskTests(unittest.TestCase):
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_validate_command", return_value=argv
         ), patch.object(tasks.operator, "_guard_git"), patch.object(
+            tasks.operator, "_git_config_values", return_value=[]
+        ), patch.object(
             tasks, "_dispatch", return_value=_launcher()
         ) as dispatch_mock, patch.object(tasks.base, "_append_audit"), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 157}
@@ -3624,6 +3628,8 @@ class TaskTests(unittest.TestCase):
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_validate_command", return_value=argv
         ), patch.object(tasks.operator, "_guard_git"), patch.object(
+            tasks.operator, "_git_config_values", return_value=[]
+        ), patch.object(
             tasks, "_dispatch", return_value=_launcher()
         ), patch.object(tasks.base, "_append_audit"), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 158}
@@ -3647,6 +3653,8 @@ class TaskTests(unittest.TestCase):
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_validate_command", return_value=argv
         ), patch.object(tasks.operator, "_guard_git"), patch.object(
+            tasks.operator, "_git_config_values", return_value=[]
+        ), patch.object(
             tasks, "_dispatch", return_value=_launcher()
         ) as dispatch_mock, patch.object(tasks.base, "_append_audit"), patch.object(
             tasks,
@@ -3674,6 +3682,8 @@ class TaskTests(unittest.TestCase):
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_validate_command", return_value=argv
         ), patch.object(tasks.operator, "_guard_git"), patch.object(
+            tasks.operator, "_git_config_values", return_value=[]
+        ), patch.object(
             tasks, "_dispatch", return_value=_launcher()
         ), patch.object(tasks.base, "_append_audit"), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 155}
@@ -3692,6 +3702,40 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(advisory["recommended_route"], "grabowski_git_status")
         self.assertIs(advisory["runtime_exceeds_synchronous_ceiling"], True)
         self.assertEqual(advisory["durable_signals"], [])
+
+    def test_explicit_read_only_repository_configured_status_keeps_durable_route(self) -> None:
+        argv = ["git", "status", "--short", "--branch"]
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks.operator, "_guard_git"), patch.object(
+            tasks.operator,
+            "_git_config_values",
+            return_value=["no"],
+        ), patch.object(
+            tasks, "_dispatch", return_value=_launcher()
+        ) as dispatch_mock, patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 162}
+        ):
+            result = tasks.grabowski_task_start(
+                "local",
+                argv,
+                cwd=str(self.root),
+                runtime_seconds=30,
+                resume_policy="never",
+                effect_profile="read_only",
+            )
+
+        advisory = result["read_routing_advisory"]
+        self.assertEqual(advisory["classification"], "durable_read_justified")
+        self.assertEqual(advisory["recommended_route"], "grabowski_task_start")
+        verification = advisory["server_read_verification"]
+        self.assertEqual(verification["status"], "unverified")
+        self.assertEqual(
+            verification["reason"],
+            "git_status_configuration_not_preserved_by_typed_route",
+        )
+        self.assertIsNotNone(result["task"])
+        dispatch_mock.assert_called_once()
 
     def test_explicit_read_only_configured_status_keeps_durable_route(self) -> None:
         argv = [

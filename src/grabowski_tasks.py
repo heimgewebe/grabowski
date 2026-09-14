@@ -3697,6 +3697,27 @@ def _server_verified_task_read_route(
         and len(_command_arguments) == 2
         and set(_command_arguments) == {"--short", "--branch"}
     ):
+        try:
+            status_untracked_configuration = operator._git_config_values(
+                Path(working_directory), "status.showUntrackedFiles"
+            )
+        except (OSError, PermissionError, RuntimeError, ValueError) as exc:
+            return {
+                **base,
+                "status": "unverified",
+                "reason": "git_status_configuration_unavailable",
+                "git_subcommand": subcommand,
+                "error_type": type(exc).__name__,
+                "recommended_route": None,
+            }
+        if status_untracked_configuration:
+            return {
+                **base,
+                "status": "unverified",
+                "reason": "git_status_configuration_not_preserved_by_typed_route",
+                "git_subcommand": subcommand,
+                "recommended_route": None,
+            }
         return {
             **base,
             "status": "verified",
