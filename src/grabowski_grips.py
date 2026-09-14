@@ -928,7 +928,7 @@ GRIP_SPECS: dict[str, GripSpec] = {
     ),
     "pr-base-converge": GripSpec(
         name="pr-base-converge",
-        version="1.1",
+        version="1.2",
         summary=(
             "Converge one exact open same-repository PR by merging only the bound base/head commits and CAS-updating the existing PR head branch."
         ),
@@ -1163,10 +1163,10 @@ GRIP_RECOVERY_PATHS_BY_NAME = {
 # so the published contract carries them explicitly per action.
 GRIP_CONDITIONAL_PRECONDITIONS = {
     "pr-base-converge": (
-        "the PR must still be OPEN, same-repository, on the requested base branch and exact expected head/base SHA before dispatch",
+        "the PR must still be OPEN, same-repository, on the requested base branch and exact expected head before dispatch; expected_base_sha must match a fresh live base-ref read",
         "the head branch must not be main/master; existing review, saga and Captain evidence is intentionally invalidated by any resulting head change and must be renewed",
         "the update is constructed only from the exact expected head and exact expected base, then the existing head branch alone is CAS-published with an exact-old-head lease; a newer base can never be substituted into the merge commit",
-        "the live base is read before and after publication; if it advances during the head update the applied head remains content-bound to the old exact base and the grip requires a fresh same-PR convergence instead of claiming currentness",
+        "the live base branch ref, not the PR baseRefOid projection, is read before no-op or publication success and again after publication; if it advances during the head update the applied head remains content-bound to the old exact base and the grip requires a fresh same-PR convergence instead of claiming currentness",
         "a non-successful or exceptional push response is reconciled by remote branch readback before return; outcome_unknown forbids an unchanged retry",
         "this grip never closes the PR, creates a successor PR, merges or grants Captain authority",
     ),
@@ -6278,6 +6278,23 @@ def _run_pr_base_converge(
             raise GripActionError("unexpected PR view output")
         return viewed
 
+    live_base_endpoint = (
+        f"repos/{{owner}}/{{repo}}/git/ref/heads/{quote(base, safe='/')}"
+    )
+
+    def read_live_base() -> str:
+        result = _github(
+            repo,
+            github_runner,
+            ["api", live_base_endpoint, "--jq", ".object.sha"],
+        )
+        live_sha = str(result.get("stdout", "")).strip().lower()
+        if len(live_sha) != 40 or any(
+            char not in "0123456789abcdef" for char in live_sha
+        ):
+            raise GripActionError("GitHub live base ref did not return a canonical commit SHA")
+        return live_sha
+
     def compare_status(base_sha: str, head: str) -> str:
         result = _github(
             repo,
@@ -6317,20 +6334,35 @@ def _run_pr_base_converge(
         )
         raise GripPreflightError("pr-base-converge refuses cross-repository PRs")
     _check(receipt, "same_repository", "pass", "same repository")
-    if (
-        before.get("baseRefName") != base
-        or str(before.get("baseRefOid", "")).lower() != expected_base_sha
-    ):
+    if before.get("baseRefName") != base:
         _check(
             receipt,
             "base_identity",
             "fail",
-            f"branch={before.get('baseRefName')} sha={before.get('baseRefOid')} expected_branch={base} expected_sha={expected_base_sha}",
+            f"branch={before.get('baseRefName')} expected_branch={base}",
+        )
+        raise GripPreflightError("PR base branch does not match requested base")
+    live_base_before = read_live_base()
+    if live_base_before != expected_base_sha:
+        _check(
+            receipt,
+            "base_identity",
+            "fail",
+            (
+                f"branch={base} live_sha={live_base_before} "
+                f"expected_sha={expected_base_sha}; "
+                f"pr_projection_sha={before.get('baseRefOid')}"
+            ),
         )
         raise GripPreflightError(
-            "PR base identity does not match expected base branch/SHA"
+            "live PR base branch does not match expected_base_sha"
         )
-    _check(receipt, "base_identity", "pass", f"{base}@{expected_base_sha}")
+    _check(
+        receipt,
+        "base_identity",
+        "pass",
+        f"{base}@{expected_base_sha}; pr_projection_sha={before.get('baseRefOid')}",
+    )
     if str(before.get("headRefOid", "")).lower() != expected_head:
         _check(
             receipt,
@@ -6385,18 +6417,26 @@ def _run_pr_base_converge(
             raise GripPreflightError(
                 "PR head branch identity drifted during no-op base convergence verification"
             )
-        if (
-            current.get("baseRefName") != base
-            or str(current.get("baseRefOid", "")).lower() != expected_base_sha
-        ):
+        if current.get("baseRefName") != base:
             _check(
                 receipt,
                 "base_identity_after",
                 "fail",
-                f"branch={current.get('baseRefName')} sha={current.get('baseRefOid')}",
+                f"branch={current.get('baseRefName')} expected_branch={base}",
             )
             raise GripPreflightError(
-                "PR base drifted during no-op base convergence verification"
+                "PR base branch drifted during no-op base convergence verification"
+            )
+        live_base_current = read_live_base()
+        if live_base_current != expected_base_sha:
+            _check(
+                receipt,
+                "base_identity_after",
+                "fail",
+                f"live_sha={live_base_current} expected_sha={expected_base_sha}",
+            )
+            raise GripPreflightError(
+                "live base advanced during no-op base convergence verification"
             )
         if str(current.get("headRefOid", "")).lower() != expected_head:
             _check(
@@ -6451,6 +6491,29 @@ def _run_pr_base_converge(
 
     cas_status = str(cas_evidence.get("status") or "")
     cas_evidence_sha256 = sha256_json(cas_evidence)
+    if int(cas_result.get("returncode", 1)) == 0:
+        cas_remote_readback = cas_evidence.get("remote_readback")
+        if not isinstance(cas_remote_readback, dict):
+            _check(
+                receipt,
+                "base_identity_after",
+                "fail",
+                "successful CAS omitted authoritative remote base readback",
+            )
+            raise GripActionError(
+                "exact-base PR-head CAS succeeded without authoritative post-push base readback"
+            )
+        cas_base_after = str(cas_remote_readback.get("base_sha") or "").lower()
+        if cas_base_after != expected_base_sha:
+            _check(
+                receipt,
+                "base_identity_after",
+                "fail",
+                f"cas_live_sha={cas_base_after} expected_sha={expected_base_sha}",
+            )
+            raise GripActionError(
+                "live base advanced during exact-base head CAS; the applied head contains only the bound base and requires fresh same-PR convergence"
+            )
     if int(cas_result.get("returncode", 1)) != 0:
         _check(
             receipt,
@@ -6508,18 +6571,26 @@ def _run_pr_base_converge(
             raise GripActionError(
                 "same PR head branch identity changed after exact head CAS"
             )
-        if (
-            current.get("baseRefName") != base
-            or str(current.get("baseRefOid", "")).lower() != expected_base_sha
-        ):
+        if current.get("baseRefName") != base:
             _check(
                 receipt,
                 "base_identity_after",
                 "fail",
-                f"branch={current.get('baseRefName')} sha={current.get('baseRefOid')}",
+                f"branch={current.get('baseRefName')} expected_branch={base}",
             )
             raise GripActionError(
-                "PR base advanced after exact-base head CAS; the applied head contains only the bound base and requires fresh same-PR convergence"
+                "PR base branch changed after exact-base head CAS"
+            )
+        live_base_current = read_live_base()
+        if live_base_current != expected_base_sha:
+            _check(
+                receipt,
+                "base_identity_after",
+                "fail",
+                f"live_sha={live_base_current} expected_sha={expected_base_sha}",
+            )
+            raise GripActionError(
+                "live base advanced after exact-base head CAS; the applied head contains only the bound base and requires fresh same-PR convergence"
             )
         observed_head = str(current.get("headRefOid", "")).lower()
         if observed_head == expected_head:
@@ -6553,13 +6624,23 @@ def _run_pr_base_converge(
                 "updated PR head does not preserve the exact prior PR head lineage"
             )
         final = read_pr()
+        final_live_base = read_live_base()
+        if final_live_base != expected_base_sha:
+            _check(
+                receipt,
+                "base_identity_after",
+                "fail",
+                f"live_sha={final_live_base} expected_sha={expected_base_sha}",
+            )
+            raise GripActionError(
+                "live base advanced after exact-base ancestry verification; fresh same-PR convergence is required"
+            )
         if (
             final.get("number") != pr_number
             or final.get("state") != "OPEN"
             or final.get("isCrossRepository") is not False
             or final.get("headRefName") != head_branch
             or final.get("baseRefName") != base
-            or str(final.get("baseRefOid", "")).lower() != expected_base_sha
             or str(final.get("headRefOid", "")).lower() != new_head
         ):
             _check(receipt, "final_pr_binding", "fail", "live PR binding drift")

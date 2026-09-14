@@ -674,6 +674,7 @@ class FakePrBaseConvergeGh:
         self,
         *,
         base_sha: str = "e" * 40,
+        pr_base_sha: str | None = None,
         head_sha: str = "a" * 40,
         new_head_sha: str = "b" * 40,
         state: str = "OPEN",
@@ -682,6 +683,7 @@ class FakePrBaseConvergeGh:
         preserve_old_head: bool = True,
     ):
         self.base_sha = base_sha
+        self.live_base_sha = base_sha
         self.head_sha = head_sha
         self.new_head_sha = new_head_sha
         self.preserve_old_head = preserve_old_head
@@ -692,7 +694,7 @@ class FakePrBaseConvergeGh:
             "url": "https://github.com/heimgewebe/grabowski/pull/77",
             "state": state,
             "baseRefName": "main",
-            "baseRefOid": base_sha,
+            "baseRefOid": pr_base_sha if pr_base_sha is not None else base_sha,
             "headRefName": "feat/work",
             "headRefOid": head_sha,
             "isDraft": False,
@@ -706,6 +708,15 @@ class FakePrBaseConvergeGh:
         if argv[:2] == ["pr", "view"]:
             return {"returncode": 0, "stdout": json.dumps(self.view), "stderr": ""}
         if argv[:1] == ["api"]:
+            live_ref_endpoint = next(
+                (item for item in argv if "/git/ref/heads/" in item), ""
+            )
+            if live_ref_endpoint:
+                return {
+                    "returncode": 0,
+                    "stdout": self.live_base_sha + "\n",
+                    "stderr": "",
+                }
             endpoint = next((item for item in argv if "/compare/" in item), "")
             if "/compare/" in endpoint:
                 comparison = endpoint.rsplit("/compare/", 1)[-1]
@@ -740,6 +751,7 @@ def fake_pr_base_converge_cas(
     status: str = "pushed_and_read_back",
     returncode: int = 0,
     merge_sha: str = "b" * 40,
+    remote_base_sha: str | None = None,
 ):
     def effect(*args: object, **kwargs: object):
         del args, kwargs
@@ -755,6 +767,11 @@ def fake_pr_base_converge_cas(
                 "merge_sha": merge_sha,
                 "effect_proven": returncode == 0,
                 "effect_not_applied_proven": status == "not_applied_proven",
+                "remote_readback": {
+                    "base_sha": remote_base_sha or gh.live_base_sha,
+                    "head_sha": merge_sha if returncode == 0 else gh.head_sha,
+                    "pr_head_sha": merge_sha if returncode == 0 else gh.head_sha,
+                },
             },
         )
 
@@ -7934,6 +7951,59 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("pass", checks["prior_head_contained_after"])
         self.assertEqual("pass", checks["base_contained_after"])
 
+    def test_pr_base_converge_uses_live_base_ref_when_pr_projection_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            gh = FakePrBaseConvergeGh(pr_base_sha="d" * 40)
+            with patch.object(
+                merge_guard,
+                "_exact_base_content_git_head_cas_update_pr_head",
+                side_effect=fake_pr_base_converge_cas(gh),
+            ) as cas:
+                result = grips.run_grip(
+                    "pr-base-converge",
+                    {
+                        "repo": tmp,
+                        "pr_number": 77,
+                        "base": "main",
+                        "expected_head": "a" * 40,
+                        "expected_base_sha": "e" * 40,
+                    },
+                    allow_mutation=True,
+                    github_runner=gh,
+                )
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("updated", result["output"]["action"])
+        self.assertEqual("e" * 40, cas.call_args.kwargs["base_sha"])
+        self.assertTrue(
+            any(
+                call[:1] == ("api",)
+                and any("/git/ref/heads/main" in item for item in call)
+                for call in gh.calls
+            )
+        )
+
+    def test_pr_base_converge_rejects_stale_expected_base_against_live_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            gh = FakePrBaseConvergeGh(base_sha="f" * 40, pr_base_sha="e" * 40)
+            with patch.object(
+                merge_guard, "_exact_base_content_git_head_cas_update_pr_head"
+            ) as cas:
+                result = grips.run_grip(
+                    "pr-base-converge",
+                    {
+                        "repo": tmp,
+                        "pr_number": 77,
+                        "base": "main",
+                        "expected_head": "a" * 40,
+                        "expected_base_sha": "e" * 40,
+                    },
+                    allow_mutation=True,
+                    github_runner=gh,
+                )
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("live PR base branch", result["output"]["error"])
+        cas.assert_not_called()
+
     def test_pr_base_converge_is_noop_when_head_already_contains_base(self) -> None:
         class AlreadyCurrent(FakePrBaseConvergeGh):
             def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
@@ -7965,13 +8035,15 @@ class GripFoundationTests(unittest.TestCase):
         class DriftedNoop(FakePrBaseConvergeGh):
             def __init__(self) -> None:
                 super().__init__()
-                self.view_reads = 0
+                self.live_base_reads = 0
 
             def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
-                if argv[:2] == ["pr", "view"]:
-                    self.view_reads += 1
-                    if self.view_reads == 2:
-                        self.view["baseRefOid"] = "f" * 40
+                if argv[:1] == ["api"] and any(
+                    "/git/ref/heads/" in item for item in argv
+                ):
+                    self.live_base_reads += 1
+                    if self.live_base_reads == 2:
+                        self.live_base_sha = "f" * 40
                 if argv[:1] == ["api"] and any("/compare/" in item for item in argv):
                     self.calls.append(tuple(argv))
                     return {"returncode": 0, "stdout": "ahead\n", "stderr": ""}
@@ -7993,8 +8065,8 @@ class GripFoundationTests(unittest.TestCase):
                     github_runner=gh,
                 )
         self.assertEqual("blocked", result["receipt"]["status"])
-        self.assertIn("base drifted", result["output"]["error"])
-        self.assertEqual(2, gh.view_reads)
+        self.assertIn("live base advanced", result["output"]["error"])
+        self.assertEqual(2, gh.live_base_reads)
         cas.assert_not_called()
 
     def test_pr_base_converge_blocks_stale_head_before_update(self) -> None:
@@ -8107,8 +8179,12 @@ class GripFoundationTests(unittest.TestCase):
     ) -> None:
         class BaseAdvancesAfterCas(FakePrBaseConvergeGh):
             def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
-                if argv[:2] == ["pr", "view"] and self.updated:
-                    self.view["baseRefOid"] = "f" * 40
+                if (
+                    argv[:1] == ["api"]
+                    and self.updated
+                    and any("/git/ref/heads/" in item for item in argv)
+                ):
+                    self.live_base_sha = "f" * 40
                 return super().__call__(repo, argv)
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -8136,6 +8212,34 @@ class GripFoundationTests(unittest.TestCase):
         )
         self.assertEqual(1, cas.call_count)
         self.assertFalse(any(call[:2] == ("pr", "create") for call in gh.calls))
+
+    def test_pr_base_converge_rejects_post_push_base_aba_from_cas_readback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            gh = FakePrBaseConvergeGh()
+            with patch.object(
+                merge_guard,
+                "_exact_base_content_git_head_cas_update_pr_head",
+                side_effect=fake_pr_base_converge_cas(
+                    gh, remote_base_sha="f" * 40
+                ),
+            ) as cas:
+                result = grips.run_grip(
+                    "pr-base-converge",
+                    {
+                        "repo": tmp,
+                        "pr_number": 77,
+                        "base": "main",
+                        "expected_head": "a" * 40,
+                        "expected_base_sha": "e" * 40,
+                    },
+                    allow_mutation=True,
+                    github_runner=gh,
+                )
+        self.assertEqual("failed", result["receipt"]["status"])
+        self.assertIn("advanced during exact-base head CAS", result["output"]["error"])
+        self.assertEqual(1, cas.call_count)
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("fail", checks["base_identity_after"])
 
     def test_pr_base_converge_unknown_cas_outcome_forbids_replay_or_successor(
         self,
