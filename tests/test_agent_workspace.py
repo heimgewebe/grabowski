@@ -7886,6 +7886,65 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertTrue(public["terminal"])
         self.assertEqual(public["unit"], "writer.service")
 
+    def test_cleanup_checkout_coordination_includes_branch_scoped_snapshot_and_tasks(self) -> None:
+        branch = "feat/writer"
+        branch_key = f"repo:{self.git.repo}:branch:{branch}"
+        branch_task = {"task_id": "branch-only-task", "blocking": True}
+        base = {
+            "resource_leases": [],
+            "tasks": [branch_task],
+            "processes": [],
+            "blocking": True,
+            "blocking_counts": {
+                "resource_leases": 0,
+                "tasks": 1,
+                "processes": 0,
+            },
+        }
+        snapshot = {
+            "complete": True,
+            "error": None,
+            "by_key": {
+                branch_key: {
+                    "resource_key": branch_key,
+                    "owner_id": "foreign-owner",
+                }
+            },
+            "by_owner": {},
+        }
+        with mock.patch.object(
+            workspace.checkouts,
+            "_linked_checkout_coordination",
+            return_value=base,
+        ) as linked:
+            result = workspace._workspace_cleanup_checkout_coordination(
+                self.git.writer,
+                self.git.repo,
+                self.git.repo / ".git",
+                branch=branch,
+                owner_id="workspace-owner",
+                resource_snapshot=snapshot,
+            )
+
+        linked.assert_called_once_with(
+            self.git.writer,
+            self.git.repo,
+            self.git.repo / ".git",
+            branch=branch,
+            owner_id="workspace-owner",
+            include_processes=True,
+            include_tasks=True,
+            include_resources=False,
+        )
+        self.assertEqual(
+            [item["resource_key"] for item in result["resource_leases"]],
+            [branch_key],
+        )
+        self.assertEqual(result["tasks"], [branch_task])
+        self.assertTrue(result["blocking"])
+        self.assertEqual(result["blocking_counts"]["resource_leases"], 1)
+        self.assertEqual(result["blocking_counts"]["tasks"], 1)
+
     def test_cleanup_plan_reads_resource_lease_snapshot_once(self) -> None:
         manifest = self._closed_cleanup_manifest()
         with (
@@ -8720,6 +8779,56 @@ class AgentWorkspaceTests(unittest.TestCase):
             persisted = workspace._manifest(manifest["workspace_id"])
             self.assertEqual(
                 persisted["workspace_cleanup_intent"]["state"], "archived_ready"
+            )
+
+    def test_persisted_archive_recovery_fence_rejects_replaced_checkout_identity(self) -> None:
+        current_physical_identity = {"physical_identity_sha256": "current-checkout"}
+        archived_physical_identity = {"physical_identity_sha256": "archived-checkout"}
+        plan = {
+            "repository": "/tmp/repo",
+            "writer_worktree": "/tmp/worktree",
+            "checkout": {
+                "checkout_key": "checkout-key",
+                "head": "0123456789abcdef0123456789abcdef01234567",
+                "branch": "feat/writer",
+                "physical_identity": current_physical_identity,
+            },
+        }
+        fence = {
+            "checkout_key": "checkout-key",
+            "operation": "archive",
+            "owner_id": "workspace-owner",
+            "operation_id": "archive-id",
+            "evidence": {
+                "archive_id": "archive-id",
+                "checkout_key": "checkout-key",
+                "owner_id": "workspace-owner",
+                "repo": "/tmp/repo",
+                "checkout_path": "/tmp/worktree",
+                "expected_head": "0123456789abcdef0123456789abcdef01234567",
+                "expected_branch": "feat/writer",
+                "expected_physical_identity": archived_physical_identity,
+            },
+        }
+        with mock.patch.object(
+            workspace.checkouts,
+            "_active_checkout_operation_uncertainties",
+            return_value=[fence],
+        ):
+            with self.assertRaisesRegex(
+                workspace.AgentWorkspaceActionError,
+                "conflicting checkout uncertainty fence",
+            ):
+                workspace._workspace_persisted_archive_uncertainty_fence(
+                    plan, owner="workspace-owner"
+                )
+
+            fence["evidence"]["expected_physical_identity"] = current_physical_identity
+            self.assertIs(
+                workspace._workspace_persisted_archive_uncertainty_fence(
+                    plan, owner="workspace-owner"
+                ),
+                fence,
             )
 
     def test_archive_recovery_coordination_rejects_foreign_or_live_activity(self) -> None:
@@ -11849,6 +11958,7 @@ class AgentWorkspaceTests(unittest.TestCase):
                 "checkout_key": "key",
                 "head": "a" * 40,
                 "branch": "topic",
+                "physical_identity": {"physical_identity_sha256": "checkout-identity"},
             },
         }
         archive = {"archive_id": "archive-123"}
@@ -11865,6 +11975,9 @@ class AgentWorkspaceTests(unittest.TestCase):
                 "checkout_path": "/repo/wt",
                 "expected_head": "a" * 40,
                 "expected_branch": "topic",
+                "expected_physical_identity": {
+                    "physical_identity_sha256": "checkout-identity"
+                },
             },
         }
         with (
@@ -11905,6 +12018,7 @@ class AgentWorkspaceTests(unittest.TestCase):
                 "checkout_key": "key",
                 "head": "a" * 40,
                 "branch": "topic",
+                "physical_identity": {"physical_identity_sha256": "checkout-identity"},
             },
         }
         exact = {
@@ -11920,6 +12034,9 @@ class AgentWorkspaceTests(unittest.TestCase):
                 "checkout_path": "/repo/wt",
                 "expected_head": "a" * 40,
                 "expected_branch": "topic",
+                "expected_physical_identity": {
+                    "physical_identity_sha256": "checkout-identity"
+                },
             },
         }
         conflict = {

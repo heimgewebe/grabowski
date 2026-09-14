@@ -10533,15 +10533,17 @@ def _workspace_cleanup_checkout_coordination(
     repo_path: Path,
     repo_common_dir: Path,
     *,
+    branch: str | None,
     owner_id: str,
     resource_snapshot: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Reuse cleanup lease evidence while still observing tasks and processes live."""
+    """Observe path- and branch-scoped cleanup coordination from one lease snapshot."""
     if resource_snapshot is None:
         return checkouts._linked_checkout_coordination(
             checkout_path,
             repo_path,
             repo_common_dir,
+            branch=branch,
             owner_id=owner_id,
             include_processes=True,
             include_tasks=True,
@@ -10551,6 +10553,7 @@ def _workspace_cleanup_checkout_coordination(
         checkout_path,
         repo_path,
         repo_common_dir,
+        branch=branch,
         owner_id=owner_id,
         include_processes=True,
         include_tasks=True,
@@ -10577,6 +10580,11 @@ def _workspace_cleanup_checkout_coordination(
     by_key = resource_snapshot.get("by_key")
     if not isinstance(by_key, dict):
         raise AgentWorkspaceActionError("resource lease snapshot key index is invalid")
+    branch_resource_key = (
+        f"repo:{repo_path}:branch:{branch}"
+        if isinstance(branch, str) and branch
+        else None
+    )
     resource_blockers: list[dict[str, Any]] = []
     for lease in by_key.values():
         if not isinstance(lease, dict):
@@ -10584,8 +10592,12 @@ def _workspace_cleanup_checkout_coordination(
         resource_key = lease.get("resource_key")
         if not isinstance(resource_key, str):
             raise AgentWorkspaceActionError("resource lease snapshot key is invalid")
-        if not checkouts._resource_related(
-            resource_key, [checkout_path, repo_common_dir]
+        if not (
+            checkouts._resource_related(resource_key, [checkout_path, repo_common_dir])
+            or (
+                branch_resource_key is not None
+                and resource_key == branch_resource_key
+            )
         ):
             continue
         resource_blockers.append({**lease, "blocking": True})
@@ -11516,6 +11528,7 @@ def _workspace_cleanup_plan_data(
                 checkout_path,
                 top_level,
                 common_dir,
+                branch=writer_branch,
                 owner_id=owner,
                 resource_snapshot=resource_snapshot,
             )
@@ -13279,6 +13292,7 @@ def _workspace_persisted_archive_uncertainty_fence(
     checkout_key = checkout.get("checkout_key")
     expected_head = checkout.get("head")
     expected_branch = checkout.get("branch")
+    expected_physical_identity = checkout.get("physical_identity")
     repo = cleanup_plan.get("repository")
     checkout_path = cleanup_plan.get("writer_worktree")
     if not all(
@@ -13290,7 +13304,7 @@ def _workspace_persisted_archive_uncertainty_fence(
             repo,
             checkout_path,
         )
-    ):
+    ) or not isinstance(expected_physical_identity, dict):
         raise AgentWorkspaceActionError(
             "workspace archive recovery lacks exact checkout identity"
         )
@@ -13317,6 +13331,8 @@ def _workspace_persisted_archive_uncertainty_fence(
             and evidence.get("checkout_path") == checkout_path
             and evidence.get("expected_head") == expected_head
             and evidence.get("expected_branch") == expected_branch
+            and evidence.get("expected_physical_identity")
+            == expected_physical_identity
         ):
             matching.append(fence)
     if len(active) != 1 or len(matching) != 1:
