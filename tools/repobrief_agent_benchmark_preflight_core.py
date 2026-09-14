@@ -624,7 +624,12 @@ def _provider_execution_classification(
     status = result.get("api_error_status")
     if isinstance(status, bool) or not isinstance(status, int) or status != 429:
         return unknown
-    if result.get("duration_api_ms") != 0:
+    duration_api_ms = result.get("duration_api_ms")
+    if (
+        isinstance(duration_api_ms, bool)
+        or not isinstance(duration_api_ms, int)
+        or duration_api_ms != 0
+    ):
         return unknown
     if not _zero_provider_usage(result.get("usage")):
         return unknown
@@ -679,11 +684,12 @@ def _provider_execution_classification(
         return unknown
     if uses or tool_results:
         return unknown
-    session_ids = {
-        message.get("session_id")
-        for message in messages
-        if isinstance(message.get("session_id"), str) and message.get("session_id")
-    }
+    session_ids: set[str] = set()
+    for message in messages:
+        session_id = message.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            return unknown
+        session_ids.add(session_id)
     if len(session_ids) != 1:
         return unknown
     return {

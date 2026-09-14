@@ -149,9 +149,10 @@ def _rate_limit_refusal_stream(
     output_tokens: int = 0,
     cost: str = "0",
     api_error_status: int = 429,
-    duration_api_ms: int = 0,
+    duration_api_ms: int | bool = 0,
     include_tool_use: bool = False,
     is_using_overage: bool = False,
+    omit_session_id_for: str | None = None,
 ) -> bytes:
     session_id = f"provider-refusal-{request['condition']}"
     zero_server_tools = {"web_search_requests": 0, "web_fetch_requests": 0}
@@ -228,6 +229,13 @@ def _rate_limit_refusal_stream(
             "total_cost_usd": cost,
         },
     ]
+    if omit_session_id_for is not None:
+        matching = [
+            message for message in messages if message.get("type") == omit_session_id_for
+        ]
+        if not matching:
+            raise AssertionError(f"unknown message type: {omit_session_id_for}")
+        matching[0].pop("session_id", None)
     return b"".join(
         json.dumps(message, sort_keys=True).encode("utf-8") + b"\n"
         for message in messages
@@ -935,9 +943,15 @@ class ProviderExecutionClassificationTests(unittest.TestCase):
             "output-token": {"output_tokens": 1},
             "cost": {"cost": "0.01"},
             "api-duration": {"duration_api_ms": 1},
+            "boolean-api-duration": {"duration_api_ms": False},
             "different-status": {"api_error_status": 503},
             "tool-use": {"include_tool_use": True},
             "overage-active": {"is_using_overage": True},
+            "missing-rate-limit-session": {
+                "omit_session_id_for": "rate_limit_event"
+            },
+            "missing-assistant-session": {"omit_session_id_for": "assistant"},
+            "missing-result-session": {"omit_session_id_for": "result"},
         }
         for label, overrides in cases.items():
             with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
