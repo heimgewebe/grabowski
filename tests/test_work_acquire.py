@@ -1571,6 +1571,79 @@ class WorkAcquireTests(unittest.TestCase):
             expected_branch="feat/authority-p0",
         )
 
+    def test_terminal_checkout_lifecycle_convergence_uses_canonical_rebound_branch(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        inputs.pop("_scoped_writer_argv")
+        checkout_key = "f" * 64
+        lane_id = "a" * 32
+        lifecycle = {
+            "checkout_key": checkout_key,
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "expected_branch": "feat/authority-p0",
+        }
+        record = {
+            "lane_id": lane_id,
+            "inputs": inputs,
+            "worktree_receipt": {"lifecycle": lifecycle},
+        }
+        rebound_branch = "feat/authority-p0-v2"
+        current_lifecycle = {
+            **lifecycle,
+            "expected_branch": rebound_branch,
+            "expected_head": SHA,
+            "phase": "active",
+            "source": {"kind": "work_lane", "id": lane_id},
+        }
+        observed = {
+            "checkout_key": checkout_key,
+            "head": SHA,
+            "branch": rebound_branch,
+        }
+        completed = {
+            **current_lifecycle,
+            "phase": "completed_retained",
+        }
+        with (
+            patch.object(
+                work_acquire.checkouts,
+                "_lifecycle_bindings",
+                return_value={checkout_key: current_lifecycle},
+            ),
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                return_value=(self.repo, self.repo / ".git", observed),
+            ),
+            patch.object(
+                work_acquire.checkouts,
+                "_require_clean_linked",
+                return_value={"dirty": False},
+            ),
+            patch.object(
+                work_acquire.checkouts,
+                "_mark_checkout_completed_retained",
+                return_value=completed,
+            ) as mark,
+        ):
+            result = work_acquire._converge_terminal_checkout_lifecycle(
+                record,
+                assessment={
+                    "phase": "terminal",
+                    "lease_release_ready": True,
+                    "terminal_head_sha": SHA,
+                },
+            )
+
+        self.assertIsNotNone(result)
+        mark.assert_called_once_with(
+            checkout_key=checkout_key,
+            owner_id=inputs["lease_owner_id"],
+            expected_head=SHA,
+            expected_branch=rebound_branch,
+        )
+
     def test_terminal_checkout_lifecycle_convergence_rejects_new_dirty_state(self) -> None:
         params = self.parameters()
         inputs = work_acquire._normalize(params)

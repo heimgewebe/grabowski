@@ -504,15 +504,45 @@ def _converge_terminal_checkout_lifecycle(
     checkout_key = lifecycle.get("checkout_key")
     checkout_path = lifecycle.get("checkout_path")
     owner_id = lifecycle.get("owner_id")
-    expected_branch = lifecycle.get("expected_branch")
-    if not all(isinstance(value, str) and value for value in (checkout_key, checkout_path, owner_id, expected_branch)):
+    recorded_branch = lifecycle.get("expected_branch")
+    if not all(
+        isinstance(value, str) and value
+        for value in (checkout_key, checkout_path, owner_id, recorded_branch)
+    ):
         raise RuntimeError("terminal Work Lane checkout lifecycle identity is incomplete")
     if (
         inputs.get("target_path") != checkout_path
-        or inputs.get("branch") != expected_branch
+        or inputs.get("branch") != recorded_branch
         or inputs.get("lease_owner_id") != owner_id
     ):
         raise RuntimeError("terminal Work Lane checkout lifecycle identity drifted")
+
+    # The durable worktree receipt preserves the checkout identity at lane
+    # creation time. A later, CAS-validated lifecycle identity rebind may
+    # legitimately move the same checkout to a successor branch before the
+    # lane becomes terminal. Prefer that canonical binding when present, while
+    # keeping the original receipt as the immutable lane-identity anchor.
+    expected_branch = recorded_branch
+    current_lifecycle = checkouts._lifecycle_bindings([checkout_key]).get(checkout_key)
+    if current_lifecycle is not None:
+        lane_id = record.get("lane_id")
+        if (
+            current_lifecycle.get("checkout_key") != checkout_key
+            or current_lifecycle.get("checkout_path") != checkout_path
+            or current_lifecycle.get("owner_id") != owner_id
+            or current_lifecycle.get("source")
+            != {"kind": "work_lane", "id": lane_id}
+        ):
+            raise RuntimeError(
+                "terminal Work Lane canonical checkout lifecycle identity drifted"
+            )
+        rebound_branch = current_lifecycle.get("expected_branch")
+        if not isinstance(rebound_branch, str) or not rebound_branch:
+            raise RuntimeError(
+                "terminal Work Lane canonical checkout branch is invalid"
+            )
+        expected_branch = rebound_branch
+
     repo_value = inputs.get("repo")
     if not isinstance(repo_value, str) or not repo_value:
         raise RuntimeError("terminal Work Lane repository identity is missing")
