@@ -877,6 +877,116 @@ def _validated_chronik_event_recall(event: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _historical_exact_selectors(query: dict[str, Any]) -> dict[str, Any]:
+    selectors: dict[str, Any] = {}
+    if query.get("pr_number") is not None:
+        pr_number = query["pr_number"]
+        if isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number < 1:
+            raise ValueError("Chronik history pr_number selector is invalid")
+        if not isinstance(query.get("repo"), str) or not query["repo"]:
+            raise ValueError("Chronik history pr_number selector lacks repository identity")
+        selectors["pr_number"] = pr_number
+    for key in ("bureau_task_id", "agent_run_id"):
+        value = query.get(key)
+        if value is None or value == "":
+            continue
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"Chronik history {key} selector is invalid")
+        selectors[key] = value
+    return selectors
+
+
+def _historical_event_matches_exact_selectors(
+    event: dict[str, Any], query: dict[str, Any], selectors: dict[str, Any]
+) -> bool:
+    subject = event.get("subject")
+    source = event.get("source")
+    if not isinstance(subject, dict) or not isinstance(source, dict):
+        return False
+    if "pr_number" in selectors:
+        if (
+            subject.get("scope") != "repository"
+            or subject.get("repo") != query.get("repo")
+            or subject.get("pr_number") != selectors["pr_number"]
+        ):
+            return False
+    if (
+        "bureau_task_id" in selectors
+        and subject.get("bureau_task_id") != selectors["bureau_task_id"]
+    ):
+        return False
+    if (
+        "agent_run_id" in selectors
+        and source.get("run_id") != selectors["agent_run_id"]
+    ):
+        return False
+    return True
+
+
+def _validated_historical_target_selection(
+    history_result: dict[str, Any],
+    *,
+    query: dict[str, Any],
+    available: bool,
+    events: list[Any],
+    history_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    selectors = _historical_exact_selectors(query)
+    if not selectors:
+        return None
+    selection = history_result.get("target_selection")
+    if not isinstance(selection, dict):
+        raise ValueError("Chronik history exact target selection is missing")
+    provider_limit = selection.get("provider_window_limit")
+    provider_returned = selection.get("provider_window_returned")
+    if (
+        (
+            available
+            and (
+                isinstance(provider_returned, bool)
+                or not isinstance(provider_returned, int)
+            )
+        )
+        or (not available and provider_returned is not None)
+        or selection.get("mode") != "exact"
+        or selection.get("exact_selectors") != selectors
+        or selection.get("selector_count") != len(selectors)
+        or selection.get("exact_target_binding") is not True
+        or selection.get("selection_scope") != "bounded_provider_window"
+        or selection.get("global_history_exhaustive") is not False
+        or selection.get("coarse_fallback_used") is not False
+        or isinstance(provider_limit, bool)
+        or not isinstance(provider_limit, int)
+        or provider_limit < 1
+        or (
+            provider_returned is not None
+            and (
+                isinstance(provider_returned, bool)
+                or not isinstance(provider_returned, int)
+                or provider_returned < 0
+                or provider_returned > provider_limit
+            )
+        )
+        or selection.get("provider_window_saturated")
+        is not (provider_returned is not None and provider_returned >= provider_limit)
+    ):
+        raise ValueError("Chronik history exact target selection is unbound")
+    if available:
+        if history_metadata is None or history_metadata.get("target_selection") != selection:
+            raise ValueError("Chronik history exact target selection metadata is unbound")
+        expected_status = "matched" if events else "no_match_in_bounded_provider_window"
+        if selection.get("match_status") != expected_status:
+            raise ValueError("Chronik history exact target match status is invalid")
+    elif selection.get("match_status") != "unavailable":
+        raise ValueError("Unavailable Chronik exact target selection has invalid status")
+    for event in events:
+        if not isinstance(event, dict) or not _historical_event_matches_exact_selectors(
+            event, query, selectors
+        ):
+            raise ValueError("Chronik history event is not bound to exact target selector")
+    return dict(selection)
+
+
 def export_chronik_history_recall(
     history_result: dict[str, Any], *, limit: int = 20
 ) -> dict[str, Any]:
@@ -924,6 +1034,12 @@ def export_chronik_history_recall(
     if not available:
         if raw_events:
             raise ValueError("Unavailable Chronik history may not carry events")
+        target_selection = _validated_historical_target_selection(
+            history_result,
+            query=query,
+            available=False,
+            events=raw_events,
+        )
         failure = history_result.get("failure")
         failure_code = failure.get("code") if isinstance(failure, dict) else None
         return {
@@ -936,7 +1052,15 @@ def export_chronik_history_recall(
             "historical_only": True,
             "query": dict(query),
             "history_result_sha256": claimed_digest,
-            "result_reference": base_result_reference,
+            "result_reference": {
+                **base_result_reference,
+                **(
+                    {"target_selection_sha256": _sha256_json(target_selection)}
+                    if target_selection is not None
+                    else {}
+                ),
+            },
+            "target_selection": target_selection,
             "returned": 0,
             "items": [],
             "failure_code": _optional_bounded_text(failure_code, max_chars=160),
@@ -954,10 +1078,22 @@ def export_chronik_history_recall(
     ledger_snapshot_sha256 = _validated_sha256(
         ledger_snapshot.get("sha256"), label="Chronik history ledger snapshot digest"
     )
+    target_selection = _validated_historical_target_selection(
+        history_result,
+        query=query,
+        available=True,
+        events=raw_events,
+        history_metadata=history_metadata,
+    )
     result_reference = {
         **base_result_reference,
         "ledger_snapshot_sha256": ledger_snapshot_sha256,
         "event_ids_sha256": _sha256_json(event_ids),
+        **(
+            {"target_selection_sha256": _sha256_json(target_selection)}
+            if target_selection is not None
+            else {}
+        ),
     }
     items = [_validated_chronik_event_recall(event) for event in raw_events[:limit]]
     pattern_summary, pattern_count = _historical_pattern_summary(items)
@@ -974,6 +1110,7 @@ def export_chronik_history_recall(
         "query": dict(query),
         "history_result_sha256": claimed_digest,
         "result_reference": result_reference,
+        "target_selection": target_selection,
         "returned": len(items),
         "items": items,
         "pattern_count": pattern_count,
