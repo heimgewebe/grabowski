@@ -10,6 +10,7 @@ from pathlib import Path
 import sys
 import types
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -245,6 +246,82 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                     len({(item["worker"], item["index"]) for item in observed}),
                     workers * records_per_worker,
                 )
+
+    def test_verify_releases_coordination_lock_before_cold_history(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"; state.mkdir(mode=0o700)
+            audit, patches = self._patches(state)
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+                for index in range(25):
+                    grabowski_mcp._append_audit({"operation": "verify-lock-scope", "index": index, "payload": "v" * 120})
+                real_lock=grabowski_mcp._audit_coordination_lock; real_read=grabowski_mcp._read_audit_chain_unlocked
+                lock_depth=0; depths=[]
+                @contextmanager
+                def tracked_lock(path, *, exclusive):
+                    nonlocal lock_depth
+                    with real_lock(path, exclusive=exclusive):
+                        lock_depth += 1
+                        try: yield
+                        finally: lock_depth -= 1
+                def tracked_read(*args, **kwargs):
+                    if kwargs.get("initial_expected") is not None: depths.append(lock_depth)
+                    return real_read(*args, **kwargs)
+                grabowski_mcp.AUDIT_SEGMENT_VERIFICATION_CACHE.clear()
+                with patch.object(grabowski_mcp, "_audit_coordination_lock", tracked_lock), patch.object(grabowski_mcp, "_read_audit_chain_unlocked", side_effect=tracked_read):
+                    status=grabowski_mcp._verify_audit_log(audit)
+                self.assertTrue(status["valid"], status); self.assertEqual(depths,[0])
+
+    def test_writer_lock_stays_live_during_cold_history_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state=Path(directory)/"state"; state.mkdir(mode=0o700)
+            audit, patches=self._patches(state)
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+                for index in range(25): grabowski_mcp._append_audit({"operation":"writer-liveness","index":index,"payload":"w"*120})
+                real_read=grabowski_mcp._read_audit_chain_unlocked
+                started=threading.Event(); allow=threading.Event(); acquired=threading.Event(); result={}
+                def paused(*args, **kwargs):
+                    if kwargs.get("initial_expected") is not None:
+                        started.set()
+                        if not allow.wait(2): raise RuntimeError("test history release timed out")
+                    return real_read(*args, **kwargs)
+                def verify_worker(): result["status"]=grabowski_mcp._verify_audit_log(audit)
+                def writer_worker():
+                    with grabowski_mcp._audit_coordination_lock(audit, exclusive=True): acquired.set()
+                grabowski_mcp.AUDIT_SEGMENT_VERIFICATION_CACHE.clear()
+                with patch.object(grabowski_mcp, "_read_audit_chain_unlocked", side_effect=paused):
+                    verifier=threading.Thread(target=verify_worker); verifier.start(); self.assertTrue(started.wait(2))
+                    writer=threading.Thread(target=writer_worker); writer.start(); self.assertTrue(acquired.wait(1)); allow.set()
+                    writer.join(2); verifier.join(3)
+                self.assertFalse(writer.is_alive()); self.assertFalse(verifier.is_alive()); self.assertTrue(result["status"]["valid"],result["status"])
+
+    def test_append_reverifies_history_after_predecessor_change(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state=Path(directory)/"state"; state.mkdir(mode=0o700)
+            audit, patches=self._patches(state)
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+                for index in range(25): grabowski_mcp._append_audit({"operation":"predecessor-retry","index":index,"payload":"p"*120})
+                real_lock=grabowski_mcp._audit_coordination_lock; real_head=grabowski_mcp._read_audit_head_unlocked; real_read=grabowski_mcp._read_audit_chain_unlocked
+                state_lock={"exclusive":False}; inject=True; reads=0
+                @contextmanager
+                def tracked_lock(path, *, exclusive):
+                    with real_lock(path, exclusive=exclusive):
+                        previous=state_lock["exclusive"]; state_lock["exclusive"]=exclusive
+                        try: yield
+                        finally: state_lock["exclusive"]=previous
+                def changing_head(path):
+                    nonlocal inject
+                    head,pred=real_head(path)
+                    if state_lock["exclusive"] and inject and pred is not None:
+                        inject=False; changed=dict(pred); changed["sha256"]=("0"*64 if pred.get("sha256") != "0"*64 else "1"*64); return head,changed
+                    return head,pred
+                def counting(*args,**kwargs):
+                    nonlocal reads
+                    if kwargs.get("initial_expected") is not None: reads += 1
+                    return real_read(*args,**kwargs)
+                with patch.object(grabowski_mcp, "_audit_coordination_lock", tracked_lock), patch.object(grabowski_mcp, "_read_audit_head_unlocked", side_effect=changing_head), patch.object(grabowski_mcp, "_read_audit_chain_unlocked", side_effect=counting):
+                    digest=grabowski_mcp._append_audit_with_digest({"operation":"after-predecessor-retry"})
+                self.assertEqual(len(digest),64); self.assertFalse(inject); self.assertEqual(reads,2)
+                status=grabowski_mcp._verify_audit_log(audit); self.assertTrue(status["valid"],status)
 
     def test_deferred_predecessor_verification_matches_full_chain(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
