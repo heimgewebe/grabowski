@@ -3693,6 +3693,73 @@ class TaskTests(unittest.TestCase):
         self.assertIs(advisory["runtime_exceeds_synchronous_ceiling"], True)
         self.assertEqual(advisory["durable_signals"], [])
 
+    def test_explicit_read_only_configured_status_keeps_durable_route(self) -> None:
+        argv = [
+            "git",
+            "-c",
+            "status.showUntrackedFiles=no",
+            "status",
+            "--short",
+            "--branch",
+        ]
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks.operator, "_guard_git"), patch.object(
+            tasks, "_dispatch", return_value=_launcher()
+        ) as dispatch_mock, patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 162}
+        ):
+            result = tasks.grabowski_task_start(
+                "local",
+                argv,
+                cwd=str(self.root),
+                runtime_seconds=30,
+                resume_policy="never",
+                effect_profile="read_only",
+            )
+
+        advisory = result["read_routing_advisory"]
+        self.assertEqual(advisory["classification"], "durable_read_justified")
+        self.assertEqual(advisory["recommended_route"], "grabowski_task_start")
+        verification = advisory["server_read_verification"]
+        self.assertEqual(verification["status"], "unverified")
+        self.assertEqual(
+            verification["reason"],
+            "guarded_git_read_has_no_executable_synchronous_route",
+        )
+        self.assertIsNotNone(result["task"])
+        dispatch_mock.assert_called_once()
+
+    def test_explicit_read_only_prefixed_status_keeps_durable_route(self) -> None:
+        argv = ["git", "--no-pager", "status", "--short", "--branch"]
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks.operator, "_guard_git"), patch.object(
+            tasks, "_dispatch", return_value=_launcher()
+        ) as dispatch_mock, patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 162}
+        ):
+            result = tasks.grabowski_task_start(
+                "local",
+                argv,
+                cwd=str(self.root),
+                runtime_seconds=30,
+                resume_policy="never",
+                effect_profile="read_only",
+            )
+
+        advisory = result["read_routing_advisory"]
+        self.assertEqual(advisory["classification"], "durable_read_justified")
+        self.assertEqual(advisory["recommended_route"], "grabowski_task_start")
+        verification = advisory["server_read_verification"]
+        self.assertEqual(verification["status"], "unverified")
+        self.assertEqual(
+            verification["reason"],
+            "guarded_git_read_has_no_executable_synchronous_route",
+        )
+        self.assertIsNotNone(result["task"])
+        dispatch_mock.assert_called_once()
+
     def test_explicit_read_only_transport_gated_git_read_keeps_durable_route(self) -> None:
         argv = ["git", "diff", "--stat"]
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(

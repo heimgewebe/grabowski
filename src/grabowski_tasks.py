@@ -3692,6 +3692,8 @@ def _server_verified_task_read_route(
         }
     if (
         subcommand == "status"
+        and arguments[0] == subcommand
+        and not _configurations
         and len(_command_arguments) == 2
         and set(_command_arguments) == {"--short", "--branch"}
     ):
