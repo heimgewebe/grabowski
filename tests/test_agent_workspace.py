@@ -8752,15 +8752,85 @@ class AgentWorkspaceTests(unittest.TestCase):
                 observed_coordination_keys.issubset(set(fence["resource_keys"]))
             )
 
+            real_reconcile = workspace._workspace_reconcile_checkout_uncertainty
+
+            def clear_fence_then_fail(**kwargs):
+                result = real_reconcile(**kwargs)
+                if (
+                    kwargs.get("operation") == "archive"
+                    and kwargs.get("release_operation_lease") is True
+                ):
+                    raise workspace.AgentWorkspaceActionError(
+                        "simulated loss after persisted archive fence release"
+                    )
+                return result
+
+            with (
+                mock.patch.object(
+                    workspace.checkouts, "grabowski_checkout_archive"
+                ) as second_archive,
+                mock.patch.object(
+                    workspace,
+                    "_workspace_reconcile_checkout_uncertainty",
+                    side_effect=clear_fence_then_fail,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    workspace.AgentWorkspaceActionError,
+                    "simulated loss after persisted archive fence release",
+                ):
+                    workspace.grabowski_agent_workspace_cleanup(
+                        manifest["workspace_id"],
+                        blocked_plan["plan_sha256"],
+                        "archive-and-remove-worktree",
+                    )
+            second_archive.assert_not_called()
+            self.assertEqual(archive_calls, 1)
+            after_clear = workspace._manifest(manifest["workspace_id"])
+            after_clear_intent = after_clear["workspace_cleanup_intent"]
+            self.assertEqual(after_clear_intent["state"], "recovery_required")
+            self.assertEqual(after_clear_intent["intent_id"], prior_intent["intent_id"])
+            self.assertIsInstance(after_clear_intent.get("archive_id"), str)
+            self.assertEqual(
+                workspace.checkouts._active_checkout_operation_uncertainties(), []
+            )
+
+            durable_plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            self.assertFalse(durable_plan["eligible"])
+            self.assertEqual(
+                {item["code"] for item in durable_plan["blockers"]},
+                {"cleanup_recovery_required"},
+            )
+
+            # A hard process exit is not caught by the cleanup exception handler.
+            # The same durable archive can therefore coexist with the older
+            # `started` intent state after the fence was already reconciled.
+            # Exact archive/checkout identity must still make this recoverable.
+            after_clear_intent["state"] = "started"
+            after_clear["workspace_cleanup_intent"] = after_clear_intent
+            workspace._write_manifest(after_clear)
+            durable_plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            self.assertFalse(durable_plan["eligible"])
+            self.assertEqual(
+                durable_plan["lifecycle_state"], "cleanup_outcome_unknown"
+            )
+            self.assertEqual(
+                {item["code"] for item in durable_plan["blockers"]},
+                {"cleanup_outcome_unknown"},
+            )
             with mock.patch.object(
                 workspace.checkouts, "grabowski_checkout_archive"
-            ) as second_archive:
+            ) as third_archive:
                 recovered = workspace.grabowski_agent_workspace_cleanup(
                     manifest["workspace_id"],
-                    blocked_plan["plan_sha256"],
+                    durable_plan["plan_sha256"],
                     "archive-and-remove-worktree",
                 )
-            second_archive.assert_not_called()
+            third_archive.assert_not_called()
             self.assertEqual(archive_calls, 1)
             self.assertIn(
                 recovered["state"],
@@ -12006,9 +12076,11 @@ class AgentWorkspaceTests(unittest.TestCase):
                 plan,
                 owner="owner",
             )
-        self.assertEqual(recovered, archive)
+        self.assertEqual(recovered["state"], "archive_verified")
+        self.assertEqual(recovered["archive"], archive)
+        self.assertIs(recovered["fence"], fence)
         post_state.assert_called_once()
-        self.assertTrue(reconcile.call_args.kwargs["release_operation_lease"])
+        reconcile.assert_not_called()
 
     def test_prearchive_recovery_fails_closed_on_conflicting_fence(self) -> None:
         plan = {
