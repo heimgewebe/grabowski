@@ -1926,13 +1926,17 @@ def _acquire_groups(
     run_dir: Path,
     *,
     groups: list[dict[str, Any]] | None = None,
+    registry_binding: RegistryBinding | None = None,
 ) -> dict[str, Any]:
     acquired: list[dict[str, Any]] = []
     owner_id = intent["lease_owner_id"]
     if groups is None:
         groups = _acquisition_groups(intent, request)
     commit_precondition = _pickup_lease_commit_precondition(
-        intent, request, allow_unknown_run=True
+        intent,
+        request,
+        allow_unknown_run=True,
+        registry_binding=registry_binding,
     )
     try:
         for index, group in enumerate(groups, start=1):
@@ -3022,7 +3026,11 @@ def _journaled_orphan_recovery_candidate(
             )
         if already_resumed:
             _validate_resumed_run(
-                coordination, validated_intent, acquisition, journal_identity
+                coordination,
+                validated_intent,
+                acquisition,
+                journal_identity,
+                allow_lease_repair=True,
             )
         elif state == "orphaned":
             _validate_recoverable_orphan(
@@ -3339,6 +3347,8 @@ def _reacquire_orphaned_assignment_leases(
     request: dict[str, Any],
     acquisition: dict[str, Any],
     run_dir: Path,
+    *,
+    allow_expired_rebind: bool = False,
 ) -> dict[str, Any]:
     original_by_key = _orphan_recovery_original_leases(intent, acquisition)
     groups = _acquisition_groups(intent, request)
@@ -3433,6 +3443,18 @@ def _reacquire_orphaned_assignment_leases(
         if not callable(pre_effect_guard):
             raise BureauPickupError("orphan-recovery-run-guard-invalid")
         pre_effect_guard()
+
+    if not allow_expired_rebind:
+        expired_keys = [
+            item["resource_key"]
+            for plan in plans
+            for item in plan["expired"]
+        ]
+        if expired_keys:
+            raise BureauPickupError(
+                "orphan-recovery-lease-not-live-for-resume",
+                details={"resource_keys": sorted(expired_keys)},
+            )
 
     actions: list[dict[str, Any]] = []
     rebound_after_snapshots: list[dict[str, Any]] = []
@@ -3672,8 +3694,23 @@ def _validate_resumed_run(
     intent: dict[str, Any],
     acquisition: dict[str, Any],
     journal_identity: dict[str, Any],
+    *,
+    allow_lease_repair: bool = False,
 ) -> dict[str, Any]:
-    run = _validate_claim_readback(coordination, intent, acquisition)
+    try:
+        run = _validate_claim_readback(coordination, intent, acquisition)
+    except BureauPickupError as exc:
+        lease = coordination.get("lease")
+        if (
+            not allow_lease_repair
+            or exc.code != "claim-readback-blocking-or-incomplete"
+            or not isinstance(lease, dict)
+            or lease.get("status") != "active-binding-drift"
+        ):
+            raise
+        run = coordination.get("run")
+        if not isinstance(run, dict):
+            raise BureauPickupError("claim-readback-run-missing") from exc
     expected = {
         key: journal_identity[key]
         for key in (
@@ -3763,7 +3800,11 @@ def _recover_orphaned_journal_before_claim(
         )
         if already_resumed:
             validated = _validate_resumed_run(
-                observed, intent, acquisition, journal_identity
+                observed,
+                intent,
+                acquisition,
+                journal_identity,
+                allow_lease_repair=True,
             )
         else:
             validated = _validate_recoverable_orphan(
@@ -3785,7 +3826,11 @@ def _recover_orphaned_journal_before_claim(
         _guard_recovery_authority(post_effect=True)
     )
     lease_receipt = _reacquire_orphaned_assignment_leases(
-        intent, lease_request, acquisition, candidate["run_dir"]
+        intent,
+        lease_request,
+        acquisition,
+        candidate["run_dir"],
+        allow_expired_rebind=already_resumed,
     )
     if (
         pre_resume is None
@@ -6709,6 +6754,7 @@ def grabowski_bureau_pickup_execute(
         normalized,
         run_dir,
         groups=acquisition_groups,
+        registry_binding=registry_binding,
     )
     try:
         commit = _bound_bureau_call(
