@@ -12911,6 +12911,8 @@ def _workspace_lifecycle_effect_begin(
         )
         raise
     return {
+        "workspace_id": identifier,
+        "intent_id": intent_id,
         "effect_kind": effect_kind,
         "execution_id": (
             f"{identifier}:{effect_kind}:{intent_id}"
@@ -12985,7 +12987,79 @@ def _workspace_lifecycle_effect_finish(
     )
 
 
+def _workspace_lifecycle_effect_durable_reference(
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    """Prove one lifecycle effect is terminal in the on-disk workspace manifest."""
+    identifier = context.get("workspace_id")
+    intent_id = context.get("intent_id")
+    effect_kind = context.get("effect_kind")
+    execution_id = context.get("execution_id")
+    plan = context.get("plan")
+    revalidation = context.get("revalidation")
+    if (
+        not isinstance(identifier, str)
+        or not isinstance(intent_id, str)
+        or not isinstance(effect_kind, str)
+        or not isinstance(execution_id, str)
+        or not isinstance(plan, dict)
+        or not isinstance(revalidation, dict)
+    ):
+        raise AgentWorkspaceActionError(
+            "workspace lifecycle effect release lacks exact durable identity"
+        )
+    expected_plan_sha256 = plan.get("plan_sha256")
+    expected_revalidation_sha256 = revalidation.get("revalidation_sha256")
+    if (
+        not isinstance(expected_plan_sha256, str)
+        or SHA256_RE.fullmatch(expected_plan_sha256) is None
+        or not isinstance(expected_revalidation_sha256, str)
+        or SHA256_RE.fullmatch(expected_revalidation_sha256) is None
+    ):
+        raise AgentWorkspaceActionError(
+            "workspace lifecycle effect release lacks bound plan evidence"
+        )
+    persisted = _manifest(identifier)
+    candidates: list[dict[str, Any]] = []
+    persisted_intent = persisted.get("workspace_cleanup_intent")
+    if (
+        isinstance(persisted_intent, dict)
+        and persisted_intent.get("intent_id") == intent_id
+        and isinstance(persisted_intent.get("lifecycle_effects"), dict)
+    ):
+        candidate = persisted_intent["lifecycle_effects"].get(effect_kind)
+        if isinstance(candidate, dict):
+            candidates.append(candidate)
+    cleanup_receipt = persisted.get("workspace_cleanup_receipt")
+    if (
+        isinstance(cleanup_receipt, dict)
+        and isinstance(cleanup_receipt.get("lifecycle_effects"), dict)
+    ):
+        candidate = cleanup_receipt["lifecycle_effects"].get(effect_kind)
+        if isinstance(candidate, dict):
+            candidates.append(candidate)
+    for reference in candidates:
+        receipt_sha256 = reference.get("receipt_sha256")
+        if (
+            reference.get("effect_kind") == effect_kind
+            and reference.get("execution_id") == execution_id
+            and reference.get("plan_sha256") == expected_plan_sha256
+            and reference.get("revalidation_sha256")
+            == expected_revalidation_sha256
+            and reference.get("status")
+            in lifecycle_effect_plan.EFFECT_RECEIPT_STATUSES
+            and isinstance(receipt_sha256, str)
+            and SHA256_RE.fullmatch(receipt_sha256) is not None
+        ):
+            return dict(reference)
+    raise AgentWorkspaceActionError(
+        "workspace lifecycle effect gate cannot be released before exact "
+        "terminal evidence is durable in the workspace manifest"
+    )
+
+
 def _workspace_lifecycle_effect_release(context: dict[str, Any]) -> None:
+    _workspace_lifecycle_effect_durable_reference(context)
     resources.release_resources(
         str(context["lease_owner"]),
         [str(context["gate_resource"])],
@@ -13025,7 +13099,23 @@ def _record_workspace_lifecycle_effect(
     intent["lifecycle_effects"] = effects
     manifest["workspace_cleanup_intent"] = intent
     _write_manifest(manifest)
-    return stored_reference
+    persisted_manifest = _manifest(str(manifest["workspace_id"]))
+    persisted_intent = persisted_manifest.get("workspace_cleanup_intent")
+    persisted_effects = (
+        persisted_intent.get("lifecycle_effects")
+        if isinstance(persisted_intent, dict)
+        else None
+    )
+    persisted_reference = (
+        persisted_effects.get(effect_kind)
+        if isinstance(persisted_effects, dict)
+        else None
+    )
+    if persisted_reference != stored_reference:
+        raise AgentWorkspaceActionError(
+            f"workspace lifecycle effect {effect_kind} was not durably persisted"
+        )
+    return dict(persisted_reference)
 
 
 def _workspace_archive_post_state(

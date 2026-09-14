@@ -7814,6 +7814,67 @@ class AgentWorkspaceTests(unittest.TestCase):
         workspace._write_manifest(manifest)
         return manifest
 
+    def test_record_workspace_lifecycle_effect_requires_durable_readback(self) -> None:
+        manifest = self._closed_cleanup_manifest()
+        intent_id = "lifecycle-durable-intent"
+        reference = {
+            "execution_id": "workspace:archive:durable",
+            "status": "succeeded",
+            "receipt_sha256": "a" * 64,
+        }
+        manifest["workspace_cleanup_intent"] = {
+            "intent_id": intent_id,
+            "lifecycle_effects": {},
+        }
+        workspace._write_manifest(manifest)
+
+        recorded = workspace._record_workspace_lifecycle_effect(
+            manifest,
+            intent_id=intent_id,
+            effect_kind="workspace_archive",
+            reference=reference,
+        )
+
+        self.assertEqual(recorded, reference)
+        persisted = workspace._manifest(manifest["workspace_id"])
+        self.assertEqual(
+            persisted["workspace_cleanup_intent"]["lifecycle_effects"][
+                "workspace_archive"
+            ],
+            reference,
+        )
+
+    def test_record_workspace_lifecycle_effect_fails_closed_on_stale_readback(self) -> None:
+        manifest = self._closed_cleanup_manifest()
+        intent_id = "lifecycle-stale-readback-intent"
+        reference = {
+            "execution_id": "workspace:archive:stale",
+            "status": "succeeded",
+            "receipt_sha256": "b" * 64,
+        }
+        manifest["workspace_cleanup_intent"] = {
+            "intent_id": intent_id,
+            "lifecycle_effects": {},
+        }
+        workspace._write_manifest(manifest)
+        stale = dict(manifest)
+        stale["workspace_cleanup_intent"] = {
+            "intent_id": intent_id,
+            "lifecycle_effects": {},
+        }
+
+        with mock.patch.object(workspace, "_manifest", return_value=stale):
+            with self.assertRaisesRegex(
+                workspace.AgentWorkspaceActionError,
+                "was not durably persisted",
+            ):
+                workspace._record_workspace_lifecycle_effect(
+                    manifest,
+                    intent_id=intent_id,
+                    effect_kind="workspace_archive",
+                    reference=reference,
+                )
+
     def _mature_checkout_archive(self, archive_id: str) -> None:
         archive = workspace.checkouts._load_archive(archive_id)
         mature_at = (
@@ -7944,6 +8005,74 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertTrue(result["blocking"])
         self.assertEqual(result["blocking_counts"]["resource_leases"], 1)
         self.assertEqual(result["blocking_counts"]["tasks"], 1)
+
+    def test_lifecycle_effect_release_requires_durable_terminal_manifest_reference(self) -> None:
+        manifest = self._closed_cleanup_manifest()
+        identifier = manifest["workspace_id"]
+        intent_id = "intent-durable-release"
+        effect_kind = "workspace_archive"
+        execution_id = f"{identifier}:{effect_kind}:{intent_id}"
+        context = {
+            "workspace_id": identifier,
+            "intent_id": intent_id,
+            "effect_kind": effect_kind,
+            "execution_id": execution_id,
+            "plan": {"plan_sha256": "a" * 64},
+            "revalidation": {"revalidation_sha256": "b" * 64},
+            "lease_owner": "effect-owner",
+            "gate_resource": "operation:workspace-effect-test",
+        }
+        ready_reference = {
+            "effect_kind": effect_kind,
+            "execution_id": execution_id,
+            "plan_sha256": "a" * 64,
+            "revalidation_sha256": "b" * 64,
+            "status": "ready",
+        }
+        manifest["workspace_cleanup_intent"] = {
+            "intent_id": intent_id,
+            "lifecycle_effects": {effect_kind: ready_reference},
+        }
+        workspace._write_manifest(manifest)
+        with mock.patch.object(
+            workspace.resources, "release_resources"
+        ) as release:
+            with self.assertRaisesRegex(
+                workspace.AgentWorkspaceActionError,
+                "cannot be released before exact terminal evidence is durable",
+            ):
+                workspace._workspace_lifecycle_effect_release(context)
+            release.assert_not_called()
+
+        terminal_reference = {
+            **ready_reference,
+            "status": "succeeded",
+            "receipt_sha256": "c" * 64,
+        }
+        manifest["workspace_cleanup_intent"]["lifecycle_effects"][
+            effect_kind
+        ] = terminal_reference
+        workspace._write_manifest(manifest)
+        with mock.patch.object(
+            workspace.resources, "release_resources"
+        ) as release:
+            workspace._workspace_lifecycle_effect_release(context)
+        release.assert_called_once_with(
+            "effect-owner", ["operation:workspace-effect-test"]
+        )
+
+        manifest.pop("workspace_cleanup_intent", None)
+        manifest["workspace_cleanup_receipt"] = {
+            "lifecycle_effects": {effect_kind: terminal_reference}
+        }
+        workspace._write_manifest(manifest)
+        with mock.patch.object(
+            workspace.resources, "release_resources"
+        ) as release:
+            workspace._workspace_lifecycle_effect_release(context)
+        release.assert_called_once_with(
+            "effect-owner", ["operation:workspace-effect-test"]
+        )
 
     def test_cleanup_plan_reads_resource_lease_snapshot_once(self) -> None:
         manifest = self._closed_cleanup_manifest()
