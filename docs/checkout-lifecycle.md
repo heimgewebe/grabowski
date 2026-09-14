@@ -31,9 +31,12 @@ trennt Inventar, Archivierung und Cleanup.
   Present-Admission existiert für `source.kind=thread_focus`: Die Thread-Fokus-Quelle
   muss acceptance-bound terminal sein, der aktuelle Branch-Head muss exakt dem
   aktiven Retention-Head entsprechen und vorhandene Dirty-Evidenz darf ausschließlich
-  aus direkten regulären Dateien unter `.review-audits/` bestehen. Tracked/staged
-  Änderungen, andere untracked Pfade, Unterverzeichnisse, Symlinks, Hardlinks, zu
-  große oder während der Beobachtung driftende Dateien bleiben blockierend. Die
+  aus direkten regulären Dateien unter `.review-audits/` bestehen. Dabei werden
+  auch durch `.gitignore` ausgeblendete Auditdateien ausdrücklich inventarisiert und
+  gehasht; andere ignorierte Inhalte außerhalb dieses Verzeichnisses blockieren den
+  Pfad ebenso wie andere untracked Pfade. Tracked/staged Änderungen,
+  Unterverzeichnisse, Symlinks, Hardlinks, zu große oder während der Beobachtung
+  driftende Dateien bleiben blockierend. Die
   Dateien werden über einen no-follow Directory-Descriptor gelesen, einzeln SHA-256-
   gebunden und als begrenztes Manifest in den Preview-Digest aufgenommen. Ein
   historischer Lifecycle-Head darf dabei nur auf den bereits separat retaineden

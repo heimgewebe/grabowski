@@ -249,6 +249,10 @@ def _missing_checkout_observation(binding: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _nul_paths(completed: Any) -> list[str]:
+    return sorted(item for item in completed.stdout.split("\0") if item)
+
+
 def _thread_focus_review_evidence_paths(
     checkout: Path, status: dict[str, Any]
 ) -> tuple[list[str], list[str]]:
@@ -263,12 +267,38 @@ def _thread_focus_review_evidence_paths(
         elif completed.returncode == 1:
             blockers.append(f"review-evidence-{label}-tracked-change")
 
-    visible_untracked = checkouts._git_read(
+    untracked = checkouts._git_read(
         checkout,
         ["ls-files", "--others", "--exclude-standard", "-z"],
         check=False,
     )
-    ignored_review_evidence = checkouts._git_read(
+    if untracked.returncode != 0:
+        blockers.append("review-evidence-untracked-status-unobservable")
+        untracked_paths: list[str] = []
+    else:
+        untracked_paths = _nul_paths(untracked)
+
+    ignored_roots = checkouts._git_read(
+        checkout,
+        [
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+        ],
+        check=False,
+    )
+    if ignored_roots.returncode != 0:
+        blockers.append("review-evidence-ignored-status-unobservable")
+        ignored_root_paths: list[str] = []
+    else:
+        ignored_root_paths = _nul_paths(ignored_roots)
+        if any(path != f"{_REVIEW_EVIDENCE_DIR}/" for path in ignored_root_paths):
+            blockers.append("review-evidence-ignored-content-outside-allowlist")
+
+    ignored_audits = checkouts._git_read(
         checkout,
         [
             "ls-files",
@@ -277,33 +307,25 @@ def _thread_focus_review_evidence_paths(
             "--exclude-standard",
             "-z",
             "--",
-            _REVIEW_EVIDENCE_DIR,
+            f"{_REVIEW_EVIDENCE_DIR}/",
         ],
         check=False,
     )
-    paths: list[str] = []
-    visible_paths: list[str] = []
-    if visible_untracked.returncode != 0:
-        blockers.append("review-evidence-untracked-status-unobservable")
+    if ignored_audits.returncode != 0:
+        blockers.append("review-evidence-ignored-audits-unobservable")
+        ignored_audit_paths: list[str] = []
     else:
-        visible_paths = [item for item in visible_untracked.stdout.split("\0") if item]
-        paths.extend(visible_paths)
-    if ignored_review_evidence.returncode != 0:
-        blockers.append("review-evidence-ignored-status-unobservable")
-    else:
-        paths.extend(
-            item for item in ignored_review_evidence.stdout.split("\0") if item
-        )
-    paths = sorted(set(paths))
+        ignored_audit_paths = _nul_paths(ignored_audits)
+
+    paths = sorted(set(untracked_paths) | set(ignored_audit_paths))
     if len(paths) > _REVIEW_EVIDENCE_MAX_FILES:
         blockers.append("review-evidence-file-count-exceeded")
     if (
-        status.get("entry_count") != len(visible_paths)
-        or status.get("untracked_count") != len(visible_paths)
+        status.get("entry_count") != len(untracked_paths)
+        or status.get("untracked_count") != len(untracked_paths)
     ):
         blockers.append("review-evidence-status-count-mismatch")
     return paths, blockers
-
 
 def _review_evidence_filename(raw_path: str) -> str | None:
     relative = Path(raw_path)
@@ -443,20 +465,24 @@ def _thread_focus_review_evidence_observation(
     record: dict[str, Any], status: dict[str, Any]
 ) -> dict[str, Any]:
     checkout = Path(record["path"])
-    if status.get("dirty") not in {True, False}:
+    paths, blockers = _thread_focus_review_evidence_paths(checkout, status)
+    if not paths:
+        core = {
+            "schema_version": 1,
+            "kind": "thread_focus_review_evidence_manifest",
+            "root": _REVIEW_EVIDENCE_DIR,
+            "file_count": 0,
+            "total_bytes": 0,
+            "files": [],
+        }
         return {
-            "classification": "blocked",
+            **core,
+            "manifest_sha256": checkouts._sha256_json(core),
+            "classification": "blocked" if blockers else "not_applicable",
             "eligible": False,
-            "blockers": ["review-evidence-status-unobservable"],
+            "blockers": sorted(set(blockers)),
         }
 
-    paths, blockers = _thread_focus_review_evidence_paths(checkout, status)
-    if not paths and status.get("dirty") is False and not blockers:
-        return {
-            "classification": "not_applicable",
-            "eligible": False,
-            "blockers": [],
-        }
     root_descriptor, root_identity, root_blockers = _open_review_evidence_root(checkout)
     blockers.extend(root_blockers)
     files: list[dict[str, Any]] = []
@@ -484,8 +510,6 @@ def _thread_focus_review_evidence_observation(
         if root_descriptor >= 0:
             os.close(root_descriptor)
 
-    if not paths:
-        blockers.append("review-evidence-files-missing")
     if len(files) != len(paths):
         blockers.append("review-evidence-manifest-incomplete")
     core = {
@@ -570,15 +594,16 @@ def _present_checkout_observation(binding: dict[str, Any]) -> dict[str, Any]:
         source_is_thread_focus = (
             isinstance(source, dict) and source.get("kind") == "thread_focus"
         )
-        if source_is_thread_focus and status.get("dirty") in {True, False}:
-            review_evidence = _thread_focus_review_evidence_observation(record, status)
-            if review_evidence.get("classification") == "blocked":
-                blockers.extend(review_evidence.get("blockers", []))
+        if source_is_thread_focus:
+            observed_review_evidence = _thread_focus_review_evidence_observation(record, status)
+            if observed_review_evidence.get("classification") != "not_applicable":
+                review_evidence = observed_review_evidence
+            blockers.extend(observed_review_evidence.get("blockers", []))
         if status.get("dirty") is True:
-            if source_is_thread_focus:
-                if review_evidence is None or review_evidence.get("eligible") is not True:
-                    blockers.append("checkout-dirty")
-            else:
+            if not source_is_thread_focus or (
+                not isinstance(review_evidence, dict)
+                or review_evidence.get("eligible") is not True
+            ):
                 blockers.append("checkout-dirty")
         elif status.get("dirty") is not False:
             blockers.append("checkout-status-unobservable")
@@ -741,16 +766,8 @@ def _preview_state(
                 blockers.append("thread-focus-head-not-retention-bound")
             status = checkout.get("status")
             review_evidence = checkout.get("review_evidence")
-            if isinstance(status, dict):
-                if status.get("dirty") is True and (
-                    not isinstance(review_evidence, dict)
-                    or review_evidence.get("eligible") is not True
-                ):
-                    blockers.append("thread-focus-review-evidence-not-admissible")
-                elif (
-                    isinstance(review_evidence, dict)
-                    and review_evidence.get("classification") == "blocked"
-                ):
+            if isinstance(status, dict) and status.get("dirty") is True:
+                if not isinstance(review_evidence, dict) or review_evidence.get("eligible") is not True:
                     blockers.append("thread-focus-review-evidence-not-admissible")
         else:
             blockers.append("present-checkout-source-not-work-lane")

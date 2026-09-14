@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -66,7 +67,10 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
         self._git("config", "user.name", "Grabowski Test")
         self._git("config", "user.email", "grabowski@example.invalid")
         (self.repo / "README.md").write_text("initial\n", encoding="utf-8")
-        self._git("add", "README.md")
+        (self.repo / ".gitignore").write_text(
+            ".review-audits/\nignored-local/\n", encoding="utf-8"
+        )
+        self._git("add", "README.md", ".gitignore")
         self._git("commit", "-m", "initial")
         self.head = self._git("rev-parse", "HEAD").stdout.strip()
         self._git("worktree", "add", "-b", "topic", str(self.checkout), "HEAD")
@@ -238,9 +242,8 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
         binding = self._present_binding(
             source_kind="thread_focus", source_id="thread-focus-id"
         )
-        (self.checkout / ".gitignore").write_text(".review-audits/\n", encoding="utf-8")
         (self.checkout / "later.txt").write_text("later\n", encoding="utf-8")
-        self._git("add", ".gitignore", "later.txt", cwd=self.checkout)
+        self._git("add", "later.txt", cwd=self.checkout)
         self._git("commit", "-m", "later terminal head", cwd=self.checkout)
         new_head = self._git("rev-parse", "HEAD", cwd=self.checkout).stdout.strip()
         with checkouts._database() as connection:
@@ -438,7 +441,6 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
 
     def test_present_thread_focus_accepts_hash_bound_review_evidence_and_retention_head_catchup(self) -> None:
         binding, new_head, evidence = self._present_thread_focus_with_retention_catchup()
-        self.assertEqual("", self._git("status", "--short", cwd=self.checkout).stdout)
         before = {
             path.name: path.read_bytes()
             for path in sorted((self.checkout / ".review-audits").iterdir())
@@ -500,24 +502,6 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
         ]
         self.assertEqual("completed_retained", lifecycle["phase"])
 
-    def test_present_thread_focus_rejects_invalid_ignored_evidence_when_status_is_clean(self) -> None:
-        binding, _new_head, evidence = self._present_thread_focus_with_retention_catchup()
-        nested = self.checkout / ".review-audits" / "nested"
-        nested.mkdir()
-        (nested / "review.json").write_text("{}\n", encoding="utf-8")
-        self.assertEqual("", self._git("status", "--short", cwd=self.checkout).stdout)
-        with (
-            patch.object(sources, "source_terminal_evidence", return_value=evidence),
-            patch.object(
-                checkouts, "_remote_secured_observation", return_value=self._remote_secured()
-            ),
-        ):
-            preview = reconciliation.preview(str(binding["checkout_key"]))
-        self.assertFalse(preview["safe_to_apply"])
-        self.assertIn("review-evidence-path-outside-allowlist", preview["blockers"])
-        self.assertIn("thread-focus-review-evidence-not-admissible", preview["blockers"])
-        self.assertNotIn("checkout-dirty", preview["blockers"])
-
     def test_present_thread_focus_manifest_drift_invalidates_apply(self) -> None:
         binding, _new_head, evidence = self._present_thread_focus_with_retention_catchup()
         with (
@@ -543,6 +527,62 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
             str(binding["checkout_key"])
         ]
         self.assertEqual("active", lifecycle["phase"])
+
+    def test_present_thread_focus_hashes_ignored_review_audits_even_when_git_status_is_clean(self) -> None:
+        binding = self._present_binding(
+            source_kind="thread_focus", source_id="thread-focus-id"
+        )
+        evidence_root = self.checkout / ".review-audits"
+        evidence_root.mkdir()
+        audit = evidence_root / "review.json"
+        audit.write_text('{"verdict":"PASS"}\n', encoding="utf-8")
+        status = checkouts._worktree_status(
+            next(
+                item
+                for item in checkouts._worktree_records(self.repo)[2]
+                if Path(item["path"]) == self.checkout
+            )
+        )
+        self.assertFalse(status["dirty"])
+        evidence = self._thread_focus_source_evidence(binding)
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(
+                checkouts, "_remote_secured_observation", return_value=self._remote_secured()
+            ),
+        ):
+            preview = reconciliation.preview(str(binding["checkout_key"]))
+        self.assertTrue(preview["safe_to_apply"])
+        manifest = preview["checkout_observation"]["review_evidence"]
+        self.assertEqual("review_evidence_only", manifest["classification"])
+        self.assertEqual(1, manifest["file_count"])
+        self.assertEqual(".review-audits/review.json", manifest["files"][0]["path"])
+        self.assertEqual(
+            hashlib.sha256(audit.read_bytes()).hexdigest(), manifest["files"][0]["sha256"]
+        )
+
+    def test_present_thread_focus_rejects_unrelated_ignored_content(self) -> None:
+        binding = self._present_binding(
+            source_kind="thread_focus", source_id="thread-focus-id"
+        )
+        evidence_root = self.checkout / ".review-audits"
+        evidence_root.mkdir()
+        (evidence_root / "review.json").write_text("{}\n", encoding="utf-8")
+        ignored = self.checkout / "ignored-local"
+        ignored.mkdir()
+        (ignored / "cache.bin").write_bytes(b"ignored but not trusted")
+        evidence = self._thread_focus_source_evidence(binding)
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(
+                checkouts, "_remote_secured_observation", return_value=self._remote_secured()
+            ),
+        ):
+            preview = reconciliation.preview(str(binding["checkout_key"]))
+        self.assertFalse(preview["safe_to_apply"])
+        self.assertIn(
+            "review-evidence-ignored-content-outside-allowlist", preview["blockers"]
+        )
 
     def test_present_thread_focus_rejects_untrusted_untracked_path(self) -> None:
         binding = self._present_binding(
