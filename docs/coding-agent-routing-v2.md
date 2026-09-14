@@ -132,6 +132,12 @@ Deterministische Prüfungen plus unabhängiger read-only Review, wenn Aufgabe od
 
 Explizite Review-Taskklassen wie `independent-review`, `critical-review` und `security-review` erzwingen diese Policy.
 
+Zusätzlich gilt eine fail-closed Verification-Floor für Implementierungsarbeit: `architecture`, `complex-patch`, `deep-debug` und `migration`, katalogseitig kritische Taskklassen, jede Aufgabe mit `novelty=high` sowie etablierte technische Hochrisiko-Flags (`security`, `security-sensitive`, `high-risk`, `runtime`, `deployment`, `schema`, `concurrency`, `data_migration`, `privilege`, `cross_repo`, `destructive`) dürfen nicht auf rein deterministische Prüfung herabgestuft werden. `need_review=false` und ein explizites `verification_policy=deterministic` sind kein Bypass. Auch ein ausdrücklich gewähltes `verification_policy=independent_review` begründet selbst die Reviewpflicht. Fehlt eine ausführbare unabhängige Reviewerroute, bleibt `review_gap` sichtbar statt still zurückzufallen.
+
+`competition` ist keine zweite Schreibautorität und kein Ersatz für diese Floor. Wenn unabhängige Verifikation Pflicht ist, bleibt die kanonische `verification_policy=independent_review`; zusätzliche Gegenarbeit wird über die separate Competition-/Contrast-Oberfläche gestartet. Dadurch müssen Downstream-Consumer nicht zwei widersprüchlich wirkende Policy-Felder korrekt kombinieren.
+
+Sensitive Kontextflags wie `private-context`, `user_data`, `secrets`, `customer-data` oder `credential` blockieren die automatische Auswahl einer externen Reviewerroute, solange kein expliziter Trust-/Redaction-Vertrag für diese Route existiert. Die Reviewpflicht bleibt dabei als `review_gap` sichtbar; Provider-Unabhängigkeit darf keine Datenfreigabe erzwingen. Sicherheitsrisiken verwenden `security-review`; andere gefloorte Implementierungsaufgaben verwenden `independent-review`. Delivery wird verweigert, solange der verpflichtende unabhängige Reviewer fehlt. Diese Floor betrifft Verification, nicht Writerautorität: Der Controller darf weiter selbst implementieren, und ein lane-gebundener Scoped Writer bleibt zulässig.
+
 ### competition
 
 Expliziter Vergleich mehrerer Kandidaten oder Ansätze. Competition bleibt ein Verification-/Vergleichsmodus. Sie ändert weder Lane-Ownership noch Integrationsautorität.
