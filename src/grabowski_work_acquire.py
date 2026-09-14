@@ -505,6 +505,7 @@ def _converge_terminal_checkout_lifecycle(
     checkout_path = lifecycle.get("checkout_path")
     owner_id = lifecycle.get("owner_id")
     recorded_branch = lifecycle.get("expected_branch")
+    recorded_source = lifecycle.get("source")
     if not all(
         isinstance(value, str) and value
         for value in (checkout_key, checkout_path, owner_id, recorded_branch)
@@ -525,13 +526,11 @@ def _converge_terminal_checkout_lifecycle(
     expected_branch = recorded_branch
     current_lifecycle = checkouts._lifecycle_bindings([checkout_key]).get(checkout_key)
     if current_lifecycle is not None:
-        lane_id = record.get("lane_id")
         if (
             current_lifecycle.get("checkout_key") != checkout_key
             or current_lifecycle.get("checkout_path") != checkout_path
             or current_lifecycle.get("owner_id") != owner_id
-            or current_lifecycle.get("source")
-            != {"kind": "work_lane", "id": lane_id}
+            or current_lifecycle.get("source") != recorded_source
         ):
             raise RuntimeError(
                 "terminal Work Lane canonical checkout lifecycle identity drifted"

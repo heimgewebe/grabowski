@@ -1577,11 +1577,16 @@ class WorkAcquireTests(unittest.TestCase):
         inputs.pop("_scoped_writer_argv")
         checkout_key = "f" * 64
         lane_id = "a" * 32
+        lifecycle_source = {
+            "kind": "operator_obligation",
+            "id": "goo-rebound-terminal",
+        }
         lifecycle = {
             "checkout_key": checkout_key,
             "checkout_path": str(self.target),
             "owner_id": inputs["lease_owner_id"],
             "expected_branch": "feat/authority-p0",
+            "source": lifecycle_source,
         }
         record = {
             "lane_id": lane_id,
@@ -1594,7 +1599,7 @@ class WorkAcquireTests(unittest.TestCase):
             "expected_branch": rebound_branch,
             "expected_head": SHA,
             "phase": "active",
-            "source": {"kind": "work_lane", "id": lane_id},
+            "source": lifecycle_source,
         }
         observed = {
             "checkout_key": checkout_key,
