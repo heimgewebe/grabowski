@@ -570,6 +570,21 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                 self.assertTrue(inherited_top_level["escalation_required"])
                 self.assertFalse(inherited_top_level["escalation_valid"])
 
+                legacy_policy = dict(policy)
+                legacy_policy.pop("profiles")
+                legacy_policy.pop("active_profile", None)
+                legacy_policy["mode"] = "legacy"
+                legacy_policy["trusted_owner"] = True
+                legacy_top_level = grabowski_mcp._session_grip_policy_decision(
+                    "captain-run",
+                    {"actions": []},
+                    legacy_policy,
+                )
+                self.assertFalse(legacy_top_level["allowed"])
+                self.assertTrue(legacy_top_level["allowed_by_risk"])
+                self.assertTrue(legacy_top_level["escalation_required"])
+                self.assertFalse(legacy_top_level["escalation_valid"])
+
     def test_non_trusted_high_risk_still_requires_valid_session_escalation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
