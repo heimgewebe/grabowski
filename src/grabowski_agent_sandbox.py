@@ -42,6 +42,17 @@ CODEX_SANDBOX_EXECUTABLE = Path("/opt/grabowski-external/codex")
 CODEX_SANDBOX_CONFIG_DIR = Path("/tmp/.codex")
 CODEX_SANDBOX_CODE_MODE_HOST = Path("/opt/grabowski-external/codex-code-mode-host")
 CODEX_SANDBOX_AUTH_LOCK = Path("/tmp/.grabowski-codex-auth.lock")
+_CODEX_WORKSPACE_WRITE_PROTECTED_CONFIG = (
+    "sandbox_workspace_write.exclude_slash_tmp=true",
+    "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+)
+_CODEX_WORKSPACE_WRITE_PROTECTED_KEYS = frozenset(
+    {
+        "sandbox_workspace_write",
+        "sandbox_workspace_write.exclude_slash_tmp",
+        "sandbox_workspace_write.exclude_tmpdir_env_var",
+    }
+)
 _CODEX_AUTH_SERIALIZED_LAUNCH_SOURCE = """\
 import fcntl
 import subprocess
@@ -161,6 +172,40 @@ def _resolved_executable(value: str, field: str) -> Path:
     return resolved
 
 
+def _codex_command_with_protected_tmp(command: list[str]) -> tuple[str, ...]:
+    """Keep model-generated Codex commands away from the durable auth mount."""
+    index = 1
+    while index < len(command):
+        item = command[index]
+        assignment: str | None = None
+        if item in {"-c", "--config"}:
+            if index + 1 < len(command):
+                assignment = command[index + 1]
+                index += 2
+            else:
+                index += 1
+        elif item.startswith("--config="):
+            assignment = item.removeprefix("--config=")
+            index += 1
+        elif item.startswith("-c") and item != "-c":
+            assignment = item[2:].removeprefix("=")
+            index += 1
+        else:
+            index += 1
+        if assignment is None:
+            continue
+        key = assignment.split("=", 1)[0].strip()
+        if key in _CODEX_WORKSPACE_WRITE_PROTECTED_KEYS:
+            raise AgentSandboxError(
+                "Codex workspace-write /tmp exclusions are controlled by Grabowski"
+            )
+    hardened = [command[0]]
+    for assignment in _CODEX_WORKSPACE_WRITE_PROTECTED_CONFIG:
+        hardened.extend(["-c", assignment])
+    hardened.extend(command[1:])
+    return tuple(hardened)
+
+
 def prepare_external_agent_command(command: list[str]) -> PreparedSandboxCommand:
     """Resolve supported external agents into explicit sandbox bindings."""
     if not command:
@@ -169,6 +214,7 @@ def prepare_external_agent_command(command: list[str]) -> PreparedSandboxCommand
     if executable_name not in {"claude", "codex"}:
         return PreparedSandboxCommand(tuple(command))
     if executable_name == "codex":
+        codex_command = _codex_command_with_protected_tmp(command)
         executable_override = os.environ.get("GRABOWSKI_CODEX_BIN")
         executable = _resolved_executable(executable_override or command[0], "Codex executable")
         auth_root = Path(
@@ -198,7 +244,7 @@ def prepare_external_agent_command(command: list[str]) -> PreparedSandboxCommand
                 _CODEX_AUTH_SERIALIZED_LAUNCH_SOURCE,
                 str(CODEX_SANDBOX_AUTH_LOCK),
                 str(CODEX_SANDBOX_EXECUTABLE),
-                *command[1:],
+                *codex_command[1:],
             ),
             extra_read_only=tuple(bindings),
             extra_read_write=(

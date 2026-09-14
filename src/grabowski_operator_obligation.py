@@ -946,13 +946,36 @@ def exact_completion_replay_classification(
         _ensure_private_directory(directory, create=False)
         open_record, open_file_sha256 = _read_private_json(directory / "open.json")
         _validate_open_record(open_record, expected_id=obligation_id)
-        return _replay_completion_classification(
+        replay_classification = _replay_completion_classification(
             directory,
             open_record=open_record,
             open_file_sha256=open_file_sha256,
             value=parameters.get("closure_classification"),
             obligation_id=obligation_id,
         )
+        if replay_classification is None:
+            return None
+        acceptance_ids = {item["id"] for item in open_record["acceptance"]}
+        try:
+            candidate_evidence = _normalize_evidence(
+                parameters.get("evidence"), acceptance_ids=acceptance_ids
+            )
+        except OperatorObligationInputError:
+            return None
+        persisted_close, _close_file_sha256 = _read_private_json(
+            directory / "close.json"
+        )
+        _validate_close_record(
+            persisted_close,
+            open_record=open_record,
+            open_file_sha256=open_file_sha256,
+        )
+        persisted_evidence = _normalize_evidence(
+            persisted_close.get("evidence"), acceptance_ids=acceptance_ids
+        )
+        if candidate_evidence != persisted_evidence:
+            return None
+        return replay_classification
 
 
 def _assert_plan_assessment_agreement(

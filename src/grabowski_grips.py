@@ -14657,11 +14657,48 @@ def _run_operator_obligation_close(
         _check(receipt, "completion_classification", "skip", "outcome is not completed")
         _check(receipt, "systemic_convergence_gate", "skip", "outcome is not completed")
     try:
-        _revalidate_operator_obligation_systemic_convergence(
-            dispatch_parameters,
-            runner,
-        )
+        replay_classification = None
+        if dispatch_parameters.get("outcome") == "completed":
+            replay_classification = (
+                grabowski_operator_obligation.exact_completion_replay_classification(
+                    dispatch_parameters
+                )
+            )
+        if replay_classification is None:
+            _revalidate_operator_obligation_systemic_convergence(
+                dispatch_parameters,
+                runner,
+            )
+        archive_result = {
+            "status": "not_applicable",
+            "archived_count": 0,
+            "archived_sha256s": [],
+            "skipped_count": 0,
+        }
+        if dispatch_parameters.get("outcome") == "completed":
+            if replay_classification is not None:
+                archive_result = {
+                    "status": "exact_close_replay",
+                    "archived_count": 0,
+                    "archived_sha256s": [],
+                    "skipped_count": 0,
+                }
+            else:
+                archive_result = grabowski_operator_obligation_evidence.archive_close_github_evidence(
+                    dispatch_parameters.get("evidence")
+                )
         output = grabowski_operator_obligation.close_obligation(dispatch_parameters)
+    except grabowski_operator_obligation_evidence.EvidenceAssessmentError as exc:
+        _check(receipt, "durable_github_evidence", "fail", str(exc))
+        return {
+            "receipt_status": "blocked",
+            "decision": "blocked",
+            "blocked_reasons": ["durable_github_evidence_unavailable"],
+            "error": str(exc),
+            "continuation_required": True,
+            "response_may_end": False,
+            "work_complete": False,
+        }
     except grabowski_operator_obligation.OperatorObligationCompletionClassificationError as exc:
         _check(receipt, "completion_classification", "fail", str(exc))
         _check(receipt, "systemic_convergence_gate", "fail", str(exc))
@@ -14696,6 +14733,15 @@ def _run_operator_obligation_close(
     except grabowski_operator_obligation.OperatorObligationError as exc:
         raise GripActionError(str(exc)) from exc
     _check(receipt, "open_binding", "pass", output["open_file_sha256"])
+    _check(
+        receipt,
+        "durable_github_evidence",
+        "pass" if archive_result.get("archived_count", 0) else "skip",
+        (
+            f"archived={archive_result.get('archived_count', 0)};"
+            f"status={archive_result.get('status')}"
+        ),
+    )
     if dispatch_parameters.get("outcome") == "completed":
         classification = output.get("completion_classification")
         if not isinstance(classification, dict):
