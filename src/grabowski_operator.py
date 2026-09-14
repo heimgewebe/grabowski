@@ -2812,6 +2812,18 @@ def _github_pr_target_selectors(
                     # (or the following argv item) as its repository selector.
                     break
                 if flag in switch_flags:
+                    if (
+                        option_index + 1 < len(short_cluster)
+                        and short_cluster[option_index + 1] == "="
+                    ):
+                        boolean_value = short_cluster[option_index + 2 :]
+                        if boolean_value.casefold() not in _GITHUB_PR_BOOLEAN_VALUES:
+                            raise RuntimeError(
+                                "trusted GitHub PR boolean option value is invalid"
+                            )
+                        if flag == "-h":
+                            help_requested = boolean_value.casefold() in {"true", "1", "t"}
+                        break
                     if flag == "-h":
                         help_requested = True
                     continue

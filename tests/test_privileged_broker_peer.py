@@ -948,6 +948,45 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
         claim.assert_called_once()
         popen.assert_not_called()
 
+    def test_execute_broker_command_rechecks_kill_switch_immediately_before_spawn(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            kill_switch = Path(raw) / "operator.kill"
+            reference = {
+                "request_id": "8" * 32,
+                "reference_sha256": "9" * 64,
+                "action": broker_tool.POWER_ACTION,
+                "target": "{}",
+            }
+            execution = {
+                "mode": "argv-json",
+                "argv": ["/usr/bin/true"],
+                "cwd": "/",
+                "timeout_seconds": 5,
+                "kill_switch_path": str(kill_switch),
+                "legacy_kill_switch_path": None,
+            }
+
+            def engage_kill_switch(*, reference: dict[str, object], argv: list[str]) -> None:
+                self.assertEqual(reference["action"], broker_tool.POWER_ACTION)
+                self.assertEqual(argv, ["/usr/bin/true"])
+                kill_switch.write_text("engaged\n")
+
+            with (
+                mock.patch.object(
+                    broker_tool,
+                    "_assert_local_backup_smart_pre_spawn",
+                    side_effect=engage_kill_switch,
+                ),
+                mock.patch.object(broker_tool.subprocess, "Popen") as popen,
+            ):
+                with self.assertRaisesRegex(PermissionError, "kill-switch"):
+                    broker_tool._execute_broker_command(
+                        reference=reference,
+                        execution=execution,
+                        operator_peer=self.peer(),
+                    )
+            popen.assert_not_called()
+
     def test_safe_package_readback_publishes_output_evidence(self) -> None:
         reference = {
             "request_id": "6" * 32,

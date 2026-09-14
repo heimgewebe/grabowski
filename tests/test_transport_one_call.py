@@ -1488,6 +1488,7 @@ class OperatorSignedTransportTests(unittest.TestCase):
         for arguments in (
             ["pr", "create", "-dt", "Title"],
             ["pr", "create", "-dtTitle"],
+            ["pr", "list", "-dw=false"],
         ):
             with self.subTest(arguments=arguments):
                 self.assertEqual(
@@ -1506,6 +1507,8 @@ class OperatorSignedTransportTests(unittest.TestCase):
                     operator._github_pr_target_host(arguments, source),
                     "ghe.example.internal",
                 )
+        with self.assertRaisesRegex(RuntimeError, "boolean option value is invalid"):
+            operator._github_pr_target_host(["pr", "list", "-dw=maybe"], source)
         with self.assertRaisesRegex(RuntimeError, "option value is missing"):
             operator._github_pr_target_host(["pr", "create", "-dt"], source)
         with self.assertRaisesRegex(RuntimeError, "repository selector is invalid"):

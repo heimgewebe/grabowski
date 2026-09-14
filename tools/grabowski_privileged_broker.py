@@ -30,6 +30,7 @@ from grabowski_privileged_broker import (
     parse_reference,
     publish_recovery_marker,
     resolve_execution,
+    _require_kill_switch_clear,
 )
 
 CONFIG = Path("/etc/grabowski/privileged-actions.json")
@@ -1516,6 +1517,24 @@ def _assert_local_backup_smart_pre_spawn(
         raise PermissionError(f"{label} By-ID identity changed before spawn")
 
 
+def _require_execution_kill_switch_clear(execution: dict[str, object]) -> None:
+    kill_switch_value = execution.get("kill_switch_path")
+    legacy_switch_value = execution.get("legacy_kill_switch_path")
+    if kill_switch_value is None:
+        if legacy_switch_value is not None:
+            raise PermissionError(
+                "power legacy kill-switch path requires canonical kill-switch path"
+            )
+        return
+    if not isinstance(kill_switch_value, str) or not kill_switch_value:
+        raise PermissionError("power kill-switch path is invalid")
+    _require_kill_switch_clear(Path(kill_switch_value))
+    if legacy_switch_value is not None:
+        if not isinstance(legacy_switch_value, str) or not legacy_switch_value:
+            raise PermissionError("power legacy kill-switch path is invalid")
+        _require_kill_switch_clear(Path(legacy_switch_value))
+
+
 def _execute_broker_command(
     *,
     reference: dict[str, object],
@@ -1563,6 +1582,7 @@ def _execute_broker_command(
                 )
         _assert_local_backup_smart_pre_spawn(reference=reference, argv=argv)
         started = time.monotonic()
+        _require_execution_kill_switch_clear(execution)
         process = subprocess.Popen(
             argv,
             cwd=str(cwd) if cwd is not None else None,
