@@ -2600,8 +2600,448 @@ _GITHUB_PR_VIEW_ISOLATED_CONFIG_PATH = Path(
     "/nonexistent-grabowski-github-pr-view-config-v1"
 )
 _GITHUB_PR_VIEW_AUTH_TIMEOUT_SECONDS = 5
+_GITHUB_PR_VIEW_KEYRING_PROBE_TIMEOUT_SECONDS = 1
+_GITHUB_PR_VIEW_BUSCTL_PATH = "/usr/bin/busctl"
+_GITHUB_PR_VIEW_DEFAULT_KEYRING_OBJECT = "/org/freedesktop/secrets/aliases/default"
 _GITHUB_PR_VIEW_MAX_TOKEN_BYTES = 4096
+_GITHUB_PR_ISOLATED_AUTH_COMMANDS = frozenset({"list", "create", "edit", "ready", "view"})
+_GITHUB_PR_ISOLATED_AUTH_ALIASES = {"ls": "list", "new": "create"}
+_GITHUB_PR_POSITIONAL_TARGET_COMMANDS = frozenset({"edit", "ready", "view"})
+_GITHUB_PR_REPOSITORY_FLAGS = frozenset({"-R", "--repo"})
+_GITHUB_PR_BOOLEAN_VALUES = frozenset({"true", "false", "1", "0", "t", "f"})
+_GITHUB_PR_VALUE_FLAGS: dict[str, frozenset[str]] = {
+    "list": frozenset({
+        "--app", "-a", "--assignee", "-A", "--author", "-B", "--base",
+        "-H", "--head", "-q", "--jq", "--json", "-l", "--label", "-L",
+        "--limit", "-S", "--search", "-s", "--state", "-t", "--template",
+    }),
+    "create": frozenset({
+        "-a", "--assignee", "-B", "--base", "-b", "--body", "-F",
+        "--body-file", "-H", "--head", "-l", "--label", "-m", "--milestone",
+        "-p", "--project", "--recover", "-r", "--reviewer", "-T", "--template",
+        "-t", "--title",
+    }),
+    "edit": frozenset({
+        "--add-assignee", "--add-label", "--add-project", "--add-reviewer", "-B",
+        "--base", "-b", "--body", "-F", "--body-file", "-m", "--milestone",
+        "--remove-assignee", "--remove-label", "--remove-project", "--remove-reviewer",
+        "-t", "--title",
+    }),
+    "ready": frozenset(),
+    "view": frozenset({"-q", "--jq", "--json", "-t", "--template"}),
+}
+_GITHUB_PR_SWITCH_FLAGS: dict[str, frozenset[str]] = {
+    "list": frozenset({"-d", "--draft", "-w", "--web", "-h", "--help"}),
+    "create": frozenset({
+        "-d", "--draft", "--dry-run", "-e", "--editor", "-f", "--fill",
+        "--fill-first", "--fill-verbose", "--no-maintainer-edit", "-w", "--web",
+        "-h", "--help",
+    }),
+    "edit": frozenset({"--remove-milestone", "-h", "--help"}),
+    "ready": frozenset({"--undo", "-h", "--help"}),
+    "view": frozenset({"-c", "--comments", "-w", "--web", "-h", "--help"}),
+}
 
+
+def _github_pr_repository_flag_at(
+    arguments: list[str], index: int
+) -> tuple[str, int] | None:
+    item = arguments[index]
+    if item in _GITHUB_PR_REPOSITORY_FLAGS:
+        if index + 1 >= len(arguments):
+            raise RuntimeError("trusted GitHub repository selector is invalid")
+        repository = arguments[index + 1]
+        if not repository:
+            raise RuntimeError("trusted GitHub repository selector is invalid")
+        return repository, 2
+    if item.startswith("--repo="):
+        repository = item.split("=", 1)[1]
+        if not repository:
+            raise RuntimeError("trusted GitHub repository selector is invalid")
+        return repository, 1
+    if item.startswith("-R") and item != "-R":
+        repository = item[2:]
+        if repository.startswith("="):
+            repository = repository[1:]
+        if not repository:
+            raise RuntimeError("trusted GitHub repository selector is invalid")
+        return repository, 1
+    return None
+
+
+def _github_pr_isolated_auth_arguments(arguments: list[str]) -> list[str] | None:
+    inherited_repositories: list[str] = []
+    index = 0
+    while index < len(arguments) and arguments[index] != "pr":
+        repository_flag = _github_pr_repository_flag_at(arguments, index)
+        if repository_flag is None:
+            return None
+        repository, consumed = repository_flag
+        inherited_repositories.append(repository)
+        index += consumed
+    if index >= len(arguments) or arguments[index] != "pr":
+        return None
+    index += 1
+    while index < len(arguments):
+        repository_flag = _github_pr_repository_flag_at(arguments, index)
+        if repository_flag is None:
+            break
+        repository, consumed = repository_flag
+        inherited_repositories.append(repository)
+        index += consumed
+    if index >= len(arguments):
+        return None
+    subcommand = _GITHUB_PR_ISOLATED_AUTH_ALIASES.get(arguments[index], arguments[index])
+    if subcommand not in _GITHUB_PR_ISOLATED_AUTH_COMMANDS:
+        return None
+    normalized = ["pr", subcommand]
+    for repository in inherited_repositories:
+        normalized.extend(["--repo", repository])
+    normalized.extend(arguments[index + 1 :])
+    return normalized
+
+
+def _github_pr_isolated_auth_subcommand(arguments: list[str]) -> str | None:
+    normalized = _github_pr_isolated_auth_arguments(arguments)
+    return None if normalized is None else normalized[1]
+
+
+def _github_pr_uses_isolated_auth(arguments: list[str]) -> bool:
+    return _github_pr_isolated_auth_arguments(arguments) is not None
+
+
+def _github_pr_positional_url_host(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise RuntimeError("trusted GitHub PR URL is invalid") from exc
+    if (
+        parsed.scheme.casefold() != "https"
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or re.fullmatch(
+            r"/[^/?#\s]+/[^/?#\s]+/pull/[1-9][0-9]*(?:/[^?#\s]*|\.(?:diff|patch))?", parsed.path
+        )
+        is None
+    ):
+        raise RuntimeError("trusted GitHub PR URL is invalid")
+    host = parsed.hostname
+    if port not in {None, 443}:
+        host = f"{host}:{port}"
+    return _github_pr_view_host({"GH_HOST": host})
+
+
+def _github_pr_target_selectors(
+    arguments: list[str],
+) -> tuple[str | None, str | None, bool]:
+    normalized_arguments = _github_pr_isolated_auth_arguments(arguments)
+    if normalized_arguments is None:
+        return None, None, False
+    arguments = normalized_arguments
+    subcommand = arguments[1]
+    value_flags = _GITHUB_PR_VALUE_FLAGS[subcommand]
+    switch_flags = _GITHUB_PR_SWITCH_FLAGS[subcommand]
+    repository: str | None = None
+    positional_host: str | None = None
+    help_requested = False
+    options_done = False
+    index = 2
+    while index < len(arguments):
+        item = arguments[index]
+        if not options_done and item == "--":
+            options_done = True
+            index += 1
+            continue
+        if not options_done:
+            repository_flag = _github_pr_repository_flag_at(arguments, index)
+            if repository_flag is not None:
+                repository, consumed = repository_flag
+                index += consumed
+                continue
+        if not options_done and item.startswith("--"):
+            flag, separator, attached = item.partition("=")
+            if flag in value_flags:
+                if separator:
+                    index += 1
+                else:
+                    if index + 1 >= len(arguments):
+                        raise RuntimeError("trusted GitHub PR option value is missing")
+                    index += 2
+                continue
+            if flag in switch_flags:
+                if separator and attached.casefold() not in _GITHUB_PR_BOOLEAN_VALUES:
+                    raise RuntimeError("trusted GitHub PR boolean option value is invalid")
+                if flag == "--help":
+                    help_requested = not separator or attached.casefold() in {"true", "1", "t"}
+                index += 1
+                continue
+            raise RuntimeError("trusted GitHub PR option is unsupported for host resolution")
+        if not options_done and item.startswith("-") and item != "-":
+            short_flag, separator, attached = item.partition("=")
+            if separator and len(short_flag) == 2:
+                if short_flag in value_flags:
+                    index += 1
+                    continue
+                if short_flag in switch_flags:
+                    if attached.casefold() not in _GITHUB_PR_BOOLEAN_VALUES:
+                        raise RuntimeError("trusted GitHub PR boolean option value is invalid")
+                    if short_flag == "-h":
+                        help_requested = attached.casefold() in {"true", "1", "t"}
+                    index += 1
+                    continue
+
+            short_cluster = item[1:]
+            consumes_next = False
+            for option_index, character in enumerate(short_cluster):
+                flag = f"-{character}"
+                if flag == "-R":
+                    repository = short_cluster[option_index + 1 :]
+                    if repository.startswith("="):
+                        repository = repository[1:]
+                    if not repository:
+                        if index + 1 >= len(arguments):
+                            raise RuntimeError("trusted GitHub repository selector is invalid")
+                        repository = arguments[index + 1]
+                        if not repository:
+                            raise RuntimeError("trusted GitHub repository selector is invalid")
+                        consumes_next = True
+                    # -R is inherited by every gh PR subcommand and, like other
+                    # value-taking short options, consumes the rest of a cluster
+                    # (or the following argv item) as its repository selector.
+                    break
+                if flag in switch_flags:
+                    if (
+                        option_index + 1 < len(short_cluster)
+                        and short_cluster[option_index + 1] == "="
+                    ):
+                        boolean_value = short_cluster[option_index + 2 :]
+                        if boolean_value.casefold() not in _GITHUB_PR_BOOLEAN_VALUES:
+                            raise RuntimeError(
+                                "trusted GitHub PR boolean option value is invalid"
+                            )
+                        if flag == "-h":
+                            help_requested = boolean_value.casefold() in {"true", "1", "t"}
+                        break
+                    if flag == "-h":
+                        help_requested = True
+                    continue
+                if flag in value_flags:
+                    if option_index + 1 == len(short_cluster):
+                        if index + 1 >= len(arguments):
+                            raise RuntimeError("trusted GitHub PR option value is missing")
+                        consumes_next = True
+                    # Any remaining characters are the value attached to this
+                    # option, matching gh/Cobra short-flag cluster semantics.
+                    break
+                raise RuntimeError("trusted GitHub PR option is unsupported for host resolution")
+            else:
+                index += 1
+                continue
+            index += 2 if consumes_next else 1
+            continue
+        if subcommand in _GITHUB_PR_POSITIONAL_TARGET_COMMANDS and "://" in item:
+            host = _github_pr_positional_url_host(item)
+            if positional_host is not None and positional_host != host:
+                raise RuntimeError("trusted GitHub PR URL host is ambiguous")
+            positional_host = host
+        index += 1
+    return repository, positional_host, help_requested
+
+
+def _github_pr_repository_selector(arguments: list[str]) -> str | None:
+    repository, _positional_host, _help_requested = _github_pr_target_selectors(arguments)
+    return repository
+
+
+def _github_pr_default_remote(working_directory: Path) -> str | None:
+    try:
+        completed = subprocess.run(
+            [
+                "/usr/bin/git", "-C", str(working_directory), "config", "--local",
+                "--get-regexp", r"^remote\..*\.gh-resolved$",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            text=True,
+            env=_git_environment(),
+            timeout=_GITHUB_PR_VIEW_AUTH_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("trusted GitHub default remote lookup failed") from exc
+    if completed.returncode not in {0, 1}:
+        raise RuntimeError("trusted GitHub default remote lookup failed")
+    defaults: list[str] = []
+    for line in completed.stdout.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2 or parts[1].strip() != "base":
+            continue
+        key = parts[0].strip()
+        prefix = "remote."
+        suffix = ".gh-resolved"
+        if not key.startswith(prefix) or not key.endswith(suffix):
+            raise RuntimeError("trusted GitHub default remote is invalid")
+        remote = key[len(prefix) : -len(suffix)]
+        if not remote or any(character.isspace() for character in remote):
+            raise RuntimeError("trusted GitHub default remote is invalid")
+        defaults.append(remote)
+    if len(defaults) > 1:
+        raise RuntimeError("trusted GitHub default remote is ambiguous")
+    return defaults[0] if defaults else None
+
+
+def _github_pr_remote_names(working_directory: Path) -> list[str]:
+    try:
+        completed = subprocess.run(
+            ["/usr/bin/git", "-C", str(working_directory), "remote"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            text=True,
+            env=_git_environment(),
+            timeout=_GITHUB_PR_VIEW_AUTH_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("trusted GitHub checkout remote lookup failed") from exc
+    if completed.returncode != 0:
+        return []
+    names = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    if len(names) > 32 or len(set(names)) != len(names):
+        raise RuntimeError("trusted GitHub checkout remotes are invalid")
+    if any(any(character.isspace() for character in name) for name in names):
+        raise RuntimeError("trusted GitHub checkout remotes are invalid")
+    return names
+
+
+def _github_pr_known_hosts(source: dict[str, str]) -> set[str]:
+    known = {_GITHUB_PR_VIEW_DEFAULT_HOST}
+    explicit = source.get("GH_HOST", "").strip()
+    if explicit:
+        known.add(_github_pr_view_host({"GH_HOST": explicit}))
+    config_dir = source.get("GH_CONFIG_DIR", "").strip()
+    if config_dir:
+        root = Path(config_dir)
+    else:
+        xdg_config = source.get("XDG_CONFIG_HOME", "").strip()
+        if xdg_config:
+            root = Path(xdg_config) / "gh"
+        else:
+            home = source.get("HOME", str(HOME)).strip()
+            root = Path(home) / ".config" / "gh"
+    if not root.is_absolute():
+        raise RuntimeError("trusted GitHub config path is invalid")
+    path = root / "hosts.yml"
+    try:
+        metadata = path.stat()
+    except FileNotFoundError:
+        return known
+    except OSError as exc:
+        raise RuntimeError("trusted GitHub host catalog lookup failed") from exc
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 262_144:
+        raise RuntimeError("trusted GitHub host catalog is invalid")
+    try:
+        content = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise RuntimeError("trusted GitHub host catalog lookup failed") from exc
+    for line in content.splitlines():
+        if not line or line[0].isspace() or line.lstrip().startswith("#"):
+            continue
+        match = re.fullmatch(r"([A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?(?::[1-9][0-9]{0,4})?):(?:\s*#.*)?", line)
+        if match is None:
+            raise RuntimeError("trusted GitHub host catalog is invalid")
+        known.add(_github_pr_view_host({"GH_HOST": match.group(1)}))
+    return known
+
+
+def _github_pr_remote_host(working_directory: Path, remote: str) -> str | None:
+    try:
+        completed = subprocess.run(
+            [
+                "/usr/bin/git", "-C", str(working_directory), "remote", "get-url",
+                "--all", remote,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            text=True,
+            env=_git_environment(),
+            timeout=_GITHUB_PR_VIEW_AUTH_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("trusted GitHub checkout host lookup failed") from exc
+    if completed.returncode != 0:
+        return None
+    urls = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    if len(urls) != 1:
+        raise RuntimeError("trusted GitHub checkout remote is ambiguous")
+    identity = _remote_target_identity(urls[0])
+    if identity is None:
+        return None
+    return _github_pr_view_host({"GH_HOST": identity[0]})
+
+
+def _github_pr_checkout_host(
+    working_directory: Path, source: dict[str, str] | None = None
+) -> str | None:
+    source = {} if source is None else source
+    default_remote = _github_pr_default_remote(working_directory)
+    names = _github_pr_remote_names(working_directory)
+    known_hosts = _github_pr_known_hosts(source)
+    if default_remote is not None:
+        if default_remote not in names:
+            raise RuntimeError("trusted GitHub default remote is missing")
+        host = _github_pr_remote_host(working_directory, default_remote)
+        if host is None:
+            raise RuntimeError("trusted GitHub default remote is invalid")
+        if not _github_pr_host_uses_standard_token(host) and host not in known_hosts:
+            raise RuntimeError("trusted GitHub default remote host is unknown")
+        return host
+    if not names:
+        return None
+    hosts = [(name, _github_pr_remote_host(working_directory, name)) for name in names]
+    hosts = [(name, host) for name, host in hosts if host is not None]
+    if not hosts:
+        return None
+    recognized_hosts = {
+        host
+        for _, host in hosts
+        if _github_pr_host_uses_standard_token(host) or host in known_hosts
+    }
+    if not recognized_hosts:
+        return None
+    if len(recognized_hosts) == 1:
+        return next(iter(recognized_hosts))
+    raise RuntimeError("trusted GitHub checkout remote is ambiguous")
+
+
+def _github_pr_target_host(
+    arguments: list[str],
+    source: dict[str, str],
+    *,
+    working_directory: Path | None = None,
+) -> str:
+    repository, positional_host, _help_requested = _github_pr_target_selectors(arguments)
+    if positional_host is not None:
+        return positional_host
+    if repository is None:
+        gh_repo = source.get("GH_REPO", "").strip()
+        if gh_repo:
+            repository = gh_repo
+        elif working_directory is not None:
+            checkout_host = _github_pr_checkout_host(working_directory, source)
+            if checkout_host is not None:
+                return checkout_host
+        if repository is None:
+            return _github_pr_view_host(source)
+    selector = repository.strip()
+    parts = selector.split("/")
+    if len(parts) == 2 and all(parts):
+        return _github_pr_view_host(source)
+    if len(parts) == 3 and all(parts):
+        return _github_pr_view_host({"GH_HOST": parts[0]})
+    raise RuntimeError("trusted GitHub repository selector is invalid")
 
 def _github_pr_view_host(source: dict[str, str]) -> str:
     raw_host = source.get("GH_HOST", _GITHUB_PR_VIEW_DEFAULT_HOST).strip().lower()
@@ -2616,7 +3056,10 @@ def _github_pr_view_host(source: dict[str, str]) -> str:
     port = match.group(2)
     if port is not None and int(port) > 65535:
         raise RuntimeError("trusted GitHub host port is invalid")
-    return raw_host
+    hostname = match.group(1)
+    if hostname == "www.github.com":
+        hostname = _GITHUB_PR_VIEW_DEFAULT_HOST
+    return f"{hostname}:{port}" if port is not None else hostname
 
 
 def _validated_github_pr_view_token(value: Any) -> str:
@@ -2632,12 +3075,17 @@ def _validated_github_pr_view_token(value: Any) -> str:
     return token
 
 
+def _github_pr_host_uses_standard_token(host: str) -> bool:
+    hostname = host.rsplit(":", 1)[0]
+    return hostname == _GITHUB_PR_VIEW_DEFAULT_HOST or hostname.endswith(".ghe.com")
+
+
 def _github_pr_view_direct_token(
     source: dict[str, str], host: str
 ) -> str | None:
     keys = (
         ("GH_TOKEN", "GITHUB_TOKEN")
-        if host == _GITHUB_PR_VIEW_DEFAULT_HOST
+        if _github_pr_host_uses_standard_token(host)
         else ("GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
     )
     for key in keys:
@@ -2672,6 +3120,85 @@ def _github_pr_view_auth_lookup_environment(
     return environment
 
 
+def _github_pr_view_default_keyring_locked(
+    source: dict[str, str], host: str
+) -> bool | None:
+    if (
+        not source.get("DBUS_SESSION_BUS_ADDRESS")
+        and not source.get("XDG_RUNTIME_DIR")
+    ):
+        return None
+    try:
+        probe = subprocess.run(
+            [
+                _GITHUB_PR_VIEW_BUSCTL_PATH,
+                "--user",
+                "get-property",
+                "org.freedesktop.secrets",
+                _GITHUB_PR_VIEW_DEFAULT_KEYRING_OBJECT,
+                "org.freedesktop.Secret.Collection",
+                "Locked",
+            ],
+            cwd=HOME,
+            env=_github_pr_view_auth_lookup_environment(source, host),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=_GITHUB_PR_VIEW_KEYRING_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if probe.returncode != 0:
+        return None
+    value = probe.stdout.strip()
+    if value == b"b true":
+        return True
+    if value == b"b false":
+        return False
+    return None
+
+
+def _github_pr_view_plaintext_auth_token(
+    executable: str, source: dict[str, str], host: str
+) -> str | None:
+    environment = _github_pr_view_auth_lookup_environment(source, host)
+    for key in (
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "GNOME_KEYRING_CONTROL",
+    ):
+        environment.pop(key, None)
+    try:
+        probe = subprocess.run(
+            [executable, "auth", "token", "--hostname", host],
+            cwd=HOME,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=_GITHUB_PR_VIEW_KEYRING_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if probe.returncode != 0:
+        return None
+    if len(probe.stdout) > _GITHUB_PR_VIEW_MAX_TOKEN_BYTES + 1:
+        return None
+    try:
+        decoded = probe.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    lines = decoded.splitlines()
+    if len(lines) != 1:
+        return None
+    try:
+        return _validated_github_pr_view_token(lines[0])
+    except RuntimeError:
+        return None
+
+
 def _github_pr_view_auth_token(
     executable: str, source: dict[str, str], host: str
 ) -> str:
@@ -2682,6 +3209,15 @@ def _github_pr_view_auth_token(
     )
     if direct is not None:
         return direct
+    plaintext = _github_pr_view_plaintext_auth_token(executable, source, host)
+    if plaintext is not None:
+        return plaintext
+    if _github_pr_view_default_keyring_locked(source, host) is True:
+        raise RuntimeError(
+            "trusted GitHub credential lookup blocked: default Secret Service keyring "
+            "is locked; unlock it in an interactive user session or configure a "
+            "non-interactive GitHub credential for trusted-owner mode"
+        )
     process = subprocess.Popen(
         [executable, "auth", "token", "--hostname", host],
         cwd=HOME,
@@ -2740,7 +3276,9 @@ def _github_pr_view_isolated_config_path() -> str:
     return str(path)
 
 
-def _github_pr_view_environment(*, host: str, token: str) -> dict[str, str]:
+def _github_pr_view_environment(
+    *, host: str, token: str, repository: str | None = None
+) -> dict[str, str]:
     isolated = _github_pr_view_isolated_config_path()
     credential = _validated_github_pr_view_token(token)
     environment = {
@@ -2759,11 +3297,35 @@ def _github_pr_view_environment(*, host: str, token: str) -> dict[str, str]:
     # Bind exactly one credential family to the server-selected host. The
     # network process receives neither the user's gh config/keyring paths nor
     # proxy/browser/editor/loader overrides.
-    if host == _GITHUB_PR_VIEW_DEFAULT_HOST:
+    if _github_pr_host_uses_standard_token(host):
         environment["GH_TOKEN"] = credential
     else:
         environment["GH_ENTERPRISE_TOKEN"] = credential
+    if repository is not None:
+        selector = repository.strip()
+        parts = selector.split("/")
+        if len(parts) not in {2, 3} or not all(parts):
+            raise RuntimeError("trusted GitHub repository selector is invalid")
+        environment["GH_REPO"] = selector
     return environment
+
+
+def _github_pr_help_environment() -> dict[str, str]:
+    isolated = _github_pr_view_isolated_config_path()
+    return {
+        "HOME": isolated,
+        "XDG_CONFIG_HOME": isolated,
+        "GH_CONFIG_DIR": isolated,
+        "PATH": str(TRUSTED_GITHUB_CLI_PATH.parent),
+        "GH_PAGER": "cat",
+        "PAGER": "cat",
+        "GIT_PAGER": "cat",
+        "GH_PROMPT_DISABLED": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "NO_COLOR": "1",
+    }
+
+
 
 def _resolve_cwd(cwd: str | None) -> Path:
     path = HOME if cwd is None else Path(cwd).expanduser()
@@ -6783,15 +7345,27 @@ def grabowski_github(
     command = _validate_argv(
         [trusted_github_cli, *arguments], cwd=working_directory
     )
-    if transport_exempt:
-        source_environment = _safe_environment()
-        github_host = _github_pr_view_host(source_environment)
-        github_token = _github_pr_view_auth_token(
-            trusted_github_cli, source_environment, github_host
-        )
-        environment = _github_pr_view_environment(
-            host=github_host, token=github_token
-        )
+    isolated_auth = transport_exempt or _github_pr_uses_isolated_auth(arguments)
+    if isolated_auth:
+        explicit_repository, positional_host, help_requested = _github_pr_target_selectors(arguments)
+        if help_requested:
+            environment = _github_pr_help_environment()
+        else:
+            source_environment = _safe_environment()
+            github_host = _github_pr_target_host(
+                arguments, source_environment, working_directory=working_directory
+            )
+            github_token = _github_pr_view_auth_token(
+                trusted_github_cli, source_environment, github_host
+            )
+            environment_repository = None
+            if explicit_repository is None and positional_host is None:
+                gh_repo = source_environment.get("GH_REPO", "").strip()
+                if gh_repo:
+                    environment_repository = gh_repo
+            environment = _github_pr_view_environment(
+                host=github_host, token=github_token, repository=environment_repository
+            )
     else:
         environment = None
     return _run(

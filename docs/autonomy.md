@@ -151,23 +151,20 @@ lehnt secret-artige Ziel- oder Begründungstexte ab. Referenzen enthalten eine
 kurze Ablaufzeit und deklarieren eine Single-Use-Replay-Policy für den späteren
 externen Broker.
 
-`grabowski_power_run` ist die maximale Operator-Schiene. Standard ist
-autonome Ausführung, Grenze ist nicht Zustimmung, sondern Auditierbarkeit,
-Recovery und Kill-Switch. Das Tool führt kein lokales `sudo` im MCP-Prozess aus,
-sondern sendet eine kurzlebige `operator_power_argv`-Referenz an den
-root-eigenen Broker. Vor jedem Aufruf müssen Audit-Chain, Kill-Switch,
-Broker-Status und Recovery-Gate grün sein. Der Befehl ist argv-basiert,
+`grabowski_power_run` ist die maximale Operator-Schiene und im Trusted-Owner-
+Modell eine normale Root-Capability des kanonischen Operators. Das Tool führt
+kein lokales `sudo` im MCP-Prozess aus, sondern sendet eine kurzlebige
+`operator_power_argv`-Referenz direkt an den root-eigenen Broker. Diese Aktion
+hängt bewusst weder von einem Recovery-Marker noch von einem Befehls-Allowlist
+ab. Sie erlaubt auch direkte Shell-Ausführung. Der Befehl bleibt argv-basiert,
 verlangt ein absolutes Executable, bounded Timeout, bounded Output und eine
 nichtleere Begründung; der Broker auditiert Ziel-, cwd- und argv-Hashes. Die
-root-eigene Konfiguration erzwingt zusätzlich eine Broker-seitige Gate-Prüfung
-und entscheidet, ob direkte bekannte Shell-Executables erlaubt sind.
-`allowed_argv_prefixes` kann diese Schiene in einen expliziten Admin-Katalog
-verwandeln; ohne diese Liste bleibt sie generisch. Für maximale trusted-owner-
-Funktionalität darf dieser Katalog bewusst breit sein. Er ist aber nur eine
-Prefix-Bremse, keine vollständige Argument- oder Zielvalidierung. Die eigentliche
-Grenze bleibt Recovery-Gate, Kill-Switch, Timeout, Audit und Broker-Ausführung.
-Ein aktiviertes `operator_power_argv` bedeutet bewusst beliebige Root-Ausführung
-über absolute argv.
+entscheidende Autoritätsgrenze ist die Kernel-/root-systemd-geprüfte Identität
+des kanonischen `grabowski-operator.service`: Same-UID-Prozesse, Terminals,
+Kinder und untrusted Worker erhalten dadurch keine Root-Autorität. Allgemeine
+Operator-Invarianten wie Audit und Not-Aus bleiben davon unabhängig erhalten.
+Ein `operator_power_argv` bedeutet damit bewusst beliebige Root-Ausführung über
+absolute argv für genau diesen kanonischen Operatorprozess.
 
 
 ## Kollisionskontrolle und spezialisierte Worker

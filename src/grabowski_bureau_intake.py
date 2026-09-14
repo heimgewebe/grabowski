@@ -1840,6 +1840,9 @@ def grabowski_bureau_task_publish(
         coordination_state_root=coordination_state_root,
     )
     metadata = {
+        "kind": resources.BUREAU_TASK_PUBLICATION_AUTHORITY_KIND,
+        "authority_action_class": "task_creation_from_external_evidence",
+        "authority_capability": "bureau_mutation",
         "task_id": publishing_task_id,
         "operation": (
             "registry-publication"
@@ -1853,7 +1856,7 @@ def grabowski_bureau_task_publish(
         acquired = resources.acquire_resources(
             owner_id,
             resource_keys,
-            purpose=f"Publish reviewed Bureau proposal {proposal_sha256}",
+            purpose=f"Publish Bureau proposal {proposal_sha256} under operator authority",
             ttl_seconds=lease_ttl_seconds,
             metadata=metadata,
         )

@@ -208,11 +208,109 @@ class CodingAgentRouterCliTests(unittest.TestCase):
             },
         )
 
+    def test_grok_auth_file_identity_tracks_login_replace_logout_and_unsafe_file(self) -> None:
+        home = self.root / "grok-identity-home"
+        home.mkdir(mode=0o700)
+        missing = router._grok_auth_file_identity(home=home)
+        self.assertRegex(missing or "", r"^[0-9a-f]{64}$")
+
+        grok = home / ".grok"
+        grok.mkdir(mode=0o700)
+        auth = grok / "auth.json"
+        auth.write_bytes(b'{"fixture":"credential-a"}\n')
+        auth.chmod(0o600)
+        present = router._grok_auth_file_identity(home=home)
+        self.assertRegex(present or "", r"^[0-9a-f]{64}$")
+        self.assertNotEqual(present, missing)
+        self.assertEqual(router._grok_auth_file_identity(home=home), present)
+
+        replacement = grok / "auth.json.new"
+        replacement.write_bytes(b'{"fixture":"credential-a"}\n')
+        replacement.chmod(0o600)
+        replacement.replace(auth)
+        replaced = router._grok_auth_file_identity(home=home)
+        self.assertRegex(replaced or "", r"^[0-9a-f]{64}$")
+        self.assertNotEqual(replaced, present)
+
+        auth.unlink()
+        self.assertEqual(router._grok_auth_file_identity(home=home), missing)
+
+        auth.write_bytes(b'{"fixture":"credential-b"}\n')
+        auth.chmod(0o644)
+        self.assertIsNone(router._grok_auth_file_identity(home=home))
+
+        auth.chmod(0o600)
+        grok.chmod(0o770)
+        self.assertIsNone(router._grok_auth_file_identity(home=home))
+
+        grok.chmod(0o700)
+        safe_directory = home / ".grok.safe"
+        grok.replace(safe_directory)
+        grok.symlink_to(safe_directory, target_is_directory=True)
+        self.assertIsNone(router._grok_auth_file_identity(home=home))
+
+        grok.unlink()
+        safe_directory.replace(grok)
+        rebound = router._grok_auth_file_identity(home=home)
+        self.assertRegex(rebound or "", r"^[0-9a-f]{64}$")
+
+    def test_grok_auth_file_identity_rejects_rotated_directory_entry(self) -> None:
+        home = self.root / "grok-identity-race-home"
+        home.mkdir(mode=0o700)
+        grok = home / ".grok"
+        grok.mkdir(mode=0o700)
+        auth = grok / "auth.json"
+        auth.write_bytes(b'{"fixture":"credential-a"}\n')
+        auth.chmod(0o600)
+        replacement = grok / "auth.json.new"
+        replacement.write_bytes(b'{"fixture":"credential-b"}\n')
+        replacement.chmod(0o600)
+        real_stat = os.stat
+        rotated = False
+
+        def rotate_before_link_read(path, *args, **kwargs):
+            nonlocal rotated
+            if path == "auth.json" and not rotated:
+                rotated = True
+                replacement.replace(auth)
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch.object(router.os, "stat", side_effect=rotate_before_link_read):
+            self.assertIsNone(router._grok_auth_file_identity(home=home))
+        self.assertTrue(rotated)
+
+    def test_grok_subscription_auth_rejects_rotated_directory_entry(self) -> None:
+        catalog, _ = router._load_catalog()
+        home = self._grok_auth_home()
+        auth = home / ".grok" / "auth.json"
+        replacement = auth.with_name("auth.json.new")
+        replacement.write_bytes(auth.read_bytes())
+        replacement.chmod(0o600)
+        real_stat = os.stat
+        rotated = False
+
+        def rotate_before_link_read(path, *args, **kwargs):
+            nonlocal rotated
+            if path == "auth.json" and not rotated:
+                rotated = True
+                replacement.replace(auth)
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch.object(cli.os, "stat", side_effect=rotate_before_link_read):
+            status = cli._grok_subscription_auth_status(
+                catalog, home=home, now_unix=1_100
+            )
+        self.assertTrue(rotated)
+        self.assertEqual(status["status"], "changed-during-read")
+        self.assertFalse(status["authenticated"])
+        self.assertFalse(status["entitlement_verified"])
+
     def test_grok_subscription_auth_requires_exact_private_oidc_tier(self) -> None:
         catalog, _ = router._load_catalog()
+        valid_home = self._grok_auth_home()
         valid = cli._grok_subscription_auth_status(
             catalog,
-            home=self._grok_auth_home(),
+            home=valid_home,
             now_unix=1_100,
         )
         self.assertEqual(valid["status"], "valid")
@@ -220,6 +318,21 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         self.assertTrue(valid["entitlement_verified"])
         self.assertEqual(valid["subscription_tier"], "SuperGrok")
         self.assertRegex(valid["account_binding_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            valid["auth_file_identity_sha256"],
+            router._grok_auth_file_identity(home=valid_home),
+        )
+
+        missing_home = self.root / "grok-auth-missing-home"
+        missing_home.mkdir(mode=0o700)
+        missing = cli._grok_subscription_auth_status(
+            catalog, home=missing_home, now_unix=1_100
+        )
+        self.assertEqual(missing["status"], "missing")
+        self.assertEqual(
+            missing["auth_file_identity_sha256"],
+            router._grok_auth_file_identity(home=missing_home),
+        )
 
         wrong_tier = cli._grok_subscription_auth_status(
             catalog,
@@ -243,6 +356,15 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         )
         self.assertEqual(unsafe["status"], "unsafe-file")
 
+        unsafe_directory_home = self._grok_auth_home()
+        (unsafe_directory_home / ".grok").chmod(0o770)
+        unsafe_directory = cli._grok_subscription_auth_status(
+            catalog,
+            home=unsafe_directory_home,
+            now_unix=1_100,
+        )
+        self.assertEqual(unsafe_directory["status"], "unsafe-directory")
+
         ambiguous = cli._grok_subscription_auth_status(
             catalog,
             home=self._grok_auth_home(extra_account=True),
@@ -256,17 +378,25 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         ):
             cli._configured_models({}, "grok")
 
-    def test_antigravity_model_discovery_canonicalizes_configured_cli_ids(self) -> None:
+    def test_antigravity_model_discovery_preserves_canonical_and_cli_ids(self) -> None:
         catalog, _ = router._load_catalog()
+        output = (
+            "gemini-3.1-pro-high\tGemini 3.1 Pro (High)\n"
+            "gemini-3.6-flash\tGemini 3.6 Flash\n"
+            "invented-model\tGemini 3.1 Pro (High)\n"
+            "Gemini 3.1 Pro (High)\n"
+        )
+        inventory = cli._antigravity_model_inventory_from_output(catalog, output)
         self.assertEqual(
-            cli._antigravity_models_from_output(
-                catalog,
-                "gemini-3.1-pro-high\tGemini 3.1 Pro (High)\n"
-                "gemini-3.6-flash\tGemini 3.6 Flash\n"
-                "invented-model\tGemini 3.1 Pro (High)\n"
-                "Gemini 3.1 Pro (High)\n",
-            ),
-            ["gemini-3.1-pro", "gemini-3.6-flash"],
+            inventory,
+            {
+                "models": ["gemini-3.1-pro", "gemini-3.6-flash"],
+                "model_args": ["gemini-3.1-pro-high", "gemini-3.6-flash"],
+            },
+        )
+        self.assertEqual(
+            cli._antigravity_models_from_output(catalog, output),
+            inventory["models"],
         )
 
     def test_grok_model_discovery_accepts_legacy_and_inline_sections_only(self) -> None:
@@ -313,6 +443,7 @@ class CodingAgentRouterCliTests(unittest.TestCase):
             "status": "valid",
             "subscription_tier": "SuperGrok",
             "account_binding_sha256": "a" * 64,
+            "auth_file_identity_sha256": "c" * 64,
         }
 
         def metadata(_harnesses, harness, arguments, _catalog):
@@ -342,13 +473,21 @@ class CodingAgentRouterCliTests(unittest.TestCase):
                 return_value={"authenticated": False},
             ),
             mock.patch.object(cli, "_resolve_executable", return_value=None),
+            mock.patch.object(
+                router, "_grok_auth_file_identity", return_value="d" * 64
+            ) as live_auth_identity,
         ):
             verified = cli._probe(catalog)
+        live_auth_identity.assert_not_called()
         self.assertIn("grok-com", verified["verified_quota_pools"])
         self.assertTrue(verified["providers"]["grok"]["logged_in"])
         self.assertTrue(verified["providers"]["grok"]["entitlement_verified"])
         self.assertEqual(
             verified["providers"]["grok"]["subscription_tier"], "SuperGrok"
+        )
+        self.assertEqual(
+            verified["providers"]["grok"]["auth_file_identity_sha256"],
+            "c" * 64,
         )
 
         changed = dict(auth)
@@ -375,6 +514,33 @@ class CodingAgentRouterCliTests(unittest.TestCase):
             rejected = cli._probe(catalog)
         self.assertNotIn("grok-com", rejected["verified_quota_pools"])
         self.assertFalse(rejected["providers"]["grok"]["entitlement_verified"])
+
+        rotated = dict(auth)
+        rotated["auth_file_identity_sha256"] = "d" * 64
+        with (
+            mock.patch.object(
+                cli,
+                "_binary_versions",
+                return_value={"grok": {"available": True, "binary": "/grok"}},
+            ),
+            mock.patch.object(cli, "_run_harness_metadata", side_effect=metadata),
+            mock.patch.object(
+                cli,
+                "_grok_subscription_auth_status",
+                side_effect=[dict(auth), rotated],
+            ),
+            mock.patch.object(
+                cli,
+                "_openhands_subscription_auth_status",
+                return_value={"authenticated": False},
+            ),
+            mock.patch.object(cli, "_resolve_executable", return_value=None),
+        ):
+            rejected_rotation = cli._probe(catalog)
+        self.assertNotIn("grok-com", rejected_rotation["verified_quota_pools"])
+        self.assertFalse(
+            rejected_rotation["providers"]["grok"]["entitlement_verified"]
+        )
 
     def test_probe_digest_safety_guard_rejects_sensitive_fields(self) -> None:
         with self.assertRaisesRegex(
@@ -428,6 +594,8 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         self.assertEqual(probe["model_invocations"], 0)
         self.assertEqual(probe["paid_api_requests_authorized"], 0)
         self.assertEqual(probe["verified_quota_pools"], [])
+        self.assertEqual(probe["providers"]["antigravity"]["models"], [])
+        self.assertEqual(probe["providers"]["antigravity"]["model_args"], [])
         self.assertIn("OPENROUTER_API_KEY", probe["api_key_environment_scrubbed"])
         digest_input = dict(probe)
         digest = digest_input.pop("catalog_probe_sha256")
