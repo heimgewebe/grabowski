@@ -351,6 +351,8 @@ def _hash_review_evidence_file(
     flags = os.O_RDONLY | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
     descriptor = -1
     try:
         descriptor = os.open(filename, flags, dir_fd=root_descriptor)
@@ -381,6 +383,7 @@ def _hash_review_evidence_file(
             or before.st_ino != after.st_ino
             or before.st_size != after.st_size
             or before.st_mtime_ns != after.st_mtime_ns
+            or before.st_ctime_ns != after.st_ctime_ns
             or before.st_nlink != after.st_nlink
             or observed_bytes != after.st_size
         ):

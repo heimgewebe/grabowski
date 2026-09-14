@@ -604,6 +604,35 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
         self.assertFalse(preview["safe_to_apply"])
         self.assertIn("review-evidence-path-outside-allowlist", preview["blockers"])
 
+    def test_review_evidence_open_is_nonblocking_and_nofollow(self) -> None:
+        evidence_root = self.checkout / ".review-audits"
+        evidence_root.mkdir()
+        (evidence_root / "review.json").write_text("{}\n", encoding="utf-8")
+        root_flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            root_flags |= os.O_DIRECTORY
+        root_descriptor = os.open(evidence_root, root_flags)
+        real_open = os.open
+        try:
+            with patch.object(reconciliation.os, "open", wraps=real_open) as opened:
+                evidence, blockers = reconciliation._hash_review_evidence_file(
+                    root_descriptor,
+                    ".review-audits/review.json",
+                    reconciliation._REVIEW_EVIDENCE_MAX_TOTAL_BYTES,
+                )
+            self.assertIsNotNone(evidence)
+            self.assertEqual([], blockers)
+            file_open = next(
+                call for call in opened.call_args_list if call.args[0] == "review.json"
+            )
+            flags = file_open.args[1]
+            if hasattr(os, "O_NONBLOCK"):
+                self.assertTrue(flags & os.O_NONBLOCK)
+            if hasattr(os, "O_NOFOLLOW"):
+                self.assertTrue(flags & os.O_NOFOLLOW)
+        finally:
+            os.close(root_descriptor)
+
     def test_present_thread_focus_rejects_symlink_review_evidence(self) -> None:
         binding = self._present_binding(
             source_kind="thread_focus", source_id="thread-focus-id"
