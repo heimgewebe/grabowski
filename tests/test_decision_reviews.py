@@ -87,7 +87,8 @@ def make_job(
     role_receipt_path = directory / "review-role-receipt.json"
     job_argv = (
         [
-            "python3",
+            reviews.REVIEW_ROLE_PYTHON,
+            "-I",
             "-m",
             reviews.REVIEW_ROLE_MODULE,
             "--role",
@@ -280,11 +281,60 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
         self.assertEqual(attempt["review_route_id"], "claude-opus-5-high")
         self.assertEqual(attempt["review_provider_family"], "anthropic")
 
+    def test_reviewer_provenance_requires_server_python_and_isolated_module(self) -> None:
+        normalized = reviews.normalize_binding(binding("independent-reviewer"))
+        receipt = "/tmp/review/review-role-receipt.json"
+        trusted = [
+            reviews.REVIEW_ROLE_PYTHON,
+            "-I",
+            "-m",
+            reviews.REVIEW_ROLE_MODULE,
+            "--role",
+            "review",
+            "--repository",
+            "/tmp/review",
+            "--expected-head",
+            HEAD,
+            "--expected-base-head",
+            BASE,
+            "--expected-diff-sha256",
+            "e" * 64,
+            "--expected-dirty",
+            "false",
+            "--output",
+            receipt,
+            "--",
+            "claude",
+            "--model",
+            "opus",
+            "--effort",
+            "high",
+            "--permission-mode",
+            "plan",
+            "Review the frozen revision",
+        ]
+        self.assertIsNotNone(
+            reviews.review_role_provenance(trusted, normalized, cwd=Path("/tmp/review"))
+        )
+        caller_python = ["/tmp/python3", *trusted[1:]]
+        self.assertIsNone(
+            reviews.review_role_provenance(
+                caller_python, normalized, cwd=Path("/tmp/review")
+            )
+        )
+        non_isolated = [trusted[0], *trusted[2:]]
+        self.assertIsNone(
+            reviews.review_role_provenance(
+                non_isolated, normalized, cwd=Path("/tmp/review")
+            )
+        )
+
     def test_route_suffix_cannot_override_verified_reviewer_route(self) -> None:
         normalized = reviews.normalize_binding(binding("independent-reviewer"))
         receipt = "/tmp/review/review-role-receipt.json"
         job_argv = [
-            "python3",
+            reviews.REVIEW_ROLE_PYTHON,
+            "-I",
             "-m",
             reviews.REVIEW_ROLE_MODULE,
             "--role",
@@ -347,7 +397,13 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
                 review_result=None,
                 review_role=True,
                 origin_provenance=False,
-                metadata_argv_override=["python3", "-m", reviews.REVIEW_ROLE_MODULE, "<REDACTED>"],
+                metadata_argv_override=[
+                    reviews.REVIEW_ROLE_PYTHON,
+                    "-I",
+                    "-m",
+                    reviews.REVIEW_ROLE_MODULE,
+                    "<REDACTED>",
+                ],
             )
             reconciled = self.reconcile(jobs)
         self.assertEqual(reconciled["status"], "blocked")

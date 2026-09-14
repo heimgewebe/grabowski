@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import sys
 from typing import Any, Iterator
 
 import grabowski_job_origin as job_origin
@@ -30,7 +31,13 @@ MAX_STDOUT_TAIL_BYTES = 256 * 1024
 MAX_ROLE_RECEIPT_BYTES = 4 * 1024 * 1024
 REVIEW_ROLE_MODULE = "grabowski_agent_role"
 REVIEW_ROLE_SANDBOX = "bubblewrap-minimal-root-read-only-worktree-v1"
-_PYTHON_EXECUTABLE_RE = re.compile(r"python(?:3(?:\.\d+)?)?\Z")
+REVIEW_ROLE_PYTHON = os.path.abspath(sys.executable)
+REVIEW_ROLE_LAUNCHER_PREFIX = (
+    REVIEW_ROLE_PYTHON,
+    "-I",
+    "-m",
+    REVIEW_ROLE_MODULE,
+)
 _REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 _SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -79,6 +86,22 @@ def _canonical_json_bytes(value: Any) -> bytes:
 
 def sha256_json(value: Any) -> str:
     return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
+
+
+def _review_role_module_identity() -> tuple[str, str] | None:
+    """Bind reviewer provenance to the server-installed role module bytes."""
+    module_path = Path(__file__).with_name(f"{REVIEW_ROLE_MODULE}.py")
+    try:
+        metadata = module_path.lstat()
+        payload = module_path.read_bytes()
+    except OSError:
+        return None
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        return None
+    return (
+        str(module_path.resolve(strict=False)),
+        hashlib.sha256(payload).hexdigest(),
+    )
 
 
 def normalize_binding(value: Any) -> dict[str, Any]:
@@ -432,14 +455,13 @@ def review_role_provenance(
     if not isinstance(argv, list) or any(not isinstance(item, str) for item in argv):
         return None
     if (
-        len(argv) < 19
-        or _PYTHON_EXECUTABLE_RE.fullmatch(Path(argv[0]).name) is None
-        or argv[1:3] != ["-m", REVIEW_ROLE_MODULE]
+        len(argv) < 20
+        or tuple(argv[:4]) != REVIEW_ROLE_LAUNCHER_PREFIX
         or argv.count("--") != 1
     ):
         return None
     separator = argv.index("--")
-    options = argv[3:separator]
+    options = argv[4:separator]
     required_order = [
         "--role",
         "--repository",
@@ -475,11 +497,19 @@ def review_role_provenance(
     review_route = _review_route_evidence(reviewer_command)
     if review_route is None:
         return None
+    module_identity = _review_role_module_identity()
+    if module_identity is None:
+        return None
+    runner_module_path, runner_module_sha256 = module_identity
     material = {
         "schema_version": 1,
         "kind": "grabowski_decision_review_provenance",
         "role": "review",
+        "runner_python": REVIEW_ROLE_PYTHON,
+        "runner_isolated": True,
         "runner_module": REVIEW_ROLE_MODULE,
+        "runner_module_path": runner_module_path,
+        "runner_module_sha256": runner_module_sha256,
         "sandbox": REVIEW_ROLE_SANDBOX,
         "repository": str(repository.resolve(strict=False)),
         "head_sha": normalized["head_sha"],
@@ -502,7 +532,8 @@ def _normalize_review_role_provenance(
     if not isinstance(value, dict):
         raise ValueError("decision review provenance is invalid")
     required = {
-        "schema_version", "kind", "role", "runner_module", "sandbox",
+        "schema_version", "kind", "role", "runner_python", "runner_isolated",
+        "runner_module", "runner_module_path", "runner_module_sha256", "sandbox",
         "repository", "head_sha", "base_sha", "workspace_diff_sha256",
         "expected_dirty", "role_receipt_path", "reviewer_command_sha256",
         "review_route", "binding_sha256", "provenance_sha256",
@@ -513,11 +544,19 @@ def _normalize_review_role_provenance(
     if value.get("provenance_sha256") != sha256_json(material):
         raise ValueError("decision review provenance digest mismatch")
     normalized = normalize_binding(binding)
+    module_identity = _review_role_module_identity()
+    if module_identity is None:
+        raise ValueError("trusted decision review role module is unavailable")
+    runner_module_path, runner_module_sha256 = module_identity
     if (
         value.get("schema_version") != 1
         or value.get("kind") != "grabowski_decision_review_provenance"
         or value.get("role") != "review"
+        or value.get("runner_python") != REVIEW_ROLE_PYTHON
+        or value.get("runner_isolated") is not True
         or value.get("runner_module") != REVIEW_ROLE_MODULE
+        or value.get("runner_module_path") != runner_module_path
+        or value.get("runner_module_sha256") != runner_module_sha256
         or value.get("sandbox") != REVIEW_ROLE_SANDBOX
         or value.get("head_sha") != normalized["head_sha"]
         or value.get("base_sha") != normalized["base_sha"]

@@ -2380,7 +2380,8 @@ class OperatorContractTests(unittest.TestCase):
                 "Review the frozen revision",
             ]
             argv = [
-                "python3",
+                operator.decision_reviews.REVIEW_ROLE_PYTHON,
+                "-I",
                 "-m",
                 operator.decision_reviews.REVIEW_ROLE_MODULE,
                 "--role",
@@ -2417,6 +2418,11 @@ class OperatorContractTests(unittest.TestCase):
             provenance = job["scope"]["decision_review_provenance"]
             self.assertEqual(provenance["kind"], "grabowski_decision_review_provenance")
             self.assertEqual(provenance["role"], "review")
+            self.assertEqual(
+                provenance["runner_python"],
+                operator.decision_reviews.REVIEW_ROLE_PYTHON,
+            )
+            self.assertIs(provenance["runner_isolated"], True)
             self.assertEqual(provenance["runner_module"], "grabowski_agent_role")
             self.assertEqual(
                 provenance["sandbox"],
