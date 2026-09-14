@@ -5389,6 +5389,9 @@ class BureauPickupTests(unittest.TestCase):
                 },
             }
             with (
+                mock.patch.object(
+                    pickup, "_coordination_status", return_value=blocking
+                ),
                 mock.patch.object(pickup.resources, "_now", return_value=221),
                 mock.patch.object(
                     pickup,
@@ -5534,6 +5537,9 @@ class BureauPickupTests(unittest.TestCase):
                 return real_rebind(*args, **kwargs)
 
             with (
+                mock.patch.object(
+                    pickup, "_coordination_status", return_value=blocking
+                ),
                 mock.patch.object(pickup.resources, "_now", return_value=221),
                 mock.patch.object(
                     pickup.bureau_leases,
@@ -5992,6 +5998,9 @@ class BureauPickupTests(unittest.TestCase):
                 "head": "5" * 40,
             }
             with (
+                mock.patch.object(
+                    pickup, "_coordination_status", return_value=blocking
+                ),
                 mock.patch.object(pickup.resources, "_now", return_value=250),
                 mock.patch.object(
                     pickup.bureau_leases,
