@@ -437,6 +437,113 @@ def captain_request_sha256(parameters: dict[str, Any]) -> str:
     return _sha256_json(visible)
 
 
+def independent_review_requirement(parameters: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the provider-neutral independent-review floor for one Captain request."""
+    review_evidence = parameters.get("review_evidence")
+    review_tier = (
+        review_evidence.get("review_tier")
+        if isinstance(review_evidence, dict)
+        else None
+    )
+    policy_value = (
+        review_evidence.get("independent_review_required")
+        if isinstance(review_evidence, dict)
+        else None
+    )
+    explicit_value = parameters.get("independent_review_required")
+    errors: list[str] = []
+    if policy_value is not None and not isinstance(policy_value, bool):
+        errors.append("independent_review_policy_invalid")
+    if explicit_value is not None and not isinstance(explicit_value, bool):
+        errors.append("independent_review_required_invalid")
+    high_critical_floor = review_tier == "high_critical"
+    policy_required = policy_value is True
+    explicitly_required = explicit_value is True
+    required = high_critical_floor or policy_required or explicitly_required
+    if high_critical_floor and policy_value is not True:
+        errors.append("independent_review_high_critical_floor_not_acknowledged")
+    return {
+        "review_tier": review_tier,
+        "high_critical_floor": high_critical_floor,
+        "policy_required": policy_required,
+        "explicitly_required": explicitly_required,
+        "required": required,
+        "errors": errors,
+    }
+
+
+INDEPENDENT_REVIEW_SLOT_PREFIX = "independent-"
+
+
+def independent_review_reconciliation_summary(
+    reconciliation: Any,
+) -> dict[str, Any]:
+    """Project role- and route-proven decision-bound review PASS evidence."""
+    errors: list[str] = []
+    admissible_slots: list[str] = []
+    ignored_pass_slots: list[str] = []
+    unverified_pass_slots: list[str] = []
+    independent_pass_count = 0
+    total_pass_count = 0
+    if not isinstance(reconciliation, dict):
+        return {
+            "admissible_slots": [],
+            "admissible_slot_count": 0,
+            "ignored_pass_slots": [],
+            "unverified_pass_slots": [],
+            "pass_count": 0,
+            "total_pass_count": 0,
+            "errors": ["independent_review_reconciliation_invalid"],
+        }
+    slots = reconciliation.get("slots")
+    if not isinstance(slots, list):
+        errors.append("independent_review_slots_invalid")
+        slots = []
+    for item in slots:
+        if not isinstance(item, dict):
+            errors.append("independent_review_slot_record_invalid")
+            continue
+        slot = item.get("slot")
+        pass_count = item.get("pass_count")
+        proven_count = item.get("independent_pass_count", 0)
+        if not isinstance(slot, str) or not slot:
+            errors.append("independent_review_slot_name_invalid")
+            continue
+        if (
+            isinstance(pass_count, bool)
+            or not isinstance(pass_count, int)
+            or pass_count < 0
+        ):
+            errors.append(f"independent_review_slot_pass_count_invalid:{slot}")
+            continue
+        if (
+            isinstance(proven_count, bool)
+            or not isinstance(proven_count, int)
+            or proven_count < 0
+            or proven_count > pass_count
+        ):
+            errors.append(f"independent_review_slot_proven_pass_count_invalid:{slot}")
+            continue
+        total_pass_count += pass_count
+        if slot.startswith(INDEPENDENT_REVIEW_SLOT_PREFIX):
+            if proven_count:
+                admissible_slots.append(slot)
+                independent_pass_count += proven_count
+            if pass_count > proven_count:
+                unverified_pass_slots.append(slot)
+        elif pass_count:
+            ignored_pass_slots.append(slot)
+    return {
+        "admissible_slots": sorted(set(admissible_slots)),
+        "admissible_slot_count": len(set(admissible_slots)),
+        "ignored_pass_slots": sorted(set(ignored_pass_slots)),
+        "unverified_pass_slots": sorted(set(unverified_pass_slots)),
+        "pass_count": independent_pass_count,
+        "total_pass_count": total_pass_count,
+        "errors": sorted(set(errors)),
+    }
+
+
 def issue_server_task_lease_delegation(
     actor_identity: dict[str, Any],
     task_evidence: dict[str, Any],
@@ -4819,7 +4926,36 @@ class CaptainMergeGuardRunner:
             self.receipt["decision_bound_review_reconciliation"] = (
                 decision_reconciliation
             )
+            independent_requirement = independent_review_requirement(self.parameters)
+            independent_summary = independent_review_reconciliation_summary(
+                decision_reconciliation
+            )
+            independent_pass_count = int(independent_summary["pass_count"])
+            independent_errors = [
+                *independent_requirement["errors"],
+                *independent_summary["errors"],
+            ]
+            if independent_requirement["required"] and (
+                decision_reconciliation.get("status") != "settled"
+                or independent_pass_count < 1
+            ):
+                independent_errors.append("merge_guard_independent_review_pass_missing")
+            independent_errors = sorted(set(independent_errors))
+            self.receipt["independent_review_revalidation"] = {
+                **independent_requirement,
+                **{
+                    key: value
+                    for key, value in independent_summary.items()
+                    if key != "errors"
+                },
+                "reconciliation_status": decision_reconciliation.get("status"),
+                "status": "blocked" if independent_errors else (
+                    "settled" if independent_requirement["required"] else "not_required"
+                ),
+                "errors": independent_errors,
+            }
             revalidation_errors = list(decision_reconciliation.get("errors", []))
+            revalidation_errors.extend(independent_errors)
             revalidation_errors.extend(self._revalidate_dispatch_bindings(bindings))
             revalidation_errors.extend(self._revalidate_repository_policy())
             revalidation_errors.extend(self._revalidate_branch_merge_policy())

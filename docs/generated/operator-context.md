@@ -110,6 +110,8 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_checkout_retain` | checkout-lifecycle | no | medium | Assign explicit retention ownership to one temporary linked Git checkout. |
 | `grabowski_checkout_archive` | checkout-lifecycle | no | medium | Archive one clean temporary linked Git checkout by creating durable recovery refs without deleting branches. |
 | `grabowski_checkout_cleanup` | checkout-lifecycle | no | high | Plan or apply cleanup for an archived linked checkout; apply requires a persisted dry run. |
+| `grabowski_checkout_uncertainty_status` | checkout-lifecycle | yes | low | Read persistent unknown-outcome fences for checkout archive and cleanup effects. |
+| `grabowski_checkout_uncertainty_reconcile` | checkout-lifecycle | no | high | Reconcile one persistent unknown-outcome checkout fence from primary Git and database evidence and release coordination only after the outcome is proven. |
 | `grabowski_github` | remote-version-control | no | variable | Run GitHub CLI operations with output redaction. |
 | `grabowski_user_service` | service | no | high | Inspect or control one user-level systemd service. |
 | `grabowski_tmux_list` | session | yes | low | List tmux sessions visible to the current user. |

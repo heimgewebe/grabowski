@@ -1388,8 +1388,10 @@ def _add_checkouts(
                 # Dirty remains visible as hygiene; it never authorizes cleanup.
                 _hygiene(group, "dirty-checkout-visible")
         elif item["cleanup_candidate"]:
-            if item["coordination_blocking"] or item["processes"] or item["retention_active"]:
+            if item["coordination_blocking"] or item["processes"]:
                 _blocking(group, "cleanup-candidate-coordination-blocked")
+            elif item["retention_active"]:
+                _hygiene(group, "cleanup-candidate-retention-active")
             else:
                 _hygiene(group, "cleanup-candidate-ready")
         elif (
@@ -1413,15 +1415,10 @@ def _add_checkouts(
                 if "closed-not-cleaned" not in group["action_reasons"]:
                     group["action_reasons"].append("closed-not-cleaned")
         elif item["binding_phase"] == "active" and item["binding_consistent"]:
-            if (
-                item["retention_active"]
-                or item["coordination_blocking"]
-                or item["resource_leases"]
-                or item["processes"]
-            ):
-                _set_projection_state(group, "active")
-            else:
-                _set_projection_state(group, "hygiene")
+            # An active lifecycle binding remains operational authority until
+            # exact terminal evidence changes the binding phase. Lease/process
+            # absence alone never proves terminality.
+            _set_projection_state(group, "active")
         elif item["coordination_blocking"]:
             _set_projection_state(group, "active")
         elif item["processes"] and not exact:

@@ -388,6 +388,20 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": ["working-tree-remove", "state-change", "resource-lease"],
         "reversibility": "git-worktree-add-from-recovery-ref",
     },
+    "grabowski_checkout_uncertainty_status": {
+        "category": "checkout-lifecycle",
+        "purpose": "Read persistent unknown-outcome fences for checkout archive and cleanup effects.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
+    "grabowski_checkout_uncertainty_reconcile": {
+        "category": "checkout-lifecycle",
+        "purpose": "Reconcile one persistent unknown-outcome checkout fence from primary Git and database evidence and release coordination only after the outcome is proven.",
+        "risk_class": "high",
+        "effects": ["audit-append", "resource-lease-release", "state-change"],
+        "reversibility": "evidence-bound-state-transition",
+    },
     "grabowski_github": {
         "category": "remote-version-control",
         "purpose": "Run GitHub CLI operations with output redaction.",

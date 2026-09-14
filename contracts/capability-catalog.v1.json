@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "64e25debc7d160de08add1525941b717101c30970bea8d8df60fb6c578f6cb43",
+  "capability_source_sha256": "00f68b06d747cfb34eb35121dbe6ba8143c8d7a0bbc6aa34c295f75605ab1b09",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "75ac50665221bcd87dc459b3c71e70363eabf265c626c0590c069afd8d88808e",
+  "contract_sha256": "4e25bada445a7995325a9406df2fe81a4f7b5940faa2df15588120d4a13956e5",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -882,6 +882,32 @@
       "reversibility": "git-worktree-add-from-recovery-ref",
       "risk_class": "high",
       "tool": "grabowski_checkout_cleanup"
+    },
+    {
+      "category": "checkout-lifecycle",
+      "description": "Read durable unknown-outcome fences for checkout lifecycle effects.",
+      "effects": [],
+      "id": "grabowski_checkout_uncertainty_status",
+      "purpose": "Read persistent unknown-outcome fences for checkout archive and cleanup effects.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_checkout_uncertainty_status"
+    },
+    {
+      "category": "checkout-lifecycle",
+      "description": "Read back one unknown checkout effect and release its fence only when proven.",
+      "effects": [
+        "audit-append",
+        "resource-lease-release",
+        "state-change"
+      ],
+      "id": "grabowski_checkout_uncertainty_reconcile",
+      "purpose": "Reconcile one persistent unknown-outcome checkout fence from primary Git and database evidence and release coordination only after the outcome is proven.",
+      "read_only": false,
+      "reversibility": "evidence-bound-state-transition",
+      "risk_class": "high",
+      "tool": "grabowski_checkout_uncertainty_reconcile"
     },
     {
       "category": "remote-version-control",

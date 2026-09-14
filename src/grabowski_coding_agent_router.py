@@ -42,6 +42,33 @@ QUALITY_CLASSES = {"S", "A", "B", "C", "HARNESS", "CONTROLLER"}
 EFFORT_LEVELS = {"low", "medium", "high", "xhigh", "max"}
 PAID_ONLY_MODEL_IDS = frozenset({"claude-fable-5"})
 VERIFICATION_POLICIES = frozenset({"deterministic", "independent_review", "competition"})
+MANDATORY_INDEPENDENT_VERIFICATION_TASK_CLASSES = frozenset(
+    {"architecture", "complex-patch", "deep-debug", "migration"}
+)
+MANDATORY_INDEPENDENT_VERIFICATION_RISK_FLAGS = frozenset(
+    {
+        "concurrency",
+        "cross_repo",
+        "data_migration",
+        "deployment",
+        "destructive",
+        "high-risk",
+        "privilege",
+        "runtime",
+        "schema",
+        "security",
+        "security-sensitive",
+    }
+)
+SECURITY_REVIEW_RISK_FLAGS = frozenset({"privilege", "security", "security-sensitive"})
+SENSITIVE_EXTERNAL_REVIEW_RISK_FLAGS = frozenset(
+    {"credential", "customer-data", "private-context", "secrets", "user_data"}
+)
+CANONICAL_ROUTING_RISK_FLAGS = frozenset(
+    set(MANDATORY_INDEPENDENT_VERIFICATION_RISK_FLAGS)
+    | set(SENSITIVE_EXTERNAL_REVIEW_RISK_FLAGS)
+    | {"external_api", "prior-attempt-failed", "public-context"}
+)
 POOL_STATUSES = {
     "unknown",
     "available",
@@ -2677,6 +2704,25 @@ def canonical_execution_route(
     controller_owned = set(catalog["policy"].get("controller_owned_task_classes", []))
     task = catalog["task_classes"].get(task_value)
     direct_review_task = bool(task and task.get("independent_review") is True)
+    critical_task_class = bool(task and task.get("critical") is True)
+    technical_risk_flags = sorted(
+        set(flags).intersection(MANDATORY_INDEPENDENT_VERIFICATION_RISK_FLAGS)
+    )
+    security_review_flags = sorted(set(flags).intersection(SECURITY_REVIEW_RISK_FLAGS))
+    sensitive_external_review_flags = sorted(
+        set(flags).intersection(SENSITIVE_EXTERNAL_REVIEW_RISK_FLAGS)
+    )
+    verification_floor_reasons: list[str] = []
+    if task_value in MANDATORY_INDEPENDENT_VERIFICATION_TASK_CLASSES:
+        verification_floor_reasons.append(f"task_class:{task_value}")
+    if critical_task_class:
+        verification_floor_reasons.append("task_class:critical")
+    if novelty_value == "high":
+        verification_floor_reasons.append("novelty:high")
+    verification_floor_reasons.extend(
+        f"risk_flag:{flag}" for flag in technical_risk_flags
+    )
+    verification_floor_required = bool(verification_floor_reasons)
     if verification_policy is not None and (
         not isinstance(verification_policy, str)
         or verification_policy not in VERIFICATION_POLICIES
@@ -2700,14 +2746,41 @@ def canonical_execution_route(
                 "need_review requires verification_policy=independent_review"
             )
         verification_policy_value = "independent_review"
+    elif verification_floor_required:
+        if verification_policy not in (None, "independent_review"):
+            raise CodingAgentRouterError(
+                "verification floor requires verification_policy=independent_review; "
+                "run competition through the separate contrast surface"
+            )
+        verification_policy_value = "independent_review"
     else:
         verification_policy_value = verification_policy or "deterministic"
+    independent_review_required = bool(
+        direct_review_task
+        or review_value
+        or verification_floor_required
+        or verification_policy_value == "independent_review"
+    )
     if effect_profile == "delivery" and verification_policy_value != "independent_review":
         raise CodingAgentRouterError(
             "effect_profile=delivery requires verification_policy=independent_review"
         )
-    external_review_requested = verification_policy_value == "independent_review"
-    review_task_class = task_value if direct_review_task else "independent-review"
+    external_review_requested = independent_review_required
+    external_review_block_reasons = [
+        f"sensitive_context:{flag}" for flag in sensitive_external_review_flags
+    ]
+    external_review_selection_allowed = bool(
+        external_review_requested and not external_review_block_reasons
+    )
+    review_task_class: str | None = (
+        "security-review"
+        if security_review_flags
+        else task_value
+        if direct_review_task
+        else "independent-review"
+        if independent_review_required
+        else None
+    )
     common = {
         "changed_files": changed_value,
         "duration_minutes": duration_value,
@@ -2728,6 +2801,7 @@ def canonical_execution_route(
     scoped_writer_state_error_type: str | None = None
     reviewers: list[dict[str, Any]] = []
     review_fallbacks: list[dict[str, Any]] = []
+    review_ranked_candidates: list[dict[str, Any]] = []
     excluded: dict[str, list[str]] = {}
     review_status = "not-requested"
     review_state_error_type: str | None = None
@@ -2736,7 +2810,7 @@ def canonical_execution_route(
     state_status = "not-required"
     state_error_type: str | None = None
     route_derivations: dict[str, dict[str, Any]] | None = None
-    if scoped_writer_allowed or external_review_requested:
+    if scoped_writer_allowed or external_review_selection_allowed:
         state, state_status, state_error_type = _current_contrast_state(catalog, validation)
         if state is not None:
             state = {**state, "_physical_pool_occupancy": _physical_pool_occupancy()}
@@ -2789,7 +2863,11 @@ def canonical_execution_route(
         elif state_error_type is not None:
             excluded["scoped-writer:state"] = [state_error_type]
 
-    if external_review_requested:
+    if external_review_selection_allowed:
+        if review_task_class is None:
+            raise CodingAgentRouterError(
+                "independent review selection requires a review task class"
+            )
         review_status = state_status
         review_state_error_type = state_error_type
         review_primary_group = controller_route["independence_group"]
@@ -2821,6 +2899,7 @@ def canonical_execution_route(
                     }
                 )
                 if ranked:
+                    review_ranked_candidates = list(ranked)
                     selected_reviewer = ranked[0]
                     if direct_review_task:
                         primary_review_exceptions = set(
@@ -2848,8 +2927,42 @@ def canonical_execution_route(
                     review_status = "no-independent-review-route"
         elif state_error_type is not None:
             excluded["reviewer:state"] = [state_error_type]
+    elif external_review_requested:
+        review_status = "external-review-blocked-sensitive-context"
+        excluded["reviewer:policy"] = list(external_review_block_reasons)
+
+    executable_review_candidates = [
+        candidate
+        for candidate in review_ranked_candidates
+        if candidate.get("execution_eligible_if_separately_authorized") is True
+    ]
+    if (
+        effect_profile == "delivery"
+        and independent_review_required
+        and executable_review_candidates
+        and (
+            not reviewers
+            or reviewers[0].get("execution_eligible_if_separately_authorized")
+            is not True
+        )
+    ):
+        selected_delivery_reviewer = executable_review_candidates[0]
+        reviewers = [selected_delivery_reviewer]
+        review_fallbacks = [
+            candidate
+            for candidate in review_ranked_candidates
+            if candidate.get("route") != selected_delivery_reviewer.get("route")
+        ][:5]
 
     selected_reviewer = reviewers[0] if reviewers else None
+    review_gap_value = max(
+        0,
+        (1 if independent_review_required else 0)
+        - len(executable_review_candidates),
+    )
+    delivery_review_ready = (
+        not independent_review_required or bool(executable_review_candidates)
+    )
     external_primary_review = bool(
         direct_review_task
         and isinstance(selected_reviewer, dict)
@@ -2900,10 +3013,14 @@ def canonical_execution_route(
         raise CodingAgentRouterError(
             "effect_profile=delivery requires an eligible scoped_writer route"
         )
+    if effect_profile == "delivery" and not delivery_review_ready:
+        raise CodingAgentRouterError(
+            "effect_profile=delivery requires an available independent reviewer route"
+        )
     risk = {
         "flags": flags,
         "novelty": novelty_value,
-        "critical_task_class": bool(task and task.get("critical") is True),
+        "critical_task_class": critical_task_class,
     }
     body = {
         "schema_version": 2,
@@ -2915,6 +3032,14 @@ def canonical_execution_route(
         "writer_route": writer_route,
         "effect_profile": effect_profile,
         "verification_policy": verification_policy_value,
+        "independent_review_required": independent_review_required,
+        "review_task_class": review_task_class,
+        "external_review_selection_allowed": external_review_selection_allowed,
+        "external_review_block_reasons": external_review_block_reasons,
+        "verification_floor": {
+            "required": verification_floor_required,
+            "reasons": verification_floor_reasons,
+        },
         "risk": risk,
         "executor_reason": executor_reason,
         "catalog_sha256": validation["catalog_sha256"],
@@ -2948,7 +3073,7 @@ def canonical_execution_route(
         "review_fallbacks": review_fallbacks,
         "review_status": review_status,
         "review_state_error_type": review_state_error_type,
-        "review_gap": max(0, (1 if external_review_requested else 0) - len(reviewers)),
+        "review_gap": review_gap_value,
         "review_quorum": {
             "direct_operator": 0 if external_primary_review else 1,
             "external_authoritative_target": 1 if external_primary_review else 0,
@@ -2984,7 +3109,7 @@ def canonical_execution_route(
             "execution_authority",
             "candidate_correctness",
             "merge_readiness",
-            "need_for_external_agents",
+            "external_route_availability",
             "external_primary_authority",
         ],
     }
