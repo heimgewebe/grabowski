@@ -1792,6 +1792,40 @@ class WorkAcquireTests(unittest.TestCase):
         acquire.assert_not_called()
         ensure.assert_not_called()
 
+    def test_terminal_closeout_persists_managed_checkout_physical_identity(self) -> None:
+        params = self.parameters()
+        inputs, receipt = self.store_lane(params)
+        lane_id = str(inputs["lane_id"])
+        with work_acquire._lane_lock(lane_id) as path:
+            current = work_acquire._read_state(path)
+            self.assertIsInstance(current, dict)
+            assert current is not None
+            current["worktree_receipt"] = {
+                "lifecycle": {"checkout_path": str(self.target)}
+            }
+            receipt = work_acquire._write_state(path, current)
+        assessment = self.terminal_assessment(lane_id, 200)
+        physical = {
+            "schema_version": 1,
+            "kind": "grabowski.physical_checkout_identity",
+            "root": {"path": str(self.target), "device": 1, "inode": 2},
+            "git_dir": {"path": str(self.root / "git-dir"), "device": 1, "inode": 3},
+            "common_dir": {"path": str(self.repo / ".git"), "device": 1, "inode": 4},
+            "physical_identity_sha256": "f" * 64,
+        }
+        with (
+            patch.object(work_acquire.physical_checkout, "capture_physical_checkout_identity", return_value=physical) as capture,
+            patch.object(work_acquire, "_converge_terminal_checkout_lifecycle", return_value=None),
+            patch.object(work_acquire, "_converge_terminal_resource_leases", return_value=None),
+        ):
+            stored = work_acquire.persist_terminal_closeout(
+                lane_id, assessment, expected_receipt_sha256=str(receipt["receipt_sha256"])
+            )
+
+        capture.assert_called_once_with(str(self.target))
+        self.assertEqual(stored["terminal_closeout"]["checkout_physical_identity"], physical)
+        self.assertNotIn("terminal_closeout_pending", stored)
+
     def test_candidate_adopted_defers_resource_release_until_publication_closeout(self) -> None:
         params = self.parameters()
         inputs, receipt = self.store_lane(params)
@@ -1861,9 +1895,98 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertEqual("released", converged["state"])
         self.assertEqual(0, converged["live_owner_lease_count"])
         self.assertEqual([late_key], converged["released_resource_keys"])
+        self.assertFalse(converged["replayed"])
+        self.assertIsInstance(converged["resource_lease_closeout"], dict)
         release.assert_called_once_with(
             owner_id, [late_key], force=False, expected_leases=[snapshot]
         )
+        durable = work_acquire._read_state(self.state / f"{lane_id}.json")
+        self.assertIsNotNone(durable)
+        assert durable is not None
+        evidence = work_acquire._terminal_resource_closeout_evidence(
+            durable, assessment=assessment
+        )
+        self.assertEqual(evidence, converged["resource_lease_closeout"])
+        self.assertEqual("released", evidence["state"])
+        durable_receipt_sha256 = durable["receipt_sha256"]
+
+        with (
+            patch.object(work_acquire.resources, "list_resources", return_value=[]),
+            patch.object(work_acquire.resources, "count_resources", return_value=0),
+            patch.object(work_acquire.resources, "grabowski_resource_release") as replay_release,
+        ):
+            replayed = work_acquire.converge_terminal_resource_closeout(
+                lane_id, expected_closeout_states={"candidate_adopted"}
+            )
+        self.assertTrue(replayed["replayed"])
+        self.assertEqual(durable_receipt_sha256, replayed["durable_receipt_sha256"])
+        self.assertEqual(evidence, replayed["resource_lease_closeout"])
+        replay_release.assert_not_called()
+
+    def test_deferred_resource_evidence_preserves_terminal_audit_binding(self) -> None:
+        params = self.parameters()
+        inputs, receipt = self.store_lane(params)
+        lane_id = str(inputs["lane_id"])
+        assessment = closeout.assess(
+            closeout.LaneCloseoutObservation(
+                lane_id=lane_id,
+                repository=str(self.repo),
+                workspace=str(self.target),
+                branch="feat/authority-p0",
+                base_revision=SHA,
+                writer_state="completed",
+                task_active=False,
+                process_active=False,
+                lease_active=True,
+                git_dirty=False,
+                head_sha=SHA,
+                candidate_id="e" * 64,
+                adoption_receipt_sha256="f" * 64,
+                adoption_commit_sha=SHA,
+            ),
+            observed_at_unix=200,
+        )
+        audit_events: list[dict] = []
+
+        def append_audit(event: dict) -> str:
+            audit_events.append(dict(event))
+            return "a" * 64
+
+        def lookup_audit(event: dict) -> str | None:
+            return "a" * 64 if any(item == event for item in audit_events) else None
+
+        terminal = work_acquire.persist_terminal_closeout(
+            lane_id,
+            assessment,
+            expected_receipt_sha256=str(receipt["receipt_sha256"]),
+            audit_fn=append_audit,
+            audit_lookup_fn=lookup_audit,
+        )
+        terminal_receipt_sha256 = terminal["receipt_sha256"]
+        self.assertEqual(len(audit_events), 1)
+        with (
+            patch.object(work_acquire.resources, "list_resources", return_value=[]),
+            patch.object(work_acquire.resources, "count_resources", return_value=0),
+        ):
+            converged = work_acquire.converge_terminal_resource_closeout(
+                lane_id, expected_closeout_states={"candidate_adopted"}
+            )
+        self.assertEqual(
+            converged["resource_lease_closeout"]["terminal_receipt_sha256"],
+            terminal_receipt_sha256,
+        )
+        self.assertNotEqual(converged["durable_receipt_sha256"], terminal_receipt_sha256)
+
+        replayed = work_acquire.persist_terminal_closeout(
+            lane_id,
+            assessment,
+            expected_receipt_sha256=str(receipt["receipt_sha256"]),
+            audit_fn=append_audit,
+            audit_lookup_fn=lookup_audit,
+        )
+        self.assertTrue(replayed["replayed"])
+        self.assertEqual(replayed["terminal_closeout_audit_record_sha256"], "a" * 64)
+        self.assertEqual(len(audit_events), 1)
 
     def test_terminal_resource_convergence_releases_all_current_owner_generations(self) -> None:
         params = self.parameters()

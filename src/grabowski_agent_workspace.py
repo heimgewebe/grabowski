@@ -30,6 +30,7 @@ import grabowski_checkouts as checkouts
 import grabowski_work_admission as work_admission
 import grabowski_lifecycle_collectors as lifecycle_collectors
 import grabowski_lifecycle_effect_plan as lifecycle_effect_plan
+import grabowski_physical_checkout as physical_checkout
 import grabowski_work_acquire as work_acquire
 from grabowski_agent_sandbox import safe_git_environment
 try:
@@ -10839,7 +10840,59 @@ def _terminal_lane_reconciliation_binding(manifest: dict[str, Any]) -> dict[str,
             ) from exc
         if live_owner_leases:
             raise AgentWorkspaceError("terminal work lane still has live resource leases")
+        if assessment.get("lease_release_ready") is not True:
+            raise AgentWorkspaceError(
+                "terminal work lane closeout is not resource-release-ready"
+            )
+        deferred_resource_closeout = None
+        if (
+            assessment.get("closeout_state")
+            in work_acquire.DEFERRED_RESOURCE_RELEASE_CLOSEOUT_STATES
+        ):
+            deferred_resource_closeout = (
+                work_acquire._terminal_resource_closeout_evidence(
+                    receipt, assessment=assessment
+                )
+            )
+            if deferred_resource_closeout is None:
+                raise AgentWorkspaceError(
+                    "terminal work lane deferred resource release lacks durable convergence evidence"
+                )
         source = inputs.get("source")
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        worktree_receipt = receipt.get("worktree_receipt")
+        lane_lifecycle = (
+            worktree_receipt.get("lifecycle")
+            if isinstance(worktree_receipt, dict)
+            else None
+        )
+        if (
+            not isinstance(lane_lifecycle, dict)
+            or lane_lifecycle.get("source") != lifecycle_source
+        ):
+            raise AgentWorkspaceError(
+                "terminal work lane lifecycle source mismatches durable lane receipt"
+            )
+        terminal_physical_identity = terminal.get("checkout_physical_identity")
+        terminal_physical_root = (
+            terminal_physical_identity.get("root")
+            if isinstance(terminal_physical_identity, dict)
+            else None
+        )
+        if (
+            not isinstance(terminal_physical_identity, dict)
+            or not isinstance(terminal_physical_root, dict)
+            or terminal_physical_root.get("path") != manifest.get("writer_worktree")
+            or not isinstance(
+                terminal_physical_identity.get("physical_identity_sha256"), str
+            )
+            or SHA256_RE.fullmatch(
+                terminal_physical_identity["physical_identity_sha256"]
+            ) is None
+        ):
+            raise AgentWorkspaceError(
+                "terminal work lane lacks original physical checkout identity"
+            )
         binding = manifest.get("binding")
         expected_identity = {
             "repo": manifest.get("repository"),
@@ -10875,8 +10928,180 @@ def _terminal_lane_reconciliation_binding(manifest: dict[str, Any]) -> dict[str,
         "terminal_receipt_sha256": receipt_sha256,
         "closeout_state": assessment["closeout_state"],
         "assessment_sha256": assessment["assessment_sha256"],
+        "terminal_head_sha": assessment.get("terminal_head_sha"),
+        "source": dict(source),
+        "lifecycle_source": dict(lifecycle_source),
+        "deferred_resource_closeout_evidence_sha256": (
+            deferred_resource_closeout.get("evidence_sha256")
+            if isinstance(deferred_resource_closeout, dict)
+            else None
+        ),
+        "checkout_physical_identity": dict(terminal_physical_identity),
         "live_owner_lease_count": 0,
     }
+
+
+def _terminal_lane_cleanup_continuity(
+    manifest: dict[str, Any],
+    terminal_lane: dict[str, Any],
+    checkout_state: dict[str, Any],
+    cleanup_intent: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Bind terminal lane authority to the checkout that is still being cleaned."""
+    if terminal_lane.get("required") is not True or terminal_lane.get("valid") is not True:
+        return terminal_lane
+    if checkout_state.get("exists") is not True:
+        return terminal_lane
+    lane_id = terminal_lane.get("lane_id")
+    try:
+        if not isinstance(lane_id, str) or re.fullmatch(r"[0-9a-f]{32}", lane_id) is None:
+            raise AgentWorkspaceError("terminal lane identity is invalid")
+        checkout_key = checkout_state.get("checkout_key")
+        checkout_head = checkout_state.get("head")
+        checkout_branch = checkout_state.get("branch")
+        if not all(
+            isinstance(value, str) and value
+            for value in (checkout_key, checkout_head, checkout_branch)
+        ):
+            raise AgentWorkspaceError("current checkout identity is incomplete")
+        if terminal_lane.get("terminal_head_sha") != checkout_head:
+            raise AgentWorkspaceError("current checkout head differs from terminal lane head")
+        lifecycle = checkouts._lifecycle_bindings([checkout_key]).get(checkout_key)
+        retention = checkouts._retention_records([checkout_key]).get(checkout_key)
+        if not isinstance(lifecycle, dict):
+            raise AgentWorkspaceError("current checkout lifecycle binding is missing")
+        if not isinstance(retention, dict):
+            raise AgentWorkspaceError("current checkout retention binding is missing")
+        owner_id = f"lane:{lane_id}"
+        archived_intent = bool(
+            isinstance(cleanup_intent, dict)
+            and isinstance(cleanup_intent.get("archive_id"), str)
+            and cleanup_intent.get("archive_id")
+        )
+        expected_phase = "archived" if archived_intent else "completed_retained"
+        expected = {
+            "owner_id": owner_id,
+            "checkout_path": manifest.get("writer_worktree"),
+            "repo_path": manifest.get("repository"),
+            "expected_head": checkout_head,
+            "expected_branch": checkout_branch,
+            "phase": expected_phase,
+        }
+        mismatches = {
+            key: {"expected": value, "actual": lifecycle.get(key)}
+            for key, value in expected.items()
+            if lifecycle.get(key) != value
+        }
+        lifecycle_source = lifecycle.get("source")
+        expected_source = terminal_lane.get("lifecycle_source")
+        if (
+            not isinstance(expected_source, dict)
+            or not isinstance(expected_source.get("kind"), str)
+            or not isinstance(expected_source.get("id"), str)
+        ):
+            raise AgentWorkspaceError("terminal lane lifecycle source identity is unavailable")
+        if lifecycle_source != expected_source:
+            mismatches["source"] = {
+                "expected": expected_source,
+                "actual": lifecycle_source,
+            }
+        if mismatches:
+            raise AgentWorkspaceError(
+                "current checkout lifecycle no longer matches terminal lane: "
+                + json.dumps(mismatches, sort_keys=True)
+            )
+        retention_expected = {
+            "owner_id": owner_id,
+            "checkout_path": manifest.get("writer_worktree"),
+            "repo_path": manifest.get("repository"),
+            "expected_head": checkout_head,
+            "expected_branch": checkout_branch,
+        }
+        retention_mismatches = {
+            key: {"expected": value, "actual": retention.get(key)}
+            for key, value in retention_expected.items()
+            if retention.get(key) != value
+        }
+        if retention_mismatches:
+            raise AgentWorkspaceError(
+                "current checkout retention no longer matches terminal lane: "
+                + json.dumps(retention_mismatches, sort_keys=True)
+            )
+        physical_identity = checkout_state.get("physical_identity")
+        if (
+            not isinstance(physical_identity, dict)
+            or not isinstance(physical_identity.get("physical_identity_sha256"), str)
+            or SHA256_RE.fullmatch(physical_identity["physical_identity_sha256"]) is None
+        ):
+            raise AgentWorkspaceError("current checkout physical identity is unavailable")
+        terminal_physical = terminal_lane.get("checkout_physical_identity")
+        if not isinstance(terminal_physical, dict):
+            raise AgentWorkspaceError(
+                "terminal work lane lacks original physical checkout identity"
+            )
+        try:
+            terminal_verified = physical_checkout.verify_physical_checkout_identity(
+                terminal_physical
+            )
+        except Exception as exc:
+            raise AgentWorkspaceError(
+                f"terminal checkout physical identity changed: {_error_summary(exc)}"
+            ) from exc
+        if (
+            terminal_verified.get("physical_identity_sha256")
+            != physical_identity.get("physical_identity_sha256")
+        ):
+            raise AgentWorkspaceError("terminal checkout physical identity changed")
+        expected_physical = (
+            cleanup_intent.get("checkout_physical_identity")
+            if isinstance(cleanup_intent, dict)
+            else None
+        )
+        if archived_intent:
+            if not isinstance(expected_physical, dict):
+                raise AgentWorkspaceError("archived cleanup intent lacks physical checkout identity")
+            if (
+                expected_physical.get("physical_identity_sha256")
+                != terminal_physical.get("physical_identity_sha256")
+            ):
+                raise AgentWorkspaceError(
+                    "archived cleanup intent physical identity differs from terminal lane"
+                )
+            verified = physical_checkout.verify_physical_checkout_identity(expected_physical)
+            if (
+                verified.get("physical_identity_sha256")
+                != physical_identity.get("physical_identity_sha256")
+            ):
+                raise AgentWorkspaceError("physical checkout identity changed after archive")
+        return {
+            **terminal_lane,
+            "checkout_key": checkout_key,
+            "checkout_lifecycle_phase": lifecycle.get("phase"),
+            "checkout_lifecycle_updated_at_unix": lifecycle.get("updated_at_unix"),
+            "retention_until_unix": retention.get("retention_until_unix"),
+            "physical_identity_sha256": physical_identity["physical_identity_sha256"],
+        }
+    except Exception as exc:
+        return {
+            **terminal_lane,
+            "valid": False,
+            "lane_id": lane_id,
+            "error": _error_summary(exc),
+        }
+
+
+def _verify_cleanup_intent_physical_identity(cleanup_intent: dict[str, Any]) -> dict[str, Any]:
+    expected = cleanup_intent.get("checkout_physical_identity")
+    if not isinstance(expected, dict):
+        raise AgentWorkspaceActionError(
+            "workspace cleanup intent lacks physical checkout identity"
+        )
+    try:
+        return physical_checkout.verify_physical_checkout_identity(expected)
+    except Exception as exc:
+        raise AgentWorkspaceActionError(
+            f"workspace checkout physical identity changed: {_error_summary(exc)}"
+        ) from exc
 
 
 def _stale_workspace_reconciliation_plan(
@@ -11079,6 +11304,11 @@ def _workspace_cleanup_plan_data(
         )
     )
     stale_reconciliation = _stale_workspace_reconciliation_plan(manifest, liveness)
+    terminal_lane_cleanup_reconciliation = (
+        stale_reconciliation.get("terminal_lane_reconciliation")
+        if fully_closed and _lane_backed(manifest)
+        else {"required": False, "valid": True}
+    )
     blockers: list[dict[str, Any]] = []
     cleanup_receipt = manifest.get("workspace_cleanup_receipt")
     cleanup_intent = manifest.get("workspace_cleanup_intent")
@@ -11108,13 +11338,18 @@ def _workspace_cleanup_plan_data(
         blockers.append({"code": "workspace_not_closed"})
     elif not _resource_close_contract_satisfied(manifest, close_receipt):
         blockers.append({"code": "workspace_resource_close_contract_unsatisfied"})
-    if fully_closed and _lane_backed(manifest):
+    if (
+        fully_closed
+        and _lane_backed(manifest)
+        and terminal_lane_cleanup_reconciliation.get("valid") is not True
+    ):
         blockers.append(
             {
                 "code": "lane_owned_checkout_preserved",
                 "lane_id": manifest.get("resources", {})
                 .get("lane_binding", {})
                 .get("lane_id"),
+                "error": terminal_lane_cleanup_reconciliation.get("error"),
             }
         )
     if fully_closed:
@@ -11238,6 +11473,17 @@ def _workspace_cleanup_plan_data(
                     "repo": str(top_level),
                 }
             )
+            try:
+                checkout_state["physical_identity"] = (
+                    physical_checkout.capture_physical_checkout_identity(checkout_path)
+                )
+            except Exception as exc:
+                blockers.append(
+                    {
+                        "code": "checkout_physical_identity_unverified",
+                        "error": _error_summary(exc),
+                    }
+                )
             if not clean:
                 blockers.append(
                     {
@@ -11298,6 +11544,29 @@ def _workspace_cleanup_plan_data(
                     "error": _error_summary(exc),
                 }
             )
+    if fully_closed and _lane_backed(manifest):
+        terminal_lane_cleanup_reconciliation = _terminal_lane_cleanup_continuity(
+            manifest,
+            terminal_lane_cleanup_reconciliation,
+            checkout_state,
+            cleanup_intent if isinstance(cleanup_intent, dict) else None,
+        )
+        stale_reconciliation = {
+            **stale_reconciliation,
+            "terminal_lane_reconciliation": terminal_lane_cleanup_reconciliation,
+        }
+        if (
+            terminal_lane_cleanup_reconciliation.get("valid") is not True
+            and not any(item.get("code") == "lane_owned_checkout_preserved" for item in blockers)
+        ):
+            blockers.append(
+                {
+                    "code": "lane_owned_checkout_preserved",
+                    "lane_id": terminal_lane_cleanup_reconciliation.get("lane_id"),
+                    "error": terminal_lane_cleanup_reconciliation.get("error"),
+                }
+            )
+
     archive_lifecycle: dict[str, Any] = {
         "state": "not_archived",
         "archive_id": None,
@@ -11440,7 +11709,11 @@ def _workspace_cleanup_plan_data(
     cleanup_intent_state = (
         cleanup_intent.get("state") if isinstance(cleanup_intent, dict) else None
     )
-    if fully_closed and _lane_backed(manifest):
+    if (
+        fully_closed
+        and _lane_backed(manifest)
+        and terminal_lane_cleanup_reconciliation.get("valid") is not True
+    ):
         lifecycle_state = "lane_owned_preserved"
     elif cleanup_receipt_valid:
         lifecycle_state = "cleaned"
@@ -11450,6 +11723,13 @@ def _workspace_cleanup_plan_data(
         lifecycle_state = "cleanup_outcome_unknown"
     elif cleanup_intent_state == "recovery_required":
         lifecycle_state = "cleanup_recovery_required"
+    elif (
+        fully_closed
+        and _lane_backed(manifest)
+        and terminal_lane_cleanup_reconciliation.get("valid") is True
+        and not checkout_state["exists"]
+    ):
+        lifecycle_state = "terminal_lane_historical_absent"
     else:
         lifecycle_state = "archive_eligible"
     archive_eligible = bool(base_eligible and lifecycle_state == "archive_eligible")
@@ -11464,6 +11744,7 @@ def _workspace_cleanup_plan_data(
         "archive_state_unverified": "verify-archive-state",
         "cleaned": "none",
         "lane_owned_preserved": "none",
+        "terminal_lane_historical_absent": "none",
     }.get(lifecycle_state, "reconcile-cleanup-state")
     body = {
         "schema_version": 1,
@@ -12465,6 +12746,21 @@ def _workspace_lifecycle_classification(
             ]
         except Exception as exc:
             lease_read_error = _error_summary(exc)
+    lifecycle_expected_owner_id = _workspace_cleanup_owner(identifier)
+    if _lane_backed(manifest):
+        terminal_lane = _terminal_lane_reconciliation_binding(manifest)
+        if terminal_lane.get("valid") is True:
+            expected_lane_owner_id = f"lane:{terminal_lane['lane_id']}"
+            manifest_owner_id = (
+                resource_values.get("owner_id")
+                if isinstance(resource_values, dict)
+                else None
+            )
+            if manifest_owner_id != expected_lane_owner_id:
+                raise AgentWorkspaceError(
+                    "terminal lane workspace owner does not match exact lane identity"
+                )
+            lifecycle_expected_owner_id = expected_lane_owner_id
     sources = {
         "task": lifecycle_collectors.SourceReadback(
             observed=True,
@@ -12508,7 +12804,7 @@ def _workspace_lifecycle_classification(
             observed_at_unix=observed_at_unix,
             sources=sources,
             exact_resource_keys=exact_resource_keys,
-            expected_owner_id=_workspace_cleanup_owner(identifier),
+            expected_owner_id=lifecycle_expected_owner_id,
             checkout_path=str(manifest["writer_worktree"]),
             process_scope=str(manifest["writer_worktree"]),
         )
@@ -12846,10 +13142,12 @@ def _workspace_archive_recovery_readback(
 
 
 def _workspace_retention_post_state(
-    manifest: dict[str, Any], archive_id: str
+    manifest: dict[str, Any], archive_id: str, *, expected_owner: str
 ) -> dict[str, str]:
     archive = checkouts._load_archive(archive_id)
-    archive_post_state = _workspace_archive_post_state(manifest, archive_id)
+    archive_post_state = _workspace_archive_post_state(
+        manifest, archive_id, expected_owner=expected_owner
+    )
     if archive.get("cleaned_at_unix") is None or archive.get("cleanup_plan_id") is None:
         raise AgentWorkspaceActionError(
             "retention convergence archive is not marked cleaned"
@@ -12967,6 +13265,162 @@ def _verified_workspace_cleanup_archive(
     return archive if head_ref_valid else None
 
 
+def _workspace_recover_persisted_archive_uncertainty(
+    manifest: dict[str, Any],
+    cleanup_plan: dict[str, Any],
+    *,
+    owner: str,
+) -> dict[str, Any] | None:
+    "Reconcile one exact prior archive outcome before another archive effect."
+    checkout = cleanup_plan.get("checkout")
+    if not isinstance(checkout, dict):
+        raise AgentWorkspaceActionError(
+            "workspace archive recovery lacks checkout identity"
+        )
+    checkout_key = checkout.get("checkout_key")
+    expected_head = checkout.get("head")
+    expected_branch = checkout.get("branch")
+    repo = cleanup_plan.get("repository")
+    checkout_path = cleanup_plan.get("writer_worktree")
+    if not all(
+        isinstance(value, str)
+        for value in (
+            checkout_key,
+            expected_head,
+            expected_branch,
+            repo,
+            checkout_path,
+        )
+    ):
+        raise AgentWorkspaceActionError(
+            "workspace archive recovery lacks exact checkout identity"
+        )
+    active = [
+        fence
+        for fence in checkouts._active_checkout_operation_uncertainties()
+        if fence.get("checkout_key") == checkout_key
+    ]
+    if not active:
+        return None
+    matching: list[dict[str, Any]] = []
+    for fence in active:
+        evidence = fence.get("evidence")
+        operation_id = fence.get("operation_id")
+        if (
+            fence.get("operation") == "archive"
+            and fence.get("owner_id") == owner
+            and isinstance(operation_id, str)
+            and isinstance(evidence, dict)
+            and evidence.get("archive_id") == operation_id
+            and evidence.get("checkout_key") == checkout_key
+            and evidence.get("owner_id") == owner
+            and evidence.get("repo") == repo
+            and evidence.get("checkout_path") == checkout_path
+            and evidence.get("expected_head") == expected_head
+            and evidence.get("expected_branch") == expected_branch
+        ):
+            matching.append(fence)
+    if len(active) != 1 or len(matching) != 1:
+        raise AgentWorkspaceActionError(
+            "workspace archive recovery found conflicting checkout uncertainty fence"
+        )
+    fence = matching[0]
+    archive_id = str(fence["operation_id"])
+    expected_evidence = dict(fence["evidence"])
+    try:
+        archive = checkouts._load_archive(archive_id)
+    except ValueError:
+        reconciliation = _workspace_reconcile_checkout_uncertainty(
+            checkout_key=checkout_key,
+            owner=owner,
+            operation="archive",
+            operation_id=archive_id,
+            expected_evidence=expected_evidence,
+            release_operation_lease=False,
+        )
+        if (
+            isinstance(reconciliation, dict)
+            and reconciliation.get("outcome") == "confirmed_no_effect"
+        ):
+            return None
+        raise AgentWorkspaceActionError(
+            "workspace archive uncertainty did not prove a reusable archive "
+            "or confirmed no-effect"
+        )
+    _workspace_archive_post_state(
+        manifest,
+        archive_id,
+        expected_checkout_key=checkout_key,
+        expected_head=expected_head,
+        expected_branch=expected_branch,
+        expected_owner=owner,
+    )
+    reconciliation = _workspace_reconcile_checkout_uncertainty(
+        checkout_key=checkout_key,
+        owner=owner,
+        operation="archive",
+        operation_id=archive_id,
+        expected_evidence=expected_evidence,
+        release_operation_lease=True,
+    )
+    if not isinstance(reconciliation, dict):
+        raise AgentWorkspaceActionError(
+            "workspace archive recovery lost its durable uncertainty fence"
+        )
+    return archive
+
+
+def _workspace_reconcile_checkout_uncertainty(
+    *,
+    checkout_key: str,
+    owner: str,
+    operation: str,
+    operation_id: str,
+    expected_evidence: dict[str, Any],
+    release_operation_lease: bool = False,
+) -> dict[str, Any] | None:
+    active_fences = [
+        fence
+        for fence in checkouts._active_checkout_operation_uncertainties()
+        if fence.get("checkout_key") == checkout_key
+    ]
+    if not active_fences:
+        return None
+    matching_fences = [
+        fence
+        for fence in active_fences
+        if fence.get("operation") == operation
+        and fence.get("operation_id") == operation_id
+        and fence.get("owner_id") == owner
+        and isinstance(fence.get("evidence"), dict)
+        and all(fence["evidence"].get(key) == value for key, value in expected_evidence.items())
+    ]
+    if len(active_fences) != 1 or len(matching_fences) != 1:
+        raise AgentWorkspaceActionError(
+            f"workspace {operation} reconciliation found conflicting checkout uncertainty fence"
+        )
+    fence = matching_fences[0]
+    if release_operation_lease:
+        # Primary post-state was already verified. The durable fence remains active
+        # while the short-lived operation lease is released, so no authority gap opens.
+        checkouts._release_uncertainty_fence_resources(fence)
+    reconciliation = checkouts.grabowski_checkout_uncertainty_reconcile(
+        fence["fence_id"],
+        "reconcile-checkout-operation-outcome",
+    )
+    if reconciliation.get("state") not in {"reconciled", "already_reconciled"}:
+        readback = reconciliation.get("readback")
+        reason = (
+            readback.get("reason")
+            if isinstance(readback, dict)
+            else reconciliation.get("reason")
+        ) or "outcome-not-proven"
+        raise AgentWorkspaceActionError(
+            f"workspace {operation} uncertainty remains fenced: {reason}"
+        )
+    return reconciliation
+
+
 def _workspace_cleanup_finalize_missing(
     manifest: dict[str, Any], expected_plan_sha256: str, owner: str
 ) -> dict[str, Any] | None:
@@ -12978,11 +13432,31 @@ def _workspace_cleanup_finalize_missing(
     archive = _verified_workspace_cleanup_archive(manifest, intent, owner)
     if archive is None:
         return None
+    checkout_key = archive.get("checkout_key")
+    cleanup_plan_id = archive.get("cleanup_plan_id")
+    if not isinstance(checkout_key, str) or not isinstance(cleanup_plan_id, str):
+        raise AgentWorkspaceActionError(
+            "workspace cleanup reconciliation lacks exact checkout cleanup identity"
+        )
+    uncertainty_reconciliation = _workspace_reconcile_checkout_uncertainty(
+        checkout_key=checkout_key,
+        owner=owner,
+        operation="cleanup",
+        operation_id=cleanup_plan_id,
+        expected_evidence={
+            "archive_id": archive.get("archive_id"),
+            "plan_id": cleanup_plan_id,
+            "checkout_key": checkout_key,
+            "owner_id": owner,
+        },
+        release_operation_lease=True,
+    )
     return {
         "archive_id": archive["archive_id"],
-        "checkout_cleanup_plan_id": archive["cleanup_plan_id"],
+        "checkout_cleanup_plan_id": cleanup_plan_id,
         "applied_at_unix": archive["cleaned_at_unix"],
         "reconciled_after_missing_worktree": True,
+        "checkout_uncertainty_reconciliation": uncertainty_reconciliation,
     }
 
 
@@ -13081,9 +13555,23 @@ def grabowski_agent_workspace_cleanup(
     with _lock(identifier):
         manifest = _manifest(identifier)
         if _lane_backed(manifest):
-            raise AgentWorkspaceError(
-                "lane-backed workspace cleanup is owned exclusively by Work Lane closeout"
+            terminal_lane = _terminal_lane_reconciliation_binding(manifest)
+            if terminal_lane.get("valid") is not True:
+                raise AgentWorkspaceError(
+                    "lane-backed workspace cleanup requires a valid terminal Work Lane closeout"
+                )
+            resources_value = manifest.get("resources")
+            lane_owner = (
+                resources_value.get("owner_id")
+                if isinstance(resources_value, dict)
+                else None
             )
+            expected_lane_owner = f"lane:{terminal_lane['lane_id']}"
+            if lane_owner != expected_lane_owner:
+                raise AgentWorkspaceError(
+                    "lane-backed workspace cleanup owner does not match exact lane identity"
+                )
+            owner = lane_owner
         existing_receipt = manifest.get("workspace_cleanup_receipt")
         cleanup_integrity = _workspace_cleanup_integrity_status(
             manifest, existing_receipt
@@ -13245,6 +13733,7 @@ def grabowski_agent_workspace_cleanup(
                 "writer_worktree": plan["writer_worktree"],
                 "writer_branch": plan["checkout"]["branch"],
                 "writer_head": plan["checkout"]["head"],
+                "checkout_physical_identity": plan["checkout"].get("physical_identity"),
                 "archive_id": reusable_archive_id,
                 "lifecycle_effects": (
                     dict(prior_intent.get("lifecycle_effects", {}))
@@ -13286,7 +13775,9 @@ def grabowski_agent_workspace_cleanup(
                     reference=_workspace_lifecycle_effect_reference(effect),
                 )
             post_state = _workspace_retention_post_state(
-                manifest, str(reconciliation["archive_id"])
+                manifest,
+                str(reconciliation["archive_id"]),
+                expected_owner=owner,
             )
             effect_receipt = _workspace_lifecycle_effect_finish(
                 effect,
@@ -13347,6 +13838,33 @@ def grabowski_agent_workspace_cleanup(
                 "workspace cleanup plan lacks a checkout identity"
             )
         if archive_id is None:
+            effect_mutation_ambiguous = True
+            recovered_archive = _workspace_recover_persisted_archive_uncertainty(
+                current_manifest,
+                plan,
+                owner=owner,
+            )
+            effect_mutation_ambiguous = False
+            if recovered_archive is not None:
+                archive_id = str(recovered_archive["archive_id"])
+                intent["archive_id"] = archive_id
+                with _lock(identifier):
+                    current_manifest = _manifest(identifier)
+                    current_intent = current_manifest.get(
+                        "workspace_cleanup_intent"
+                    )
+                    if (
+                        not isinstance(current_intent, dict)
+                        or current_intent.get("intent_id") != intent["intent_id"]
+                    ):
+                        raise AgentWorkspaceActionError(
+                            "workspace cleanup intent changed during "
+                            "pre-archive recovery"
+                        )
+                    current_intent["archive_id"] = archive_id
+                    current_manifest["workspace_cleanup_intent"] = current_intent
+                    _write_manifest(current_manifest)
+        if archive_id is None:
             previous_archive = checkouts._latest_archive_for_key(checkout_key)
             previous_archive_id = (
                 str(previous_archive["archive_id"])
@@ -13371,6 +13889,7 @@ def grabowski_agent_workspace_cleanup(
                     )
                 effect_mutation_ambiguous = True
                 try:
+                    _verify_cleanup_intent_physical_identity(intent)
                     archive_result = checkouts.grabowski_checkout_archive(
                         repo=plan["repository"],
                         checkout_path=plan["writer_worktree"],
@@ -13381,6 +13900,7 @@ def grabowski_agent_workspace_cleanup(
                         ),
                         expected_head=str(plan["checkout"]["head"]),
                         expected_branch=str(plan["checkout"]["branch"]),
+                        expected_physical_identity=intent["checkout_physical_identity"],
                     )
                     archive_id = str(archive_result["archive"]["archive_id"])
                     with _lock(identifier):
@@ -13465,6 +13985,20 @@ def grabowski_agent_workspace_cleanup(
                     if recovered_archive is None:
                         raise
                     archive_id = str(recovered_archive["archive_id"])
+                    _workspace_reconcile_checkout_uncertainty(
+                        checkout_key=checkout_key,
+                        owner=owner,
+                        operation="archive",
+                        operation_id=archive_id,
+                        expected_evidence={
+                            "archive_id": archive_id,
+                            "checkout_key": checkout_key,
+                            "owner_id": owner,
+                            "expected_head": str(plan["checkout"]["head"]),
+                            "expected_branch": str(plan["checkout"]["branch"]),
+                        },
+                        release_operation_lease=True,
+                    )
                     with _lock(identifier):
                         current_manifest = _manifest(identifier)
                         current_intent = current_manifest.get(
@@ -13658,6 +14192,7 @@ def grabowski_agent_workspace_cleanup(
                 "worktree_preserved": True,
             }
 
+        _verify_cleanup_intent_physical_identity(intent)
         dry_run = checkouts.grabowski_checkout_cleanup(
             repo=plan["repository"],
             checkout_path=plan["writer_worktree"],
@@ -13666,6 +14201,7 @@ def grabowski_agent_workspace_cleanup(
             archive_id=str(archive_id),
             expected_head=str(plan["checkout"]["head"]),
             expected_branch=str(plan["checkout"]["branch"]),
+            expected_physical_identity=intent["checkout_physical_identity"],
         )
         cleanup_plan = dry_run["plan"]
         if not cleanup_plan.get("safe_to_apply"):
@@ -13694,6 +14230,7 @@ def grabowski_agent_workspace_cleanup(
                 )
             effect_mutation_ambiguous = True
             try:
+                _verify_cleanup_intent_physical_identity(intent)
                 applied = checkouts.grabowski_checkout_cleanup(
                     repo=plan["repository"],
                     checkout_path=plan["writer_worktree"],
@@ -13702,10 +14239,13 @@ def grabowski_agent_workspace_cleanup(
                     archive_id=str(archive_id),
                     plan_id=str(dry_run_record["plan_id"]),
                     expected_plan_sha256=str(cleanup_plan["plan_sha256"]),
+                    expected_physical_identity=intent["checkout_physical_identity"],
                     confirmation="remove-linked-checkout",
                 )
                 post_state = _workspace_retention_post_state(
-                    current_manifest, str(archive_id)
+                    current_manifest,
+                    str(archive_id),
+                    expected_owner=owner,
                 )
                 retention_effect_receipt = _workspace_lifecycle_effect_finish(
                     retention_effect,

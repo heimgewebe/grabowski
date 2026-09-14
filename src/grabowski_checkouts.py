@@ -17,6 +17,7 @@ import uuid
 from typing import Any, Iterable, Mapping
 
 import grabowski_mcp as base
+import grabowski_physical_checkout as physical_checkout
 import grabowski_resources as resources
 import grabowski_tasks as tasks
 try:
@@ -56,7 +57,7 @@ BINDING_IDENTITY_REBIND_CONFIRMATION = "rebind-checkout-lifecycle-identity"
 MAX_RETENTION_SECONDS = 365 * 24 * 60 * 60
 # Compatibility telemetry remains in schema 2; cleanup itself is immediately eligible.
 CHECKOUT_CLEANUP_GRACE_SECONDS = 0
-CLEANUP_PLAN_SCHEMA_VERSION = 2
+CLEANUP_PLAN_SCHEMA_VERSION = 3
 CLEANUP_PLAN_HASH_EXCLUDED_FIELDS = (
     "archive_age_seconds",
     "remote_secured",
@@ -273,6 +274,26 @@ def _safe_path(raw: str | Path, *, must_exist: bool) -> Path:
     return path.resolve(strict=must_exist)
 
 
+class CheckoutPhysicalIdentityPreconditionError(RuntimeError):
+    """Physical checkout identity failed before the destructive Git mutation."""
+
+
+def _verify_expected_physical_checkout_identity(
+    checkout: Path, expected: dict[str, Any]
+) -> dict[str, Any]:
+    root = expected.get("root") if isinstance(expected, dict) else None
+    if not isinstance(root, dict) or root.get("path") != str(checkout):
+        raise CheckoutPhysicalIdentityPreconditionError(
+            "Checkout physical identity precondition does not belong to checkout path"
+        )
+    try:
+        return physical_checkout.verify_physical_checkout_identity(expected)
+    except physical_checkout.PhysicalCheckoutIdentityError as exc:
+        raise CheckoutPhysicalIdentityPreconditionError(
+            f"Checkout physical identity precondition failed: {exc}"
+        ) from exc
+
+
 def _resolve_repo(raw: str | Path) -> Path:
     repo = _safe_path(raw, must_exist=True)
     if not repo.is_dir():
@@ -331,8 +352,24 @@ def _operation_lock():
         os.close(descriptor)
 
 
-def _git_mutate(repo: Path, arguments: list[str], *, timeout_seconds: int = 60) -> dict[str, Any]:
+def _git_mutate(
+    repo: Path,
+    arguments: list[str],
+    *,
+    timeout_seconds: int = 60,
+    expected_physical_identity: dict[str, Any] | None = None,
+    expected_physical_checkout: Path | None = None,
+) -> dict[str, Any]:
+    if (expected_physical_identity is None) != (expected_physical_checkout is None):
+        raise ValueError(
+            "expected_physical_identity and expected_physical_checkout must be supplied together"
+        )
     with _operation_lock():
+        if expected_physical_identity is not None:
+            assert expected_physical_checkout is not None
+            _verify_expected_physical_checkout_identity(
+                expected_physical_checkout, expected_physical_identity
+            )
         result = operator._run(
             ["git", "-C", str(repo), *arguments],
             cwd=repo,
@@ -495,6 +532,30 @@ def _database() -> sqlite3.Connection:
         )
         """
     )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS operation_uncertainty (
+            fence_id TEXT PRIMARY KEY,
+            checkout_key TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            lease_owner_id TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            operation_id TEXT NOT NULL,
+            resource_keys_json TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            evidence_sha256 TEXT NOT NULL,
+            created_at_unix INTEGER NOT NULL,
+            cleared_at_unix INTEGER,
+            clearance_json TEXT,
+            clearance_sha256 TEXT,
+            UNIQUE(operation, operation_id)
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS operation_uncertainty_active_idx "
+        "ON operation_uncertainty(cleared_at_unix, checkout_key)"
+    )
     current = connection.execute(
         "SELECT value FROM metadata WHERE key='schema_version'"
     ).fetchone()
@@ -603,6 +664,27 @@ def _lifecycle_bindings(keys: Iterable[str]) -> dict[str, dict[str, Any]]:
     finally:
         connection.close()
     return {row["checkout_key"]: _lifecycle_public(row) for row in rows}
+
+
+def _strict_lifecycle_binding(checkout_key: str) -> dict[str, Any] | None:
+    "Read one lifecycle binding without collapsing SQLite failures into legacy absence."
+    connection = _readonly_connection(CHECKOUT_DB)
+    if connection is None:
+        return None
+    try:
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='lifecycle_bindings'"
+        ).fetchone()
+        if table is None:
+            return None
+        row = connection.execute(
+            "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
+            (checkout_key,),
+        ).fetchone()
+    finally:
+        connection.close()
+    return None if row is None else _lifecycle_public(row)
 
 
 def _phase_limit(phase: str) -> int:
@@ -1381,6 +1463,217 @@ def _checkout_resource_keys(
     return keys
 
 
+def _operation_uncertainty_public(
+    row: sqlite3.Row | dict[str, Any],
+) -> dict[str, Any]:
+    record = dict(row)
+    evidence = json.loads(record["evidence_json"])
+    if _sha256_json(evidence) != record["evidence_sha256"]:
+        raise RuntimeError("Checkout operation uncertainty evidence integrity failed")
+    clearance = None
+    if record.get("clearance_json") is not None:
+        clearance = json.loads(record["clearance_json"])
+        if _sha256_json(clearance) != record.get("clearance_sha256"):
+            raise RuntimeError("Checkout operation uncertainty clearance integrity failed")
+    return {
+        "fence_id": record["fence_id"],
+        "checkout_key": record["checkout_key"],
+        "owner_id": record["owner_id"],
+        "lease_owner_id": record["lease_owner_id"],
+        "operation": record["operation"],
+        "operation_id": record["operation_id"],
+        "resource_keys": json.loads(record["resource_keys_json"]),
+        "evidence": evidence,
+        "evidence_sha256": record["evidence_sha256"],
+        "created_at_unix": record["created_at_unix"],
+        "cleared_at_unix": record["cleared_at_unix"],
+        "clearance": clearance,
+        "clearance_sha256": record["clearance_sha256"],
+    }
+
+
+def _active_checkout_operation_uncertainties(
+    resource_keys: Iterable[str] = (),
+) -> list[dict[str, Any]]:
+    raw_resource_keys = list(resource_keys)
+    wanted = (
+        set(resources.normalize_resource_keys(raw_resource_keys))
+        if raw_resource_keys
+        else set()
+    )
+    connection = _readonly_connection(CHECKOUT_DB)
+    if connection is None:
+        return []
+    try:
+        table = connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type='table' AND name='operation_uncertainty'
+            """
+        ).fetchone()
+        if table is None:
+            return []
+        rows = connection.execute(
+            """
+            SELECT * FROM operation_uncertainty
+            WHERE cleared_at_unix IS NULL
+            ORDER BY created_at_unix ASC, fence_id ASC
+            """
+        ).fetchall()
+    finally:
+        connection.close()
+    fences = [_operation_uncertainty_public(row) for row in rows]
+    if not wanted:
+        return fences
+    return [
+        fence
+        for fence in fences
+        if wanted.intersection(fence["resource_keys"])
+    ]
+
+
+def _load_checkout_operation_uncertainty(fence_id: str) -> dict[str, Any]:
+    if not isinstance(fence_id, str) or re.fullmatch(r"[0-9a-f]{32}", fence_id) is None:
+        raise ValueError("fence_id must be a 32-character lowercase hex identifier")
+    connection = _readonly_connection(CHECKOUT_DB)
+    if connection is None:
+        raise ValueError(f"Unknown checkout uncertainty fence: {fence_id}")
+    try:
+        row = connection.execute(
+            "SELECT * FROM operation_uncertainty WHERE fence_id=?",
+            (fence_id,),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        raise ValueError(f"Unknown checkout uncertainty fence: {fence_id}") from exc
+    finally:
+        connection.close()
+    if row is None:
+        raise ValueError(f"Unknown checkout uncertainty fence: {fence_id}")
+    return _operation_uncertainty_public(row)
+
+
+def _require_no_checkout_operation_uncertainty(resource_keys: Iterable[str]) -> None:
+    blockers = _active_checkout_operation_uncertainties(resource_keys)
+    if not blockers:
+        return
+    blocker = blockers[0]
+    raise RuntimeError(
+        "Checkout resources are durably fenced by an uncertain "
+        f"{blocker['operation']} outcome: {blocker['fence_id']}"
+    )
+
+
+def _persist_checkout_operation_uncertainty(
+    *,
+    lease: dict[str, Any],
+    checkout_key: str,
+    owner_id: str,
+    operation: str,
+    operation_id: str,
+    evidence: dict[str, Any],
+) -> dict[str, Any]:
+    checkout_identity = _validate_sha256(checkout_key, "checkout_key")
+    owner = _owner(owner_id)
+    if operation not in {"archive", "cleanup"}:
+        raise ValueError("Checkout uncertainty operation must be archive or cleanup")
+    if (
+        not isinstance(operation_id, str)
+        or not operation_id
+        or len(operation_id.encode("utf-8")) > 128
+        or "\x00" in operation_id
+    ):
+        raise ValueError("Checkout uncertainty operation_id is invalid")
+    lease_owner = _owner(str(lease.get("owner_id")))
+    resource_keys = sorted(
+        {
+            resources.normalize_resource_key(str(item["resource_key"]))
+            for item in lease.get("leases", [])
+            if isinstance(item, dict) and isinstance(item.get("resource_key"), str)
+        }
+    )
+    evidence_value = dict(evidence)
+    evidence_sha256 = _sha256_json(evidence_value)
+    fence_id = uuid.uuid4().hex
+    created = _now()
+    with _database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        active_rows = connection.execute(
+            "SELECT * FROM operation_uncertainty WHERE cleared_at_unix IS NULL"
+        ).fetchall()
+        for active_row in active_rows:
+            active = _operation_uncertainty_public(active_row)
+            if set(active["resource_keys"]).intersection(resource_keys):
+                raise RuntimeError(
+                    "Checkout operation uncertainty already fences requested resources"
+                )
+        connection.execute(
+            """
+            INSERT INTO operation_uncertainty(
+                fence_id, checkout_key, owner_id, lease_owner_id,
+                operation, operation_id, resource_keys_json,
+                evidence_json, evidence_sha256, created_at_unix,
+                cleared_at_unix, clearance_json, clearance_sha256
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+            """,
+            (
+                fence_id,
+                checkout_identity,
+                owner,
+                lease_owner,
+                operation,
+                operation_id,
+                _canonical_json(resource_keys),
+                _canonical_json(evidence_value),
+                evidence_sha256,
+                created,
+            ),
+        )
+        connection.commit()
+    return _load_checkout_operation_uncertainty(fence_id)
+
+
+def _clear_checkout_operation_uncertainty(
+    fence_id: str,
+    *,
+    outcome: str,
+    evidence: dict[str, Any],
+) -> dict[str, Any]:
+    if outcome not in {"confirmed_success", "confirmed_no_effect", "reconciled_success"}:
+        raise ValueError("Checkout uncertainty clearance outcome is invalid")
+    clearance = {
+        "outcome": outcome,
+        "evidence": dict(evidence),
+        "cleared_at_unix": _now(),
+    }
+    clearance_sha256 = _sha256_json(clearance)
+    with _database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT * FROM operation_uncertainty WHERE fence_id=?",
+            (fence_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Unknown checkout uncertainty fence: {fence_id}")
+        current = _operation_uncertainty_public(row)
+        if current["cleared_at_unix"] is not None:
+            return current
+        connection.execute(
+            """
+            UPDATE operation_uncertainty
+            SET cleared_at_unix=?, clearance_json=?, clearance_sha256=?
+            WHERE fence_id=? AND cleared_at_unix IS NULL
+            """,
+            (
+                clearance["cleared_at_unix"],
+                _canonical_json(clearance),
+                clearance_sha256,
+                fence_id,
+            ),
+        )
+        connection.commit()
+    return _load_checkout_operation_uncertainty(fence_id)
+
+
 def _acquire_checkout_resources(
     *,
     owner_id: str,
@@ -1400,6 +1693,7 @@ def _acquire_checkout_resources(
         repo_path=repo_path,
         branch=branch,
     )
+    _require_no_checkout_operation_uncertainty(keys)
     bureau_keys = resources.bureau_leases.bureau_resource_keys(keys)
     bureau_key_set = set(bureau_keys)
     non_bureau_keys = [key for key in keys if key not in bureau_key_set]
@@ -1444,6 +1738,337 @@ def _acquire_checkout_resources(
 def _release_checkout_resources(lease: dict[str, Any]) -> dict[str, Any]:
     keys = [item["resource_key"] for item in lease["leases"]]
     return resources.release_resources(lease["owner_id"], keys)
+
+
+def _release_uncertainty_fence_resources(fence: dict[str, Any]) -> dict[str, Any]:
+    return resources.release_resources(
+        str(fence["lease_owner_id"]), list(fence["resource_keys"])
+    )
+
+
+def _archive_manifest_matches_uncertainty(
+    archive: dict[str, Any], evidence: dict[str, Any]
+) -> bool:
+    "Verify manifest contents before durable archive uncertainty may clear."
+    try:
+        archive_id = _validate_archive_id(str(evidence["archive_id"]))
+        archive_root = ARCHIVE_ROOT.expanduser()
+        if archive_root.is_symlink() or not archive_root.is_dir():
+            return False
+        archive_dir = archive_root.resolve(strict=True) / archive_id
+        if archive_dir.is_symlink() or not archive_dir.is_dir():
+            return False
+        archive_dir = archive_dir.resolve(strict=True)
+        manifest_path = Path(str(archive.get("manifest_path", "")))
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            return False
+        if manifest_path.resolve(strict=True) != archive_dir / "manifest.json":
+            return False
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (KeyError, OSError, UnicodeError, ValueError):
+        return False
+    if not isinstance(manifest, dict) or archive.get("archive_id") != archive_id:
+        return False
+    recovery_refs = archive.get("recovery_refs")
+    if not isinstance(recovery_refs, list) or not recovery_refs:
+        return False
+    normalized_refs: list[dict[str, str]] = []
+    for item in recovery_refs:
+        if not isinstance(item, dict):
+            return False
+        ref = item.get("ref")
+        target = item.get("target")
+        if not isinstance(ref, str) or not isinstance(target, str):
+            return False
+        normalized_refs.append({"ref": ref, "target": target})
+    return bool(
+        manifest.get("schema_version") == 1
+        and manifest.get("archive_id") == archive_id
+        and manifest.get("checkout_key")
+        == archive.get("checkout_key")
+        == evidence.get("checkout_key")
+        and manifest.get("repo")
+        == archive.get("repo_path")
+        == evidence.get("repo")
+        and manifest.get("git_common_dir")
+        == archive.get("repo_common_dir")
+        == evidence.get("git_common_dir")
+        and manifest.get("checkout_path")
+        == archive.get("checkout_path")
+        == evidence.get("checkout_path")
+        and manifest.get("head")
+        == archive.get("head")
+        == evidence.get("expected_head")
+        and manifest.get("branch")
+        == archive.get("branch")
+        == evidence.get("expected_branch")
+        and manifest.get("owner_id")
+        == archive.get("owner_id")
+        == evidence.get("owner_id")
+        and manifest.get("purpose") == archive.get("purpose")
+        and manifest.get("retention_until_unix") == archive.get("retention_until_unix")
+        and manifest.get("recovery_refs") == recovery_refs
+        and normalized_refs == evidence.get("planned_recovery_refs")
+    )
+
+
+def _archive_uncertainty_readback(fence: dict[str, Any]) -> dict[str, Any]:
+    evidence = fence["evidence"]
+    repo = _resolve_repo(str(evidence["repo"]))
+    checkout = Path(str(evidence["checkout_path"]))
+    archive_id = _validate_archive_id(str(evidence["archive_id"]))
+    planned_refs = list(evidence.get("planned_recovery_refs") or [])
+    verified_refs = _verify_recovery_refs(repo, planned_refs)
+    try:
+        archive = _load_archive(archive_id)
+    except ValueError:
+        archive = None
+    archive_dir = ARCHIVE_ROOT.expanduser() / archive_id
+    if archive is not None:
+        lifecycle = _strict_lifecycle_binding(str(evidence["checkout_key"]))
+        if (
+            verified_refs
+            and all(bool(item["present"]) for item in verified_refs)
+            and archive.get("checkout_key") == evidence["checkout_key"]
+            and archive.get("repo_path") == evidence["repo"]
+            and archive.get("checkout_path") == evidence["checkout_path"]
+            and archive.get("head") == evidence["expected_head"]
+            and archive.get("branch") == evidence["expected_branch"]
+            and archive.get("owner_id") == evidence["owner_id"]
+            and _archive_manifest_matches_uncertainty(archive, evidence)
+            and (
+                lifecycle is None
+                or (
+                    isinstance(lifecycle, dict)
+                    and lifecycle.get("phase") == "archived"
+                    and lifecycle.get("owner_id") == evidence["owner_id"]
+                )
+            )
+        ):
+            return {
+                "state": "confirmed_success",
+                "archive_id": archive_id,
+                "verified_recovery_refs": verified_refs,
+            }
+        return {
+            "state": "still_fenced",
+            "reason": "archive-readback-mismatch",
+            "verified_recovery_refs": verified_refs,
+        }
+    if any(bool(item["present"]) for item in verified_refs) or archive_dir.exists():
+        return {
+            "state": "still_fenced",
+            "reason": "partial-archive-effects-observed",
+            "verified_recovery_refs": verified_refs,
+        }
+    try:
+        _, _, record = _worktree_for_path(repo, checkout)
+        _require_expected(
+            record,
+            str(evidence["expected_head"]),
+            evidence.get("expected_branch"),
+        )
+        physical = evidence.get("expected_physical_identity")
+        if isinstance(physical, dict):
+            _verify_expected_physical_checkout_identity(checkout, physical)
+    except Exception as exc:
+        return {
+            "state": "still_fenced",
+            "reason": f"archive-no-effect-not-provable:{type(exc).__name__}",
+            "verified_recovery_refs": verified_refs,
+        }
+    return {
+        "state": "confirmed_no_effect",
+        "archive_id": archive_id,
+        "verified_recovery_refs": verified_refs,
+    }
+
+
+def _cleanup_uncertainty_readback(fence: dict[str, Any]) -> dict[str, Any]:
+    evidence = fence["evidence"]
+    repo = _resolve_repo(str(evidence["repo"]))
+    checkout = Path(str(evidence["checkout_path"]))
+    archive_id = _validate_archive_id(str(evidence["archive_id"]))
+    plan_id = _validate_plan_id(str(evidence["plan_id"]))
+    plan_sha256 = _validate_sha256(str(evidence["plan_sha256"]), "plan_sha256")
+    stored = _load_dry_run(plan_id)
+    archive = _load_archive(archive_id)
+    if (
+        stored.get("archive_id") != archive_id
+        or stored.get("checkout_key") != evidence["checkout_key"]
+        or stored.get("owner_id") != evidence["owner_id"]
+        or stored.get("plan_sha256") != plan_sha256
+    ):
+        return {"state": "still_fenced", "reason": "cleanup-plan-readback-mismatch"}
+    _, _, records = _worktree_records(repo)
+    matching = [record for record in records if record.get("path") == str(checkout)]
+    verified_refs = _verify_recovery_refs(
+        repo, list(evidence.get("recovery_refs") or [])
+    )
+    refs_ok = bool(verified_refs) and all(bool(item["present"]) for item in verified_refs)
+    if (
+        not matching
+        and stored.get("applied_at_unix") is not None
+        and archive.get("cleaned_at_unix") is not None
+        and archive.get("cleanup_plan_id") == plan_id
+        and refs_ok
+    ):
+        return {
+            "state": "confirmed_success",
+            "archive_id": archive_id,
+            "plan_id": plan_id,
+            "verified_recovery_refs": verified_refs,
+        }
+    if (
+        len(matching) == 1
+        and stored.get("applied_at_unix") is None
+        and archive.get("cleaned_at_unix") is None
+        and refs_ok
+    ):
+        try:
+            _require_expected(
+                matching[0],
+                str(evidence["expected_head"]),
+                evidence.get("expected_branch"),
+            )
+            physical = evidence.get("expected_physical_identity")
+            if isinstance(physical, dict):
+                _verify_expected_physical_checkout_identity(checkout, physical)
+        except Exception as exc:
+            return {
+                "state": "still_fenced",
+                "reason": f"cleanup-no-effect-not-provable:{type(exc).__name__}",
+            }
+        return {
+            "state": "confirmed_no_effect",
+            "archive_id": archive_id,
+            "plan_id": plan_id,
+            "verified_recovery_refs": verified_refs,
+        }
+    if (
+        not matching
+        and stored.get("applied_at_unix") is None
+        and archive.get("cleaned_at_unix") is None
+        and refs_ok
+    ):
+        applied = _now()
+        with _operation_lock():
+            with _database() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                current_dry = connection.execute(
+                    "SELECT * FROM dry_runs WHERE plan_id=?", (plan_id,)
+                ).fetchone()
+                current_archive = connection.execute(
+                    "SELECT * FROM archives WHERE archive_id=?", (archive_id,)
+                ).fetchone()
+                if (
+                    current_dry is None
+                    or current_archive is None
+                    or current_dry["applied_at_unix"] is not None
+                    or current_archive["cleaned_at_unix"] is not None
+                    or current_archive["cleanup_plan_id"] is not None
+                ):
+                    raise RuntimeError(
+                        "Cleanup reconciliation state changed during atomic readback"
+                    )
+                connection.execute(
+                    "UPDATE dry_runs SET applied_at_unix=? WHERE plan_id=?",
+                    (applied, plan_id),
+                )
+                connection.execute(
+                    "UPDATE archives SET cleaned_at_unix=?, cleanup_plan_id=? WHERE archive_id=?",
+                    (applied, plan_id, archive_id),
+                )
+                connection.commit()
+        return {
+            "state": "reconciled_success",
+            "archive_id": archive_id,
+            "plan_id": plan_id,
+            "applied_at_unix": applied,
+            "verified_recovery_refs": verified_refs,
+        }
+    return {
+        "state": "still_fenced",
+        "reason": "cleanup-outcome-remains-ambiguous",
+        "verified_recovery_refs": verified_refs,
+    }
+
+
+@mcp.tool(name="grabowski_checkout_uncertainty_status", annotations=READ_ONLY)
+def grabowski_checkout_uncertainty_status(fence_id: str = "") -> dict[str, Any]:
+    """Read durable unknown-outcome fences for checkout lifecycle effects."""
+    if fence_id:
+        fence = _load_checkout_operation_uncertainty(fence_id)
+        return {"fences": [fence], "count": 1}
+    fences = _active_checkout_operation_uncertainties()
+    return {"fences": fences[:256], "count": len(fences), "truncated": len(fences) > 256}
+
+
+@mcp.tool(name="grabowski_checkout_uncertainty_reconcile", annotations=MUTATING)
+def grabowski_checkout_uncertainty_reconcile(
+    fence_id: str,
+    confirmation: str,
+) -> dict[str, Any]:
+    """Read back one unknown checkout effect and release its fence only when proven."""
+    operator._require_operator_mutation("resource_lease")
+    operator._require_operator_capability("git_cli")
+    if confirmation != "reconcile-checkout-operation-outcome":
+        raise ValueError(
+            "confirmation must be exactly 'reconcile-checkout-operation-outcome'"
+        )
+    fence = _load_checkout_operation_uncertainty(fence_id)
+    if fence["cleared_at_unix"] is not None:
+        return {"state": "already_reconciled", "fence": fence}
+    wanted = set(fence["resource_keys"])
+    live = [
+        item
+        for item in _read_resource_leases()
+        if item.get("owner_id") == fence["lease_owner_id"]
+        and item.get("resource_key") in wanted
+    ]
+    if live:
+        return {
+            "state": "still_fenced",
+            "reason": "operation-lease-still-live",
+            "fence": fence,
+            "live_lease_count": len(live),
+        }
+    readback = (
+        _archive_uncertainty_readback(fence)
+        if fence["operation"] == "archive"
+        else _cleanup_uncertainty_readback(fence)
+    )
+    outcome = str(readback.get("state"))
+    if outcome == "still_fenced":
+        return {"state": "still_fenced", "fence": fence, "readback": readback}
+    if outcome not in {"confirmed_success", "confirmed_no_effect", "reconciled_success"}:
+        raise RuntimeError("Checkout uncertainty readback returned an invalid state")
+    audit = {
+        "timestamp_unix": _now(),
+        "operation": "checkout-operation-uncertainty-reconcile",
+        "fence_id": fence["fence_id"],
+        "checkout_key": fence["checkout_key"],
+        "owner_id": fence["owner_id"],
+        "effect_operation": fence["operation"],
+        "effect_operation_id": fence["operation_id"],
+        "outcome": outcome,
+        "readback": readback,
+    }
+    base._append_audit(audit)
+    lease_release = _release_uncertainty_fence_resources(fence)
+    cleared = _clear_checkout_operation_uncertainty(
+        fence["fence_id"],
+        outcome=outcome,
+        evidence={"readback": readback, "audit_timestamp_unix": audit["timestamp_unix"]},
+    )
+    return {
+        "state": "reconciled",
+        "outcome": outcome,
+        "fence": cleared,
+        "lease_release": lease_release,
+        "readback": readback,
+        "audit": audit,
+    }
 
 
 def _require_retention_owner(checkout_key: str, owner_id: str) -> None:
@@ -2840,9 +3465,21 @@ def _check_ref_format(repo: Path, ref: str) -> None:
     _git_read(repo, ["check-ref-format", ref])
 
 
-def _create_recovery_ref(repo: Path, ref: str, target: str) -> dict[str, Any]:
+def _create_recovery_ref(
+    repo: Path,
+    ref: str,
+    target: str,
+    *,
+    expected_physical_identity: dict[str, Any] | None = None,
+    expected_physical_checkout: Path | None = None,
+) -> dict[str, Any]:
     _check_ref_format(repo, ref)
-    result = _git_mutate(repo, ["update-ref", "--create-reflog", ref, target])
+    result = _git_mutate(
+        repo,
+        ["update-ref", "--create-reflog", ref, target],
+        expected_physical_identity=expected_physical_identity,
+        expected_physical_checkout=expected_physical_checkout,
+    )
     verified = _git_read(repo, ["rev-parse", "--verify", f"{ref}^{{commit}}"]).stdout.strip()
     if verified != target:
         raise RuntimeError(f"Recovery ref verification failed: {ref}")
@@ -3970,6 +4607,7 @@ def grabowski_checkout_archive(
     retention_until_unix: int,
     expected_head: str,
     expected_branch: str | None = None,
+    expected_physical_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Archive one clean temporary linked checkout by creating durable recovery refs."""
     operator._require_operator_mutation("git_cli")
@@ -3984,6 +4622,12 @@ def grabowski_checkout_archive(
     until = _retention_until(retention_until_unix)
     archive_purpose = _purpose(purpose)
     _require_retention_owner(record["checkout_key"], owner)
+    if expected_physical_identity is None:
+        archive_physical_identity = physical_checkout.capture_physical_checkout_identity(checkout)
+    else:
+        archive_physical_identity = _verify_expected_physical_checkout_identity(
+            checkout, expected_physical_identity
+        )
     lifecycle_before = _lifecycle_bindings([record["checkout_key"]]).get(
         record["checkout_key"]
     )
@@ -4019,6 +4663,7 @@ def grabowski_checkout_archive(
         },
     )
     result: dict[str, Any] | None = None
+    uncertainty_fence: dict[str, Any] | None = None
     try:
         lifecycle = _lifecycle_bindings([record["checkout_key"]]).get(
             record["checkout_key"]
@@ -4035,23 +4680,64 @@ def grabowski_checkout_archive(
         archive_id = _new_archive_id()
         path_hash = record["checkout_key"][:16]
         ref_base = f"{ARCHIVE_REF_ROOT}/{path_hash}/{archive_id}"
-        recovery_refs = [
-            _create_recovery_ref(top_level, f"{ref_base}/head", expected_head)
-        ]
         branch_head = None
+        planned_refs = [{"ref": f"{ref_base}/head", "target": expected_head}]
         if record.get("branch"):
             branch_ref = f"refs/heads/{record['branch']}"
             branch_head = _git_read(
                 top_level,
                 ["rev-parse", "--verify", f"{branch_ref}^{{commit}}"],
             ).stdout.strip()
-            recovery_refs.append(
-                _create_recovery_ref(
-                    top_level,
-                    f"{ref_base}/branch-head",
-                    branch_head,
-                )
+            planned_refs.append(
+                {"ref": f"{ref_base}/branch-head", "target": branch_head}
             )
+        uncertainty_fence = _persist_checkout_operation_uncertainty(
+            lease=lease,
+            checkout_key=record["checkout_key"],
+            owner_id=owner,
+            operation="archive",
+            operation_id=archive_id,
+            evidence={
+                "repo": str(top_level),
+                "git_common_dir": str(common_dir),
+                "checkout_path": str(checkout),
+                "checkout_key": record["checkout_key"],
+                "owner_id": owner,
+                "archive_id": archive_id,
+                "expected_head": expected_head,
+                "expected_branch": record.get("branch"),
+                "expected_physical_identity": archive_physical_identity,
+                "planned_recovery_refs": planned_refs,
+            },
+        )
+        recovery_refs: list[dict[str, Any]] = []
+        for item in planned_refs:
+            try:
+                created_ref = _create_recovery_ref(
+                    top_level,
+                    item["ref"],
+                    item["target"],
+                    expected_physical_identity=archive_physical_identity,
+                    expected_physical_checkout=checkout,
+                )
+            except CheckoutPhysicalIdentityPreconditionError:
+                if recovery_refs:
+                    # At least one recovery ref exists, so archive effects are partial
+                    # and the durable fence must remain until reconciliation.
+                    raise
+                _clear_checkout_operation_uncertainty(
+                    uncertainty_fence["fence_id"],
+                    outcome="confirmed_no_effect",
+                    evidence={
+                        "reason": (
+                            "physical-identity-precondition-failed-before-first-archive-git-mutation"
+                        ),
+                        "archive_id": archive_id,
+                    },
+                )
+                _release_checkout_resources(lease)
+                raise
+            recovery_refs.append(created_ref)
         manifest_dir = _archive_directory(archive_id)
         public_refs = [
             {
@@ -4180,11 +4866,23 @@ def grabowski_checkout_archive(
             "audit": audit,
             "terminal_detached_transition": terminal_detached_transition,
         }
-    finally:
-        lease_release = _release_checkout_resources(lease)
-    if result is None:
+    except Exception:
+        if uncertainty_fence is None:
+            _release_checkout_resources(lease)
+        raise
+    if result is None or uncertainty_fence is None:
         raise RuntimeError("Checkout archive did not produce a result")
+    lease_release = _release_checkout_resources(lease)
+    fence_clearance = _clear_checkout_operation_uncertainty(
+        uncertainty_fence["fence_id"],
+        outcome="confirmed_success",
+        evidence={
+            "archive_id": result["archive"]["archive_id"],
+            "audit_timestamp_unix": result["audit"]["timestamp_unix"],
+        },
+    )
     result["lease_release"] = lease_release
+    result["uncertainty_fence"] = fence_clearance
     return result
 
 
@@ -4211,11 +4909,17 @@ def _cleanup_plan(
     archive_id: str | None,
     expected_head: str | None,
     expected_branch: str | None,
+    expected_physical_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     top_level, common_dir, record = _worktree_for_path(repo_path, checkout)
     status = _require_clean_linked(record)
     if expected_head is not None or expected_branch is not None:
         _require_expected(record, expected_head or str(record.get("head")), expected_branch)
+    verified_physical_identity = None
+    if expected_physical_identity is not None:
+        verified_physical_identity = _verify_expected_physical_checkout_identity(
+            checkout, expected_physical_identity
+        )
     archive = _load_archive(archive_id) if archive_id is not None else _latest_archive_for_key(record["checkout_key"])
     if archive is None:
         raise RuntimeError("Cleanup requires a prior checkout archive")
@@ -4263,6 +4967,7 @@ def _cleanup_plan(
         "owner_id": owner,
         "head": record.get("head"),
         "branch": record.get("branch"),
+        "expected_physical_identity": verified_physical_identity,
         "status": status,
         "retention": retention,
         "retention_active": retention_active,
@@ -4350,6 +5055,7 @@ def grabowski_checkout_cleanup(
     archive_id: str | None = None,
     expected_head: str | None = None,
     expected_branch: str | None = None,
+    expected_physical_identity: dict[str, Any] | None = None,
     plan_id: str | None = None,
     expected_plan_sha256: str | None = None,
     confirmation: str = "",
@@ -4372,6 +5078,7 @@ def grabowski_checkout_cleanup(
             archive_id=archive,
             expected_head=expected_head,
             expected_branch=expected_branch,
+            expected_physical_identity=expected_physical_identity,
         )
         persisted = _persist_dry_run(plan)
         audit = {
@@ -4405,6 +5112,23 @@ def grabowski_checkout_cleanup(
     if stored["expires_at_unix"] <= _now():
         raise RuntimeError("Cleanup dry-run has expired")
     stored_plan = json.loads(stored["plan_json"])
+    stored_physical_identity = stored_plan.get("expected_physical_identity")
+    if stored_physical_identity is None:
+        if expected_physical_identity is not None:
+            raise RuntimeError(
+                "Cleanup dry-run was not bound to a physical checkout identity"
+            )
+    else:
+        if expected_physical_identity is None:
+            raise RuntimeError(
+                "Cleanup apply requires the physical checkout identity from dry-run"
+            )
+        if _canonical_json(expected_physical_identity) != _canonical_json(
+            stored_physical_identity
+        ):
+            raise RuntimeError(
+                "Cleanup physical identity differs from the dry-run precondition"
+            )
     current_plan = _cleanup_plan(
         repo_path=repo_path,
         checkout=checkout,
@@ -4412,6 +5136,7 @@ def grabowski_checkout_cleanup(
         archive_id=stored["archive_id"],
         expected_head=stored_plan["head"],
         expected_branch=stored_plan["branch"],
+        expected_physical_identity=stored_physical_identity,
     )
     if current_plan["plan_sha256"] != expected_hash:
         raise RuntimeError("Cleanup dry-run is stale; rerun dry_run first")
@@ -4436,11 +5161,51 @@ def grabowski_checkout_cleanup(
             "checkout_path": str(checkout),
         },
     )
-    result = _git_mutate(
-        Path(current_plan["repo"]),
-        ["worktree", "remove", str(checkout)],
-        timeout_seconds=120,
-    )
+    try:
+        uncertainty_fence = _persist_checkout_operation_uncertainty(
+            lease=lease,
+            checkout_key=current_plan["checkout_key"],
+            owner_id=owner,
+            operation="cleanup",
+            operation_id=plan_id,
+            evidence={
+                "repo": current_plan["repo"],
+                "git_common_dir": current_plan["git_common_dir"],
+                "checkout_path": str(checkout),
+                "checkout_key": current_plan["checkout_key"],
+                "owner_id": owner,
+                "archive_id": stored["archive_id"],
+                "plan_id": plan_id,
+                "plan_sha256": expected_hash,
+                "expected_head": stored_plan["head"],
+                "expected_branch": stored_plan["branch"],
+                "expected_physical_identity": stored_physical_identity,
+                "recovery_refs": current_plan["recovery_refs"],
+            },
+        )
+    except Exception:
+        _release_checkout_resources(lease)
+        raise
+    try:
+        result = _git_mutate(
+            Path(current_plan["repo"]),
+            ["worktree", "remove", str(checkout)],
+            timeout_seconds=120,
+            expected_physical_identity=stored_physical_identity,
+            expected_physical_checkout=(
+                checkout if stored_physical_identity is not None else None
+            ),
+        )
+    except CheckoutPhysicalIdentityPreconditionError:
+        _clear_checkout_operation_uncertainty(
+            uncertainty_fence["fence_id"],
+            outcome="confirmed_no_effect",
+            evidence={
+                "reason": "physical-identity-precondition-failed-before-git-mutation",
+            },
+        )
+        _release_checkout_resources(lease)
+        raise
     applied = _now()
     with _database() as connection:
         connection.execute(
@@ -4456,7 +5221,6 @@ def grabowski_checkout_cleanup(
             (applied, plan_id, stored["archive_id"]),
         )
         connection.commit()
-    lease_release = _release_checkout_resources(lease)
     audit = {
         "timestamp_unix": applied,
         "operation": "checkout-cleanup-apply",
@@ -4468,18 +5232,34 @@ def grabowski_checkout_cleanup(
         "checkout_path": str(checkout),
         "owner_id": owner,
         "branch_preserved": True,
+        "expected_physical_identity_sha256": (
+            stored_physical_identity.get("physical_identity_sha256")
+            if isinstance(stored_physical_identity, dict)
+            else None
+        ),
         "recovery_refs": current_plan["recovery_refs"],
         "resource_keys": [item["resource_key"] for item in lease["leases"]],
         "result": result,
         "rollback": current_plan["rollback"],
     }
     base._append_audit(audit)
+    lease_release = _release_checkout_resources(lease)
+    fence_clearance = _clear_checkout_operation_uncertainty(
+        uncertainty_fence["fence_id"],
+        outcome="confirmed_success",
+        evidence={
+            "plan_id": plan_id,
+            "applied_at_unix": applied,
+            "audit_timestamp_unix": audit["timestamp_unix"],
+        },
+    )
     return {
         "dry_run": False,
         "applied_at_unix": applied,
         "plan": current_plan,
         "lease": lease,
         "lease_release": lease_release,
+        "uncertainty_fence": fence_clearance,
         "result": result,
         "audit": audit,
     }
