@@ -68,9 +68,9 @@ Fleet-Aufrufe bleiben argv-basiert. Benannte Operationen behalten Preflight, Act
 - frischen serverseitigen Backup-, Restore- und Repository-Check,
 - Bereitschaft des root-eigenen Brokers.
 
-Benutzer-Power-Tasks und privilegierte Aktionen besitzen getrennte Gates. Der Root-Gate kann erst grün werden, wenn auch der Broker hostseitig installiert und geprüft ist.
+Recovery-gebundene Spezialaktionen besitzen eigene Gates. Dazu gehören insbesondere persistente katalogisierte Root-Tasks und Recovery-/Blockade-Lifecycle-Pfade. Der allgemeine `grabowski_power_run`-Pfad ist davon bewusst entkoppelt: Seine Root-Autorität stammt aus der kernel-/root-systemd-geprüften Identität des kanonischen Operators und nicht aus Recovery-Freshness.
 
-Runtime-Gesundheit und Recovery-Evidence sind getrennte Wahrheiten. Ein grüner Runtime-Status beweist nicht, dass Restore-Pfade frisch geprüft sind. `grabowski_recovery_status` gibt deshalb zusätzlich `recovery_evidence_boundary` aus. Bei der Standardkonfiguration meldet die Boundary `uses_default_heimserver_backend=true`; ist dieser Pfad nicht frisch und zielgleich belegt, bleiben Power-Worker und privilegierte Aktionen blockiert. Ein Custom-Recovery-Ziel meldet `custom_recovery_target_configured=true` nur bei gültiger Target-Form `<host>:rest-server/<probe>` und gilt erst als Recovery-Evidence, nachdem Backup-, Restore-Sentinel- und Repository-Check gegen exakt dieses konfigurierte Ziel bestanden haben. Ungültige Targets melden `configured_target_valid=false` und bleiben fail-closed. Details: `docs/non-heimserver-recovery-boundary.md`.
+Runtime-Gesundheit und Recovery-Evidence bleiben getrennte Wahrheiten. Ein grüner Runtime-Status beweist nicht, dass Restore-Pfade frisch geprüft sind. `grabowski_recovery_status` gibt deshalb zusätzlich `recovery_evidence_boundary` aus. Bei der Standardkonfiguration meldet die Boundary `uses_default_heimserver_backend=true`; ist dieser Pfad nicht frisch und zielgleich belegt, bleiben die recovery-gebundenen Spezialaktionen blockiert, nicht jedoch der allgemeine `grabowski_power_run`-Rootpfad. Ein Custom-Recovery-Ziel meldet `custom_recovery_target_configured=true` nur bei gültiger Target-Form `<host>:rest-server/<probe>` und gilt erst als Recovery-Evidence, nachdem Backup-, Restore-Sentinel- und Repository-Check gegen exakt dieses konfigurierte Ziel bestanden haben. Ungültige Targets melden `configured_target_valid=false` und bleiben für diese Recovery-Verträge fail-closed. Details: `docs/non-heimserver-recovery-boundary.md`.
 
 ## Recovery-Server
 
@@ -95,4 +95,4 @@ Die Compose-Datei allein ist kein Recovery-Beleg. Erst ein erfolgreiches Backup 
 - Browser- oder Desktopsteuerung,
 - Veröffentlichung eines neuen Connector-Snapshots.
 
-Diese Schritte folgen erst nach bestandenem Recovery-Gate und eigenen End-to-End-Tests.
+Diese Schritte besitzen jeweils eigene Abnahmebedingungen. Recovery-Evidence bleibt Voraussetzung nur für recovery-gebundene Spezialaktionen; der allgemeine Trusted-Owner-Rootpfad wird über Prozessidentität, Broker-Vertrag und End-to-End-Tests abgenommen.
