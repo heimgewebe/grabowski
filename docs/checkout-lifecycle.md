@@ -18,29 +18,43 @@ trennt Inventar, Archivierung und Cleanup.
 - `grabowski_checkout_cleanup`: erzeugt zuerst einen persistierten Dry-Run-Plan
   und führt erst danach, mit Plan-ID und Plan-Hash, `git worktree remove` ohne
   Force-Option aus.
-- `grabowski_checkout_binding_terminal_preview`: prüft read-only zwei eng
+- `grabowski_checkout_binding_terminal_preview`: prüft read-only eng
   begrenzte Terminal-Reconciliation-Modi. Ein bereits verschwundener managed
   Checkout kann durch unveränderliche Quellterminalität, exakte Binding-Identität
   und fehlende Koordination als `externally_terminal_missing` vorbereitet werden.
-  Zusätzlich kann ein noch vorhandener `active`-Checkout ausschließlich für eine
-  terminal belegte Work Lane als `completed_retained` vorbereitet werden, wenn er
-  sauber, unkoordiniert, remote recoverbar und `lease_release_ready=true` ist. Bei
-  aktuellen Work-Lane-Receipts muss der Checkout-Head außerdem exakt dem
-  `terminal_head_sha` des Closeouts entsprechen; Legacy-Receipts ohne dieses Feld
-  bleiben auf den strengeren historischen Recovery-Nachweis beschränkt.
+  Zusätzlich kann ein noch vorhandener `active`-Checkout für eine terminal belegte
+  Work Lane als `completed_retained` vorbereitet werden, wenn er sauber,
+  unkoordiniert, remote recoverbar und `lease_release_ready=true` ist. Bei aktuellen
+  Work-Lane-Receipts muss der Checkout-Head außerdem exakt dem `terminal_head_sha`
+  des Closeouts entsprechen; Legacy-Receipts ohne dieses Feld bleiben auf den
+  strengeren historischen Recovery-Nachweis beschränkt. Eine zweite, bewusst enge
+  Present-Admission existiert für `source.kind=thread_focus`: Die Thread-Fokus-Quelle
+  muss acceptance-bound terminal sein, der aktuelle Branch-Head muss exakt dem
+  aktiven Retention-Head entsprechen und vorhandene Dirty-Evidenz darf ausschließlich
+  aus direkten regulären Dateien unter `.review-audits/` bestehen. Tracked/staged
+  Änderungen, andere untracked Pfade, Unterverzeichnisse, Symlinks, Hardlinks, zu
+  große oder während der Beobachtung driftende Dateien bleiben blockierend. Die
+  Dateien werden über einen no-follow Directory-Descriptor gelesen, einzeln SHA-256-
+  gebunden und als begrenztes Manifest in den Preview-Digest aufgenommen. Ein
+  historischer Lifecycle-Head darf dabei nur auf den bereits separat retaineden
+  aktuellen Head catch-up-en; bei einem fehlenden Checkout ist dieser Catch-up
+  ausdrücklich verboten.
 - `grabowski_checkout_binding_terminal_apply`: übernimmt ausschließlich einen
   frischen, zeitgebundenen Preview-Digest per Compare-and-Swap. Missing-Mode geht
-  nach `externally_terminal_missing`; Present-Work-Lane-Mode geht nur von `active`
-  nach `completed_retained` und gibt damit den Active-Creation-Slot frei, ohne den
-  Checkout oder seine Retention zu entfernen. Ein später verschwundener
+  nach `externally_terminal_missing`; ein zulässiger Present-Mode geht nur von
+  `active` nach `completed_retained` und gibt damit den Active-Creation-Slot frei,
+  ohne Checkout oder Retention zu entfernen. Ein später verschwundener
   `completed_retained`-Checkout darf in einem neuen Preview nach
   `externally_terminal_missing` konvergieren; der vorherige Receipt bleibt dabei
   hashgebunden als Vorgänger erhalten. Ist ein zulässiger Branch-Head ein
   nachweislicher Descendant des gebundenen Heads, darf derselbe CAS zusätzlich
-  ausschließlich `expected_head` in Binding und Retention rebind-en. Divergenz,
-  fehlende Release-Readiness, ein Head nach aktuellem Work-Lane-Closeout oder nicht
-  beobachtbare Recovery-Evidenz bleiben blockierend. Der Aufruf archiviert oder
-  löscht nichts und verändert weder Branch noch Ref.
+  ausschließlich `expected_head` in Binding und Retention rebind-en. Im engen
+  `thread_focus`-Fall wird zusätzlich das exakte `.review-audits`-Manifest in den
+  Receipt gebunden; Preview-vs-Apply-Drift macht den CAS stale. Die Evidence-Dateien
+  selbst werden weder verändert, verschoben, gestasht, committed noch gelöscht.
+  Divergenz, fehlende Work-Lane-Release-Readiness, ein Head nach aktuellem
+  Work-Lane-Closeout oder nicht beobachtbare Recovery-Evidenz bleiben blockierend.
+  Der Aufruf archiviert oder löscht nichts und verändert weder Branch noch Ref.
 - Die Grips `checkout-owner-handoff-preview` und `checkout-owner-handoff-apply`
   sind ein enger Reconciliation-Pfad für genau `binding-retention-owner-mismatch`:
   nur sauberer, unkoordinierter Checkout; nur `completed_retained`; kein
@@ -96,7 +110,10 @@ Die Phasen werden read-only wie folgt projiziert:
   lässt Lifecycle-, Dirty-, Pfad- und Branch-Schutz unverändert und erteilt
   keine Cleanup-, Terminalitäts- oder Wiederverwendungsautorität.
 - `completed_retained` bleibt als terminal-retained und
-  archivierungspflichtig sichtbar.
+  archivierungspflichtig sichtbar. Ein vorhandener `thread_focus`-Checkout darf
+  diesen Zustand trotz untracked Review-Evidence nur über die oben beschriebene
+  evidence-only Admission erreichen; normale Dirty-Arbeit bleibt unverändert
+  blockiert. Der generische Identity-Rebind bleibt weiterhin clean-only.
 - `externally_terminal_missing` bezeichnet ausschließlich einen durch
   Quellreceipt und CAS belegten externen Abschluss bei bereits fehlendem Checkout.
   Ein inzwischen fortgeschrittener Branch ist nur zulässig, wenn Git den gebundenen
@@ -162,7 +179,9 @@ weiterhin nur nach Archiv- und Dry-Run-Vertrag.
 1. Der Haupt-Worktree ist kein temporärer Cleanup-Kandidat.
 2. Dirty oder untracked Checkouts werden nicht archiviert oder entfernt.
    Dirty-State wird nie gelöscht und ist nur bei realer Ressourcenüberschneidung
-   coordination-blocking.
+   coordination-blocking. Die enge `thread_focus`-Admission für hashgebundene
+   `.review-audits`-Dateien terminalisiert ausschließlich Lifecycle-Evidenz; sie
+   erteilt gerade keine Archiv-, Cleanup- oder Dateimutationsautorität.
 3. Branches werden nicht gelöscht. Cleanup entfernt nur die verlinkte
    Arbeitskopie; `refs/heads/...` und Recovery-Refs bleiben erhalten.
 4. Cleanup verlangt eine vorherige Archivierung mit verifizierbaren
@@ -182,7 +201,11 @@ weiterhin nur nach Archiv- und Dry-Run-Vertrag.
 8. `externally_terminal_missing` verändert Phase und Terminalzeit. Nur bei
    nachgewiesener Descendant-Branchbewegung darf derselbe CAS außerdem
    `expected_head` in Binding und Retention auf den beobachteten Descendant setzen;
-   Branch, Ref, Archiv und Dateisystem bleiben unverändert.
+   Branch, Ref, Archiv und Dateisystem bleiben unverändert. Ein bereits zwischen
+   Lifecycle und Retention auseinanderliegender Head darf nicht im Missing-Mode
+   nachträglich geheilt werden. Der enge `thread_focus`-Catch-up ist nur bei einem
+   noch vorhandenen Checkout zulässig, dessen aktueller Head exakt dem Retention-
+   Head entspricht und dessen übrige Admission vollständig grün ist.
 9. `~/repos/merges` bleibt unveränderbare Evidence-Zone.
 10. Es gibt keine direkte oder forcierte Dateisystemlöschung durch den
    Lifecycle-Code.

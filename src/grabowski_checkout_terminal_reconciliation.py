@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
 import stat
@@ -15,6 +17,10 @@ SCHEMA_VERSION = checkouts.TERMINAL_RECONCILIATION_SCHEMA_VERSION
 PREVIEW_TTL_SECONDS = checkouts.TERMINAL_RECONCILIATION_PREVIEW_TTL_SECONDS
 CONFIRMATION = checkouts.TERMINAL_RECONCILIATION_CONFIRMATION
 _ALLOWED_SOURCE_PHASES = frozenset({"active", "completed_retained"})
+_REVIEW_EVIDENCE_DIR = ".review-audits"
+_REVIEW_EVIDENCE_MAX_FILES = 64
+_REVIEW_EVIDENCE_MAX_FILE_BYTES = 2 * 1024 * 1024
+_REVIEW_EVIDENCE_MAX_TOTAL_BYTES = 8 * 1024 * 1024
 
 
 def _checkout_key(value: str) -> str:
@@ -101,7 +107,6 @@ def _snapshot(checkout_key: str) -> dict[str, Any]:
         "repo_path",
         "checkout_path",
         "owner_id",
-        "expected_head",
         "expected_branch",
     )
     mismatched = [field for field in identity_fields if binding.get(field) != retention.get(field)]
@@ -109,16 +114,38 @@ def _snapshot(checkout_key: str) -> dict[str, Any]:
         raise RuntimeError(
             "checkout binding and retention identity differ: " + ",".join(mismatched)
         )
-    if not isinstance(binding.get("expected_head"), str) or not isinstance(
-        binding.get("expected_branch"), str
-    ):
-        raise RuntimeError("terminal reconciliation requires exact stored head and branch")
+    for row_name, row in (("binding", binding), ("retention", retention)):
+        if (
+            not isinstance(row.get("expected_head"), str)
+            or checkouts.GIT_OBJECT_RE.fullmatch(row["expected_head"]) is None
+            or not isinstance(row.get("expected_branch"), str)
+        ):
+            raise RuntimeError(
+                f"terminal reconciliation requires exact stored {row_name} head and branch"
+            )
+    identity_catchup: dict[str, Any] | None = None
+    if binding["expected_head"] != retention["expected_head"]:
+        source = binding.get("source")
+        if not (
+            binding.get("phase") == "active"
+            and isinstance(source, dict)
+            and source.get("kind") == "thread_focus"
+        ):
+            raise RuntimeError(
+                "checkout binding and retention identity differ: expected_head"
+            )
+        identity_catchup = {
+            "kind": "thread_focus_retention_head_catchup",
+            "binding_expected_head": binding["expected_head"],
+            "retention_expected_head": retention["expected_head"],
+        }
     return {
         "binding": binding,
         "binding_sha256": checkouts._sha256_json(binding),
         "retention": retention,
         "retention_sha256": checkouts._sha256_json(retention),
         "archive_count": int(archive_count),
+        "identity_catchup": identity_catchup,
     }
 
 
@@ -222,6 +249,261 @@ def _missing_checkout_observation(binding: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _thread_focus_review_evidence_paths(
+    checkout: Path, status: dict[str, Any]
+) -> tuple[list[str], list[str]]:
+    blockers: list[str] = []
+    for label, arguments in (
+        ("unstaged", ["diff", "--quiet", "--no-ext-diff", "--"]),
+        ("staged", ["diff", "--cached", "--quiet", "--no-ext-diff", "--"]),
+    ):
+        completed = checkouts._git_read(checkout, arguments, check=False)
+        if completed.returncode not in {0, 1}:
+            blockers.append(f"review-evidence-{label}-status-unobservable")
+        elif completed.returncode == 1:
+            blockers.append(f"review-evidence-{label}-tracked-change")
+
+    visible_untracked = checkouts._git_read(
+        checkout,
+        ["ls-files", "--others", "--exclude-standard", "-z"],
+        check=False,
+    )
+    ignored_review_evidence = checkouts._git_read(
+        checkout,
+        [
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+            "--",
+            _REVIEW_EVIDENCE_DIR,
+        ],
+        check=False,
+    )
+    paths: list[str] = []
+    visible_paths: list[str] = []
+    if visible_untracked.returncode != 0:
+        blockers.append("review-evidence-untracked-status-unobservable")
+    else:
+        visible_paths = [item for item in visible_untracked.stdout.split("\0") if item]
+        paths.extend(visible_paths)
+    if ignored_review_evidence.returncode != 0:
+        blockers.append("review-evidence-ignored-status-unobservable")
+    else:
+        paths.extend(
+            item for item in ignored_review_evidence.stdout.split("\0") if item
+        )
+    paths = sorted(set(paths))
+    if len(paths) > _REVIEW_EVIDENCE_MAX_FILES:
+        blockers.append("review-evidence-file-count-exceeded")
+    if (
+        status.get("entry_count") != len(visible_paths)
+        or status.get("untracked_count") != len(visible_paths)
+    ):
+        blockers.append("review-evidence-status-count-mismatch")
+    return paths, blockers
+
+
+def _review_evidence_filename(raw_path: str) -> str | None:
+    relative = Path(raw_path)
+    parts = relative.parts
+    if (
+        relative.is_absolute()
+        or len(parts) != 2
+        or parts[0] != _REVIEW_EVIDENCE_DIR
+        or raw_path != f"{_REVIEW_EVIDENCE_DIR}/{parts[-1]}"
+        or parts[-1] in {"", ".", ".."}
+    ):
+        return None
+    return parts[-1]
+
+
+def _open_review_evidence_root(
+    checkout: Path,
+) -> tuple[int, os.stat_result | None, list[str]]:
+    root = checkout / _REVIEW_EVIDENCE_DIR
+    blockers: list[str] = []
+    try:
+        linked = root.lstat()
+    except OSError:
+        return -1, None, ["review-evidence-root-unobservable"]
+    if stat.S_ISLNK(linked.st_mode):
+        return -1, None, ["review-evidence-root-symlink"]
+    if not stat.S_ISDIR(linked.st_mode):
+        return -1, None, ["review-evidence-root-not-directory"]
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(root, flags)
+    except OSError:
+        return -1, None, ["review-evidence-root-unobservable"]
+    opened = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or opened.st_dev != linked.st_dev
+        or opened.st_ino != linked.st_ino
+    ):
+        blockers.append("review-evidence-root-identity-drift")
+    return descriptor, opened, blockers
+
+
+def _hash_review_evidence_file(
+    root_descriptor: int, raw_path: str, remaining_bytes: int
+) -> tuple[dict[str, Any] | None, list[str]]:
+    filename = _review_evidence_filename(raw_path)
+    if filename is None:
+        return None, ["review-evidence-path-outside-allowlist"]
+    try:
+        linked = os.stat(filename, dir_fd=root_descriptor, follow_symlinks=False)
+    except OSError:
+        return None, ["review-evidence-file-unobservable"]
+    if not stat.S_ISREG(linked.st_mode):
+        return None, ["review-evidence-file-not-regular"]
+    if linked.st_nlink != 1:
+        return None, ["review-evidence-file-hardlinked"]
+    if linked.st_size > _REVIEW_EVIDENCE_MAX_FILE_BYTES:
+        return None, ["review-evidence-file-size-exceeded"]
+    if linked.st_size > remaining_bytes:
+        return None, ["review-evidence-total-size-exceeded"]
+
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    descriptor = -1
+    try:
+        descriptor = os.open(filename, flags, dir_fd=root_descriptor)
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_dev != linked.st_dev
+            or before.st_ino != linked.st_ino
+            or before.st_nlink != 1
+            or before.st_size != linked.st_size
+        ):
+            return None, ["review-evidence-file-identity-drift"]
+        digest = hashlib.sha256()
+        observed_bytes = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            observed_bytes += len(chunk)
+            if observed_bytes > _REVIEW_EVIDENCE_MAX_FILE_BYTES:
+                return None, ["review-evidence-file-size-exceeded"]
+            if observed_bytes > remaining_bytes:
+                return None, ["review-evidence-total-size-exceeded"]
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev != after.st_dev
+            or before.st_ino != after.st_ino
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+            or before.st_ctime_ns != after.st_ctime_ns
+            or before.st_nlink != after.st_nlink
+            or observed_bytes != after.st_size
+        ):
+            return None, ["review-evidence-file-changed-during-read"]
+        return {
+            "path": raw_path,
+            "bytes": observed_bytes,
+            "sha256": digest.hexdigest(),
+        }, []
+    except OSError:
+        return None, ["review-evidence-file-unobservable"]
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _review_evidence_root_unchanged(
+    checkout: Path, opened: os.stat_result | None
+) -> bool:
+    if opened is None:
+        return False
+    try:
+        linked = (checkout / _REVIEW_EVIDENCE_DIR).lstat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(linked.st_mode)
+        and not stat.S_ISLNK(linked.st_mode)
+        and linked.st_dev == opened.st_dev
+        and linked.st_ino == opened.st_ino
+    )
+
+
+def _thread_focus_review_evidence_observation(
+    record: dict[str, Any], status: dict[str, Any]
+) -> dict[str, Any]:
+    checkout = Path(record["path"])
+    if status.get("dirty") not in {True, False}:
+        return {
+            "classification": "blocked",
+            "eligible": False,
+            "blockers": ["review-evidence-status-unobservable"],
+        }
+
+    paths, blockers = _thread_focus_review_evidence_paths(checkout, status)
+    if not paths and status.get("dirty") is False and not blockers:
+        return {
+            "classification": "not_applicable",
+            "eligible": False,
+            "blockers": [],
+        }
+    root_descriptor, root_identity, root_blockers = _open_review_evidence_root(checkout)
+    blockers.extend(root_blockers)
+    files: list[dict[str, Any]] = []
+    total_bytes = 0
+    try:
+        if (
+            root_descriptor >= 0
+            and not root_blockers
+            and len(paths) <= _REVIEW_EVIDENCE_MAX_FILES
+        ):
+            for raw_path in paths:
+                evidence, file_blockers = _hash_review_evidence_file(
+                    root_descriptor,
+                    raw_path,
+                    _REVIEW_EVIDENCE_MAX_TOTAL_BYTES - total_bytes,
+                )
+                blockers.extend(file_blockers)
+                if evidence is None:
+                    continue
+                total_bytes += int(evidence["bytes"])
+                files.append(evidence)
+            if not _review_evidence_root_unchanged(checkout, root_identity):
+                blockers.append("review-evidence-root-changed-during-read")
+    finally:
+        if root_descriptor >= 0:
+            os.close(root_descriptor)
+
+    if not paths:
+        blockers.append("review-evidence-files-missing")
+    if len(files) != len(paths):
+        blockers.append("review-evidence-manifest-incomplete")
+    core = {
+        "schema_version": 1,
+        "kind": "thread_focus_review_evidence_manifest",
+        "root": _REVIEW_EVIDENCE_DIR,
+        "file_count": len(files),
+        "total_bytes": total_bytes,
+        "files": files,
+    }
+    return {
+        **core,
+        "manifest_sha256": checkouts._sha256_json(core),
+        "classification": "review_evidence_only" if not blockers else "blocked",
+        "eligible": not blockers,
+        "blockers": sorted(set(blockers)),
+    }
+
 def _present_checkout_observation(binding: dict[str, Any]) -> dict[str, Any]:
     repo = checkouts._resolve_repo(binding["repo_path"])
     common_dir = checkouts._git_common_dir(repo)
@@ -258,6 +540,7 @@ def _present_checkout_observation(binding: dict[str, Any]) -> dict[str, Any]:
     relation = "unobservable"
     status: dict[str, Any] | None = None
     remote_security: dict[str, Any] | None = None
+    review_evidence: dict[str, Any] | None = None
     if record is not None:
         if record.get("prunable"):
             blockers.append("checkout-record-prunable")
@@ -283,8 +566,20 @@ def _present_checkout_observation(binding: dict[str, Any]) -> dict[str, Any]:
         elif branch_head is not None and ref_head != branch_head:
             blockers.append("branch-ref-head-drift")
         status = checkouts._worktree_status(record)
+        source = binding.get("source")
+        source_is_thread_focus = (
+            isinstance(source, dict) and source.get("kind") == "thread_focus"
+        )
+        if source_is_thread_focus and status.get("dirty") in {True, False}:
+            review_evidence = _thread_focus_review_evidence_observation(record, status)
+            if review_evidence.get("classification") == "blocked":
+                blockers.extend(review_evidence.get("blockers", []))
         if status.get("dirty") is True:
-            blockers.append("checkout-dirty")
+            if source_is_thread_focus:
+                if review_evidence is None or review_evidence.get("eligible") is not True:
+                    blockers.append("checkout-dirty")
+            else:
+                blockers.append("checkout-dirty")
         elif status.get("dirty") is not False:
             blockers.append("checkout-status-unobservable")
         remote_security = checkouts._remote_secured_observation(
@@ -307,6 +602,7 @@ def _present_checkout_observation(binding: dict[str, Any]) -> dict[str, Any]:
         "expected_branch": binding["expected_branch"],
         "status": status,
         "remote_security": remote_security,
+        "review_evidence": review_evidence,
         "blockers": sorted(set(blockers)),
     }
 
@@ -421,19 +717,43 @@ def _preview_state(
     checkout = _terminal_checkout_observation(binding)
     coordination = _coordination(binding, ignore_lease_owner=ignore_lease_owner)
     blockers = list(checkout["blockers"])
+    if snapshot["identity_catchup"] is not None and checkout.get("mode") != "present":
+        blockers.append("thread-focus-retention-head-catchup-requires-present-checkout")
     if snapshot["archive_count"]:
         blockers.append("archive-record-present")
     source = binding.get("source")
     source_is_work_lane = (
         isinstance(source, dict) and source.get("kind") == "work_lane"
     )
+    source_is_thread_focus = (
+        isinstance(source, dict) and source.get("kind") == "thread_focus"
+    )
     if checkout.get("mode") == "present":
         if binding["phase"] != "active":
             blockers.append("present-checkout-not-active")
-        if not source_is_work_lane:
+        if source_is_work_lane:
+            if source_evidence.get("lease_release_ready") is not True:
+                blockers.append("work-lane-lease-release-not-ready")
+        elif source_is_thread_focus:
+            if source_evidence.get("terminal_state") != "completed_without_current_obligation":
+                blockers.append("thread-focus-terminal-evidence-invalid")
+            if checkout.get("branch_head") != snapshot["retention"].get("expected_head"):
+                blockers.append("thread-focus-head-not-retention-bound")
+            status = checkout.get("status")
+            review_evidence = checkout.get("review_evidence")
+            if isinstance(status, dict):
+                if status.get("dirty") is True and (
+                    not isinstance(review_evidence, dict)
+                    or review_evidence.get("eligible") is not True
+                ):
+                    blockers.append("thread-focus-review-evidence-not-admissible")
+                elif (
+                    isinstance(review_evidence, dict)
+                    and review_evidence.get("classification") == "blocked"
+                ):
+                    blockers.append("thread-focus-review-evidence-not-admissible")
+        else:
             blockers.append("present-checkout-source-not-work-lane")
-        elif source_evidence.get("lease_release_ready") is not True:
-            blockers.append("work-lane-lease-release-not-ready")
     if source_is_work_lane:
         terminal_head = source_evidence.get("terminal_head_sha")
         if terminal_head is not None:
@@ -455,6 +775,7 @@ def _preview_state(
         "binding_sha256": snapshot["binding_sha256"],
         "retention": snapshot["retention"],
         "retention_sha256": snapshot["retention_sha256"],
+        "identity_catchup": snapshot["identity_catchup"],
         "source_evidence": source_evidence,
         "checkout_observation": checkout,
         "coordination": coordination,
@@ -467,6 +788,7 @@ def _preview_state(
             "branch_or_ref_deletion_authority",
             "historical_checkout_content",
             "permission_to_remove_retention_or_binding_rows",
+            "permission_to_modify_or_delete_review_evidence",
         ],
     }
     return stable
@@ -764,6 +1086,9 @@ def apply(
                 "retention_after": retention_after,
                 "retention_after_sha256": checkouts._sha256_json(retention_after),
                 "branch_head_rebind": branch_head_rebind,
+                "identity_catchup": planned.get("identity_catchup"),
+                "review_evidence_manifest": checkout_observation.get("review_evidence"),
+                "checkout_observation_sha256": checkouts._sha256_json(checkout_observation),
                 "source_evidence": planned["source_evidence"],
                 "source_evidence_sha256": planned["source_evidence"]["evidence_sha256"],
                 "preview_sha256": preview_sha256,
@@ -776,6 +1101,7 @@ def apply(
                     "branch_or_ref_deletion_authority",
                     "historical_checkout_content",
                     "permission_to_delete_binding_or_retention_rows",
+                    "permission_to_modify_or_delete_review_evidence",
                 ],
             }
             if superseded_receipt is not None:
@@ -847,6 +1173,11 @@ def apply(
             "preview_sha256": preview_sha256,
             "receipt_sha256": receipt["receipt_sha256"],
             "resource_keys": resource_keys,
+            "review_evidence_manifest_sha256": (
+                checkout_observation.get("review_evidence", {}).get("manifest_sha256")
+                if isinstance(checkout_observation.get("review_evidence"), dict)
+                else None
+            ),
         }
         checkouts.base._append_audit(audit)
         result = {
