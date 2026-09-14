@@ -587,6 +587,114 @@ def _error_evidence(exc: BaseException) -> dict[str, Any]:
     }
 
 
+def _zero_provider_usage(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    token_fields = (
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    )
+    for field in token_fields:
+        amount = value.get(field)
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount != 0:
+            return False
+    server_tools = value.get("server_tool_use")
+    if not isinstance(server_tools, Mapping) or not server_tools:
+        return False
+    return all(
+        not isinstance(amount, bool) and isinstance(amount, int) and amount == 0
+        for amount in server_tools.values()
+    )
+
+
+def _provider_execution_classification(
+    messages: Sequence[Mapping[str, Any]], result: Mapping[str, Any]
+) -> dict[str, Any]:
+    unknown = {
+        "classification": "unknown_or_model_work_possible",
+        "classification_grants_retry": False,
+        "reason": "insufficient_immutable_evidence",
+    }
+    if result.get("is_error") is not True:
+        return unknown
+    if result.get("terminal_reason") != "api_error":
+        return unknown
+    status = result.get("api_error_status")
+    if isinstance(status, bool) or not isinstance(status, int) or status != 429:
+        return unknown
+    if result.get("duration_api_ms") != 0:
+        return unknown
+    if not _zero_provider_usage(result.get("usage")):
+        return unknown
+    try:
+        cost = Decimal(str(result.get("total_cost_usd")))
+    except Exception:
+        return unknown
+    if not cost.is_finite() or cost != 0:
+        return unknown
+    if result.get("modelUsage") != {}:
+        return unknown
+    subagents = result.get("subagent_stats")
+    if not isinstance(subagents, Mapping):
+        return unknown
+    for field in ("spawned", "started_in_background", "completed", "failed"):
+        amount = subagents.get(field)
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount != 0:
+            return unknown
+    allowed_message_types = {"system", "rate_limit_event", "assistant", "result"}
+    if any(message.get("type") not in allowed_message_types for message in messages):
+        return unknown
+    rate_events = [message for message in messages if message.get("type") == "rate_limit_event"]
+    if len(rate_events) != 1:
+        return unknown
+    rate_info = rate_events[0].get("rate_limit_info")
+    if not isinstance(rate_info, Mapping) or rate_info.get("status") != "rejected":
+        return unknown
+    if rate_info.get("isUsingOverage") is not False:
+        return unknown
+    rate_limit_type = rate_info.get("rateLimitType")
+    if not isinstance(rate_limit_type, str) or not rate_limit_type:
+        return unknown
+    assistants = [message for message in messages if message.get("type") == "assistant"]
+    if len(assistants) != 1:
+        return unknown
+    assistant = assistants[0]
+    nested = assistant.get("message")
+    if not isinstance(nested, Mapping):
+        return unknown
+    if assistant.get("is_api_error_message") is not True or assistant.get("error") != "rate_limit":
+        return unknown
+    if nested.get("model") != "<synthetic>" or not _zero_provider_usage(nested.get("usage")):
+        return unknown
+    content = nested.get("content")
+    if not isinstance(content, list) or not content:
+        return unknown
+    if any(not isinstance(block, Mapping) or block.get("type") != "text" for block in content):
+        return unknown
+    try:
+        uses, tool_results = runner._tool_blocks(messages)
+    except runner.RunnerError:
+        return unknown
+    if uses or tool_results:
+        return unknown
+    session_ids = {
+        message.get("session_id")
+        for message in messages
+        if isinstance(message.get("session_id"), str) and message.get("session_id")
+    }
+    if len(session_ids) != 1:
+        return unknown
+    return {
+        "classification": "provider_refusal_before_model_execution",
+        "classification_grants_retry": False,
+        "reason": "explicit_rate_limit_rejection_zero_usage_zero_cost_no_model_or_tool_work",
+        "api_error_status": status,
+        "rate_limit_type": rate_limit_type,
+    }
+
+
 def _failure_transcript_summary(
     request: Mapping[str, Any], transcript_root: Path
 ) -> dict[str, Any]:
@@ -596,6 +704,11 @@ def _failure_transcript_summary(
         "artifact": artifact,
         "outcome_ambiguous": True,
         "observed_cost_usd": None,
+        "provider_execution": {
+            "classification": "unknown_or_model_work_possible",
+            "classification_grants_retry": False,
+            "reason": "insufficient_immutable_evidence",
+        },
     }
     try:
         if path.is_symlink() or not path.is_file():
@@ -625,6 +738,7 @@ def _failure_transcript_summary(
             "outcome_ambiguous": False,
             "subtype": result.get("subtype"),
             "is_error": result.get("is_error"),
+            "provider_execution": _provider_execution_classification(messages, result),
         }
     )
     try:

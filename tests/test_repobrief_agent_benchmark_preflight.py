@@ -142,6 +142,106 @@ def _fixture_kwargs(root: Path, environment: dict) -> dict:
     }
 
 
+def _rate_limit_refusal_stream(
+    request: dict,
+    *,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cost: str = "0",
+    api_error_status: int = 429,
+    duration_api_ms: int = 0,
+    include_tool_use: bool = False,
+    is_using_overage: bool = False,
+) -> bytes:
+    session_id = f"provider-refusal-{request['condition']}"
+    zero_server_tools = {"web_search_requests": 0, "web_fetch_requests": 0}
+    assistant_content: list[dict] = [
+        {"type": "text", "text": "session limit reached"}
+    ]
+    if include_tool_use:
+        assistant_content.append(
+            {
+                "type": "tool_use",
+                "id": "unexpected-tool",
+                "name": "Read",
+                "input": {"file_path": "src/example.py"},
+            }
+        )
+    usage = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "server_tool_use": zero_server_tools,
+    }
+    messages = [
+        {
+            "type": "system",
+            "subtype": "init",
+            "session_id": session_id,
+            "model": support.MODEL,
+            "tools": list(support.runner.READ_ONLY_BUILTINS),
+        },
+        {
+            "type": "system",
+            "subtype": "status",
+            "status": "requesting",
+            "session_id": session_id,
+        },
+        {
+            "type": "rate_limit_event",
+            "session_id": session_id,
+            "rate_limit_info": {
+                "status": "rejected",
+                "rateLimitType": "five_hour",
+                "isUsingOverage": is_using_overage,
+            },
+        },
+        {
+            "type": "assistant",
+            "session_id": session_id,
+            "error": "rate_limit",
+            "is_api_error_message": True,
+            "message": {
+                "model": "<synthetic>",
+                "role": "assistant",
+                "usage": usage,
+                "content": assistant_content,
+            },
+        },
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": True,
+            "session_id": session_id,
+            "terminal_reason": "api_error",
+            "api_error_status": api_error_status,
+            "duration_api_ms": duration_api_ms,
+            "usage": usage,
+            "modelUsage": {},
+            "subagent_stats": {
+                "spawned": 0,
+                "started_in_background": 0,
+                "completed": 0,
+                "failed": 0,
+            },
+            "total_cost_usd": cost,
+        },
+    ]
+    return b"".join(
+        json.dumps(message, sort_keys=True).encode("utf-8") + b"\n"
+        for message in messages
+    )
+
+
+def _write_failure_transcript(
+    request: dict, transcript_root: Path, payload: bytes
+) -> None:
+    path, _artifact = support.runner._transcript_path(request, transcript_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+
+
 class ClaudeExecutableIdentityTests(unittest.TestCase):
     def _identity(self, executable: Path) -> dict:
         with mock.patch.object(
@@ -798,6 +898,112 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
             self.assertFalse(
                 report["environment"]["claude"]["version_probed"]
             )
+
+
+class ProviderExecutionClassificationTests(unittest.TestCase):
+    def test_exact_zero_work_rate_limit_refusal_is_classified_without_retry_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = support.fixture_environment(root)
+            request = environment["baseline"]
+            transcript_root = root / "transcripts"
+            _write_failure_transcript(
+                request, transcript_root, _rate_limit_refusal_stream(request)
+            )
+            summary = support.preflight._core._failure_transcript_summary(
+                request, transcript_root
+            )
+            self.assertFalse(summary["outcome_ambiguous"])
+            self.assertEqual(summary["observed_cost_usd"], "0")
+            self.assertEqual(
+                summary["provider_execution"]["classification"],
+                "provider_refusal_before_model_execution",
+            )
+            self.assertFalse(
+                summary["provider_execution"]["classification_grants_retry"]
+            )
+            self.assertEqual(
+                summary["provider_execution"]["api_error_status"], 429
+            )
+            self.assertEqual(
+                summary["provider_execution"]["rate_limit_type"], "five_hour"
+            )
+
+    def test_any_work_or_nonzero_cost_fails_closed(self) -> None:
+        cases = {
+            "input-token": {"input_tokens": 1},
+            "output-token": {"output_tokens": 1},
+            "cost": {"cost": "0.01"},
+            "api-duration": {"duration_api_ms": 1},
+            "different-status": {"api_error_status": 503},
+            "tool-use": {"include_tool_use": True},
+            "overage-active": {"is_using_overage": True},
+        }
+        for label, overrides in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = support.fixture_environment(root)
+                request = environment["baseline"]
+                transcript_root = root / "transcripts"
+                _write_failure_transcript(
+                    request,
+                    transcript_root,
+                    _rate_limit_refusal_stream(request, **overrides),
+                )
+                summary = support.preflight._core._failure_transcript_summary(
+                    request, transcript_root
+                )
+                self.assertEqual(
+                    summary["provider_execution"]["classification"],
+                    "unknown_or_model_work_possible",
+                )
+                self.assertFalse(
+                    summary["provider_execution"]["classification_grants_retry"]
+                )
+
+    def test_ledger_records_classification_but_still_blocks_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = support.fixture_environment(root)
+            kwargs = _preflight_kwargs(root, environment)
+
+            def reject_without_model_work(request, **runner_kwargs):
+                _write_failure_transcript(
+                    request,
+                    Path(runner_kwargs["transcript_root"]),
+                    _rate_limit_refusal_stream(request),
+                )
+                raise support.preflight.runner.RunnerError(
+                    "provider did not produce a successful result"
+                )
+
+            with mock.patch.object(
+                support.preflight._core.runner,
+                "execute",
+                side_effect=reject_without_model_work,
+            ):
+                with self.assertRaisesRegex(
+                    support.preflight.runner.RunnerError,
+                    "did not produce a successful result",
+                ):
+                    _execute_with_test_provider_binding(**kwargs)
+            events = support.ledger_events(root / "state")
+            failure = next(
+                event for event in events if event["event"] == "condition-failed"
+            )
+            self.assertEqual(
+                failure["payload"]["transcript"]["provider_execution"][
+                    "classification"
+                ],
+                "provider_refusal_before_model_execution",
+            )
+            self.assertFalse(
+                failure["payload"]["transcript"]["provider_execution"][
+                    "classification_grants_retry"
+                ]
+            )
+            self.assertFalse(events[-1]["payload"]["retry_permitted"])
+            self.assertEqual(events[-1]["payload"]["provider_process_intents"], 1)
 
 
 class RepoBriefAgentBenchmarkPreflightLedgerTests(unittest.TestCase):
