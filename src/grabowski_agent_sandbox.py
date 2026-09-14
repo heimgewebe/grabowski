@@ -28,13 +28,41 @@ class AgentSandboxError(RuntimeError):
 class PreparedSandboxCommand:
     command: tuple[str, ...]
     extra_read_only: tuple[tuple[Path, Path], ...] = ()
+    extra_read_write: tuple[tuple[Path, Path], ...] = ()
     extra_directories: tuple[Path, ...] = ()
     profile: str | None = None
+    probe_executable: str | None = None
 
 
 CLAUDE_PROFILE = "claude-cli-readonly-auth-v1"
 CLAUDE_SANDBOX_EXECUTABLE = Path("/opt/grabowski-external/claude")
 CLAUDE_SANDBOX_CONFIG_DIR = Path("/tmp/.claude")
+CODEX_PROFILE = "codex-cli-dedicated-durable-auth-v1"
+CODEX_SANDBOX_EXECUTABLE = Path("/opt/grabowski-external/codex")
+CODEX_SANDBOX_CONFIG_DIR = Path("/tmp/.codex")
+CODEX_SANDBOX_CODE_MODE_HOST = Path("/opt/grabowski-external/codex-code-mode-host")
+CODEX_SANDBOX_AUTH_LOCK = Path("/tmp/.grabowski-codex-auth.lock")
+_CODEX_WORKSPACE_WRITE_PROTECTED_CONFIG = (
+    "sandbox_workspace_write.exclude_slash_tmp=true",
+    "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+)
+_CODEX_WORKSPACE_WRITE_PROTECTED_KEYS = frozenset(
+    {
+        "sandbox_workspace_write",
+        "sandbox_workspace_write.exclude_slash_tmp",
+        "sandbox_workspace_write.exclude_tmpdir_env_var",
+    }
+)
+_CODEX_AUTH_SERIALIZED_LAUNCH_SOURCE = """\
+import fcntl
+import subprocess
+import sys
+
+with open(sys.argv[1], "rb+") as lock_file:
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    completed = subprocess.run(sys.argv[2:], check=False)
+raise SystemExit(completed.returncode if completed.returncode >= 0 else 128 - completed.returncode)
+"""
 
 
 def _private_regular_file(path: Path, field: str) -> Path:
@@ -43,6 +71,88 @@ def _private_regular_file(path: Path, field: str) -> Path:
     if metadata.st_uid != os.getuid() or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) & 0o077:
         raise AgentSandboxError(f"{field} must be one owner-private regular file")
     return resolved
+
+
+def _private_directory(path: Path, field: str, *, create: bool = False) -> Path:
+    candidate = path.expanduser()
+    if not candidate.is_absolute() or candidate.is_symlink():
+        raise AgentSandboxError(f"{field} must be an absolute non-symlink path")
+    if create and not candidate.exists():
+        try:
+            candidate.mkdir(parents=True, mode=0o700, exist_ok=True)
+        except OSError as exc:
+            raise AgentSandboxError(f"{field} cannot be created safely") from exc
+    resolved = _safe_existing_path(candidate, field, directory=True)
+    metadata = resolved.stat()
+    if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise AgentSandboxError(f"{field} must be an owner-private directory")
+    return resolved
+
+
+def _private_lock_descriptor(path: Path, field: str) -> int:
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise AgentSandboxError(f"{field} is not safely openable") from exc
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+    ):
+        os.close(descriptor)
+        raise AgentSandboxError(f"{field} must be one owner-private regular file")
+    return descriptor
+
+
+def _codex_sandbox_auth_files(auth_root: Path) -> tuple[Path, Path]:
+    candidate = auth_root.expanduser()
+    normal_host_root = (Path.home() / ".codex").absolute()
+    candidate_absolute = candidate.absolute()
+    if candidate_absolute == normal_host_root or candidate_absolute.is_relative_to(
+        normal_host_root
+    ):
+        raise AgentSandboxError(
+            "Codex dedicated auth root must be separate from the normal host ~/.codex"
+        )
+    if not candidate.exists():
+        raise AgentSandboxError(
+            "Codex dedicated auth root is missing; create it owner-private (mode 0700) "
+            "and provision an independent login with "
+            f"CODEX_HOME={candidate} codex login --device-auth"
+        )
+    dedicated_root = _private_directory(candidate, "Codex dedicated auth root")
+    auth_file = _private_regular_file(
+        dedicated_root / "auth.json", "Codex dedicated auth"
+    )
+    normal_host_auth = normal_host_root / "auth.json"
+    normal_host_auth_file: Path | None = None
+    if os.path.lexists(normal_host_auth):
+        try:
+            resolved_host_auth = normal_host_auth.resolve(strict=True)
+            if stat.S_ISREG(resolved_host_auth.stat().st_mode):
+                normal_host_auth_file = resolved_host_auth
+        except OSError:
+            normal_host_auth_file = None
+    if (
+        normal_host_auth_file is not None
+        and (
+            os.path.samefile(normal_host_auth_file, auth_file)
+            or normal_host_auth_file.read_bytes() == auth_file.read_bytes()
+        )
+    ):
+        raise AgentSandboxError(
+            "Codex dedicated auth matches the normal host credential; provision an "
+            "independent login instead of copying or linking ~/.codex/auth.json"
+        )
+    lock_path = dedicated_root / ".auth.lock"
+    lock_descriptor = _private_lock_descriptor(lock_path, "Codex dedicated auth lock")
+    os.close(lock_descriptor)
+    return auth_file, lock_path
 
 
 def _resolved_executable(value: str, field: str) -> Path:
@@ -62,12 +172,93 @@ def _resolved_executable(value: str, field: str) -> Path:
     return resolved
 
 
+def _codex_command_with_protected_tmp(command: list[str]) -> tuple[str, ...]:
+    """Keep model-generated Codex commands away from the durable auth mount."""
+    index = 1
+    while index < len(command):
+        item = command[index]
+        assignment: str | None = None
+        if item in {"-c", "--config"}:
+            if index + 1 < len(command):
+                assignment = command[index + 1]
+                index += 2
+            else:
+                index += 1
+        elif item.startswith("--config="):
+            assignment = item.removeprefix("--config=")
+            index += 1
+        elif item.startswith("-c") and item != "-c":
+            assignment = item[2:].removeprefix("=")
+            index += 1
+        else:
+            index += 1
+        if assignment is None:
+            continue
+        key = assignment.split("=", 1)[0].strip()
+        if key in _CODEX_WORKSPACE_WRITE_PROTECTED_KEYS:
+            raise AgentSandboxError(
+                "Codex workspace-write /tmp exclusions are controlled by Grabowski"
+            )
+    hardened = [command[0]]
+    for assignment in _CODEX_WORKSPACE_WRITE_PROTECTED_CONFIG:
+        hardened.extend(["-c", assignment])
+    hardened.extend(command[1:])
+    return tuple(hardened)
+
+
 def prepare_external_agent_command(command: list[str]) -> PreparedSandboxCommand:
-    """Resolve supported external agents into explicit, read-only sandbox bindings."""
+    """Resolve supported external agents into explicit sandbox bindings."""
     if not command:
         raise AgentSandboxError("sandbox command must be non-empty")
-    if Path(command[0]).name != "claude":
+    executable_name = Path(command[0]).name
+    if executable_name not in {"claude", "codex"}:
         return PreparedSandboxCommand(tuple(command))
+    if executable_name == "codex":
+        codex_command = _codex_command_with_protected_tmp(command)
+        executable_override = os.environ.get("GRABOWSKI_CODEX_BIN")
+        executable = _resolved_executable(executable_override or command[0], "Codex executable")
+        auth_root = Path(
+            os.environ.get(
+                "GRABOWSKI_CODEX_AUTH_ROOT",
+                str(Path.home() / ".local/state/grabowski/codex-auth"),
+            )
+        ).expanduser()
+        sandbox_auth_file, sandbox_auth_lock = _codex_sandbox_auth_files(auth_root)
+        bindings: list[tuple[Path, Path]] = [
+            (executable, CODEX_SANDBOX_EXECUTABLE),
+        ]
+        code_mode_host = executable.parent / "codex-code-mode-host"
+        if code_mode_host.exists():
+            bindings.append(
+                (
+                    _resolved_executable(str(code_mode_host), "Codex code mode host"),
+                    CODEX_SANDBOX_CODE_MODE_HOST,
+                )
+            )
+        return PreparedSandboxCommand(
+            command=(
+                "/usr/bin/python3",
+                "-I",
+                "-S",
+                "-c",
+                _CODEX_AUTH_SERIALIZED_LAUNCH_SOURCE,
+                str(CODEX_SANDBOX_AUTH_LOCK),
+                str(CODEX_SANDBOX_EXECUTABLE),
+                *codex_command[1:],
+            ),
+            extra_read_only=tuple(bindings),
+            extra_read_write=(
+                (sandbox_auth_file, CODEX_SANDBOX_CONFIG_DIR / "auth.json"),
+                (sandbox_auth_lock, CODEX_SANDBOX_AUTH_LOCK),
+            ),
+            extra_directories=(
+                Path("/opt"),
+                Path("/opt/grabowski-external"),
+                CODEX_SANDBOX_CONFIG_DIR,
+            ),
+            profile=CODEX_PROFILE,
+            probe_executable=str(CODEX_SANDBOX_EXECUTABLE),
+        )
     executable_override = os.environ.get("GRABOWSKI_CLAUDE_BIN")
     executable = _resolved_executable(executable_override or command[0], "Claude executable")
     auth_root = Path(
@@ -279,6 +470,7 @@ def minimal_sandbox_argv(
     writable_paths: Iterable[Path] = (),
     git_common_dir: Path | None = None,
     extra_read_only: Iterable[tuple[Path, Path]] = (),
+    extra_read_write: Iterable[tuple[Path, Path]] = (),
     extra_directories: Iterable[Path] = (),
 ) -> list[str]:
     """Build the sandbox argv without requiring bubblewrap on the build host.
@@ -359,6 +551,23 @@ def minimal_sandbox_argv(
             raise AgentSandboxError(f"duplicate sandbox target: {target}")
         seen_targets.add(target)
         arguments.extend(["--ro-bind", str(source), target])
+    for source_value, target_value in extra_read_write:
+        source = _private_regular_file(source_value, "extra_read_write source")
+        target_path = Path(target_value)
+        if (
+            not target_path.is_absolute()
+            or "\x00" in str(target_path)
+            or target_path == Path("/tmp")
+            or not target_path.is_relative_to(Path("/tmp"))
+        ):
+            raise AgentSandboxError(
+                "extra_read_write target must be a private file path below /tmp"
+            )
+        target = str(target_path)
+        if target in seen_targets:
+            raise AgentSandboxError(f"duplicate sandbox target: {target}")
+        seen_targets.add(target)
+        arguments.extend(["--bind", str(source), target])
     arguments.extend(
         [
             "--clearenv",
