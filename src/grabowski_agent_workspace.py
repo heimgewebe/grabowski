@@ -13265,13 +13265,12 @@ def _verified_workspace_cleanup_archive(
     return archive if head_ref_valid else None
 
 
-def _workspace_recover_persisted_archive_uncertainty(
-    manifest: dict[str, Any],
+def _workspace_persisted_archive_uncertainty_fence(
     cleanup_plan: dict[str, Any],
     *,
     owner: str,
 ) -> dict[str, Any] | None:
-    "Reconcile one exact prior archive outcome before another archive effect."
+    "Return the one exact durable archive fence eligible for recovery readback."
     checkout = cleanup_plan.get("checkout")
     if not isinstance(checkout, dict):
         raise AgentWorkspaceActionError(
@@ -13324,7 +13323,64 @@ def _workspace_recover_persisted_archive_uncertainty(
         raise AgentWorkspaceActionError(
             "workspace archive recovery found conflicting checkout uncertainty fence"
         )
-    fence = matching[0]
+    return matching[0]
+
+
+def _workspace_recovery_coordination_matches_fence(
+    cleanup_plan: dict[str, Any], fence: dict[str, Any]
+) -> bool:
+    "Allow only coordination owned exactly by the durable recovery fence."
+    checkout = cleanup_plan.get("checkout")
+    coordination = checkout.get("coordination") if isinstance(checkout, dict) else None
+    if not isinstance(coordination, dict):
+        return False
+    leases = coordination.get("resource_leases")
+    tasks_value = coordination.get("tasks")
+    processes_value = coordination.get("processes")
+    expected_owner = fence.get("lease_owner_id")
+    expected_keys = fence.get("resource_keys")
+    if (
+        not isinstance(leases, list)
+        or not isinstance(tasks_value, list)
+        or not isinstance(processes_value, list)
+        or tasks_value
+        or processes_value
+        or not isinstance(expected_owner, str)
+        or not isinstance(expected_keys, list)
+        or not expected_keys
+        or any(not isinstance(item, str) or not item for item in expected_keys)
+    ):
+        return False
+    observed_keys: set[str] = set()
+    for lease in leases:
+        if (
+            not isinstance(lease, dict)
+            or lease.get("owner_id") != expected_owner
+            or not isinstance(lease.get("resource_key"), str)
+        ):
+            return False
+        observed_keys.add(str(lease["resource_key"]))
+    return bool(observed_keys) and observed_keys.issubset(set(expected_keys))
+
+
+def _workspace_recover_persisted_archive_uncertainty(
+    manifest: dict[str, Any],
+    cleanup_plan: dict[str, Any],
+    *,
+    owner: str,
+) -> dict[str, Any] | None:
+    "Reconcile one exact prior archive outcome before another archive effect."
+    fence = _workspace_persisted_archive_uncertainty_fence(
+        cleanup_plan, owner=owner
+    )
+    if fence is None:
+        return None
+    checkout = cleanup_plan["checkout"]
+    checkout_key = str(checkout["checkout_key"])
+    expected_head = str(checkout["head"])
+    expected_branch = str(checkout["branch"])
+    repo = str(cleanup_plan["repository"])
+    checkout_path = str(cleanup_plan["writer_worktree"])
     archive_id = str(fence["operation_id"])
     expected_evidence = dict(fence["evidence"])
     try:
@@ -13668,7 +13724,64 @@ def grabowski_agent_workspace_cleanup(
                 raise AgentWorkspaceError(
                     "workspace cleanup plan is stale; rerun cleanup_plan"
                 )
-            if not plan["eligible"]:
+            recovery_blocker_codes = {
+                item.get("code")
+                for item in plan.get("blockers", [])
+                if isinstance(item, dict)
+            }
+            prior_archive_effect = (
+                prior_intent.get("lifecycle_effects", {}).get("workspace_archive")
+                if isinstance(prior_intent, dict)
+                and isinstance(prior_intent.get("lifecycle_effects"), dict)
+                else None
+            )
+            recovery_fence = (
+                _workspace_persisted_archive_uncertainty_fence(plan, owner=owner)
+                if recovery_blocker_codes
+                in (
+                    {"cleanup_recovery_required"},
+                    {"cleanup_recovery_required", "active_checkout_coordination"},
+                )
+                else None
+            )
+            recovery_coordination_safe = bool(
+                "active_checkout_coordination" not in recovery_blocker_codes
+                or (
+                    isinstance(recovery_fence, dict)
+                    and _workspace_recovery_coordination_matches_fence(
+                        plan, recovery_fence
+                    )
+                )
+            )
+            expected_archive_execution = (
+                f"{identifier}:workspace_archive:{prior_intent.get('intent_id')}"
+                if isinstance(prior_intent, dict)
+                else None
+            )
+            archive_recovery_only = bool(
+                not plan["eligible"]
+                and plan.get("lifecycle_state") == "cleanup_recovery_required"
+                and recovery_blocker_codes
+                in (
+                    {"cleanup_recovery_required"},
+                    {"cleanup_recovery_required", "active_checkout_coordination"},
+                )
+                and recovery_coordination_safe
+                and isinstance(recovery_fence, dict)
+                and isinstance(prior_intent, dict)
+                and prior_intent.get("state") == "recovery_required"
+                and isinstance(prior_intent.get("source_plan_sha256"), str)
+                and SHA256_RE.fullmatch(str(prior_intent["source_plan_sha256"])) is not None
+                and prior_intent.get("owner_id") == owner
+                and prior_intent.get("writer_worktree") == plan["writer_worktree"]
+                and prior_intent.get("writer_branch") == plan["checkout"]["branch"]
+                and prior_intent.get("writer_head") == plan["checkout"]["head"]
+                and isinstance(prior_archive_effect, dict)
+                and prior_archive_effect.get("status") == "recovery_required"
+                and prior_archive_effect.get("execution_id")
+                in {expected_archive_execution, f"{expected_archive_execution}:reconcile"}
+            )
+            if not plan["eligible"] and not archive_recovery_only:
                 return {
                     "workspace_id": identifier,
                     "state": "cleanup_blocked",
