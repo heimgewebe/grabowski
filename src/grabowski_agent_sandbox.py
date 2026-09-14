@@ -102,6 +102,9 @@ def _private_lock_descriptor(path: Path, field: str) -> int:
 
 
 def _codex_sandbox_auth_files(auth_root: Path) -> tuple[Path, Path]:
+    source = _private_regular_file(auth_root / "auth.json", "Codex auth bootstrap")
+    source_bytes = source.read_bytes()
+    bootstrap_identity = hashlib.sha256(source_bytes).hexdigest()
     raw_state_root = os.environ.get(
         CODEX_SANDBOX_AUTH_STATE_ENV,
         str(Path.home() / ".local/state/grabowski/codex-auth"),
@@ -109,32 +112,33 @@ def _codex_sandbox_auth_files(auth_root: Path) -> tuple[Path, Path]:
     state_root = _private_directory(
         Path(raw_state_root), "Codex sandbox auth root", create=True
     )
-    lock_descriptor = _private_lock_descriptor(
-        state_root / ".auth.lock", "Codex sandbox auth lock"
+    state_namespace = _private_directory(
+        state_root / f"bootstrap-{bootstrap_identity}",
+        "Codex sandbox auth namespace",
+        create=True,
     )
+    lock_path = state_namespace / ".auth.lock"
+    lock_descriptor = _private_lock_descriptor(lock_path, "Codex sandbox auth lock")
     try:
         fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
-        destination = state_root / "auth.json"
+        destination = state_namespace / "auth.json"
         if os.path.lexists(destination):
             _private_regular_file(destination, "Codex sandbox auth")
-            return destination, state_root / ".auth.lock"
-        source = _private_regular_file(auth_root / "auth.json", "Codex auth bootstrap")
+            return destination, lock_path
         temp_descriptor, temp_name = tempfile.mkstemp(
-            prefix=".auth-seed-", dir=state_root
+            prefix=".auth-seed-", dir=state_namespace
         )
         temp_path = Path(temp_name)
         try:
             os.fchmod(temp_descriptor, 0o600)
-            with source.open("rb") as source_file, os.fdopen(
-                temp_descriptor, "wb", closefd=True
-            ) as destination_file:
-                shutil.copyfileobj(source_file, destination_file)
+            with os.fdopen(temp_descriptor, "wb", closefd=True) as destination_file:
+                destination_file.write(source_bytes)
                 destination_file.flush()
                 os.fsync(destination_file.fileno())
             temp_descriptor = -1
             os.replace(temp_path, destination)
             directory_descriptor = os.open(
-                state_root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+                state_namespace, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
             )
             try:
                 os.fsync(directory_descriptor)
@@ -148,7 +152,7 @@ def _codex_sandbox_auth_files(auth_root: Path) -> tuple[Path, Path]:
             except FileNotFoundError:
                 pass
         _private_regular_file(destination, "Codex sandbox auth")
-        return destination, state_root / ".auth.lock"
+        return destination, lock_path
     finally:
         fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
         os.close(lock_descriptor)

@@ -3079,6 +3079,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         auth.write_text("{}\n", encoding="utf-8")
         auth.chmod(0o600)
         state_root = self.root / "codex-sandbox-auth"
+        state_namespace = state_root / f"bootstrap-{hashlib.sha256(auth.read_bytes()).hexdigest()}"
         executable = self.root / "codex-bin"
         executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         executable.chmod(0o755)
@@ -3122,22 +3123,23 @@ class AgentWorkspaceTests(unittest.TestCase):
         ]
         self.assertIn(
             (
-                str((state_root / "auth.json").resolve()),
+                str((state_namespace / "auth.json").resolve()),
                 str(sandbox.CODEX_SANDBOX_CONFIG_DIR / "auth.json"),
             ),
             writable_bindings,
         )
         self.assertIn(
             (
-                str((state_root / ".auth.lock").resolve()),
+                str((state_namespace / ".auth.lock").resolve()),
                 str(sandbox.CODEX_SANDBOX_AUTH_LOCK),
             ),
             writable_bindings,
         )
-        sandbox_auth = state_root / "auth.json"
+        sandbox_auth = state_namespace / "auth.json"
         self.assertEqual(sandbox_auth.read_bytes(), auth.read_bytes())
         self.assertEqual(stat.S_IMODE(sandbox_auth.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(state_root.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(state_namespace.stat().st_mode), 0o700)
         self.assertNotIn(str(Path.home()), argv)
 
     def test_codex_profile_preserves_refreshed_auth_across_sandboxes(self) -> None:
@@ -3152,6 +3154,9 @@ class AgentWorkspaceTests(unittest.TestCase):
         auth.write_bytes(original_auth)
         auth.chmod(0o600)
         state_root = self.root / "codex-sandbox-auth-persistent"
+        state_namespace = state_root / (
+            f"bootstrap-{hashlib.sha256(original_auth).hexdigest()}"
+        )
         executable = self.root / "codex-persistent-bin"
         executable.write_text(
             "#!/usr/bin/python3\n"
@@ -3208,9 +3213,59 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertIn("0o600", second.stdout)
         self.assertIn("config_exists=False", first.stdout)
         self.assertIn("config_exists=False", second.stdout)
-        self.assertEqual((state_root / "auth.json").read_text(), "sandbox-refreshed\n")
-        self.assertFalse((state_root / "config.toml").exists())
+        self.assertEqual(
+            (state_namespace / "auth.json").read_text(), "sandbox-refreshed\n"
+        )
+        self.assertFalse((state_namespace / "config.toml").exists())
         self.assertEqual(auth.read_bytes(), original_auth)
+
+    def test_codex_profile_reselects_namespace_when_bootstrap_changes(self) -> None:
+        first_bootstrap = b'{"fixture":"first-login"}\n'
+        second_bootstrap = b'{"fixture":"second-login"}\n'
+        auth_root = self.root / "codex-auth-relogin"
+        auth_root.mkdir(mode=0o700)
+        auth = auth_root / "auth.json"
+        auth.write_bytes(first_bootstrap)
+        auth.chmod(0o600)
+        state_root = self.root / "codex-sandbox-auth-relogin"
+        executable = self.root / "codex-relogin-bin"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
+        first_namespace = state_root / (
+            f"bootstrap-{hashlib.sha256(first_bootstrap).hexdigest()}"
+        )
+        second_namespace = state_root / (
+            f"bootstrap-{hashlib.sha256(second_bootstrap).hexdigest()}"
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GRABOWSKI_CODEX_BIN": str(executable),
+                "GRABOWSKI_CODEX_AUTH_ROOT": str(auth_root),
+                sandbox.CODEX_SANDBOX_AUTH_STATE_ENV: str(state_root),
+            },
+            clear=False,
+        ):
+            first = sandbox.prepare_external_agent_command(["codex"])
+            first_auth = first.extra_read_write[0][0]
+            first_auth.write_text("sandbox-refreshed\n", encoding="utf-8")
+            auth.write_bytes(second_bootstrap)
+            auth.chmod(0o600)
+            second = sandbox.prepare_external_agent_command(["codex"])
+            second_auth = second.extra_read_write[0][0]
+
+        self.assertEqual(first_auth, (first_namespace / "auth.json").resolve())
+        self.assertEqual(second_auth, (second_namespace / "auth.json").resolve())
+        self.assertNotEqual(first_auth, second_auth)
+        self.assertEqual(first_auth.read_text(), "sandbox-refreshed\n")
+        self.assertEqual(second_auth.read_bytes(), second_bootstrap)
+        self.assertEqual(auth.read_bytes(), second_bootstrap)
+        self.assertEqual(stat.S_IMODE(second_auth.stat().st_mode), 0o600)
+        self.assertEqual(
+            second.extra_read_write[1][0],
+            (second_namespace / ".auth.lock").resolve(),
+        )
 
     def test_codex_profile_serializes_concurrent_refreshes(self) -> None:
         try:
@@ -3223,6 +3278,9 @@ class AgentWorkspaceTests(unittest.TestCase):
         auth.write_text("start\n", encoding="utf-8")
         auth.chmod(0o600)
         state_root = self.root / "codex-sandbox-auth-concurrent"
+        state_namespace = state_root / (
+            f"bootstrap-{hashlib.sha256(auth.read_bytes()).hexdigest()}"
+        )
         executable = self.root / "codex-concurrent-bin"
         executable.write_text(
             "#!/usr/bin/python3\n"
@@ -3282,7 +3340,9 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(second.returncode, 0, second_stderr)
         observed = {first_stdout.strip(), second_stdout.strip()}
         self.assertEqual(observed, {"start", "rotated"})
-        self.assertEqual((state_root / "auth.json").read_text(), "rotated-again\n")
+        self.assertEqual(
+            (state_namespace / "auth.json").read_text(), "rotated-again\n"
+        )
         self.assertEqual(auth.read_text(), "start\n")
 
     def test_codex_toolchain_probe_targets_codex_not_lock_wrapper(self) -> None:
@@ -3359,7 +3419,9 @@ class AgentWorkspaceTests(unittest.TestCase):
         auth.chmod(0o600)
         state_root = self.root / "codex-sandbox-auth-public"
         state_root.mkdir(mode=0o700)
-        persistent_auth = state_root / "auth.json"
+        state_namespace = state_root / f"bootstrap-{hashlib.sha256(auth.read_bytes()).hexdigest()}"
+        state_namespace.mkdir(mode=0o700)
+        persistent_auth = state_namespace / "auth.json"
         persistent_auth.write_text("{}\n", encoding="utf-8")
         persistent_auth.chmod(0o644)
         executable = self.root / "codex-bin-persistent-public"
