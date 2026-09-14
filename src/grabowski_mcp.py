@@ -1550,8 +1550,8 @@ def _session_grip_policy_decision(
     risk = grabowski_grips.grip_risk_level(name)
     allowed_by_name = "*" in allowed_grips or name in allowed_grips
     allowed_by_risk = _risk_allowed(risk, contract["max_risk_level"])
-    trusted_owner = _trusted_owner_enabled(source)
-    escalation_required = risk == "high" and not trusted_owner
+    profile_trusted_owner = _active_profile(source).get("trusted_owner") is True
+    escalation_required = risk == "high" and not profile_trusted_owner
     escalation_valid = True
     escalation_error = None
     if escalation_required:

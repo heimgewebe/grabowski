@@ -558,6 +558,18 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                 self.assertFalse(blocked_by_risk["allowed_by_risk"])
                 self.assertFalse(blocked_by_risk["escalation_required"])
 
+                profile.pop("trusted_owner")
+                policy["trusted_owner"] = True
+                profile["max_risk_level"] = "high"
+                inherited_top_level = grabowski_mcp._session_grip_policy_decision(
+                    "captain-run",
+                    {"actions": []},
+                )
+                self.assertFalse(inherited_top_level["allowed"])
+                self.assertTrue(inherited_top_level["allowed_by_risk"])
+                self.assertTrue(inherited_top_level["escalation_required"])
+                self.assertFalse(inherited_top_level["escalation_valid"])
+
     def test_non_trusted_high_risk_still_requires_valid_session_escalation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
