@@ -21,6 +21,7 @@ import grabowski_agent_role as agent_role
 import grabowski_candidate_adoption as candidate_adoption
 import grabowski_candidate_verification as candidate_verification
 import grabowski_execution_plan as execution_plan
+import grabowski_coding_agent_router as coding_agent_router
 import grabowski_mcp as base
 import grabowski_resources as resources
 import grabowski_tasks as tasks
@@ -123,11 +124,7 @@ ROUTE_EXECUTION_MODES = frozenset({
 })
 ROUTE_TASK_KINDS = frozenset({"code", "docs", "analysis", "operations"})
 ROUTE_NOVELTY = frozenset({"low", "medium", "high"})
-ROUTE_RISK_FLAGS = frozenset({
-    "security", "runtime", "deployment", "schema", "concurrency",
-    "data_migration", "privilege", "external_api", "cross_repo",
-    "destructive", "user_data",
-})
+ROUTE_RISK_FLAGS = frozenset(coding_agent_router.CANONICAL_ROUTING_RISK_FLAGS)
 ROUTE_EXTERNAL_AGENTS = frozenset({"claude", "antigravity", "opencode", "openhands", "codex", "grok"})
 LEGACY_ROUTE_EXTERNAL_AGENTS_V21 = frozenset({"claude", "agy"})
 LEGACY_ROUTE_POLICY_VERSION_V21 = "workspace-routing-v2.1"
@@ -812,11 +809,18 @@ def _route_decision_v2(input_facts: dict[str, Any]) -> dict[str, Any]:
     external_requested = bool(input_facts["user_requested_external"])
     external_available = list(input_facts["available_external_agents"])
 
-    critical_flags = {
-        "security", "runtime", "deployment", "schema", "concurrency",
-        "data_migration", "privilege", "cross_repo", "destructive", "user_data",
-    }
-    design_flags = {"security", "schema", "concurrency", "data_migration", "cross_repo"}
+    critical_flags = set(
+        coding_agent_router.MANDATORY_INDEPENDENT_VERIFICATION_RISK_FLAGS
+    ) | {"user_data"}
+    design_flags = {
+        "security",
+        "security-sensitive",
+        "high-risk",
+        "schema",
+        "concurrency",
+        "data_migration",
+        "cross_repo",
+    } & critical_flags
     score = 0
     if kind in {"code", "operations"}:
         score += 1
