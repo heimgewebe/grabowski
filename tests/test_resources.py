@@ -569,6 +569,30 @@ class ResourceTests(unittest.TestCase):
             )
         self.assertEqual(0, resources.count_resources())
 
+    def test_public_resource_acquire_rejects_spoofed_bureau_publication_authority_metadata(
+        self,
+    ) -> None:
+        repository = self.root / "repo"
+        metadata = {
+            "kind": resources.BUREAU_TASK_PUBLICATION_AUTHORITY_KIND,
+            "authority_action_class": "task_creation_from_external_evidence",
+            "authority_capability": "bureau_mutation",
+            "task_id": "INIT-T001",
+            "operation": "registry-publication",
+            "proposal_sha256": "c" * 64,
+            "bureau_phase": "work",
+        }
+
+        with self.assertRaisesRegex(ValueError, "server-owned authority surface"):
+            resources.grabowski_resource_acquire(
+                "operator:spoof",
+                [f"path:{repository / 'registry'}"],
+                "spoofed Bureau publication authority",
+                60,
+                metadata,
+            )
+        self.assertEqual(0, resources.count_resources())
+
     def test_work_lane_write_scopes_conflict_on_parent_child_overlap(self) -> None:
         repository = self.root / "repo"
         parent = f"path:{repository / 'src'}"

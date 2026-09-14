@@ -1022,12 +1022,192 @@ def _load_optional_advisory_state() -> tuple[dict[str, Any], str | None]:
         return {}, type(exc).__name__
 
 
+def _grok_auth_identity_sha256(marker: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            marker, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _grok_missing_auth_file_identity() -> str:
+    return _grok_auth_identity_sha256({"state": "missing"})
+
+
+def _grok_auth_directory_metadata_marker(
+    metadata: os.stat_result,
+) -> dict[str, int] | None:
+    safe = (
+        stat.S_ISDIR(metadata.st_mode)
+        and metadata.st_uid == os.getuid()
+        and metadata.st_nlink >= 1
+        and stat.S_IMODE(metadata.st_mode) & 0o022 == 0
+    )
+    if not safe:
+        return None
+    return {
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "mode": stat.S_IMODE(metadata.st_mode),
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "nlink": metadata.st_nlink,
+    }
+
+
+def _grok_auth_metadata_identity(metadata: os.stat_result) -> str | None:
+    safe = (
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_uid == os.getuid()
+        and metadata.st_nlink == 1
+        and stat.S_IMODE(metadata.st_mode) & 0o077 == 0
+    )
+    if not safe:
+        return None
+    return _grok_auth_identity_sha256(
+        {
+            "state": "present",
+            "device": metadata.st_dev,
+            "inode": metadata.st_ino,
+            "mode": stat.S_IMODE(metadata.st_mode),
+            "uid": metadata.st_uid,
+            "nlink": metadata.st_nlink,
+            "size": metadata.st_size,
+            "mtime_ns": metadata.st_mtime_ns,
+            "ctime_ns": metadata.st_ctime_ns,
+        }
+    )
+
+
+def _grok_auth_storage_metadata_identity(
+    directory_metadata: os.stat_result,
+    auth_metadata: os.stat_result,
+) -> str | None:
+    directory_marker = _grok_auth_directory_metadata_marker(directory_metadata)
+    if directory_marker is None:
+        return None
+    auth_identity = _grok_auth_metadata_identity(auth_metadata)
+    if auth_identity is None:
+        return None
+    return _grok_auth_identity_sha256(
+        {
+            "state": "present",
+            "directory": directory_marker,
+            "auth_file_identity_sha256": auth_identity,
+        }
+    )
+
+
+def _grok_auth_file_identity(*, home: Path | None = None) -> str | None:
+    """Bind readiness to safe non-secret auth path identity metadata."""
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        return None
+    base = home or Path.home()
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptors: list[int] = []
+
+    def directory_identity(metadata: os.stat_result) -> tuple[int, ...]:
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_uid,
+            metadata.st_gid,
+            metadata.st_nlink,
+        )
+
+    def auth_identity(metadata: os.stat_result) -> tuple[int, ...]:
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_uid,
+            metadata.st_nlink,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        )
+
+    try:
+        descriptors.append(os.open(str(base), directory_flags))
+        home_metadata = os.fstat(descriptors[-1])
+        if not stat.S_ISDIR(home_metadata.st_mode) or home_metadata.st_uid != os.getuid():
+            return None
+        home_fd = descriptors[-1]
+        descriptors.append(os.open(".grok", directory_flags, dir_fd=home_fd))
+        grok_fd = descriptors[-1]
+        grok_before = os.fstat(grok_fd)
+        if _grok_auth_directory_metadata_marker(grok_before) is None:
+            return None
+        try:
+            descriptors.append(os.open("auth.json", file_flags, dir_fd=grok_fd))
+        except FileNotFoundError:
+            grok_after = os.fstat(grok_fd)
+            linked_grok = os.stat(".grok", dir_fd=home_fd, follow_symlinks=False)
+            if (
+                directory_identity(grok_before) != directory_identity(grok_after)
+                or directory_identity(grok_after) != directory_identity(linked_grok)
+                or _grok_auth_directory_metadata_marker(grok_after) is None
+            ):
+                return None
+            return _grok_missing_auth_file_identity()
+        auth_metadata = os.fstat(descriptors[-1])
+        grok_after = os.fstat(grok_fd)
+        linked_grok = os.stat(".grok", dir_fd=home_fd, follow_symlinks=False)
+        linked_auth = os.stat("auth.json", dir_fd=grok_fd, follow_symlinks=False)
+        if (
+            directory_identity(grok_before) != directory_identity(grok_after)
+            or directory_identity(grok_after) != directory_identity(linked_grok)
+            or auth_identity(auth_metadata) != auth_identity(linked_auth)
+        ):
+            return None
+        return _grok_auth_storage_metadata_identity(grok_after, auth_metadata)
+    except FileNotFoundError:
+        return _grok_missing_auth_file_identity()
+    except OSError:
+        return None
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
 def _state_catalog_fresh(state: dict[str, Any]) -> bool:
-    observed = _parse_time(state.get("catalog", {}).get("observed_at"))
+    catalog_state = state.get("catalog", {})
+    observed = _parse_time(catalog_state.get("observed_at"))
     if observed is None:
         return False
     age = (_utc_now() - observed).total_seconds()
-    return 0 <= age <= CATALOG_FRESHNESS_SECONDS
+    if not 0 <= age <= CATALOG_FRESHNESS_SECONDS:
+        return False
+    providers = catalog_state.get("providers")
+    # Freshness is not a structural validator. Preserve malformed-state
+    # classification for the normal router validation path, and permit bounded
+    # partial probes that intentionally do not report Grok at all. A snapshot
+    # that *does* report Grok must be bound to the current auth-file identity.
+    if not isinstance(providers, dict):
+        return True
+    if "grok" not in providers:
+        return True
+    grok = providers["grok"]
+    if not isinstance(grok, dict):
+        return True
+    stored_identity = grok.get("auth_file_identity_sha256")
+    if stored_identity is None:
+        return (
+            grok.get("authenticated") is False
+            and grok.get("entitlement_verified") is False
+            and isinstance(grok.get("status"), str)
+            and bool(grok["status"])
+        )
+    current_identity = _grok_auth_file_identity()
+    return (
+        isinstance(stored_identity, str)
+        and len(stored_identity) == 64
+        and isinstance(current_identity, str)
+        and len(current_identity) == 64
+        and stored_identity == current_identity
+    )
 
 
 def _physical_pool_occupancy() -> dict[str, Any]:
@@ -1166,15 +1346,31 @@ def _effective_pool(
                 }
             counts[lifecycle_state] = value
         observed_physical = sum(counts.values())
+        protected_for_admission = counts["protected"]
+        active_sessions_source = "advisory-active-max-plus-protected-and-unbound"
+        if (
+            pool_id == "openai-agentic"
+            and protected_for_admission == int(static_pool["max_concurrency"])
+            and protected_for_admission > 0
+        ):
+            # ``max_concurrency`` is a local managed-admission cap for this pool,
+            # not a provider-attested maximum. If protected interactive Codex
+            # shells alone exactly fill that cap, discount exactly one so they
+            # cannot permanently starve managed work. Counts above the cap stay
+            # fully conservative rather than widening this exception.
+            protected_for_admission -= 1
+            active_sessions_source = (
+                "advisory-active-max-plus-one-protected-discount-and-unbound"
+            )
         effective_active = (
             max(active_sessions, counts["active"])
-            + counts["protected"]
+            + protected_for_admission
             + counts["unbound"]
         )
         pool["observed_physical_sessions"] = observed_physical
         pool["physical_lifecycle_sessions"] = counts
         pool["active_sessions"] = effective_active
-        pool["active_sessions_source"] = "advisory-active-max-plus-protected-and-unbound"
+        pool["active_sessions_source"] = active_sessions_source
     else:
         pool["active_sessions"] = active_sessions
         pool["active_sessions_source"] = "advisory-state-only"
@@ -1229,6 +1425,11 @@ def _pool_gate(
         return False, ["cost is unknown or non-zero"], 0.0, False
     if pool.get("payg_fallback_allowed") is not False:
         return False, ["PAYG fallback is not forbidden"], 0.0, False
+    if pool.get("cost_mode") == "subscription_included":
+        if pool.get("automatic_overage") is not False:
+            return False, ["automatic subscription overage is not forbidden"], 0.0, False
+        if pool.get("credits_allowed") is not False:
+            return False, ["purchased subscription credits are not forbidden"], 0.0, False
     if pool.get("blocked_reason"):
         return False, [str(pool["blocked_reason"])], 0.0, False
     if pool.get("runtime_blocked_reason"):
@@ -1304,8 +1505,13 @@ def _route_available(
             return False, "Claude plan authentication is unavailable"
     if harness == "antigravity":
         antigravity = providers.get("antigravity", providers.get("agy", {}))
-        if model_arg not in antigravity.get("models", []):
+        if model_id not in antigravity.get("models", []):
             return False, "Antigravity model is absent"
+        observed_model_args = antigravity.get("model_args")
+        if not isinstance(observed_model_args, list):
+            return False, "Antigravity route model identity is unverified"
+        if model_arg not in observed_model_args:
+            return False, "Antigravity route model is absent"
     if harness == "opencode":
         opencode = providers.get("opencode", {})
         quota_pools = route.get("quota_pools", [])

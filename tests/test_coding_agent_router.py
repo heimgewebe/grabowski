@@ -36,6 +36,10 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.catalog_path.write_text(
             json.dumps(self.catalog, sort_keys=True, indent=2) + "\n", encoding="utf-8"
         )
+        self.grok_auth_identity = mock.patch.object(
+            router, "_grok_auth_file_identity", return_value="a" * 64
+        )
+        self.grok_auth_identity_mock = self.grok_auth_identity.start()
         self.state = self._fresh_state()
         self._write_state()
         self.environment = mock.patch.dict(
@@ -74,11 +78,13 @@ class CodingAgentRouterTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.physical_occupancy.stop()
         self.environment.stop()
+        self.grok_auth_identity.stop()
         self.temporary.cleanup()
 
     def _fresh_state(self) -> dict:
         routes = self.catalog["routes"]
         agy_models: list[str] = []
+        agy_model_args: list[str] = []
         grok_models: list[str] = []
         for route in routes:
             argv = route.get("argv_prefix", [])
@@ -86,7 +92,8 @@ class CodingAgentRouterTests(unittest.TestCase):
                 if item == "--model":
                     model = argv[index + 1]
                     if route["harness"] == "antigravity":
-                        agy_models.append(model)
+                        agy_models.append(route["model"])
+                        agy_model_args.append(model)
                     elif route["harness"] == "grok":
                         grok_models.append(model)
         observed = datetime.now(timezone.utc).replace(microsecond=0)
@@ -122,9 +129,13 @@ class CodingAgentRouterTests(unittest.TestCase):
                             "claude-sonnet-5",
                         ],
                     },
-                    "antigravity": {"models": sorted(set(agy_models))},
+                    "antigravity": {
+                        "models": sorted(set(agy_models)),
+                        "model_args": sorted(set(agy_model_args)),
+                    },
                     "grok": {
                         "logged_in": True,
+                        "auth_file_identity_sha256": router._grok_auth_file_identity(),
                         "models": sorted(set(grok_models)),
                     },
                     "opencode": {
@@ -174,6 +185,96 @@ class CodingAgentRouterTests(unittest.TestCase):
     def _write_state(self) -> None:
         self.state_path.write_text(
             json.dumps(self.state, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+        )
+
+    def test_catalog_freshness_invalidates_on_grok_auth_file_change(self) -> None:
+        self.assertTrue(router._state_catalog_fresh(self.state))
+        self.grok_auth_identity_mock.return_value = "b" * 64
+        self.assertFalse(router._state_catalog_fresh(self.state))
+
+    def test_catalog_freshness_fails_closed_on_unsafe_grok_auth_identity(self) -> None:
+        self.assertTrue(router._state_catalog_fresh(self.state))
+        self.grok_auth_identity_mock.return_value = None
+        self.assertFalse(router._state_catalog_fresh(self.state))
+
+    def test_catalog_freshness_keeps_ineligible_grok_from_staling_other_providers(self) -> None:
+        grok = self.state["catalog"]["providers"]["grok"]
+        grok.update(
+            {
+                "authenticated": False,
+                "entitlement_verified": False,
+                "status": "unsafe-file",
+                "auth_file_identity_sha256": None,
+                "models": [],
+            }
+        )
+        self.state["catalog"]["verified_quota_pools"].remove("grok-com")
+        self.grok_auth_identity_mock.return_value = None
+        self.assertTrue(router._state_catalog_fresh(self.state))
+
+    def test_catalog_freshness_rejects_missing_identity_for_eligible_grok(self) -> None:
+        grok = self.state["catalog"]["providers"]["grok"]
+        grok.update(
+            {
+                "authenticated": True,
+                "entitlement_verified": True,
+                "status": "verified",
+                "auth_file_identity_sha256": None,
+            }
+        )
+        self.grok_auth_identity_mock.return_value = None
+        self.assertFalse(router._state_catalog_fresh(self.state))
+
+    def test_grok_subscription_pool_requires_zero_additional_cost_contract(self) -> None:
+        pool = self.catalog["quota_pools"]["grok-com"]
+        self.assertEqual(pool["marginal_cost_usd"], 0)
+        self.assertFalse(pool["payg_fallback_allowed"])
+        self.assertFalse(pool["automatic_overage"])
+        self.assertFalse(pool["credits_allowed"])
+
+        allowed, reasons, _penalty, execution_eligible = router._pool_gate(
+            "grok-com", self.catalog, self._fresh_state(), critical=False
+        )
+        self.assertTrue(allowed)
+        self.assertFalse(execution_eligible)
+        self.assertIn("quota is opaque", reasons)
+
+        unsafe_cases = {
+            "payg_fallback_allowed": True,
+            "automatic_overage": True,
+            "credits_allowed": True,
+            "marginal_cost_usd": 0.01,
+            "marginal_cost_unknown": None,
+        }
+        for field, value in unsafe_cases.items():
+            with self.subTest(field=field):
+                state = self._fresh_state()
+                catalog = json.loads(json.dumps(self.catalog))
+                target_field = (
+                    "marginal_cost_usd" if field == "marginal_cost_unknown" else field
+                )
+                catalog["quota_pools"]["grok-com"][target_field] = value
+                allowed, reasons, _penalty, execution_eligible = router._pool_gate(
+                    "grok-com", catalog, state, critical=False
+                )
+                self.assertFalse(allowed)
+                self.assertFalse(execution_eligible)
+                self.assertTrue(reasons)
+
+    def test_grok_nominal_usage_telemetry_does_not_grant_paid_authority(self) -> None:
+        state = self._fresh_state()
+        state["routes"]["grok-4.6-review-high"] = {
+            "runs": 1,
+            "last_reported_cost_usd": 0.01338648,
+        }
+        allowed, reasons, _penalty, execution_eligible = router._pool_gate(
+            "grok-com", self.catalog, state, critical=False
+        )
+        self.assertTrue(allowed)
+        self.assertFalse(execution_eligible)
+        self.assertIn("quota is opaque", reasons)
+        self.assertFalse(
+            self.catalog["quota_pools"]["grok-com"]["payg_fallback_allowed"]
         )
 
     def _route(self, task_class: str, **kwargs: object) -> dict:
@@ -1281,7 +1382,7 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertEqual(admission["reason_code"], "no_catalog_route_match")
         self.assertEqual(admission["physical_occupancy_status"], "not_observed")
 
-    def test_protected_physical_agent_consumes_provider_concurrency(self) -> None:
+    def test_protected_physical_agent_consumes_provider_concurrency_by_default(self) -> None:
         state = self._fresh_state()
         state["pools"]["claude-pro"] = {"active_sessions": 0}
         state["_physical_pool_occupancy"] = {
@@ -1298,8 +1399,122 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertEqual(effective["state_active_sessions"], 0)
         self.assertEqual(effective["observed_physical_sessions"], 1)
         self.assertEqual(effective["active_sessions"], 1)
+        self.assertEqual(
+            effective["active_sessions_source"],
+            "advisory-active-max-plus-protected-and-unbound",
+        )
         allowed, reasons, _, execution = router._pool_gate(
             "claude-pro", self.catalog, state, critical=False
+        )
+        self.assertFalse(allowed)
+        self.assertFalse(execution)
+        self.assertIn("pool concurrency is saturated", reasons)
+
+    def test_openai_protected_agents_cannot_starve_the_last_managed_slot(self) -> None:
+        state = self._fresh_state()
+        state["pools"]["openai-agentic"] = {
+            "active_sessions": 0,
+            "remaining_ratio": 1.0,
+        }
+        state["_physical_pool_occupancy"] = {
+            "status": "current",
+            "tracked_provider_pools": sorted(
+                current_work.PHYSICAL_CODING_AGENT_PROVIDER_POOLS
+            ),
+            "provider_pool_sessions": {"openai-agentic": 3},
+            "provider_pool_lifecycle_sessions": {
+                "openai-agentic": {"active": 0, "protected": 3, "unbound": 0}
+            },
+        }
+        effective = router._effective_pool("openai-agentic", self.catalog, state)
+        self.assertEqual(effective["observed_physical_sessions"], 3)
+        self.assertEqual(effective["physical_lifecycle_sessions"]["protected"], 3)
+        self.assertEqual(effective["active_sessions"], 2)
+        self.assertEqual(
+            effective["active_sessions_source"],
+            "advisory-active-max-plus-one-protected-discount-and-unbound",
+        )
+        allowed, reasons, _, execution = router._pool_gate(
+            "openai-agentic", self.catalog, state, critical=False
+        )
+        self.assertTrue(allowed)
+        self.assertTrue(execution)
+        self.assertNotIn("pool concurrency is saturated", reasons)
+
+    def test_openai_protected_count_above_cap_remains_fail_closed(self) -> None:
+        state = self._fresh_state()
+        state["pools"]["openai-agentic"] = {
+            "active_sessions": 0,
+            "remaining_ratio": 1.0,
+        }
+        state["_physical_pool_occupancy"] = {
+            "status": "current",
+            "tracked_provider_pools": sorted(
+                current_work.PHYSICAL_CODING_AGENT_PROVIDER_POOLS
+            ),
+            "provider_pool_sessions": {"openai-agentic": 4},
+            "provider_pool_lifecycle_sessions": {
+                "openai-agentic": {"active": 0, "protected": 4, "unbound": 0}
+            },
+        }
+        effective = router._effective_pool("openai-agentic", self.catalog, state)
+        self.assertEqual(effective["active_sessions"], 4)
+        self.assertEqual(
+            effective["active_sessions_source"],
+            "advisory-active-max-plus-protected-and-unbound",
+        )
+        allowed, reasons, _, execution = router._pool_gate(
+            "openai-agentic", self.catalog, state, critical=False
+        )
+        self.assertFalse(allowed)
+        self.assertFalse(execution)
+        self.assertIn("pool concurrency is saturated", reasons)
+
+    def test_openai_reserved_slot_saturates_after_one_managed_agent_starts(self) -> None:
+        state = self._fresh_state()
+        state["pools"]["openai-agentic"] = {
+            "active_sessions": 1,
+            "remaining_ratio": 1.0,
+        }
+        state["_physical_pool_occupancy"] = {
+            "status": "current",
+            "tracked_provider_pools": sorted(
+                current_work.PHYSICAL_CODING_AGENT_PROVIDER_POOLS
+            ),
+            "provider_pool_sessions": {"openai-agentic": 4},
+            "provider_pool_lifecycle_sessions": {
+                "openai-agentic": {"active": 1, "protected": 3, "unbound": 0}
+            },
+        }
+        effective = router._effective_pool("openai-agentic", self.catalog, state)
+        self.assertEqual(effective["active_sessions"], 3)
+        allowed, reasons, _, execution = router._pool_gate(
+            "openai-agentic", self.catalog, state, critical=False
+        )
+        self.assertFalse(allowed)
+        self.assertFalse(execution)
+        self.assertIn("pool concurrency is saturated", reasons)
+
+    def test_openai_unbound_agent_still_consumes_reserved_managed_slot(self) -> None:
+        state = self._fresh_state()
+        state["pools"]["openai-agentic"] = {
+            "active_sessions": 0,
+            "remaining_ratio": 1.0,
+        }
+        state["_physical_pool_occupancy"] = {
+            "status": "current",
+            "tracked_provider_pools": sorted(
+                current_work.PHYSICAL_CODING_AGENT_PROVIDER_POOLS
+            ),
+            "provider_pool_sessions": {"openai-agentic": 4},
+            "provider_pool_lifecycle_sessions": {
+                "openai-agentic": {"active": 0, "protected": 3, "unbound": 1}
+            },
+        }
+        effective = router._effective_pool("openai-agentic", self.catalog, state)
+        self.assertEqual(effective["active_sessions"], 3)
+        allowed, reasons, _, execution = router._pool_gate(
+            "openai-agentic", self.catalog, state, critical=False
         )
         self.assertFalse(allowed)
         self.assertFalse(execution)
@@ -1495,6 +1710,52 @@ class CodingAgentRouterTests(unittest.TestCase):
         )
         self.assertFalse(available)
         self.assertIn("authentication", reason)
+
+    def test_stale_opencode_deepseek_free_route_remains_fail_closed(self) -> None:
+        route = next(
+            route
+            for route in self.catalog["routes"]
+            if route["id"] == "opencode-deepseek-v4-flash-free"
+        )
+        model = self.catalog["models"]["deepseek-v4-flash"]
+        self.assertFalse(route["enabled"])
+        self.assertIn("no longer advertises", route["disabled_reason"])
+        self.assertEqual(model["availability"], "route-stale-disabled")
+        self.assertIn("slug-absent-2026-09-13", model["evidence"])
+
+    def test_antigravity_availability_binds_canonical_and_cli_model_identities(self) -> None:
+        high = next(
+            route
+            for route in self.catalog["routes"]
+            if route["id"] == "antigravity-gemini-pro-review-high"
+        )
+        low = next(
+            route
+            for route in self.catalog["routes"]
+            if route["id"] == "antigravity-gemini-pro-low"
+        )
+        self.assertEqual(high["model"], low["model"])
+        high_arg = router._configured_model_arg(high)
+        low_arg = router._configured_model_arg(low)
+        self.assertIsNotNone(high_arg)
+        self.assertIsNotNone(low_arg)
+        self.assertNotEqual(high_arg, low_arg)
+
+        state = self._fresh_state()
+        provider = state["catalog"]["providers"]["antigravity"]
+        provider["models"] = [high["model"]]
+        provider["model_args"] = [high_arg]
+
+        available, reason = router._route_available(high, self.catalog, state)
+        self.assertTrue(available, reason)
+        available, reason = router._route_available(low, self.catalog, state)
+        self.assertFalse(available)
+        self.assertEqual(reason, "Antigravity route model is absent")
+
+        provider.pop("model_args")
+        available, reason = router._route_available(high, self.catalog, state)
+        self.assertFalse(available)
+        self.assertEqual(reason, "Antigravity route model identity is unverified")
 
     def test_external_reviewers_are_independent_from_controller(self) -> None:
         for task_class in ("complex-patch", "deep-debug", "architecture"):

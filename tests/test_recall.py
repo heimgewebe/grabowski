@@ -402,6 +402,130 @@ class RecallTests(unittest.TestCase):
         self.assertNotIn("pr_number", item["reuse_condition"]["match"])
         self.assertIn("root_cause", item["does_not_establish"])
 
+    def test_chronik_history_recall_rechecks_exact_pr_binding(self) -> None:
+        module = self._load_module()
+        history = self._chronik_history_result(module)
+        event = history["events"][0]
+        event["subject"]["pr_number"] = 404
+        event["event_id"] = module._chronik_event_id(event)
+        history["query"]["pr_number"] = 404
+        selection = {
+            "mode": "exact",
+            "exact_selectors": {"pr_number": 404},
+            "selector_count": 1,
+            "exact_target_binding": True,
+            "selection_scope": "bounded_provider_window",
+            "match_status": "matched",
+            "provider_window_limit": 100,
+            "provider_window_returned": 2,
+            "provider_window_saturated": False,
+            "global_history_exhaustive": False,
+            "coarse_fallback_used": False,
+        }
+        history["target_selection"] = selection
+        history["history"]["query"] = dict(history["query"])
+        history["history"]["target_selection"] = dict(selection)
+        history["history"]["event_ids"] = [event["event_id"]]
+        unsigned = dict(history)
+        unsigned.pop("result_sha256", None)
+        history["result_sha256"] = module._sha256_json(unsigned)
+
+        result = module.export_chronik_history_recall(history)
+        self.assertEqual(result["returned"], 1)
+        self.assertEqual(result["target_selection"], selection)
+        self.assertEqual(
+            result["result_reference"]["target_selection_sha256"],
+            module._sha256_json(selection),
+        )
+
+        history["query"]["pr_number"] = 405
+        history["history"]["query"] = dict(history["query"])
+        bad_selection = {**selection, "exact_selectors": {"pr_number": 405}}
+        history["target_selection"] = bad_selection
+        history["history"]["target_selection"] = dict(bad_selection)
+        unsigned = dict(history)
+        unsigned.pop("result_sha256", None)
+        history["result_sha256"] = module._sha256_json(unsigned)
+        with self.assertRaisesRegex(ValueError, "exact target selector"):
+            module.export_chronik_history_recall(history)
+
+    def test_chronik_history_recall_rejects_false_exhaustiveness_metadata(self) -> None:
+        module = self._load_module()
+        history = self._chronik_history_result(module)
+        event = history["events"][0]
+        event["subject"]["pr_number"] = 404
+        event["event_id"] = module._chronik_event_id(event)
+        history["query"]["pr_number"] = 404
+        selection = {
+            "mode": "exact",
+            "exact_selectors": {"pr_number": 404},
+            "selector_count": 1,
+            "exact_target_binding": True,
+            "selection_scope": "bounded_provider_window",
+            "match_status": "matched",
+            "provider_window_limit": 100,
+            "provider_window_returned": 1,
+            "provider_window_saturated": False,
+            "global_history_exhaustive": True,
+            "coarse_fallback_used": False,
+        }
+        history["target_selection"] = selection
+        history["history"]["query"] = dict(history["query"])
+        history["history"]["target_selection"] = dict(selection)
+        history["history"]["event_ids"] = [event["event_id"]]
+        unsigned = dict(history)
+        unsigned.pop("result_sha256", None)
+        history["result_sha256"] = module._sha256_json(unsigned)
+
+        with self.assertRaisesRegex(ValueError, "exact target selection is unbound"):
+            module.export_chronik_history_recall(history)
+
+        selection["global_history_exhaustive"] = False
+        selection["provider_window_returned"] = None
+        history["target_selection"] = dict(selection)
+        history["history"]["target_selection"] = dict(selection)
+        unsigned = dict(history)
+        unsigned.pop("result_sha256", None)
+        history["result_sha256"] = module._sha256_json(unsigned)
+        with self.assertRaisesRegex(ValueError, "exact target selection is unbound"):
+            module.export_chronik_history_recall(history)
+
+    def test_chronik_history_recall_preserves_exact_no_match_without_coarse_fallback(self) -> None:
+        module = self._load_module()
+        history = self._chronik_history_result(module)
+        history["events"] = []
+        history["history"]["event_ids"] = []
+        history["query"]["bureau_task_id"] = "BUREAU-NO-MATCH"
+        selection = {
+            "mode": "exact",
+            "exact_selectors": {"bureau_task_id": "BUREAU-NO-MATCH"},
+            "selector_count": 1,
+            "exact_target_binding": True,
+            "selection_scope": "bounded_provider_window",
+            "match_status": "no_match_in_bounded_provider_window",
+            "provider_window_limit": 100,
+            "provider_window_returned": 1,
+            "provider_window_saturated": False,
+            "global_history_exhaustive": False,
+            "coarse_fallback_used": False,
+        }
+        history["target_selection"] = selection
+        history["history"]["query"] = dict(history["query"])
+        history["history"]["target_selection"] = dict(selection)
+        unsigned = dict(history)
+        unsigned.pop("result_sha256", None)
+        history["result_sha256"] = module._sha256_json(unsigned)
+
+        result = module.export_chronik_history_recall(history)
+        self.assertTrue(result["available"])
+        self.assertEqual(result["returned"], 0)
+        self.assertEqual(result["items"], [])
+        self.assertEqual(
+            result["target_selection"]["match_status"],
+            "no_match_in_bounded_provider_window",
+        )
+        self.assertFalse(result["target_selection"]["coarse_fallback_used"])
+
     def test_chronik_history_started_event_has_no_terminal_signature(self) -> None:
         module = self._load_module()
         history = self._chronik_history_result(module)

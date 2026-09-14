@@ -1608,9 +1608,18 @@ class BureauIntakeAdapterTests(unittest.TestCase):
             )
         metadata = acquire.call_args.kwargs["metadata"]
         self.assertEqual(acquire.call_args.args[1], keys)
+        self.assertEqual(
+            metadata["kind"], intake.resources.BUREAU_TASK_PUBLICATION_AUTHORITY_KIND
+        )
+        self.assertEqual(
+            metadata["authority_action_class"],
+            "task_creation_from_external_evidence",
+        )
+        self.assertEqual(metadata["authority_capability"], "bureau_mutation")
         self.assertEqual(metadata["task_id"], "INIT-T001")
         self.assertEqual(metadata["operation"], "registry-publication")
         self.assertEqual(metadata["proposal_sha256"], "c" * 64)
+        self.assertEqual(metadata["bureau_phase"], "work")
         self.assertEqual(acquire.call_args.kwargs["ttl_seconds"], 240)
         release.assert_called_once()
         self.assertTrue(result["leases_released"])

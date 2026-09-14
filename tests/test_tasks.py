@@ -11067,6 +11067,9 @@ def make_event(target_scope, target_value, index, operation, task_class, subject
                else {'scope': 'host', 'host': target_value})
     if subject_component:
         subject['component'] = subject_component
+    if target_scope == 'repository':
+        subject['pr_number'] = 404 + index
+        subject['bureau_task_id'] = f'CCM-V1-T00{2 + index}'
     event = {
         'schema_version': 'agent-run-event.v0',
         'kind': 'agent.run.completed',
@@ -11413,6 +11416,80 @@ else:
         self.assertEqual({"scope": "repository", "repo": "heimgewebe/grabowski"}, result["history"]["target"])
         self.assertTrue(result["history"]["ledger_snapshot"]["integrity_valid"])
 
+    def test_history_exact_pr_selector_excludes_sibling_prs_without_fallback(self) -> None:
+        with patch.object(tasks.operator, "_require_operator_capability"):
+            result = tasks.grabowski_chronik_history(
+                repo="heimgewebe/grabowski", pr_number=404, limit=1
+            )
+        self.assertTrue(result["available"])
+        self.assertEqual(result["query"]["pr_number"], 404)
+        self.assertEqual(result["history"]["query"], result["query"])
+        self.assertEqual(result["history"]["provider_query"]["limit"], tasks.CHRONIK_HISTORY_MAX_LIMIT)
+        self.assertEqual(len(result["events"]), 1)
+        self.assertEqual(result["events"][0]["subject"]["pr_number"], 404)
+        selection = result["target_selection"]
+        self.assertEqual(selection["mode"], "exact")
+        self.assertEqual(selection["exact_selectors"], {"pr_number": 404})
+        self.assertEqual(selection["match_status"], "matched")
+        self.assertFalse(selection["coarse_fallback_used"])
+        self.assertFalse(selection["global_history_exhaustive"])
+
+        with patch.object(tasks.operator, "_require_operator_capability"):
+            missing = tasks.grabowski_chronik_history(
+                repo="heimgewebe/grabowski", pr_number=999, limit=1
+            )
+        self.assertTrue(missing["available"])
+        self.assertEqual(missing["events"], [])
+        self.assertEqual(
+            missing["target_selection"]["match_status"],
+            "no_match_in_bounded_provider_window",
+        )
+        self.assertFalse(missing["target_selection"]["coarse_fallback_used"])
+
+    def test_history_exact_bureau_task_and_agent_run_selectors_are_anded(self) -> None:
+        run_id = "task-" + "b" * 24 + "-a1"
+        with patch.object(tasks.operator, "_require_operator_capability"):
+            result = tasks.grabowski_chronik_history(
+                repo="heimgewebe/grabowski",
+                bureau_task_id="CCM-V1-T003",
+                agent_run_id=run_id,
+                limit=2,
+            )
+        self.assertTrue(result["available"])
+        self.assertEqual(len(result["events"]), 1)
+        event = result["events"][0]
+        self.assertEqual(event["subject"]["bureau_task_id"], "CCM-V1-T003")
+        self.assertEqual(event["source"]["run_id"], run_id)
+        self.assertEqual(
+            result["target_selection"]["exact_selectors"],
+            {"bureau_task_id": "CCM-V1-T003", "agent_run_id": run_id},
+        )
+
+        with patch.object(tasks.operator, "_require_operator_capability"):
+            mismatch = tasks.grabowski_chronik_history(
+                repo="heimgewebe/grabowski",
+                pr_number=404,
+                bureau_task_id="CCM-V1-T003",
+                limit=2,
+            )
+        self.assertEqual(mismatch["events"], [])
+        self.assertEqual(
+            mismatch["target_selection"]["match_status"],
+            "no_match_in_bounded_provider_window",
+        )
+
+    def test_history_exact_selector_validation_fails_before_provider_execution(self) -> None:
+        with patch.object(tasks.operator, "_require_operator_capability"), patch.object(
+            tasks, "_chronik_cli_run"
+        ) as cli_run:
+            with self.assertRaisesRegex(ValueError, "pr_number requires"):
+                tasks.grabowski_chronik_history(host="heim-pc", pr_number=404)
+            with self.assertRaisesRegex(ValueError, "agent_run_id is invalid"):
+                tasks.grabowski_chronik_history(
+                    repo="heimgewebe/grabowski", agent_run_id="not-a-run"
+                )
+        cli_run.assert_not_called()
+
     def test_history_matcher_supports_v1_execution_outcomes(self) -> None:
         event = json.loads(self.source.read_text(encoding="utf-8"))
         normalized = {
@@ -11716,6 +11793,9 @@ else:
             operation="operator-convergence-check",
             task_class="",
             outcome="",
+            pr_number=None,
+            bureau_task_id="",
+            agent_run_id="",
             since="",
             limit=1,
         )
@@ -11729,6 +11809,103 @@ else:
             result["result_reference"]["ledger_snapshot_sha256"],
             "b" * 64,
         )
+
+    def test_historical_recall_forwards_exact_target_selectors(self) -> None:
+        history = {
+            "schema_version": 1,
+            "kind": "grabowski_chronik_history",
+            "query": {
+                "repo": "heimgewebe/grabowski",
+                "pr_number": 404,
+                "bureau_task_id": "CCM-V1-T002",
+                "agent_run_id": "task-" + "a" * 24 + "-a1",
+                "limit": 1,
+            },
+            "target_selection": {
+                "mode": "exact",
+                "exact_selectors": {
+                    "pr_number": 404,
+                    "bureau_task_id": "CCM-V1-T002",
+                    "agent_run_id": "task-" + "a" * 24 + "-a1",
+                },
+                "selector_count": 3,
+                "exact_target_binding": True,
+                "selection_scope": "bounded_provider_window",
+                "match_status": "no_match_in_bounded_provider_window",
+                "provider_window_limit": 100,
+                "provider_window_returned": 2,
+                "provider_window_saturated": False,
+                "global_history_exhaustive": False,
+                "coarse_fallback_used": False,
+            },
+            "cli_present": True,
+            "available": True,
+            "historical_only": True,
+            "events": [],
+            "history": {
+                "schema_version": "chronik-coding-history.v1",
+                "query": {
+                    "repo": "heimgewebe/grabowski",
+                    "pr_number": 404,
+                    "bureau_task_id": "CCM-V1-T002",
+                    "agent_run_id": "task-" + "a" * 24 + "-a1",
+                    "limit": 1,
+                },
+                "provider_query": {"repo": "heimgewebe/grabowski", "limit": 100},
+                "target": {"scope": "repository", "repo": "heimgewebe/grabowski"},
+                "target_selection": {
+                    "mode": "exact",
+                    "exact_selectors": {
+                        "pr_number": 404,
+                        "bureau_task_id": "CCM-V1-T002",
+                        "agent_run_id": "task-" + "a" * 24 + "-a1",
+                    },
+                    "selector_count": 3,
+                    "exact_target_binding": True,
+                    "selection_scope": "bounded_provider_window",
+                    "match_status": "no_match_in_bounded_provider_window",
+                    "provider_window_limit": 100,
+                    "provider_window_returned": 2,
+                    "provider_window_saturated": False,
+                    "global_history_exhaustive": False,
+                    "coarse_fallback_used": False,
+                },
+                "event_ids": [],
+                "historical_only": True,
+                "does_not_establish": list(tasks.recall.CHRONIK_HISTORY_DOES_NOT_ESTABLISH),
+                "ledger_snapshot": {"sha256": "b" * 64},
+            },
+            "does_not_establish": list(tasks.recall.CHRONIK_HISTORY_DOES_NOT_ESTABLISH),
+        }
+        history["result_sha256"] = tasks.recall._sha256_json(history)
+        run_id = "task-" + "a" * 24 + "-a1"
+        with (
+            patch.object(tasks.operator, "_require_operator_capability"),
+            patch.object(tasks, "grabowski_chronik_history", return_value=history) as provider,
+        ):
+            result = tasks.grabowski_operator_historical_recall(
+                repo="heimgewebe/grabowski",
+                pr_number=404,
+                bureau_task_id="CCM-V1-T002",
+                agent_run_id=run_id,
+                limit=1,
+            )
+        provider.assert_called_once_with(
+            repo="heimgewebe/grabowski",
+            host="",
+            component="",
+            subject_component="",
+            operation="",
+            task_class="",
+            outcome="",
+            pr_number=404,
+            bureau_task_id="CCM-V1-T002",
+            agent_run_id=run_id,
+            since="",
+            limit=1,
+        )
+        self.assertEqual(result["returned"], 0)
+        self.assertFalse(result["target_selection"]["coarse_fallback_used"])
 
     def test_deployed_runtime_tool_reports_missing_recall_helper(self) -> None:
         manifest = self.root / "deployment-manifest.json"

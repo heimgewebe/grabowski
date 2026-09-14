@@ -1359,9 +1359,12 @@ def _resolve_power_argv_action(
 ) -> dict[str, Any]:
     required = {
         "enabled", "mode", "target_pattern", "timeout_seconds",
-        "cwd_pattern", "max_argv", "allow_shell", "gate",
+        "cwd_pattern", "max_argv", "allow_shell", "kill_switch_path",
     }
-    optional = {"allowed_argv_prefixes", "policy_intent", "allowed_peer_uid", "allowed_peer_unit"}
+    optional = {
+        "allowed_argv_prefixes", "policy_intent", "allowed_peer_uid",
+        "allowed_peer_unit", "legacy_kill_switch_path",
+    }
     candidate_keys = set(candidate)
     if not required.issubset(candidate_keys) or candidate_keys - required - optional or candidate["enabled"] is not True:
         raise PermissionError("privileged action is disabled or malformed")
@@ -1387,10 +1390,23 @@ def _resolve_power_argv_action(
         max_argv=max_argv,
         allow_shell=allow_shell,
     )
+    kill_switch = _validate_gate_path(
+        candidate["kill_switch_path"], label="power kill_switch_path"
+    )
+    legacy_switch = (
+        _validate_gate_path(
+            candidate["legacy_kill_switch_path"],
+            label="power legacy_kill_switch_path",
+        )
+        if candidate.get("legacy_kill_switch_path") is not None
+        else None
+    )
+    _require_kill_switch_clear(kill_switch)
+    if legacy_switch is not None:
+        _require_kill_switch_clear(legacy_switch)
     cwd_pattern = candidate["cwd_pattern"]
     if not isinstance(cwd_pattern, str):
         raise ValueError("power cwd_pattern is invalid")
-    gate = _validate_power_gate(candidate["gate"])
     try:
         payload = json.loads(reference["target"])
     except json.JSONDecodeError as exc:
@@ -1421,7 +1437,10 @@ def _resolve_power_argv_action(
         "cwd": cwd,
         "timeout_seconds": requested_timeout,
         "configured_timeout_seconds": timeout,
-        "gate": gate,
+        "kill_switch_path": str(kill_switch),
+        "legacy_kill_switch_path": (
+            str(legacy_switch) if legacy_switch is not None else None
+        ),
     }
     peer_uid = candidate.get("allowed_peer_uid")
     peer_unit = candidate.get("allowed_peer_unit")
