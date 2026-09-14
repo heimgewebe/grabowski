@@ -338,8 +338,8 @@ def parse_pinned_input_file(path: Path, *, label: str = "Pinned-Input") -> dict[
 
 def parse_runtime_input(path: Path) -> dict[str, str]:
     pins = parse_pinned_input_file(path, label="Runtime-Input")
-    if pins.get("mcp") != "1.27.2":
-        fail("runtime.in muss mcp==1.27.2 enthalten")
+    if pins.get("mcp") != "1.30.0":
+        fail("runtime.in muss mcp==1.30.0 enthalten")
     return pins
 
 
@@ -408,8 +408,8 @@ def parse_pinned_lock_file(path: Path, *, label: str = "Pinned-Lockfile") -> dic
 
 def parse_runtime_lock(path: Path) -> dict[str, str]:
     locked = parse_pinned_lock_file(path, label="Runtime-Lockfile")
-    if locked.get("mcp") != "1.27.2":
-        fail("Runtime-Lock muss mcp==1.27.2 enthalten")
+    if locked.get("mcp") != "1.30.0":
+        fail("Runtime-Lock muss mcp==1.30.0 enthalten")
     return locked
 
 
