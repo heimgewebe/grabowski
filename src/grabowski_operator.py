@@ -6424,9 +6424,15 @@ def _start_job(
         "runtime_seconds": runtime,
     }
     if decision_review_binding is not None:
-        scope["decision_bound_review"] = decision_reviews.normalize_binding(
+        normalized_review_binding = decision_reviews.normalize_binding(
             decision_review_binding
         )
+        scope["decision_bound_review"] = normalized_review_binding
+        review_provenance = decision_reviews.review_role_provenance(
+            command, normalized_review_binding, cwd=working_directory
+        )
+        if review_provenance is not None:
+            scope["decision_review_provenance"] = review_provenance
     # The origin record must name the tool that actually authorized the job, so
     # a reserved deploy started by the provenance repair lane is not attributed
     # to the ordinary self-deploy scheduler.  The value is constrained to the

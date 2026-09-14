@@ -9267,6 +9267,7 @@ def captain_parameters(actions: list[dict[str, object]] | None = None, **overrid
             "base_sha": CAPTAIN_BASE_SHA,
             "diff_sha256": CAPTAIN_DIFF,
             "review_tier": "high_critical",
+            "independent_review_required": True,
             "minimum_review_iterations": 4,
             "actual_review_iterations": 4,
             "all_findings_triaged": True,
@@ -9360,6 +9361,46 @@ def authorized_captain_run_parameters(**overrides) -> dict[str, object]:
     parameters.pop("execution_authority")
     parameters["execution_intent"] = captain_execution_intent(parameters)
     return parameters
+
+
+def captain_independent_review_reconciliation(
+    *,
+    status: str = "settled",
+    pass_count: int = 1,
+    independent_pass_count: int | None = None,
+    infrastructure_error_count: int = 0,
+    deferred_diff_identity_count: int = 0,
+    errors: list[str] | None = None,
+    slot: str = "independent-reviewer",
+) -> dict[str, object]:
+    attempts = pass_count + infrastructure_error_count
+    if independent_pass_count is None:
+        independent_pass_count = pass_count
+    slots = []
+    if attempts:
+        slots.append(
+            {
+                "slot": slot,
+                "attempt_count": attempts,
+                "pass_count": pass_count,
+                "independent_pass_count": independent_pass_count,
+                "material_reject_count": 0,
+                "infrastructure_error_count": infrastructure_error_count,
+                "unresolved_count": 0,
+                "units_sha256": "0" * 64,
+            }
+        )
+    return {
+        "schema_version": 1,
+        "kind": "grabowski_decision_review_reconciliation",
+        "status": status,
+        "attempt_count": attempts,
+        "slot_count": len(slots),
+        "slots": slots,
+        "attempts": [],
+        "deferred_diff_identity_count": deferred_diff_identity_count,
+        "errors": list(errors or []),
+    }
 
 
 class GithubBaseUpdateGuardTests(unittest.TestCase):
@@ -9515,9 +9556,16 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             Path(self._resource_tempdir.name) / "resources.sqlite3",
         )
         self._resource_db_patch.start()
+        self._decision_review_patch = patch.object(
+            merge_guard.decision_reviews,
+            "reconcile",
+            return_value=captain_independent_review_reconciliation(),
+        )
+        self._decision_review_patch.start()
 
 
     def tearDown(self) -> None:
+        self._decision_review_patch.stop()
         self._resource_db_patch.stop()
         self._resource_tempdir.cleanup()
 
@@ -10005,15 +10053,156 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
         self.assertIn("review_evidence_missing", result["output"]["blocked_reasons"])
 
-    def test_high_critical_merge_uses_self_review_policy_without_codex(self) -> None:
-        parameters = captain_parameters()
+    def test_high_critical_merge_uses_independent_policy_without_codex_or_external_transport(self) -> None:
+        parameters = captain_parameters(codex_review_required=False)
         parameters.pop("codex_review_evidence")
         result = self.run_captain(parameters)
 
+        independent = self.gate(result, "independent-review-policy")
+        self.assertEqual("pass", independent["status"])
+        self.assertTrue(independent["details"]["required"])
+        self.assertTrue(independent["details"]["high_critical_floor"])
+        self.assertEqual(
+            "captain-preflight-and-atomic-merge-guard",
+            independent["details"]["settlement_stage"],
+        )
         gate = self.gate(result, "codex-review-settled")
         self.assertEqual("pass", gate["status"])
         self.assertFalse(gate["details"]["external_review_required"])
         self.assertFalse(gate["details"]["required"])
+
+    def test_high_critical_preflight_ignores_generic_decision_bound_pass(self) -> None:
+        parameters = captain_parameters(codex_review_required=False)
+        parameters.pop("codex_review_evidence")
+        with patch.object(
+            merge_guard.decision_reviews,
+            "reconcile",
+            return_value=captain_independent_review_reconciliation(
+                status="settled", pass_count=1, slot="reviewer-a"
+            ),
+        ):
+            result = self.run_captain(parameters)
+
+        gate = self.gate(result, "independent-review-policy")
+        self.assertEqual("blocked", gate["status"])
+        self.assertIn("independent_review_pass_missing", gate["details"])
+
+    def test_high_critical_preflight_rejects_unproven_independent_named_pass(self) -> None:
+        parameters = captain_parameters(codex_review_required=False)
+        parameters.pop("codex_review_evidence")
+        with patch.object(
+            merge_guard.decision_reviews,
+            "reconcile",
+            return_value=captain_independent_review_reconciliation(
+                status="settled",
+                pass_count=1,
+                independent_pass_count=0,
+                slot="independent-reviewer",
+            ),
+        ):
+            result = self.run_captain(parameters)
+
+        gate = self.gate(result, "independent-review-policy")
+        self.assertEqual("blocked", gate["status"])
+        self.assertIn("independent_review_pass_missing", gate["details"])
+
+    def test_high_critical_preflight_defers_diff_identity_to_atomic_guard(self) -> None:
+        parameters = captain_parameters(codex_review_required=False)
+        parameters.pop("codex_review_evidence")
+        reconciliation = captain_independent_review_reconciliation(
+            status="settled",
+            pass_count=1,
+            independent_pass_count=1,
+            deferred_diff_identity_count=1,
+        )
+        with patch.object(
+            merge_guard.decision_reviews, "reconcile", return_value=reconciliation
+        ) as reconcile:
+            result = self.run_captain(parameters)
+
+        gate = self.gate(result, "independent-review-policy")
+        self.assertEqual("pass", gate["status"])
+        self.assertEqual(
+            "deferred-to-atomic-merge-guard", gate["details"]["diff_identity_stage"]
+        )
+        self.assertEqual(1, gate["details"]["deferred_diff_identity_count"])
+        self.assertTrue(reconcile.call_args.kwargs["defer_diff_identity"])
+
+    def test_high_critical_preflight_blocks_without_independent_pass(self) -> None:
+        parameters = captain_parameters(codex_review_required=False)
+        parameters.pop("codex_review_evidence")
+        with patch.object(
+            merge_guard.decision_reviews,
+            "reconcile",
+            return_value=captain_independent_review_reconciliation(
+                status="not_applicable", pass_count=0
+            ),
+        ):
+            result = self.run_captain(parameters)
+
+        gate = self.gate(result, "independent-review-policy")
+        self.assertEqual("blocked", gate["status"])
+        self.assertIn("independent_review_pass_missing", result["output"]["blocked_reasons"])
+        self.assertIn("independent_review_pass_missing", gate["details"])
+
+    def test_high_critical_preflight_blocks_infrastructure_only_review(self) -> None:
+        parameters = captain_parameters(codex_review_required=False)
+        parameters.pop("codex_review_evidence")
+        with patch.object(
+            merge_guard.decision_reviews,
+            "reconcile",
+            return_value=captain_independent_review_reconciliation(
+                status="blocked",
+                pass_count=0,
+                infrastructure_error_count=1,
+                errors=["decision_review_slot_without_pass:independent-reviewer"],
+            ),
+        ):
+            result = self.run_captain(parameters)
+
+        gate = self.gate(result, "independent-review-policy")
+        self.assertEqual("blocked", gate["status"])
+        self.assertIn(
+            "decision_review_slot_without_pass:independent-reviewer",
+            result["output"]["blocked_reasons"],
+        )
+        self.assertIn("independent_review_pass_missing", result["output"]["blocked_reasons"])
+
+    def test_high_critical_audit_cannot_omit_independent_review_floor(self) -> None:
+        parameters = captain_parameters()
+        del parameters["review_evidence"]["independent_review_required"]
+        result = self.run_captain(parameters)
+
+        gate = self.gate(result, "independent-review-policy")
+        self.assertEqual("blocked", gate["status"])
+        self.assertIn(
+            "independent_review_high_critical_floor_not_acknowledged",
+            result["output"]["blocked_reasons"],
+        )
+
+    def test_caller_false_cannot_downgrade_high_critical_independent_review(self) -> None:
+        parameters = captain_parameters(
+            independent_review_required=False,
+            codex_review_required=False,
+        )
+        result = self.run_captain(parameters)
+
+        gate = self.gate(result, "independent-review-policy")
+        self.assertEqual("pass", gate["status"])
+        self.assertTrue(gate["details"]["required"])
+        self.assertFalse(gate["details"]["explicitly_required"])
+        self.assertTrue(gate["details"]["high_critical_floor"])
+
+    def test_invalid_independent_review_requirement_blocks(self) -> None:
+        parameters = captain_parameters(independent_review_required="yes")
+        result = self.run_captain(parameters)
+
+        gate = self.gate(result, "independent-review-policy")
+        self.assertEqual("blocked", gate["status"])
+        self.assertIn(
+            "independent_review_required_invalid",
+            result["output"]["blocked_reasons"],
+        )
 
     def test_optional_codex_evidence_is_advisory_even_when_stale(self) -> None:
         parameters = captain_parameters()
@@ -10048,17 +10237,70 @@ class CaptainAuthorityPathTests(unittest.TestCase):
     def test_standard_merge_does_not_require_codex_review_by_default(self) -> None:
         parameters = captain_parameters()
         parameters["review_evidence"]["review_tier"] = "standard"
+        parameters["review_evidence"]["independent_review_required"] = False
         parameters["review_evidence"]["minimum_review_iterations"] = 2
         parameters["review_evidence"]["actual_review_iterations"] = 2
         parameters.pop("codex_review_evidence")
         parameters["execution_intent"] = captain_execution_intent(parameters)
-        result = self.run_captain(parameters)
+        with patch.object(
+            merge_guard.decision_reviews,
+            "reconcile",
+            return_value=captain_independent_review_reconciliation(
+                status="not_applicable", pass_count=0
+            ),
+        ):
+            result = self.run_captain(parameters)
 
         self.assertEqual("pass", self.gate(result, "codex-review-settled")["status"])
+        independent = self.gate(result, "independent-review-policy")
+        self.assertEqual("pass", independent["status"])
+        self.assertFalse(independent["details"]["required"])
+
+    def test_legacy_standard_audit_without_independent_field_remains_compatible(self) -> None:
+        parameters = captain_parameters()
+        parameters["review_evidence"]["review_tier"] = "standard"
+        del parameters["review_evidence"]["independent_review_required"]
+        parameters["review_evidence"]["minimum_review_iterations"] = 2
+        parameters["review_evidence"]["actual_review_iterations"] = 2
+        result = self.run_captain(parameters)
+
+        gate = self.gate(result, "independent-review-policy")
+        self.assertEqual("pass", gate["status"])
+        self.assertFalse(gate["details"]["required"])
+
+    def test_standard_preflight_still_blocks_existing_material_reject(self) -> None:
+        parameters = captain_parameters()
+        parameters["review_evidence"]["review_tier"] = "standard"
+        parameters["review_evidence"]["independent_review_required"] = False
+        parameters["review_evidence"]["minimum_review_iterations"] = 2
+        parameters["review_evidence"]["actual_review_iterations"] = 2
+        reconciliation = captain_independent_review_reconciliation(
+            status="blocked",
+            pass_count=0,
+            errors=[
+                "decision_review_material_reject:reviewer-a:grabowski-job-a00000000001"
+            ],
+        )
+        with patch.object(
+            merge_guard.decision_reviews, "reconcile", return_value=reconciliation
+        ):
+            result = self.run_captain(parameters)
+
+        gate = self.gate(result, "independent-review-policy")
+        self.assertEqual("blocked", gate["status"])
+        self.assertIn(
+            "decision_review_material_reject:reviewer-a:grabowski-job-a00000000001",
+            gate["details"],
+        )
+        self.assertIn(
+            "decision_review_material_reject:reviewer-a:grabowski-job-a00000000001",
+            result["output"]["blocked_reasons"],
+        )
 
     def test_explicit_codex_requirement_blocks_standard_merge_without_evidence(self) -> None:
         parameters = captain_parameters(codex_review_required=True)
         parameters["review_evidence"]["review_tier"] = "standard"
+        parameters["review_evidence"]["independent_review_required"] = False
         parameters["review_evidence"]["minimum_review_iterations"] = 2
         parameters["review_evidence"]["actual_review_iterations"] = 2
         parameters.pop("codex_review_evidence")
@@ -13803,7 +14045,183 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual(
             "settled", guard["dispatch_codex_review_revalidation"]["status"]
         )
+        self.assertTrue(guard["independent_review_revalidation"]["required"])
+        self.assertEqual("settled", guard["independent_review_revalidation"]["status"])
+        self.assertEqual(1, guard["independent_review_revalidation"]["pass_count"])
         self.assertEqual([], resources.list_resources())
+
+    def test_atomic_merge_guard_ignores_generic_decision_bound_pass_for_independent_floor(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": "e" * 40,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            },
+            diff_text=CAPTAIN_DIFF_TEXT,
+        )
+        with patch.object(
+            merge_guard.decision_reviews,
+            "reconcile",
+            side_effect=[
+                captain_independent_review_reconciliation(),
+                captain_independent_review_reconciliation(
+                    status="settled", pass_count=1, slot="reviewer-a"
+                ),
+            ],
+        ):
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=gh,
+            )
+
+        execution = result["output"]["executions"][0]
+        guard = execution["merge_lease_guard"]
+        review = guard["independent_review_revalidation"]
+        self.assertFalse(execution["verification_passed"])
+        self.assertEqual(0, review["pass_count"])
+        self.assertEqual(1, review["total_pass_count"])
+        self.assertEqual(["reviewer-a"], review["ignored_pass_slots"])
+        self.assertIn("merge_guard_independent_review_pass_missing", guard["errors"])
+
+    def test_atomic_merge_guard_blocks_high_critical_without_independent_pass(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": "e" * 40,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            },
+            diff_text=CAPTAIN_DIFF_TEXT,
+        )
+        reconciliation = captain_independent_review_reconciliation(
+            status="not_applicable",
+            pass_count=0,
+        )
+        with patch.object(
+            merge_guard.decision_reviews,
+            "reconcile",
+            side_effect=[captain_independent_review_reconciliation(), reconciliation],
+        ):
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=gh,
+            )
+
+        execution = result["output"]["executions"][0]
+        guard = execution["merge_lease_guard"]
+        self.assertFalse(execution["verification_passed"])
+        self.assertEqual("blocked", guard["independent_review_revalidation"]["status"])
+        self.assertIn("merge_guard_independent_review_pass_missing", guard["errors"])
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
+    def test_atomic_merge_guard_blocks_high_critical_infrastructure_only_review(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": "e" * 40,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            },
+            diff_text=CAPTAIN_DIFF_TEXT,
+        )
+        reconciliation = captain_independent_review_reconciliation(
+            status="blocked",
+            pass_count=0,
+            infrastructure_error_count=1,
+            errors=["decision_review_slot_without_pass:independent-reviewer"],
+        )
+        with patch.object(
+            merge_guard.decision_reviews,
+            "reconcile",
+            side_effect=[captain_independent_review_reconciliation(), reconciliation],
+        ):
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=gh,
+            )
+
+        execution = result["output"]["executions"][0]
+        guard = execution["merge_lease_guard"]
+        self.assertFalse(execution["verification_passed"])
+        self.assertIn("decision_review_slot_without_pass:independent-reviewer", guard["errors"])
+        self.assertIn("merge_guard_independent_review_pass_missing", guard["errors"])
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
+    def test_atomic_merge_guard_allows_standard_without_independent_pass(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        review_evidence = parameters["review_evidence"]
+        assert isinstance(review_evidence, dict)
+        review_evidence["review_tier"] = "standard"
+        review_evidence["independent_review_required"] = False
+        review_evidence["minimum_review_iterations"] = 2
+        review_evidence["actual_review_iterations"] = 2
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": "e" * 40,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            },
+            diff_text=CAPTAIN_DIFF_TEXT,
+        )
+        with patch.object(
+            merge_guard.decision_reviews,
+            "reconcile",
+            return_value=captain_independent_review_reconciliation(
+                status="not_applicable", pass_count=0
+            ),
+        ):
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=gh,
+            )
+
+        execution = result["output"]["executions"][0]
+        guard = execution["merge_lease_guard"]
+        self.assertTrue(execution["verification_passed"])
+        self.assertFalse(guard["independent_review_revalidation"]["required"])
+        self.assertEqual("not_required", guard["independent_review_revalidation"]["status"])
 
     def test_atomic_merge_guard_reconciles_proven_raw_and_canonical_diff_aliases(self) -> None:
         diff_text = (
@@ -13847,14 +14265,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             },
             diff_text=diff_text,
         )
-        reconciliation = {
-            "schema_version": 1,
-            "kind": "grabowski_decision_review_reconciliation",
-            "status": "not_applicable",
-            "attempt_count": 0,
-            "slot_count": 0,
-            "errors": [],
-        }
+        reconciliation = captain_independent_review_reconciliation()
         with patch.object(
             merge_guard.decision_reviews,
             "reconcile",
@@ -13876,8 +14287,8 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             "raw-current-provider-compat",
             guard["bindings"]["diff_identity_mode"],
         )
-        reconcile.assert_called_once()
-        reconcile_kwargs = reconcile.call_args.kwargs
+        self.assertEqual(2, reconcile.call_count)
+        reconcile_kwargs = reconcile.call_args_list[-1].kwargs
         self.assertEqual(raw_diff_sha256, reconcile_kwargs["diff_sha256"])
         self.assertEqual(canonical_diff_sha256, previous_canonical_diff_sha256)
         self.assertEqual(
@@ -13946,14 +14357,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             diff_text=diff_text,
             codex_state=codex_state,
         )
-        reconciliation = {
-            "schema_version": 1,
-            "kind": "grabowski_decision_review_reconciliation",
-            "status": "not_applicable",
-            "attempt_count": 0,
-            "slot_count": 0,
-            "errors": [],
-        }
+        reconciliation = captain_independent_review_reconciliation()
         with patch.object(
             merge_guard.decision_reviews,
             "reconcile",
@@ -13979,8 +14383,8 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             previous_canonical_diff_sha256,
             guard["bindings"]["previous_canonical_diff_sha256"],
         )
-        reconcile.assert_called_once()
-        reconcile_kwargs = reconcile.call_args.kwargs
+        self.assertEqual(2, reconcile.call_count)
+        reconcile_kwargs = reconcile.call_args_list[-1].kwargs
         self.assertEqual(previous_canonical_diff_sha256, reconcile_kwargs["diff_sha256"])
         self.assertEqual(
             [canonical_diff_sha256],
@@ -13989,6 +14393,13 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
     def test_atomic_merge_guard_blocks_material_decision_bound_review(self) -> None:
         parameters = authorized_captain_run_parameters()
+        review_evidence = parameters["review_evidence"]
+        assert isinstance(review_evidence, dict)
+        review_evidence["review_tier"] = "standard"
+        review_evidence["independent_review_required"] = False
+        review_evidence["minimum_review_iterations"] = 2
+        review_evidence["actual_review_iterations"] = 2
+        parameters["execution_intent"] = captain_execution_intent(parameters)
         gh = FakeGh(
             view={
                 "number": 96,
@@ -14016,7 +14427,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         with patch.object(
             merge_guard.decision_reviews,
             "reconcile",
-            return_value=reconciliation,
+            side_effect=[captain_independent_review_reconciliation(), reconciliation],
         ):
             result = grips.grip_run(
                 "captain-run",
@@ -16944,8 +17355,15 @@ class CaptainExecutionIntentTests(unittest.TestCase):
             Path(self._resource_tempdir.name) / "resources.sqlite3",
         )
         self._resource_db_patch.start()
+        self._decision_review_patch = patch.object(
+            merge_guard.decision_reviews,
+            "reconcile",
+            return_value=captain_independent_review_reconciliation(),
+        )
+        self._decision_review_patch.start()
 
     def tearDown(self) -> None:
+        self._decision_review_patch.stop()
         self._resource_db_patch.stop()
         self._resource_tempdir.cleanup()
 

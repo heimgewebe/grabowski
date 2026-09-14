@@ -63,20 +63,67 @@ def make_job(
     terminal_status: str | None,
     review_result: dict | None,
     diff_sha256: str = DIFF,
+    review_role: bool = False,
+    origin_provenance: bool = True,
+    metadata_argv_override: list[str] | None = None,
 ) -> Path:
     unit = f"grabowski-job-{suffix}"
     directory = jobs / unit
     directory.mkdir(parents=True)
     os.chmod(directory, 0o700)
-    argv_sha = (suffix[0] if suffix[0] in "abcdef" else "d") * 64
+    normalized_binding = reviews.normalize_binding(
+        binding(slot, diff_sha256=diff_sha256)
+    )
+    role_command = [
+        "claude",
+        "--model",
+        "opus",
+        "--effort",
+        "high",
+        "--permission-mode",
+        "plan",
+        "Review the frozen revision",
+    ]
+    role_receipt_path = directory / "review-role-receipt.json"
+    job_argv = (
+        [
+            reviews.REVIEW_ROLE_PYTHON,
+            "-I",
+            "-m",
+            reviews.REVIEW_ROLE_MODULE,
+            "--role",
+            "review",
+            "--repository",
+            "/tmp/review",
+            "--expected-head",
+            HEAD,
+            "--expected-base-head",
+            BASE,
+            "--expected-diff-sha256",
+            "e" * 64,
+            "--expected-dirty",
+            "false",
+            "--output",
+            str(role_receipt_path),
+            "--",
+            *role_command,
+        ]
+        if review_role
+        else ["python3", "-c", "print('review')"]
+    )
+    argv_sha = reviews.sha256_json(job_argv)
     scope = {
         "cwd": "/tmp/review",
         "argv_sha256": argv_sha,
         "runtime_seconds": 60,
-        "decision_bound_review": reviews.normalize_binding(
-            binding(slot, diff_sha256=diff_sha256)
-        ),
+        "decision_bound_review": normalized_binding,
     }
+    if review_role and origin_provenance:
+        provenance = reviews.review_role_provenance(
+            job_argv, normalized_binding, cwd=Path("/tmp/review")
+        )
+        assert provenance is not None
+        scope["decision_review_provenance"] = provenance
     origin, origin_sha = job_origin.build_origin(
         unit=unit,
         owner="uid:1000",
@@ -112,7 +159,9 @@ def make_job(
         "scope": scope,
         "origin": origin,
         "origin_sha256": origin_sha,
+        "argv": job_argv if metadata_argv_override is None else metadata_argv_override,
         "argv_sha256": argv_sha,
+        "cwd": "/tmp/review",
         "created_at_unix": 1_787_000_000,
         "finalization_contract": contract,
     }
@@ -122,6 +171,30 @@ def make_job(
         marker = reviews.RESULT_PREFIX + json.dumps(review_result, separators=(",", ":")) + "\n"
     write_private(directory / "stdout.log", marker)
     write_private(directory / "stderr.log", "")
+    if review_role:
+        role_receipt = {
+            "schema_version": 1,
+            "role": "review",
+            "expected_head": HEAD,
+            "expected_base_head": BASE,
+            "expected_diff_sha256": "e" * 64,
+            "expected_dirty": False,
+            "head_before": HEAD,
+            "head_after": HEAD,
+            "diff_after": "e" * 64,
+            "worktree_dirty_after": False,
+            "argv_sha256": reviews.sha256_json(role_command),
+            "returncode": 0,
+            "sandbox": reviews.REVIEW_ROLE_SANDBOX,
+            "review_receipt_generated_by": reviews.REVIEW_ROLE_MODULE,
+            "verdict": "PASS",
+            "findings": [],
+            "failure_classification": "passed",
+        }
+        role_receipt["receipt_sha256"] = reviews._agent_role_receipt_sha256(
+            role_receipt
+        )
+        write_private(role_receipt_path, json.dumps(role_receipt))
     if terminal_status is not None:
         final_material = {
             **contract,
@@ -167,6 +240,200 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
         self.assertEqual(reconciled["slot_count"], 2)
         self.assertTrue(reconciled["read_by_merge_guard"])
         self.assertEqual(reconciled["errors"], [])
+
+    def test_independent_named_generic_marker_is_not_proven_independent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp)
+            make_job(
+                jobs,
+                suffix="a00000000021",
+                slot="independent-reviewer",
+                terminal_status="succeeded",
+                review_result=result("independent-reviewer", "PASS_THIS_REVISION", 0),
+            )
+            reconciled = self.reconcile(jobs)
+        self.assertEqual(reconciled["status"], "settled")
+        slot = reconciled["slots"][0]
+        self.assertEqual(slot["pass_count"], 1)
+        self.assertEqual(slot["independent_pass_count"], 0)
+        self.assertFalse(reconciled["attempts"][0]["independence_verified"])
+
+    def test_server_bound_read_only_reviewer_route_is_proven_independent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp)
+            make_job(
+                jobs,
+                suffix="a00000000022",
+                slot="independent-reviewer",
+                terminal_status="succeeded",
+                review_result=None,
+                review_role=True,
+            )
+            reconciled = self.reconcile(jobs)
+        self.assertEqual(reconciled["status"], "settled")
+        slot = reconciled["slots"][0]
+        self.assertEqual(slot["pass_count"], 1)
+        self.assertEqual(slot["independent_pass_count"], 1)
+        attempt = reconciled["attempts"][0]
+        self.assertTrue(attempt["review_role_verified"])
+        self.assertTrue(attempt["review_route_verified"])
+        self.assertTrue(attempt["independence_verified"])
+        self.assertEqual(attempt["review_route_id"], "claude-opus-5-high")
+        self.assertEqual(attempt["review_provider_family"], "anthropic")
+
+    def test_reviewer_provenance_requires_server_python_and_isolated_module(self) -> None:
+        normalized = reviews.normalize_binding(binding("independent-reviewer"))
+        receipt = "/tmp/review/review-role-receipt.json"
+        trusted = [
+            reviews.REVIEW_ROLE_PYTHON,
+            "-I",
+            "-m",
+            reviews.REVIEW_ROLE_MODULE,
+            "--role",
+            "review",
+            "--repository",
+            "/tmp/review",
+            "--expected-head",
+            HEAD,
+            "--expected-base-head",
+            BASE,
+            "--expected-diff-sha256",
+            "e" * 64,
+            "--expected-dirty",
+            "false",
+            "--output",
+            receipt,
+            "--",
+            "claude",
+            "--model",
+            "opus",
+            "--effort",
+            "high",
+            "--permission-mode",
+            "plan",
+            "Review the frozen revision",
+        ]
+        self.assertIsNotNone(
+            reviews.review_role_provenance(trusted, normalized, cwd=Path("/tmp/review"))
+        )
+        caller_python = ["/tmp/python3", *trusted[1:]]
+        self.assertIsNone(
+            reviews.review_role_provenance(
+                caller_python, normalized, cwd=Path("/tmp/review")
+            )
+        )
+        non_isolated = [trusted[0], *trusted[2:]]
+        self.assertIsNone(
+            reviews.review_role_provenance(
+                non_isolated, normalized, cwd=Path("/tmp/review")
+            )
+        )
+
+    def test_route_suffix_cannot_override_verified_reviewer_route(self) -> None:
+        normalized = reviews.normalize_binding(binding("independent-reviewer"))
+        receipt = "/tmp/review/review-role-receipt.json"
+        job_argv = [
+            reviews.REVIEW_ROLE_PYTHON,
+            "-I",
+            "-m",
+            reviews.REVIEW_ROLE_MODULE,
+            "--role",
+            "review",
+            "--repository",
+            "/tmp/review",
+            "--expected-head",
+            HEAD,
+            "--expected-base-head",
+            BASE,
+            "--expected-diff-sha256",
+            "e" * 64,
+            "--expected-dirty",
+            "false",
+            "--output",
+            receipt,
+            "--",
+            "claude",
+            "--model",
+            "opus",
+            "--effort",
+            "high",
+            "--permission-mode",
+            "plan",
+            "--model",
+            "sonnet",
+            "Review the frozen revision",
+        ]
+        self.assertIsNone(
+            reviews.review_role_provenance(
+                job_argv, normalized, cwd=Path("/tmp/review")
+            )
+        )
+
+    def test_exact_origin_bound_argv_bootstraps_reviewer_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp)
+            make_job(
+                jobs,
+                suffix="a00000000024",
+                slot="independent-reviewer",
+                terminal_status="succeeded",
+                review_result=None,
+                review_role=True,
+                origin_provenance=False,
+            )
+            reconciled = self.reconcile(jobs)
+        self.assertEqual(reconciled["status"], "settled")
+        self.assertEqual(reconciled["slots"][0]["independent_pass_count"], 1)
+        self.assertTrue(reconciled["attempts"][0]["independence_verified"])
+
+    def test_redacted_or_changed_metadata_argv_cannot_bootstrap_independence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp)
+            make_job(
+                jobs,
+                suffix="a00000000025",
+                slot="independent-reviewer",
+                terminal_status="succeeded",
+                review_result=None,
+                review_role=True,
+                origin_provenance=False,
+                metadata_argv_override=[
+                    reviews.REVIEW_ROLE_PYTHON,
+                    "-I",
+                    "-m",
+                    reviews.REVIEW_ROLE_MODULE,
+                    "<REDACTED>",
+                ],
+            )
+            reconciled = self.reconcile(jobs)
+        self.assertEqual(reconciled["status"], "blocked")
+        self.assertEqual(reconciled["slots"][0]["independent_pass_count"], 0)
+        self.assertIn("decision_review_slot_without_pass:independent-reviewer", reconciled["errors"])
+
+    def test_preflight_can_defer_unproven_diff_identity_without_claiming_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp)
+            make_job(
+                jobs,
+                suffix="a00000000023",
+                slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "PASS_THIS_REVISION", 0, diff_sha256=ALIAS_DIFF),
+                diff_sha256=ALIAS_DIFF,
+            )
+            reconciled = reviews.reconcile(
+                repo=REPO,
+                pr=PR,
+                head_sha=HEAD,
+                base_sha=BASE,
+                diff_sha256=DIFF,
+                defer_diff_identity=True,
+                jobs_root=jobs,
+            )
+        self.assertEqual(reconciled["status"], "settled")
+        self.assertEqual(reconciled["accepted_diff_sha256s"], [DIFF])
+        self.assertEqual(reconciled["deferred_diff_identity_count"], 1)
+        self.assertTrue(reconciled["attempts"][0]["diff_identity_deferred"])
 
     def test_unproven_diff_alias_still_blocks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

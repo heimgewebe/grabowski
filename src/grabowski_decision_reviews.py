@@ -9,9 +9,11 @@ import os
 from pathlib import Path
 import re
 import stat
+import sys
 from typing import Any, Iterator
 
 import grabowski_job_origin as job_origin
+import grabowski_coding_agent_catalog_data as catalog_data
 
 
 STATE_ROOT = Path.home() / ".local" / "state" / "grabowski"
@@ -26,6 +28,16 @@ MAX_JOB_DIRECTORIES = 10_000
 MAX_METADATA_BYTES = 256 * 1024
 MAX_FINALIZATION_BYTES = 256 * 1024
 MAX_STDOUT_TAIL_BYTES = 256 * 1024
+MAX_ROLE_RECEIPT_BYTES = 4 * 1024 * 1024
+REVIEW_ROLE_MODULE = "grabowski_agent_role"
+REVIEW_ROLE_SANDBOX = "bubblewrap-minimal-root-read-only-worktree-v1"
+REVIEW_ROLE_PYTHON = os.path.abspath(sys.executable)
+REVIEW_ROLE_LAUNCHER_PREFIX = (
+    REVIEW_ROLE_PYTHON,
+    "-I",
+    "-m",
+    REVIEW_ROLE_MODULE,
+)
 _REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 _SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -74,6 +86,22 @@ def _canonical_json_bytes(value: Any) -> bytes:
 
 def sha256_json(value: Any) -> str:
     return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
+
+
+def _review_role_module_identity() -> tuple[str, str] | None:
+    """Bind reviewer provenance to the server-installed role module bytes."""
+    module_path = Path(__file__).with_name(f"{REVIEW_ROLE_MODULE}.py")
+    try:
+        metadata = module_path.lstat()
+        payload = module_path.read_bytes()
+    except OSError:
+        return None
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        return None
+    return (
+        str(module_path.resolve(strict=False)),
+        hashlib.sha256(payload).hexdigest(),
+    )
 
 
 def normalize_binding(value: Any) -> dict[str, Any]:
@@ -238,7 +266,7 @@ def _proven_not_started(metadata: dict[str, Any]) -> bool:
     )
 
 
-def _validated_origin_binding(directory: Path) -> tuple[dict[str, Any], dict[str, Any] | None]:
+def _validated_origin_binding(directory: Path) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any] | None]:
     unit = directory.name
     if _UNIT_RE.fullmatch(unit) is None:
         raise ValueError("job unit is invalid")
@@ -259,8 +287,25 @@ def _validated_origin_binding(directory: Path) -> tuple[dict[str, Any], dict[str
         raise ValueError("job origin scope is invalid")
     raw_binding = scope.get("decision_bound_review")
     if raw_binding is None:
-        return metadata, None
-    return metadata, normalize_binding(raw_binding)
+        return metadata, None, None
+    binding = normalize_binding(raw_binding)
+    origin_cwd = scope.get("cwd")
+    if not isinstance(origin_cwd, str) or not origin_cwd:
+        raise ValueError("job origin cwd is invalid")
+    provenance = _normalize_review_role_provenance(
+        scope.get("decision_review_provenance"), binding, cwd=origin_cwd
+    )
+    if provenance is None:
+        exact_argv = metadata.get("argv")
+        if (
+            isinstance(exact_argv, list)
+            and all(isinstance(item, str) for item in exact_argv)
+            and sha256_json(exact_argv) == origin.get("argv_sha256")
+        ):
+            provenance = review_role_provenance(
+                exact_argv, binding, cwd=Path(origin_cwd)
+            )
+    return metadata, binding, provenance
 
 
 def _validated_finalization(directory: Path, metadata: dict[str, Any]) -> dict[str, Any] | None:
@@ -339,6 +384,260 @@ def _parse_result_marker(stdout_text: str, binding: dict[str, Any]) -> dict[str,
     }
 
 
+def _agent_role_receipt_sha256(value: dict[str, Any]) -> str:
+    material = {key: item for key, item in value.items() if key != "receipt_sha256"}
+    payload = json.dumps(
+        material,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _review_route_evidence(command: list[str]) -> dict[str, Any] | None:
+    try:
+        catalog = json.loads(catalog_data.CATALOG_JSON)
+    except (AttributeError, json.JSONDecodeError):
+        return None
+    routes = catalog.get("routes")
+    models = catalog.get("models")
+    if not isinstance(routes, list) or not isinstance(models, dict):
+        return None
+    matches: list[dict[str, Any]] = []
+    for route in routes:
+        if not isinstance(route, dict):
+            continue
+        prefix = route.get("argv_prefix")
+        if (
+            route.get("enabled") is not True
+            or route.get("review_only") is not True
+            or route.get("contrast_only") is True
+            or "independent-review" not in route.get("task_classes", [])
+            or not isinstance(prefix, list)
+            or not prefix
+            or any(not isinstance(item, str) or not item for item in prefix)
+            or len(command) != len(prefix) + 1
+            or command[: len(prefix)] != prefix
+            or not command[-1].strip()
+            or command[-1].startswith("-")
+        ):
+            continue
+        model_id = route.get("model")
+        model = models.get(model_id) if isinstance(model_id, str) else None
+        provider_family = model.get("provider_family") if isinstance(model, dict) else None
+        route_id = route.get("id")
+        independence_group = route.get("independence_group")
+        if not all(
+            isinstance(value, str) and value
+            for value in (route_id, model_id, provider_family, independence_group)
+        ):
+            continue
+        matches.append(
+            {
+                "route_id": route_id,
+                "model": model_id,
+                "provider_family": provider_family,
+                "independence_group": independence_group,
+                "argv_prefix_sha256": sha256_json(prefix),
+            }
+        )
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def review_role_provenance(
+    argv: list[str], binding: dict[str, Any], *, cwd: Path
+) -> dict[str, Any] | None:
+    """Derive server-owned reviewer provenance from the pre-redaction launch argv."""
+    normalized = normalize_binding(binding)
+    if not isinstance(argv, list) or any(not isinstance(item, str) for item in argv):
+        return None
+    if (
+        len(argv) < 20
+        or tuple(argv[:4]) != REVIEW_ROLE_LAUNCHER_PREFIX
+        or argv.count("--") != 1
+    ):
+        return None
+    separator = argv.index("--")
+    options = argv[4:separator]
+    required_order = [
+        "--role",
+        "--repository",
+        "--expected-head",
+        "--expected-base-head",
+        "--expected-diff-sha256",
+        "--expected-dirty",
+        "--output",
+    ]
+    if len(options) != len(required_order) * 2 or options[::2] != required_order:
+        return None
+    values = dict(zip(options[::2], options[1::2], strict=True))
+    if values["--role"] != "review":
+        return None
+    if values["--expected-head"].lower() != normalized["head_sha"]:
+        return None
+    if values["--expected-base-head"].lower() != normalized["base_sha"]:
+        return None
+    workspace_diff = values["--expected-diff-sha256"].lower()
+    if _SHA256_RE.fullmatch(workspace_diff) is None or values["--expected-dirty"] != "false":
+        return None
+    repository = Path(values["--repository"]).expanduser()
+    if not repository.is_absolute():
+        repository = cwd / repository
+    if repository.resolve(strict=False) != cwd.resolve(strict=False):
+        return None
+    output = Path(values["--output"]).expanduser()
+    if not output.is_absolute():
+        output = cwd / output
+    reviewer_command = argv[separator + 1 :]
+    if not reviewer_command:
+        return None
+    review_route = _review_route_evidence(reviewer_command)
+    if review_route is None:
+        return None
+    module_identity = _review_role_module_identity()
+    if module_identity is None:
+        return None
+    runner_module_path, runner_module_sha256 = module_identity
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski_decision_review_provenance",
+        "role": "review",
+        "runner_python": REVIEW_ROLE_PYTHON,
+        "runner_isolated": True,
+        "runner_module": REVIEW_ROLE_MODULE,
+        "runner_module_path": runner_module_path,
+        "runner_module_sha256": runner_module_sha256,
+        "sandbox": REVIEW_ROLE_SANDBOX,
+        "repository": str(repository.resolve(strict=False)),
+        "head_sha": normalized["head_sha"],
+        "base_sha": normalized["base_sha"],
+        "workspace_diff_sha256": workspace_diff,
+        "expected_dirty": False,
+        "role_receipt_path": str(output.resolve(strict=False)),
+        "reviewer_command_sha256": sha256_json(reviewer_command),
+        "review_route": review_route,
+        "binding_sha256": sha256_json(normalized),
+    }
+    return {**material, "provenance_sha256": sha256_json(material)}
+
+
+def _normalize_review_role_provenance(
+    value: Any, binding: dict[str, Any], *, cwd: str
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("decision review provenance is invalid")
+    required = {
+        "schema_version", "kind", "role", "runner_python", "runner_isolated",
+        "runner_module", "runner_module_path", "runner_module_sha256", "sandbox",
+        "repository", "head_sha", "base_sha", "workspace_diff_sha256",
+        "expected_dirty", "role_receipt_path", "reviewer_command_sha256",
+        "review_route", "binding_sha256", "provenance_sha256",
+    }
+    if set(value) != required:
+        raise ValueError("decision review provenance has an invalid shape")
+    material = {key: item for key, item in value.items() if key != "provenance_sha256"}
+    if value.get("provenance_sha256") != sha256_json(material):
+        raise ValueError("decision review provenance digest mismatch")
+    normalized = normalize_binding(binding)
+    module_identity = _review_role_module_identity()
+    if module_identity is None:
+        raise ValueError("trusted decision review role module is unavailable")
+    runner_module_path, runner_module_sha256 = module_identity
+    if (
+        value.get("schema_version") != 1
+        or value.get("kind") != "grabowski_decision_review_provenance"
+        or value.get("role") != "review"
+        or value.get("runner_python") != REVIEW_ROLE_PYTHON
+        or value.get("runner_isolated") is not True
+        or value.get("runner_module") != REVIEW_ROLE_MODULE
+        or value.get("runner_module_path") != runner_module_path
+        or value.get("runner_module_sha256") != runner_module_sha256
+        or value.get("sandbox") != REVIEW_ROLE_SANDBOX
+        or value.get("head_sha") != normalized["head_sha"]
+        or value.get("base_sha") != normalized["base_sha"]
+        or value.get("expected_dirty") is not False
+        or value.get("binding_sha256") != sha256_json(normalized)
+    ):
+        raise ValueError("decision review provenance binding mismatch")
+    repository = value.get("repository")
+    receipt_path = value.get("role_receipt_path")
+    workspace_diff = value.get("workspace_diff_sha256")
+    command_sha = value.get("reviewer_command_sha256")
+    route = value.get("review_route")
+    if (
+        not isinstance(repository, str)
+        or Path(repository).resolve(strict=False) != Path(cwd).resolve(strict=False)
+        or not isinstance(receipt_path, str)
+        or not Path(receipt_path).is_absolute()
+        or not isinstance(workspace_diff, str)
+        or _SHA256_RE.fullmatch(workspace_diff) is None
+        or not isinstance(command_sha, str)
+        or _SHA256_RE.fullmatch(command_sha) is None
+        or not isinstance(route, dict)
+    ):
+        raise ValueError("decision review provenance fields are invalid")
+    for key in ("route_id", "model", "provider_family", "independence_group", "argv_prefix_sha256"):
+        if not isinstance(route.get(key), str) or not route[key]:
+            raise ValueError("decision review route provenance is invalid")
+    return value
+
+
+def _validated_review_role_evidence(
+    metadata: dict[str, Any], binding: dict[str, Any], provenance: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    if provenance is None:
+        return None
+    receipt = _read_private_json(Path(provenance["role_receipt_path"]), MAX_ROLE_RECEIPT_BYTES)
+    expected_receipt_sha256 = _agent_role_receipt_sha256(receipt)
+    if receipt.get("receipt_sha256") != expected_receipt_sha256:
+        raise ValueError("decision review role receipt digest mismatch")
+    workspace_diff = provenance["workspace_diff_sha256"]
+    expected_fields = {
+        "schema_version": 1,
+        "role": "review",
+        "expected_head": binding["head_sha"],
+        "expected_base_head": binding["base_sha"],
+        "expected_diff_sha256": workspace_diff,
+        "expected_dirty": False,
+        "head_before": binding["head_sha"],
+        "head_after": binding["head_sha"],
+        "diff_after": workspace_diff,
+        "worktree_dirty_after": False,
+        "sandbox": REVIEW_ROLE_SANDBOX,
+        "review_receipt_generated_by": REVIEW_ROLE_MODULE,
+        "argv_sha256": provenance["reviewer_command_sha256"],
+    }
+    for key, expected_value in expected_fields.items():
+        if receipt.get(key) != expected_value:
+            raise ValueError(f"decision review role receipt {key} mismatch")
+    verdict = receipt.get("verdict")
+    findings = receipt.get("findings")
+    failure_classification = receipt.get("failure_classification")
+    result: dict[str, Any] | None = None
+    if verdict == "PASS" and findings == [] and receipt.get("returncode") == 0 and failure_classification == "passed":
+        result = {**normalize_binding(binding), "verdict": "PASS_THIS_REVISION", "material_findings": 0}
+    elif (
+        verdict in {"NEEDS_CHANGE", "BLOCK"}
+        and isinstance(findings, list) and findings
+        and all(isinstance(item, dict) for item in findings)
+        and failure_classification == "review_verdict"
+    ):
+        result = {**normalize_binding(binding), "verdict": "REJECT_THIS_REVISION", "material_findings": len(findings)}
+    return {
+        "role_verified": True,
+        "route_verified": True,
+        "independence_verified": True,
+        "role_receipt_sha256": expected_receipt_sha256,
+        "review_route": provenance["review_route"],
+        "result": result,
+    }
+
+
 def _binding_matches_pr_head(
     binding: dict[str, Any], expected: dict[str, Any]
 ) -> bool:
@@ -357,6 +656,7 @@ def reconcile(
     base_sha: str,
     diff_sha256: str,
     equivalent_diff_sha256s: list[str] | tuple[str, ...] | None = None,
+    defer_diff_identity: bool = False,
     jobs_root: Path | None = None,
 ) -> dict[str, Any]:
     expected = normalize_binding(
@@ -372,6 +672,8 @@ def reconcile(
         }
     )
     expected.pop("slot")
+    if not isinstance(defer_diff_identity, bool):
+        raise ValueError("decision review defer_diff_identity must be boolean")
     aliases = [] if equivalent_diff_sha256s is None else equivalent_diff_sha256s
     if not isinstance(aliases, (list, tuple)):
         raise ValueError("decision review equivalent diff digests must be a list or tuple")
@@ -439,7 +741,7 @@ def reconcile(
             raw_targets_pr_head = _raw_binding_targets_pr_head(
                 raw_review_binding, expected
             )
-            metadata, binding = _validated_origin_binding(directory)
+            metadata, binding, provenance = _validated_origin_binding(directory)
         except (FileNotFoundError, OSError, ValueError) as exc:
             if raw_targets_pr_head:
                 errors.append(f"decision_review_origin_invalid:{directory.name}:{type(exc).__name__}")
@@ -459,6 +761,13 @@ def reconcile(
             "material_findings": None,
             "result_sha256": None,
             "stdout_tail_sha256": None,
+            "review_role_verified": False,
+            "review_route_verified": False,
+            "review_route_id": None,
+            "review_provider_family": None,
+            "independence_verified": False,
+            "review_role_receipt_sha256": None,
+            "diff_identity_deferred": False,
         }
         if binding["base_sha"] != expected["base_sha"]:
             errors.append(f"decision_review_base_sha_drift:{directory.name}")
@@ -466,10 +775,13 @@ def reconcile(
             attempts.append(attempt)
             continue
         if binding["diff_sha256"] not in accepted_diff_sha256s:
-            errors.append(f"decision_review_diff_sha256_drift:{directory.name}")
-            attempt["classification"] = "binding_drift"
-            attempts.append(attempt)
-            continue
+            if defer_diff_identity:
+                attempt["diff_identity_deferred"] = True
+            else:
+                errors.append(f"decision_review_diff_sha256_drift:{directory.name}")
+                attempt["classification"] = "binding_drift"
+                attempts.append(attempt)
+                continue
         if _proven_not_started(metadata):
             attempt["terminal"] = True
             attempt["terminal_status"] = "launch_failed"
@@ -493,7 +805,19 @@ def reconcile(
         try:
             stdout_text, stdout_tail_sha256 = _read_stdout_tail(directory / "stdout.log")
             attempt["stdout_tail_sha256"] = stdout_tail_sha256
-            result = _parse_result_marker(stdout_text, binding)
+            role_evidence = _validated_review_role_evidence(metadata, binding, provenance)
+            if role_evidence is not None:
+                attempt["review_role_verified"] = role_evidence["role_verified"]
+                attempt["review_route_verified"] = role_evidence["route_verified"]
+                attempt["independence_verified"] = role_evidence["independence_verified"]
+                attempt["review_role_receipt_sha256"] = role_evidence["role_receipt_sha256"]
+                review_route = role_evidence.get("review_route")
+                if isinstance(review_route, dict):
+                    attempt["review_route_id"] = review_route.get("route_id")
+                    attempt["review_provider_family"] = review_route.get("provider_family")
+                result = role_evidence["result"]
+            else:
+                result = _parse_result_marker(stdout_text, binding)
         except (FileNotFoundError, OSError, ValueError) as exc:
             errors.append(f"decision_review_result_invalid:{directory.name}:{type(exc).__name__}")
             attempt["classification"] = "invalid_result"
@@ -524,6 +848,9 @@ def reconcile(
     for slot in sorted({str(item["slot"]) for item in attempts}):
         slot_attempts = [item for item in attempts if item["slot"] == slot]
         passes = [item for item in slot_attempts if item["classification"] == "pass"]
+        independent_passes = [
+            item for item in passes if item.get("independence_verified") is True
+        ]
         rejects = [
             item for item in slot_attempts if item["classification"] == "material_reject"
         ]
@@ -545,6 +872,7 @@ def reconcile(
                 "slot": slot,
                 "attempt_count": len(slot_attempts),
                 "pass_count": len(passes),
+                "independent_pass_count": len(independent_passes),
                 "material_reject_count": len(rejects),
                 "infrastructure_error_count": len(infrastructure),
                 "unresolved_count": len(unresolved),
@@ -569,6 +897,13 @@ def reconcile(
                 "material_findings",
                 "result_sha256",
                 "stdout_tail_sha256",
+                "review_role_verified",
+                "review_route_verified",
+                "review_route_id",
+                "review_provider_family",
+                "independence_verified",
+                "review_role_receipt_sha256",
+                "diff_identity_deferred",
             )
         }
         for item in sorted(attempts, key=lambda item: (str(item["slot"]), str(item["unit"])))
@@ -584,6 +919,9 @@ def reconcile(
         "attempt_count": len(attempts_projection),
         "slot_count": len(slots),
         "slots": slots,
+        "deferred_diff_identity_count": sum(
+            1 for item in attempts_projection if item["diff_identity_deferred"]
+        ),
         "attempts": attempts_projection,
         "attempts_sha256": sha256_json(attempts_projection),
         "errors": errors,

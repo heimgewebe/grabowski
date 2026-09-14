@@ -95,6 +95,43 @@ class PrReviewGateRiskPathExpansionTests(unittest.TestCase):
                     result["failures"],
                 )
                 self.assertFalse(result["review_sources"]["external_review_required"])
+                self.assertTrue(result["review_sources"]["independent_review_required"])
+                self.assertTrue(result["complexity"]["independent_review_required"])
+
+    def test_documentation_does_not_gain_independent_review_floor(self) -> None:
+        state = _state("docs/usage.md")
+        state["repoName"] = "heimgewebe/example"
+        complexity = pr_review_gate.classify_complexity(
+            state["pr"], None, repo_name=state["repoName"]
+        )
+
+        self.assertEqual("documentation", complexity["review_tier"])
+        self.assertFalse(complexity["independent_review_required"])
+        self.assertFalse(complexity["external_review_required"])
+
+    def test_self_review_audit_transports_independent_review_policy(self) -> None:
+        state = _state("src/grabowski_tasks.py")
+        state["pr_diff_sha256"] = "0" * 64
+        complexity = pr_review_gate.classify_complexity(
+            state["pr"], None, repo_name=state["repoName"]
+        )
+        review = _self_review("src/grabowski_tasks.py")
+        review["review_iterations"] = [
+            {"n": index, "summary": "reviewed", "material_findings": 0}
+            for index in range(1, complexity["minimum_self_review_iterations"] + 1)
+        ]
+        result = {
+            "complexity": complexity,
+            "review_sources": {"self_review_gate_valid": True},
+        }
+
+        audit = pr_review_gate.build_self_review_audit(state, result, review)
+
+        self.assertEqual("high_critical", audit["review_tier"])
+        self.assertTrue(audit["independent_review_required"])
+        self.assertEqual(HEAD, audit["head_sha"])
+        self.assertEqual(BASE, audit["base_sha"])
+        self.assertEqual("0" * 64, audit["diff_sha256"])
 
 
 if __name__ == "__main__":
