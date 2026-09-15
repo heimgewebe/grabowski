@@ -51,7 +51,9 @@ class GrokReviewRoleTests(unittest.TestCase):
             "review this",
         )
 
-        actual = role._grok_streaming_review_command(prepared)
+        actual = role._grok_streaming_review_command(
+            prepared, expected_head="a" * 40, expected_base_head="b" * 40
+        )
 
         self.assertEqual(actual[0:3], prepared[0:3])
         self.assertNotIn("--always-approve", actual)
@@ -75,6 +77,31 @@ class GrokReviewRoleTests(unittest.TestCase):
         self.assertTrue(actual[-1].startswith("review this"))
         self.assertIn("Do not wrap", actual[-1])
         self.assertIn("git diff --no-ext-diff --no-textconv", actual[-1])
+
+    def test_streaming_review_prompt_binds_exact_revisions_and_single_command_tools(self) -> None:
+        prepared = (
+            "/opt/grabowski-external/grok",
+            "--model",
+            "grok-4.6",
+            "-p",
+            "review this",
+        )
+        head = "a" * 40
+        base = "b" * 40
+
+        actual = role._grok_streaming_review_command(
+            prepared, expected_head=head, expected_base_head=base
+        )
+
+        prompt = actual[-1]
+        self.assertIn(f"bound head is {head}", prompt)
+        self.assertIn(f"bound base is {base}", prompt)
+        self.assertIn("one Git command per tool call", prompt)
+        self.assertIn(
+            f"git diff --no-ext-diff --no-textconv {base}...{head}", prompt
+        )
+        self.assertIn("Do not use git log", prompt)
+        self.assertIn("Do not use shell control operators", prompt)
 
     def test_streaming_review_command_rejects_caller_owned_execution_framing(self) -> None:
         controlled = (
@@ -101,7 +128,9 @@ class GrokReviewRoleTests(unittest.TestCase):
                     "review this",
                 )
                 with self.assertRaisesRegex(RuntimeError, "controlled by Grabowski"):
-                    role._grok_streaming_review_command(prepared)
+                    role._grok_streaming_review_command(
+                        prepared, expected_head="a" * 40, expected_base_head="b" * 40
+                    )
             with self.subTest(option=option, form="attached"):
                 prepared = (
                     "/opt/grabowski-external/grok",
@@ -110,7 +139,9 @@ class GrokReviewRoleTests(unittest.TestCase):
                     "review this",
                 )
                 with self.assertRaisesRegex(RuntimeError, "controlled by Grabowski"):
-                    role._grok_streaming_review_command(prepared)
+                    role._grok_streaming_review_command(
+                        prepared, expected_head="a" * 40, expected_base_head="b" * 40
+                    )
 
     def test_review_sandbox_preserves_declared_command_for_provenance(self) -> None:
         repo = Path("/tmp/repo")
@@ -128,7 +159,12 @@ class GrokReviewRoleTests(unittest.TestCase):
             mock.patch.object(role, "prepare_external_agent_command", return_value=prepared),
             mock.patch.object(role, "sandbox_argv", return_value=["sandbox"]) as sandbox_argv,
         ):
-            argv, contract = role._review_sandbox_argv(repo, declared)
+            argv, contract = role._review_sandbox_argv(
+                repo,
+                declared,
+                expected_head="a" * 40,
+                expected_base_head="b" * 40,
+            )
 
         self.assertEqual(argv, ["sandbox"])
         self.assertEqual(contract, role.GROK_REVIEW_STREAM_CONTRACT)

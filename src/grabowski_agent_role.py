@@ -486,8 +486,13 @@ def _normalize_review_object(
 
 def _grok_streaming_review_command(
     prepared_command: tuple[str, ...],
+    *,
+    expected_head: str,
+    expected_base_head: str,
 ) -> tuple[str, ...]:
     """Run Grok reviews as bounded read-only tool sessions with event evidence."""
+    if SHA40.fullmatch(expected_head) is None or SHA40.fullmatch(expected_base_head) is None:
+        raise RuntimeError("Grok review requires exact bound head and base revisions")
     command = list(prepared_command)
     if command.count("-p") != 1:
         raise RuntimeError("Grok review command must contain exactly one single-turn prompt")
@@ -516,7 +521,22 @@ def _grok_streaming_review_command(
         for item in command
     ):
         raise RuntimeError("Grok review execution framing is controlled by Grabowski")
-    prompt = command[-1] + GROK_REVIEW_PROMPT_SUFFIX
+    prompt = (
+        command[-1]
+        + GROK_REVIEW_PROMPT_SUFFIX
+        + " The bound head is "
+        + expected_head.lower()
+        + " and the bound base is "
+        + expected_base_head.lower()
+        + ". Run one Git command per tool call. Do not use shell control operators, "
+          "redirections, command substitution, or pipes. Do not use git log. The revision binding is "
+          "already known; do not rediscover it. Inspect the complete bound diff in one "
+          "separate tool call using exactly: git diff --no-ext-diff --no-textconv "
+        + expected_base_head.lower()
+        + "..."
+        + expected_head.lower()
+        + ". Use additional safe Git reads only as separate tool calls when needed."
+    )
     command[-1] = prompt
     review_flags = [
         "--disable-web-search",
@@ -543,12 +563,22 @@ def _grok_streaming_review_command(
 
 
 def _review_sandbox_argv(
-    repo: Path, command: list[str]
+    repo: Path,
+    command: list[str],
+    *,
+    expected_head: str,
+    expected_base_head: str,
 ) -> tuple[list[str], str | None]:
     if Path(command[0]).name != "grok":
         return sandbox_argv(repo, command), None
     prepared = prepare_external_agent_command(command)
-    actual = list(_grok_streaming_review_command(prepared.command))
+    actual = list(
+        _grok_streaming_review_command(
+            prepared.command,
+            expected_head=expected_head,
+            expected_base_head=expected_base_head,
+        )
+    )
     return (
         sandbox_argv(repo, actual, declared_command=command),
         GROK_REVIEW_STREAM_CONTRACT,
@@ -822,7 +852,12 @@ def main(argv: list[str] | None = None) -> int:
         raise RuntimeError("writer binding changed before read-only role start")
     review_provider_contract: str | None = None
     if args.role == "review":
-        role_sandbox_argv, review_provider_contract = _review_sandbox_argv(repo, command)
+        role_sandbox_argv, review_provider_contract = _review_sandbox_argv(
+            repo,
+            command,
+            expected_head=args.expected_head,
+            expected_base_head=args.expected_base_head,
+        )
     else:
         role_sandbox_argv = sandbox_argv(repo, command)
     review_content_limit = 0
