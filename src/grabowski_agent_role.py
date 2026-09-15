@@ -65,8 +65,7 @@ GROK_REVIEW_PROMPT_SUFFIX = (
     "PASS requires an empty findings array; non-PASS requires at least one finding. "
     "Do not wrap the final JSON object in Markdown or code fences. "
     "For repository inspection, use only these safe command forms: "
-    "git status --short --branch; the exact bound git diff command; and "
-    "git cat-file blob using only the bound head or base revision."
+    "git status --short --branch and the exact bound git diff command."
 )
 PYTHON_EXECUTABLE_NAMES = frozenset(
     {"python", "python3"} | {f"python3.{minor}" for minor in range(0, 20)}
@@ -482,9 +481,6 @@ def _grok_review_allow_rules(*, expected_head: str, expected_base_head: str) -> 
     return (
         "Bash(git status --short --branch)",
         f"Bash(git diff --no-ext-diff --no-textconv {base}...{head})",
-        f"Bash(git diff --no-ext-diff --no-textconv {base}...{head} -- *)",
-        f"Bash(git cat-file blob {head}:*)",
-        f"Bash(git cat-file blob {base}:*)",
     )
 
 
@@ -539,14 +535,13 @@ def _grok_streaming_review_command(
         + expected_base_head.lower()
         + "..."
         + expected_head.lower()
-        + ". Treat the complete bound diff as primary evidence. Use additional safe Git "
-          "reads only as separate tool calls when one specific material uncertainty cannot be "
-          "resolved from the diff. Hard limit: at most four tool calls total. Never repeat a "
-          "command. Do not request name-status after reading the complete diff. Do not re-read "
-          "an entire changed file unless that specific material uncertainty requires it. Reserve "
-          "the final turn for the required JSON verdict. After the bounded inspection, stop "
-          "reading and immediately return the final JSON. If material uncertainty remains, "
-          "return NEEDS_CHANGE or BLOCK instead of consuming more turns."
+        + ". Treat the complete bound diff as the complete repository review evidence. "
+          "Do not make any additional repository tool calls after reading it. Hard limit: at "
+          "most two tool calls total: optional exact status, then the mandatory exact full diff. "
+          "Never repeat a command. Reserve the final turn for the required JSON verdict. After "
+          "the bound diff, stop reading and immediately return the final JSON. If material "
+          "uncertainty remains, return NEEDS_CHANGE or BLOCK instead of broadening the tool "
+          "surface or consuming more turns."
     )
     command[-1] = prompt
     review_flags = [
@@ -654,19 +649,9 @@ def _safe_grok_git_read_command(
     if subcommand == "status":
         return argv == ["git", "status", "--short", "--branch"]
     if subcommand == "diff":
-        required = [
+        return argv == [
             "git", "diff", "--no-ext-diff", "--no-textconv", f"{base}...{head}"
         ]
-        if argv[:5] != required:
-            return False
-        if len(argv) == 5:
-            return True
-        return len(argv) > 6 and argv[5] == "--" and all(argv[6:])
-    if subcommand == "cat-file":
-        if len(argv) != 4 or argv[:3] != ["git", "cat-file", "blob"]:
-            return False
-        revision, separator, path = argv[3].partition(":")
-        return bool(separator and path) and revision in {head, base}
     return False
 
 

@@ -70,9 +70,6 @@ class GrokReviewRoleTests(unittest.TestCase):
             (
                 "Bash(git status --short --branch)",
                 f"Bash(git diff --no-ext-diff --no-textconv {base}...{head})",
-                f"Bash(git diff --no-ext-diff --no-textconv {base}...{head} -- *)",
-                f"Bash(git cat-file blob {head}:*)",
-                f"Bash(git cat-file blob {base}:*)",
             ),
         )
         self.assertEqual(tuple(deny_values), role.GROK_REVIEW_DENY_RULES)
@@ -112,8 +109,10 @@ class GrokReviewRoleTests(unittest.TestCase):
         )
         self.assertIn("Do not use git log", prompt)
         self.assertIn("Do not use shell control operators", prompt)
-        self.assertIn("at most four tool calls total", prompt)
+        self.assertIn("at most two tool calls total", prompt)
         self.assertIn("Never repeat a command", prompt)
+        self.assertIn("Do not make any additional repository tool calls", prompt)
+        self.assertNotIn("git cat-file blob", prompt)
         self.assertIn("Reserve the final turn", prompt)
         self.assertIn("immediately return the final JSON", prompt)
         self.assertIn("return NEEDS_CHANGE or BLOCK", prompt)
@@ -194,11 +193,14 @@ class GrokReviewRoleTests(unittest.TestCase):
         accepted = (
             "git status --short --branch",
             f"git diff --no-ext-diff --no-textconv {base}...{head}",
+        )
+        rejected = (
             f"git diff --no-ext-diff --no-textconv {base}...{head} -- src tests",
             f"git cat-file blob {head}:src/app.py",
             f"git cat-file blob {base}:src/app.py",
-        )
-        rejected = (
+            f"git cat-file blob {head}:../outside",
+            f"git cat-file blob {head}:/abs/path",
+            f"git cat-file blob {head}:~private",
             "git rev-parse HEAD",
             f"git rev-parse --output-file=review-output {head}",
             f"git merge-base {base} {head}",
@@ -266,7 +268,7 @@ class GrokReviewRoleTests(unittest.TestCase):
     def test_extract_stream_requires_successful_bounded_git_tool_and_terminal_review(self) -> None:
         head = "a" * 40
         base = "b" * 40
-        command = f"git diff --no-ext-diff --no-textconv {base}...{head} -- src tests"
+        command = f"git diff --no-ext-diff --no-textconv {base}...{head}"
         events = [
             {"type": "thought", "data": "inspect exact diff"},
             {"type": "available_commands", "tools": ["run_terminal_command"]},
