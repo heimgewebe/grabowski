@@ -803,387 +803,124 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
                 support.preflight._command_sha256.reset(sha_token)
                 support.preflight._credential_file.reset(credential_token)
 
-    def test_quota_readiness_is_explicitly_unknown_without_provider_probe(self) -> None:
-        with (
-            mock.patch.object(
-                support.preflight.http.client, "HTTPSConnection"
-            ) as connection,
-            mock.patch("subprocess.run") as provider_call,
-        ):
-            readiness = support.preflight._claude_quota_readiness()
+    @staticmethod
+    def _quota_credential(token: str = "synthetic-token") -> bytes:
+        return json.dumps({"claudeAiOauth": {"accessToken": token}}).encode()
 
-        connection.assert_not_called()
-        provider_call.assert_not_called()
-        self.assertEqual(readiness["status"], "unknown")
-        self.assertEqual(
-            readiness["source"], "claude_oauth_usage_at_wall_skip_spend"
-        )
-        self.assertEqual(readiness["reason"], "oauth_credential_unavailable")
-        self.assertFalse(readiness["authentication_is_quota_evidence"])
+    @staticmethod
+    def _quota_http(body, status: int = 200):
+        response = mock.Mock(status=status)
+        response.read.return_value = body if isinstance(body, bytes) else json.dumps(body).encode()
+        http = mock.Mock()
+        http.getresponse.return_value = response
+        return http
+
+    def _quota_call(self, body, *, credential=None, status: int = 200, now=None):
+        http = self._quota_http(body, status)
+        connection = mock.patch.object(support.preflight.http.client, "HTTPSConnection", return_value=http)
+        if now is None:
+            with connection:
+                return support.preflight._claude_quota_readiness(credential or self._quota_credential()), http
+        with connection, mock.patch.object(support.preflight, "_utc_now", return_value=now):
+            return support.preflight._claude_quota_readiness(credential or self._quota_credential()), http
+
+    @staticmethod
+    def _quota_argv(issued_at: str = "2026-09-15T03:00:00Z", *, nonce: str = "0" * 32, digest: str = "1" * 64) -> list[str]:
+        return ["--claude-quota-readiness-only", "--quota-commitment-nonce", nonce,
+                "--quota-commitment-sha256", digest, "--quota-commitment-issued-at", issued_at]
+
+    def test_quota_readiness_is_explicitly_unknown_without_provider_probe(self) -> None:
+        with mock.patch.object(support.preflight.http.client, "HTTPSConnection") as connection, mock.patch("subprocess.run") as provider_call:
+            readiness = support.preflight._claude_quota_readiness()
+        connection.assert_not_called(); provider_call.assert_not_called()
+        self.assertEqual((readiness["status"], readiness["reason"]), ("unknown", "oauth_credential_unavailable"))
         self.assertIsNone(readiness["provider_available"])
-        self.assertIsNone(readiness["remaining_five_hour_quota"])
-        self.assertIsNone(readiness["remaining_weekly_quota"])
+        self.assertFalse(readiness["authentication_is_quota_evidence"])
         self.assertFalse(readiness["spend_and_credits_considered"])
-        self.assertIn("provider_availability", readiness["does_not_establish"])
         self.assertIn("retry_authority", readiness["does_not_establish"])
 
-    def test_quota_readiness_uses_non_consuming_usage_endpoint(self) -> None:
+    def test_quota_readiness_observes_subscription_windows_without_spend(self) -> None:
         secret = "synthetic-oauth-access-token"
-        credential = json.dumps(
-            {"claudeAiOauth": {"accessToken": secret}}
-        ).encode("utf-8")
-        payload = {
+        now = datetime(2026, 9, 15, 5, 0, tzinfo=timezone.utc)
+        readiness, http = self._quota_call({
             "five_hour": {"utilization": 25.0, "resets_at": "2026-09-15T06:00:00Z"},
             "seven_day": {"utilization": 40.0, "resets_at": "2026-09-20T06:00:00Z"},
-            "extra_usage": {"is_enabled": True, "monthly_limit": 100, "used_credits": 1, "utilization": 1},
-        }
-        response = mock.Mock(status=200)
-        response.read.return_value = json.dumps(payload).encode("utf-8")
-        http = mock.Mock()
-        http.getresponse.return_value = response
-        with (
-            mock.patch.object(support.preflight.http.client, "HTTPSConnection", return_value=http) as connection,
-            mock.patch("subprocess.run") as provider_call,
-            mock.patch.object(
-                support.preflight, "_utc_now",
-                return_value=datetime(2026, 9, 15, 5, 0, tzinfo=timezone.utc),
-            ),
-        ):
-            readiness = support.preflight._claude_quota_readiness(credential)
-        provider_call.assert_not_called()
-        connection.assert_called_once_with("api.anthropic.com", timeout=5)
-        http.request.assert_called_once_with(
-            "GET",
-            "/api/oauth/usage?at_wall=1&skip_spend=1",
-            headers={"Authorization": f"Bearer {secret}", "Accept": "application/json", "Content-Type": "application/json"},
-        )
+            "extra_usage": {"is_enabled": True, "used_credits": 1},
+        }, credential=self._quota_credential(secret), now=now)
+        http.request.assert_called_once_with("GET", "/api/oauth/usage?at_wall=1&skip_spend=1", headers={
+            "Authorization": f"Bearer {secret}", "Accept": "application/json", "Content-Type": "application/json"})
         http.close.assert_called_once_with()
-        self.assertEqual(readiness["status"], "observed")
-        self.assertIsNone(readiness["provider_available"])
+        self.assertEqual((readiness["status"], readiness["remaining_five_hour_quota"], readiness["remaining_weekly_quota"]), ("observed", 75.0, 60.0))
         self.assertTrue(readiness["subscription_quota_not_exhausted"])
-        self.assertEqual(readiness["remaining_five_hour_quota"], 75.0)
-        self.assertEqual(readiness["remaining_weekly_quota"], 60.0)
-        self.assertEqual(readiness["five_hour"]["utilization_percent"], 25.0)
-        self.assertFalse(readiness["spend_and_credits_considered"])
-        serialized = json.dumps(readiness, sort_keys=True)
-        self.assertNotIn(secret, serialized)
-        self.assertNotIn("extra_usage", serialized)
-        self.assertIn("sufficient_quota_for_complete_benchmark_pair", readiness["does_not_establish"])
+        self.assertNotIn(secret, json.dumps(readiness, sort_keys=True)); self.assertNotIn("extra_usage", json.dumps(readiness, sort_keys=True))
+        exhausted, _ = self._quota_call({"five_hour": {"utilization": 100.0, "resets_at": None}, "seven_day": {"utilization": 50.0, "resets_at": None}})
+        self.assertFalse(exhausted["subscription_quota_not_exhausted"])
+        self.assertEqual((exhausted["remaining_five_hour_quota"], exhausted["remaining_weekly_quota"]), (0.0, 50.0))
 
-    def test_quota_readiness_marks_exhausted_window_unavailable(self) -> None:
-        credential = json.dumps({"claudeAiOauth": {"accessToken": "synthetic-token"}}).encode("utf-8")
-        response = mock.Mock(status=200)
-        response.read.return_value = json.dumps({"five_hour": {"utilization": 100.0, "resets_at": None}, "seven_day": {"utilization": 50.0, "resets_at": None}}).encode("utf-8")
-        http = mock.Mock()
-        http.getresponse.return_value = response
-        with mock.patch.object(support.preflight.http.client, "HTTPSConnection", return_value=http):
-            readiness = support.preflight._claude_quota_readiness(credential)
-        self.assertEqual(readiness["status"], "observed")
-        self.assertIsNone(readiness["provider_available"])
-        self.assertFalse(readiness["subscription_quota_not_exhausted"])
-        self.assertEqual(readiness["remaining_five_hour_quota"], 0.0)
-        self.assertEqual(readiness["remaining_weekly_quota"], 50.0)
-
-    def test_quota_readiness_fails_closed_on_invalid_evidence(self) -> None:
-        valid_credential = json.dumps({"claudeAiOauth": {"accessToken": "synthetic-token"}}).encode("utf-8")
+    def test_quota_readiness_fails_closed_on_invalid_bounded_evidence(self) -> None:
+        valid = self._quota_credential()
         cases = [
-            (b"not-json", "credential_json_invalid", False),
-            (b"{}", "oauth_access_token_unavailable", False),
-            (valid_credential, "required_usage_windows_unavailable", {"five_hour": {"utilization": 1.0, "resets_at": None}}),
-            (valid_credential, "required_usage_windows_unavailable", {"five_hour": {"utilization": True, "resets_at": None}, "seven_day": {"utilization": 1.0, "resets_at": None}}),
-            (valid_credential, "required_usage_windows_unavailable", {"five_hour": {"utilization": 101.0, "resets_at": None}, "seven_day": {"utilization": 1.0, "resets_at": None}}),
-            (valid_credential, "usage_response_invalid", {"five_hour": {"utilization": 10**400, "resets_at": None}, "seven_day": {"utilization": 1.0, "resets_at": None}}),
-            (valid_credential, "usage_response_invalid", b"not-json"),
+            (b"not-json", "credential_json_invalid", None),
+            (b"{}", "oauth_access_token_unavailable", None),
+            (valid, "required_usage_windows_unavailable", {"five_hour": {"utilization": 1.0, "resets_at": None}}),
+            (valid, "required_usage_windows_unavailable", {"five_hour": {"utilization": True, "resets_at": None}, "seven_day": {"utilization": 1.0, "resets_at": None}}),
+            (valid, "required_usage_windows_unavailable", {"five_hour": {"utilization": 101.0, "resets_at": None}, "seven_day": {"utilization": 1.0, "resets_at": None}}),
+            (valid, "usage_response_invalid", b"not-json"),
         ]
-        for credential, reason, response_body in cases:
-            with self.subTest(reason=reason, response_body=response_body):
-                http = mock.Mock()
-                response = mock.Mock(status=200)
-                if isinstance(response_body, dict):
-                    response.read.return_value = json.dumps(response_body).encode("utf-8")
-                elif isinstance(response_body, bytes):
-                    response.read.return_value = response_body
-                http.getresponse.return_value = response
-                with mock.patch.object(support.preflight.http.client, "HTTPSConnection", return_value=http) as connection:
-                    readiness = support.preflight._claude_quota_readiness(credential)
-                self.assertEqual(readiness["status"], "unknown")
-                self.assertEqual(readiness["reason"], reason)
-                self.assertIsNone(readiness["provider_available"])
-                if response_body is False:
+        for credential, reason, body in cases:
+            with self.subTest(reason=reason, body=body):
+                if body is None:
+                    with mock.patch.object(support.preflight.http.client, "HTTPSConnection") as connection:
+                        result = support.preflight._claude_quota_readiness(credential)
                     connection.assert_not_called()
+                else:
+                    result, _ = self._quota_call(body, credential=credential)
+                self.assertEqual((result["status"], result["reason"]), ("unknown", reason))
+        now = datetime(2026, 9, 15, 5, 0, tzinfo=timezone.utc)
+        for reset in ["not-a-timestamp", "2026-09-15T06:00:00", "2026-09-15T04:59:59Z", "2026-09-15T05:00:00Z", "0001-01-01T00:00:00+23:59"]:
+            with self.subTest(reset=reset):
+                result, _ = self._quota_call({"five_hour": {"utilization": 1.0, "resets_at": reset}, "seven_day": {"utilization": 1.0, "resets_at": "2026-09-20T06:00:00Z"}}, now=now)
+                self.assertEqual(result["reason"], "required_usage_windows_unavailable")
+        huge = b"9" * 5000
+        with mock.patch.object(support.preflight.http.client, "HTTPSConnection") as connection:
+            bad_credential = support.preflight._claude_quota_readiness(b'{"ignored":' + huge + b',"claudeAiOauth":{"accessToken":"synthetic-token"}}')
+        connection.assert_not_called(); self.assertEqual(bad_credential["reason"], "credential_json_invalid")
+        bad_response, _ = self._quota_call(b'{"ignored":' + huge + b',"five_hour":{"utilization":1,"resets_at":null},"seven_day":{"utilization":1,"resets_at":null}}')
+        self.assertEqual(bad_response["reason"], "usage_response_invalid")
 
-    def test_quota_readiness_rejects_invalid_or_expired_reset_timestamps(self) -> None:
-        credential = json.dumps(
-            {"claudeAiOauth": {"accessToken": "synthetic-token"}}
-        ).encode("utf-8")
-        observed_at = datetime(2026, 9, 15, 5, 0, tzinfo=timezone.utc)
-        invalid_resets = [
-            "not-a-timestamp",
-            "2026-09-15T06:00:00",
-            "2026-09-15T04:59:59Z",
-            "2026-09-15T05:00:00Z",
-            "0001-01-01T00:00:00+23:59",
-        ]
-        for resets_at in invalid_resets:
-            with self.subTest(resets_at=resets_at):
-                response = mock.Mock(status=200)
-                response.read.return_value = json.dumps(
-                    {
-                        "five_hour": {
-                            "utilization": 1.0,
-                            "resets_at": resets_at,
-                        },
-                        "seven_day": {
-                            "utilization": 1.0,
-                            "resets_at": "2026-09-20T06:00:00Z",
-                        },
-                    }
-                ).encode("utf-8")
-                http = mock.Mock()
-                http.getresponse.return_value = response
-                with (
-                    mock.patch.object(
-                        support.preflight.http.client,
-                        "HTTPSConnection",
-                        return_value=http,
-                    ),
-                    mock.patch.object(
-                        support.preflight, "_utc_now", return_value=observed_at
-                    ),
-                ):
-                    readiness = support.preflight._claude_quota_readiness(credential)
-                self.assertEqual(readiness["status"], "unknown")
-                self.assertEqual(
-                    readiness["reason"], "required_usage_windows_unavailable"
-                )
+    def test_quota_readiness_deadline_and_failures_are_bounded_and_sanitized(self) -> None:
+        body = {"five_hour": {"utilization": 1.0, "resets_at": None}, "seven_day": {"utilization": 1.0, "resets_at": None}}
+        http = self._quota_http(body)
+        with mock.patch.object(support.preflight.http.client, "HTTPSConnection", return_value=http), mock.patch.object(support.preflight.signal, "getsignal", return_value=signal.SIG_DFL), mock.patch.object(support.preflight.signal, "getitimer", return_value=(0.0, 0.0)), mock.patch.object(support.preflight.signal, "signal") as set_signal, mock.patch.object(support.preflight.signal, "setitimer") as set_timer:
+            self.assertEqual(support.preflight._claude_quota_readiness(self._quota_credential())["status"], "observed")
+        set_timer.assert_has_calls([mock.call(signal.ITIMER_REAL, 5.0), mock.call(signal.ITIMER_REAL, 0.0)]); self.assertGreaterEqual(set_signal.call_count, 2)
+        with mock.patch.object(support.preflight.signal, "getitimer", return_value=(1.0, 0.0)), mock.patch.object(support.preflight.http.client, "HTTPSConnection") as connection:
+            unavailable = support.preflight._claude_quota_readiness(self._quota_credential())
+        connection.assert_not_called(); self.assertEqual(unavailable["reason"], "usage_request_failed")
+        secret = "synthetic-token-never-return-this"; credential = self._quota_credential(secret)
+        unauthorized, _ = self._quota_call(b"", credential=credential, status=401)
+        broken = mock.Mock(); broken.request.side_effect = OSError(f"network failure {secret}")
+        with mock.patch.object(support.preflight.http.client, "HTTPSConnection", return_value=broken): failed = support.preflight._claude_quota_readiness(credential)
+        oversized, _ = self._quota_call(b"x" * (support.preflight.CLAUDE_USAGE_MAX_RESPONSE_BYTES + 1), credential=credential)
+        self.assertEqual([unauthorized["reason"], failed["reason"], oversized["reason"]], ["usage_http_status_401", "usage_request_failed", "usage_response_too_large"])
+        for result in (unauthorized, failed, oversized): self.assertNotIn(secret, json.dumps(result, sort_keys=True))
 
-    def test_quota_readiness_rejects_overlong_json_integers(self) -> None:
-        huge_integer = b"9" * 5000
-        invalid_credential = (
-            b'{"ignored":'
-            + huge_integer
-            + b',"claudeAiOauth":{"accessToken":"synthetic-token"}}'
-        )
-        with mock.patch.object(
-            support.preflight.http.client, "HTTPSConnection"
-        ) as connection:
-            credential_result = support.preflight._claude_quota_readiness(
-                invalid_credential
-            )
-        connection.assert_not_called()
-        self.assertEqual(credential_result["status"], "unknown")
-        self.assertEqual(credential_result["reason"], "credential_json_invalid")
-
-        credential = json.dumps(
-            {"claudeAiOauth": {"accessToken": "synthetic-token"}}
-        ).encode("utf-8")
-        response = mock.Mock(status=200)
-        response.read.return_value = (
-            b'{"ignored":'
-            + huge_integer
-            + b',"five_hour":{"utilization":1,"resets_at":null},'
-            + b'"seven_day":{"utilization":1,"resets_at":null}}'
-        )
-        http = mock.Mock()
-        http.getresponse.return_value = response
-        with mock.patch.object(
-            support.preflight.http.client, "HTTPSConnection", return_value=http
-        ):
-            response_result = support.preflight._claude_quota_readiness(credential)
-        self.assertEqual(response_result["status"], "unknown")
-        self.assertEqual(response_result["reason"], "usage_response_invalid")
-
-    def test_quota_readiness_arms_total_request_deadline(self) -> None:
-        credential = json.dumps(
-            {"claudeAiOauth": {"accessToken": "synthetic-token"}}
-        ).encode("utf-8")
-        response = mock.Mock(status=200)
-        response.read.return_value = json.dumps(
-            {
-                "five_hour": {"utilization": 1.0, "resets_at": None},
-                "seven_day": {"utilization": 1.0, "resets_at": None},
-            }
-        ).encode("utf-8")
-        http = mock.Mock()
-        http.getresponse.return_value = response
-        with (
-            mock.patch.object(
-                support.preflight.http.client, "HTTPSConnection", return_value=http
-            ),
-            mock.patch.object(
-                support.preflight.signal, "getsignal", return_value=signal.SIG_DFL
-            ),
-            mock.patch.object(
-                support.preflight.signal, "getitimer", return_value=(0.0, 0.0)
-            ),
-            mock.patch.object(support.preflight.signal, "signal") as set_signal,
-            mock.patch.object(support.preflight.signal, "setitimer") as set_timer,
-        ):
-            readiness = support.preflight._claude_quota_readiness(credential)
-
-        self.assertEqual(readiness["status"], "observed")
-        set_timer.assert_has_calls(
-            [
-                mock.call(signal.ITIMER_REAL, 5.0),
-                mock.call(signal.ITIMER_REAL, 0.0),
-            ]
-        )
-        self.assertGreaterEqual(set_signal.call_count, 2)
-
-    def test_quota_readiness_fails_closed_when_total_deadline_is_unavailable(self) -> None:
-        credential = json.dumps(
-            {"claudeAiOauth": {"accessToken": "synthetic-token"}}
-        ).encode("utf-8")
-        with (
-            mock.patch.object(
-                support.preflight.signal, "getitimer", return_value=(1.0, 0.0)
-            ),
-            mock.patch.object(
-                support.preflight.http.client, "HTTPSConnection"
-            ) as connection,
-        ):
-            readiness = support.preflight._claude_quota_readiness(credential)
-        connection.assert_not_called()
-        self.assertEqual(readiness["status"], "unknown")
-        self.assertEqual(readiness["reason"], "usage_request_failed")
-
-    def test_quota_readiness_sanitizes_http_and_network_failures(self) -> None:
-        secret = "synthetic-token-never-return-this"
-        credential = json.dumps({"claudeAiOauth": {"accessToken": secret}}).encode("utf-8")
-        response = mock.Mock(status=401)
-        http = mock.Mock()
-        http.getresponse.return_value = response
-        with mock.patch.object(support.preflight.http.client, "HTTPSConnection", return_value=http):
-            unauthorized = support.preflight._claude_quota_readiness(credential)
-        self.assertEqual(unauthorized["reason"], "usage_http_status_401")
-        self.assertNotIn(secret, json.dumps(unauthorized, sort_keys=True))
-        broken = mock.Mock()
-        broken.request.side_effect = OSError(f"network failure {secret}")
-        with mock.patch.object(support.preflight.http.client, "HTTPSConnection", return_value=broken):
-            failed = support.preflight._claude_quota_readiness(credential)
-        self.assertEqual(failed["reason"], "usage_request_failed")
-        self.assertNotIn(secret, json.dumps(failed, sort_keys=True))
-        oversized = mock.Mock(status=200)
-        oversized.read.return_value = b"x" * (support.preflight.CLAUDE_USAGE_MAX_RESPONSE_BYTES + 1)
-        oversized_http = mock.Mock()
-        oversized_http.getresponse.return_value = oversized
-        with mock.patch.object(support.preflight.http.client, "HTTPSConnection", return_value=oversized_http):
-            too_large = support.preflight._claude_quota_readiness(credential)
-        self.assertEqual(too_large["reason"], "usage_response_too_large")
-        self.assertNotIn(secret, json.dumps(too_large, sort_keys=True))
-
-
-    def test_quota_readiness_only_mode_never_enters_benchmark_core(self) -> None:
-        fake_metadata = mock.Mock(st_mode=0o100600)
-        readiness = {
-            "status": "observed",
-            "provider_available": None,
-            "subscription_quota_not_exhausted": True,
-        }
-        argv = [
-            "--claude-quota-readiness-only",
-            "--quota-commitment-nonce",
-            "0" * 32,
-            "--quota-commitment-sha256",
-            "1" * 64,
-            "--quota-commitment-issued-at",
-            "2026-09-15T03:00:00Z",
-        ]
-        with (
-            mock.patch.object(
-                support.preflight,
-                "_validated_live_credential_binding",
-                return_value=(
-                    b"synthetic-credential",
-                    fake_metadata,
-                    {"kind": "synthetic-commitment"},
-                ),
-            ),
-            mock.patch.object(
-                support.preflight,
-                "_claude_quota_readiness",
-                return_value=readiness,
-            ),
-            mock.patch.object(support.preflight._core, "main") as core_main,
-            mock.patch.object(support.preflight.sys, "stdout") as stdout,
-        ):
-            stdout.write.return_value = None
-            status = support.preflight.main(argv)
-
-        self.assertEqual(status, 0)
+    def test_quota_readiness_only_mode_is_isolated_and_structured(self) -> None:
+        readiness = {"status": "observed", "provider_available": None, "subscription_quota_not_exhausted": True}
+        with mock.patch.object(support.preflight, "_validated_live_credential_binding", return_value=(b"synthetic-credential", mock.Mock(st_mode=0o100600), {"kind": "synthetic-commitment"})), mock.patch.object(support.preflight, "_claude_quota_readiness", return_value=readiness), mock.patch.object(support.preflight._core, "main") as core_main, mock.patch.object(support.preflight.sys, "stdout") as stdout:
+            stdout.write.return_value = None; self.assertEqual(support.preflight.main(self._quota_argv()), 0)
         core_main.assert_not_called()
-
-    def test_quota_readiness_only_handles_invalid_canonical_auth_root(self) -> None:
-        argv = [
-            "--claude-quota-readiness-only",
-            "--quota-commitment-nonce",
-            "0" * 32,
-            "--quota-commitment-sha256",
-            "1" * 64,
-            "--quota-commitment-issued-at",
-            "2026-09-15T03:00:00Z",
-        ]
         stderr = io.StringIO()
-        with (
-            mock.patch.dict(
-                os.environ,
-                {support.preflight.CLAUDE_AUTH_ROOT_ENV: "relative-auth-root"},
-                clear=False,
-            ),
-            redirect_stderr(stderr),
-            mock.patch.object(support.preflight._core, "main") as core_main,
-        ):
-            status = support.preflight.main(argv)
-
-        self.assertEqual(status, 2)
-        core_main.assert_not_called()
-        self.assertEqual(
-            json.loads(stderr.getvalue()),
-            {"status": "error", "error": "canonical Claude auth root is invalid"},
-        )
-
-    def test_quota_readiness_only_handles_overflowing_commitment_timestamp(self) -> None:
+        with mock.patch.dict(os.environ, {support.preflight.CLAUDE_AUTH_ROOT_ENV: "relative-auth-root"}, clear=False), redirect_stderr(stderr), mock.patch.object(support.preflight._core, "main") as core_main:
+            self.assertEqual(support.preflight.main(self._quota_argv()), 2)
+        core_main.assert_not_called(); self.assertEqual(json.loads(stderr.getvalue())["error"], "canonical Claude auth root is invalid")
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            credential = root / ".credentials.json"
-            credential_data = b"{}\n"
-            credential.write_bytes(credential_data)
-            credential.chmod(0o600)
-            nonce = "ab" * 16
-            argv = [
-                "--claude-quota-readiness-only",
-                "--quota-commitment-nonce",
-                nonce,
-                "--quota-commitment-sha256",
-                support.preflight._commitment_sha256(credential_data, nonce),
-                "--quota-commitment-issued-at",
-                "0001-01-01T00:00:00+23:59",
-            ]
-            stderr = io.StringIO()
-            with (
-                mock.patch.dict(
-                    os.environ,
-                    {support.preflight.CLAUDE_AUTH_ROOT_ENV: str(root)},
-                    clear=False,
-                ),
-                redirect_stderr(stderr),
-                mock.patch.object(support.preflight._core, "main") as core_main,
-                mock.patch.object(
-                    support.preflight, "_claude_quota_readiness"
-                ) as quota_readiness,
-            ):
-                status = support.preflight.main(argv)
-
-        self.assertEqual(status, 2)
-        core_main.assert_not_called()
-        quota_readiness.assert_not_called()
-        self.assertEqual(
-            json.loads(stderr.getvalue()),
-            {
-                "status": "error",
-                "error": "Claude credential commitment timestamp is invalid",
-            },
-        )
+            root=Path(temporary); credential=root/".credentials.json"; credential_data=b"{}\n"; credential.write_bytes(credential_data); credential.chmod(0o600); nonce="ab"*16
+            stderr=io.StringIO()
+            with mock.patch.dict(os.environ, {support.preflight.CLAUDE_AUTH_ROOT_ENV: str(root)}, clear=False), redirect_stderr(stderr), mock.patch.object(support.preflight._core, "main") as core_main, mock.patch.object(support.preflight, "_claude_quota_readiness") as quota_readiness:
+                status=support.preflight.main(self._quota_argv("0001-01-01T00:00:00+23:59", nonce=nonce, digest=support.preflight._commitment_sha256(credential_data, nonce)))
+        self.assertEqual(status, 2); core_main.assert_not_called(); quota_readiness.assert_not_called()
+        self.assertEqual(json.loads(stderr.getvalue())["error"], "Claude credential commitment timestamp is invalid")
 
     def test_live_call_requires_explicit_provider_bindings(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

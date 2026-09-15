@@ -230,20 +230,12 @@ def _unknown_claude_quota_readiness(reason: str) -> dict[str, Any]:
         "five_hour": None,
         "seven_day": None,
         "spend_and_credits_considered": False,
-        "does_not_establish": [
-            "remaining_five_hour_quota",
-            "remaining_weekly_quota",
-            "provider_availability",
-            "sufficient_quota_for_complete_benchmark_pair",
-            "model_request_success",
-            "retry_authority",
-        ],
+        "does_not_establish": ["remaining_five_hour_quota", "remaining_weekly_quota", "provider_availability",
+                               "sufficient_quota_for_complete_benchmark_pair", "model_request_success", "retry_authority"],
     }
 
 
-def _validated_claude_usage_window(
-    payload: dict[str, Any], key: str
-) -> dict[str, Any] | None:
+def _validated_claude_usage_window(payload: dict[str, Any], key: str) -> dict[str, Any] | None:
     window = payload.get(key)
     if not isinstance(window, dict):
         return None
@@ -275,17 +267,8 @@ def _validated_claude_usage_window(
     }
 
 
-def _claude_quota_readiness(
-    credential_data: bytes | None = None,
-) -> dict[str, Any]:
-    """Read Claude subscription utilization without sending a model request.
-
-    Claude Code itself uses this OAuth account-read endpoint for ``/usage``. The
-    at-wall form is intentionally paired with ``skip_spend=1`` so benchmark
-    admission never treats optional spend or usage credits as subscription quota.
-    Authentication alone remains distinct from quota evidence, and any malformed
-    credential, response, or network failure degrades to an explicit unknown state.
-    """
+def _claude_quota_readiness(credential_data: bytes | None = None) -> dict[str, Any]:
+    """Read subscription utilization without a model request; malformed evidence stays unknown."""
 
     if credential_data is None:
         return _unknown_claude_quota_readiness("oauth_credential_unavailable")
@@ -373,12 +356,8 @@ def _claude_quota_readiness(
         "five_hour": five_hour,
         "seven_day": seven_day,
         "spend_and_credits_considered": False,
-        "does_not_establish": [
-            "provider_availability",
-            "sufficient_quota_for_complete_benchmark_pair",
-            "model_request_success",
-            "retry_authority",
-        ],
+        "does_not_establish": ["provider_availability", "sufficient_quota_for_complete_benchmark_pair",
+                               "model_request_success", "retry_authority"],
     }
 
 
@@ -416,9 +395,7 @@ def _validated_live_credential_binding(
 
 
 def _quota_readiness_only_report(credential: Path) -> dict[str, Any]:
-    credential_data, credential_metadata, commitment = (
-        _validated_live_credential_binding(credential)
-    )
+    credential_data, credential_metadata, commitment = _validated_live_credential_binding(credential)
     readiness = _claude_quota_readiness(credential_data)
     return {
         "kind": "grabowski.claude_quota_readiness",
@@ -434,11 +411,7 @@ def _quota_readiness_only_report(credential: Path) -> dict[str, Any]:
         "provider_process_intents": 0,
         "model_request_intents": 0,
         "dispatch_ledger_created": False,
-        "does_not_establish": [
-            "benchmark_authorization",
-            "benchmark_dispatch",
-            "retry_authority",
-        ],
+        "does_not_establish": ["benchmark_authorization", "benchmark_dispatch", "retry_authority"],
     }
 
 
@@ -615,94 +588,43 @@ def _adapter_arguments(argv: list[str] | None) -> tuple[argparse.Namespace, list
     return parser.parse_known_args(argv)
 
 
+def _adapter_error(message: str) -> int:
+    print(json.dumps({"status": "error", "error": message}, sort_keys=True), file=sys.stderr)
+    return 2
+
+
+def _quota_readiness_only_main(adapter: argparse.Namespace, remaining: list[str]) -> int:
+    if remaining:
+        return _adapter_error("quota-readiness-only accepts no benchmark arguments")
+    if adapter.claude_credential_file is not None:
+        return _adapter_error("quota-readiness-only derives the canonical credential path internally")
+    commitment = (adapter.claude_credential_commitment_nonce, adapter.claude_credential_commitment_sha256, adapter.claude_credential_commitment_issued_at)
+    if any(value is None for value in commitment):
+        return _adapter_error("quota-readiness-only requires an opaque credential commitment")
+    try:
+        credential = _canonical_claude_credential_path()
+    except _core.PreflightError as exc:
+        return _adapter_error(str(exc))
+    bindings = [(_credential_file, credential), (_credential_commitment_nonce, commitment[0]),
+                (_credential_commitment_sha256, commitment[1]), (_credential_commitment_issued_at, commitment[2]),
+                (_authorized_credential_sha256, None)]
+    tokens = [(variable, variable.set(value)) for variable, value in bindings]
+    try:
+        report = _quota_readiness_only_report(credential)
+    except (_core.PreflightError, _core.runner.RunnerError) as exc:
+        return _adapter_error(str(exc))
+    finally:
+        for variable, token in reversed(tokens):
+            variable.reset(token)
+    json.dump(report, sys.stdout, ensure_ascii=False, sort_keys=True)
+    sys.stdout.write("\n")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     adapter, remaining = _adapter_arguments(argv)
     if adapter.claude_quota_readiness_only:
-        if remaining:
-            print(
-                json.dumps(
-                    {
-                        "status": "error",
-                        "error": "quota-readiness-only accepts no benchmark arguments",
-                    },
-                    sort_keys=True,
-                ),
-                file=sys.stderr,
-            )
-            return 2
-        if adapter.claude_credential_file is not None:
-            print(
-                json.dumps(
-                    {
-                        "status": "error",
-                        "error": (
-                            "quota-readiness-only derives the canonical credential "
-                            "path internally"
-                        ),
-                    },
-                    sort_keys=True,
-                ),
-                file=sys.stderr,
-            )
-            return 2
-        if any(
-            value is None
-            for value in (
-                adapter.claude_credential_commitment_nonce,
-                adapter.claude_credential_commitment_sha256,
-                adapter.claude_credential_commitment_issued_at,
-            )
-        ):
-            print(
-                json.dumps(
-                    {
-                        "status": "error",
-                        "error": (
-                            "quota-readiness-only requires an opaque credential "
-                            "commitment"
-                        ),
-                    },
-                    sort_keys=True,
-                ),
-                file=sys.stderr,
-            )
-            return 2
-        try:
-            credential = _canonical_claude_credential_path()
-        except _core.PreflightError as exc:
-            print(
-                json.dumps({"status": "error", "error": str(exc)}, sort_keys=True),
-                file=sys.stderr,
-            )
-            return 2
-        credential_token = _credential_file.set(credential)
-        commitment_nonce_token = _credential_commitment_nonce.set(
-            adapter.claude_credential_commitment_nonce
-        )
-        commitment_sha_token = _credential_commitment_sha256.set(
-            adapter.claude_credential_commitment_sha256
-        )
-        commitment_time_token = _credential_commitment_issued_at.set(
-            adapter.claude_credential_commitment_issued_at
-        )
-        authorized_credential_token = _authorized_credential_sha256.set(None)
-        try:
-            report = _quota_readiness_only_report(credential)
-        except (_core.PreflightError, _core.runner.RunnerError) as exc:
-            print(
-                json.dumps({"status": "error", "error": str(exc)}, sort_keys=True),
-                file=sys.stderr,
-            )
-            return 2
-        finally:
-            _authorized_credential_sha256.reset(authorized_credential_token)
-            _credential_commitment_issued_at.reset(commitment_time_token)
-            _credential_commitment_sha256.reset(commitment_sha_token)
-            _credential_commitment_nonce.reset(commitment_nonce_token)
-            _credential_file.reset(credential_token)
-        json.dump(report, sys.stdout, ensure_ascii=False, sort_keys=True)
-        sys.stdout.write("\n")
-        return 0
+        return _quota_readiness_only_main(adapter, remaining)
     synthetic = (
         "--baseline-stream-fixture" in remaining
         or "--treatment-stream-fixture" in remaining
