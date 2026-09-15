@@ -42,6 +42,9 @@ CODEX_SANDBOX_EXECUTABLE = Path("/opt/grabowski-external/codex")
 CODEX_SANDBOX_CONFIG_DIR = Path("/tmp/.codex")
 CODEX_SANDBOX_CODE_MODE_HOST = Path("/opt/grabowski-external/codex-code-mode-host")
 CODEX_SANDBOX_AUTH_LOCK = Path("/tmp/.grabowski-codex-auth.lock")
+GROK_PROFILE = "grok-cli-readonly-auth-v1"
+GROK_SANDBOX_EXECUTABLE = Path("/opt/grabowski-external/grok")
+GROK_SANDBOX_CONFIG_DIR = Path("/tmp/.grok")
 _CODEX_WORKSPACE_WRITE_PROTECTED_CONFIG = (
     "sandbox_workspace_write.exclude_slash_tmp=true",
     "sandbox_workspace_write.exclude_tmpdir_env_var=true",
@@ -172,6 +175,62 @@ def _resolved_executable(value: str, field: str) -> Path:
     return resolved
 
 
+def _owner_controlled_executable(value: str, field: str) -> Path:
+    resolved = _resolved_executable(value, field)
+    metadata = resolved.stat()
+    if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise AgentSandboxError(
+            f"{field} must be owner-controlled and not group/world-writable"
+        )
+    return resolved
+
+
+def _owner_controlled_directory(path: Path, field: str) -> Path:
+    candidate = path.expanduser()
+    if not candidate.is_absolute() or candidate.is_symlink():
+        raise AgentSandboxError(f"{field} must be an absolute non-symlink path")
+    resolved = _safe_existing_path(candidate, field, directory=True)
+    metadata = resolved.stat()
+    if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise AgentSandboxError(
+            f"{field} must be owner-controlled and not group/world-writable"
+        )
+    return resolved
+
+
+def _canonical_grok_executable() -> Path:
+    """Resolve only the owner-controlled versioned native Grok binary."""
+    bin_directory = Path.home() / ".grok" / "bin"
+    controlled_bin = _owner_controlled_directory(bin_directory, "Grok binary directory")
+    canonical = controlled_bin / "grok"
+    try:
+        linked = canonical.lstat()
+    except OSError as exc:
+        raise AgentSandboxError("Grok canonical executable is unavailable") from exc
+    if linked.st_uid != os.getuid() or not stat.S_ISLNK(linked.st_mode):
+        raise AgentSandboxError("Grok canonical executable must be an owner-controlled symlink")
+    executable = _owner_controlled_executable(str(canonical), "Grok executable")
+    suffix = executable.name.removeprefix("grok-")
+    allowed = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+    if (
+        executable.parent != controlled_bin
+        or not executable.name.startswith("grok-")
+        or not suffix
+        or not suffix[0].isalnum()
+        or len(executable.name) > 85
+        or any(character not in allowed for character in suffix)
+    ):
+        raise AgentSandboxError("Grok executable must stay inside the versioned native binary directory")
+    return executable
+
+
+def _grok_command_for_headless_execution(command: list[str]) -> tuple[str, ...]:
+    """Turn the catalogued Grok route into its non-interactive single-turn form."""
+    if len(command) == 4 and command[1] == "--model" and not command[-1].startswith("-"):
+        return (*command[:-1], "-p", command[-1])
+    return tuple(command)
+
+
 def _codex_command_with_protected_tmp(command: list[str]) -> tuple[str, ...]:
     """Keep model-generated Codex commands away from the durable auth mount."""
     index = 1
@@ -211,8 +270,35 @@ def prepare_external_agent_command(command: list[str]) -> PreparedSandboxCommand
     if not command:
         raise AgentSandboxError("sandbox command must be non-empty")
     executable_name = Path(command[0]).name
-    if executable_name not in {"claude", "codex"}:
+    if executable_name not in {"claude", "codex", "grok"}:
         return PreparedSandboxCommand(tuple(command))
+    if executable_name == "grok":
+        grok_command = _grok_command_for_headless_execution(command)
+        executable_override = os.environ.get("GRABOWSKI_GROK_BIN")
+        executable = (
+            _owner_controlled_executable(executable_override, "Grok executable")
+            if executable_override
+            else _canonical_grok_executable()
+        )
+        auth_root = Path(
+            os.environ.get("GRABOWSKI_GROK_AUTH_ROOT", str(Path.home() / ".grok"))
+        ).expanduser()
+        controlled_auth_root = _owner_controlled_directory(auth_root, "Grok auth root")
+        auth_file = _private_regular_file(controlled_auth_root / "auth.json", "Grok auth")
+        return PreparedSandboxCommand(
+            command=(str(GROK_SANDBOX_EXECUTABLE), *grok_command[1:]),
+            extra_read_only=(
+                (executable, GROK_SANDBOX_EXECUTABLE),
+                (auth_file, GROK_SANDBOX_CONFIG_DIR / "auth.json"),
+            ),
+            extra_directories=(
+                Path("/opt"),
+                Path("/opt/grabowski-external"),
+                GROK_SANDBOX_CONFIG_DIR,
+            ),
+            profile=GROK_PROFILE,
+            probe_executable=str(GROK_SANDBOX_EXECUTABLE),
+        )
     if executable_name == "codex":
         codex_command = _codex_command_with_protected_tmp(command)
         executable_override = os.environ.get("GRABOWSKI_CODEX_BIN")
