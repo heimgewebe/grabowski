@@ -27,7 +27,7 @@ class GrokReviewRoleTests(unittest.TestCase):
         head = "a" * 40
         base = "b" * 40
         review_diff = b"diff --git a/a.py b/a.py\n+safe = True\n"
-        actual = role._grok_streaming_review_command(
+        actual, prompt_bytes = role._grok_streaming_review_command(
             prepared, expected_head=head, expected_base_head=base, review_diff=review_diff
         )
         self.assertEqual(actual[actual.index("--tools") + 1], "todo_write")
@@ -37,13 +37,29 @@ class GrokReviewRoleTests(unittest.TestCase):
         )
         self.assertNotIn("--allow", actual)
         self.assertNotIn("--deny", actual)
+        self.assertNotIn("-p", actual)
         self.assertEqual(actual[actual.index("--sandbox") + 1], "read-only")
-        prompt = actual[-1]
+        self.assertEqual(actual[actual.index("--prompt-file") + 1], "/dev/stdin")
+        prompt = prompt_bytes.decode("utf-8")
         self.assertIn(base, prompt)
         self.assertIn(head, prompt)
         self.assertIn(hashlib.sha256(review_diff).hexdigest(), prompt)
         self.assertIn(review_diff.decode(), prompt)
         self.assertIn("Do not use any tool", prompt)
+
+
+    def test_streaming_review_large_diff_stays_out_of_argv(self) -> None:
+        prepared = ("/opt/grabowski-external/grok", "--model", "grok-4.6", "-p", "review this")
+        review_diff = b"x" * 247_109
+        actual, prompt_bytes = role._grok_streaming_review_command(
+            prepared,
+            expected_head="a" * 40,
+            expected_base_head="b" * 40,
+            review_diff=review_diff,
+        )
+        self.assertLess(max(len(item.encode("utf-8")) for item in actual), 4096)
+        self.assertGreater(len(prompt_bytes), len(review_diff))
+        self.assertEqual(actual[actual.index("--prompt-file") + 1], "/dev/stdin")
 
     def test_streaming_review_command_rejects_oversized_or_non_utf8_diff(self) -> None:
         prepared = ("/opt/grabowski-external/grok", "--model", "grok-4.6", "-p", "review this")
@@ -60,6 +76,7 @@ class GrokReviewRoleTests(unittest.TestCase):
             "--always-approve", "--yolo", "--dangerously-skip-permissions",
             "--permission-mode", "--allow", "--deny", "--sandbox", "--tools",
             "--disallowed-tools", "--output-format", "--max-turns", "--json-schema",
+            "--prompt-file",
         )
         for option in controlled:
             for item in ((option, "value"), (f"{option}=value",)):
@@ -80,11 +97,12 @@ class GrokReviewRoleTests(unittest.TestCase):
             mock.patch.object(role, "prepare_external_agent_command", return_value=prepared),
             mock.patch.object(role, "sandbox_argv", return_value=["sandbox"]) as sandbox_argv,
         ):
-            argv, contract = role._review_sandbox_argv(
+            argv, contract, prompt_bytes = role._review_sandbox_argv(
                 repo, declared, expected_head="a" * 40, expected_base_head="b" * 40, review_diff=b"diff"
             )
         self.assertEqual(argv, ["sandbox"])
         self.assertEqual(contract, role.GROK_REVIEW_STREAM_CONTRACT)
+        self.assertIn(b"diff", prompt_bytes)
         actual = sandbox_argv.call_args.args[1]
         self.assertEqual(actual[actual.index("--tools") + 1], "todo_write")
         self.assertEqual(
@@ -185,7 +203,7 @@ class GrokReviewRoleTests(unittest.TestCase):
         with (
             mock.patch.object(role, "current_binding", side_effect=[(head, diff, False), (head, diff, False)]),
             mock.patch.object(role, "committed_diff", return_value=b"diff"),
-            mock.patch.object(role, "_review_sandbox_argv", return_value=(["sandbox"], role.GROK_REVIEW_STREAM_CONTRACT)),
+            mock.patch.object(role, "_review_sandbox_argv", return_value=(["sandbox"], role.GROK_REVIEW_STREAM_CONTRACT, b"prompt")),
             mock.patch.object(role, "runtime_sandbox_argv", return_value=["runtime"]),
             mock.patch.object(role, "run_bounded_capture", return_value=completed),
             mock.patch.object(role, "classify_result", return_value="invalid_review_output"),
@@ -243,7 +261,7 @@ class GrokReviewRoleTests(unittest.TestCase):
         with (
             mock.patch.object(role, "current_binding", side_effect=[(head, diff, False), (head, diff, False)]),
             mock.patch.object(role, "committed_diff", return_value=b"diff"),
-            mock.patch.object(role, "_review_sandbox_argv", return_value=(["sandbox"], role.GROK_REVIEW_STREAM_CONTRACT)),
+            mock.patch.object(role, "_review_sandbox_argv", return_value=(["sandbox"], role.GROK_REVIEW_STREAM_CONTRACT, b"prompt")),
             mock.patch.object(role, "runtime_sandbox_argv", return_value=["runtime"]),
             mock.patch.object(role, "run_bounded_capture", return_value=completed),
             mock.patch.object(

@@ -474,8 +474,8 @@ def _grok_streaming_review_command(
     expected_head: str,
     expected_base_head: str,
     review_diff: bytes,
-) -> tuple[str, ...]:
-    """Run Grok against one trusted exact-diff bundle with no repository tools."""
+) -> tuple[tuple[str, ...], bytes]:
+    """Build one tool-less Grok review command and its exact stdin prompt bytes."""
     if SHA40.fullmatch(expected_head) is None or SHA40.fullmatch(expected_base_head) is None:
         raise RuntimeError("Grok review requires exact bound head and base revisions")
     if len(review_diff) > MAX_GROK_REVIEW_INPUT_BYTES:
@@ -494,7 +494,7 @@ def _grok_streaming_review_command(
         "--always-approve", "--yolo", "--dangerously-skip-permissions",
         "--permission-mode", "--allow", "--deny", "--disable-web-search",
         "--no-subagents", "--sandbox", "--tools", "--disallowed-tools",
-        "--output-format", "--max-turns", "--json-schema",
+        "--output-format", "--max-turns", "--json-schema", "--prompt-file",
     }
     if any(
         item in controlled
@@ -511,24 +511,27 @@ def _grok_streaming_review_command(
         + "\n\n--- BEGIN GRABOWSKI BOUND DIFF ---\n"
         + diff_text
         + "\n--- END GRABOWSKI BOUND DIFF ---"
+    ).encode("utf-8")
+    del command[prompt_index:]
+    command.extend(
+        [
+            "--disable-web-search",
+            "--no-subagents",
+            "--sandbox",
+            "read-only",
+            "--tools",
+            GROK_REVIEW_TOOLS,
+            "--disallowed-tools",
+            GROK_REVIEW_DISALLOWED_TOOLS,
+            "--output-format",
+            "streaming-json",
+            "--max-turns",
+            str(GROK_REVIEW_MAX_TURNS),
+            "--prompt-file",
+            "/dev/stdin",
+        ]
     )
-    command[-1] = prompt
-    review_flags = [
-        "--disable-web-search",
-        "--no-subagents",
-        "--sandbox",
-        "read-only",
-        "--tools",
-        GROK_REVIEW_TOOLS,
-        "--disallowed-tools",
-        GROK_REVIEW_DISALLOWED_TOOLS,
-        "--output-format",
-        "streaming-json",
-        "--max-turns",
-        str(GROK_REVIEW_MAX_TURNS),
-    ]
-    command[prompt_index:prompt_index] = review_flags
-    return tuple(command)
+    return tuple(command), prompt
 
 
 def _review_sandbox_argv(
@@ -538,21 +541,20 @@ def _review_sandbox_argv(
     expected_head: str,
     expected_base_head: str,
     review_diff: bytes,
-) -> tuple[list[str], str | None]:
+) -> tuple[list[str], str | None, bytes | None]:
     if Path(command[0]).name != "grok":
-        return sandbox_argv(repo, command), None
+        return sandbox_argv(repo, command), None, None
     prepared = prepare_external_agent_command(command)
-    actual = list(
-        _grok_streaming_review_command(
-            prepared.command,
-            expected_head=expected_head,
-            expected_base_head=expected_base_head,
-            review_diff=review_diff,
-        )
+    actual, prompt_bytes = _grok_streaming_review_command(
+        prepared.command,
+        expected_head=expected_head,
+        expected_base_head=expected_base_head,
+        review_diff=review_diff,
     )
     return (
-        sandbox_argv(repo, actual, declared_command=command),
+        sandbox_argv(repo, list(actual), declared_command=command),
         GROK_REVIEW_STREAM_CONTRACT,
+        prompt_bytes,
     )
 
 
@@ -746,10 +748,11 @@ def main(argv: list[str] | None = None) -> int:
         raise RuntimeError("writer binding changed before read-only role start")
     review_provider_contract: str | None = None
     review_input: bytes | None = None
+    review_stdin: bytes | None = None
     if args.role == "review":
         if Path(command[0]).name == "grok":
             review_input = committed_diff(repo, args.expected_base_head, args.expected_head)
-        role_sandbox_argv, review_provider_contract = _review_sandbox_argv(
+        role_sandbox_argv, review_provider_contract, review_stdin = _review_sandbox_argv(
             repo,
             command,
             expected_head=args.expected_head,
@@ -770,6 +773,7 @@ def main(argv: list[str] | None = None) -> int:
         stdout_limit=MAX_ROLE_OUTPUT_BYTES,
         stderr_limit=MAX_ROLE_OUTPUT_BYTES,
         stdout_content_limit=review_content_limit,
+        stdin_content=review_stdin,
     )
     after_head, after_diff, after_dirty = current_binding(repo, args.expected_base_head)
     payload: dict[str, Any] = {
@@ -795,6 +799,8 @@ def main(argv: list[str] | None = None) -> int:
         "review_content_limit_bytes": review_content_limit if args.role == "review" else None,
         "review_input_bytes": len(review_input) if review_input is not None else None,
         "review_input_sha256": hashlib.sha256(review_input).hexdigest() if review_input is not None else None,
+        "review_prompt_bytes": len(review_stdin) if review_stdin is not None else None,
+        "review_prompt_sha256": hashlib.sha256(review_stdin).hexdigest() if review_stdin is not None else None,
         "sandbox": SANDBOX_LABEL,
     }
     if completed.output_limit_exceeded:
