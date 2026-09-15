@@ -51,8 +51,10 @@ class GrokReviewRoleTests(unittest.TestCase):
             "review this",
         )
 
+        head = "a" * 40
+        base = "b" * 40
         actual = role._grok_streaming_review_command(
-            prepared, expected_head="a" * 40, expected_base_head="b" * 40
+            prepared, expected_head=head, expected_base_head=base
         )
 
         self.assertEqual(actual[0:3], prepared[0:3])
@@ -63,9 +65,17 @@ class GrokReviewRoleTests(unittest.TestCase):
         self.assertEqual(actual[actual.index("--max-turns") + 1], str(role.GROK_REVIEW_MAX_TURNS))
         allow_values = [actual[index + 1] for index, value in enumerate(actual) if value == "--allow"]
         deny_values = [actual[index + 1] for index, value in enumerate(actual) if value == "--deny"]
-        self.assertEqual(tuple(allow_values), role.GROK_REVIEW_ALLOW_RULES)
+        self.assertEqual(
+            tuple(allow_values),
+            (
+                "Bash(git status --short --branch)",
+                f"Bash(git diff --no-ext-diff --no-textconv {base}...{head})",
+                f"Bash(git diff --no-ext-diff --no-textconv {base}...{head} -- *)",
+                f"Bash(git cat-file blob {head}:*)",
+                f"Bash(git cat-file blob {base}:*)",
+            ),
+        )
         self.assertEqual(tuple(deny_values), role.GROK_REVIEW_DENY_RULES)
-        self.assertIn("Bash(git diff --no-ext-diff --no-textconv*)", allow_values)
         self.assertIn("Bash(*;*)", deny_values)
         self.assertIn("Bash(*&*)", deny_values)
         self.assertIn("Bash(*.grok*)", deny_values)
@@ -178,17 +188,24 @@ class GrokReviewRoleTests(unittest.TestCase):
         self.assertNotIn("--always-approve", actual)
         self.assertEqual(sandbox_argv.call_args.kwargs["declared_command"], declared)
 
-    def test_safe_grok_git_read_command_accepts_only_bounded_read_forms(self) -> None:
+    def test_safe_grok_git_read_command_accepts_only_exact_bound_read_forms(self) -> None:
+        head = "a" * 40
+        base = "b" * 40
         accepted = (
             "git status --short --branch",
-            "git diff --no-ext-diff --no-textconv HEAD~1...HEAD -- src tests",
-            "git cat-file blob HEAD:src/app.py",
-            "git rev-parse HEAD",
-            "git merge-base main HEAD",
-            "git ls-files src tests",
-            "git ls-files -- src tests",
+            f"git diff --no-ext-diff --no-textconv {base}...{head}",
+            f"git diff --no-ext-diff --no-textconv {base}...{head} -- src tests",
+            f"git cat-file blob {head}:src/app.py",
+            f"git cat-file blob {base}:src/app.py",
         )
         rejected = (
+            "git rev-parse HEAD",
+            f"git rev-parse --output-file=review-output {head}",
+            f"git merge-base {base} {head}",
+            "git ls-files src tests",
+            "git ls-files -- src tests",
+            f"git diff --no-ext-diff --no-textconv {'c' * 40}...{head}",
+            f"git cat-file blob {'c' * 40}:src/app.py",
             "git diff HEAD~1...HEAD",
             "git diff --no-ext-diff --no-textconv HEAD~1...HEAD --ext-diff",
             "git diff --no-ext-diff --no-textconv --textconv HEAD~1...HEAD",
@@ -221,10 +238,18 @@ class GrokReviewRoleTests(unittest.TestCase):
         )
         for command in accepted:
             with self.subTest(command=command):
-                self.assertTrue(role._safe_grok_git_read_command(command))
+                self.assertTrue(
+                    role._safe_grok_git_read_command(
+                        command, expected_head=head, expected_base_head=base
+                    )
+                )
         for command in rejected:
             with self.subTest(command=command):
-                self.assertFalse(role._safe_grok_git_read_command(command))
+                self.assertFalse(
+                    role._safe_grok_git_read_command(
+                        command, expected_head=head, expected_base_head=base
+                    )
+                )
 
     def test_terminal_json_object_accepts_unique_object_suffix_after_prose(self) -> None:
         review = role._terminal_json_object(
@@ -239,7 +264,9 @@ class GrokReviewRoleTests(unittest.TestCase):
         )
 
     def test_extract_stream_requires_successful_bounded_git_tool_and_terminal_review(self) -> None:
-        command = "git diff --no-ext-diff --no-textconv HEAD~1...HEAD -- src tests"
+        head = "a" * 40
+        base = "b" * 40
+        command = f"git diff --no-ext-diff --no-textconv {base}...{head} -- src tests"
         events = [
             {"type": "thought", "data": "inspect exact diff"},
             {"type": "available_commands", "tools": ["run_terminal_command"]},
@@ -252,7 +279,7 @@ class GrokReviewRoleTests(unittest.TestCase):
         ]
 
         document, error, metadata = role._extract_grok_stream_review_document(
-            stream_bytes(events)
+            stream_bytes(events), expected_head=head, expected_base_head=base
         )
 
         self.assertIsNone(error)
@@ -340,7 +367,9 @@ class GrokReviewRoleTests(unittest.TestCase):
         for events, expected_error in cases:
             with self.subTest(expected_error=expected_error):
                 document, error, _metadata = role._extract_grok_stream_review_document(
-                    stream_bytes(events)
+                    stream_bytes(events),
+                    expected_head="a" * 40,
+                    expected_base_head="b" * 40,
                 )
                 self.assertIsNone(document)
                 self.assertIn(expected_error, error)
@@ -374,7 +403,14 @@ class GrokReviewRoleTests(unittest.TestCase):
                         "type": "tool_call",
                         "toolCallId": "call-2",
                         "toolName": "run_terminal_command",
-                        "rawInput": {"command": "git rev-parse HEAD"},
+                        "rawInput": {
+                            "command": (
+                                "git diff --no-ext-diff --no-textconv "
+                                + "b" * 40
+                                + "..."
+                                + "a" * 40
+                            )
+                        },
                     },
                     {"type": "text", "data": '{"verdict":"PASS","findings":[]}'},
                     {"type": "end", "stopReason": "end_turn", "num_turns": 3},
@@ -420,7 +456,9 @@ class GrokReviewRoleTests(unittest.TestCase):
         for events, expected_error in cases:
             with self.subTest(expected_error=expected_error):
                 document, error, _metadata = role._extract_grok_stream_review_document(
-                    stream_bytes(events)
+                    stream_bytes(events),
+                    expected_head="a" * 40,
+                    expected_base_head="b" * 40,
                 )
                 self.assertIsNone(document)
                 self.assertIn(expected_error, error)
@@ -469,6 +507,67 @@ class GrokReviewRoleTests(unittest.TestCase):
         self.assertEqual(
             payload["error"],
             f"review stdout exceeds {role.MAX_GROK_REVIEW_STREAM_BYTES} bytes",
+        )
+
+    def test_grok_extracted_review_document_reapplies_review_json_limit(self) -> None:
+        head = "a" * 40
+        base = "b" * 40
+        diff = "c" * 64
+        stream = b"{}\n"
+        completed = SimpleNamespace(
+            returncode=0,
+            stdout_sha256="d" * 64,
+            stderr_sha256="e" * 64,
+            stdout_bytes=len(stream),
+            stderr_bytes=0,
+            stdout_tail="",
+            stderr_tail="",
+            output_limit_exceeded=False,
+            stdout_content_exceeded=False,
+            stdout_content=stream,
+        )
+        oversized_document = json.dumps(
+            {
+                "verdict": "PASS",
+                "findings": [],
+                "padding": "x" * role.MAX_REVIEW_JSON_BYTES,
+            },
+            separators=(",", ":"),
+        ).encode()
+        self.assertGreater(len(oversized_document), role.MAX_REVIEW_JSON_BYTES)
+        self.assertLess(len(oversized_document), role.MAX_GROK_REVIEW_STREAM_BYTES)
+
+        with (
+            mock.patch.object(role, "current_binding", side_effect=[(head, diff, False), (head, diff, False)]),
+            mock.patch.object(role, "_review_sandbox_argv", return_value=(["sandbox"], role.GROK_REVIEW_STREAM_CONTRACT)),
+            mock.patch.object(role, "runtime_sandbox_argv", return_value=["runtime"]),
+            mock.patch.object(role, "run_bounded_capture", return_value=completed),
+            mock.patch.object(
+                role,
+                "_extract_grok_stream_review_document",
+                return_value=(oversized_document, None, {"review_provider_stream_contract": role.GROK_REVIEW_STREAM_CONTRACT}),
+            ),
+            mock.patch.object(role, "write_receipt") as write_receipt,
+        ):
+            returncode = role.main(
+                [
+                    "--role", "review",
+                    "--repository", str(ROOT),
+                    "--expected-head", head,
+                    "--expected-base-head", base,
+                    "--expected-diff-sha256", diff,
+                    "--expected-dirty", "false",
+                    "--output", "/tmp/grok-document-oversize-receipt.json",
+                    "--", "grok", "--model", "grok-4.6", "review this",
+                ]
+            )
+
+        self.assertEqual(returncode, 126)
+        payload = write_receipt.call_args.args[1]
+        self.assertEqual(payload["verdict"], "INVALID")
+        self.assertEqual(
+            payload["error"],
+            f"review document exceeds {role.MAX_REVIEW_JSON_BYTES} bytes",
         )
 
 

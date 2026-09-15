@@ -40,14 +40,6 @@ GROK_REVIEW_EVENT_TYPES = frozenset(
         "end",
     }
 )
-GROK_REVIEW_ALLOW_RULES = (
-    "Bash(git status --short --branch*)",
-    "Bash(git diff --no-ext-diff --no-textconv*)",
-    "Bash(git cat-file blob*)",
-    "Bash(git rev-parse*)",
-    "Bash(git merge-base*)",
-    "Bash(git ls-files*)",
-)
 GROK_REVIEW_DENY_RULES = (
     "Bash(*;*)",
     "Bash(*&*)",
@@ -73,9 +65,8 @@ GROK_REVIEW_PROMPT_SUFFIX = (
     "PASS requires an empty findings array; non-PASS requires at least one finding. "
     "Do not wrap the final JSON object in Markdown or code fences. "
     "For repository inspection, use only these safe command forms: "
-    "git status --short --branch; git diff --no-ext-diff --no-textconv ...; "
-    "git cat-file blob REV:path; git rev-parse ...; git merge-base ...; "
-    "git ls-files ...."
+    "git status --short --branch; the exact bound git diff command; and "
+    "git cat-file blob using only the bound head or base revision."
 )
 PYTHON_EXECUTABLE_NAMES = frozenset(
     {"python", "python3"} | {f"python3.{minor}" for minor in range(0, 20)}
@@ -484,6 +475,19 @@ def _normalize_review_object(
     return verdict, findings, None, normalized_empty_object
 
 
+def _grok_review_allow_rules(*, expected_head: str, expected_base_head: str) -> tuple[str, ...]:
+    """Return execution rules no broader than the exact bound review parser."""
+    head = expected_head.lower()
+    base = expected_base_head.lower()
+    return (
+        "Bash(git status --short --branch)",
+        f"Bash(git diff --no-ext-diff --no-textconv {base}...{head})",
+        f"Bash(git diff --no-ext-diff --no-textconv {base}...{head} -- *)",
+        f"Bash(git cat-file blob {head}:*)",
+        f"Bash(git cat-file blob {base}:*)",
+    )
+
+
 def _grok_streaming_review_command(
     prepared_command: tuple[str, ...],
     *,
@@ -553,7 +557,9 @@ def _grok_streaming_review_command(
         "--tools",
         GROK_REVIEW_TOOLS,
     ]
-    for rule in GROK_REVIEW_ALLOW_RULES:
+    for rule in _grok_review_allow_rules(
+        expected_head=expected_head, expected_base_head=expected_base_head
+    ):
         review_flags.extend(["--allow", rule])
     for rule in GROK_REVIEW_DENY_RULES:
         review_flags.extend(["--deny", rule])
@@ -613,8 +619,15 @@ def _terminal_json_object(text: str) -> dict[str, Any] | None:
     return candidates[0]
 
 
-def _safe_grok_git_read_command(command: str) -> bool:
-    """Accept only shell-free, read-only Git command forms used by Grok reviews."""
+def _safe_grok_git_read_command(
+    command: str,
+    *,
+    expected_head: str,
+    expected_base_head: str,
+) -> bool:
+    """Accept only exact revision-bound Git reads exposed to Grok reviews."""
+    if SHA40.fullmatch(expected_head) is None or SHA40.fullmatch(expected_base_head) is None:
+        return False
     shell_expansion_markers = (
         "\n", "\r", ";", "&", "|", "`", "$", ">", "<",
         "*", "?", "[", "]", "{", "}",
@@ -635,34 +648,33 @@ def _safe_grok_git_read_command(command: str) -> bool:
         path_value = argument.split("=", 1)[-1]
         if path_value.startswith(("/", "~")) or ".." in PurePosixPath(path_value).parts:
             return False
+    head = expected_head.lower()
+    base = expected_base_head.lower()
     subcommand = argv[1]
     if subcommand == "status":
         return argv == ["git", "status", "--short", "--branch"]
     if subcommand == "diff":
-        if argv[:4] != ["git", "diff", "--no-ext-diff", "--no-textconv"]:
+        required = [
+            "git", "diff", "--no-ext-diff", "--no-textconv", f"{base}...{head}"
+        ]
+        if argv[:5] != required:
             return False
-        forbidden_diff_options = ("--ext-diff", "--textconv", "--no-index")
-        if any(item in forbidden_diff_options or item.startswith("--output") for item in argv[4:]):
-            return False
-        return True
+        if len(argv) == 5:
+            return True
+        return len(argv) > 6 and argv[5] == "--" and all(argv[6:])
     if subcommand == "cat-file":
-        return len(argv) == 4 and argv[:3] == ["git", "cat-file", "blob"]
-    if subcommand == "ls-files":
-        separator_seen = False
-        for argument in argv[2:]:
-            if argument == "--":
-                if separator_seen:
-                    return False
-                separator_seen = True
-                continue
-            if not separator_seen and argument.startswith("-"):
-                return False
-        return True
-    return subcommand in {"rev-parse", "merge-base"}
+        if len(argv) != 4 or argv[:3] != ["git", "cat-file", "blob"]:
+            return False
+        revision, separator, path = argv[3].partition(":")
+        return bool(separator and path) and revision in {head, base}
+    return False
 
 
 def _extract_grok_stream_review_document(
     raw: bytes,
+    *,
+    expected_head: str,
+    expected_base_head: str,
 ) -> tuple[bytes | None, str | None, dict[str, Any]]:
     metadata: dict[str, Any] = {
         "review_provider_stream_contract": GROK_REVIEW_STREAM_CONTRACT,
@@ -711,7 +723,11 @@ def _extract_grok_stream_review_document(
                 return None, f"Grok review used disallowed tool: {tool_name}", metadata
             raw_input = event.get("rawInput")
             tool_command = raw_input.get("command") if isinstance(raw_input, dict) else None
-            if not isinstance(tool_command, str) or not _safe_grok_git_read_command(tool_command):
+            if not isinstance(tool_command, str) or not _safe_grok_git_read_command(
+                tool_command,
+                expected_head=expected_head,
+                expected_base_head=expected_base_head,
+            ):
                 return None, "Grok review requested a non-read-only Git command", metadata
             tool_names[call_id] = tool_name
             tool_commands[call_id] = tool_command
@@ -929,9 +945,21 @@ def main(argv: list[str] | None = None) -> int:
             provider_error: str | None = None
             if review_provider_contract == GROK_REVIEW_STREAM_CONTRACT:
                 review_document, provider_error, provider_metadata = (
-                    _extract_grok_stream_review_document(completed.stdout_content)
+                    _extract_grok_stream_review_document(
+                        completed.stdout_content,
+                        expected_head=args.expected_head,
+                        expected_base_head=args.expected_base_head,
+                    )
                 )
                 payload.update(provider_metadata)
+                if (
+                    provider_error is None
+                    and review_document is not None
+                    and len(review_document) > MAX_REVIEW_JSON_BYTES
+                ):
+                    provider_error = (
+                        f"review document exceeds {MAX_REVIEW_JSON_BYTES} bytes"
+                    )
             if provider_error is not None or review_document is None:
                 verdict = None
                 findings = None
