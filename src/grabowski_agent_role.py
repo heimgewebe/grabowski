@@ -578,7 +578,11 @@ def _terminal_json_object(text: str) -> dict[str, Any] | None:
 
 def _safe_grok_git_read_command(command: str) -> bool:
     """Accept only shell-free, read-only Git command forms used by Grok reviews."""
-    if not command or any(marker in command for marker in ("\n", "\r", ";", "&", "&&", "||", "|", "`", "$", ">", "<")):
+    shell_expansion_markers = (
+        "\n", "\r", ";", "&", "|", "`", "$", ">", "<",
+        "*", "?", "[", "]", "{", "}",
+    )
+    if not command or any(marker in command for marker in shell_expansion_markers):
         return False
     if ".grok" in command or "auth.json" in command:
         return False
@@ -588,6 +592,10 @@ def _safe_grok_git_read_command(command: str) -> bool:
         return False
     if len(argv) < 2 or argv[0] != "git":
         return False
+    for argument in argv[2:]:
+        path_value = argument.split("=", 1)[-1]
+        if path_value.startswith(("/", "~")) or ".." in PurePosixPath(path_value).parts:
+            return False
     subcommand = argv[1]
     if subcommand == "status":
         return argv == ["git", "status", "--short", "--branch"]
