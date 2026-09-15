@@ -1150,6 +1150,9 @@ def _resource_identifies_checkout(resource_key: str, item: dict[str, Any]) -> bo
     kind = binding["kind"]
     if kind == "path":
         path = binding["id"]
+        if item["is_main"]:
+            # Main child-path leases coordinate work without owning the checkout.
+            return path.rstrip("/") == item["path"].rstrip("/")
         return _path_in_checkout(path, item["path"])
     if kind == "branch":
         return (
