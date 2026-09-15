@@ -52,10 +52,6 @@ GROK_REVIEW_DENY_RULES = (
     "Bash(*<*)",
     "Bash(*.grok*)",
     "Bash(*auth.json*)",
-    "Bash(*--ext-diff*)",
-    "Bash(*--textconv*)",
-    "Bash(*--no-index*)",
-    "Bash(*--output*)",
 )
 GROK_REVIEW_PROMPT_SUFFIX = (
     "\n\nGrabowski review contract: inspect the repository with at least one of the "
