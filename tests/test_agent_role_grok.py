@@ -78,20 +78,33 @@ class GrokReviewRoleTests(unittest.TestCase):
     def test_streaming_review_command_rejects_caller_owned_execution_framing(self) -> None:
         controlled = (
             "--always-approve",
+            "--yolo",
+            "--dangerously-skip-permissions",
+            "--permission-mode",
             "--allow",
             "--deny",
             "--sandbox",
             "--tools",
+            "--disallowed-tools",
             "--output-format",
             "--max-turns",
             "--json-schema",
         )
         for option in controlled:
-            with self.subTest(option=option):
+            with self.subTest(option=option, form="separate"):
                 prepared = (
                     "/opt/grabowski-external/grok",
                     option,
                     "value",
+                    "-p",
+                    "review this",
+                )
+                with self.assertRaisesRegex(RuntimeError, "controlled by Grabowski"):
+                    role._grok_streaming_review_command(prepared)
+            with self.subTest(option=option, form="attached"):
+                prepared = (
+                    "/opt/grabowski-external/grok",
+                    f"{option}=value",
                     "-p",
                     "review this",
                 )

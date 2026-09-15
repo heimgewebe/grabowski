@@ -484,17 +484,25 @@ def _grok_streaming_review_command(
         raise RuntimeError("Grok review prompt must be the final command argument")
     controlled = {
         "--always-approve",
+        "--yolo",
+        "--dangerously-skip-permissions",
+        "--permission-mode",
         "--allow",
         "--deny",
         "--disable-web-search",
         "--no-subagents",
         "--sandbox",
         "--tools",
+        "--disallowed-tools",
         "--output-format",
         "--max-turns",
         "--json-schema",
     }
-    if any(item in controlled for item in command):
+    if any(
+        item in controlled
+        or any(item.startswith(f"{option}=") for option in controlled)
+        for item in command
+    ):
         raise RuntimeError("Grok review execution framing is controlled by Grabowski")
     prompt = command[-1] + GROK_REVIEW_PROMPT_SUFFIX
     command[-1] = prompt
