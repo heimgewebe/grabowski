@@ -511,6 +511,121 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                 self.assertFalse(blocked_high["allowed_by_risk"])
                 self.assertFalse(blocked_high["escalation_valid"])
 
+    def test_trusted_owner_high_risk_does_not_require_session_escalation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work, _secret, _browser, _export, _state, *patches = self._patched_runtime(
+                root,
+                capabilities=["file_read", "terminal_execute"],
+            )
+            policy = json.loads((root / "access.json").read_text(encoding="utf-8"))
+            profile = policy["profiles"]["test"]
+            profile["trusted_owner"] = True
+            with (
+                patches[0],
+                patches[1],
+                patches[2],
+                patches[3],
+                patches[4],
+                patch.object(grabowski_mcp, "_load_policy", return_value=policy),
+            ):
+                without_escalation = grabowski_mcp._session_grip_policy_decision(
+                    "captain-run",
+                    {"actions": []},
+                )
+                self.assertTrue(without_escalation["allowed"])
+                self.assertTrue(without_escalation["allowed_by_risk"])
+                self.assertFalse(without_escalation["escalation_required"])
+                self.assertTrue(without_escalation["escalation_valid"])
+
+                malformed_legacy = grabowski_mcp._session_grip_policy_decision(
+                    "captain-run",
+                    {
+                        "actions": [],
+                        "session_escalation": {"target": {}},
+                    },
+                )
+                self.assertTrue(malformed_legacy["allowed"])
+                self.assertFalse(malformed_legacy["escalation_required"])
+                self.assertTrue(malformed_legacy["escalation_valid"])
+
+                profile["max_risk_level"] = "low"
+                blocked_by_risk = grabowski_mcp._session_grip_policy_decision(
+                    "captain-run",
+                    {"actions": []},
+                )
+                self.assertFalse(blocked_by_risk["allowed"])
+                self.assertFalse(blocked_by_risk["allowed_by_risk"])
+                self.assertFalse(blocked_by_risk["escalation_required"])
+
+                profile.pop("trusted_owner")
+                policy["trusted_owner"] = True
+                profile["max_risk_level"] = "high"
+                inherited_top_level = grabowski_mcp._session_grip_policy_decision(
+                    "captain-run",
+                    {"actions": []},
+                )
+                self.assertFalse(inherited_top_level["allowed"])
+                self.assertTrue(inherited_top_level["allowed_by_risk"])
+                self.assertTrue(inherited_top_level["escalation_required"])
+                self.assertFalse(inherited_top_level["escalation_valid"])
+
+                legacy_policy = dict(policy)
+                legacy_policy.pop("profiles")
+                legacy_policy.pop("active_profile", None)
+                legacy_policy["mode"] = "legacy"
+                legacy_policy["trusted_owner"] = True
+                legacy_top_level = grabowski_mcp._session_grip_policy_decision(
+                    "captain-run",
+                    {"actions": []},
+                    legacy_policy,
+                )
+                self.assertFalse(legacy_top_level["allowed"])
+                self.assertTrue(legacy_top_level["allowed_by_risk"])
+                self.assertTrue(legacy_top_level["escalation_required"])
+                self.assertFalse(legacy_top_level["escalation_valid"])
+
+    def test_non_trusted_high_risk_still_requires_valid_session_escalation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work, _secret, _browser, _export, _state, *patches = self._patched_runtime(
+                root,
+                capabilities=["file_read", "terminal_execute"],
+            )
+            policy = json.loads((root / "access.json").read_text(encoding="utf-8"))
+            with (
+                patches[0],
+                patches[1],
+                patches[2],
+                patches[3],
+                patches[4],
+                patch.object(grabowski_mcp, "_load_policy", return_value=policy),
+            ):
+                missing = grabowski_mcp._session_grip_policy_decision(
+                    "captain-run",
+                    {"actions": []},
+                )
+                self.assertFalse(missing["allowed"])
+                self.assertTrue(missing["allowed_by_risk"])
+                self.assertTrue(missing["escalation_required"])
+                self.assertFalse(missing["escalation_valid"])
+
+                valid = grabowski_mcp._session_grip_policy_decision(
+                    "captain-run",
+                    {
+                        "actions": [],
+                        "session_escalation": {
+                            "target": "captain-run",
+                            "reason": "non-trusted high-risk compatibility test",
+                            "expires_at_unix": int(__import__("time").time()) + 60,
+                            "recovery": {"path": "captain-action-gates"},
+                        },
+                    },
+                )
+                self.assertTrue(valid["allowed"])
+                self.assertTrue(valid["escalation_required"])
+                self.assertTrue(valid["escalation_valid"])
+
     def test_grip_run_checks_capability_before_session_policy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

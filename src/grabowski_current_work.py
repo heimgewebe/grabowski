@@ -1150,6 +1150,9 @@ def _resource_identifies_checkout(resource_key: str, item: dict[str, Any]) -> bo
     kind = binding["kind"]
     if kind == "path":
         path = binding["id"]
+        if item["is_main"]:
+            # Main child-path leases coordinate work without owning the checkout.
+            return path.rstrip("/") == item["path"].rstrip("/")
         return _path_in_checkout(path, item["path"])
     if kind == "branch":
         return (
@@ -1355,15 +1358,6 @@ def _add_checkouts(
             for reason in item["binding_drift_reasons"]:
                 if reason not in group["action_reasons"]:
                     group["action_reasons"].append(reason)
-        if (
-            item["lifecycle_state"] == "managed_active_attention"
-            and item["binding_phase"] == "active"
-            and item["binding_consistent"]
-        ):
-            group["action_required"] = True
-            if "managed-active-lifecycle-attention" not in group["action_reasons"]:
-                group["action_reasons"].append("managed-active-lifecycle-attention")
-
         if item["dirty"]:
             identifying_live_lease = any(
                 _resource_identifies_checkout(lease["resource_key"], item)
@@ -2030,31 +2024,6 @@ def derive_group_convergence_recommendation(group: dict[str, Any]) -> dict[str, 
             "finishable_chain": False,
             "priority": 5,
         }
-
-    # Expired managed-active bindings remain actionable lifecycle attention even
-    # when they no longer establish coordination blocking. Preserve that signal
-    # in convergence guidance for both standalone hygiene and mixed live groups.
-    if "managed-active-lifecycle-attention" in action_reasons:
-        if projection_state == "hygiene":
-            return {
-                "convergence_stage": "hygiene",
-                "next_convergence_action": (
-                    "reconcile managed active lifecycle attention without "
-                    "treating it as coordination blocking"
-                ),
-                "finishable_chain": False,
-                "priority": 5,
-            }
-        if projection_state == "active":
-            return {
-                "convergence_stage": "active",
-                "next_convergence_action": (
-                    "monitor active work execution and reconcile managed active "
-                    "lifecycle attention"
-                ),
-                "finishable_chain": False,
-                "priority": 4,
-            }
 
     if (
         projection_state == "hygiene"

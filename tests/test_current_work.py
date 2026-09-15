@@ -788,6 +788,105 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertEqual(attached[0]["binding_status"], "ambiguous")
         self.assertEqual(set(attached[0]["related_work_ids"]), {"task:taska", "task:taskb"})
 
+    def test_main_child_path_leases_are_overlap_without_exact_ownership(self) -> None:
+        leases = [
+            lease("operator:source-edit", f"path:{REPOSITORY}/src"),
+            lease("operator:test-edit", f"path:{REPOSITORY}/tests"),
+        ]
+        for dirty in (False, True):
+            with self.subTest(dirty=dirty):
+                record = checkout(
+                    "main", REPOSITORY, is_main=True, dirty=dirty,
+                    blocking=True, lifecycle_state="main",
+                )
+                record["branch"] = "main"
+                record["coordination"]["resource_leases"] = leases
+                result = project(
+                    resources_payload={
+                        "leases": leases, "count": len(leases), "truncated": False,
+                    },
+                    checkout_payloads=[
+                        {"repository": REPOSITORY, "worktrees": [record]}
+                    ],
+                )
+                groups = {item["work_id"]: item for item in result["work"]}
+                for group in groups.values():
+                    self.assertNotIn(
+                        "ambiguous-exact-checkout-bindings", group["action_reasons"]
+                    )
+                    if not dirty:
+                        self.assertFalse(group["action_required"])
+                main = groups["checkout:main"]
+                self.assertEqual(main["binding"]["kind"], "checkout")
+                overlaps = [
+                    ref for ref in main["heuristic_refs"]
+                    if ref["kind"] == "checkout-resource-overlap"
+                ]
+                self.assertEqual(
+                    {ref["owner_id"] for ref in overlaps},
+                    {item["owner_id"] for item in leases},
+                )
+                self.assertTrue(all(ref["authority"] is False for ref in overlaps))
+                for item in leases:
+                    self.assertFalse(groups[f"operation:{item['owner_id']}"]["checkout_refs"])
+                if dirty:
+                    self.assertEqual(main["projection_state"], "blocking")
+                    self.assertTrue(main["action_required"])
+                    self.assertIn("dirty-main-checkout", main["action_reasons"])
+
+    def test_main_root_path_and_branch_leases_remain_exact(self) -> None:
+        owner = "operator:main-owner"
+        for resource_key in (
+            f"path:{REPOSITORY}",
+            f"path:{REPOSITORY}/",
+            f"repo:{REPOSITORY}:branch:main",
+        ):
+            with self.subTest(resource_key=resource_key):
+                record = checkout(
+                    "main", REPOSITORY, is_main=True, blocking=True,
+                    lifecycle_state="main",
+                )
+                record["branch"] = "main"
+                leases = [lease(owner, resource_key)]
+                record["coordination"]["resource_leases"] = leases
+                result = project(
+                    resources_payload={
+                        "leases": leases, "count": 1, "truncated": False,
+                    },
+                    checkout_payloads=[
+                        {"repository": REPOSITORY, "worktrees": [record]}
+                    ],
+                )
+                self.assertEqual(result["count"], 1)
+                group = result["work"][0]
+                self.assertEqual(group["work_id"], f"operation:{owner}")
+                self.assertEqual(group["checkout_refs"][0]["checkout_key"], "main")
+                self.assertEqual(group["projection_state"], "active")
+                self.assertFalse(group["action_required"])
+
+    def test_linked_worktree_child_path_lease_remains_exact(self) -> None:
+        owner = "operator:linked-edit"
+        path = "/home/alex/repos/.worktrees/linked-edit"
+        leases = [lease(owner, f"path:{path}/src/module.py")]
+        for dirty in (False, True):
+            with self.subTest(dirty=dirty):
+                record = checkout("linked-edit", path, dirty=dirty, blocking=True)
+                record["coordination"]["resource_leases"] = leases
+                result = project(
+                    resources_payload={
+                        "leases": leases, "count": 1, "truncated": False,
+                    },
+                    checkout_payloads=[
+                        {"repository": REPOSITORY, "worktrees": [record]}
+                    ],
+                )
+                self.assertEqual(result["count"], 1)
+                group = result["work"][0]
+                self.assertEqual(group["work_id"], f"operation:{owner}")
+                self.assertEqual(group["checkout_refs"][0]["checkout_key"], "linked-edit")
+                self.assertEqual(group["projection_state"], "active")
+                self.assertFalse(group["action_required"])
+
     def test_managed_active_checkout_with_retention_only_remains_active(self) -> None:
         owner = "operator:managed-active"
         result = project(
@@ -842,13 +941,13 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         group = result["work"][0]
         self.assertEqual(group["projection_state"], "active")
         self.assertEqual(group["work_class"], "operational")
-        self.assertTrue(group["action_required"])
-        self.assertIn(
+        self.assertFalse(group["action_required"])
+        self.assertNotIn(
             "managed-active-lifecycle-attention", group["action_reasons"]
         )
         self.assertEqual(
             group["next_convergence_action"],
-            "monitor active work execution and reconcile managed active lifecycle attention",
+            "monitor active work execution",
         )
 
     def test_managed_active_checkout_with_process_remains_active(self) -> None:
@@ -874,13 +973,13 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         group = result["work"][0]
         self.assertEqual(group["projection_state"], "active")
         self.assertEqual(group["work_class"], "operational")
-        self.assertTrue(group["action_required"])
-        self.assertIn(
+        self.assertFalse(group["action_required"])
+        self.assertNotIn(
             "managed-active-lifecycle-attention", group["action_reasons"]
         )
         self.assertEqual(
             group["next_convergence_action"],
-            "monitor active work execution and reconcile managed active lifecycle attention",
+            "monitor active work execution",
         )
 
     def test_managed_active_mixed_stale_and_retained_checkout_remains_active(self) -> None:
@@ -911,8 +1010,8 @@ class CurrentWorkProjectionTests(unittest.TestCase):
                 group = result["work"][0]
                 self.assertEqual(group["projection_state"], "active")
                 self.assertEqual(group["work_class"], "operational")
-                self.assertTrue(group["action_required"])
-                self.assertIn(
+                self.assertFalse(group["action_required"])
+                self.assertNotIn(
                     "managed-active-lifecycle-attention", group["action_reasons"]
                 )
 
@@ -947,7 +1046,7 @@ class CurrentWorkProjectionTests(unittest.TestCase):
                 self.assertEqual(group["work_class"], "operational")
                 self.assertTrue(group["action_required"])
                 self.assertIn("dirty-checkout-visible", group["action_reasons"])
-                self.assertIn(
+                self.assertNotIn(
                     "managed-active-lifecycle-attention", group["action_reasons"]
                 )
 
