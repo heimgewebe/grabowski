@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import sys
 import unittest
 from unittest import mock
@@ -187,6 +188,9 @@ class GrokReviewRoleTests(unittest.TestCase):
     def test_extract_stream_requires_successful_bounded_git_tool_and_terminal_review(self) -> None:
         command = "git diff --no-ext-diff --no-textconv HEAD~1...HEAD -- src tests"
         events = [
+            {"type": "thought", "data": "inspect exact diff"},
+            {"type": "available_commands", "tools": ["run_terminal_command"]},
+            {"type": "usage", "usage": {"input_tokens": 1}},
             {"type": "text", "data": "I will inspect."},
             *successful_git_tool_events(command),
             {"type": "text", "data": "Reviewed.\n\n"},
@@ -207,6 +211,18 @@ class GrokReviewRoleTests(unittest.TestCase):
 
     def test_extract_stream_fails_closed_on_unsafe_or_failed_git_tool(self) -> None:
         cases = (
+            (
+                [
+                    {
+                        "type": "tool_use",
+                        "toolCallId": "write-1",
+                        "toolName": "write_file",
+                        "rawInput": {"path": "src/app.py"},
+                    },
+                    {"type": "end", "stopReason": "end_turn", "num_turns": 2},
+                ],
+                "unsupported event type",
+            ),
             (
                 [
                     {
@@ -355,6 +371,52 @@ class GrokReviewRoleTests(unittest.TestCase):
                 )
                 self.assertIsNone(document)
                 self.assertIn(expected_error, error)
+
+
+    def test_grok_oversize_receipt_reports_the_applied_stream_limit(self) -> None:
+        head = "a" * 40
+        base = "b" * 40
+        diff = "c" * 64
+        completed = SimpleNamespace(
+            returncode=0,
+            stdout_sha256="d" * 64,
+            stderr_sha256="e" * 64,
+            stdout_bytes=role.MAX_GROK_REVIEW_STREAM_BYTES + 1,
+            stderr_bytes=0,
+            stdout_tail="",
+            stderr_tail="",
+            output_limit_exceeded=False,
+            stdout_content_exceeded=True,
+            stdout_content=None,
+        )
+        with (
+            mock.patch.object(role, "current_binding", side_effect=[(head, diff, False), (head, diff, False)]),
+            mock.patch.object(role, "_review_sandbox_argv", return_value=(["sandbox"], role.GROK_REVIEW_STREAM_CONTRACT)),
+            mock.patch.object(role, "runtime_sandbox_argv", return_value=["runtime"]),
+            mock.patch.object(role, "run_bounded_capture", return_value=completed),
+            mock.patch.object(role, "classify_result", return_value="invalid_review_output"),
+            mock.patch.object(role, "write_receipt") as write_receipt,
+        ):
+            returncode = role.main(
+                [
+                    "--role", "review",
+                    "--repository", str(ROOT),
+                    "--expected-head", head,
+                    "--expected-base-head", base,
+                    "--expected-diff-sha256", diff,
+                    "--expected-dirty", "false",
+                    "--output", "/tmp/grok-oversize-receipt.json",
+                    "--", "grok", "--model", "grok-4.6", "review this",
+                ]
+            )
+
+        self.assertEqual(returncode, 126)
+        payload = write_receipt.call_args.args[1]
+        self.assertEqual(payload["review_content_limit_bytes"], role.MAX_GROK_REVIEW_STREAM_BYTES)
+        self.assertEqual(
+            payload["error"],
+            f"review stdout exceeds {role.MAX_GROK_REVIEW_STREAM_BYTES} bytes",
+        )
 
 
 if __name__ == "__main__":

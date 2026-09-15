@@ -198,6 +198,32 @@ def _owner_controlled_directory(path: Path, field: str) -> Path:
     return resolved
 
 
+def _canonical_grok_executable() -> Path:
+    """Resolve only the owner-controlled versioned native Grok binary."""
+    bin_directory = Path.home() / ".grok" / "bin"
+    controlled_bin = _owner_controlled_directory(bin_directory, "Grok binary directory")
+    canonical = controlled_bin / "grok"
+    try:
+        linked = canonical.lstat()
+    except OSError as exc:
+        raise AgentSandboxError("Grok canonical executable is unavailable") from exc
+    if linked.st_uid != os.getuid() or not stat.S_ISLNK(linked.st_mode):
+        raise AgentSandboxError("Grok canonical executable must be an owner-controlled symlink")
+    executable = _owner_controlled_executable(str(canonical), "Grok executable")
+    suffix = executable.name.removeprefix("grok-")
+    allowed = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+    if (
+        executable.parent != controlled_bin
+        or not executable.name.startswith("grok-")
+        or not suffix
+        or not suffix[0].isalnum()
+        or len(executable.name) > 85
+        or any(character not in allowed for character in suffix)
+    ):
+        raise AgentSandboxError("Grok executable must stay inside the versioned native binary directory")
+    return executable
+
+
 def _grok_command_for_headless_execution(command: list[str]) -> tuple[str, ...]:
     """Turn the catalogued Grok route into its non-interactive single-turn form."""
     if len(command) == 4 and command[1] == "--model" and not command[-1].startswith("-"):
@@ -249,9 +275,10 @@ def prepare_external_agent_command(command: list[str]) -> PreparedSandboxCommand
     if executable_name == "grok":
         grok_command = _grok_command_for_headless_execution(command)
         executable_override = os.environ.get("GRABOWSKI_GROK_BIN")
-        executable = _owner_controlled_executable(
-            executable_override or str(Path.home() / ".grok/bin/grok"),
-            "Grok executable",
+        executable = (
+            _owner_controlled_executable(executable_override, "Grok executable")
+            if executable_override
+            else _canonical_grok_executable()
         )
         auth_root = Path(
             os.environ.get("GRABOWSKI_GROK_AUTH_ROOT", str(Path.home() / ".grok"))

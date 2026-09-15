@@ -28,6 +28,18 @@ GROK_REVIEW_STREAM_CONTRACT = "grok-streaming-json-readonly-review-v1"
 GROK_REVIEW_TOOL_NAMES = frozenset({"run_terminal_command"})
 GROK_REVIEW_TOOLS = "run_terminal_cmd"
 GROK_REVIEW_MAX_TURNS = 8
+GROK_REVIEW_EVENT_TYPES = frozenset(
+    {
+        "text",
+        "thought",
+        "usage",
+        "available_commands",
+        "tool_call",
+        "tool_call_update",
+        "max_turns_reached",
+        "end",
+    }
+)
 GROK_REVIEW_ALLOW_RULES = (
     "Bash(git status --short --branch*)",
     "Bash(git diff --no-ext-diff --no-textconv*)",
@@ -628,6 +640,8 @@ def _extract_grok_stream_review_document(
     end_events: list[tuple[int, dict[str, Any]]] = []
     for index, event in enumerate(events):
         event_type = event.get("type")
+        if event_type not in GROK_REVIEW_EVENT_TYPES:
+            return None, f"Grok review stream used unsupported event type: {event_type}", metadata
         if event_type == "tool_call":
             call_id = event.get("toolCallId")
             tool_name = event.get("toolName")
@@ -824,6 +838,7 @@ def main(argv: list[str] | None = None) -> int:
         "stdout_tail": completed.stdout_tail,
         "stderr_tail": completed.stderr_tail,
         "output_limit_bytes": MAX_ROLE_OUTPUT_BYTES,
+        "review_content_limit_bytes": review_content_limit if args.role == "review" else None,
         "sandbox": SANDBOX_LABEL,
     }
     if completed.output_limit_exceeded:
@@ -845,7 +860,7 @@ def main(argv: list[str] | None = None) -> int:
             payload["returncode"] = 126
             payload["verdict"] = "INVALID"
             payload["findings"] = []
-            payload["error"] = f"review stdout exceeds {MAX_REVIEW_JSON_BYTES} bytes"
+            payload["error"] = f"review stdout exceeds {review_content_limit} bytes"
         else:
             review_document = completed.stdout_content
             provider_error: str | None = None

@@ -94,6 +94,44 @@ class GrokSandboxTests(unittest.TestCase):
                     finally:
                         path.chmod(safe_mode)
 
+    def test_default_grok_binary_requires_owner_controlled_versioned_containment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            grok_root = home / ".grok"
+            bin_directory = grok_root / "bin"
+            bin_directory.mkdir(parents=True, mode=0o755)
+            native = bin_directory / "grok-1.0.30"
+            native.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            native.chmod(0o700)
+            canonical = bin_directory / "grok"
+            canonical.symlink_to(native.name)
+            auth_file = grok_root / "auth.json"
+            auth_file.write_text("{}\n", encoding="utf-8")
+            auth_file.chmod(0o600)
+            environment = {
+                "HOME": str(home),
+                "GRABOWSKI_GROK_BIN": "",
+                "GRABOWSKI_GROK_AUTH_ROOT": str(grok_root),
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                prepared = sandbox.prepare_external_agent_command(["grok", "--version"])
+                self.assertEqual(prepared.extra_read_only[0][0], native.resolve())
+
+                bin_directory.chmod(0o775)
+                try:
+                    with self.assertRaisesRegex(sandbox.AgentSandboxError, "binary directory"):
+                        sandbox.prepare_external_agent_command(["grok", "--version"])
+                finally:
+                    bin_directory.chmod(0o755)
+
+                outside = home / "grok-elsewhere"
+                outside.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                outside.chmod(0o700)
+                canonical.unlink()
+                canonical.symlink_to(outside)
+                with self.assertRaisesRegex(sandbox.AgentSandboxError, "versioned native"):
+                    sandbox.prepare_external_agent_command(["grok", "--version"])
+
     def test_grok_minimal_sandbox_keeps_host_home_unmounted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
