@@ -3767,7 +3767,10 @@ def _operator_admission_call_counts(
     # of the bounded historical contracts that can directly precede this release.
     # Accept only those exact versions, but do not trust their narrower read-only
     # buckets under current semantics: every in-flight predecessor call blocks.
-    if classification in OPERATOR_ADMISSION_PREDECESSOR_EFFECT_CLASSIFICATIONS:
+    if (
+        isinstance(classification, str)
+        and classification in OPERATOR_ADMISSION_PREDECESSOR_EFFECT_CLASSIFICATIONS
+    ):
         if (
             not isinstance(blocking, int)
             or isinstance(blocking, bool)
