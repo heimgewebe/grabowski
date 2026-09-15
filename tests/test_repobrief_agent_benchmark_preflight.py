@@ -922,6 +922,7 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
             "2026-09-15T06:00:00",
             "2026-09-15T04:59:59Z",
             "2026-09-15T05:00:00Z",
+            "0001-01-01T00:00:00+23:59",
         ]
         for resets_at in invalid_resets:
             with self.subTest(resets_at=resets_at):

@@ -261,11 +261,12 @@ def _validated_claude_usage_window(
             return None
         try:
             parsed_reset = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
-        except ValueError:
+            if parsed_reset.tzinfo is None:
+                return None
+            normalized_reset = parsed_reset.astimezone(timezone.utc)
+        except (ValueError, OverflowError):
             return None
-        if parsed_reset.tzinfo is None:
-            return None
-        if parsed_reset.astimezone(timezone.utc) <= _utc_now():
+        if normalized_reset <= _utc_now():
             return None
     return {
         "utilization_percent": utilization_percent,
