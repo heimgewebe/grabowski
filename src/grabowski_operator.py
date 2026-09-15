@@ -3818,6 +3818,15 @@ def _job_timestamp() -> tuple[int, str]:
     )
 
 
+def _job_start_timestamp() -> tuple[int, str, int]:
+    now_ns = time.time_ns()
+    now_unix = now_ns // 1_000_000_000
+    now_iso = datetime.fromtimestamp(now_unix, timezone.utc).isoformat(
+        timespec="seconds"
+    ).replace("+00:00", "Z")
+    return now_unix, now_iso, now_ns
+
+
 def _bounded_job_text(value: Any, *, label: str, max_chars: int = MAX_NOTIFY_ON_DONE_TEXT) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{label} must be a string")
@@ -6421,7 +6430,7 @@ def _start_job(
         )
         os.close(descriptor)
 
-    now_unix, now_iso = _job_timestamp()
+    now_unix, now_iso, started_at_unix_ns = _job_start_timestamp()
     metadata_path = directory / "metadata.json"
     identity = _job_identity(unit)
     argv_sha256 = _argv_hash(command)
@@ -6435,6 +6444,7 @@ def _start_job(
             decision_review_binding
         )
         scope["decision_bound_review"] = normalized_review_binding
+        scope["started_at_unix_ns"] = started_at_unix_ns
         review_provenance = decision_reviews.review_role_provenance(
             command, normalized_review_binding, cwd=working_directory
         )

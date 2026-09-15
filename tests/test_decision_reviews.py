@@ -66,6 +66,8 @@ def make_job(
     review_role: bool = False,
     origin_provenance: bool = True,
     metadata_argv_override: list[str] | None = None,
+    created_at_unix: int = 1_787_000_000,
+    started_at_unix_ns: int | None = None,
 ) -> Path:
     unit = f"grabowski-job-{suffix}"
     directory = jobs / unit
@@ -118,6 +120,8 @@ def make_job(
         "runtime_seconds": 60,
         "decision_bound_review": normalized_binding,
     }
+    if started_at_unix_ns is not None:
+        scope["started_at_unix_ns"] = started_at_unix_ns
     if review_role and origin_provenance:
         provenance = reviews.review_role_provenance(
             job_argv, normalized_binding, cwd=Path("/tmp/review")
@@ -130,7 +134,7 @@ def make_job(
         argv_sha256=argv_sha,
         scope=scope,
         notify_on_done={"requested": False, "channels": []},
-        created_at_unix=1_787_000_000,
+        created_at_unix=created_at_unix,
         started_at="2026-08-18T12:00:00Z",
         invoker_tool="grabowski_job_start",
     )
@@ -162,7 +166,7 @@ def make_job(
         "argv": job_argv if metadata_argv_override is None else metadata_argv_override,
         "argv_sha256": argv_sha,
         "cwd": "/tmp/review",
-        "created_at_unix": 1_787_000_000,
+        "created_at_unix": created_at_unix,
         "finalization_contract": contract,
     }
     write_private(directory / "metadata.json", json.dumps(metadata))
@@ -521,14 +525,163 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
     def test_terminal_infrastructure_error_can_be_replaced_in_same_slot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             jobs = Path(tmp)
-            make_job(jobs, suffix="a00000000007", slot="A", terminal_status="failed", review_result=None)
-            make_job(jobs, suffix="a00000000008", slot="A", terminal_status="succeeded", review_result=result("A", "PASS_THIS_REVISION", 0))
+            make_job(jobs, suffix="a00000000007", slot="A", terminal_status="failed", review_result=None, created_at_unix=1_787_000_100)
+            make_job(jobs, suffix="a00000000008", slot="A", terminal_status="succeeded", review_result=result("A", "PASS_THIS_REVISION", 0), created_at_unix=1_787_000_200)
             make_job(jobs, suffix="b00000000009", slot="B", terminal_status="succeeded", review_result=result("B", "PASS_THIS_REVISION", 0))
             reconciled = self.reconcile(jobs)
         self.assertEqual(reconciled["status"], "settled")
         a_slot = next(item for item in reconciled["slots"] if item["slot"] == "a")
         self.assertEqual(a_slot["infrastructure_error_count"], 1)
         self.assertEqual(a_slot["pass_count"], 1)
+
+    def test_same_second_infrastructure_error_is_replaced_by_later_pass_with_ns_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp)
+            second = 1_787_000_100
+            make_job(
+                jobs,
+                suffix="a00000000035",
+                slot="A",
+                terminal_status="failed",
+                review_result=None,
+                created_at_unix=second,
+                started_at_unix_ns=second * 1_000_000_000 + 100_000_000,
+            )
+            make_job(
+                jobs,
+                suffix="a00000000036",
+                slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "PASS_THIS_REVISION", 0),
+                created_at_unix=second,
+                started_at_unix_ns=second * 1_000_000_000 + 200_000_000,
+            )
+            reconciled = self.reconcile(jobs)
+        self.assertEqual(reconciled["status"], "settled")
+        self.assertEqual(reconciled["errors"], [])
+
+    def test_same_second_legacy_attempts_without_ns_evidence_stay_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp)
+            second = 1_787_000_100
+            make_job(
+                jobs,
+                suffix="a00000000037",
+                slot="A",
+                terminal_status="failed",
+                review_result=None,
+                created_at_unix=second,
+            )
+            make_job(
+                jobs,
+                suffix="a00000000038",
+                slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "PASS_THIS_REVISION", 0),
+                created_at_unix=second,
+            )
+            reconciled = self.reconcile(jobs)
+        self.assertEqual(reconciled["status"], "blocked")
+        self.assertTrue(
+            any(
+                error.startswith("decision_review_infrastructure_not_superseded:a:")
+                for error in reconciled["errors"]
+            )
+        )
+
+    def test_newer_missing_result_blocks_older_pass_until_later_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp)
+            make_job(
+                jobs,
+                suffix="a00000000030",
+                slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "PASS_THIS_REVISION", 0),
+                created_at_unix=1_787_000_100,
+            )
+            make_job(
+                jobs,
+                suffix="a00000000031",
+                slot="A",
+                terminal_status="succeeded",
+                review_result=None,
+                created_at_unix=1_787_000_200,
+            )
+            reconciled = self.reconcile(jobs)
+        self.assertEqual(reconciled["status"], "blocked")
+        self.assertTrue(
+            any(
+                error.startswith("decision_review_infrastructure_not_superseded:a:")
+                for error in reconciled["errors"]
+            )
+        )
+
+    def test_succeeded_missing_result_can_be_replaced_by_later_proven_pass_in_same_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp)
+            make_job(
+                jobs,
+                suffix="a00000000031",
+                slot="independent-reviewer",
+                terminal_status="succeeded",
+                review_result=None,
+                created_at_unix=1_787_000_100,
+            )
+            make_job(
+                jobs,
+                suffix="a00000000032",
+                slot="independent-reviewer",
+                terminal_status="succeeded",
+                review_result=None,
+                review_role=True,
+                created_at_unix=1_787_000_200,
+            )
+            reconciled = self.reconcile(jobs)
+        self.assertEqual(reconciled["status"], "settled")
+        self.assertEqual(reconciled["errors"], [])
+        slot = reconciled["slots"][0]
+        self.assertEqual(slot["independent_pass_count"], 1)
+        self.assertEqual(slot["infrastructure_error_count"], 1)
+        self.assertEqual(slot["unresolved_count"], 0)
+        self.assertEqual(
+            {item["classification"] for item in reconciled["attempts"]},
+            {"infrastructure_error", "pass"},
+        )
+
+    def test_material_reject_remains_blocking_after_later_proven_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp)
+            make_job(
+                jobs,
+                suffix="a00000000033",
+                slot="independent-reviewer",
+                terminal_status="succeeded",
+                review_result=result(
+                    "independent-reviewer", "REJECT_THIS_REVISION", 1
+                ),
+            )
+            make_job(
+                jobs,
+                suffix="a00000000034",
+                slot="independent-reviewer",
+                terminal_status="succeeded",
+                review_result=None,
+                review_role=True,
+            )
+            reconciled = self.reconcile(jobs)
+        self.assertEqual(reconciled["status"], "blocked")
+        slot = reconciled["slots"][0]
+        self.assertEqual(slot["material_reject_count"], 1)
+        self.assertEqual(slot["independent_pass_count"], 1)
+        self.assertTrue(
+            any(
+                error.startswith(
+                    "decision_review_material_reject:independent-reviewer:"
+                )
+                for error in reconciled["errors"]
+            )
+        )
 
     def test_later_pass_does_not_erase_prior_material_reject_in_same_slot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -547,7 +700,13 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
             make_job(jobs, suffix="c0000000000c", slot="A", terminal_status="succeeded", review_result=None)
             reconciled = self.reconcile(jobs)
         self.assertEqual(reconciled["status"], "blocked")
-        self.assertTrue(any(error.startswith("decision_review_success_missing_result:") for error in reconciled["errors"]))
+        self.assertIn("decision_review_slot_without_pass:a", reconciled["errors"])
+        self.assertFalse(
+            any(
+                error.startswith("decision_review_success_missing_result:")
+                for error in reconciled["errors"]
+            )
+        )
 
     def test_oversized_stdout_blocks_instead_of_hiding_earlier_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -579,6 +738,7 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
                 slot="A",
                 terminal_status=None,
                 review_result=None,
+                created_at_unix=1_787_000_100,
             )
             metadata_path = directory / "metadata.json"
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -602,6 +762,7 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
                 slot="A",
                 terminal_status="succeeded",
                 review_result=result("A", "PASS_THIS_REVISION", 0),
+                created_at_unix=1_787_000_200,
             )
             reconciled = self.reconcile(jobs)
         self.assertEqual(reconciled["status"], "settled")
