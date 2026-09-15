@@ -3197,6 +3197,34 @@ def _role_task_argv(
     command: list[str] | None = None,
     output_path: Path | None = None,
 ) -> list[str]:
+    selected_command = (
+        list(command) if command is not None else list(manifest["commands"][role])
+    )
+    review_input_arguments: list[str] = []
+    if (
+        role == "review"
+        and dirty
+        and selected_command
+        and Path(selected_command[0]).name == "grok"
+    ):
+        frozen = manifest.get("frozen_writer")
+        writer_result = frozen.get("writer_result") if isinstance(frozen, dict) else None
+        if (
+            not isinstance(writer_result, dict)
+            or writer_result.get("type") != "patch"
+            or not _verify_patch_artifact(
+                writer_result, expected_path=_writer_patch_path(manifest)
+            )
+        ):
+            raise AgentWorkspaceError(
+                "dirty Grok review requires the exact verified frozen writer patch"
+            )
+        review_input_arguments = [
+            "--review-input-path",
+            str(writer_result["path"]),
+            "--review-input-sha256",
+            str(writer_result["sha256"]),
+        ]
     return [
         sys.executable,
         "-m",
@@ -3213,10 +3241,11 @@ def _role_task_argv(
         diff_sha256,
         "--expected-dirty",
         "true" if dirty else "false",
+        *review_input_arguments,
         "--output",
         str(output_path if output_path is not None else _role_receipt_path(manifest, role)),
         "--",
-        *(list(command) if command is not None else list(manifest["commands"][role])),
+        *selected_command,
     ]
 
 

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import sys
 import unittest
@@ -70,6 +72,115 @@ class GrokReviewRoleTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(RuntimeError, "UTF-8"):
             role._grok_streaming_review_command(prepared, review_diff=b"\xff", **kwargs)
+
+    def test_bound_review_input_artifact_is_private_hash_bound_and_size_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace_root = root / "gaw-a2345678"
+            workspace_root.mkdir(mode=0o700)
+            patch_path = workspace_root / "writer.patch"
+            patch_bytes = b"diff --git a/src/app.py b/src/app.py\n+dirty = True\n"
+            patch_path.write_bytes(patch_bytes)
+            os.chmod(patch_path, 0o600)
+            patch_sha256 = hashlib.sha256(patch_bytes).hexdigest()
+            with mock.patch.object(role, "REVIEW_INPUT_ROOT", root):
+                self.assertEqual(
+                    role.read_bound_review_input_artifact(str(patch_path), patch_sha256),
+                    patch_bytes,
+                )
+                with self.assertRaisesRegex(RuntimeError, "SHA-256 mismatch"):
+                    role.read_bound_review_input_artifact(str(patch_path), "0" * 64)
+                patch_path.write_bytes(b"x" * (role.MAX_GROK_REVIEW_INPUT_BYTES + 1))
+                os.chmod(patch_path, 0o600)
+                with self.assertRaisesRegex(RuntimeError, "safety boundary"):
+                    role.read_bound_review_input_artifact(
+                        str(patch_path), hashlib.sha256(patch_path.read_bytes()).hexdigest()
+                    )
+
+    def test_dirty_grok_review_uses_frozen_patch_instead_of_committed_diff(self) -> None:
+        head = "a" * 40
+        base = "b" * 40
+        diff = "c" * 64
+        patch_bytes = b"diff --git a/src/app.py b/src/app.py\n+dirty = True\n"
+        completed = SimpleNamespace(
+            returncode=0,
+            stdout_sha256=hashlib.sha256(b'{"verdict":"PASS","findings":[]}').hexdigest(),
+            stderr_sha256=hashlib.sha256(b"").hexdigest(),
+            stdout_bytes=len(b'{"verdict":"PASS","findings":[]}'),
+            stderr_bytes=0,
+            stdout_tail="",
+            stderr_tail="",
+            output_limit_exceeded=False,
+            stdout_content_exceeded=False,
+            stdout_content=b'{"verdict":"PASS","findings":[]}',
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace_root = root / "gaw-b2345678"
+            workspace_root.mkdir(mode=0o700)
+            patch_path = workspace_root / "writer.patch"
+            patch_path.write_bytes(patch_bytes)
+            os.chmod(patch_path, 0o600)
+            patch_sha256 = hashlib.sha256(patch_bytes).hexdigest()
+            with (
+                mock.patch.object(role, "REVIEW_INPUT_ROOT", root),
+                mock.patch.object(
+                    role, "current_binding",
+                    side_effect=[(head, diff, True), (head, diff, True)],
+                ),
+                mock.patch.object(role, "committed_diff") as committed_diff,
+                mock.patch.object(
+                    role, "_review_sandbox_argv",
+                    return_value=(["sandbox"], None, b"prompt"),
+                ) as review_sandbox,
+                mock.patch.object(role, "runtime_sandbox_argv", return_value=["runtime"]),
+                mock.patch.object(role, "run_bounded_capture", return_value=completed),
+                mock.patch.object(role, "write_receipt") as write_receipt,
+            ):
+                returncode = role.main(
+                    [
+                        "--role", "review",
+                        "--repository", str(ROOT),
+                        "--expected-head", head,
+                        "--expected-base-head", base,
+                        "--expected-diff-sha256", diff,
+                        "--expected-dirty", "true",
+                        "--review-input-path", str(patch_path),
+                        "--review-input-sha256", patch_sha256,
+                        "--output", "/tmp/grok-dirty-review-receipt.json",
+                        "--", "grok", "--model", "grok-4.6", "review this",
+                    ]
+                )
+
+        self.assertEqual(returncode, 0)
+        committed_diff.assert_not_called()
+        self.assertEqual(review_sandbox.call_args.kwargs["review_diff"], patch_bytes)
+        payload = write_receipt.call_args.args[1]
+        self.assertEqual(payload["review_input_source"], "frozen_writer_patch")
+        self.assertEqual(payload["review_input_sha256"], hashlib.sha256(patch_bytes).hexdigest())
+
+    def test_dirty_grok_review_without_frozen_patch_fails_closed(self) -> None:
+        head = "a" * 40
+        base = "b" * 40
+        diff = "c" * 64
+        with (
+            mock.patch.object(role, "current_binding", return_value=(head, diff, True)),
+            mock.patch.object(role, "committed_diff") as committed_diff,
+            self.assertRaisesRegex(RuntimeError, "requires the frozen writer patch"),
+        ):
+            role.main(
+                [
+                    "--role", "review",
+                    "--repository", str(ROOT),
+                    "--expected-head", head,
+                    "--expected-base-head", base,
+                    "--expected-diff-sha256", diff,
+                    "--expected-dirty", "true",
+                    "--output", "/tmp/grok-missing-dirty-review-receipt.json",
+                    "--", "grok", "--model", "grok-4.6", "review this",
+                ]
+            )
+        committed_diff.assert_not_called()
 
     def test_streaming_review_command_rejects_caller_owned_execution_framing(self) -> None:
         controlled = (
@@ -224,6 +335,7 @@ class GrokReviewRoleTests(unittest.TestCase):
 
         self.assertEqual(returncode, 126)
         payload = write_receipt.call_args.args[1]
+        self.assertEqual(payload["review_input_source"], "committed_diff")
         self.assertEqual(payload["review_content_limit_bytes"], role.MAX_GROK_REVIEW_STREAM_BYTES)
         self.assertEqual(
             payload["error"],

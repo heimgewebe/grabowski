@@ -18,6 +18,14 @@ MAX_ROLE_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_REVIEW_JSON_BYTES = 1024 * 1024
 MAX_GROK_REVIEW_STREAM_BYTES = 2 * 1024 * 1024
 MAX_GROK_REVIEW_INPUT_BYTES = 1024 * 1024
+REVIEW_INPUT_ROOT = Path(
+    os.environ.get(
+        "GRABOWSKI_AGENT_WORKSPACE_ROOT",
+        str(Path.home() / ".local/state/grabowski/agent-workspaces"),
+    )
+).expanduser()
+WORKSPACE_ID = __import__("re").compile(r"^gaw-[a-z0-9][a-z0-9-]{7,79}$")
+WRITER_PATCH_NAME = __import__("re").compile(r"^writer(?:-round-[0-9]{4})?\.patch$")
 MAX_UNTRACKED_FILE_BYTES = 16 * 1024 * 1024
 MAX_UNTRACKED_TOTAL_BYTES = 64 * 1024 * 1024
 SANDBOX_LABEL = "bubblewrap-minimal-root-read-only-worktree-v1"
@@ -139,6 +147,72 @@ def committed_diff(repo: Path, base: str, head: str) -> bytes:
         "--no-textconv",
         f"{base.lower()}...{head.lower()}",
     )
+
+
+def read_bound_review_input_artifact(path_value: str, expected_sha256: str) -> bytes:
+    """Read one canonical private workspace patch with exact content binding."""
+    if SHA256.fullmatch(expected_sha256) is None:
+        raise RuntimeError("review input artifact requires an exact SHA-256")
+    path = Path(path_value)
+    if not path.is_absolute():
+        raise RuntimeError("review input artifact path must be absolute")
+    try:
+        root = REVIEW_INPUT_ROOT.resolve(strict=True)
+        parent = path.parent.resolve(strict=True)
+        relative_parent = parent.relative_to(root)
+        parent_metadata = parent.stat()
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("review input artifact is outside the canonical workspace root") from exc
+    if (
+        len(relative_parent.parts) != 1
+        or WORKSPACE_ID.fullmatch(relative_parent.parts[0]) is None
+        or WRITER_PATCH_NAME.fullmatch(path.name) is None
+        or not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent_metadata.st_uid != os.getuid()
+        or stat.S_IMODE(parent_metadata.st_mode) & 0o077
+    ):
+        raise RuntimeError("review input artifact path is not a canonical private workspace patch")
+    canonical_path = parent / path.name
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            canonical_path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != os.getuid()
+            or stat.S_IMODE(before.st_mode) & 0o077
+            or before.st_size <= 0
+            or before.st_size > MAX_GROK_REVIEW_INPUT_BYTES
+        ):
+            raise RuntimeError("review input artifact exceeds the Grok safety boundary or is unsafe")
+        chunks: list[bytes] = []
+        total = 0
+        digest_value = hashlib.sha256()
+        while chunk := os.read(descriptor, min(1024 * 1024, MAX_GROK_REVIEW_INPUT_BYTES + 1 - total)):
+            total += len(chunk)
+            if total > MAX_GROK_REVIEW_INPUT_BYTES:
+                raise RuntimeError("review input artifact exceeds the Grok safety boundary")
+            chunks.append(chunk)
+            digest_value.update(chunk)
+        after = os.fstat(descriptor)
+        if (
+            total != before.st_size
+            or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        ):
+            raise RuntimeError("review input artifact changed while being read")
+        if digest_value.hexdigest() != expected_sha256:
+            raise RuntimeError("review input artifact SHA-256 mismatch")
+        return b"".join(chunks)
+    except OSError as exc:
+        raise RuntimeError("review input artifact could not be read safely") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def current_binding(repo: Path, base: str) -> tuple[str, str, bool]:
@@ -723,6 +797,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--expected-base-head", required=True)
     parser.add_argument("--expected-diff-sha256", required=True)
     parser.add_argument("--expected-dirty", choices=("true", "false"), required=True)
+    parser.add_argument("--review-input-path")
+    parser.add_argument("--review-input-sha256")
     parser.add_argument("--output", required=True)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
@@ -739,6 +815,13 @@ def main(argv: list[str] | None = None) -> int:
     ):
         parser.error("invalid command or binding")
     expected_dirty = args.expected_dirty == "true"
+    review_artifact_declared = (
+        args.review_input_path is not None or args.review_input_sha256 is not None
+    )
+    if (args.review_input_path is None) != (args.review_input_sha256 is None):
+        parser.error("review input path and SHA-256 must be supplied together")
+    if args.role != "review" and review_artifact_declared:
+        parser.error("review input artifact is only valid for the review role")
     before_head, before_diff, before_dirty = current_binding(repo, args.expected_base_head)
     if (
         before_head != args.expected_head
@@ -748,10 +831,24 @@ def main(argv: list[str] | None = None) -> int:
         raise RuntimeError("writer binding changed before read-only role start")
     review_provider_contract: str | None = None
     review_input: bytes | None = None
+    review_input_source: str | None = None
     review_stdin: bytes | None = None
     if args.role == "review":
         if Path(command[0]).name == "grok":
-            review_input = committed_diff(repo, args.expected_base_head, args.expected_head)
+            if expected_dirty:
+                if not review_artifact_declared:
+                    raise RuntimeError("dirty Grok review requires the frozen writer patch artifact")
+                review_input = read_bound_review_input_artifact(
+                    str(args.review_input_path), str(args.review_input_sha256)
+                )
+                review_input_source = "frozen_writer_patch"
+            else:
+                if review_artifact_declared:
+                    raise RuntimeError("clean Grok review must use the exact committed diff")
+                review_input = committed_diff(repo, args.expected_base_head, args.expected_head)
+                review_input_source = "committed_diff"
+        elif review_artifact_declared:
+            raise RuntimeError("review input artifact is only valid for Grok review")
         role_sandbox_argv, review_provider_contract, review_stdin = _review_sandbox_argv(
             repo,
             command,
@@ -797,6 +894,7 @@ def main(argv: list[str] | None = None) -> int:
         "stderr_tail": completed.stderr_tail,
         "output_limit_bytes": MAX_ROLE_OUTPUT_BYTES,
         "review_content_limit_bytes": review_content_limit if args.role == "review" else None,
+        "review_input_source": review_input_source,
         "review_input_bytes": len(review_input) if review_input is not None else None,
         "review_input_sha256": hashlib.sha256(review_input).hexdigest() if review_input is not None else None,
         "review_prompt_bytes": len(review_stdin) if review_stdin is not None else None,
