@@ -15,6 +15,8 @@ import hmac
 import http.client
 import math
 import os
+import signal
+from contextlib import contextmanager
 from contextvars import ContextVar
 from decimal import Decimal
 import importlib.util
@@ -63,6 +65,7 @@ CLAUDE_USAGE_API_HOST = "api.anthropic.com"
 CLAUDE_USAGE_API_PATH = "/api/oauth/usage?at_wall=1&skip_spend=1"
 CLAUDE_USAGE_TIMEOUT_SECONDS = 5
 CLAUDE_USAGE_MAX_RESPONSE_BYTES = 64 * 1024
+CLAUDE_USAGE_MAX_JSON_INTEGER_DIGITS = 128
 
 
 def _utc_now() -> datetime:
@@ -173,6 +176,47 @@ def _validated_credential_data_adapter(
     return data
 
 
+
+
+def _bounded_json_int(value: str) -> int:
+    digits = value.lstrip("-")
+    if not digits or len(digits) > CLAUDE_USAGE_MAX_JSON_INTEGER_DIGITS:
+        raise ValueError("JSON integer is outside the quota-evidence bound")
+    return int(value)
+
+
+@contextmanager
+def _quota_request_deadline(seconds: float):
+    """Bound the whole synchronous quota request, including DNS and body reads."""
+
+    try:
+        previous_handler = signal.getsignal(signal.SIGALRM)
+        previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    except (AttributeError, OSError, ValueError) as exc:
+        raise TimeoutError("quota request deadline is unavailable") from exc
+    if previous_timer != (0.0, 0.0):
+        raise TimeoutError("quota request deadline is already in use")
+
+    def _deadline_expired(_signum: int, _frame: Any) -> None:
+        raise TimeoutError("quota request deadline exceeded")
+
+    armed = False
+    try:
+        signal.signal(signal.SIGALRM, _deadline_expired)
+        signal.setitimer(signal.ITIMER_REAL, float(seconds))
+        armed = True
+        yield
+    except (AttributeError, OSError, ValueError) as exc:
+        raise TimeoutError("quota request deadline is unavailable") from exc
+    finally:
+        if armed:
+            signal.setitimer(signal.ITIMER_REAL, 0.0)
+        try:
+            signal.signal(signal.SIGALRM, previous_handler)
+        except (AttributeError, OSError, ValueError):
+            pass
+
+
 def _unknown_claude_quota_readiness(reason: str) -> dict[str, Any]:
     return {
         "status": "unknown",
@@ -212,10 +256,17 @@ def _validated_claude_usage_window(
         return None
     utilization_percent = float(utilization)
     resets_at = window.get("resets_at")
-    if resets_at is not None and (
-        not isinstance(resets_at, str) or not resets_at.strip()
-    ):
-        return None
+    if resets_at is not None:
+        if not isinstance(resets_at, str) or not resets_at.strip():
+            return None
+        try:
+            parsed_reset = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed_reset.tzinfo is None:
+            return None
+        if parsed_reset.astimezone(timezone.utc) <= _utc_now():
+            return None
     return {
         "utilization_percent": utilization_percent,
         "remaining_percent": round(100.0 - utilization_percent, 6),
@@ -238,8 +289,10 @@ def _claude_quota_readiness(
     if credential_data is None:
         return _unknown_claude_quota_readiness("oauth_credential_unavailable")
     try:
-        credential = json.loads(credential_data.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+        credential = json.loads(
+            credential_data.decode("utf-8"), parse_int=_bounded_json_int
+        )
+    except (UnicodeDecodeError, ValueError):
         return _unknown_claude_quota_readiness("credential_json_invalid")
     if not isinstance(credential, dict):
         return _unknown_claude_quota_readiness("credential_json_invalid")
@@ -257,24 +310,25 @@ def _claude_quota_readiness(
 
     connection: http.client.HTTPSConnection | None = None
     try:
-        connection = http.client.HTTPSConnection(
-            CLAUDE_USAGE_API_HOST, timeout=CLAUDE_USAGE_TIMEOUT_SECONDS
-        )
-        connection.request(
-            "GET",
-            CLAUDE_USAGE_API_PATH,
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
-        )
-        response = connection.getresponse()
-        if response.status != 200:
-            return _unknown_claude_quota_readiness(
-                f"usage_http_status_{response.status}"
+        with _quota_request_deadline(CLAUDE_USAGE_TIMEOUT_SECONDS):
+            connection = http.client.HTTPSConnection(
+                CLAUDE_USAGE_API_HOST, timeout=CLAUDE_USAGE_TIMEOUT_SECONDS
             )
-        raw_response = response.read(CLAUDE_USAGE_MAX_RESPONSE_BYTES + 1)
+            connection.request(
+                "GET",
+                CLAUDE_USAGE_API_PATH,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                },
+            )
+            response = connection.getresponse()
+            if response.status != 200:
+                return _unknown_claude_quota_readiness(
+                    f"usage_http_status_{response.status}"
+                )
+            raw_response = response.read(CLAUDE_USAGE_MAX_RESPONSE_BYTES + 1)
     except Exception:
         return _unknown_claude_quota_readiness("usage_request_failed")
     finally:
@@ -287,8 +341,10 @@ def _claude_quota_readiness(
     if len(raw_response) > CLAUDE_USAGE_MAX_RESPONSE_BYTES:
         return _unknown_claude_quota_readiness("usage_response_too_large")
     try:
-        payload = json.loads(raw_response.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+        payload = json.loads(
+            raw_response.decode("utf-8"), parse_int=_bounded_json_int
+        )
+    except (UnicodeDecodeError, ValueError):
         return _unknown_claude_quota_readiness("usage_response_invalid")
     if not isinstance(payload, dict):
         return _unknown_claude_quota_readiness("usage_response_invalid")
