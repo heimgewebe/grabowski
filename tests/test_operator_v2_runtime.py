@@ -1313,6 +1313,96 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                     blocked_operator["output"]["error"],
                 )
 
+                bureau_run_id = "BUR-RUN-20260914T120000Z-aaaaaaaaaa"
+                bureau_owner = f"bureau-run:{bureau_run_id}"
+                bureau_parameters = dict(valid_parameters)
+                bureau_parameters["execution_intent"] = {
+                    "context": {"lease_owner_id": bureau_owner}
+                }
+                bureau_keys = ["component:test-bureau-run"]
+                bureau_observed_at = int(__import__("time").time())
+                bureau_snapshots = [
+                    {
+                        "resource_key": bureau_keys[0],
+                        "owner_id": bureau_owner,
+                        "acquired_at_unix": bureau_observed_at - 1,
+                        "updated_at_unix": bureau_observed_at - 1,
+                        "expires_at_unix": bureau_observed_at + 60,
+                        "metadata_sha256": "d" * 64,
+                    }
+                ]
+                bureau_evidence = {
+                    "schema_version": 1,
+                    "kind": "grabowski_live_bureau_run_lease_delegation_evidence",
+                    "run_id": bureau_run_id,
+                    "task_id": "TASK-1",
+                    "worker_id": "worker-1",
+                    "lease_owner_id": bureau_owner,
+                    "resource_keys": bureau_keys,
+                    "resource_keys_sha256": (
+                        grabowski_mcp.grabowski_merge_guard._sha256_json(bureau_keys)
+                    ),
+                    "lease_snapshots": bureau_snapshots,
+                    "lease_bindings_sha256": (
+                        grabowski_mcp.grabowski_merge_guard._sha256_json(
+                            bureau_snapshots
+                        )
+                    ),
+                    "coordination_sha256": "e" * 64,
+                    "minimum_expires_at_unix": bureau_observed_at + 60,
+                    "observed_at_unix": bureau_observed_at,
+                }
+                fake_bureau_pickup = types.SimpleNamespace(
+                    server_bureau_run_lease_delegation_evidence=lambda run_id: (
+                        bureau_evidence if run_id == bureau_run_id else None
+                    )
+                )
+                with (
+                    patch.dict(
+                        sys.modules, {"grabowski_bureau_pickup": fake_bureau_pickup}
+                    ),
+                    patch.object(
+                        grabowski_mcp.grabowski_grips,
+                        "grip_run",
+                        return_value={"ok": True},
+                    ) as bureau_run,
+                ):
+                    bureau_result = grabowski_mcp.grip_run(
+                        "captain-run", bureau_parameters, ctx=RequestContext()
+                    )
+                self.assertEqual({"ok": True}, bureau_result)
+                bureau_dispatched = bureau_run.call_args.args[1]
+                bureau_actor = bureau_dispatched["_server_runtime_actor_identity"]
+                bureau_delegation = bureau_dispatched[
+                    "_server_bureau_run_lease_delegation"
+                ]
+                verified_bureau = (
+                    grabowski_mcp.grabowski_merge_guard.verify_server_bureau_run_lease_delegation(
+                        bureau_delegation,
+                        actor_identity=bureau_actor,
+                        captain_request_sha256_value=(
+                            grabowski_mcp.grabowski_merge_guard.captain_request_sha256(
+                                bureau_dispatched
+                            )
+                        ),
+                    )
+                )
+                self.assertEqual(bureau_run_id, verified_bureau["run_id"])
+                self.assertEqual(bureau_owner, verified_bureau["lease_owner_id"])
+
+                spoofed_bureau = dict(bureau_parameters)
+                spoofed_bureau["_server_bureau_run_lease_delegation"] = (
+                    bureau_delegation
+                )
+                blocked_bureau = grabowski_mcp.grip_run(
+                    "captain-run", spoofed_bureau, ctx=RequestContext()
+                )
+                self.assertEqual("blocked", blocked_bureau["receipt"]["status"])
+                self.assertIn(
+                    "reserved server parameter",
+                    blocked_bureau["output"]["error"],
+                )
+
                 unavailable = grabowski_mcp.grip_run(
                     "captain-run", valid_parameters, ctx=None
                 )

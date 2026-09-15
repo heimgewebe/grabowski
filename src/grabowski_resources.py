@@ -58,6 +58,9 @@ RESOURCE_KINDS = {
 }
 OWNER_RE = re.compile(r"[A-Za-z0-9._:@-]{1,128}\Z")
 DIRECT_OPERATOR_OWNER_RE = re.compile(r"operator:[A-Za-z0-9._:@-]{1,119}\Z")
+BUREAU_RUN_OWNER_RE = re.compile(
+    r"bureau-run:(BUR-RUN-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{10})\Z"
+)
 SERVICE_RE = re.compile(r"[A-Za-z0-9_.:@-]{1,255}\Z")
 COMPONENT_RE = re.compile(r"[A-Za-z0-9_.:@/-]{1,255}\Z")
 OPERATION_SEGMENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@/-]{0,255}\Z")
@@ -4136,6 +4139,59 @@ def operator_lease_delegation_evidence(
     }
 
 
+def bureau_run_lease_delegation_evidence(
+    owner_id: str,
+    *,
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    """Return the complete live lease snapshot for one Bureau run owner."""
+    owner = _owner(owner_id)
+    matched = BUREAU_RUN_OWNER_RE.fullmatch(owner)
+    if matched is None:
+        raise ValueError("Bureau run lease owner is invalid")
+    now = _now() if now_unix is None else int(now_unix)
+    with _database() as connection:
+        rows = connection.execute(
+            "SELECT * FROM leases WHERE owner_id=? AND expires_at_unix>? "
+            "ORDER BY resource_key",
+            (owner, now),
+        ).fetchall()
+    resource_keys = [str(row["resource_key"]) for row in rows]
+    if not resource_keys:
+        raise ValueError("Bureau run owner has no live leases")
+    if len(resource_keys) > 64:
+        raise ValueError("Bureau run owner has more than 64 live leases")
+    snapshots: list[dict[str, Any]] = []
+    minimum_expiry: int | None = None
+    for row in rows:
+        metadata = _row_metadata(row)
+        _, observed_metadata_sha256 = _metadata(metadata)
+        if row["metadata_sha256"] != observed_metadata_sha256:
+            raise ValueError("Bureau run lease metadata integrity mismatch")
+        snapshot = {key: row[key] for key in LEASE_SNAPSHOT_KEYS}
+        snapshots.append(snapshot)
+        expiry = int(row["expires_at_unix"])
+        minimum_expiry = (
+            expiry if minimum_expiry is None else min(minimum_expiry, expiry)
+        )
+    return {
+        "schema_version": 1,
+        "kind": "grabowski_live_bureau_run_lease_delegation_evidence",
+        "run_id": matched.group(1),
+        "lease_owner_id": owner,
+        "resource_keys": resource_keys,
+        "resource_keys_sha256": hashlib.sha256(
+            _canonical_json(resource_keys).encode("utf-8")
+        ).hexdigest(),
+        "lease_snapshots": snapshots,
+        "lease_bindings_sha256": hashlib.sha256(
+            _canonical_json(snapshots).encode("utf-8")
+        ).hexdigest(),
+        "minimum_expires_at_unix": minimum_expiry,
+        "observed_at_unix": now,
+    }
+
+
 def reconcile_delegated_operator_leases(
     owner_id: str,
     expected_lease_snapshots: Iterable[Mapping[str, Any]],
@@ -4380,6 +4436,7 @@ def acquire_merge_guard_resources(
     metadata: dict[str, Any] | None = None,
     delegated_task: dict[str, Any] | None = None,
     delegated_operator: dict[str, Any] | None = None,
+    delegated_bureau: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     guard_owner = _owner(guard_owner_id)
     lease_owner = _owner(lease_owner_id)
@@ -4396,8 +4453,11 @@ def acquire_merge_guard_resources(
     delegated_operator_snapshots: list[dict[str, Any]] = []
     delegated_operator_authority_key: str | None = None
     delegated_operator_delegation_sha256: str | None = None
-    if delegated_task is not None and delegated_operator is not None:
-        raise ValueError("task and direct Operator delegations are mutually exclusive")
+    delegated_bureau_run_id: str | None = None
+    delegated_bureau_snapshots: list[dict[str, Any]] = []
+    delegated_bureau_delegation_sha256: str | None = None
+    if sum(value is not None for value in (delegated_task, delegated_operator, delegated_bureau)) > 1:
+        raise ValueError("task, direct Operator and Bureau delegations are mutually exclusive")
     if delegated_task is not None:
         required = {
             "task_id",
@@ -4510,6 +4570,45 @@ def acquire_merge_guard_resources(
             + hashlib.sha256(lease_owner.encode("utf-8")).hexdigest()
         )
         keys = normalize_resource_keys([*keys, delegated_operator_authority_key])
+    if delegated_bureau is not None:
+        required = {
+            "run_id", "lease_owner_id", "resource_keys", "resource_keys_sha256",
+            "lease_snapshots", "lease_bindings_sha256", "delegation_sha256",
+        }
+        if not isinstance(delegated_bureau, dict) or not required.issubset(delegated_bureau):
+            raise ValueError("delegated Bureau binding is invalid")
+        delegated_bureau_run_id = delegated_bureau.get("run_id")
+        if (not isinstance(delegated_bureau_run_id, str)
+            or lease_owner != f"bureau-run:{delegated_bureau_run_id}"):
+            raise ValueError("delegated Bureau owner is invalid")
+        delegated_resource_keys = normalize_resource_keys(delegated_bureau.get("resource_keys"))
+        expected_keys_sha256 = hashlib.sha256(
+            _canonical_json(delegated_resource_keys).encode("utf-8")
+        ).hexdigest()
+        if delegated_bureau.get("resource_keys_sha256") != expected_keys_sha256:
+            raise ValueError("delegated Bureau resource key digest is invalid")
+        raw_snapshots = delegated_bureau.get("lease_snapshots")
+        if (not isinstance(raw_snapshots, list) or len(raw_snapshots) != len(delegated_resource_keys)
+            or any(not isinstance(item, dict) or set(item) != LEASE_SNAPSHOT_KEYS for item in raw_snapshots)):
+            raise ValueError("delegated Bureau lease snapshots are invalid")
+        delegated_bureau_snapshots = [dict(item) for item in raw_snapshots]
+        if ([item["resource_key"] for item in delegated_bureau_snapshots] != delegated_resource_keys
+            or any(item["owner_id"] != lease_owner for item in delegated_bureau_snapshots)):
+            raise ValueError("delegated Bureau lease snapshot binding is invalid")
+        delegated_bureau_delegation_sha256 = delegated_bureau.get("delegation_sha256")
+        if (not isinstance(delegated_bureau_delegation_sha256, str)
+            or SHA256_RE.fullmatch(delegated_bureau_delegation_sha256) is None):
+            raise ValueError("delegated Bureau delegation digest is invalid")
+        delegated_bindings_sha256 = delegated_bureau.get("lease_bindings_sha256")
+        if (not isinstance(delegated_bindings_sha256, str)
+            or delegated_bindings_sha256 != hashlib.sha256(
+                _canonical_json(delegated_bureau_snapshots).encode("utf-8")
+            ).hexdigest()):
+            raise ValueError("delegated Bureau lease binding digest is invalid")
+        delegated_expiry = delegated_bureau.get("expires_at_unix", delegated_bureau.get("minimum_expires_at_unix"))
+        if not isinstance(delegated_expiry, int) or isinstance(delegated_expiry, bool) or delegated_expiry < 1:
+            raise ValueError("delegated Bureau lease expiry is invalid")
+        delegated_expires_at_unix = delegated_expiry
     repository_path = Path(repository).expanduser()
     if not repository_path.is_absolute():
         raise ValueError("merge guard repository must be absolute")
@@ -4572,6 +4671,15 @@ def acquire_merge_guard_resources(
             ).hexdigest(),
             "lease_bindings_sha256": delegated_bindings_sha256,
             "delegation_sha256": delegated_operator_delegation_sha256,
+        }
+    if delegated_bureau is not None:
+        normalized_metadata["bureau_run_lease_delegation"] = {
+            "run_id_sha256": hashlib.sha256(str(delegated_bureau_run_id).encode("utf-8")).hexdigest(),
+            "resource_keys_sha256": hashlib.sha256(
+                _canonical_json(delegated_resource_keys).encode("utf-8")
+            ).hexdigest(),
+            "lease_bindings_sha256": delegated_bindings_sha256,
+            "delegation_sha256": delegated_bureau_delegation_sha256,
         }
     guarded_branches = _merge_guard_branch_names(normalized_metadata)
     if guarded_branches is None:
@@ -4736,8 +4844,27 @@ def acquire_merge_guard_resources(
                 ).hexdigest()
                 if observed_bindings_sha256 != delegated_bindings_sha256:
                     raise ValueError("delegated Operator lease bindings changed")
+            if delegated_bureau is not None:
+                bureau_rows = [row for row in rows if row["owner_id"] == lease_owner]
+                bureau_keys = [str(row["resource_key"]) for row in bureau_rows]
+                if bureau_keys != delegated_resource_keys:
+                    raise ValueError("delegated Bureau lease set changed after signing")
+                bureau_by_key = {row["resource_key"]: row for row in bureau_rows}
+                observed_bureau_snapshots: list[dict[str, Any]] = []
+                for expected_snapshot in delegated_bureau_snapshots:
+                    delegated_key = str(expected_snapshot["resource_key"])
+                    delegated_row = bureau_by_key.get(delegated_key)
+                    if delegated_row is None:
+                        raise ValueError(f"delegated Bureau lease is not live: {delegated_key}")
+                    observed_snapshot = {field: delegated_row[field] for field in LEASE_SNAPSHOT_KEYS}
+                    if observed_snapshot != expected_snapshot:
+                        raise ValueError(f"delegated Bureau lease snapshot changed: {delegated_key}")
+                    observed_bureau_snapshots.append(observed_snapshot)
+                if hashlib.sha256(_canonical_json(observed_bureau_snapshots).encode("utf-8")).hexdigest() != delegated_bindings_sha256:
+                    raise ValueError("delegated Bureau lease bindings changed")
             existing_owned_keys: set[str] = set()
             delegated_operator_target_keys: set[str] = set()
+            delegated_bureau_target_keys: set[str] = set()
             for row in rows:
                 row_key = row["resource_key"]
                 row_metadata = _row_metadata(row)
@@ -4827,6 +4954,12 @@ def acquire_merge_guard_resources(
                     and row_key in delegated_resource_keys
                 ):
                     delegated_operator_target_keys.add(str(row_key))
+                if (
+                    delegated_bureau is not None
+                    and same_lease_owner
+                    and row_key in delegated_resource_keys
+                ):
+                    delegated_bureau_target_keys.add(str(row_key))
                 if same_lease_owner:
                     if (
                         delegated_operator_authority_key is not None
@@ -4840,7 +4973,7 @@ def acquire_merge_guard_resources(
                             row_key, row["owner_id"], row["expires_at_unix"]
                         )
                     if (
-                        (delegated_task_id is not None or delegated_operator is not None)
+                        (delegated_task_id is not None or delegated_operator is not None or delegated_bureau is not None)
                         and row_key not in delegated_resource_keys
                     ):
                         raise ResourceConflict(
@@ -4856,6 +4989,10 @@ def acquire_merge_guard_resources(
             if delegated_operator is not None and not delegated_operator_target_keys:
                 raise ValueError(
                     "delegated Operator leases do not bind the merge target"
+                )
+            if delegated_bureau is not None and not delegated_bureau_target_keys:
+                raise ValueError(
+                    "delegated Bureau leases do not bind the merge target"
                 )
             keys_to_acquire = [
                 key for key in keys if key not in existing_owned_keys
@@ -4948,6 +5085,24 @@ def acquire_merge_guard_resources(
             else None
         ),
         "delegated_operator_authority_key": delegated_operator_authority_key,
+        "delegated_bureau_run_id": delegated_bureau_run_id,
+        "delegated_bureau_resource_keys": (
+            delegated_resource_keys if delegated_bureau is not None else []
+        ),
+        "delegated_bureau_target_resource_keys": (
+            sorted(delegated_bureau_target_keys)
+            if delegated_bureau is not None
+            else []
+        ),
+        "delegated_bureau_lease_snapshots": (
+            delegated_bureau_snapshots if delegated_bureau is not None else []
+        ),
+        "delegated_bureau_lease_bindings_sha256": (
+            delegated_bindings_sha256 if delegated_bureau is not None else None
+        ),
+        "delegated_bureau_delegation_sha256": (
+            delegated_bureau_delegation_sha256 if delegated_bureau is not None else None
+        ),
     }
 
 
