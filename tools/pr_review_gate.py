@@ -111,6 +111,7 @@ BOOTSTRAP_EXPECTED_CHECK_NAMES_BY_REPO = {
     "alexdermohr/livia": ("quality",),
     "heimgewebe/metarepo": ("ci (ubuntu-latest)", "ci (macos-latest)"),
     "heimgewebe/mitschreiber": ("ci / reusable-ci",),
+    "heimgewebe/systemkatalog": ("Repository Contract", "Secret Scan"),
     "heimgewebe/weltgewebe": ("Detect docs updates", "Core Guard Tests"),
 }
 MAX_REQUIRED_CHECK_NAMES = 64

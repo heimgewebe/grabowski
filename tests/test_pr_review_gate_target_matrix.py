@@ -110,6 +110,7 @@ class PrReviewGateTargetMatrixTests(unittest.TestCase):
             "Hall-of-Memory/Hall-of-Memory": ("verify",),
             "alexdermohr/livia": ("quality",),
             "heimgewebe/metarepo": ("ci (ubuntu-latest)", "ci (macos-latest)"),
+            "heimgewebe/systemkatalog": ("Repository Contract", "Secret Scan"),
         }
         for repo_name, expected in cases.items():
             with self.subTest(repo_name=repo_name), tempfile.TemporaryDirectory() as raw:
