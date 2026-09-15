@@ -2120,6 +2120,7 @@ class BureauPickupTests(unittest.TestCase):
                 fixture["stored_request"],
                 fixture["acquisition"],
                 fixture["run_dir"],
+                allow_expired_rebind=True,
             )
         rebind.assert_not_called()
         acquire.assert_not_called()
@@ -2140,6 +2141,7 @@ class BureauPickupTests(unittest.TestCase):
                 fixture["stored_request"],
                 fixture["acquisition"],
                 fixture["run_dir"],
+                allow_expired_rebind=True,
             )
         self.assertEqual(
             "orphan-recovery-expired-lease-history-missing", raised.exception.code
@@ -2186,6 +2188,7 @@ class BureauPickupTests(unittest.TestCase):
                 fixture["stored_request"],
                 fixture["acquisition"],
                 fixture["run_dir"],
+                allow_expired_rebind=True,
             )
         self.assertEqual("orphan-recovery-lease-foreign-owner", raised.exception.code)
         rebind.assert_not_called()
@@ -2424,6 +2427,7 @@ class BureauPickupTests(unittest.TestCase):
                 fixture["stored_request"],
                 fixture["acquisition"],
                 fixture["run_dir"],
+                allow_expired_rebind=True,
             )
         self.assertEqual("same-owner-rebind", receipt["actions"][0]["method"])
         rebind.assert_called_once()
@@ -2469,12 +2473,14 @@ class BureauPickupTests(unittest.TestCase):
                 fixture["stored_request"],
                 fixture["acquisition"],
                 fixture["run_dir"],
+                allow_expired_rebind=True,
             )
             second = pickup._reacquire_orphaned_assignment_leases(
                 fixture["intent"],
                 fixture["stored_request"],
                 fixture["acquisition"],
                 fixture["run_dir"],
+                allow_expired_rebind=True,
             )
         self.assertEqual(first["receipt_sha256"], second["receipt_sha256"])
         self.assertEqual("same-owner-rebind", second["actions"][0]["method"])
@@ -2637,6 +2643,7 @@ class BureauPickupTests(unittest.TestCase):
                 fixture["stored_request"],
                 fixture["acquisition"],
                 fixture["run_dir"],
+                allow_expired_rebind=True,
             )
         self.assertEqual("orphan-recovery-lease-effect-failed", raised.exception.code)
         self.assertEqual("released", raised.exception.details["compensation"]["status"])
@@ -2700,6 +2707,7 @@ class BureauPickupTests(unittest.TestCase):
                 fixture["stored_request"],
                 fixture["acquisition"],
                 fixture["run_dir"],
+                allow_expired_rebind=True,
             )
         self.assertEqual("orphan-recovery-lease-effect-failed", raised.exception.code)
         self.assertEqual(
@@ -5436,6 +5444,9 @@ class BureauPickupTests(unittest.TestCase):
                 },
             }
             with (
+                mock.patch.object(
+                    pickup, "_coordination_status", return_value=blocking
+                ),
                 mock.patch.object(pickup.resources, "_now", return_value=221),
                 mock.patch.object(
                     pickup,
@@ -5581,6 +5592,9 @@ class BureauPickupTests(unittest.TestCase):
                 return real_rebind(*args, **kwargs)
 
             with (
+                mock.patch.object(
+                    pickup, "_coordination_status", return_value=blocking
+                ),
                 mock.patch.object(pickup.resources, "_now", return_value=221),
                 mock.patch.object(
                     pickup.bureau_leases,
@@ -6039,6 +6053,9 @@ class BureauPickupTests(unittest.TestCase):
                 "head": "5" * 40,
             }
             with (
+                mock.patch.object(
+                    pickup, "_coordination_status", return_value=blocking
+                ),
                 mock.patch.object(pickup.resources, "_now", return_value=250),
                 mock.patch.object(
                     pickup.bureau_leases,

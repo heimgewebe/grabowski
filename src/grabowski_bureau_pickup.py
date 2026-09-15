@@ -1926,11 +1926,18 @@ def _acquire_groups(
     run_dir: Path,
     *,
     groups: list[dict[str, Any]] | None = None,
+    registry_binding: RegistryBinding | None = None,
 ) -> dict[str, Any]:
     acquired: list[dict[str, Any]] = []
     owner_id = intent["lease_owner_id"]
     if groups is None:
         groups = _acquisition_groups(intent, request)
+    commit_precondition = _pickup_lease_commit_precondition(
+        intent,
+        request,
+        allow_unknown_run=True,
+        registry_binding=registry_binding,
+    )
     try:
         for index, group in enumerate(groups, start=1):
             result = resources.acquire_resources(
@@ -1940,6 +1947,7 @@ def _acquire_groups(
                 ttl_seconds=group["ttl_seconds"],
                 metadata=group["metadata"],
                 nonconflict_proof=group["nonconflict_proof"],
+                _commit_precondition=commit_precondition,
             )
             entry = {
                 "group": group["name"],
@@ -2084,6 +2092,77 @@ def _definitive_missing_run(payload: dict[str, Any]) -> bool:
             "state-error-unknown-run",
         }
     )
+
+
+def _pickup_lease_commit_precondition(
+    intent: dict[str, Any],
+    request: dict[str, Any],
+    *,
+    allow_unknown_run: bool,
+    registry_binding: RegistryBinding | None = None,
+):
+    """Return the final read-only Bureau authority check for one lease writer."""
+
+    def check() -> None:
+        def read_status() -> dict[str, Any]:
+            return _coordination_status(
+                intent["run_id"],
+                registry_root=request["registry_root"],
+                coordination_root=request["coordination_root"],
+            )
+
+        payload = (
+            read_status()
+            if registry_binding is None
+            else _bound_bureau_call(registry_binding, read_status)
+        )
+        if not isinstance(payload, dict):
+            raise BureauPickupError("pickup-lease-authority-readback-invalid")
+        if _definitive_missing_run(payload):
+            if allow_unknown_run:
+                return
+            raise BureauPickupError("pickup-lease-authority-run-missing")
+        if payload.get("status") != "coordinated":
+            raise BureauPickupError(
+                "pickup-lease-authority-unavailable",
+                details={
+                    "status": payload.get("status"),
+                    "code": payload.get("code"),
+                },
+            )
+        run = payload.get("run")
+        if not isinstance(run, dict):
+            raise BureauPickupError("pickup-lease-authority-run-missing")
+        expected = {
+            "run_id": intent["run_id"],
+            "task_id": intent["task_id"],
+            "worker_id": intent["worker_id"],
+        }
+        mismatches = {
+            key: {"expected": value, "observed": run.get(key)}
+            for key, value in expected.items()
+            if run.get(key) != value
+        }
+        if mismatches:
+            raise BureauPickupError(
+                "pickup-lease-authority-identity-drift",
+                details={"mismatches": mismatches},
+            )
+        if payload.get("claim_intent_sha256") != intent["intent_sha256"]:
+            raise BureauPickupError("pickup-lease-authority-intent-drift")
+        state = run.get("state")
+        if state in TERMINAL_EXECUTION_STATES:
+            raise BureauPickupError(
+                "pickup-lease-authority-terminal",
+                details={"state": state, "error": run.get("error")},
+            )
+        if state not in ACTIVE_EXECUTION_STATES or run.get("error") is not None:
+            raise BureauPickupError(
+                "pickup-lease-authority-not-active",
+                details={"state": state, "error": run.get("error")},
+            )
+
+    return check
 
 
 def _validate_claim_readback(
@@ -2947,7 +3026,11 @@ def _journaled_orphan_recovery_candidate(
             )
         if already_resumed:
             _validate_resumed_run(
-                coordination, validated_intent, acquisition, journal_identity
+                coordination,
+                validated_intent,
+                acquisition,
+                journal_identity,
+                allow_lease_repair=True,
             )
         elif state == "orphaned":
             _validate_recoverable_orphan(
@@ -3264,6 +3347,8 @@ def _reacquire_orphaned_assignment_leases(
     request: dict[str, Any],
     acquisition: dict[str, Any],
     run_dir: Path,
+    *,
+    allow_expired_rebind: bool = False,
 ) -> dict[str, Any]:
     original_by_key = _orphan_recovery_original_leases(intent, acquisition)
     groups = _acquisition_groups(intent, request)
@@ -3359,6 +3444,18 @@ def _reacquire_orphaned_assignment_leases(
             raise BureauPickupError("orphan-recovery-run-guard-invalid")
         pre_effect_guard()
 
+    if not allow_expired_rebind:
+        expired_keys = [
+            item["resource_key"]
+            for plan in plans
+            for item in plan["expired"]
+        ]
+        if expired_keys:
+            raise BureauPickupError(
+                "orphan-recovery-lease-not-live-for-resume",
+                details={"resource_keys": sorted(expired_keys)},
+            )
+
     actions: list[dict[str, Any]] = []
     rebound_after_snapshots: list[dict[str, Any]] = []
 
@@ -3418,6 +3515,7 @@ def _reacquire_orphaned_assignment_leases(
                 expected_original_leases=[
                     _lease_snapshot(original_by_key[key]) for key in expired_keys
                 ],
+                _commit_precondition=pre_effect_guard,
             )
             result_leases = result.get("leases")
             if not isinstance(result_leases, list):
@@ -3596,8 +3694,23 @@ def _validate_resumed_run(
     intent: dict[str, Any],
     acquisition: dict[str, Any],
     journal_identity: dict[str, Any],
+    *,
+    allow_lease_repair: bool = False,
 ) -> dict[str, Any]:
-    run = _validate_claim_readback(coordination, intent, acquisition)
+    try:
+        run = _validate_claim_readback(coordination, intent, acquisition)
+    except BureauPickupError as exc:
+        lease = coordination.get("lease")
+        if (
+            not allow_lease_repair
+            or exc.code != "claim-readback-blocking-or-incomplete"
+            or not isinstance(lease, dict)
+            or lease.get("status") != "active-binding-drift"
+        ):
+            raise
+        run = coordination.get("run")
+        if not isinstance(run, dict):
+            raise BureauPickupError("claim-readback-run-missing") from exc
     expected = {
         key: journal_identity[key]
         for key in (
@@ -3687,7 +3800,11 @@ def _recover_orphaned_journal_before_claim(
         )
         if already_resumed:
             validated = _validate_resumed_run(
-                observed, intent, acquisition, journal_identity
+                observed,
+                intent,
+                acquisition,
+                journal_identity,
+                allow_lease_repair=True,
             )
         else:
             validated = _validate_recoverable_orphan(
@@ -3709,7 +3826,11 @@ def _recover_orphaned_journal_before_claim(
         _guard_recovery_authority(post_effect=True)
     )
     lease_receipt = _reacquire_orphaned_assignment_leases(
-        intent, lease_request, acquisition, candidate["run_dir"]
+        intent,
+        lease_request,
+        acquisition,
+        candidate["run_dir"],
+        allow_expired_rebind=already_resumed,
     )
     if (
         pre_resume is None
@@ -5846,6 +5967,12 @@ def _repair_existing_assignment_lease_binding(
     repair_request = _existing_assignment_repair_effective_request(
         request, repair_binding
     )
+    lease_commit_precondition = _pickup_lease_commit_precondition(
+        intent,
+        repair_request,
+        allow_unknown_run=False,
+        registry_binding=repair_binding,
+    )
     operator._require_operator_mutation(
         "bureau_mutation", path=repair_request["registry_root"]
     )
@@ -5978,6 +6105,7 @@ def _repair_existing_assignment_lease_binding(
                     expected_original_leases=[
                         _lease_snapshot(original_by_key[key]) for key in expired_keys
                     ],
+                    _commit_precondition=lease_commit_precondition,
                 )
                 _validate_acquired_group(
                     intent["lease_owner_id"], rebound_group, result
@@ -6111,6 +6239,7 @@ def _repair_existing_assignment_lease_binding(
                     ttl_seconds=group["ttl_seconds"],
                     metadata=group["metadata"],
                     nonconflict_proof=group["nonconflict_proof"],
+                    _commit_precondition=lease_commit_precondition,
                 )
                 preserved = {
                     item.get("resource_key") if isinstance(item, dict) else item
@@ -6243,6 +6372,7 @@ def _repair_existing_assignment_lease_binding(
         expected_original_leases=[
             _lease_snapshot(original_by_key[key]) for key in keys
         ],
+        _commit_precondition=lease_commit_precondition,
     )
     _validate_acquired_group(intent["lease_owner_id"], group, result)
     if any(
@@ -6624,6 +6754,7 @@ def grabowski_bureau_pickup_execute(
         normalized,
         run_dir,
         groups=acquisition_groups,
+        registry_binding=registry_binding,
     )
     try:
         commit = _bound_bureau_call(

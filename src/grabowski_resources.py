@@ -5100,6 +5100,7 @@ def acquire_resources(
     nonconflict_proof: dict[str, Any] | None = None,
     admission_assessor: Any | None = None,
     _preserve_live_same_owner: bool = False,
+    _commit_precondition: Any | None = None,
 ) -> dict[str, Any]:
     owner = _owner(owner_id)
     task_owner_match = re.fullmatch(r"task:([0-9a-f]{24})", owner)
@@ -5110,6 +5111,8 @@ def acquire_resources(
         raise ValueError("metadata must be an object")
     if not isinstance(_preserve_live_same_owner, bool):
         raise ValueError("_preserve_live_same_owner must be boolean")
+    if _commit_precondition is not None and not callable(_commit_precondition):
+        raise ValueError("_commit_precondition must be callable")
     if _preserve_live_same_owner and task_owner_match is None:
         raise PermissionError("live lease preservation requires a task owner")
     normalized_metadata: dict[str, Any] = {} if metadata is None else dict(metadata)
@@ -5348,6 +5351,8 @@ def acquire_resources(
                 persisted_metadata,
                 preserve_task_attempt=_preserve_live_same_owner,
             )
+            if _commit_precondition is not None:
+                _commit_precondition()
             for key in keys:
                 row = existing.get(key)
                 live_same_owner = (
@@ -6666,6 +6671,7 @@ def rebind_same_owner_resources(
     metadata: dict[str, Any],
     expected_current_leases: list[dict[str, Any]],
     expected_original_leases: list[dict[str, Any]],
+    _commit_precondition: Any | None = None,
 ) -> dict[str, Any]:
     """Restore an exact journaled lease identity without changing ownership."""
     owner = _owner(owner_id)
@@ -6674,6 +6680,8 @@ def rebind_same_owner_resources(
     ttl = _ttl(ttl_seconds)
     if not isinstance(metadata, dict):
         raise ValueError("metadata must be an object")
+    if _commit_precondition is not None and not callable(_commit_precondition):
+        raise ValueError("_commit_precondition must be callable")
     normalized_metadata = dict(metadata)
     if "lease_mode" in normalized_metadata:
         raise ValueError("metadata.lease_mode is not an authority surface")
@@ -6786,6 +6794,8 @@ def rebind_same_owner_resources(
                         "Journaled lease metadata does not match requested rebind"
                     )
 
+            if _commit_precondition is not None:
+                _commit_precondition()
             for key in keys:
                 row = observed_rows[key]
                 lease_expires = max(int(row["expires_at_unix"]), requested_expires)
