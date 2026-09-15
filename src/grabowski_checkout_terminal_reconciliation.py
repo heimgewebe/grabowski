@@ -253,6 +253,28 @@ def _nul_paths(completed: Any) -> list[str]:
     return sorted(item for item in completed.stdout.split("\0") if item)
 
 
+def _review_evidence_ignored_roots(checkout: Path) -> tuple[list[str], list[str]]:
+    completed = checkouts._git_read(
+        checkout,
+        [
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+        ],
+        check=False,
+    )
+    if completed.returncode != 0:
+        return [], ["review-evidence-ignored-status-unobservable"]
+    paths = _nul_paths(completed)
+    blockers: list[str] = []
+    if any(path != f"{_REVIEW_EVIDENCE_DIR}/" for path in paths):
+        blockers.append("review-evidence-ignored-content-outside-allowlist")
+    return paths, blockers
+
+
 def _thread_focus_review_evidence_paths(
     checkout: Path, status: dict[str, Any]
 ) -> tuple[list[str], list[str]]:
@@ -306,25 +328,8 @@ def _thread_focus_review_evidence_paths(
     else:
         untracked_paths = _nul_paths(untracked)
 
-    ignored_roots = checkouts._git_read(
-        checkout,
-        [
-            "ls-files",
-            "--others",
-            "--ignored",
-            "--exclude-standard",
-            "--directory",
-            "-z",
-        ],
-        check=False,
-    )
-    if ignored_roots.returncode != 0:
-        blockers.append("review-evidence-ignored-status-unobservable")
-        ignored_root_paths: list[str] = []
-    else:
-        ignored_root_paths = _nul_paths(ignored_roots)
-        if any(path != f"{_REVIEW_EVIDENCE_DIR}/" for path in ignored_root_paths):
-            blockers.append("review-evidence-ignored-content-outside-allowlist")
+    _, ignored_root_blockers = _review_evidence_ignored_roots(checkout)
+    blockers.extend(ignored_root_blockers)
 
     ignored_audits = checkouts._git_read(
         checkout,
@@ -354,6 +359,7 @@ def _thread_focus_review_evidence_paths(
     ):
         blockers.append("review-evidence-status-count-mismatch")
     return paths, blockers
+
 
 def _review_evidence_filename(raw_path: str) -> str | None:
     relative = Path(raw_path)
@@ -504,6 +510,10 @@ def _thread_focus_review_evidence_observation(
 ) -> dict[str, Any]:
     checkout = Path(record["path"])
     paths, blockers = _thread_focus_review_evidence_paths(checkout, status)
+    ignored_roots_before_hash, ignored_root_blockers = _review_evidence_ignored_roots(
+        checkout
+    )
+    blockers.extend(ignored_root_blockers)
     if not paths:
         try:
             (checkout / _REVIEW_EVIDENCE_DIR).lstat()
@@ -556,12 +566,27 @@ def _thread_focus_review_evidence_observation(
                     continue
                 total_bytes += int(evidence["bytes"])
                 files.append(evidence)
+            for evidence in files:
+                verified, verification_blockers = _hash_review_evidence_file(
+                    root_descriptor,
+                    str(evidence["path"]),
+                    _REVIEW_EVIDENCE_MAX_TOTAL_BYTES,
+                )
+                blockers.extend(verification_blockers)
+                if verified is not None and verified != evidence:
+                    blockers.append("review-evidence-file-changed-after-read")
             final_root_members, member_blockers = _review_evidence_root_members(
                 root_descriptor
             )
             blockers.extend(member_blockers)
             if final_root_members != expected_root_members:
                 blockers.append("review-evidence-root-membership-drift")
+            ignored_roots_after_hash, ignored_root_blockers = _review_evidence_ignored_roots(
+                checkout
+            )
+            blockers.extend(ignored_root_blockers)
+            if ignored_roots_after_hash != ignored_roots_before_hash:
+                blockers.append("review-evidence-ignored-inventory-drift")
             if not _review_evidence_root_unchanged(checkout, root_identity):
                 blockers.append("review-evidence-root-changed-during-read")
     finally:
@@ -587,6 +612,7 @@ def _thread_focus_review_evidence_observation(
         "eligible": bool(paths) and not blockers,
         "blockers": sorted(set(blockers)),
     }
+
 
 def _present_checkout_observation(binding: dict[str, Any]) -> dict[str, Any]:
     repo = checkouts._resolve_repo(binding["repo_path"])
@@ -900,9 +926,6 @@ def _replay(
     existing_mode = _reconciliation_mode(existing["receipt"])
     if existing["owner_id"] != owner_id:
         if existing_mode == "present_retained":
-            # A completed-retained owner handoff changes lifecycle/retention
-            # authority without rewriting the historical reconciliation receipt.
-            # Let the fresh binding-owner check decide a later missing follow-up.
             return None
         raise PermissionError("terminal reconciliation belongs to another owner")
     if existing["preview_sha256"] != expected_preview_sha256:
