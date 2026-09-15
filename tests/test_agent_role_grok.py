@@ -35,7 +35,7 @@ class GrokReviewRoleTests(unittest.TestCase):
         self.assertEqual(actual[actual.index("--tools") + 1], "todo_write")
         self.assertEqual(
             actual[actual.index("--disallowed-tools") + 1],
-            "todo_write,search_tool,use_tool",
+            "todo_write,search_tool,use_tool,run_terminal_cmd,run_terminal_command",
         )
         self.assertNotIn("--allow", actual)
         self.assertNotIn("--deny", actual)
@@ -105,6 +105,175 @@ class GrokReviewRoleTests(unittest.TestCase):
                     str(patch_path),
                     hashlib.sha256(patch_path.read_bytes()).hexdigest(),
                 )
+
+    def test_bound_review_input_artifact_requires_private_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace_root = root / "gaw-a2345678"
+            workspace_root.mkdir(mode=0o700)
+            patch_path = workspace_root / "writer.patch"
+            patch_bytes = b"diff --git a/src/app.py b/src/app.py\n+dirty = True\n"
+            patch_path.write_bytes(patch_bytes)
+            os.chmod(patch_path, 0o600)
+            os.chmod(root, 0o750)
+            with self.assertRaisesRegex(RuntimeError, "workspace root"):
+                role.read_bound_review_input_artifact(
+                    str(root), str(patch_path), hashlib.sha256(patch_bytes).hexdigest()
+                )
+
+    def test_bound_review_input_artifact_rejects_wrong_owner_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace_root = root / "gaw-a2345678"
+            workspace_root.mkdir(mode=0o700)
+            patch_path = workspace_root / "writer.patch"
+            patch_bytes = b"diff --git a/src/app.py b/src/app.py\n+dirty = True\n"
+            patch_path.write_bytes(patch_bytes)
+            os.chmod(patch_path, 0o600)
+            expected_uid = os.getuid() + 1
+            with mock.patch.object(role.os, "getuid", return_value=expected_uid):
+                with self.assertRaisesRegex(RuntimeError, "workspace root"):
+                    role.read_bound_review_input_artifact(
+                        str(root), str(patch_path), hashlib.sha256(patch_bytes).hexdigest()
+                    )
+
+    def test_bound_review_input_artifact_requires_private_workspace_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace_root = root / "gaw-a2345678"
+            workspace_root.mkdir(mode=0o700)
+            patch_path = workspace_root / "writer.patch"
+            patch_bytes = b"diff --git a/src/app.py b/src/app.py\n+dirty = True\n"
+            patch_path.write_bytes(patch_bytes)
+            os.chmod(patch_path, 0o600)
+            os.chmod(workspace_root, 0o750)
+            with self.assertRaisesRegex(RuntimeError, "canonical private workspace patch"):
+                role.read_bound_review_input_artifact(
+                    str(root), str(patch_path), hashlib.sha256(patch_bytes).hexdigest()
+                )
+
+    def test_bound_review_input_artifact_rejects_static_workspace_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            real_workspace = root / "gaw-b2345678"
+            real_workspace.mkdir(mode=0o700)
+            real_patch = real_workspace / "writer.patch"
+            patch_bytes = b"diff --git a/src/app.py b/src/app.py\n+dirty = True\n"
+            real_patch.write_bytes(patch_bytes)
+            os.chmod(real_patch, 0o600)
+            linked_workspace = root / "gaw-a2345678"
+            linked_workspace.symlink_to(real_workspace, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "could not be read safely"):
+                role.read_bound_review_input_artifact(
+                    str(root),
+                    str(linked_workspace / "writer.patch"),
+                    hashlib.sha256(patch_bytes).hexdigest(),
+                )
+
+    def test_bound_review_input_artifact_rejects_patch_symlink_and_hardlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace_root = root / "gaw-a2345678"
+            workspace_root.mkdir(mode=0o700)
+            patch_bytes = b"diff --git a/src/app.py b/src/app.py\n+dirty = True\n"
+            patch_sha256 = hashlib.sha256(patch_bytes).hexdigest()
+
+            symlink_target = workspace_root / "writer-round-0002.patch"
+            symlink_target.write_bytes(patch_bytes)
+            os.chmod(symlink_target, 0o600)
+            patch_path = workspace_root / "writer.patch"
+            patch_path.symlink_to(symlink_target.name)
+            with self.assertRaisesRegex(RuntimeError, "could not be read safely"):
+                role.read_bound_review_input_artifact(
+                    str(root), str(patch_path), patch_sha256
+                )
+
+            patch_path.unlink()
+            hardlink_source = root / "hardlink-source.patch"
+            hardlink_source.write_bytes(patch_bytes)
+            os.chmod(hardlink_source, 0o600)
+            os.link(hardlink_source, patch_path)
+            with self.assertRaisesRegex(RuntimeError, "safety boundary"):
+                role.read_bound_review_input_artifact(
+                    str(root), str(patch_path), patch_sha256
+                )
+
+    def test_bound_review_input_artifact_rejects_exact_one_mib(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace_root = root / "gaw-a2345678"
+            workspace_root.mkdir(mode=0o700)
+            patch_path = workspace_root / "writer.patch"
+            patch_bytes = b"x" * role.MAX_GROK_REVIEW_INPUT_BYTES
+            patch_path.write_bytes(patch_bytes)
+            os.chmod(patch_path, 0o600)
+            with self.assertRaisesRegex(RuntimeError, "safety boundary"):
+                role.read_bound_review_input_artifact(
+                    str(root), str(patch_path), hashlib.sha256(patch_bytes).hexdigest()
+                )
+
+    def test_bound_review_input_artifact_rejects_patch_change_during_read(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace_root = root / "gaw-a2345678"
+            workspace_root.mkdir(mode=0o700)
+            patch_path = workspace_root / "writer.patch"
+            patch_bytes = b"diff --git a/src/app.py b/src/app.py\n+dirty = True\n"
+            patch_path.write_bytes(patch_bytes)
+            os.chmod(patch_path, 0o600)
+            patch_sha256 = hashlib.sha256(patch_bytes).hexdigest()
+            real_read = os.read
+            changed = False
+
+            def racing_read(descriptor, count):
+                nonlocal changed
+                chunk = real_read(descriptor, count)
+                if chunk and not changed:
+                    patch_path.write_bytes(patch_bytes + b"# changed\n")
+                    os.chmod(patch_path, 0o600)
+                    changed = True
+                return chunk
+
+            with mock.patch.object(role.os, "read", side_effect=racing_read):
+                with self.assertRaisesRegex(RuntimeError, "changed while being read"):
+                    role.read_bound_review_input_artifact(
+                        str(root), str(patch_path), patch_sha256
+                    )
+            self.assertTrue(changed)
+
+    def test_bound_review_input_artifact_rejects_intermediate_symlink_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as outside_temporary:
+            root = Path(temporary)
+            workspace_root = root / "gaw-a2345678"
+            workspace_root.mkdir(mode=0o700)
+            patch_path = workspace_root / "writer.patch"
+            patch_bytes = b"diff --git a/src/app.py b/src/app.py\n+dirty = True\n"
+            patch_path.write_bytes(patch_bytes)
+            os.chmod(patch_path, 0o600)
+            outside = Path(outside_temporary)
+            outside_patch = outside / "writer.patch"
+            outside_patch.write_bytes(patch_bytes)
+            os.chmod(outside_patch, 0o600)
+            patch_sha256 = hashlib.sha256(patch_bytes).hexdigest()
+            real_open = os.open
+            swapped = False
+
+            def racing_open(path_value, flags, mode=0o777, *, dir_fd=None):
+                nonlocal swapped
+                fd = real_open(path_value, flags, mode, dir_fd=dir_fd)
+                if not swapped and dir_fd is None and Path(path_value) == root.resolve():
+                    preserved = root / "preserved-workspace"
+                    workspace_root.rename(preserved)
+                    workspace_root.symlink_to(outside, target_is_directory=True)
+                    swapped = True
+                return fd
+
+            with mock.patch.object(role.os, "open", side_effect=racing_open):
+                with self.assertRaisesRegex(RuntimeError, "could not be read safely"):
+                    role.read_bound_review_input_artifact(
+                        str(root), str(patch_path), patch_sha256
+                    )
+            self.assertTrue(swapped)
 
     def test_dirty_grok_review_uses_frozen_patch_instead_of_committed_diff(self) -> None:
         head = "a" * 40
@@ -227,7 +396,7 @@ class GrokReviewRoleTests(unittest.TestCase):
         self.assertEqual(actual[actual.index("--tools") + 1], "todo_write")
         self.assertEqual(
             actual[actual.index("--disallowed-tools") + 1],
-            "todo_write,search_tool,use_tool",
+            "todo_write,search_tool,use_tool,run_terminal_cmd,run_terminal_command",
         )
         self.assertEqual(sandbox_argv.call_args.kwargs["declared_command"], declared)
 

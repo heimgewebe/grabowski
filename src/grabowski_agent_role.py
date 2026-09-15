@@ -28,7 +28,7 @@ TOOLCHAIN_PROBE_CONTRACT = "role-toolchain-probe-v2"
 REVIEW_DOCUMENT_CONTRACT = "review-document-wrapper-v2"
 GROK_REVIEW_STREAM_CONTRACT = "grok-streaming-json-bound-diff-review-v2"
 GROK_REVIEW_TOOLS = "todo_write"
-GROK_REVIEW_DISALLOWED_TOOLS = "todo_write,search_tool,use_tool"
+GROK_REVIEW_DISALLOWED_TOOLS = "todo_write,search_tool,use_tool,run_terminal_cmd,run_terminal_command"
 GROK_REVIEW_MAX_TURNS = 2
 GROK_REVIEW_EVENT_TYPES = frozenset(
     {
@@ -156,28 +156,51 @@ def read_bound_review_input_artifact(
     if not path.is_absolute():
         raise RuntimeError("review input artifact path must be absolute")
     try:
-        root = root_path.resolve(strict=True)
-        parent = path.parent.resolve(strict=True)
-        relative_parent = parent.relative_to(root)
-        parent_metadata = parent.stat()
-    except (OSError, ValueError) as exc:
+        relative = path.relative_to(root_path)
+    except ValueError as exc:
         raise RuntimeError("review input artifact is outside the canonical workspace root") from exc
     if (
-        len(relative_parent.parts) != 1
-        or WORKSPACE_ID.fullmatch(relative_parent.parts[0]) is None
-        or WRITER_PATCH_NAME.fullmatch(path.name) is None
-        or not stat.S_ISDIR(parent_metadata.st_mode)
-        or parent_metadata.st_uid != os.getuid()
-        or stat.S_IMODE(parent_metadata.st_mode) & 0o077
+        len(relative.parts) != 2
+        or ".." in root_path.parts
+        or ".." in relative.parts
+        or WORKSPACE_ID.fullmatch(relative.parts[0]) is None
+        or WRITER_PATCH_NAME.fullmatch(relative.parts[1]) is None
     ):
         raise RuntimeError("review input artifact path is not a canonical private workspace patch")
-    canonical_path = parent / path.name
+
+    root_descriptor = -1
+    parent_descriptor = -1
     descriptor = -1
+    directory_flags = (
+        os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+    )
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
     try:
-        descriptor = os.open(
-            canonical_path,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        # Do not resolve the root or gaw-* component before opening them: resolve()
+        # would follow a symlink and turn the later O_NOFOLLOW checks into a no-op.
+        # Bind the exact two-component lexical shape above, then pin each object
+        # through descriptor-relative no-follow opens.
+        root_descriptor = os.open(root_path, directory_flags)
+        root_metadata = os.fstat(root_descriptor)
+        if (
+            not stat.S_ISDIR(root_metadata.st_mode)
+            or root_metadata.st_uid != os.getuid()
+            or stat.S_IMODE(root_metadata.st_mode) & 0o077
+        ):
+            raise RuntimeError("review input root is not a canonical private workspace root")
+
+        parent_descriptor = os.open(
+            relative.parts[0], directory_flags, dir_fd=root_descriptor
         )
+        parent_metadata = os.fstat(parent_descriptor)
+        if (
+            not stat.S_ISDIR(parent_metadata.st_mode)
+            or parent_metadata.st_uid != os.getuid()
+            or stat.S_IMODE(parent_metadata.st_mode) & 0o077
+        ):
+            raise RuntimeError("review input artifact path is not a canonical private workspace patch")
+
+        descriptor = os.open(relative.parts[1], file_flags, dir_fd=parent_descriptor)
         before = os.fstat(descriptor)
         if (
             not stat.S_ISREG(before.st_mode)
@@ -185,7 +208,7 @@ def read_bound_review_input_artifact(
             or before.st_uid != os.getuid()
             or stat.S_IMODE(before.st_mode) & 0o077
             or before.st_size <= 0
-            or before.st_size > MAX_GROK_REVIEW_INPUT_BYTES
+            or before.st_size >= MAX_GROK_REVIEW_INPUT_BYTES
         ):
             raise RuntimeError("review input artifact exceeds the Grok safety boundary or is unsafe")
         chunks: list[bytes] = []
@@ -212,6 +235,10 @@ def read_bound_review_input_artifact(
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+        if root_descriptor >= 0:
+            os.close(root_descriptor)
 
 
 def current_binding(repo: Path, base: str) -> tuple[str, str, bool]:
