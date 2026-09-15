@@ -52,13 +52,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python -m pytest -q \
-            tests/test_checkout_terminal_reconciliation.py \
-            tests/test_checkout_terminal_reconciliation_toctou.py \
-            tests/test_checkout_terminal_reconciliation_index_flags.py \
-            tests/test_grips.py \
-            -k 'checkout_binding_terminal_apply or thread_focus or review_evidence or commit_boundary or after_review_evidence'
-          python -m unittest tests.test_publication_profiles tests.test_operator_context -v
+          python -m unittest -v \
+            tests.test_checkout_terminal_reconciliation \
+            tests.test_checkout_terminal_reconciliation_toctou \
+            tests.test_checkout_terminal_reconciliation_index_flags \
+            tests.test_grips \
+            tests.test_publication_profiles \
+            tests.test_operator_context
           git diff --check
 
       - name: Full repository validation before publication
