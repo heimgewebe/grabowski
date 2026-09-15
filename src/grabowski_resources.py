@@ -4864,6 +4864,7 @@ def acquire_merge_guard_resources(
                     raise ValueError("delegated Bureau lease bindings changed")
             existing_owned_keys: set[str] = set()
             delegated_operator_target_keys: set[str] = set()
+            delegated_bureau_target_keys: set[str] = set()
             for row in rows:
                 row_key = row["resource_key"]
                 row_metadata = _row_metadata(row)
@@ -4953,6 +4954,12 @@ def acquire_merge_guard_resources(
                     and row_key in delegated_resource_keys
                 ):
                     delegated_operator_target_keys.add(str(row_key))
+                if (
+                    delegated_bureau is not None
+                    and same_lease_owner
+                    and row_key in delegated_resource_keys
+                ):
+                    delegated_bureau_target_keys.add(str(row_key))
                 if same_lease_owner:
                     if (
                         delegated_operator_authority_key is not None
@@ -4982,6 +4989,10 @@ def acquire_merge_guard_resources(
             if delegated_operator is not None and not delegated_operator_target_keys:
                 raise ValueError(
                     "delegated Operator leases do not bind the merge target"
+                )
+            if delegated_bureau is not None and not delegated_bureau_target_keys:
+                raise ValueError(
+                    "delegated Bureau leases do not bind the merge target"
                 )
             keys_to_acquire = [
                 key for key in keys if key not in existing_owned_keys
@@ -5077,6 +5088,11 @@ def acquire_merge_guard_resources(
         "delegated_bureau_run_id": delegated_bureau_run_id,
         "delegated_bureau_resource_keys": (
             delegated_resource_keys if delegated_bureau is not None else []
+        ),
+        "delegated_bureau_target_resource_keys": (
+            sorted(delegated_bureau_target_keys)
+            if delegated_bureau is not None
+            else []
         ),
         "delegated_bureau_lease_snapshots": (
             delegated_bureau_snapshots if delegated_bureau is not None else []

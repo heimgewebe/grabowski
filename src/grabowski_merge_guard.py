@@ -5147,6 +5147,28 @@ class CaptainMergeGuardRunner:
                 "delegated_operator_authority_key": self.acquisition.get(
                     "delegated_operator_authority_key"
                 ),
+                "delegated_bureau_resource_keys_sha256": (
+                    _sha256_json(
+                        self.acquisition.get("delegated_bureau_resource_keys", [])
+                    )
+                    if self.acquisition.get("delegated_bureau_run_id") is not None
+                    else None
+                ),
+                "delegated_bureau_target_resource_keys_sha256": (
+                    _sha256_json(
+                        self.acquisition.get(
+                            "delegated_bureau_target_resource_keys", []
+                        )
+                    )
+                    if self.acquisition.get("delegated_bureau_run_id") is not None
+                    else None
+                ),
+                "delegated_bureau_lease_bindings_sha256": self.acquisition.get(
+                    "delegated_bureau_lease_bindings_sha256"
+                ),
+                "delegated_bureau_delegation_sha256": self.acquisition.get(
+                    "delegated_bureau_delegation_sha256"
+                ),
             }
         )
         decision_binding = {

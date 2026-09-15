@@ -16477,6 +16477,10 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual(
             "bureau_run", guard["lease_owner_binding"]["delegation_kind"]
         )
+        self.assertEqual(
+            merge_guard._sha256_json([changed_path_key]),
+            guard["delegated_bureau_target_resource_keys_sha256"],
+        )
         remaining = resources.inspect_resource(changed_path_key)
         self.assertIsNotNone(remaining)
         assert remaining is not None
@@ -16486,6 +16490,80 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         )
         self.assertEqual(
             1, len([call for call in gh.calls if call[:2] == ("pr", "merge")])
+        )
+
+    def test_atomic_merge_guard_rejects_unrelated_server_delegated_bureau_run_lease(self) -> None:
+        class Session:
+            pass
+
+        run_id = "BUR-RUN-20260914T120000Z-aaaaaaaaaa"
+        owner = f"bureau-run:{run_id}"
+        unrelated_key = "component:test-unrelated-bureau-delegation"
+        resources.acquire_resources(
+            owner,
+            [unrelated_key],
+            purpose="live but merge-unrelated Bureau lease",
+            ttl_seconds=600,
+            metadata={"run_id": run_id},
+        )
+        resource_evidence = resources.bureau_run_lease_delegation_evidence(owner)
+        evidence = {
+            **resource_evidence,
+            "task_id": "TASK-1",
+            "worker_id": "worker-1",
+            "coordination_sha256": "e" * 64,
+        }
+        parameters = authorized_captain_run_parameters()
+        parameters["execution_intent"]["context"]["lease_owner_id"] = owner
+        parameters["execution_intent"] = captain_execution_intent(
+            parameters, context=parameters["execution_intent"]["context"]
+        )
+        actor = merge_guard.issue_server_runtime_actor_identity(
+            Session(), profile="trusted-owner"
+        )
+        parameters["_server_runtime_actor_identity"] = actor
+        parameters["_server_bureau_run_lease_delegation"] = (
+            merge_guard.issue_server_bureau_run_lease_delegation(
+                actor,
+                evidence,
+                captain_request_sha256_value=merge_guard.captain_request_sha256(
+                    parameters
+                ),
+            )
+        )
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": CAPTAIN_BASE_SHA,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            }
+        )
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        guard = result["output"]["executions"][0]["merge_lease_guard"]
+        self.assertEqual("blocked_by_live_lease", guard["status"])
+        self.assertTrue(
+            any(
+                "delegated Bureau leases do not bind the merge target" in item
+                for item in guard["errors"]
+            )
+        )
+        self.assertEqual(
+            [], [call for call in gh.calls if call[:2] == ("pr", "merge")]
         )
 
     def test_atomic_merge_guard_rejects_unsigned_direct_operator_owner(self) -> None:
