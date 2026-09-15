@@ -2330,6 +2330,15 @@ class OperatorContractTests(unittest.TestCase):
             expected = operator.decision_reviews.normalize_binding(decision_binding)
             self.assertEqual(job["scope"]["decision_bound_review"], expected)
             self.assertEqual(job["origin"]["scope"]["decision_bound_review"], expected)
+            self.assertIsInstance(job["scope"]["started_at_unix_ns"], int)
+            self.assertEqual(
+                job["origin"]["scope"]["started_at_unix_ns"],
+                job["scope"]["started_at_unix_ns"],
+            )
+            self.assertEqual(
+                job["scope"]["started_at_unix_ns"] // 1_000_000_000,
+                job["created_at_unix"],
+            )
             self.assertEqual(
                 job["decision_review_contract"]["prefix"],
                 operator.decision_reviews.RESULT_PREFIX,
@@ -2341,6 +2350,10 @@ class OperatorContractTests(unittest.TestCase):
             persisted = json.loads(Path(job["metadata_path"]).read_text(encoding="utf-8"))
             self.assertEqual(
                 persisted["origin"]["scope"]["decision_bound_review"], expected
+            )
+            self.assertEqual(
+                persisted["origin"]["scope"]["started_at_unix_ns"],
+                job["scope"]["started_at_unix_ns"],
             )
 
     def test_job_start_origin_binds_server_derived_independent_reviewer_provenance(self) -> None:
