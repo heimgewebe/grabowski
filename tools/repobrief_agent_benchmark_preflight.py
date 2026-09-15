@@ -204,15 +204,13 @@ def _validated_claude_usage_window(
     if not isinstance(window, dict):
         return None
     utilization = window.get("utilization")
-    if (
-        isinstance(utilization, bool)
-        or not isinstance(utilization, (int, float))
-        or not math.isfinite(float(utilization))
-    ):
+    if isinstance(utilization, bool) or not isinstance(utilization, (int, float)):
+        return None
+    if isinstance(utilization, float) and not math.isfinite(utilization):
+        return None
+    if utilization < 0 or utilization > 100:
         return None
     utilization_percent = float(utilization)
-    if utilization_percent < 0 or utilization_percent > 100:
-        return None
     resets_at = window.get("resets_at")
     if resets_at is not None and (
         not isinstance(resets_at, str) or not resets_at.strip()
@@ -431,7 +429,6 @@ def _dispatch_provider_binding_adapter(
             "credential_digest_public": False,
             "commitment": commitment,
         },
-        "quota_readiness": _claude_quota_readiness(credential_data),
     }
 
 

@@ -617,14 +617,20 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
             )
             authorized_token = support.preflight._authorized_credential_sha256.set(None)
             try:
-                with mock.patch.dict(
-                    os.environ,
-                    {support.preflight.CLAUDE_AUTH_ROOT_ENV: str(root)},
-                    clear=False,
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {support.preflight.CLAUDE_AUTH_ROOT_ENV: str(root)},
+                        clear=False,
+                    ),
+                    mock.patch.object(
+                        support.preflight, "_claude_quota_readiness"
+                    ) as quota_readiness,
                 ):
                     binding = support.preflight._dispatch_provider_binding_adapter(
                         str(launcher), False
                     )
+                    quota_readiness.assert_not_called()
             finally:
                 support.preflight._authorized_credential_sha256.reset(authorized_token)
                 support.preflight._credential_commitment_issued_at.reset(commitment_time_token)
@@ -645,15 +651,7 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
             self.assertNotIn(
                 raw_credential_digest, json.dumps(binding["credential"], sort_keys=True)
             )
-            self.assertEqual(binding["quota_readiness"]["status"], "unknown")
-            self.assertIsNone(binding["quota_readiness"]["provider_available"])
-            self.assertFalse(
-                binding["quota_readiness"]["authentication_is_quota_evidence"]
-            )
-            self.assertIn(
-                "provider_availability",
-                binding["quota_readiness"]["does_not_establish"],
-            )
+            self.assertNotIn("quota_readiness", binding)
 
 
     def test_noncanonical_credential_path_blocks_before_secret_read(self) -> None:
@@ -889,6 +887,7 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
             (valid_credential, "required_usage_windows_unavailable", {"five_hour": {"utilization": 1.0, "resets_at": None}}),
             (valid_credential, "required_usage_windows_unavailable", {"five_hour": {"utilization": True, "resets_at": None}, "seven_day": {"utilization": 1.0, "resets_at": None}}),
             (valid_credential, "required_usage_windows_unavailable", {"five_hour": {"utilization": 101.0, "resets_at": None}, "seven_day": {"utilization": 1.0, "resets_at": None}}),
+            (valid_credential, "required_usage_windows_unavailable", {"five_hour": {"utilization": 10**400, "resets_at": None}, "seven_day": {"utilization": 1.0, "resets_at": None}}),
             (valid_credential, "usage_response_invalid", b"not-json"),
         ]
         for credential, reason, response_body in cases:
