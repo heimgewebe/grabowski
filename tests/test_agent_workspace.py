@@ -3171,6 +3171,9 @@ class AgentWorkspaceTests(unittest.TestCase):
         )
 
         self.assertEqual(
+            argv[argv.index("--review-input-root") + 1], str(workspace._ensure_root())
+        )
+        self.assertEqual(
             argv[argv.index("--review-input-path") + 1], writer_result["path"]
         )
         self.assertEqual(
@@ -3189,6 +3192,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             False,
             command=["grok", "--model", "grok-4.6", "review this"],
         )
+        self.assertNotIn("--review-input-root", clean_argv)
         self.assertNotIn("--review-input-path", clean_argv)
         self.assertNotIn("--review-input-sha256", clean_argv)
 

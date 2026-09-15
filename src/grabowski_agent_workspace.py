@@ -3220,6 +3220,8 @@ def _role_task_argv(
                 "dirty Grok review requires the exact verified frozen writer patch"
             )
         review_input_arguments = [
+            "--review-input-root",
+            str(_ensure_root()),
             "--review-input-path",
             str(writer_result["path"]),
             "--review-input-sha256",

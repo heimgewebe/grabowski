@@ -83,19 +83,28 @@ class GrokReviewRoleTests(unittest.TestCase):
             patch_path.write_bytes(patch_bytes)
             os.chmod(patch_path, 0o600)
             patch_sha256 = hashlib.sha256(patch_bytes).hexdigest()
-            with mock.patch.object(role, "REVIEW_INPUT_ROOT", root):
-                self.assertEqual(
-                    role.read_bound_review_input_artifact(str(patch_path), patch_sha256),
-                    patch_bytes,
+            self.assertEqual(
+                role.read_bound_review_input_artifact(
+                    str(root), str(patch_path), patch_sha256
+                ),
+                patch_bytes,
+            )
+            with self.assertRaisesRegex(RuntimeError, "SHA-256 mismatch"):
+                role.read_bound_review_input_artifact(
+                    str(root), str(patch_path), "0" * 64
                 )
-                with self.assertRaisesRegex(RuntimeError, "SHA-256 mismatch"):
-                    role.read_bound_review_input_artifact(str(patch_path), "0" * 64)
-                patch_path.write_bytes(b"x" * (role.MAX_GROK_REVIEW_INPUT_BYTES + 1))
-                os.chmod(patch_path, 0o600)
-                with self.assertRaisesRegex(RuntimeError, "safety boundary"):
-                    role.read_bound_review_input_artifact(
-                        str(patch_path), hashlib.sha256(patch_path.read_bytes()).hexdigest()
-                    )
+            with self.assertRaisesRegex(RuntimeError, "outside the canonical workspace root"):
+                role.read_bound_review_input_artifact(
+                    str(root / "other-root"), str(patch_path), patch_sha256
+                )
+            patch_path.write_bytes(b"x" * (role.MAX_GROK_REVIEW_INPUT_BYTES + 1))
+            os.chmod(patch_path, 0o600)
+            with self.assertRaisesRegex(RuntimeError, "safety boundary"):
+                role.read_bound_review_input_artifact(
+                    str(root),
+                    str(patch_path),
+                    hashlib.sha256(patch_path.read_bytes()).hexdigest(),
+                )
 
     def test_dirty_grok_review_uses_frozen_patch_instead_of_committed_diff(self) -> None:
         head = "a" * 40
@@ -123,7 +132,6 @@ class GrokReviewRoleTests(unittest.TestCase):
             os.chmod(patch_path, 0o600)
             patch_sha256 = hashlib.sha256(patch_bytes).hexdigest()
             with (
-                mock.patch.object(role, "REVIEW_INPUT_ROOT", root),
                 mock.patch.object(
                     role, "current_binding",
                     side_effect=[(head, diff, True), (head, diff, True)],
@@ -145,6 +153,7 @@ class GrokReviewRoleTests(unittest.TestCase):
                         "--expected-base-head", base,
                         "--expected-diff-sha256", diff,
                         "--expected-dirty", "true",
+                        "--review-input-root", str(root),
                         "--review-input-path", str(patch_path),
                         "--review-input-sha256", patch_sha256,
                         "--output", "/tmp/grok-dirty-review-receipt.json",

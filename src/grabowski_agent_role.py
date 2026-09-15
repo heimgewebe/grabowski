@@ -18,12 +18,6 @@ MAX_ROLE_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_REVIEW_JSON_BYTES = 1024 * 1024
 MAX_GROK_REVIEW_STREAM_BYTES = 2 * 1024 * 1024
 MAX_GROK_REVIEW_INPUT_BYTES = 1024 * 1024
-REVIEW_INPUT_ROOT = Path(
-    os.environ.get(
-        "GRABOWSKI_AGENT_WORKSPACE_ROOT",
-        str(Path.home() / ".local/state/grabowski/agent-workspaces"),
-    )
-).expanduser()
 WORKSPACE_ID = __import__("re").compile(r"^gaw-[a-z0-9][a-z0-9-]{7,79}$")
 WRITER_PATCH_NAME = __import__("re").compile(r"^writer(?:-round-[0-9]{4})?\.patch$")
 MAX_UNTRACKED_FILE_BYTES = 16 * 1024 * 1024
@@ -149,15 +143,20 @@ def committed_diff(repo: Path, base: str, head: str) -> bytes:
     )
 
 
-def read_bound_review_input_artifact(path_value: str, expected_sha256: str) -> bytes:
-    """Read one canonical private workspace patch with exact content binding."""
+def read_bound_review_input_artifact(
+    root_value: str, path_value: str, expected_sha256: str
+) -> bytes:
+    """Read one canonical private workspace patch with exact root/content binding."""
     if SHA256.fullmatch(expected_sha256) is None:
         raise RuntimeError("review input artifact requires an exact SHA-256")
+    root_path = Path(root_value)
     path = Path(path_value)
+    if not root_path.is_absolute():
+        raise RuntimeError("review input root must be absolute")
     if not path.is_absolute():
         raise RuntimeError("review input artifact path must be absolute")
     try:
-        root = REVIEW_INPUT_ROOT.resolve(strict=True)
+        root = root_path.resolve(strict=True)
         parent = path.parent.resolve(strict=True)
         relative_parent = parent.relative_to(root)
         parent_metadata = parent.stat()
@@ -797,6 +796,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--expected-base-head", required=True)
     parser.add_argument("--expected-diff-sha256", required=True)
     parser.add_argument("--expected-dirty", choices=("true", "false"), required=True)
+    parser.add_argument("--review-input-root")
     parser.add_argument("--review-input-path")
     parser.add_argument("--review-input-sha256")
     parser.add_argument("--output", required=True)
@@ -815,11 +815,12 @@ def main(argv: list[str] | None = None) -> int:
     ):
         parser.error("invalid command or binding")
     expected_dirty = args.expected_dirty == "true"
-    review_artifact_declared = (
-        args.review_input_path is not None or args.review_input_sha256 is not None
+    review_artifact_values = (
+        args.review_input_root, args.review_input_path, args.review_input_sha256
     )
-    if (args.review_input_path is None) != (args.review_input_sha256 is None):
-        parser.error("review input path and SHA-256 must be supplied together")
+    review_artifact_declared = any(value is not None for value in review_artifact_values)
+    if review_artifact_declared and any(value is None for value in review_artifact_values):
+        parser.error("review input root, path, and SHA-256 must be supplied together")
     if args.role != "review" and review_artifact_declared:
         parser.error("review input artifact is only valid for the review role")
     before_head, before_diff, before_dirty = current_binding(repo, args.expected_base_head)
@@ -839,7 +840,9 @@ def main(argv: list[str] | None = None) -> int:
                 if not review_artifact_declared:
                     raise RuntimeError("dirty Grok review requires the frozen writer patch artifact")
                 review_input = read_bound_review_input_artifact(
-                    str(args.review_input_path), str(args.review_input_sha256)
+                    str(args.review_input_root),
+                    str(args.review_input_path),
+                    str(args.review_input_sha256),
                 )
                 review_input_source = "frozen_writer_patch"
             else:
