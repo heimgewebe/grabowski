@@ -3148,6 +3148,67 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertTrue(workspace._verify_patch_artifact(frozen["writer_result"]))
         self.assertTrue(self.git.writer.exists())
 
+    def test_dirty_grok_role_argv_binds_exact_frozen_patch_with_untracked_files(self) -> None:
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text("dirty = True\n", encoding="utf-8")
+        (self.git.writer / "src" / "new.py").write_text("untracked = True\n", encoding="utf-8")
+        snapshot = workspace._git_snapshot(manifest, workspace._run)
+        writer_result = workspace._materialize_writer_patch(manifest, snapshot, workspace._run)
+        manifest["frozen_writer"] = {
+            "writer_head": snapshot["writer_head"],
+            "diff_sha256": snapshot["diff_sha256"],
+            "dirty": snapshot["dirty"],
+            "writer_result": writer_result,
+        }
+
+        argv = workspace._role_task_argv(
+            manifest,
+            "review",
+            snapshot["writer_head"],
+            snapshot["diff_sha256"],
+            True,
+            command=["grok", "--model", "grok-4.6", "review this"],
+        )
+
+        self.assertEqual(
+            argv[argv.index("--review-input-root") + 1], str(workspace._ensure_root())
+        )
+        self.assertEqual(
+            argv[argv.index("--review-input-path") + 1], writer_result["path"]
+        )
+        self.assertEqual(
+            argv[argv.index("--review-input-sha256") + 1], writer_result["sha256"]
+        )
+        patch = Path(writer_result["path"]).read_bytes()
+        self.assertIn(b"dirty = True", patch)
+        self.assertIn(b"new.py", patch)
+        self.assertIn(b"untracked = True", patch)
+
+        clean_argv = workspace._role_task_argv(
+            manifest,
+            "review",
+            snapshot["writer_head"],
+            snapshot["diff_sha256"],
+            False,
+            command=["grok", "--model", "grok-4.6", "review this"],
+        )
+        self.assertNotIn("--review-input-root", clean_argv)
+        self.assertNotIn("--review-input-path", clean_argv)
+        self.assertNotIn("--review-input-sha256", clean_argv)
+
+        Path(writer_result["path"]).write_text("tampered\n", encoding="utf-8")
+        with self.assertRaisesRegex(
+            workspace.AgentWorkspaceError, "exact verified frozen writer patch"
+        ):
+            workspace._role_task_argv(
+                manifest,
+                "review",
+                snapshot["writer_head"],
+                snapshot["diff_sha256"],
+                True,
+                command=["grok", "--model", "grok-4.6", "review this"],
+            )
+
     def test_writer_commit_is_rejected_as_unbound_result(self) -> None:
         manifest = self.manifest()
         self.git.commit_writer()
