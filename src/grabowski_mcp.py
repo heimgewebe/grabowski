@@ -12641,6 +12641,7 @@ def _grip_run_core(
             "_server_runtime_actor_identity",
             "_server_task_lease_delegation",
             "_server_operator_lease_delegation",
+            "_server_bureau_run_lease_delegation",
             "_server_tool_contract",
             "_server_runtime",
             "_server_agent_instructions_sha256",
@@ -12762,6 +12763,33 @@ def _grip_run_core(
                     grabowski_merge_guard.issue_server_operator_lease_delegation(
                         actor_identity,
                         operator_evidence,
+                        captain_request_sha256_value=(
+                            grabowski_merge_guard.captain_request_sha256(
+                                dispatch_parameters
+                            )
+                        ),
+                    )
+                )
+            elif (
+                isinstance(requested_lease_owner, str)
+                and re.fullmatch(
+                    r"bureau-run:BUR-RUN-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{10}",
+                    requested_lease_owner,
+                )
+                is not None
+            ):
+                import grabowski_bureau_pickup
+
+                run_id = requested_lease_owner.removeprefix("bureau-run:")
+                bureau_evidence = (
+                    grabowski_bureau_pickup.server_bureau_run_lease_delegation_evidence(
+                        run_id
+                    )
+                )
+                dispatch_parameters["_server_bureau_run_lease_delegation"] = (
+                    grabowski_merge_guard.issue_server_bureau_run_lease_delegation(
+                        actor_identity,
+                        bureau_evidence,
                         captain_request_sha256_value=(
                             grabowski_merge_guard.captain_request_sha256(
                                 dispatch_parameters
