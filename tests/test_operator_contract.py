@@ -2339,6 +2339,14 @@ class OperatorContractTests(unittest.TestCase):
                 job["scope"]["started_at_unix_ns"] // 1_000_000_000,
                 job["created_at_unix"],
             )
+            order_key = operator.job_origin._decision_review_order_key(job["scope"])
+            self.assertIsNotNone(order_key)
+            self.assertTrue(
+                (state / "decision-review-order" / f"{order_key}.json").is_file()
+            )
+            self.assertEqual(job["created_at_unix"], job["origin"]["created_at_unix"])
+            self.assertEqual(job["started_at_unix"], job["origin"]["created_at_unix"])
+            self.assertEqual(job["started_at"], job["origin"]["started_at"])
             self.assertEqual(
                 job["decision_review_contract"]["prefix"],
                 operator.decision_reviews.RESULT_PREFIX,

@@ -6472,7 +6472,11 @@ def _start_job(
         created_at_unix=now_unix,
         started_at=now_iso,
         invoker_tool=invoker_tool,
+        order_root=STATE_DIR / "decision-review-order",
+        jobs_root=JOBS_DIR,
     )
+    effective_created_at_unix = origin["created_at_unix"]
+    effective_started_at = origin["started_at"]
     if deployment_observer_request is not None:
         if not allow_reserved_runtime_deploy or finalization_expected_head is None:
             raise ValueError(
@@ -6533,9 +6537,9 @@ def _start_job(
         "command": _redacted_command(command),
         "cwd": str(working_directory),
         "runtime_seconds": runtime,
-        "created_at_unix": now_unix,
-        "started_at": now_iso,
-        "started_at_unix": now_unix,
+        "created_at_unix": effective_created_at_unix,
+        "started_at": effective_started_at,
+        "started_at_unix": effective_created_at_unix,
         "stdout_path": str(stdout_path),
         "stderr_path": str(stderr_path),
         "expected_receipt": _job_expected_receipt(
