@@ -56,7 +56,10 @@ jobs:
             tests.test_checkout_terminal_reconciliation \
             tests.test_checkout_terminal_reconciliation_toctou \
             tests.test_checkout_terminal_reconciliation_index_flags \
-            tests.test_grips \
+            tests.test_grips.GripFoundationTests.test_checkout_binding_terminal_apply_accepts_identity_catchup_receipt \
+            tests.test_grips.GripFoundationTests.test_checkout_binding_terminal_apply_accepts_descendant_head_rebind_receipt \
+            tests.test_grips.GripFoundationTests.test_checkout_binding_terminal_apply_accepts_present_retained_receipt \
+            tests.test_grips.GripFoundationTests.test_checkout_binding_terminal_apply_grip_requires_mutation_and_exact_cas \
             tests.test_publication_profiles \
             tests.test_operator_context
           git diff --check
