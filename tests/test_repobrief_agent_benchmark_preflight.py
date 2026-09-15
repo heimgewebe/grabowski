@@ -974,6 +974,35 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
         self.assertEqual(status, 0)
         core_main.assert_not_called()
 
+    def test_quota_readiness_only_handles_invalid_canonical_auth_root(self) -> None:
+        argv = [
+            "--claude-quota-readiness-only",
+            "--quota-commitment-nonce",
+            "0" * 32,
+            "--quota-commitment-sha256",
+            "1" * 64,
+            "--quota-commitment-issued-at",
+            "2026-09-15T03:00:00Z",
+        ]
+        stderr = io.StringIO()
+        with (
+            mock.patch.dict(
+                os.environ,
+                {support.preflight.CLAUDE_AUTH_ROOT_ENV: "relative-auth-root"},
+                clear=False,
+            ),
+            redirect_stderr(stderr),
+            mock.patch.object(support.preflight._core, "main") as core_main,
+        ):
+            status = support.preflight.main(argv)
+
+        self.assertEqual(status, 2)
+        core_main.assert_not_called()
+        self.assertEqual(
+            json.loads(stderr.getvalue()),
+            {"status": "error", "error": "canonical Claude auth root is invalid"},
+        )
+
     def test_live_call_requires_explicit_provider_bindings(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

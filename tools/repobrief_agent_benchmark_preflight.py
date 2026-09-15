@@ -613,7 +613,14 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
-        credential = _canonical_claude_credential_path()
+        try:
+            credential = _canonical_claude_credential_path()
+        except _core.PreflightError as exc:
+            print(
+                json.dumps({"status": "error", "error": str(exc)}, sort_keys=True),
+                file=sys.stderr,
+            )
+            return 2
         credential_token = _credential_file.set(credential)
         commitment_nonce_token = _credential_commitment_nonce.set(
             adapter.claude_credential_commitment_nonce
