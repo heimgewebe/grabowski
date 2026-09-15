@@ -102,6 +102,11 @@ class GrokReviewRoleTests(unittest.TestCase):
         )
         self.assertIn("Do not use git log", prompt)
         self.assertIn("Do not use shell control operators", prompt)
+        self.assertIn("at most four tool calls total", prompt)
+        self.assertIn("Never repeat a command", prompt)
+        self.assertIn("Reserve the final turn", prompt)
+        self.assertIn("immediately return the final JSON", prompt)
+        self.assertIn("return NEEDS_CHANGE or BLOCK", prompt)
 
     def test_streaming_review_command_rejects_caller_owned_execution_framing(self) -> None:
         controlled = (

@@ -535,7 +535,14 @@ def _grok_streaming_review_command(
         + expected_base_head.lower()
         + "..."
         + expected_head.lower()
-        + ". Use additional safe Git reads only as separate tool calls when needed."
+        + ". Treat the complete bound diff as primary evidence. Use additional safe Git "
+          "reads only as separate tool calls when one specific material uncertainty cannot be "
+          "resolved from the diff. Hard limit: at most four tool calls total. Never repeat a "
+          "command. Do not request name-status after reading the complete diff. Do not re-read "
+          "an entire changed file unless that specific material uncertainty requires it. Reserve "
+          "the final turn for the required JSON verdict. After the bounded inspection, stop "
+          "reading and immediately return the final JSON. If material uncertainty remains, "
+          "return NEEDS_CHANGE or BLOCK instead of consuming more turns."
     )
     command[-1] = prompt
     review_flags = [
