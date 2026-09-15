@@ -5305,6 +5305,97 @@ class DurableJobFinalizationReceiptTests(unittest.TestCase):
             (directory / "finalization.json").write_text(json.dumps(payload), encoding="utf-8")
         return state, jobs, unit
 
+    def test_decision_review_logical_frontier_does_not_invalidate_completion(self) -> None:
+        operator = _load_operator_module()
+        for legacy in (False, True):
+            for final_status in ("succeeded", "failed"):
+                with self.subTest(legacy=legacy, final_status=final_status):
+                    with tempfile.TemporaryDirectory() as temporary:
+                        root = Path(temporary)
+                        state = root / "state"
+                        jobs = state / "jobs"
+                        locks = state / "decision-review-locks"
+                        binding = {
+                            "schema_version": 1,
+                            "kind": operator.decision_reviews.BINDING_KIND,
+                            "repo": "heimgewebe/grabowski",
+                            "pr": 1221,
+                            "head_sha": "a" * 40,
+                            "base_sha": "b" * 40,
+                            "diff_sha256": "c" * 64,
+                            "slot": "clock-regression",
+                        }
+                        wall_second = 1000
+                        wall_iso = "1970-01-01T00:16:40Z"
+                        frontier_second = wall_second if legacy else 1100
+                        frontier_iso = wall_iso if legacy else "1970-01-01T00:18:20Z"
+                        with patch.object(operator, "STATE_DIR", state), patch.object(
+                            operator, "JOBS_DIR", jobs
+                        ), patch.object(operator.decision_reviews, "LOCKS_ROOT", locks), patch.object(
+                            operator, "_run", return_value=self._systemd_visible_success(root)
+                        ):
+                            with patch.object(
+                                operator.uuid, "uuid4",
+                                return_value=types.SimpleNamespace(hex="a11ce0000000" + "f" * 20),
+                            ), patch.object(
+                                operator, "_job_start_timestamp",
+                                return_value=(frontier_second, frontier_iso, frontier_second * 1_000_000_000 + 500),
+                            ):
+                                prior = operator.grabowski_job_start(
+                                    ["python3", "-c", "print('review')"], cwd=str(root),
+                                    runtime_seconds=60, decision_review_binding=binding,
+                                )
+                            if legacy:
+                                prior_path = Path(prior["metadata_path"])
+                                prior_metadata = json.loads(prior_path.read_text(encoding="utf-8"))
+                                del prior_metadata["origin"]["scope"]["started_at_unix_ns"]
+                                prior_metadata["origin_sha256"] = operator._json_sha256(prior_metadata["origin"])
+                                prior_path.write_text(json.dumps(prior_metadata), encoding="utf-8")
+                            with patch.object(
+                                operator.uuid, "uuid4",
+                                return_value=types.SimpleNamespace(hex="a11ce0000001" + "f" * 20),
+                            ), patch.object(
+                                operator, "_job_start_timestamp",
+                                return_value=(wall_second, wall_iso, wall_second * 1_000_000_000 + 500),
+                            ):
+                                job = operator.grabowski_job_start(
+                                    ["python3", "-c", "print('review')"], cwd=str(root),
+                                    runtime_seconds=60, decision_review_binding=binding,
+                                )
+                        # Origin keeps its historical causal clock; runtime metadata must not.
+                        self.assertGreater(job["scope"]["started_at_unix_ns"], wall_second * 1_000_000_000 + 500)
+                        self.assertEqual(job["created_at_unix"], wall_second)
+                        self.assertEqual(job["started_at_unix"], wall_second)
+                        self.assertEqual(job["started_at"], wall_iso)
+                        self.assertGreater(job["origin"]["created_at_unix"], wall_second)
+                        material = {
+                            **job["finalization_contract"],
+                            "final_status": final_status,
+                            "completion_status": "complete" if final_status == "succeeded" else "failed",
+                            "failure_type": None if final_status == "succeeded" else final_status,
+                            "timestamp_unix": wall_second,
+                        }
+                        receipt_path = Path(job["expected_receipt"]["finalization_path"])
+                        receipt_path.write_text(json.dumps({
+                            **material, "payload_sha256": operator._json_sha256(material),
+                        }), encoding="utf-8")
+                        for _ in range(2):
+                            status = self._status(operator, state, jobs, job["unit"], self._systemd_not_found(root))
+                            self.assertEqual(status["final_status"], final_status)
+                            self.assertTrue(status["finalization_receipt"]["valid"])
+                            self.assertTrue(status["terminalization_evidence"]["fallback_used"])
+                        persisted = json.loads(Path(job["metadata_path"]).read_text(encoding="utf-8"))
+                        self.assertEqual(persisted["created_at_unix"], wall_second)
+                        # Do not weaken the guard against genuinely pre-start receipts.
+                        material["timestamp_unix"] = wall_second - 1
+                        receipt_path.write_text(json.dumps({
+                            **material, "payload_sha256": operator._json_sha256(material),
+                        }), encoding="utf-8")
+                        with patch.object(operator, "STATE_DIR", state), patch.object(operator, "JOBS_DIR", jobs):
+                            invalid = operator._finalization_receipt_result(job["unit"], persisted)
+                        self.assertFalse(invalid["valid"])
+                        self.assertEqual(invalid["reason"], "timestamp_precedes_job")
+
     def test_generic_collected_success_and_delayed_read_are_stable(self) -> None:
         operator = _load_operator_module()
         with tempfile.TemporaryDirectory() as temporary:
