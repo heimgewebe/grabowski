@@ -99,7 +99,7 @@ class DecisionReviewLogicalClockTests(unittest.TestCase):
                 origin, digest = build(
                     "000000000003", 2_000_000_000_500_000_000
                 )
-                state_path = next(job_origin.DECISION_REVIEW_ORDER_ROOT.iterdir())
+                state_path = next(job_origin.DECISION_REVIEW_ORDER_ROOT.glob("*.json"))
                 before = state_path.read_bytes()
                 validated = job_origin.validate_origin(
                     origin,
@@ -132,7 +132,7 @@ class DecisionReviewLogicalClockTests(unittest.TestCase):
                     encoding="utf-8",
                 )
                 os.chmod(metadata_path, 0o600)
-                state_path = next(job_origin.DECISION_REVIEW_ORDER_ROOT.iterdir())
+                state_path = next(job_origin.DECISION_REVIEW_ORDER_ROOT.glob("*.json"))
                 state_path.unlink()
 
                 second, _ = build(
@@ -144,12 +144,43 @@ class DecisionReviewLogicalClockTests(unittest.TestCase):
             first["scope"]["started_at_unix_ns"] + 1,
         )
 
+    def test_interrupted_replace_preserves_last_valid_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            order_patch, jobs_patch = self.roots(temporary)
+            with order_patch, jobs_patch:
+                first, _ = build("000000000009", 2_000_000_000_500_000_000)
+                state_path = next(
+                    job_origin.DECISION_REVIEW_ORDER_ROOT.glob("*.json")
+                )
+                before = state_path.read_bytes()
+                with mock.patch.object(
+                    job_origin.os,
+                    "replace",
+                    side_effect=OSError("simulated interrupted publication"),
+                ):
+                    with self.assertRaisesRegex(
+                        OSError, "simulated interrupted publication"
+                    ):
+                        build("00000000000a", 1_900_000_000_100_000_000)
+                self.assertEqual(state_path.read_bytes(), before)
+                self.assertEqual(
+                    list(job_origin.DECISION_REVIEW_ORDER_ROOT.glob("*.tmp")), []
+                )
+                third, _ = build(
+                    "00000000000b", 1_900_000_000_200_000_000
+                )
+
+        self.assertEqual(
+            third["scope"]["started_at_unix_ns"],
+            first["scope"]["started_at_unix_ns"] + 1,
+        )
+
     def test_corrupt_order_state_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             order_patch, jobs_patch = self.roots(temporary)
             with order_patch, jobs_patch:
                 build("000000000006", 2_000_000_000_500_000_000)
-                state_path = next(job_origin.DECISION_REVIEW_ORDER_ROOT.iterdir())
+                state_path = next(job_origin.DECISION_REVIEW_ORDER_ROOT.glob("*.json"))
                 state_path.write_text("{}", encoding="utf-8")
                 with self.assertRaisesRegex(
                     ValueError, "decision review ordering state"

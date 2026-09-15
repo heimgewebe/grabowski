@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import sys
 
@@ -128,16 +129,22 @@ def make_job(
         )
         assert provenance is not None
         scope["decision_review_provenance"] = provenance
-    origin, origin_sha = job_origin.build_origin(
-        unit=unit,
-        owner="uid:1000",
-        argv_sha256=argv_sha,
-        scope=scope,
-        notify_on_done={"requested": False, "channels": []},
-        created_at_unix=created_at_unix,
-        started_at="2026-08-18T12:00:00Z",
-        invoker_tool="grabowski_job_start",
-    )
+    with (
+        mock.patch.object(
+            job_origin, "DECISION_REVIEW_ORDER_ROOT", jobs.parent / "decision-review-order"
+        ),
+        mock.patch.object(job_origin, "DECISION_REVIEW_JOBS_ROOT", jobs),
+    ):
+        origin, origin_sha = job_origin.build_origin(
+            unit=unit,
+            owner="uid:1000",
+            argv_sha256=argv_sha,
+            scope=scope,
+            notify_on_done={"requested": False, "channels": []},
+            created_at_unix=created_at_unix,
+            started_at="2026-08-18T12:00:00Z",
+            invoker_tool="grabowski_job_start",
+        )
     contract_material = {
         "schema_version": 1,
         "kind": "grabowski_job_finalization",

@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import tempfile
 from typing import Any
 
 from grabowski_consumer_surface import canonical_json_bytes
@@ -277,8 +278,26 @@ def _read_decision_review_order_state(
     return last_logical_ns
 
 
+def _read_decision_review_order_state_path(
+    path: Path, *, key_sha256: str
+) -> int | None:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    try:
+        return _read_decision_review_order_state(
+            descriptor, key_sha256=key_sha256
+        )
+    finally:
+        os.close(descriptor)
+
+
 def _write_decision_review_order_state(
-    descriptor: int, *, key_sha256: str, last_logical_ns: int
+    path: Path, *, key_sha256: str, last_logical_ns: int
 ) -> None:
     state = {
         "schema_version": DECISION_REVIEW_ORDER_SCHEMA_VERSION,
@@ -289,15 +308,36 @@ def _write_decision_review_order_state(
     payload = canonical_json_bytes(state)
     if len(payload) > DECISION_REVIEW_ORDER_MAX_BYTES:
         raise ValueError("decision review ordering state is too large")
-    os.lseek(descriptor, 0, os.SEEK_SET)
-    os.ftruncate(descriptor, 0)
-    view = memoryview(payload)
-    while view:
-        written = os.write(descriptor, view)
-        if written <= 0:
-            raise OSError("short decision review ordering state write")
-        view = view[written:]
-    os.fsync(descriptor)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{key_sha256}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short decision review ordering state write")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, path)
+        directory_fd = os.open(
+            path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _allocate_decision_review_order(
@@ -312,14 +352,23 @@ def _allocate_decision_review_order(
     root = DECISION_REVIEW_ORDER_ROOT
     _ensure_private_directory(root, label="decision review ordering root")
     path = root / f"{key_sha256}.json"
+    lock_path = root / f"{key_sha256}.lock"
     flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    descriptor = os.open(path, flags, 0o600)
+    descriptor = os.open(lock_path, flags, 0o600)
     try:
+        lock_metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(lock_metadata.st_mode)
+            or lock_metadata.st_nlink != 1
+            or lock_metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(lock_metadata.st_mode) & 0o077
+        ):
+            raise PermissionError("decision review ordering lock file is unsafe")
         fcntl.flock(descriptor, fcntl.LOCK_EX)
-        stored_logical_ns = _read_decision_review_order_state(
-            descriptor, key_sha256=key_sha256
+        stored_logical_ns = _read_decision_review_order_state_path(
+            path, key_sha256=key_sha256
         )
         existing_logical_ns = _existing_decision_review_max_ns(key_sha256)
         last_logical_ns = max(
@@ -332,7 +381,7 @@ def _allocate_decision_review_order(
         if logical_ns > DECISION_REVIEW_ORDER_MAX_NS:
             raise OverflowError("decision review logical clock is exhausted")
         _write_decision_review_order_state(
-            descriptor,
+            path,
             key_sha256=key_sha256,
             last_logical_ns=logical_ns,
         )
