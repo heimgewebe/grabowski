@@ -926,6 +926,9 @@ def _replay(
     existing_mode = _reconciliation_mode(existing["receipt"])
     if existing["owner_id"] != owner_id:
         if existing_mode == "present_retained":
+            # A completed-retained owner handoff changes lifecycle/retention
+            # authority without rewriting the historical reconciliation receipt.
+            # Let the fresh binding-owner check decide a later missing follow-up.
             return None
         raise PermissionError("terminal reconciliation belongs to another owner")
     if existing["preview_sha256"] != expected_preview_sha256:
