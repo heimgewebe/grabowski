@@ -6472,6 +6472,8 @@ def _start_job(
         created_at_unix=now_unix,
         started_at=now_iso,
         invoker_tool=invoker_tool,
+        order_root=STATE_DIR / "decision-review-order",
+        jobs_root=JOBS_DIR,
     )
     if deployment_observer_request is not None:
         if not allow_reserved_runtime_deploy or finalization_expected_head is None:
@@ -6533,6 +6535,9 @@ def _start_job(
         "command": _redacted_command(command),
         "cwd": str(working_directory),
         "runtime_seconds": runtime,
+        # Runtime/finalizer time is physical. The versioned origin keeps its
+        # causal ordering clock, which can lead wall time after rollback or a
+        # legacy bridge; copying it here would invalidate timely completion.
         "created_at_unix": now_unix,
         "started_at": now_iso,
         "started_at_unix": now_unix,

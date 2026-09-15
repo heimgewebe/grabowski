@@ -250,6 +250,9 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
         self.assertEqual(reconciled["status"], "settled")
         self.assertEqual(reconciled["slot_count"], 2)
         self.assertTrue(reconciled["read_by_merge_guard"])
+        self.assertTrue(
+            all("started_at_unix_ns" in attempt for attempt in reconciled["attempts"])
+        )
         self.assertEqual(reconciled["errors"], [])
 
     def test_independent_named_generic_marker_is_not_proven_independent(self) -> None:
