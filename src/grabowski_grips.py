@@ -5515,6 +5515,31 @@ def _run_checkout_binding_terminal_apply(
             raise GripActionError("present checkout terminal apply must preserve checkout")
     else:
         raise GripActionError("checkout terminal apply reconciliation mode is invalid")
+    snapshot = terminal_receipt.get("review_evidence_snapshot")
+    if snapshot is not None:
+        import grabowski_checkout_terminal_reconciliation as reconciliation
+
+        manifest = terminal_receipt.get("review_evidence_manifest")
+        source = binding_before.get("source")
+        if (
+            reconciliation_mode != "present_retained"
+            or not isinstance(source, dict)
+            or source.get("kind") != "thread_focus"
+            or not isinstance(manifest, dict)
+            or manifest.get("eligible") is not True
+        ):
+            raise GripActionError("checkout terminal review snapshot is outside admitted scope")
+        try:
+            expected_snapshot = reconciliation._review_snapshot_identity(
+                checkout_key, expected_preview_sha256, manifest
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise GripActionError("checkout terminal review snapshot is invalid") from exc
+        if snapshot != expected_snapshot:
+            raise GripActionError("checkout terminal review snapshot binding mismatch")
+        allowed_effects = tuple(
+            item + ["review_evidence_snapshot_retained"] for item in allowed_effects
+        )
     if effects not in allowed_effects:
         raise GripActionError("checkout terminal apply exceeded bounded lifecycle effects")
     if "terminal_head_rebind" in effects:

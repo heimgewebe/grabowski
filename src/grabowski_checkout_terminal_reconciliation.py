@@ -60,6 +60,7 @@ def _record(checkout_key: str) -> dict[str, Any] | None:
         or source_evidence.get("evidence_sha256") != result["source_evidence_sha256"]
     ):
         raise RuntimeError("terminal reconciliation record digest is invalid")
+    _verify_review_snapshot(receipt)
     return {**result, "receipt": receipt, "source_evidence": source_evidence}
 
 
@@ -412,7 +413,8 @@ def _open_review_evidence_root(
 
 
 def _hash_review_evidence_file(
-    root_descriptor: int, raw_path: str, remaining_bytes: int
+    root_descriptor: int, raw_path: str, remaining_bytes: int,
+    *, capture: dict[str, bytes] | None = None,
 ) -> tuple[dict[str, Any] | None, list[str]]:
     filename = _review_evidence_filename(raw_path)
     if filename is None:
@@ -448,6 +450,7 @@ def _hash_review_evidence_file(
         ):
             return None, ["review-evidence-file-identity-drift"]
         digest = hashlib.sha256()
+        chunks: list[bytes] = []
         observed_bytes = 0
         while True:
             chunk = os.read(descriptor, 1024 * 1024)
@@ -459,6 +462,8 @@ def _hash_review_evidence_file(
             if observed_bytes > remaining_bytes:
                 return None, ["review-evidence-total-size-exceeded"]
             digest.update(chunk)
+            if capture is not None:
+                chunks.append(chunk)
         after = os.fstat(descriptor)
         if (
             before.st_dev != after.st_dev
@@ -470,6 +475,8 @@ def _hash_review_evidence_file(
             or observed_bytes != after.st_size
         ):
             return None, ["review-evidence-file-changed-during-read"]
+        if capture is not None:
+            capture[raw_path] = b"".join(chunks)
         return {
             "path": raw_path,
             "bytes": observed_bytes,
@@ -480,6 +487,131 @@ def _hash_review_evidence_file(
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+
+
+
+def _review_snapshot_identity(
+    checkout_key: str, preview_sha256: str, manifest: dict[str, Any]
+) -> dict[str, Any]:
+    core = {
+        "schema_version": 1,
+        "kind": "terminal_review_evidence_snapshot",
+        "checkout_key": checkout_key,
+        "preview_sha256": preview_sha256,
+        "manifest_sha256": manifest["manifest_sha256"],
+        "file_count": manifest["file_count"],
+        "total_bytes": manifest["total_bytes"],
+        "storage": "checkout_database",
+        "source_files_frozen": False,
+    }
+    return {**core, "snapshot_sha256": checkouts._sha256_json(core)}
+
+
+def _retain_review_snapshot(
+    connection: sqlite3.Connection,
+    checkout_key: str,
+    preview_sha256: str,
+    observation: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Retain bounded evidence bytes in the lifecycle transaction, never in output."""
+    manifest = observation.get("review_evidence")
+    if not isinstance(manifest, dict) or manifest.get("eligible") is not True:
+        return None
+    checkout = Path(observation["checkout_path"])
+    root_fd, identity, blockers = _open_review_evidence_root(checkout)
+    captured: dict[str, bytes] = {}
+    try:
+        if root_fd < 0 or blockers:
+            raise RuntimeError("review evidence snapshot root changed")
+        expected_paths = [item["path"] for item in manifest["files"]]
+        members, blockers = _review_evidence_root_members(root_fd)
+        if blockers or members != expected_paths:
+            raise RuntimeError("review evidence snapshot membership changed")
+        remaining = _REVIEW_EVIDENCE_MAX_TOTAL_BYTES
+        for expected in manifest["files"]:
+            observed, blockers = _hash_review_evidence_file(
+                root_fd, expected["path"], remaining, capture=captured
+            )
+            if blockers or observed != expected:
+                raise RuntimeError("review evidence snapshot content changed")
+            remaining -= expected["bytes"]
+        members, blockers = _review_evidence_root_members(root_fd)
+        if (
+            blockers
+            or members != expected_paths
+            or not _review_evidence_root_unchanged(checkout, identity)
+        ):
+            raise RuntimeError("review evidence snapshot root changed during capture")
+    finally:
+        if root_fd >= 0:
+            os.close(root_fd)
+    snapshot = _review_snapshot_identity(checkout_key, preview_sha256, manifest)
+    # This module owns this additive, private evidence table. It is created only
+    # for the admitted review-evidence path; rollback removes partial snapshots.
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS terminal_review_evidence ("
+        "snapshot_sha256 TEXT NOT NULL, path TEXT NOT NULL, content BLOB NOT NULL, "
+        "PRIMARY KEY(snapshot_sha256, path))"
+    )
+    for path, content in captured.items():
+        connection.execute(
+            "INSERT INTO terminal_review_evidence(snapshot_sha256, path, content) "
+            "VALUES (?, ?, ?)",
+            (snapshot["snapshot_sha256"], path, content),
+        )
+    return snapshot
+
+
+def _verify_review_snapshot(receipt: dict[str, Any]) -> None:
+    snapshot = receipt.get("review_evidence_snapshot")
+    if snapshot is None:  # Legacy receipts keep their original evidence contract.
+        return
+    manifest = receipt.get("review_evidence_manifest")
+    if not isinstance(manifest, dict) or snapshot != _review_snapshot_identity(
+        receipt["checkout_key"], receipt["preview_sha256"], manifest
+    ):
+        raise RuntimeError("terminal review evidence snapshot identity is invalid")
+    connection = checkouts._readonly_connection(checkouts.CHECKOUT_DB)
+    if connection is None:
+        raise RuntimeError("terminal review evidence snapshot database is unavailable")
+    files = []
+    total = 0
+    try:
+        rows = connection.execute(
+            "SELECT path, length(content) AS bytes, substr(content, 1, ?) AS content "
+            "FROM terminal_review_evidence WHERE snapshot_sha256=? ORDER BY path LIMIT ?",
+            (
+                _REVIEW_EVIDENCE_MAX_FILE_BYTES + 1,
+                snapshot["snapshot_sha256"],
+                _REVIEW_EVIDENCE_MAX_FILES + 1,
+            ),
+        )
+        for row in rows:
+            content = row["content"]
+            if (
+                not isinstance(content, bytes)
+                or row["bytes"] != len(content)
+                or len(content) > _REVIEW_EVIDENCE_MAX_FILE_BYTES
+            ):
+                raise RuntimeError("terminal review evidence snapshot content is invalid")
+            total += len(content)
+            if total > _REVIEW_EVIDENCE_MAX_TOTAL_BYTES:
+                raise RuntimeError("terminal review evidence snapshot exceeds budget")
+            files.append({
+                "path": row["path"], "bytes": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+            })
+    except sqlite3.Error as exc:
+        raise RuntimeError("terminal review evidence snapshot is unavailable") from exc
+    finally:
+        connection.close()
+    if (
+        len(files) > _REVIEW_EVIDENCE_MAX_FILES
+        or files != manifest["files"]
+        or len(files) != manifest["file_count"]
+        or total != manifest["total_bytes"]
+    ):
+        raise RuntimeError("terminal review evidence snapshot digest is invalid")
 
 
 def _review_evidence_root_unchanged(
@@ -1104,6 +1236,9 @@ def apply(
                         "terminal reconciliation changed at commit boundary"
                     )
                 planned = commit_bound
+                review_snapshot = _retain_review_snapshot(
+                    connection, key, preview_sha256, planned["checkout_observation"]
+                )
                 prior_row = connection.execute(
                     "SELECT owner_id, preview_sha256, receipt_json, receipt_sha256 "
                     "FROM terminal_reconciliations WHERE checkout_key=?",
@@ -1291,6 +1426,8 @@ def apply(
                     effects.append("terminal_head_rebind")
                 if identity_catchup is not None:
                     effects.append("thread_focus_retention_head_catchup")
+                if review_snapshot is not None:
+                    effects.append("review_evidence_snapshot_retained")
                 receipt_core = {
                     "schema_version": SCHEMA_VERSION,
                     "kind": "checkout_terminal_reconciliation_receipt",
@@ -1312,6 +1449,7 @@ def apply(
                     "branch_head_rebind": branch_head_rebind,
                     "identity_catchup": planned.get("identity_catchup"),
                     "review_evidence_manifest": checkout_observation.get("review_evidence"),
+                    "review_evidence_snapshot": review_snapshot,
                     "checkout_observation_sha256": checkouts._sha256_json(checkout_observation),
                     "source_evidence": planned["source_evidence"],
                     "source_evidence_sha256": planned["source_evidence"]["evidence_sha256"],
@@ -1326,6 +1464,7 @@ def apply(
                         "historical_checkout_content",
                         "permission_to_delete_binding_or_retention_rows",
                         "permission_to_modify_or_delete_review_evidence",
+                        "immutable_live_review_evidence_files",
                     ],
                 }
                 if superseded_receipt is not None:
@@ -1382,6 +1521,13 @@ def apply(
                         raise RuntimeError(
                             "terminal reconciliation predecessor CAS replacement failed"
                         )
+                final_observation = _bind_preview(
+                    _preview_state(key, ignore_lease_owner=operation_owner),
+                    preview_created_at_unix,
+                )
+                if final_observation.get("preview_sha256") != preview_sha256:
+                    connection.rollback()
+                    raise RuntimeError("terminal reconciliation changed before commit")
                 connection.commit()
         readback = _record(key)
         if (

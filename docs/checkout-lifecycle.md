@@ -179,6 +179,28 @@ Owner-Entscheidung und Dry-Run-Plan-Hash. Der Name `obsolete` bedeutet hier
 nicht: Branch löschen. Er bedeutet: lokal cleanupfähig wirkende Arbeitskopie,
 weiterhin nur nach Archiv- und Dry-Run-Vertrag.
 
+
+### Transaktional erhaltene Review-Belege
+
+Die zugelassene `.review-audits`-Evidenz wird beim Terminalisieren zusätzlich
+als begrenzte Byte-Kopie in der privaten Checkout-Datenbank erhalten. Die
+Snapshot-Zeilen (`terminal_review_evidence`), die Lifecycle-Änderung und die
+Terminalquittung werden in derselben SQLite-Transaktion committed. Die Quittung
+enthält nur Snapshot-Identität und Manifest, niemals die Dateiinhalte. Der
+Readback prüft die gespeicherten Bytes erneut gegen das gebundene Manifest;
+fehlende oder beschädigte Kopien werden abgewiesen. Bestehende Quittungen ohne
+Snapshot behalten ihren historischen Vertrag.
+
+Nach den SQL-Änderungen erfolgt unmittelbar vor `commit()` eine erneute Prüfung
+des vollständigen Preview-Zustands. Erkannte Änderungen brechen die Transaktion
+ab. Dies ist **keine Dateisystemsperre gegen unabhängige Writer**: Ein Writer kann
+Originaldateien nach dieser letzten Beobachtung verändern. Autoritativ erhalten
+bleibt dann die gemeinsam mit dem Abschluss gespeicherte Belegkopie, nicht ein
+behaupteter unveränderlicher Zustand der Originaldateien. Originaldateien werden
+weder geändert, verschoben noch gelöscht; `source_files_frozen=false` macht diese
+Grenze in der Quittung sichtbar. Bestehende Größen- und Pfadgrenzen gelten auch
+für die Kopie. Cleanup- und Archivierungsrechte werden dadurch nicht erweitert.
+
 ## Invarianten
 
 1. Der Haupt-Worktree ist kein temporärer Cleanup-Kandidat.

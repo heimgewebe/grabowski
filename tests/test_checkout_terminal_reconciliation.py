@@ -491,6 +491,7 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
                 "lifecycle_phase_transition",
                 "active_capacity_release",
                 "thread_focus_retention_head_catchup",
+                "review_evidence_snapshot_retained",
             ],
             receipt["effects"],
         )
@@ -511,6 +512,139 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
             str(binding["checkout_key"])
         ]
         self.assertEqual("completed_retained", lifecycle["phase"])
+
+
+    def test_review_evidence_sql_race_aborts_without_terminal_transition(self) -> None:
+        binding, _head, evidence = self._present_thread_focus_with_retention_catchup()
+        key = str(binding["checkout_key"])
+        audit = self.checkout / ".review-audits" / "self-review.json"
+        real_database = checkouts._database
+        injected = False
+
+        @contextmanager
+        def database_with_sql_race():
+            nonlocal injected
+            with real_database() as connection:
+                def trace(sql):
+                    nonlocal injected
+                    if not injected and sql.startswith("SELECT owner_id, preview_sha256"):
+                        injected = True
+                        audit.write_text('{"verdict":"LATE"}\n', encoding="utf-8")
+                connection.set_trace_callback(trace)
+                try:
+                    yield connection
+                finally:
+                    connection.set_trace_callback(None)
+
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(checkouts, "_remote_secured_observation", return_value=self._remote_secured()),
+        ):
+            preview = reconciliation.preview(key)
+            with patch.object(checkouts, "_database", database_with_sql_race):
+                with self.assertRaisesRegex(RuntimeError, "snapshot|before commit"):
+                    reconciliation.apply(key, "owner-a", preview["preview_sha256"],
+                                         preview["preview_created_at_unix"], reconciliation.CONFIRMATION)
+        self.assertTrue(injected)
+        self.assertEqual("active", checkouts._lifecycle_bindings([key])[key]["phase"])
+        self.assertIsNone(reconciliation._record(key))
+
+    def test_review_evidence_changed_inside_commit_keeps_atomic_snapshot(self) -> None:
+        binding, _head, evidence = self._present_thread_focus_with_retention_catchup()
+        key = str(binding["checkout_key"])
+        audit = self.checkout / ".review-audits" / "self-review.json"
+        original = audit.read_bytes()
+        real_database = checkouts._database
+        injected = False
+
+        @contextmanager
+        def database_with_commit_race():
+            nonlocal injected
+            with real_database() as connection:
+                def trace(sql):
+                    nonlocal injected
+                    if not injected and sql == "COMMIT":
+                        injected = True
+                        audit.write_text('{"verdict":"AFTER-OBSERVATION"}\n', encoding="utf-8")
+                connection.set_trace_callback(trace)
+                try:
+                    yield connection
+                finally:
+                    connection.set_trace_callback(None)
+
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(checkouts, "_remote_secured_observation", return_value=self._remote_secured()),
+        ):
+            preview = reconciliation.preview(key)
+            with patch.object(checkouts, "_database", database_with_commit_race):
+                result = reconciliation.apply(key, "owner-a", preview["preview_sha256"],
+                                              preview["preview_created_at_unix"], reconciliation.CONFIRMATION)
+        self.assertTrue(injected)
+        self.assertEqual("applied", result["status"])
+        self.assertNotEqual(original, audit.read_bytes())
+        receipt = reconciliation._record(key)["receipt"]
+        snapshot = receipt["review_evidence_snapshot"]
+        self.assertFalse(snapshot["source_files_frozen"])
+        self.assertNotIn('"content":', json.dumps(receipt))
+        with checkouts._database() as connection:
+            retained = connection.execute(
+                "SELECT content FROM terminal_review_evidence WHERE snapshot_sha256=? AND path=?",
+                (snapshot["snapshot_sha256"], ".review-audits/self-review.json"),
+            ).fetchone()[0]
+        self.assertEqual(original, retained)
+        self.assertIn("review_evidence_snapshot_retained", receipt["effects"])
+
+    def test_review_evidence_snapshot_corruption_is_rejected_on_readback(self) -> None:
+        binding, _head, evidence = self._present_thread_focus_with_retention_catchup()
+        key = str(binding["checkout_key"])
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(checkouts, "_remote_secured_observation", return_value=self._remote_secured()),
+        ):
+            preview = reconciliation.preview(key)
+            result = reconciliation.apply(key, "owner-a", preview["preview_sha256"],
+                                          preview["preview_created_at_unix"], reconciliation.CONFIRMATION)
+        with checkouts._database() as connection:
+            connection.execute("UPDATE terminal_review_evidence SET content=? WHERE snapshot_sha256=?",
+                               (b"changed", result["receipt"]["review_evidence_snapshot"]["snapshot_sha256"]))
+            connection.commit()
+        with self.assertRaisesRegex(RuntimeError, "snapshot digest"):
+            reconciliation._record(key)
+
+    def test_review_evidence_snapshot_and_lifecycle_rollback_together(self) -> None:
+        binding, _head, evidence = self._present_thread_focus_with_retention_catchup()
+        key = str(binding["checkout_key"])
+        real_database = checkouts._database
+
+        @contextmanager
+        def database_with_receipt_failure():
+            with real_database() as connection:
+                class Proxy:
+                    def execute(self, sql, *args):
+                        if "INSERT INTO terminal_reconciliations(" in sql:
+                            raise RuntimeError("injected receipt failure")
+                        return connection.execute(sql, *args)
+                    def __getattr__(self, name):
+                        return getattr(connection, name)
+                yield Proxy()
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(checkouts, "_remote_secured_observation", return_value=self._remote_secured()),
+        ):
+            preview = reconciliation.preview(key)
+            with patch.object(checkouts, "_database", database_with_receipt_failure):
+                with self.assertRaisesRegex(RuntimeError, "injected receipt failure"):
+                    reconciliation.apply(key, "owner-a", preview["preview_sha256"],
+                                         preview["preview_created_at_unix"], reconciliation.CONFIRMATION)
+        self.assertEqual("active", checkouts._lifecycle_bindings([key])[key]["phase"])
+        self.assertIsNone(reconciliation._record(key))
+        with checkouts._database() as connection:
+            table = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='terminal_review_evidence'"
+            ).fetchone()
+            if table is not None:
+                self.assertEqual(0, connection.execute("SELECT count(*) FROM terminal_review_evidence").fetchone()[0])
 
     def test_present_thread_focus_revalidates_head_after_review_evidence_scan(self) -> None:
         binding, _new_head, evidence = self._present_thread_focus_with_retention_catchup()
