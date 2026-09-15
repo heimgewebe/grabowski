@@ -375,6 +375,7 @@ OPERATOR_ADMISSION_MAX_TIMEOUT_SECONDS = 120
 # but not the effect-aware classification added by this release.
 OPERATOR_ADMISSION_BOOTSTRAP_DRAIN_SECONDS = 300
 OPERATOR_ADMISSION_EFFECT_CLASSIFICATION = "readOnlyHint-or-server-verified-git-read-or-exact-github-pr-view-is-read-only-v3"
+MIDCUTOVER_RECOVERY_TOOL_NAME = "grabowski_recovery_provenance_repair"
 OPERATOR_ADMISSION_PREDECESSOR_EFFECT_CLASSIFICATION = (
     "readOnlyHint-true-is-read-only-v1"
 )
@@ -3949,10 +3950,11 @@ def wait_for_operator_deployment_admission(
     )
 
 
-def verify_operator_deployment_admission(
+def _verify_operator_deployment_admission_final_guard(
     marker: dict[str, Any],
     *,
-    port: int = OPERATOR_LISTENER_PORT,
+    port: int,
+    allow_single_recovery_parent: bool = False,
 ) -> dict[str, Any]:
     observed = _operator_admission_observation(port)
     call_counts = (
@@ -3961,6 +3963,28 @@ def verify_operator_deployment_admission(
         )
         if isinstance(observed, dict)
         else None
+    )
+    recovery_parent_allowed = False
+    if (
+        allow_single_recovery_parent
+        and isinstance(observed, dict)
+        and call_counts is not None
+        and call_counts.get("effect_aware") is True
+        and call_counts.get("blocking_tool_calls") == 1
+        and observed.get("active_tool_calls_by_tool_name_truncated") is False
+        and observed.get("active_tool_calls_by_tool_name_omitted_call_count") == 0
+    ):
+        by_tool_name = observed.get("active_tool_calls_by_tool_name")
+        recovery_parent_allowed = (
+            isinstance(by_tool_name, dict)
+            and by_tool_name.get(MIDCUTOVER_RECOVERY_TOOL_NAME) == 1
+        )
+    blocking_calls_valid = bool(
+        call_counts is not None
+        and (
+            call_counts["blocking_tool_calls"] == 0
+            or recovery_parent_allowed
+        )
     )
     if (
         observed is None
@@ -3971,15 +3995,53 @@ def verify_operator_deployment_admission(
         or observed.get("expected_head") != marker.get("expected_head")
         or observed.get("source_identity_sha256")
         != marker.get("source_identity_sha256")
-        or call_counts is None
-        or call_counts["blocking_tool_calls"] != 0
+        or not blocking_calls_valid
     ):
         core.fail(
             "Operator-Admission-Finalprüfung scheiterte",
             phase="operator-admission-final-guard",
             details={"observation": observed, "call_counts": call_counts},
         )
-    return {**observed, "admission_call_counts": call_counts}
+    return {
+        **observed,
+        "admission_call_counts": call_counts,
+        "recovery_parent_allowed": recovery_parent_allowed,
+    }
+
+
+def verify_operator_deployment_admission(
+    marker: dict[str, Any],
+    *,
+    port: int = OPERATOR_LISTENER_PORT,
+) -> dict[str, Any]:
+    result = _verify_operator_deployment_admission_final_guard(
+        marker, port=port, allow_single_recovery_parent=False
+    )
+    return {
+        key: value
+        for key, value in result.items()
+        if key != "recovery_parent_allowed"
+    }
+
+
+def verify_operator_deployment_admission_for_s3_retirement(
+    marker: dict[str, Any],
+    *,
+    port: int = OPERATOR_LISTENER_PORT,
+) -> dict[str, Any]:
+    """Verify canonical admission while permitting only the parent recovery call.
+
+    In S3 canonical is already selected and remains serving; only residual green
+    is about to be retired. The public recovery tool that dispatched this resume
+    is itself still registered on canonical until its response returns, so
+    requiring canonical to reach zero blocking calls deadlocks the recovery on
+    its own parent. Keep the marker and effect-classification checks fail-closed,
+    and tolerate exactly one blocking call only when the complete, untruncated
+    registry groups identify it as grabowski_recovery_provenance_repair.
+    """
+    return _verify_operator_deployment_admission_final_guard(
+        marker, port=port, allow_single_recovery_parent=True
+    )
 
 
 def _tunnel_drain_counter_snapshot(observed: dict[str, float]) -> dict[str, float]:
@@ -7990,10 +8052,16 @@ class MidCutoverResumeRuntime:
         )
         canonical_guard = None
         if (self.admission_topology or {}).get("topology") == CANONICAL_OPERATOR_LIVE:
-            # The old canonical process is not publicly routed, but while it is
-            # alive it can still be reached directly, so guard it too.
+            # Guard canonical whenever it remains live. Before S3 it is the old
+            # directly reachable process; in S3 it is already the selected public
+            # process and may contain the still-running parent recovery call.
+            canonical_guard_reader = (
+                verify_operator_deployment_admission_for_s3_retirement
+                if self.resume_phase == midcutover.PHASE_RETIRE_GREEN
+                else verify_operator_deployment_admission
+            )
             canonical_guard = _json_sha256(
-                verify_operator_deployment_admission(
+                canonical_guard_reader(
                     self.admission_marker, port=OPERATOR_LISTENER_PORT
                 )
             )
