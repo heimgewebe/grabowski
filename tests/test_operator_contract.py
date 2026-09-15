@@ -41,9 +41,12 @@ class _FakeFastMCP:
         self.settings = types.SimpleNamespace(
             log_level="INFO",
             stateless_http=False,
+            session_idle_timeout=1800,
+            max_sessions=10000,
         )
         self.session_manager = types.SimpleNamespace(
-            session_idle_timeout=None,
+            session_idle_timeout=1800,
+            max_sessions=10000,
             _session_creation_lock=_FakeAsyncLock(),
             stateless=False,
         )
@@ -79,6 +82,8 @@ class _FakeFastMCP:
 
     def streamable_http_app(self):
         self.session_manager.stateless = self.settings.stateless_http
+        self.session_manager.session_idle_timeout = self.settings.session_idle_timeout
+        self.session_manager.max_sessions = self.settings.max_sessions
         return object()
 
 
@@ -310,10 +315,13 @@ class OperatorContractTests(unittest.TestCase):
         operator._configure_http_runtime()
         self.assertTrue(operator.HTTP_STATELESS_MODE)
         self.assertTrue(operator.mcp.settings.stateless_http)
+        self.assertIsNone(operator.mcp.settings.session_idle_timeout)
+        self.assertIsNone(operator.mcp.settings.max_sessions)
         self.assertEqual("WARNING", operator.HTTP_LOG_LEVEL)
         self.assertEqual(operator.HTTP_LOG_LEVEL, operator.mcp.settings.log_level)
         self.assertTrue(operator.mcp.session_manager.stateless)
         self.assertIsNone(operator.mcp.session_manager.session_idle_timeout)
+        self.assertIsNone(operator.mcp.session_manager.max_sessions)
         self.assertEqual(
             {
                 "mcp.server.lowlevel.server",

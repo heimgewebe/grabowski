@@ -2246,6 +2246,11 @@ def _configure_http_runtime() -> None:
     if not callable(getattr(mcp, "custom_route", None)):
         raise RuntimeError("FastMCP custom_route support is required")
     mcp.settings.stateless_http = HTTP_STATELESS_MODE
+    # MCP SDK 1.30.0 introduced stateful-session defaults. Keep Grabowski's
+    # stateless transport contract explicit so a future SDK default cannot
+    # silently reintroduce retention or a session-count ceiling.
+    mcp.settings.session_idle_timeout = None
+    mcp.settings.max_sessions = None
     mcp.settings.log_level = HTTP_LOG_LEVEL
     for logger_name in HTTP_TRANSPORT_VERBOSE_LOGGERS:
         logging.getLogger(logger_name).setLevel(logging.WARNING)
@@ -2258,6 +2263,8 @@ def _configure_http_runtime() -> None:
     _install_deployment_admission_gate()
     if manager.session_idle_timeout is not None:
         raise RuntimeError("FastMCP stateless HTTP mode retained an idle timeout")
+    if manager.max_sessions is not None:
+        raise RuntimeError("FastMCP stateless HTTP mode retained a session limit")
 
 
 
