@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import fcntl
 import hashlib
 import hmac
@@ -166,8 +168,10 @@ def _legacy_decision_review_upper_bound_ns(created_at_unix: int) -> int:
     return upper_bound
 
 
-def _existing_decision_review_max_ns(key_sha256: str) -> int:
-    root = DECISION_REVIEW_JOBS_ROOT
+def _existing_decision_review_max_ns(
+    key_sha256: str, *, jobs_root: Path | None = None
+) -> int:
+    root = DECISION_REVIEW_JOBS_ROOT if jobs_root is None else Path(jobs_root)
     try:
         root_metadata = root.lstat()
     except FileNotFoundError:
@@ -341,7 +345,11 @@ def _write_decision_review_order_state(
 
 
 def _allocate_decision_review_order(
-    scope: dict[str, Any], created_at_unix: int
+    scope: dict[str, Any],
+    created_at_unix: int,
+    *,
+    order_root: Path | None = None,
+    jobs_root: Path | None = None,
 ) -> int:
     observed_ns = _validate_decision_review_order_point(scope, created_at_unix)
     if observed_ns is None:
@@ -349,7 +357,7 @@ def _allocate_decision_review_order(
     key_sha256 = _decision_review_order_key(scope)
     if key_sha256 is None:
         return created_at_unix
-    root = DECISION_REVIEW_ORDER_ROOT
+    root = DECISION_REVIEW_ORDER_ROOT if order_root is None else Path(order_root)
     _ensure_private_directory(root, label="decision review ordering root")
     path = root / f"{key_sha256}.json"
     lock_path = root / f"{key_sha256}.lock"
@@ -370,7 +378,9 @@ def _allocate_decision_review_order(
         stored_logical_ns = _read_decision_review_order_state_path(
             path, key_sha256=key_sha256
         )
-        existing_logical_ns = _existing_decision_review_max_ns(key_sha256)
+        existing_logical_ns = _existing_decision_review_max_ns(
+            key_sha256, jobs_root=jobs_root
+        )
         last_logical_ns = max(
             -1 if stored_logical_ns is None else stored_logical_ns,
             existing_logical_ns,
@@ -405,6 +415,8 @@ def _build_origin(
     started_at: str,
     invoker_tool: str,
     allocate_decision_review_order: bool,
+    order_root: Path | None = None,
+    jobs_root: Path | None = None,
 ) -> tuple[dict[str, Any], str]:
     match = UNIT_RE.fullmatch(unit) if isinstance(unit, str) else None
     if match is None:
@@ -429,7 +441,17 @@ def _build_origin(
     ):
         raise ValueError("origin invoker tool is invalid")
     if allocate_decision_review_order:
-        created_at_unix = _allocate_decision_review_order(scope, created_at_unix)
+        original_created_at_unix = created_at_unix
+        created_at_unix = _allocate_decision_review_order(
+            scope,
+            created_at_unix,
+            order_root=order_root,
+            jobs_root=jobs_root,
+        )
+        if created_at_unix != original_created_at_unix:
+            started_at = datetime.fromtimestamp(
+                created_at_unix, tz=timezone.utc
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
     else:
         _validate_decision_review_order_point(scope, created_at_unix)
     origin = {
@@ -458,6 +480,8 @@ def build_origin(
     created_at_unix: int,
     started_at: str,
     invoker_tool: str,
+    order_root: Path | None = None,
+    jobs_root: Path | None = None,
 ) -> tuple[dict[str, Any], str]:
     return _build_origin(
         unit=unit,
@@ -469,6 +493,8 @@ def build_origin(
         started_at=started_at,
         invoker_tool=invoker_tool,
         allocate_decision_review_order=True,
+        order_root=order_root,
+        jobs_root=jobs_root,
     )
 
 
