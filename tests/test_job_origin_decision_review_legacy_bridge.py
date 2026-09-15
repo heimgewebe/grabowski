@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import json
 import os
 from pathlib import Path
@@ -99,6 +101,12 @@ class DecisionReviewLegacyBridgeTests(unittest.TestCase):
                 )
 
         self.assertGreater(new["created_at_unix"], legacy["created_at_unix"])
+        self.assertEqual(
+            new["started_at"],
+            datetime.fromtimestamp(
+                new["created_at_unix"], tz=timezone.utc
+            ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
         self.assertGreater(
             new["scope"]["started_at_unix_ns"],
             legacy["created_at_unix"] * 1_000_000_000 + 999_999_999,

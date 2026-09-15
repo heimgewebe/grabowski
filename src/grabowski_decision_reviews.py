@@ -935,6 +935,7 @@ def reconcile(
                 "slot",
                 "origin_sha256",
                 "created_at_unix",
+                "started_at_unix_ns",
                 "terminal",
                 "terminal_status",
                 "classification",
