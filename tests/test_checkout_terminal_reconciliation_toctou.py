@@ -160,6 +160,41 @@ class CheckoutTerminalReconciliationToctouTests(unittest.TestCase):
             observation["blockers"],
         )
 
+    def test_rejects_index_flag_added_after_initial_repository_scan(self) -> None:
+        real_index_flags = reconciliation._review_evidence_index_flags
+        inventory_calls = 0
+
+        def flags_with_late_assume_unchanged(
+            checkout: Path,
+        ) -> tuple[list[str], list[str]]:
+            nonlocal inventory_calls
+            result = real_index_flags(checkout)
+            inventory_calls += 1
+            if inventory_calls == 2:
+                self._git("update-index", "--assume-unchanged", "tracked.txt")
+                (self.repo / "tracked.txt").write_text(
+                    "hidden late change\n", encoding="utf-8"
+                )
+            return result
+
+        with (
+            patch.object(checkouts, "_git_read", side_effect=self._git_read),
+            patch.object(
+                reconciliation,
+                "_review_evidence_index_flags",
+                side_effect=flags_with_late_assume_unchanged,
+            ),
+        ):
+            observation = reconciliation._thread_focus_review_evidence_observation(
+                {"path": str(self.repo)}, self._status()
+            )
+
+        self.assertFalse(observation["eligible"])
+        self.assertIn(
+            "review-evidence-assume-unchanged-present", observation["blockers"]
+        )
+        self.assertIn("review-evidence-index-flags-drift", observation["blockers"])
+
 
 if __name__ == "__main__":
     unittest.main()
