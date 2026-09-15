@@ -9,7 +9,6 @@ import shutil
 import signal
 import stat
 import subprocess
-import tempfile
 from typing import Iterable
 
 BWRAP = Path(os.environ.get("GRABOWSKI_BWRAP_BIN", "/usr/bin/bwrap"))
@@ -713,34 +712,17 @@ def run_bounded_capture(
     stdout_limit: int,
     stderr_limit: int,
     stdout_content_limit: int = 0,
-    stdin_content: bytes | None = None,
 ) -> BoundedCapture:
-    """Drain both streams while optionally supplying bounded caller-owned stdin bytes."""
+    """Drain both streams without imposing RLIMIT_FSIZE on the child workload."""
     if stdout_limit <= 0 or stderr_limit <= 0 or stdout_content_limit < 0:
         raise ValueError("capture limits must be positive")
-    if stdin_content is not None and not isinstance(stdin_content, bytes):
-        raise TypeError("stdin_content must be bytes or None")
-    stdin_file = None
-    if stdin_content is not None:
-        stdin_file = tempfile.TemporaryFile()
-        try:
-            stdin_file.write(stdin_content)
-            stdin_file.flush()
-            stdin_file.seek(0)
-        except BaseException:
-            stdin_file.close()
-            raise
-    try:
-        process = subprocess.Popen(
-            argv,
-            stdin=stdin_file if stdin_file is not None else subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-    finally:
-        if stdin_file is not None:
-            stdin_file.close()
+    process = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
     if process.stdout is None or process.stderr is None:
         _kill_process_group(process)
         process.wait()
