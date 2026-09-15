@@ -309,6 +309,9 @@ def run_captain_run(
                 server_operator_lease_delegation=parameters.get(
                     "_server_operator_lease_delegation"
                 ),
+                server_bureau_run_lease_delegation=parameters.get(
+                    "_server_bureau_run_lease_delegation"
+                ),
             )
             execution_result: dict[str, Any] = {
                 "action": "pr-merge",
