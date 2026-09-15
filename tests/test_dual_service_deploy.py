@@ -3174,6 +3174,8 @@ class DeploymentAdmissionTests(unittest.TestCase):
         self.assertEqual(1, counts["blocking_tool_calls"])
         for mutation in (
             {"effect_classification": "unknown-v4"},
+            {"effect_classification": []},
+            {"effect_classification": {}},
             {"read_only_active_tool_calls": 2},
             {"drain_blocking_tool_calls": True},
         ):
