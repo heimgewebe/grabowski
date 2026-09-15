@@ -1710,6 +1710,241 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("pass", checks["lifecycle-only-effect"]["status"])
         self.assertEqual("pass", checks["active-capacity-transition"]["status"])
 
+    def test_checkout_binding_terminal_apply_accepts_identity_catchup_receipt(self) -> None:
+        checkout_key = "a" * 64
+        expected_preview = "c" * 64
+        old_head = "1" * 40
+        new_head = "2" * 40
+        terminal_receipt = {
+            "checkout_key": checkout_key,
+            "owner_id": "owner-a",
+            "preview_sha256": expected_preview,
+            "preview_created_at_unix": 100,
+            "source_evidence_sha256": "d" * 64,
+            "reconciliation_mode": "present_retained",
+            "checkout_preserved": True,
+            "binding_before": {
+                "phase": "active",
+                "expected_head": old_head,
+                "expected_branch": "topic",
+                "owner_id": "owner-a",
+                "source": {"kind": "thread_focus", "id": "thread-focus-id"},
+            },
+            "binding_after": {
+                "phase": "completed_retained",
+                "expected_head": new_head,
+                "expected_branch": "topic",
+                "owner_id": "owner-a",
+            },
+            "retention_before": {
+                "expected_head": new_head,
+                "expected_branch": "topic",
+                "owner_id": "owner-a",
+            },
+            "retention_after": {
+                "expected_head": new_head,
+                "expected_branch": "topic",
+                "owner_id": "owner-a",
+            },
+            "branch_head_rebind": None,
+            "identity_catchup": {
+                "kind": "thread_focus_retention_head_catchup",
+                "binding_expected_head": old_head,
+                "retention_expected_head": new_head,
+            },
+            "effects": [
+                "lifecycle_phase_transition",
+                "active_capacity_release",
+                "thread_focus_retention_head_catchup",
+            ],
+            "receipt_sha256": "e" * 64,
+        }
+        parameters = {
+            "checkout_key": checkout_key,
+            "owner_id": "owner-a",
+            "expected_preview_sha256": expected_preview,
+            "preview_created_at_unix": 100,
+            "confirmation": "reconcile-terminal-missing-checkout",
+        }
+        with patch(
+            "grabowski_checkouts.grabowski_checkout_binding_terminal_apply",
+            return_value={
+                "schema_version": 1,
+                "kind": "checkout_terminal_reconciliation_result",
+                "status": "applied",
+                "receipt": terminal_receipt,
+            },
+        ):
+            result = grips.grip_run(
+                "checkout-binding-terminal-apply",
+                parameters,
+                allow_mutation=True,
+            )
+        self.assertEqual("passed", result["status"])
+        self.assertTrue(result["output"]["capacity_effect"]["active_binding_released"])
+
+    def test_checkout_binding_terminal_apply_accepts_bound_review_snapshot(self) -> None:
+        checkout_key = "a" * 64
+        expected_preview = "c" * 64
+        old_head = "1" * 40
+        new_head = "2" * 40
+        terminal_receipt = {
+            "checkout_key": checkout_key,
+            "owner_id": "owner-a",
+            "preview_sha256": expected_preview,
+            "preview_created_at_unix": 100,
+            "source_evidence_sha256": "d" * 64,
+            "reconciliation_mode": "present_retained",
+            "checkout_preserved": True,
+            "binding_before": {
+                "phase": "active",
+                "expected_head": old_head,
+                "expected_branch": "topic",
+                "owner_id": "owner-a",
+                "source": {"kind": "thread_focus", "id": "thread-focus-id"},
+            },
+            "binding_after": {
+                "phase": "completed_retained",
+                "expected_head": new_head,
+                "expected_branch": "topic",
+                "owner_id": "owner-a",
+            },
+            "retention_before": {
+                "expected_head": new_head,
+                "expected_branch": "topic",
+                "owner_id": "owner-a",
+            },
+            "retention_after": {
+                "expected_head": new_head,
+                "expected_branch": "topic",
+                "owner_id": "owner-a",
+            },
+            "branch_head_rebind": None,
+            "identity_catchup": {
+                "kind": "thread_focus_retention_head_catchup",
+                "binding_expected_head": old_head,
+                "retention_expected_head": new_head,
+            },
+            "effects": [
+                "lifecycle_phase_transition",
+                "active_capacity_release",
+                "thread_focus_retention_head_catchup",
+            ],
+            "receipt_sha256": "e" * 64,
+        }
+        import grabowski_checkout_terminal_reconciliation as reconciliation
+        manifest = {"eligible": True, "manifest_sha256": "f" * 64,
+                    "file_count": 1, "total_bytes": 3}
+        terminal_receipt["review_evidence_manifest"] = manifest
+        terminal_receipt["review_evidence_snapshot"] = reconciliation._review_snapshot_identity(
+            checkout_key, expected_preview, manifest
+        )
+        terminal_receipt["effects"].append("review_evidence_snapshot_retained")
+        parameters = {
+            "checkout_key": checkout_key,
+            "owner_id": "owner-a",
+            "expected_preview_sha256": expected_preview,
+            "preview_created_at_unix": 100,
+            "confirmation": "reconcile-terminal-missing-checkout",
+        }
+        with patch(
+            "grabowski_checkouts.grabowski_checkout_binding_terminal_apply",
+            return_value={
+                "schema_version": 1,
+                "kind": "checkout_terminal_reconciliation_result",
+                "status": "applied",
+                "receipt": terminal_receipt,
+            },
+        ):
+            result = grips.grip_run(
+                "checkout-binding-terminal-apply",
+                parameters,
+                allow_mutation=True,
+            )
+        self.assertEqual("passed", result["status"])
+        self.assertTrue(result["output"]["capacity_effect"]["active_binding_released"])
+
+    def test_checkout_binding_terminal_apply_rejects_wrong_review_snapshot_binding(self) -> None:
+        checkout_key = "a" * 64
+        expected_preview = "c" * 64
+        old_head = "1" * 40
+        new_head = "2" * 40
+        terminal_receipt = {
+            "checkout_key": checkout_key,
+            "owner_id": "owner-a",
+            "preview_sha256": expected_preview,
+            "preview_created_at_unix": 100,
+            "source_evidence_sha256": "d" * 64,
+            "reconciliation_mode": "present_retained",
+            "checkout_preserved": True,
+            "binding_before": {
+                "phase": "active",
+                "expected_head": old_head,
+                "expected_branch": "topic",
+                "owner_id": "owner-a",
+                "source": {"kind": "thread_focus", "id": "thread-focus-id"},
+            },
+            "binding_after": {
+                "phase": "completed_retained",
+                "expected_head": new_head,
+                "expected_branch": "topic",
+                "owner_id": "owner-a",
+            },
+            "retention_before": {
+                "expected_head": new_head,
+                "expected_branch": "topic",
+                "owner_id": "owner-a",
+            },
+            "retention_after": {
+                "expected_head": new_head,
+                "expected_branch": "topic",
+                "owner_id": "owner-a",
+            },
+            "branch_head_rebind": None,
+            "identity_catchup": {
+                "kind": "thread_focus_retention_head_catchup",
+                "binding_expected_head": old_head,
+                "retention_expected_head": new_head,
+            },
+            "effects": [
+                "lifecycle_phase_transition",
+                "active_capacity_release",
+                "thread_focus_retention_head_catchup",
+            ],
+            "receipt_sha256": "e" * 64,
+        }
+        import grabowski_checkout_terminal_reconciliation as reconciliation
+        manifest = {"eligible": True, "manifest_sha256": "f" * 64,
+                    "file_count": 1, "total_bytes": 3}
+        terminal_receipt["review_evidence_manifest"] = manifest
+        terminal_receipt["review_evidence_snapshot"] = reconciliation._review_snapshot_identity(
+            checkout_key, expected_preview, manifest
+        )
+        terminal_receipt["effects"].append("review_evidence_snapshot_retained")
+        terminal_receipt["review_evidence_snapshot"]["preview_sha256"] = "9" * 64
+        parameters = {
+            "checkout_key": checkout_key,
+            "owner_id": "owner-a",
+            "expected_preview_sha256": expected_preview,
+            "preview_created_at_unix": 100,
+            "confirmation": "reconcile-terminal-missing-checkout",
+        }
+        with patch(
+            "grabowski_checkouts.grabowski_checkout_binding_terminal_apply",
+            return_value={
+                "schema_version": 1,
+                "kind": "checkout_terminal_reconciliation_result",
+                "status": "applied",
+                "receipt": terminal_receipt,
+            },
+        ):
+            result = grips.grip_run(
+                "checkout-binding-terminal-apply",
+                parameters,
+                allow_mutation=True,
+            )
+        self.assertEqual("failed", result["status"])
+
     def test_checkout_binding_terminal_apply_accepts_present_retained_receipt(self) -> None:
         checkout_key = "a" * 64
         expected_preview = "c" * 64
