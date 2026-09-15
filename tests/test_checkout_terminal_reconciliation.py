@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -484,6 +485,15 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
         self.assertEqual("present_retained", receipt["reconciliation_mode"])
         self.assertEqual(new_head, receipt["binding_after"]["expected_head"])
         self.assertEqual(new_head, receipt["retention_after"]["expected_head"])
+        self.assertIsNone(receipt["branch_head_rebind"])
+        self.assertEqual(
+            [
+                "lifecycle_phase_transition",
+                "active_capacity_release",
+                "thread_focus_retention_head_catchup",
+            ],
+            receipt["effects"],
+        )
         self.assertEqual(
             manifest["manifest_sha256"],
             receipt["review_evidence_manifest"]["manifest_sha256"],
@@ -501,6 +511,123 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
             str(binding["checkout_key"])
         ]
         self.assertEqual("completed_retained", lifecycle["phase"])
+
+    def test_present_thread_focus_revalidates_head_after_review_evidence_scan(self) -> None:
+        binding, _new_head, evidence = self._present_thread_focus_with_retention_catchup()
+        real_observation = reconciliation._thread_focus_review_evidence_observation
+        injected = False
+
+        def observation_with_late_commit(
+            record: dict[str, object], status: dict[str, object]
+        ) -> dict[str, object]:
+            nonlocal injected
+            result = real_observation(record, status)
+            if not injected:
+                self._git(
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "late head during evidence scan",
+                    cwd=self.checkout,
+                )
+                injected = True
+            return result
+
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(
+                checkouts, "_remote_secured_observation", return_value=self._remote_secured()
+            ),
+            patch.object(
+                reconciliation,
+                "_thread_focus_review_evidence_observation",
+                side_effect=observation_with_late_commit,
+            ),
+        ):
+            preview = reconciliation.preview(str(binding["checkout_key"]))
+        self.assertFalse(preview["safe_to_apply"])
+        self.assertIn(
+            "checkout-head-drift-after-review-evidence", preview["blockers"]
+        )
+
+    def test_present_thread_focus_revalidates_review_evidence_at_commit_boundary(self) -> None:
+        binding, _new_head, evidence = self._present_thread_focus_with_retention_catchup()
+        audit = self.checkout / ".review-audits" / "self-review.json"
+        real_database = checkouts._database
+        injected = False
+
+        @contextmanager
+        def database_with_late_evidence():
+            nonlocal injected
+            if not injected:
+                audit.write_text('{"verdict":"LATE"}\n', encoding="utf-8")
+                injected = True
+            with real_database() as connection:
+                yield connection
+
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(
+                checkouts, "_remote_secured_observation", return_value=self._remote_secured()
+            ),
+        ):
+            preview = reconciliation.preview(str(binding["checkout_key"]))
+            self.assertTrue(preview["safe_to_apply"])
+            with patch.object(checkouts, "_database", database_with_late_evidence):
+                with self.assertRaisesRegex(RuntimeError, "commit boundary"):
+                    reconciliation.apply(
+                        str(binding["checkout_key"]),
+                        "owner-a",
+                        str(preview["preview_sha256"]),
+                        int(preview["preview_created_at_unix"]),
+                        reconciliation.CONFIRMATION,
+                    )
+        lifecycle = checkouts._lifecycle_bindings([str(binding["checkout_key"])])[
+            str(binding["checkout_key"])
+        ]
+        self.assertEqual("active", lifecycle["phase"])
+
+    def test_present_thread_focus_revalidates_head_at_commit_boundary(self) -> None:
+        binding, _new_head, evidence = self._present_thread_focus_with_retention_catchup()
+        real_database = checkouts._database
+        injected = False
+
+        @contextmanager
+        def database_with_late_commit():
+            nonlocal injected
+            if not injected:
+                self._git(
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "late head at commit boundary",
+                    cwd=self.checkout,
+                )
+                injected = True
+            with real_database() as connection:
+                yield connection
+
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(
+                checkouts, "_remote_secured_observation", return_value=self._remote_secured()
+            ),
+        ):
+            preview = reconciliation.preview(str(binding["checkout_key"]))
+            self.assertTrue(preview["safe_to_apply"])
+            with patch.object(checkouts, "_database", database_with_late_commit):
+                with self.assertRaisesRegex(RuntimeError, "commit boundary"):
+                    reconciliation.apply(
+                        str(binding["checkout_key"]),
+                        "owner-a",
+                        str(preview["preview_sha256"]),
+                        int(preview["preview_created_at_unix"]),
+                        reconciliation.CONFIRMATION,
+                    )
+        lifecycle = checkouts._lifecycle_bindings([str(binding["checkout_key"])])[
+            str(binding["checkout_key"])
+        ]
+        self.assertEqual("active", lifecycle["phase"])
 
     def test_present_thread_focus_manifest_drift_invalidates_apply(self) -> None:
         binding, _new_head, evidence = self._present_thread_focus_with_retention_catchup()

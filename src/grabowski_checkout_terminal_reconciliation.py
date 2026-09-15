@@ -703,6 +703,65 @@ def _present_checkout_observation(binding: dict[str, Any]) -> dict[str, Any]:
             if observed_review_evidence.get("classification") != "not_applicable":
                 review_evidence = observed_review_evidence
             blockers.extend(observed_review_evidence.get("blockers", []))
+
+            refreshed_top_level, refreshed_common, refreshed_records = checkouts._worktree_records(repo)
+            refreshed_matches = [
+                candidate
+                for candidate in refreshed_records
+                if Path(candidate["path"]).resolve(strict=False)
+                == checkout_path.resolve(strict=False)
+            ]
+            if (
+                str(refreshed_top_level) != str(top_level)
+                or refreshed_common != observed_common
+            ):
+                blockers.append("checkout-repository-drift-after-review-evidence")
+            if len(refreshed_matches) != 1:
+                blockers.append("checkout-record-drift-after-review-evidence")
+            else:
+                refreshed_record = refreshed_matches[0]
+                refreshed_head = refreshed_record.get("head")
+                if refreshed_record.get("prunable"):
+                    blockers.append("checkout-record-prunable")
+                if refreshed_record.get("branch") != binding["expected_branch"]:
+                    blockers.append("checkout-branch-drift-after-review-evidence")
+                if refreshed_head != record.get("head"):
+                    blockers.append("checkout-head-drift-after-review-evidence")
+                refreshed_branch_read = checkouts._git_read(
+                    repo,
+                    ["rev-parse", "--verify", f"{branch_ref}^{{commit}}"],
+                    check=False,
+                )
+                refreshed_ref_head = (
+                    refreshed_branch_read.stdout.strip()
+                    if refreshed_branch_read.returncode == 0
+                    else None
+                )
+                if refreshed_ref_head != ref_head:
+                    blockers.append("branch-ref-drift-after-review-evidence")
+                refreshed_status = checkouts._worktree_status(refreshed_record)
+                if refreshed_status != status:
+                    blockers.append("checkout-status-drift-after-review-evidence")
+                record = refreshed_record
+                status = refreshed_status
+                ref_head = refreshed_ref_head
+                if (
+                    not isinstance(refreshed_head, str)
+                    or checkouts.GIT_OBJECT_RE.fullmatch(refreshed_head) is None
+                ):
+                    branch_head = None
+                    relation = "unobservable"
+                    blockers.append("checkout-record-head-unobservable")
+                else:
+                    branch_head = refreshed_head
+                    relation, relation_blockers = _branch_head_relation(
+                        repo, binding["expected_head"], refreshed_head
+                    )
+                    blockers.extend(relation_blockers)
+                if ref_head is None:
+                    blockers.append("branch-ref-missing")
+                elif branch_head is not None and ref_head != branch_head:
+                    blockers.append("branch-ref-head-drift")
         if status.get("dirty") is True:
             if not source_is_thread_focus or (
                 not isinstance(review_evidence, dict)
@@ -1035,6 +1094,16 @@ def apply(
             applied_at = checkouts._now()
             with checkouts._database() as connection:
                 connection.execute("BEGIN IMMEDIATE")
+                commit_bound = _bind_preview(
+                    _preview_state(key, ignore_lease_owner=operation_owner),
+                    preview_created_at_unix,
+                )
+                if commit_bound.get("preview_sha256") != preview_sha256:
+                    connection.rollback()
+                    raise RuntimeError(
+                        "terminal reconciliation changed at commit boundary"
+                    )
+                planned = commit_bound
                 prior_row = connection.execute(
                     "SELECT owner_id, preview_sha256, receipt_json, receipt_sha256 "
                     "FROM terminal_reconciliations WHERE checkout_key=?",
@@ -1182,6 +1251,29 @@ def apply(
                     raise RuntimeError("checkout lifecycle post-state disappeared")
                 binding_after = checkouts._lifecycle_public(binding_after_row)
                 retention_after = checkouts._retention_public(retention_after_row)
+                identity_catchup = planned.get("identity_catchup")
+                if identity_catchup is not None:
+                    binding_source = binding_before.get("source")
+                    if (
+                        not isinstance(identity_catchup, dict)
+                        or identity_catchup.get("kind")
+                        != "thread_focus_retention_head_catchup"
+                        or mode != "present"
+                        or not isinstance(binding_source, dict)
+                        or binding_source.get("kind") != "thread_focus"
+                        or identity_catchup.get("binding_expected_head")
+                        != binding_before.get("expected_head")
+                        or identity_catchup.get("retention_expected_head")
+                        != retention_before.get("expected_head")
+                        or rebind_head != retention_before.get("expected_head")
+                        or rebind_head == binding_before.get("expected_head")
+                        or binding_after.get("expected_head") != rebind_head
+                        or retention_after.get("expected_head")
+                        != retention_before.get("expected_head")
+                    ):
+                        raise RuntimeError(
+                            "thread-focus retention head catch-up receipt drifted"
+                        )
                 branch_head_rebind = (
                     {
                         "relation": "descendant",
@@ -1189,7 +1281,7 @@ def apply(
                         "to_head": rebind_head,
                     }
                     if rebind_head != binding_before["expected_head"]
-                    and planned.get("identity_catchup") is None
+                    and identity_catchup is None
                     else None
                 )
                 effects = ["lifecycle_phase_transition"]
@@ -1197,6 +1289,8 @@ def apply(
                     effects.append("active_capacity_release")
                 if branch_head_rebind is not None:
                     effects.append("terminal_head_rebind")
+                if identity_catchup is not None:
+                    effects.append("thread_focus_retention_head_catchup")
                 receipt_core = {
                     "schema_version": SCHEMA_VERSION,
                     "kind": "checkout_terminal_reconciliation_receipt",
