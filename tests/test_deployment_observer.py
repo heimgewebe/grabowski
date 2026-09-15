@@ -447,6 +447,7 @@ class RuntimeDeployScheduleObserverTests(unittest.TestCase):
                 issued_at_unix=int(time.time()),
             )
             captured["request"] = request
+            captured["contract"] = contract
             return {
                 "unit": unit,
                 "argv_sha256": SELF_DEPLOY.operator._argv_hash(command),
@@ -491,16 +492,8 @@ class RuntimeDeployScheduleObserverTests(unittest.TestCase):
         capability = result["deployment_observer"]["capability"]
         self.assertEqual(request["capability"], capability)
         self.assertTrue(result["deployment_observer"]["available"])
-        contract = observer.build_contract(
-            unit=unit,
-            capability=capability,
-            client_id=CLIENT_ID,
-            expected_head=expected,
-            source_identity_sha256=identity["identity_sha256"],
-            argv_sha256=SELF_DEPLOY.operator._argv_hash(command),
-            origin_sha256="8" * 64,
-            issued_at_unix=int(time.time()),
-        )
+        contract = captured["contract"]
+        self.assertIsInstance(contract, dict)
         self.assertNotIn(capability, json.dumps(contract, sort_keys=True))
         self.assertEqual(contract["contract_sha256"], result["deployment_observer"]["contract_sha256"])
         self.assertEqual(
