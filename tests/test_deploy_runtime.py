@@ -63,9 +63,9 @@ class DeployRuntimeTests(unittest.TestCase):
             dirty=False,
             contract=contract,
             contract_bytes=json.dumps(contract.to_manifest()).encode(),
-            runtime_input_bytes=b"mcp==1.27.2\n",
+            runtime_input_bytes=b"mcp==1.30.0\n",
             runtime_lock_bytes=(
-                b"mcp==1.27.2 \\\n"
+                b"mcp==1.30.0 \\\n"
                 b"    --hash=sha256:" + b"1" * 64 + b"\n"
             ),
             source_bytes=b"print('snapshot')\n",
@@ -200,7 +200,7 @@ class DeployRuntimeTests(unittest.TestCase):
                 dirty=False,
                 contract=contract,
                 contract_bytes=json.dumps(contract.to_manifest()).encode(),
-                runtime_input_bytes=b"mcp==1.27.2\n",
+                runtime_input_bytes=b"mcp==1.30.0\n",
                 runtime_lock_bytes=b"lock\n",
                 source_bytes=b"print('same source')\n",
             )
@@ -265,7 +265,7 @@ class DeployRuntimeTests(unittest.TestCase):
             dirty=False,
             contract=contract,
             contract_bytes=(ROOT / "config" / "runtime-entrypoint.json").read_bytes(),
-            runtime_input_bytes=b"mcp==1.27.2\n",
+            runtime_input_bytes=b"mcp==1.30.0\n",
             runtime_lock_bytes=b"lock\n",
             source_bytes=b"print('snapshot')\n",
         )
@@ -911,8 +911,8 @@ class DeployRuntimeTests(unittest.TestCase):
             dirty=False,
             contract=contract,
             contract_bytes=json.dumps(contract.to_manifest()).encode(),
-            runtime_input_bytes=b"mcp==1.27.2\n",
-            runtime_lock_bytes=b"mcp==1.27.2\n",
+            runtime_input_bytes=b"mcp==1.30.0\n",
+            runtime_lock_bytes=b"mcp==1.30.0\n",
             source_bytes=b"print('snapshot')\n",
             runtime_asset_bytes={
                 "config/coding-agent-catalog.json": b"{\"schema_version\": 2}\n"
@@ -954,8 +954,8 @@ class DeployRuntimeTests(unittest.TestCase):
         snapshot = deploy_runtime.Snapshot(
             repo_head="a" * 40, dirty=False, contract=contract,
             contract_bytes=json.dumps(contract.to_manifest()).encode(),
-            runtime_input_bytes=b"mcp==1.27.2\n",
-            runtime_lock_bytes=b"mcp==1.27.2\n",
+            runtime_input_bytes=b"mcp==1.30.0\n",
+            runtime_lock_bytes=b"mcp==1.30.0\n",
             source_bytes=b"print('snapshot')\n",
             runtime_asset_bytes={"config/coding-agent-catalog.json": b"{\"schema_version\": 2}\n"},
         )
@@ -1771,9 +1771,9 @@ class DeployRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runtime.lock.txt"
             path.write_text(
-                "mcp==1.27.2 \\\n"
+                "mcp==1.30.0 \\\n"
                 "    --hash=sha256:" + "1" * 64 + "\n"
-                "MCP==1.27.2 \\\n"
+                "MCP==1.30.0 \\\n"
                 "    --hash=sha256:" + "2" * 64 + "\n",
                 encoding="utf-8",
             )
@@ -1784,7 +1784,7 @@ class DeployRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runtime.lock.txt"
             path.write_text(
-                "mcp==1.27.2 \\\n"
+                "mcp==1.30.0 \\\n"
                 "    --index-url=https://example.invalid/simple\n",
                 encoding="utf-8",
             )
@@ -1795,7 +1795,7 @@ class DeployRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runtime.lock.txt"
             path.write_text(
-                "mcp==1.27.2 \\\n"
+                "mcp==1.30.0 \\\n"
                 "    --hash=sha256:" + "z" * 64 + "\n",
                 encoding="utf-8",
             )
@@ -1806,11 +1806,11 @@ class DeployRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runtime.lock.txt"
             path.write_text(
-                "mcp==1.27.2 \\\n"
+                "mcp==1.30.0 \\\n"
                 "    --hash=sha256:" + "1" * 64 + "\n",
                 encoding="utf-8",
             )
-            with patch.object(deploy_runtime, "installed_distributions", return_value={"mcp": "1.27.2", "surprise": "1.0"}):
+            with patch.object(deploy_runtime, "installed_distributions", return_value={"mcp": "1.30.0", "surprise": "1.0"}):
                 with self.assertRaisesRegex(deploy_runtime.DeployError, "Unerwartete"):
                     deploy_runtime.verify_installed_distributions(Path("/python"), path)
 
@@ -1821,9 +1821,9 @@ class DeployRuntimeTests(unittest.TestCase):
             dirty=snapshot.dirty,
             contract=snapshot.contract,
             contract_bytes=snapshot.contract_bytes,
-            runtime_input_bytes=b"mcp==1.27.2\nexample==1.0\n",
+            runtime_input_bytes=b"mcp==1.30.0\nexample==1.0\n",
             runtime_lock_bytes=(
-                b"mcp==1.27.2 \\\n"
+                b"mcp==1.30.0 \\\n"
                 b"    --hash=sha256:" + b"1" * 64 + b"\n"
                 b"example==2.0 \\\n"
                 b"    --hash=sha256:" + b"2" * 64 + b"\n"
@@ -2069,7 +2069,7 @@ class DeployRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runtime.lock.txt"
             path.write_text(
-                "mcp==1.27.2\n"
+                "mcp==1.30.0\n"
                 "    --hash=sha256:" + "1" * 64 + "\n",
                 encoding="utf-8",
             )
@@ -2080,7 +2080,7 @@ class DeployRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runtime.lock.txt"
             path.write_text(
-                "mcp==1.27.2 \\\n"
+                "mcp==1.30.0 \\\n"
                 "    --hash=sha256:" + "1" * 64 + " \\\n",
                 encoding="utf-8",
             )
