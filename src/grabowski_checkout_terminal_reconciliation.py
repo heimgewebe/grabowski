@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
+import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
 import stat
@@ -15,6 +18,10 @@ SCHEMA_VERSION = checkouts.TERMINAL_RECONCILIATION_SCHEMA_VERSION
 PREVIEW_TTL_SECONDS = checkouts.TERMINAL_RECONCILIATION_PREVIEW_TTL_SECONDS
 CONFIRMATION = checkouts.TERMINAL_RECONCILIATION_CONFIRMATION
 _ALLOWED_SOURCE_PHASES = frozenset({"active", "completed_retained"})
+_REVIEW_EVIDENCE_DIR = ".review-audits"
+_REVIEW_EVIDENCE_MAX_FILES = 64
+_REVIEW_EVIDENCE_MAX_FILE_BYTES = 2 * 1024 * 1024
+_REVIEW_EVIDENCE_MAX_TOTAL_BYTES = 8 * 1024 * 1024
 
 
 def _checkout_key(value: str) -> str:
@@ -53,6 +60,7 @@ def _record(checkout_key: str) -> dict[str, Any] | None:
         or source_evidence.get("evidence_sha256") != result["source_evidence_sha256"]
     ):
         raise RuntimeError("terminal reconciliation record digest is invalid")
+    _verify_review_snapshot(receipt)
     return {**result, "receipt": receipt, "source_evidence": source_evidence}
 
 
@@ -101,7 +109,6 @@ def _snapshot(checkout_key: str) -> dict[str, Any]:
         "repo_path",
         "checkout_path",
         "owner_id",
-        "expected_head",
         "expected_branch",
     )
     mismatched = [field for field in identity_fields if binding.get(field) != retention.get(field)]
@@ -109,16 +116,38 @@ def _snapshot(checkout_key: str) -> dict[str, Any]:
         raise RuntimeError(
             "checkout binding and retention identity differ: " + ",".join(mismatched)
         )
-    if not isinstance(binding.get("expected_head"), str) or not isinstance(
-        binding.get("expected_branch"), str
-    ):
-        raise RuntimeError("terminal reconciliation requires exact stored head and branch")
+    for row_name, row in (("binding", binding), ("retention", retention)):
+        if (
+            not isinstance(row.get("expected_head"), str)
+            or checkouts.GIT_OBJECT_RE.fullmatch(row["expected_head"]) is None
+            or not isinstance(row.get("expected_branch"), str)
+        ):
+            raise RuntimeError(
+                f"terminal reconciliation requires exact stored {row_name} head and branch"
+            )
+    identity_catchup: dict[str, Any] | None = None
+    if binding["expected_head"] != retention["expected_head"]:
+        source = binding.get("source")
+        if not (
+            binding.get("phase") == "active"
+            and isinstance(source, dict)
+            and source.get("kind") == "thread_focus"
+        ):
+            raise RuntimeError(
+                "checkout binding and retention identity differ: expected_head"
+            )
+        identity_catchup = {
+            "kind": "thread_focus_retention_head_catchup",
+            "binding_expected_head": binding["expected_head"],
+            "retention_expected_head": retention["expected_head"],
+        }
     return {
         "binding": binding,
         "binding_sha256": checkouts._sha256_json(binding),
         "retention": retention,
         "retention_sha256": checkouts._sha256_json(retention),
         "archive_count": int(archive_count),
+        "identity_catchup": identity_catchup,
     }
 
 
@@ -222,6 +251,519 @@ def _missing_checkout_observation(binding: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _nul_paths(completed: Any) -> list[str]:
+    return sorted(item for item in completed.stdout.split("\0") if item)
+
+
+def _review_evidence_ignored_roots(checkout: Path) -> tuple[list[str], list[str]]:
+    completed = checkouts._git_read(
+        checkout,
+        [
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+        ],
+        check=False,
+    )
+    if completed.returncode != 0:
+        return [], ["review-evidence-ignored-status-unobservable"]
+    paths = _nul_paths(completed)
+    blockers: list[str] = []
+    if any(path != f"{_REVIEW_EVIDENCE_DIR}/" for path in paths):
+        blockers.append("review-evidence-ignored-content-outside-allowlist")
+    return paths, blockers
+
+
+def _review_evidence_index_flags(checkout: Path) -> tuple[list[str], list[str]]:
+    completed = checkouts._git_read(
+        checkout, ["ls-files", "-v", "-z"], check=False
+    )
+    if completed.returncode != 0:
+        return [], ["review-evidence-index-flags-unobservable"]
+    entries = sorted(item for item in completed.stdout.split("\0") if item)
+    tags = [entry[0] for entry in entries]
+    blockers: list[str] = []
+    if any(tag.islower() for tag in tags):
+        blockers.append("review-evidence-assume-unchanged-present")
+    if any(tag.upper() == "S" for tag in tags):
+        blockers.append("review-evidence-skip-worktree-present")
+    return entries, blockers
+
+
+def _thread_focus_review_evidence_paths(
+    checkout: Path, status: dict[str, Any]
+) -> tuple[list[str], list[str]]:
+    blockers: list[str] = []
+    tracked_entries = checkouts._git_read(
+        checkout, ["ls-files", "--stage", "-z"], check=False
+    )
+    if tracked_entries.returncode != 0:
+        blockers.append("review-evidence-tracked-layout-unobservable")
+    elif any(
+        entry.startswith("160000 ")
+        for entry in tracked_entries.stdout.split("\0")
+        if entry
+    ):
+        blockers.append("review-evidence-submodules-present")
+
+    _, index_flag_blockers = _review_evidence_index_flags(checkout)
+    blockers.extend(index_flag_blockers)
+
+    for label, arguments in (
+        ("unstaged", ["diff", "--quiet", "--no-ext-diff", "--"]),
+        ("staged", ["diff", "--cached", "--quiet", "--no-ext-diff", "--"]),
+    ):
+        completed = checkouts._git_read(checkout, arguments, check=False)
+        if completed.returncode not in {0, 1}:
+            blockers.append(f"review-evidence-{label}-status-unobservable")
+        elif completed.returncode == 1:
+            blockers.append(f"review-evidence-{label}-tracked-change")
+
+    untracked = checkouts._git_read(
+        checkout,
+        ["ls-files", "--others", "--exclude-standard", "-z"],
+        check=False,
+    )
+    if untracked.returncode != 0:
+        blockers.append("review-evidence-untracked-status-unobservable")
+        untracked_paths: list[str] = []
+    else:
+        untracked_paths = _nul_paths(untracked)
+
+    _, ignored_root_blockers = _review_evidence_ignored_roots(checkout)
+    blockers.extend(ignored_root_blockers)
+
+    ignored_audits = checkouts._git_read(
+        checkout,
+        [
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+            "--",
+            f"{_REVIEW_EVIDENCE_DIR}/",
+        ],
+        check=False,
+    )
+    if ignored_audits.returncode != 0:
+        blockers.append("review-evidence-ignored-audits-unobservable")
+        ignored_audit_paths: list[str] = []
+    else:
+        ignored_audit_paths = _nul_paths(ignored_audits)
+
+    paths = sorted(set(untracked_paths) | set(ignored_audit_paths))
+    if len(paths) > _REVIEW_EVIDENCE_MAX_FILES:
+        blockers.append("review-evidence-file-count-exceeded")
+    if (
+        status.get("entry_count") != len(untracked_paths)
+        or status.get("untracked_count") != len(untracked_paths)
+    ):
+        blockers.append("review-evidence-status-count-mismatch")
+    return paths, blockers
+
+
+def _review_evidence_filename(raw_path: str) -> str | None:
+    relative = Path(raw_path)
+    parts = relative.parts
+    if (
+        relative.is_absolute()
+        or len(parts) != 2
+        or parts[0] != _REVIEW_EVIDENCE_DIR
+        or raw_path != f"{_REVIEW_EVIDENCE_DIR}/{parts[-1]}"
+        or parts[-1] in {"", ".", ".."}
+    ):
+        return None
+    return parts[-1]
+
+
+def _open_review_evidence_root(
+    checkout: Path,
+) -> tuple[int, os.stat_result | None, list[str]]:
+    root = checkout / _REVIEW_EVIDENCE_DIR
+    blockers: list[str] = []
+    try:
+        linked = root.lstat()
+    except OSError:
+        return -1, None, ["review-evidence-root-unobservable"]
+    if stat.S_ISLNK(linked.st_mode):
+        return -1, None, ["review-evidence-root-symlink"]
+    if not stat.S_ISDIR(linked.st_mode):
+        return -1, None, ["review-evidence-root-not-directory"]
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(root, flags)
+    except OSError:
+        return -1, None, ["review-evidence-root-unobservable"]
+    opened = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or opened.st_dev != linked.st_dev
+        or opened.st_ino != linked.st_ino
+    ):
+        blockers.append("review-evidence-root-identity-drift")
+    return descriptor, opened, blockers
+
+
+def _hash_review_evidence_file(
+    root_descriptor: int, raw_path: str, remaining_bytes: int,
+    *, capture: dict[str, bytes] | None = None,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    filename = _review_evidence_filename(raw_path)
+    if filename is None:
+        return None, ["review-evidence-path-outside-allowlist"]
+    try:
+        linked = os.stat(filename, dir_fd=root_descriptor, follow_symlinks=False)
+    except OSError:
+        return None, ["review-evidence-file-unobservable"]
+    if not stat.S_ISREG(linked.st_mode):
+        return None, ["review-evidence-file-not-regular"]
+    if linked.st_nlink != 1:
+        return None, ["review-evidence-file-hardlinked"]
+    if linked.st_size > _REVIEW_EVIDENCE_MAX_FILE_BYTES:
+        return None, ["review-evidence-file-size-exceeded"]
+    if linked.st_size > remaining_bytes:
+        return None, ["review-evidence-total-size-exceeded"]
+
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    descriptor = -1
+    try:
+        descriptor = os.open(filename, flags, dir_fd=root_descriptor)
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_dev != linked.st_dev
+            or before.st_ino != linked.st_ino
+            or before.st_nlink != 1
+            or before.st_size != linked.st_size
+        ):
+            return None, ["review-evidence-file-identity-drift"]
+        digest = hashlib.sha256()
+        chunks: list[bytes] = []
+        observed_bytes = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            observed_bytes += len(chunk)
+            if observed_bytes > _REVIEW_EVIDENCE_MAX_FILE_BYTES:
+                return None, ["review-evidence-file-size-exceeded"]
+            if observed_bytes > remaining_bytes:
+                return None, ["review-evidence-total-size-exceeded"]
+            digest.update(chunk)
+            if capture is not None:
+                chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev != after.st_dev
+            or before.st_ino != after.st_ino
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+            or before.st_ctime_ns != after.st_ctime_ns
+            or before.st_nlink != after.st_nlink
+            or observed_bytes != after.st_size
+        ):
+            return None, ["review-evidence-file-changed-during-read"]
+        if capture is not None:
+            capture[raw_path] = b"".join(chunks)
+        return {
+            "path": raw_path,
+            "bytes": observed_bytes,
+            "sha256": digest.hexdigest(),
+        }, []
+    except OSError:
+        return None, ["review-evidence-file-unobservable"]
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+
+def _review_snapshot_identity(
+    checkout_key: str, preview_sha256: str, manifest: dict[str, Any]
+) -> dict[str, Any]:
+    core = {
+        "schema_version": 1,
+        "kind": "terminal_review_evidence_snapshot",
+        "checkout_key": checkout_key,
+        "preview_sha256": preview_sha256,
+        "manifest_sha256": manifest["manifest_sha256"],
+        "file_count": manifest["file_count"],
+        "total_bytes": manifest["total_bytes"],
+        "storage": "checkout_database",
+        "source_files_frozen": False,
+    }
+    return {**core, "snapshot_sha256": checkouts._sha256_json(core)}
+
+
+def _retain_review_snapshot(
+    connection: sqlite3.Connection,
+    checkout_key: str,
+    preview_sha256: str,
+    observation: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Retain bounded evidence bytes in the lifecycle transaction, never in output."""
+    manifest = observation.get("review_evidence")
+    if not isinstance(manifest, dict) or manifest.get("eligible") is not True:
+        return None
+    checkout = Path(observation["checkout_path"])
+    root_fd, identity, blockers = _open_review_evidence_root(checkout)
+    captured: dict[str, bytes] = {}
+    try:
+        if root_fd < 0 or blockers:
+            raise RuntimeError("review evidence snapshot root changed")
+        expected_paths = [item["path"] for item in manifest["files"]]
+        members, blockers = _review_evidence_root_members(root_fd)
+        if blockers or members != expected_paths:
+            raise RuntimeError("review evidence snapshot membership changed")
+        remaining = _REVIEW_EVIDENCE_MAX_TOTAL_BYTES
+        for expected in manifest["files"]:
+            observed, blockers = _hash_review_evidence_file(
+                root_fd, expected["path"], remaining, capture=captured
+            )
+            if blockers or observed != expected:
+                raise RuntimeError("review evidence snapshot content changed")
+            remaining -= expected["bytes"]
+        members, blockers = _review_evidence_root_members(root_fd)
+        if (
+            blockers
+            or members != expected_paths
+            or not _review_evidence_root_unchanged(checkout, identity)
+        ):
+            raise RuntimeError("review evidence snapshot root changed during capture")
+    finally:
+        if root_fd >= 0:
+            os.close(root_fd)
+    snapshot = _review_snapshot_identity(checkout_key, preview_sha256, manifest)
+    # This module owns this additive, private evidence table. It is created only
+    # for the admitted review-evidence path; rollback removes partial snapshots.
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS terminal_review_evidence ("
+        "snapshot_sha256 TEXT NOT NULL, path TEXT NOT NULL, content BLOB NOT NULL, "
+        "PRIMARY KEY(snapshot_sha256, path))"
+    )
+    for path, content in captured.items():
+        connection.execute(
+            "INSERT INTO terminal_review_evidence(snapshot_sha256, path, content) "
+            "VALUES (?, ?, ?)",
+            (snapshot["snapshot_sha256"], path, content),
+        )
+    return snapshot
+
+
+def _verify_review_snapshot(receipt: dict[str, Any]) -> None:
+    snapshot = receipt.get("review_evidence_snapshot")
+    if snapshot is None:  # Legacy receipts keep their original evidence contract.
+        return
+    manifest = receipt.get("review_evidence_manifest")
+    if not isinstance(manifest, dict) or snapshot != _review_snapshot_identity(
+        receipt["checkout_key"], receipt["preview_sha256"], manifest
+    ):
+        raise RuntimeError("terminal review evidence snapshot identity is invalid")
+    connection = checkouts._readonly_connection(checkouts.CHECKOUT_DB)
+    if connection is None:
+        raise RuntimeError("terminal review evidence snapshot database is unavailable")
+    files = []
+    total = 0
+    try:
+        rows = connection.execute(
+            "SELECT path, length(content) AS bytes, substr(content, 1, ?) AS content "
+            "FROM terminal_review_evidence WHERE snapshot_sha256=? ORDER BY path LIMIT ?",
+            (
+                _REVIEW_EVIDENCE_MAX_FILE_BYTES + 1,
+                snapshot["snapshot_sha256"],
+                _REVIEW_EVIDENCE_MAX_FILES + 1,
+            ),
+        )
+        for row in rows:
+            content = row["content"]
+            if (
+                not isinstance(content, bytes)
+                or row["bytes"] != len(content)
+                or len(content) > _REVIEW_EVIDENCE_MAX_FILE_BYTES
+            ):
+                raise RuntimeError("terminal review evidence snapshot content is invalid")
+            total += len(content)
+            if total > _REVIEW_EVIDENCE_MAX_TOTAL_BYTES:
+                raise RuntimeError("terminal review evidence snapshot exceeds budget")
+            files.append({
+                "path": row["path"], "bytes": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+            })
+    except sqlite3.Error as exc:
+        raise RuntimeError("terminal review evidence snapshot is unavailable") from exc
+    finally:
+        connection.close()
+    if (
+        len(files) > _REVIEW_EVIDENCE_MAX_FILES
+        or files != manifest["files"]
+        or len(files) != manifest["file_count"]
+        or total != manifest["total_bytes"]
+    ):
+        raise RuntimeError("terminal review evidence snapshot digest is invalid")
+
+
+def _review_evidence_root_unchanged(
+    checkout: Path, opened: os.stat_result | None
+) -> bool:
+    if opened is None:
+        return False
+    try:
+        linked = (checkout / _REVIEW_EVIDENCE_DIR).lstat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(linked.st_mode)
+        and not stat.S_ISLNK(linked.st_mode)
+        and linked.st_dev == opened.st_dev
+        and linked.st_ino == opened.st_ino
+        and linked.st_mtime_ns == opened.st_mtime_ns
+        and linked.st_ctime_ns == opened.st_ctime_ns
+    )
+
+
+def _review_evidence_root_members(root_descriptor: int) -> tuple[list[str], list[str]]:
+    try:
+        names = sorted(os.listdir(root_descriptor))
+    except OSError:
+        return [], ["review-evidence-root-members-unobservable"]
+    return [f"{_REVIEW_EVIDENCE_DIR}/{name}" for name in names], []
+
+
+def _thread_focus_review_evidence_observation(
+    record: dict[str, Any], status: dict[str, Any]
+) -> dict[str, Any]:
+    checkout = Path(record["path"])
+    paths, blockers = _thread_focus_review_evidence_paths(checkout, status)
+    index_flags_before_hash, index_flag_blockers = _review_evidence_index_flags(checkout)
+    blockers.extend(index_flag_blockers)
+    ignored_roots_before_hash, ignored_root_blockers = _review_evidence_ignored_roots(
+        checkout
+    )
+    blockers.extend(ignored_root_blockers)
+    if not paths:
+        try:
+            (checkout / _REVIEW_EVIDENCE_DIR).lstat()
+        except FileNotFoundError:
+            core = {
+                "schema_version": 1,
+                "kind": "thread_focus_review_evidence_manifest",
+                "root": _REVIEW_EVIDENCE_DIR,
+                "file_count": 0,
+                "total_bytes": 0,
+                "files": [],
+            }
+            return {
+                **core,
+                "manifest_sha256": checkouts._sha256_json(core),
+                "classification": "blocked" if blockers else "not_applicable",
+                "eligible": False,
+                "blockers": sorted(set(blockers)),
+            }
+        except OSError:
+            blockers.append("review-evidence-root-unobservable")
+
+    root_descriptor, root_identity, root_blockers = _open_review_evidence_root(checkout)
+    blockers.extend(root_blockers)
+    files: list[dict[str, Any]] = []
+    total_bytes = 0
+    expected_root_members = sorted(
+        path for path in paths if _review_evidence_filename(path) is not None
+    )
+    try:
+        if (
+            root_descriptor >= 0
+            and not root_blockers
+            and len(paths) <= _REVIEW_EVIDENCE_MAX_FILES
+        ):
+            initial_root_members, member_blockers = _review_evidence_root_members(
+                root_descriptor
+            )
+            blockers.extend(member_blockers)
+            if initial_root_members != expected_root_members:
+                blockers.append("review-evidence-root-membership-drift")
+            for raw_path in paths:
+                evidence, file_blockers = _hash_review_evidence_file(
+                    root_descriptor,
+                    raw_path,
+                    _REVIEW_EVIDENCE_MAX_TOTAL_BYTES - total_bytes,
+                )
+                blockers.extend(file_blockers)
+                if evidence is None:
+                    continue
+                total_bytes += int(evidence["bytes"])
+                files.append(evidence)
+            for evidence in files:
+                verified, verification_blockers = _hash_review_evidence_file(
+                    root_descriptor,
+                    str(evidence["path"]),
+                    _REVIEW_EVIDENCE_MAX_TOTAL_BYTES,
+                )
+                blockers.extend(verification_blockers)
+                if verified is not None and verified != evidence:
+                    blockers.append("review-evidence-file-changed-after-read")
+            final_root_members, member_blockers = _review_evidence_root_members(
+                root_descriptor
+            )
+            blockers.extend(member_blockers)
+            if final_root_members != expected_root_members:
+                blockers.append("review-evidence-root-membership-drift")
+            ignored_roots_after_hash, ignored_root_blockers = _review_evidence_ignored_roots(
+                checkout
+            )
+            blockers.extend(ignored_root_blockers)
+            if ignored_roots_after_hash != ignored_roots_before_hash:
+                blockers.append("review-evidence-ignored-inventory-drift")
+            final_paths, final_path_blockers = _thread_focus_review_evidence_paths(
+                checkout, status
+            )
+            blockers.extend(final_path_blockers)
+            if final_paths != paths:
+                blockers.append("review-evidence-repository-inventory-drift")
+            index_flags_after_hash, index_flag_blockers = _review_evidence_index_flags(
+                checkout
+            )
+            blockers.extend(index_flag_blockers)
+            if index_flags_after_hash != index_flags_before_hash:
+                blockers.append("review-evidence-index-flags-drift")
+            if not _review_evidence_root_unchanged(checkout, root_identity):
+                blockers.append("review-evidence-root-changed-during-read")
+    finally:
+        if root_descriptor >= 0:
+            os.close(root_descriptor)
+
+    if len(files) != len(paths):
+        blockers.append("review-evidence-manifest-incomplete")
+    core = {
+        "schema_version": 1,
+        "kind": "thread_focus_review_evidence_manifest",
+        "root": _REVIEW_EVIDENCE_DIR,
+        "file_count": len(files),
+        "total_bytes": total_bytes,
+        "files": files,
+    }
+    return {
+        **core,
+        "manifest_sha256": checkouts._sha256_json(core),
+        "classification": (
+            "blocked" if blockers else "review_evidence_only" if paths else "not_applicable"
+        ),
+        "eligible": bool(paths) and not blockers,
+        "blockers": sorted(set(blockers)),
+    }
+
+
 def _present_checkout_observation(binding: dict[str, Any]) -> dict[str, Any]:
     repo = checkouts._resolve_repo(binding["repo_path"])
     common_dir = checkouts._git_common_dir(repo)
@@ -258,6 +800,7 @@ def _present_checkout_observation(binding: dict[str, Any]) -> dict[str, Any]:
     relation = "unobservable"
     status: dict[str, Any] | None = None
     remote_security: dict[str, Any] | None = None
+    review_evidence: dict[str, Any] | None = None
     if record is not None:
         if record.get("prunable"):
             blockers.append("checkout-record-prunable")
@@ -283,8 +826,80 @@ def _present_checkout_observation(binding: dict[str, Any]) -> dict[str, Any]:
         elif branch_head is not None and ref_head != branch_head:
             blockers.append("branch-ref-head-drift")
         status = checkouts._worktree_status(record)
+        source = binding.get("source")
+        source_is_thread_focus = (
+            isinstance(source, dict) and source.get("kind") == "thread_focus"
+        )
+        if source_is_thread_focus:
+            observed_review_evidence = _thread_focus_review_evidence_observation(record, status)
+            if observed_review_evidence.get("classification") != "not_applicable":
+                review_evidence = observed_review_evidence
+            blockers.extend(observed_review_evidence.get("blockers", []))
+
+            refreshed_top_level, refreshed_common, refreshed_records = checkouts._worktree_records(repo)
+            refreshed_matches = [
+                candidate
+                for candidate in refreshed_records
+                if Path(candidate["path"]).resolve(strict=False)
+                == checkout_path.resolve(strict=False)
+            ]
+            if (
+                str(refreshed_top_level) != str(top_level)
+                or refreshed_common != observed_common
+            ):
+                blockers.append("checkout-repository-drift-after-review-evidence")
+            if len(refreshed_matches) != 1:
+                blockers.append("checkout-record-drift-after-review-evidence")
+            else:
+                refreshed_record = refreshed_matches[0]
+                refreshed_head = refreshed_record.get("head")
+                if refreshed_record.get("prunable"):
+                    blockers.append("checkout-record-prunable")
+                if refreshed_record.get("branch") != binding["expected_branch"]:
+                    blockers.append("checkout-branch-drift-after-review-evidence")
+                if refreshed_head != record.get("head"):
+                    blockers.append("checkout-head-drift-after-review-evidence")
+                refreshed_branch_read = checkouts._git_read(
+                    repo,
+                    ["rev-parse", "--verify", f"{branch_ref}^{{commit}}"],
+                    check=False,
+                )
+                refreshed_ref_head = (
+                    refreshed_branch_read.stdout.strip()
+                    if refreshed_branch_read.returncode == 0
+                    else None
+                )
+                if refreshed_ref_head != ref_head:
+                    blockers.append("branch-ref-drift-after-review-evidence")
+                refreshed_status = checkouts._worktree_status(refreshed_record)
+                if refreshed_status != status:
+                    blockers.append("checkout-status-drift-after-review-evidence")
+                record = refreshed_record
+                status = refreshed_status
+                ref_head = refreshed_ref_head
+                if (
+                    not isinstance(refreshed_head, str)
+                    or checkouts.GIT_OBJECT_RE.fullmatch(refreshed_head) is None
+                ):
+                    branch_head = None
+                    relation = "unobservable"
+                    blockers.append("checkout-record-head-unobservable")
+                else:
+                    branch_head = refreshed_head
+                    relation, relation_blockers = _branch_head_relation(
+                        repo, binding["expected_head"], refreshed_head
+                    )
+                    blockers.extend(relation_blockers)
+                if ref_head is None:
+                    blockers.append("branch-ref-missing")
+                elif branch_head is not None and ref_head != branch_head:
+                    blockers.append("branch-ref-head-drift")
         if status.get("dirty") is True:
-            blockers.append("checkout-dirty")
+            if not source_is_thread_focus or (
+                not isinstance(review_evidence, dict)
+                or review_evidence.get("eligible") is not True
+            ):
+                blockers.append("checkout-dirty")
         elif status.get("dirty") is not False:
             blockers.append("checkout-status-unobservable")
         remote_security = checkouts._remote_secured_observation(
@@ -307,6 +922,7 @@ def _present_checkout_observation(binding: dict[str, Any]) -> dict[str, Any]:
         "expected_branch": binding["expected_branch"],
         "status": status,
         "remote_security": remote_security,
+        "review_evidence": review_evidence,
         "blockers": sorted(set(blockers)),
     }
 
@@ -421,19 +1037,35 @@ def _preview_state(
     checkout = _terminal_checkout_observation(binding)
     coordination = _coordination(binding, ignore_lease_owner=ignore_lease_owner)
     blockers = list(checkout["blockers"])
+    if snapshot["identity_catchup"] is not None and checkout.get("mode") != "present":
+        blockers.append("thread-focus-retention-head-catchup-requires-present-checkout")
     if snapshot["archive_count"]:
         blockers.append("archive-record-present")
     source = binding.get("source")
     source_is_work_lane = (
         isinstance(source, dict) and source.get("kind") == "work_lane"
     )
+    source_is_thread_focus = (
+        isinstance(source, dict) and source.get("kind") == "thread_focus"
+    )
     if checkout.get("mode") == "present":
         if binding["phase"] != "active":
             blockers.append("present-checkout-not-active")
-        if not source_is_work_lane:
+        if source_is_work_lane:
+            if source_evidence.get("lease_release_ready") is not True:
+                blockers.append("work-lane-lease-release-not-ready")
+        elif source_is_thread_focus:
+            if source_evidence.get("terminal_state") != "completed_without_current_obligation":
+                blockers.append("thread-focus-terminal-evidence-invalid")
+            if checkout.get("branch_head") != snapshot["retention"].get("expected_head"):
+                blockers.append("thread-focus-head-not-retention-bound")
+            status = checkout.get("status")
+            review_evidence = checkout.get("review_evidence")
+            if isinstance(status, dict) and status.get("dirty") is True:
+                if not isinstance(review_evidence, dict) or review_evidence.get("eligible") is not True:
+                    blockers.append("thread-focus-review-evidence-not-admissible")
+        else:
             blockers.append("present-checkout-source-not-work-lane")
-        elif source_evidence.get("lease_release_ready") is not True:
-            blockers.append("work-lane-lease-release-not-ready")
     if source_is_work_lane:
         terminal_head = source_evidence.get("terminal_head_sha")
         if terminal_head is not None:
@@ -455,6 +1087,7 @@ def _preview_state(
         "binding_sha256": snapshot["binding_sha256"],
         "retention": snapshot["retention"],
         "retention_sha256": snapshot["retention_sha256"],
+        "identity_catchup": snapshot["identity_catchup"],
         "source_evidence": source_evidence,
         "checkout_observation": checkout,
         "coordination": coordination,
@@ -467,6 +1100,7 @@ def _preview_state(
             "branch_or_ref_deletion_authority",
             "historical_checkout_content",
             "permission_to_remove_retention_or_binding_rows",
+            "permission_to_modify_or_delete_review_evidence",
         ],
     }
     return stable
@@ -573,263 +1207,328 @@ def apply(
             "source_evidence_sha256": planned["source_evidence"]["evidence_sha256"],
         },
     )
+    binding_source = planned["binding"].get("source")
+    source_lock = (
+        sources.operator_obligation._state_lock()
+        if isinstance(binding_source, dict)
+        and binding_source.get("kind") == "thread_focus"
+        else nullcontext()
+    )
     result: dict[str, Any] | None = None
     try:
-        current = _bind_preview(
-            _preview_state(key, ignore_lease_owner=operation_owner),
-            preview_created_at_unix,
-        )
-        if current.get("preview_sha256") != preview_sha256:
-            raise RuntimeError("terminal reconciliation changed after lease acquisition")
-        applied_at = checkouts._now()
-        with checkouts._operation_lock(), checkouts._database() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            prior_row = connection.execute(
-                "SELECT owner_id, preview_sha256, receipt_json, receipt_sha256 "
-                "FROM terminal_reconciliations WHERE checkout_key=?",
-                (key,),
-            ).fetchone()
-            superseded_receipt: dict[str, Any] | None = None
-            superseded_receipt_sha256: str | None = None
-            if prior_row is not None:
-                same_owner = prior_row["owner_id"] == owner
-                if prior_row["preview_sha256"] == preview_sha256:
-                    if not same_owner:
-                        raise PermissionError(
-                            "terminal reconciliation replay belongs to another owner"
-                        )
+        with source_lock, checkouts._operation_lock():
+            current = _bind_preview(
+                _preview_state(key, ignore_lease_owner=operation_owner),
+                preview_created_at_unix,
+            )
+            if current.get("preview_sha256") != preview_sha256:
+                raise RuntimeError("terminal reconciliation changed after lease acquisition")
+            applied_at = checkouts._now()
+            with checkouts._database() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                commit_bound = _bind_preview(
+                    _preview_state(key, ignore_lease_owner=operation_owner),
+                    preview_created_at_unix,
+                )
+                if commit_bound.get("preview_sha256") != preview_sha256:
                     connection.rollback()
-                    replay = _replay(key, owner, preview_sha256)
-                    if replay is None:
-                        raise RuntimeError("terminal reconciliation replay disappeared")
-                    return replay
-                try:
-                    prior_receipt = json.loads(prior_row["receipt_json"])
-                except json.JSONDecodeError as exc:
                     raise RuntimeError(
-                        "terminal reconciliation predecessor receipt is invalid"
-                    ) from exc
-                expected_predecessor = planned.get(
-                    "supersedes_reconciliation_receipt_sha256"
-                )
-                predecessor_is_present = (
-                    isinstance(prior_receipt, dict)
-                    and _reconciliation_mode(prior_receipt) == "present_retained"
-                    and expected_predecessor == prior_row["receipt_sha256"]
-                    and prior_receipt.get("receipt_sha256")
-                    == prior_row["receipt_sha256"]
-                )
-                handoff_supersession = (
-                    predecessor_is_present
-                    and not same_owner
-                    and planned["binding"]["owner_id"] == owner
-                    and planned["binding"]["phase"] == "completed_retained"
-                )
-                if not predecessor_is_present:
-                    raise RuntimeError(
-                        "terminal reconciliation predecessor changed or is not supersedable"
+                        "terminal reconciliation changed at commit boundary"
                     )
-                if not same_owner and not handoff_supersession:
-                    raise PermissionError(
-                        "terminal reconciliation predecessor belongs to another owner"
-                    )
-                superseded_receipt = prior_receipt
-                superseded_receipt_sha256 = prior_row["receipt_sha256"]
-            binding_row = connection.execute(
-                "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
-                (key,),
-            ).fetchone()
-            retention_row = connection.execute(
-                "SELECT * FROM retention WHERE checkout_key=?",
-                (key,),
-            ).fetchone()
-            if binding_row is None or retention_row is None:
-                raise RuntimeError("checkout lifecycle state disappeared before apply")
-            binding_before = checkouts._lifecycle_public(binding_row)
-            retention_before = checkouts._retention_public(retention_row)
-            if (
-                checkouts._sha256_json(binding_before) != planned["binding_sha256"]
-                or checkouts._sha256_json(retention_before) != planned["retention_sha256"]
-            ):
-                raise RuntimeError("checkout lifecycle CAS preimage changed")
-            checkout_observation = planned["checkout_observation"]
-            mode = checkout_observation.get("mode")
-            if mode not in {"missing", "present"}:
-                raise RuntimeError("terminal reconciliation checkout mode is invalid")
-            target_phase = (
-                "completed_retained"
-                if mode == "present"
-                else "externally_terminal_missing"
-            )
-            relation = checkout_observation.get("branch_head_relation")
-            rebind_head = (
-                checkout_observation.get("branch_head")
-                if relation == "descendant"
-                else binding_before["expected_head"]
-            )
-            if not isinstance(rebind_head, str):
-                raise RuntimeError("terminal reconciliation lacks an exact terminal head")
-            lifecycle_updated_at = max(
-                applied_at, int(binding_before["updated_at_unix"]) + 1
-            )
-            updated = connection.execute(
-                """
-                UPDATE lifecycle_bindings
-                SET phase=?,
-                    expected_head=?,
-                    terminal_at_unix=COALESCE(terminal_at_unix, ?),
-                    archived_at_unix=NULL,
-                    updated_at_unix=?
-                WHERE checkout_key=? AND owner_id=? AND phase=?
-                  AND expected_head=? AND updated_at_unix=?
-                """,
-                (
-                    target_phase,
-                    rebind_head,
-                    applied_at,
-                    lifecycle_updated_at,
-                    key,
-                    owner,
-                    binding_before["phase"],
-                    binding_before["expected_head"],
-                    binding_before["updated_at_unix"],
-                ),
-            )
-            if updated.rowcount != 1:
-                raise RuntimeError("checkout lifecycle CAS transition was not applied exactly")
-            if rebind_head != retention_before["expected_head"]:
-                retention_updated_at = max(
-                    applied_at, int(retention_before["updated_at_unix"]) + 1
+                planned = commit_bound
+                review_snapshot = _retain_review_snapshot(
+                    connection, key, preview_sha256, planned["checkout_observation"]
                 )
-                retention_updated = connection.execute(
+                prior_row = connection.execute(
+                    "SELECT owner_id, preview_sha256, receipt_json, receipt_sha256 "
+                    "FROM terminal_reconciliations WHERE checkout_key=?",
+                    (key,),
+                ).fetchone()
+                superseded_receipt: dict[str, Any] | None = None
+                superseded_receipt_sha256: str | None = None
+                if prior_row is not None:
+                    same_owner = prior_row["owner_id"] == owner
+                    if prior_row["preview_sha256"] == preview_sha256:
+                        if not same_owner:
+                            raise PermissionError(
+                                "terminal reconciliation replay belongs to another owner"
+                            )
+                        connection.rollback()
+                        replay = _replay(key, owner, preview_sha256)
+                        if replay is None:
+                            raise RuntimeError("terminal reconciliation replay disappeared")
+                        return replay
+                    try:
+                        prior_receipt = json.loads(prior_row["receipt_json"])
+                    except json.JSONDecodeError as exc:
+                        raise RuntimeError(
+                            "terminal reconciliation predecessor receipt is invalid"
+                        ) from exc
+                    expected_predecessor = planned.get(
+                        "supersedes_reconciliation_receipt_sha256"
+                    )
+                    predecessor_is_present = (
+                        isinstance(prior_receipt, dict)
+                        and _reconciliation_mode(prior_receipt) == "present_retained"
+                        and expected_predecessor == prior_row["receipt_sha256"]
+                        and prior_receipt.get("receipt_sha256")
+                        == prior_row["receipt_sha256"]
+                    )
+                    handoff_supersession = (
+                        predecessor_is_present
+                        and not same_owner
+                        and planned["binding"]["owner_id"] == owner
+                        and planned["binding"]["phase"] == "completed_retained"
+                    )
+                    if not predecessor_is_present:
+                        raise RuntimeError(
+                            "terminal reconciliation predecessor changed or is not supersedable"
+                        )
+                    if not same_owner and not handoff_supersession:
+                        raise PermissionError(
+                            "terminal reconciliation predecessor belongs to another owner"
+                        )
+                    superseded_receipt = prior_receipt
+                    superseded_receipt_sha256 = prior_row["receipt_sha256"]
+                binding_row = connection.execute(
+                    "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
+                    (key,),
+                ).fetchone()
+                retention_row = connection.execute(
+                    "SELECT * FROM retention WHERE checkout_key=?",
+                    (key,),
+                ).fetchone()
+                if binding_row is None or retention_row is None:
+                    raise RuntimeError("checkout lifecycle state disappeared before apply")
+                binding_before = checkouts._lifecycle_public(binding_row)
+                retention_before = checkouts._retention_public(retention_row)
+                if (
+                    checkouts._sha256_json(binding_before) != planned["binding_sha256"]
+                    or checkouts._sha256_json(retention_before) != planned["retention_sha256"]
+                ):
+                    raise RuntimeError("checkout lifecycle CAS preimage changed")
+                checkout_observation = planned["checkout_observation"]
+                mode = checkout_observation.get("mode")
+                if mode not in {"missing", "present"}:
+                    raise RuntimeError("terminal reconciliation checkout mode is invalid")
+                target_phase = (
+                    "completed_retained"
+                    if mode == "present"
+                    else "externally_terminal_missing"
+                )
+                relation = checkout_observation.get("branch_head_relation")
+                rebind_head = (
+                    checkout_observation.get("branch_head")
+                    if relation == "descendant"
+                    else binding_before["expected_head"]
+                )
+                if not isinstance(rebind_head, str):
+                    raise RuntimeError("terminal reconciliation lacks an exact terminal head")
+                lifecycle_updated_at = max(
+                    applied_at, int(binding_before["updated_at_unix"]) + 1
+                )
+                updated = connection.execute(
                     """
-                    UPDATE retention
-                    SET expected_head=?, updated_at_unix=?
-                    WHERE checkout_key=? AND owner_id=? AND expected_head=?
-                      AND updated_at_unix=?
+                    UPDATE lifecycle_bindings
+                    SET phase=?,
+                        expected_head=?,
+                        terminal_at_unix=COALESCE(terminal_at_unix, ?),
+                        archived_at_unix=NULL,
+                        updated_at_unix=?
+                    WHERE checkout_key=? AND owner_id=? AND phase=?
+                      AND expected_head=? AND updated_at_unix=?
                     """,
                     (
+                        target_phase,
                         rebind_head,
-                        retention_updated_at,
+                        applied_at,
+                        lifecycle_updated_at,
                         key,
                         owner,
-                        retention_before["expected_head"],
-                        retention_before["updated_at_unix"],
+                        binding_before["phase"],
+                        binding_before["expected_head"],
+                        binding_before["updated_at_unix"],
                     ),
                 )
-                if retention_updated.rowcount != 1:
-                    raise RuntimeError("checkout retention head rebind was not applied exactly")
-            binding_after_row = connection.execute(
-                "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
-                (key,),
-            ).fetchone()
-            retention_after_row = connection.execute(
-                "SELECT * FROM retention WHERE checkout_key=?",
-                (key,),
-            ).fetchone()
-            if binding_after_row is None or retention_after_row is None:
-                raise RuntimeError("checkout lifecycle post-state disappeared")
-            binding_after = checkouts._lifecycle_public(binding_after_row)
-            retention_after = checkouts._retention_public(retention_after_row)
-            branch_head_rebind = (
-                {
-                    "relation": "descendant",
-                    "from_head": binding_before["expected_head"],
-                    "to_head": rebind_head,
-                }
-                if rebind_head != binding_before["expected_head"]
-                else None
-            )
-            effects = ["lifecycle_phase_transition"]
-            if mode == "present":
-                effects.append("active_capacity_release")
-            if branch_head_rebind is not None:
-                effects.append("terminal_head_rebind")
-            receipt_core = {
-                "schema_version": SCHEMA_VERSION,
-                "kind": "checkout_terminal_reconciliation_receipt",
-                "checkout_key": key,
-                "reconciliation_mode": (
-                    "present_retained" if mode == "present" else "missing_external"
-                ),
-                "checkout_preserved": mode == "present",
-                "owner_id": owner,
-                "binding_before": binding_before,
-                "binding_before_sha256": planned["binding_sha256"],
-                "binding_after": binding_after,
-                "binding_after_sha256": checkouts._sha256_json(binding_after),
-                "retention_before": retention_before,
-                "retention_sha256": planned["retention_sha256"],
-                "retention_before_sha256": planned["retention_sha256"],
-                "retention_after": retention_after,
-                "retention_after_sha256": checkouts._sha256_json(retention_after),
-                "branch_head_rebind": branch_head_rebind,
-                "source_evidence": planned["source_evidence"],
-                "source_evidence_sha256": planned["source_evidence"]["evidence_sha256"],
-                "preview_sha256": preview_sha256,
-                "preview_created_at_unix": preview_created_at_unix,
-                "applied_at_unix": applied_at,
-                "resource_keys": resource_keys,
-                "effects": effects,
-                "does_not_establish": [
-                    "archive_or_cleanup_authority",
-                    "branch_or_ref_deletion_authority",
-                    "historical_checkout_content",
-                    "permission_to_delete_binding_or_retention_rows",
-                ],
-            }
-            if superseded_receipt is not None:
-                receipt_core["supersedes_reconciliation_receipt_sha256"] = (
-                    superseded_receipt_sha256
-                )
-                receipt_core["supersedes_reconciliation_receipt"] = superseded_receipt
-            receipt = {**receipt_core, "receipt_sha256": checkouts._sha256_json(receipt_core)}
-            row_values = (
-                owner,
-                planned["binding_sha256"],
-                planned["retention_sha256"],
-                checkouts._canonical_json(planned["source_evidence"]),
-                planned["source_evidence"]["evidence_sha256"],
-                preview_sha256,
-                preview_created_at_unix,
-                applied_at,
-                checkouts._canonical_json(receipt),
-                receipt["receipt_sha256"],
-            )
-            if superseded_receipt is None:
-                connection.execute(
-                    """
-                    INSERT INTO terminal_reconciliations(
-                        checkout_key, owner_id, binding_before_sha256,
-                        retention_sha256, source_evidence_json,
-                        source_evidence_sha256, preview_sha256,
-                        preview_created_at_unix, applied_at_unix,
-                        receipt_json, receipt_sha256
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (key, *row_values),
-                )
-            else:
-                replaced = connection.execute(
-                    """
-                    UPDATE terminal_reconciliations
-                    SET owner_id=?, binding_before_sha256=?, retention_sha256=?,
-                        source_evidence_json=?, source_evidence_sha256=?,
-                        preview_sha256=?, preview_created_at_unix=?, applied_at_unix=?,
-                        receipt_json=?, receipt_sha256=?
-                    WHERE checkout_key=? AND receipt_sha256=?
-                    """,
-                    (
-                        *row_values,
-                        key,
-                        superseded_receipt_sha256,
-                    ),
-                )
-                if replaced.rowcount != 1:
-                    raise RuntimeError(
-                        "terminal reconciliation predecessor CAS replacement failed"
+                if updated.rowcount != 1:
+                    raise RuntimeError("checkout lifecycle CAS transition was not applied exactly")
+                if rebind_head != retention_before["expected_head"]:
+                    retention_updated_at = max(
+                        applied_at, int(retention_before["updated_at_unix"]) + 1
                     )
-            connection.commit()
+                    retention_updated = connection.execute(
+                        """
+                        UPDATE retention
+                        SET expected_head=?, updated_at_unix=?
+                        WHERE checkout_key=? AND owner_id=? AND expected_head=?
+                          AND updated_at_unix=?
+                        """,
+                        (
+                            rebind_head,
+                            retention_updated_at,
+                            key,
+                            owner,
+                            retention_before["expected_head"],
+                            retention_before["updated_at_unix"],
+                        ),
+                    )
+                    if retention_updated.rowcount != 1:
+                        raise RuntimeError("checkout retention head rebind was not applied exactly")
+                binding_after_row = connection.execute(
+                    "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
+                    (key,),
+                ).fetchone()
+                retention_after_row = connection.execute(
+                    "SELECT * FROM retention WHERE checkout_key=?",
+                    (key,),
+                ).fetchone()
+                if binding_after_row is None or retention_after_row is None:
+                    raise RuntimeError("checkout lifecycle post-state disappeared")
+                binding_after = checkouts._lifecycle_public(binding_after_row)
+                retention_after = checkouts._retention_public(retention_after_row)
+                identity_catchup = planned.get("identity_catchup")
+                if identity_catchup is not None:
+                    binding_source = binding_before.get("source")
+                    if (
+                        not isinstance(identity_catchup, dict)
+                        or identity_catchup.get("kind")
+                        != "thread_focus_retention_head_catchup"
+                        or mode != "present"
+                        or not isinstance(binding_source, dict)
+                        or binding_source.get("kind") != "thread_focus"
+                        or identity_catchup.get("binding_expected_head")
+                        != binding_before.get("expected_head")
+                        or identity_catchup.get("retention_expected_head")
+                        != retention_before.get("expected_head")
+                        or rebind_head != retention_before.get("expected_head")
+                        or rebind_head == binding_before.get("expected_head")
+                        or binding_after.get("expected_head") != rebind_head
+                        or retention_after.get("expected_head")
+                        != retention_before.get("expected_head")
+                    ):
+                        raise RuntimeError(
+                            "thread-focus retention head catch-up receipt drifted"
+                        )
+                branch_head_rebind = (
+                    {
+                        "relation": "descendant",
+                        "from_head": binding_before["expected_head"],
+                        "to_head": rebind_head,
+                    }
+                    if rebind_head != binding_before["expected_head"]
+                    and identity_catchup is None
+                    else None
+                )
+                effects = ["lifecycle_phase_transition"]
+                if mode == "present":
+                    effects.append("active_capacity_release")
+                if branch_head_rebind is not None:
+                    effects.append("terminal_head_rebind")
+                if identity_catchup is not None:
+                    effects.append("thread_focus_retention_head_catchup")
+                if review_snapshot is not None:
+                    effects.append("review_evidence_snapshot_retained")
+                receipt_core = {
+                    "schema_version": SCHEMA_VERSION,
+                    "kind": "checkout_terminal_reconciliation_receipt",
+                    "checkout_key": key,
+                    "reconciliation_mode": (
+                        "present_retained" if mode == "present" else "missing_external"
+                    ),
+                    "checkout_preserved": mode == "present",
+                    "owner_id": owner,
+                    "binding_before": binding_before,
+                    "binding_before_sha256": planned["binding_sha256"],
+                    "binding_after": binding_after,
+                    "binding_after_sha256": checkouts._sha256_json(binding_after),
+                    "retention_before": retention_before,
+                    "retention_sha256": planned["retention_sha256"],
+                    "retention_before_sha256": planned["retention_sha256"],
+                    "retention_after": retention_after,
+                    "retention_after_sha256": checkouts._sha256_json(retention_after),
+                    "branch_head_rebind": branch_head_rebind,
+                    "identity_catchup": planned.get("identity_catchup"),
+                    "review_evidence_manifest": checkout_observation.get("review_evidence"),
+                    "review_evidence_snapshot": review_snapshot,
+                    "checkout_observation_sha256": checkouts._sha256_json(checkout_observation),
+                    "source_evidence": planned["source_evidence"],
+                    "source_evidence_sha256": planned["source_evidence"]["evidence_sha256"],
+                    "preview_sha256": preview_sha256,
+                    "preview_created_at_unix": preview_created_at_unix,
+                    "applied_at_unix": applied_at,
+                    "resource_keys": resource_keys,
+                    "effects": effects,
+                    "does_not_establish": [
+                        "archive_or_cleanup_authority",
+                        "branch_or_ref_deletion_authority",
+                        "historical_checkout_content",
+                        "permission_to_delete_binding_or_retention_rows",
+                        "permission_to_modify_or_delete_review_evidence",
+                        "immutable_live_review_evidence_files",
+                    ],
+                }
+                if superseded_receipt is not None:
+                    receipt_core["supersedes_reconciliation_receipt_sha256"] = (
+                        superseded_receipt_sha256
+                    )
+                    receipt_core["supersedes_reconciliation_receipt"] = superseded_receipt
+                receipt = {
+                    **receipt_core,
+                    "receipt_sha256": checkouts._sha256_json(receipt_core),
+                }
+                row_values = (
+                    owner,
+                    planned["binding_sha256"],
+                    planned["retention_sha256"],
+                    checkouts._canonical_json(planned["source_evidence"]),
+                    planned["source_evidence"]["evidence_sha256"],
+                    preview_sha256,
+                    preview_created_at_unix,
+                    applied_at,
+                    checkouts._canonical_json(receipt),
+                    receipt["receipt_sha256"],
+                )
+                if superseded_receipt is None:
+                    connection.execute(
+                        """
+                        INSERT INTO terminal_reconciliations(
+                            checkout_key, owner_id, binding_before_sha256,
+                            retention_sha256, source_evidence_json,
+                            source_evidence_sha256, preview_sha256,
+                            preview_created_at_unix, applied_at_unix,
+                            receipt_json, receipt_sha256
+                        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (key, *row_values),
+                    )
+                else:
+                    replaced = connection.execute(
+                        """
+                        UPDATE terminal_reconciliations
+                        SET owner_id=?, binding_before_sha256=?, retention_sha256=?,
+                            source_evidence_json=?, source_evidence_sha256=?,
+                            preview_sha256=?, preview_created_at_unix=?, applied_at_unix=?,
+                            receipt_json=?, receipt_sha256=?
+                        WHERE checkout_key=? AND receipt_sha256=?
+                        """,
+                        (
+                            *row_values,
+                            key,
+                            superseded_receipt_sha256,
+                        ),
+                    )
+                    if replaced.rowcount != 1:
+                        raise RuntimeError(
+                            "terminal reconciliation predecessor CAS replacement failed"
+                        )
+                final_observation = _bind_preview(
+                    _preview_state(key, ignore_lease_owner=operation_owner),
+                    preview_created_at_unix,
+                )
+                if final_observation.get("preview_sha256") != preview_sha256:
+                    connection.rollback()
+                    raise RuntimeError("terminal reconciliation changed before commit")
+                connection.commit()
         readback = _record(key)
         if (
             readback is None
@@ -847,6 +1546,11 @@ def apply(
             "preview_sha256": preview_sha256,
             "receipt_sha256": receipt["receipt_sha256"],
             "resource_keys": resource_keys,
+            "review_evidence_manifest_sha256": (
+                checkout_observation.get("review_evidence", {}).get("manifest_sha256")
+                if isinstance(checkout_observation.get("review_evidence"), dict)
+                else None
+            ),
         }
         checkouts.base._append_audit(audit)
         result = {

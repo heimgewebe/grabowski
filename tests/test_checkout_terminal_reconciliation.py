@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -66,7 +68,10 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
         self._git("config", "user.name", "Grabowski Test")
         self._git("config", "user.email", "grabowski@example.invalid")
         (self.repo / "README.md").write_text("initial\n", encoding="utf-8")
-        self._git("add", "README.md")
+        (self.repo / ".gitignore").write_text(
+            ".review-audits/\nignored-local/\n", encoding="utf-8"
+        )
+        self._git("add", "README.md", ".gitignore")
         self._git("commit", "-m", "initial")
         self.head = self._git("rev-parse", "HEAD").stdout.strip()
         self._git("worktree", "add", "-b", "topic", str(self.checkout), "HEAD")
@@ -196,6 +201,69 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
         if source["kind"] == "work_lane":
             core["lease_release_ready"] = True
         return {**core, "evidence_sha256": checkouts._sha256_json(core)}
+
+    @staticmethod
+    def _thread_focus_source_evidence(
+        binding: dict[str, object]
+    ) -> dict[str, object]:
+        source = binding["source"]
+        assert isinstance(source, dict)
+        assert source["kind"] == "thread_focus"
+        obligations = [
+            {
+                "obligation_id": "goo-thread-focus-test",
+                "state": "completed",
+                "attention_class": "none",
+                "open_file_sha256": "a" * 64,
+                "close_file_sha256": "b" * 64,
+                "resolution_file_sha256": None,
+            }
+        ]
+        core = {
+            "schema_version": 1,
+            "kind": "thread_focus",
+            "source_id": source["id"],
+            "terminal_state": "completed_without_current_obligation",
+            "obligations": obligations,
+            "obligation_set_sha256": checkouts._sha256_json(obligations),
+        }
+        return {**core, "evidence_sha256": checkouts._sha256_json(core)}
+
+    @staticmethod
+    def _remote_secured() -> dict[str, object]:
+        return {
+            "remote_secured": True,
+            "remote_secured_refs": ["refs/remotes/origin/topic"],
+            "error": None,
+        }
+
+    def _present_thread_focus_with_retention_catchup(
+        self,
+    ) -> tuple[dict[str, object], str, dict[str, object]]:
+        binding = self._present_binding(
+            source_kind="thread_focus", source_id="thread-focus-id"
+        )
+        (self.checkout / "later.txt").write_text("later\n", encoding="utf-8")
+        self._git("add", "later.txt", cwd=self.checkout)
+        self._git("commit", "-m", "later terminal head", cwd=self.checkout)
+        new_head = self._git("rev-parse", "HEAD", cwd=self.checkout).stdout.strip()
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE retention SET expected_head=?, updated_at_unix=updated_at_unix+1 "
+                "WHERE checkout_key=?",
+                (new_head, str(binding["checkout_key"])),
+            )
+            connection.commit()
+        evidence_root = self.checkout / ".review-audits"
+        evidence_root.mkdir()
+        (evidence_root / "self-review.json").write_text(
+            '{"verdict":"PASS"}\n', encoding="utf-8"
+        )
+        (evidence_root / "settlement.json").write_text(
+            '{"settled":true}\n', encoding="utf-8"
+        )
+        evidence = self._thread_focus_source_evidence(binding)
+        return binding, new_head, evidence
 
     def _preview(self, binding: dict[str, object]) -> dict[str, object]:
         with patch.object(
@@ -371,6 +439,744 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
             preview = self._preview(binding)
         self.assertFalse(preview["safe_to_apply"])
         self.assertIn("present-checkout-source-not-work-lane", preview["blockers"])
+
+    def test_present_thread_focus_accepts_hash_bound_review_evidence_and_retention_head_catchup(self) -> None:
+        binding, new_head, evidence = self._present_thread_focus_with_retention_catchup()
+        before = {
+            path.name: path.read_bytes()
+            for path in sorted((self.checkout / ".review-audits").iterdir())
+        }
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(
+                checkouts, "_remote_secured_observation", return_value=self._remote_secured()
+            ),
+        ):
+            preview = reconciliation.preview(str(binding["checkout_key"]))
+            self.assertTrue(preview["safe_to_apply"])
+            self.assertEqual([], preview["blockers"])
+            self.assertEqual(
+                {
+                    "kind": "thread_focus_retention_head_catchup",
+                    "binding_expected_head": self.head,
+                    "retention_expected_head": new_head,
+                },
+                preview["identity_catchup"],
+            )
+            manifest = preview["checkout_observation"]["review_evidence"]
+            self.assertEqual("review_evidence_only", manifest["classification"])
+            self.assertTrue(manifest["eligible"])
+            self.assertEqual(2, manifest["file_count"])
+            self.assertEqual(
+                [
+                    ".review-audits/self-review.json",
+                    ".review-audits/settlement.json",
+                ],
+                [item["path"] for item in manifest["files"]],
+            )
+            result = reconciliation.apply(
+                str(binding["checkout_key"]),
+                "owner-a",
+                str(preview["preview_sha256"]),
+                int(preview["preview_created_at_unix"]),
+                reconciliation.CONFIRMATION,
+            )
+        receipt = result["receipt"]
+        self.assertEqual("present_retained", receipt["reconciliation_mode"])
+        self.assertEqual(new_head, receipt["binding_after"]["expected_head"])
+        self.assertEqual(new_head, receipt["retention_after"]["expected_head"])
+        self.assertIsNone(receipt["branch_head_rebind"])
+        self.assertEqual(
+            [
+                "lifecycle_phase_transition",
+                "active_capacity_release",
+                "thread_focus_retention_head_catchup",
+                "review_evidence_snapshot_retained",
+            ],
+            receipt["effects"],
+        )
+        self.assertEqual(
+            manifest["manifest_sha256"],
+            receipt["review_evidence_manifest"]["manifest_sha256"],
+        )
+        self.assertIn(
+            "permission_to_modify_or_delete_review_evidence",
+            receipt["does_not_establish"],
+        )
+        after = {
+            path.name: path.read_bytes()
+            for path in sorted((self.checkout / ".review-audits").iterdir())
+        }
+        self.assertEqual(before, after)
+        lifecycle = checkouts._lifecycle_bindings([str(binding["checkout_key"])])[
+            str(binding["checkout_key"])
+        ]
+        self.assertEqual("completed_retained", lifecycle["phase"])
+
+
+    def test_review_evidence_sql_race_aborts_without_terminal_transition(self) -> None:
+        binding, _head, evidence = self._present_thread_focus_with_retention_catchup()
+        key = str(binding["checkout_key"])
+        audit = self.checkout / ".review-audits" / "self-review.json"
+        real_database = checkouts._database
+        injected = False
+
+        @contextmanager
+        def database_with_sql_race():
+            nonlocal injected
+            with real_database() as connection:
+                def trace(sql):
+                    nonlocal injected
+                    if not injected and sql.startswith("SELECT owner_id, preview_sha256"):
+                        injected = True
+                        audit.write_text('{"verdict":"LATE"}\n', encoding="utf-8")
+                connection.set_trace_callback(trace)
+                try:
+                    yield connection
+                finally:
+                    connection.set_trace_callback(None)
+
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(checkouts, "_remote_secured_observation", return_value=self._remote_secured()),
+        ):
+            preview = reconciliation.preview(key)
+            with patch.object(checkouts, "_database", database_with_sql_race):
+                with self.assertRaisesRegex(RuntimeError, "snapshot|before commit"):
+                    reconciliation.apply(key, "owner-a", preview["preview_sha256"],
+                                         preview["preview_created_at_unix"], reconciliation.CONFIRMATION)
+        self.assertTrue(injected)
+        self.assertEqual("active", checkouts._lifecycle_bindings([key])[key]["phase"])
+        self.assertIsNone(reconciliation._record(key))
+
+    def test_review_evidence_changed_inside_commit_keeps_atomic_snapshot(self) -> None:
+        binding, _head, evidence = self._present_thread_focus_with_retention_catchup()
+        key = str(binding["checkout_key"])
+        audit = self.checkout / ".review-audits" / "self-review.json"
+        original = audit.read_bytes()
+        real_database = checkouts._database
+        injected = False
+
+        @contextmanager
+        def database_with_commit_race():
+            nonlocal injected
+            with real_database() as connection:
+                def trace(sql):
+                    nonlocal injected
+                    if not injected and sql == "COMMIT":
+                        injected = True
+                        audit.write_text('{"verdict":"AFTER-OBSERVATION"}\n', encoding="utf-8")
+                connection.set_trace_callback(trace)
+                try:
+                    yield connection
+                finally:
+                    connection.set_trace_callback(None)
+
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(checkouts, "_remote_secured_observation", return_value=self._remote_secured()),
+        ):
+            preview = reconciliation.preview(key)
+            with patch.object(checkouts, "_database", database_with_commit_race):
+                result = reconciliation.apply(key, "owner-a", preview["preview_sha256"],
+                                              preview["preview_created_at_unix"], reconciliation.CONFIRMATION)
+        self.assertTrue(injected)
+        self.assertEqual("applied", result["status"])
+        self.assertNotEqual(original, audit.read_bytes())
+        receipt = reconciliation._record(key)["receipt"]
+        snapshot = receipt["review_evidence_snapshot"]
+        self.assertFalse(snapshot["source_files_frozen"])
+        self.assertNotIn('"content":', json.dumps(receipt))
+        with checkouts._database() as connection:
+            retained = connection.execute(
+                "SELECT content FROM terminal_review_evidence WHERE snapshot_sha256=? AND path=?",
+                (snapshot["snapshot_sha256"], ".review-audits/self-review.json"),
+            ).fetchone()[0]
+        self.assertEqual(original, retained)
+        self.assertIn("review_evidence_snapshot_retained", receipt["effects"])
+
+    def test_review_evidence_snapshot_corruption_is_rejected_on_readback(self) -> None:
+        binding, _head, evidence = self._present_thread_focus_with_retention_catchup()
+        key = str(binding["checkout_key"])
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(checkouts, "_remote_secured_observation", return_value=self._remote_secured()),
+        ):
+            preview = reconciliation.preview(key)
+            result = reconciliation.apply(key, "owner-a", preview["preview_sha256"],
+                                          preview["preview_created_at_unix"], reconciliation.CONFIRMATION)
+        with checkouts._database() as connection:
+            connection.execute("UPDATE terminal_review_evidence SET content=? WHERE snapshot_sha256=?",
+                               (b"changed", result["receipt"]["review_evidence_snapshot"]["snapshot_sha256"]))
+            connection.commit()
+        with self.assertRaisesRegex(RuntimeError, "snapshot digest"):
+            reconciliation._record(key)
+
+    def test_review_evidence_snapshot_and_lifecycle_rollback_together(self) -> None:
+        binding, _head, evidence = self._present_thread_focus_with_retention_catchup()
+        key = str(binding["checkout_key"])
+        real_database = checkouts._database
+
+        @contextmanager
+        def database_with_receipt_failure():
+            with real_database() as connection:
+                class Proxy:
+                    def execute(self, sql, *args):
+                        if "INSERT INTO terminal_reconciliations(" in sql:
+                            raise RuntimeError("injected receipt failure")
+                        return connection.execute(sql, *args)
+                    def __getattr__(self, name):
+                        return getattr(connection, name)
+                yield Proxy()
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(checkouts, "_remote_secured_observation", return_value=self._remote_secured()),
+        ):
+            preview = reconciliation.preview(key)
+            with patch.object(checkouts, "_database", database_with_receipt_failure):
+                with self.assertRaisesRegex(RuntimeError, "injected receipt failure"):
+                    reconciliation.apply(key, "owner-a", preview["preview_sha256"],
+                                         preview["preview_created_at_unix"], reconciliation.CONFIRMATION)
+        self.assertEqual("active", checkouts._lifecycle_bindings([key])[key]["phase"])
+        self.assertIsNone(reconciliation._record(key))
+        with checkouts._database() as connection:
+            table = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='terminal_review_evidence'"
+            ).fetchone()
+            if table is not None:
+                self.assertEqual(0, connection.execute("SELECT count(*) FROM terminal_review_evidence").fetchone()[0])
+
+    def test_present_thread_focus_revalidates_head_after_review_evidence_scan(self) -> None:
+        binding, _new_head, evidence = self._present_thread_focus_with_retention_catchup()
+        real_observation = reconciliation._thread_focus_review_evidence_observation
+        injected = False
+
+        def observation_with_late_commit(
+            record: dict[str, object], status: dict[str, object]
+        ) -> dict[str, object]:
+            nonlocal injected
+            result = real_observation(record, status)
+            if not injected:
+                self._git(
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "late head during evidence scan",
+                    cwd=self.checkout,
+                )
+                injected = True
+            return result
+
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(
+                checkouts, "_remote_secured_observation", return_value=self._remote_secured()
+            ),
+            patch.object(
+                reconciliation,
+                "_thread_focus_review_evidence_observation",
+                side_effect=observation_with_late_commit,
+            ),
+        ):
+            preview = reconciliation.preview(str(binding["checkout_key"]))
+        self.assertFalse(preview["safe_to_apply"])
+        self.assertIn(
+            "checkout-head-drift-after-review-evidence", preview["blockers"]
+        )
+
+    def test_present_thread_focus_revalidates_review_evidence_at_commit_boundary(self) -> None:
+        binding, _new_head, evidence = self._present_thread_focus_with_retention_catchup()
+        audit = self.checkout / ".review-audits" / "self-review.json"
+        real_database = checkouts._database
+        injected = False
+
+        @contextmanager
+        def database_with_late_evidence():
+            nonlocal injected
+            if not injected:
+                audit.write_text('{"verdict":"LATE"}\n', encoding="utf-8")
+                injected = True
+            with real_database() as connection:
+                yield connection
+
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(
+                checkouts, "_remote_secured_observation", return_value=self._remote_secured()
+            ),
+        ):
+            preview = reconciliation.preview(str(binding["checkout_key"]))
+            self.assertTrue(preview["safe_to_apply"])
+            with patch.object(checkouts, "_database", database_with_late_evidence):
+                with self.assertRaisesRegex(RuntimeError, "commit boundary"):
+                    reconciliation.apply(
+                        str(binding["checkout_key"]),
+                        "owner-a",
+                        str(preview["preview_sha256"]),
+                        int(preview["preview_created_at_unix"]),
+                        reconciliation.CONFIRMATION,
+                    )
+        lifecycle = checkouts._lifecycle_bindings([str(binding["checkout_key"])])[
+            str(binding["checkout_key"])
+        ]
+        self.assertEqual("active", lifecycle["phase"])
+
+    def test_present_thread_focus_revalidates_head_at_commit_boundary(self) -> None:
+        binding, _new_head, evidence = self._present_thread_focus_with_retention_catchup()
+        real_database = checkouts._database
+        injected = False
+
+        @contextmanager
+        def database_with_late_commit():
+            nonlocal injected
+            if not injected:
+                self._git(
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "late head at commit boundary",
+                    cwd=self.checkout,
+                )
+                injected = True
+            with real_database() as connection:
+                yield connection
+
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(
+                checkouts, "_remote_secured_observation", return_value=self._remote_secured()
+            ),
+        ):
+            preview = reconciliation.preview(str(binding["checkout_key"]))
+            self.assertTrue(preview["safe_to_apply"])
+            with patch.object(checkouts, "_database", database_with_late_commit):
+                with self.assertRaisesRegex(RuntimeError, "commit boundary"):
+                    reconciliation.apply(
+                        str(binding["checkout_key"]),
+                        "owner-a",
+                        str(preview["preview_sha256"]),
+                        int(preview["preview_created_at_unix"]),
+                        reconciliation.CONFIRMATION,
+                    )
+        lifecycle = checkouts._lifecycle_bindings([str(binding["checkout_key"])])[
+            str(binding["checkout_key"])
+        ]
+        self.assertEqual("active", lifecycle["phase"])
+
+    def test_present_thread_focus_manifest_drift_invalidates_apply(self) -> None:
+        binding, _new_head, evidence = self._present_thread_focus_with_retention_catchup()
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(
+                checkouts, "_remote_secured_observation", return_value=self._remote_secured()
+            ),
+        ):
+            preview = reconciliation.preview(str(binding["checkout_key"]))
+            self.assertTrue(preview["safe_to_apply"])
+            (self.checkout / ".review-audits" / "self-review.json").write_text(
+                '{"verdict":"CHANGED"}\n', encoding="utf-8"
+            )
+            with self.assertRaisesRegex(RuntimeError, "preview is stale"):
+                reconciliation.apply(
+                    str(binding["checkout_key"]),
+                    "owner-a",
+                    str(preview["preview_sha256"]),
+                    int(preview["preview_created_at_unix"]),
+                    reconciliation.CONFIRMATION,
+                )
+        lifecycle = checkouts._lifecycle_bindings([str(binding["checkout_key"])])[
+            str(binding["checkout_key"])
+        ]
+        self.assertEqual("active", lifecycle["phase"])
+
+    def test_present_thread_focus_hashes_ignored_review_audits_even_when_git_status_is_clean(self) -> None:
+        binding = self._present_binding(
+            source_kind="thread_focus", source_id="thread-focus-id"
+        )
+        evidence_root = self.checkout / ".review-audits"
+        evidence_root.mkdir()
+        audit = evidence_root / "review.json"
+        audit.write_text('{"verdict":"PASS"}\n', encoding="utf-8")
+        status = checkouts._worktree_status(
+            next(
+                item
+                for item in checkouts._worktree_records(self.repo)[2]
+                if Path(item["path"]) == self.checkout
+            )
+        )
+        self.assertFalse(status["dirty"])
+        evidence = self._thread_focus_source_evidence(binding)
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(
+                checkouts, "_remote_secured_observation", return_value=self._remote_secured()
+            ),
+        ):
+            preview = reconciliation.preview(str(binding["checkout_key"]))
+        self.assertTrue(preview["safe_to_apply"])
+        manifest = preview["checkout_observation"]["review_evidence"]
+        self.assertEqual("review_evidence_only", manifest["classification"])
+        self.assertEqual(1, manifest["file_count"])
+        self.assertEqual(".review-audits/review.json", manifest["files"][0]["path"])
+        self.assertEqual(
+            hashlib.sha256(audit.read_bytes()).hexdigest(), manifest["files"][0]["sha256"]
+        )
+
+    def test_present_thread_focus_rejects_review_evidence_appearing_after_empty_scan(self) -> None:
+        binding = self._present_binding(
+            source_kind="thread_focus", source_id="thread-focus-id"
+        )
+        evidence = self._thread_focus_source_evidence(binding)
+        real_paths = reconciliation._thread_focus_review_evidence_paths
+        injected = False
+
+        def paths_with_late_audit(
+            checkout: Path, status: dict[str, object]
+        ) -> tuple[list[str], list[str]]:
+            nonlocal injected
+            result = real_paths(checkout, status)
+            if not injected:
+                evidence_root = self.checkout / ".review-audits"
+                evidence_root.mkdir()
+                (evidence_root / "late.json").write_text("{}\n", encoding="utf-8")
+                injected = True
+            return result
+
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(
+                checkouts, "_remote_secured_observation", return_value=self._remote_secured()
+            ),
+            patch.object(
+                reconciliation,
+                "_thread_focus_review_evidence_paths",
+                side_effect=paths_with_late_audit,
+            ),
+        ):
+            preview = reconciliation.preview(str(binding["checkout_key"]))
+        self.assertFalse(preview["safe_to_apply"])
+        self.assertIn("review-evidence-root-membership-drift", preview["blockers"])
+
+    def test_present_thread_focus_rejects_review_evidence_membership_change_during_hash(self) -> None:
+        binding = self._present_binding(
+            source_kind="thread_focus", source_id="thread-focus-id"
+        )
+        evidence_root = self.checkout / ".review-audits"
+        evidence_root.mkdir()
+        (evidence_root / "review.json").write_text("{}\n", encoding="utf-8")
+        late_audit = evidence_root / "late.json"
+        evidence = self._thread_focus_source_evidence(binding)
+        real_hash = reconciliation._hash_review_evidence_file
+        injected = False
+
+        def hash_with_late_audit(
+            root_descriptor: int, raw_path: str, remaining_bytes: int
+        ) -> tuple[dict[str, object] | None, list[str]]:
+            nonlocal injected
+            result = real_hash(root_descriptor, raw_path, remaining_bytes)
+            if not injected:
+                late_audit.write_text('{"verdict":"PASS"}\n', encoding="utf-8")
+                injected = True
+            return result
+
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(
+                checkouts, "_remote_secured_observation", return_value=self._remote_secured()
+            ),
+            patch.object(
+                reconciliation,
+                "_hash_review_evidence_file",
+                side_effect=hash_with_late_audit,
+            ),
+        ):
+            preview = reconciliation.preview(str(binding["checkout_key"]))
+        self.assertFalse(preview["safe_to_apply"])
+        self.assertIn("review-evidence-root-membership-drift", preview["blockers"])
+        self.assertIn("review-evidence-root-changed-during-read", preview["blockers"])
+
+    def test_present_thread_focus_rejects_tracked_submodule(self) -> None:
+        self._git(
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{self.head},vendor/submodule",
+            cwd=self.checkout,
+        )
+        self._git("commit", "-m", "tracked gitlink", cwd=self.checkout)
+        (self.checkout / "vendor" / "submodule").mkdir(parents=True)
+        self.head = self._git("rev-parse", "HEAD", cwd=self.checkout).stdout.strip()
+        binding = self._present_binding(
+            source_kind="thread_focus", source_id="thread-focus-id"
+        )
+        evidence_root = self.checkout / ".review-audits"
+        evidence_root.mkdir()
+        (evidence_root / "review.json").write_text("{}\n", encoding="utf-8")
+        evidence = self._thread_focus_source_evidence(binding)
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(
+                checkouts, "_remote_secured_observation", return_value=self._remote_secured()
+            ),
+        ):
+            preview = reconciliation.preview(str(binding["checkout_key"]))
+        self.assertFalse(preview["safe_to_apply"])
+        self.assertIn("review-evidence-submodules-present", preview["blockers"])
+
+    def test_present_thread_focus_rejects_unrelated_ignored_content(self) -> None:
+        binding = self._present_binding(
+            source_kind="thread_focus", source_id="thread-focus-id"
+        )
+        evidence_root = self.checkout / ".review-audits"
+        evidence_root.mkdir()
+        (evidence_root / "review.json").write_text("{}\n", encoding="utf-8")
+        ignored = self.checkout / "ignored-local"
+        ignored.mkdir()
+        (ignored / "cache.bin").write_bytes(b"ignored but not trusted")
+        evidence = self._thread_focus_source_evidence(binding)
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(
+                checkouts, "_remote_secured_observation", return_value=self._remote_secured()
+            ),
+        ):
+            preview = reconciliation.preview(str(binding["checkout_key"]))
+        self.assertFalse(preview["safe_to_apply"])
+        self.assertIn(
+            "review-evidence-ignored-content-outside-allowlist", preview["blockers"]
+        )
+
+    def test_present_thread_focus_rejects_untrusted_untracked_path(self) -> None:
+        binding = self._present_binding(
+            source_kind="thread_focus", source_id="thread-focus-id"
+        )
+        evidence_root = self.checkout / ".review-audits"
+        evidence_root.mkdir()
+        (evidence_root / "review.json").write_text("{}\n", encoding="utf-8")
+        (self.checkout / "notes.txt").write_text("not evidence\n", encoding="utf-8")
+        evidence = self._thread_focus_source_evidence(binding)
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(
+                checkouts, "_remote_secured_observation", return_value=self._remote_secured()
+            ),
+        ):
+            preview = reconciliation.preview(str(binding["checkout_key"]))
+        self.assertFalse(preview["safe_to_apply"])
+        self.assertIn("review-evidence-path-outside-allowlist", preview["blockers"])
+        self.assertIn("checkout-dirty", preview["blockers"])
+        self.assertIn("thread-focus-review-evidence-not-admissible", preview["blockers"])
+
+    def test_present_thread_focus_rejects_unstaged_tracked_change(self) -> None:
+        binding = self._present_binding(
+            source_kind="thread_focus", source_id="thread-focus-id"
+        )
+        evidence_root = self.checkout / ".review-audits"
+        evidence_root.mkdir()
+        (evidence_root / "review.json").write_text("{}\n", encoding="utf-8")
+        (self.checkout / "README.md").write_text("changed\n", encoding="utf-8")
+        evidence = self._thread_focus_source_evidence(binding)
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(
+                checkouts, "_remote_secured_observation", return_value=self._remote_secured()
+            ),
+        ):
+            preview = reconciliation.preview(str(binding["checkout_key"]))
+        self.assertFalse(preview["safe_to_apply"])
+        self.assertIn("review-evidence-unstaged-tracked-change", preview["blockers"])
+        self.assertIn("checkout-dirty", preview["blockers"])
+
+    def test_present_thread_focus_rejects_staged_tracked_change(self) -> None:
+        binding = self._present_binding(
+            source_kind="thread_focus", source_id="thread-focus-id"
+        )
+        evidence_root = self.checkout / ".review-audits"
+        evidence_root.mkdir()
+        (evidence_root / "review.json").write_text("{}\n", encoding="utf-8")
+        (self.checkout / "README.md").write_text("changed\n", encoding="utf-8")
+        self._git("add", "README.md", cwd=self.checkout)
+        evidence = self._thread_focus_source_evidence(binding)
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(
+                checkouts, "_remote_secured_observation", return_value=self._remote_secured()
+            ),
+        ):
+            preview = reconciliation.preview(str(binding["checkout_key"]))
+        self.assertFalse(preview["safe_to_apply"])
+        self.assertIn("review-evidence-staged-tracked-change", preview["blockers"])
+        self.assertIn("checkout-dirty", preview["blockers"])
+
+    def test_present_thread_focus_rejects_nested_review_evidence(self) -> None:
+        binding = self._present_binding(
+            source_kind="thread_focus", source_id="thread-focus-id"
+        )
+        nested = self.checkout / ".review-audits" / "nested"
+        nested.mkdir(parents=True)
+        (nested / "review.json").write_text("{}\n", encoding="utf-8")
+        evidence = self._thread_focus_source_evidence(binding)
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(
+                checkouts, "_remote_secured_observation", return_value=self._remote_secured()
+            ),
+        ):
+            preview = reconciliation.preview(str(binding["checkout_key"]))
+        self.assertFalse(preview["safe_to_apply"])
+        self.assertIn("review-evidence-path-outside-allowlist", preview["blockers"])
+
+    def test_review_evidence_open_is_nonblocking_and_nofollow(self) -> None:
+        evidence_root = self.checkout / ".review-audits"
+        evidence_root.mkdir()
+        (evidence_root / "review.json").write_text("{}\n", encoding="utf-8")
+        root_flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            root_flags |= os.O_DIRECTORY
+        root_descriptor = os.open(evidence_root, root_flags)
+        real_open = os.open
+        try:
+            with patch.object(reconciliation.os, "open", wraps=real_open) as opened:
+                evidence, blockers = reconciliation._hash_review_evidence_file(
+                    root_descriptor,
+                    ".review-audits/review.json",
+                    reconciliation._REVIEW_EVIDENCE_MAX_TOTAL_BYTES,
+                )
+            self.assertIsNotNone(evidence)
+            self.assertEqual([], blockers)
+            file_open = next(
+                call for call in opened.call_args_list if call.args[0] == "review.json"
+            )
+            flags = file_open.args[1]
+            if hasattr(os, "O_NONBLOCK"):
+                self.assertTrue(flags & os.O_NONBLOCK)
+            if hasattr(os, "O_NOFOLLOW"):
+                self.assertTrue(flags & os.O_NOFOLLOW)
+        finally:
+            os.close(root_descriptor)
+
+    def test_present_thread_focus_rejects_symlink_review_evidence(self) -> None:
+        binding = self._present_binding(
+            source_kind="thread_focus", source_id="thread-focus-id"
+        )
+        evidence_root = self.checkout / ".review-audits"
+        evidence_root.mkdir()
+        outside = self.root / "outside-review.json"
+        outside.write_text("secret-ish\n", encoding="utf-8")
+        (evidence_root / "review.json").symlink_to(outside)
+        evidence = self._thread_focus_source_evidence(binding)
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(
+                checkouts, "_remote_secured_observation", return_value=self._remote_secured()
+            ),
+        ):
+            preview = reconciliation.preview(str(binding["checkout_key"]))
+        self.assertFalse(preview["safe_to_apply"])
+        self.assertIn("review-evidence-file-not-regular", preview["blockers"])
+
+    def test_present_thread_focus_rejects_symlink_review_root_without_hashing_target(self) -> None:
+        binding = self._present_binding(
+            source_kind="thread_focus", source_id="thread-focus-id"
+        )
+        outside = self.root / "outside-audits"
+        outside.mkdir()
+        (outside / "review.json").write_text("must-not-be-read\n", encoding="utf-8")
+        (self.checkout / ".review-audits").symlink_to(outside, target_is_directory=True)
+        evidence = self._thread_focus_source_evidence(binding)
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(
+                checkouts, "_remote_secured_observation", return_value=self._remote_secured()
+            ),
+            patch.object(
+                reconciliation,
+                "_hash_review_evidence_file",
+                side_effect=AssertionError("symlink root target must not be hashed"),
+            ),
+        ):
+            preview = reconciliation.preview(str(binding["checkout_key"]))
+        self.assertFalse(preview["safe_to_apply"])
+        self.assertIn("review-evidence-root-symlink", preview["blockers"])
+
+    def test_present_thread_focus_rejects_oversized_review_evidence(self) -> None:
+        binding = self._present_binding(
+            source_kind="thread_focus", source_id="thread-focus-id"
+        )
+        evidence_root = self.checkout / ".review-audits"
+        evidence_root.mkdir()
+        (evidence_root / "review.bin").write_bytes(
+            b"x" * (reconciliation._REVIEW_EVIDENCE_MAX_FILE_BYTES + 1)
+        )
+        evidence = self._thread_focus_source_evidence(binding)
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(
+                checkouts, "_remote_secured_observation", return_value=self._remote_secured()
+            ),
+        ):
+            preview = reconciliation.preview(str(binding["checkout_key"]))
+        self.assertFalse(preview["safe_to_apply"])
+        self.assertIn("review-evidence-file-size-exceeded", preview["blockers"])
+
+    def test_present_thread_focus_rejects_aggregate_review_evidence_over_budget(self) -> None:
+        binding = self._present_binding(
+            source_kind="thread_focus", source_id="thread-focus-id"
+        )
+        evidence_root = self.checkout / ".review-audits"
+        evidence_root.mkdir()
+        (evidence_root / "a.json").write_text("1234\n", encoding="utf-8")
+        (evidence_root / "b.json").write_text("5678\n", encoding="utf-8")
+        evidence = self._thread_focus_source_evidence(binding)
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(
+                checkouts, "_remote_secured_observation", return_value=self._remote_secured()
+            ),
+            patch.object(reconciliation, "_REVIEW_EVIDENCE_MAX_TOTAL_BYTES", 8),
+        ):
+            preview = reconciliation.preview(str(binding["checkout_key"]))
+        self.assertFalse(preview["safe_to_apply"])
+        self.assertIn("review-evidence-total-size-exceeded", preview["blockers"])
+
+    def test_present_thread_focus_requires_retention_bound_current_head(self) -> None:
+        binding = self._present_binding(
+            source_kind="thread_focus", source_id="thread-focus-id"
+        )
+        (self.checkout / "later.txt").write_text("later\n", encoding="utf-8")
+        self._git("add", "later.txt", cwd=self.checkout)
+        self._git("commit", "-m", "later unbound head", cwd=self.checkout)
+        evidence = self._thread_focus_source_evidence(binding)
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(
+                checkouts, "_remote_secured_observation", return_value=self._remote_secured()
+            ),
+        ):
+            preview = reconciliation.preview(str(binding["checkout_key"]))
+        self.assertFalse(preview["safe_to_apply"])
+        self.assertIn("thread-focus-head-not-retention-bound", preview["blockers"])
+
+    def test_thread_focus_retention_head_catchup_requires_present_checkout(self) -> None:
+        binding = self._missing_binding(
+            source_kind="thread_focus", source_id="thread-focus-id"
+        )
+        descendant = self._advance_topic_branch()
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE retention SET expected_head=?, updated_at_unix=updated_at_unix+1 "
+                "WHERE checkout_key=?",
+                (descendant, str(binding["checkout_key"])),
+            )
+            connection.commit()
+        evidence = self._thread_focus_source_evidence(binding)
+        with patch.object(sources, "source_terminal_evidence", return_value=evidence):
+            preview = reconciliation.preview(str(binding["checkout_key"]))
+        self.assertFalse(preview["safe_to_apply"])
+        self.assertIn(
+            "thread-focus-retention-head-catchup-requires-present-checkout",
+            preview["blockers"],
+        )
 
     def test_present_terminal_checkout_rebinds_descendant_head_in_lifecycle_and_retention(self) -> None:
         binding = self._present_binding()
