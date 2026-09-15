@@ -1142,6 +1142,49 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
             {"status": "error", "error": "canonical Claude auth root is invalid"},
         )
 
+    def test_quota_readiness_only_handles_overflowing_commitment_timestamp(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            credential = root / ".credentials.json"
+            credential_data = b"{}\n"
+            credential.write_bytes(credential_data)
+            credential.chmod(0o600)
+            nonce = "ab" * 16
+            argv = [
+                "--claude-quota-readiness-only",
+                "--quota-commitment-nonce",
+                nonce,
+                "--quota-commitment-sha256",
+                support.preflight._commitment_sha256(credential_data, nonce),
+                "--quota-commitment-issued-at",
+                "0001-01-01T00:00:00+23:59",
+            ]
+            stderr = io.StringIO()
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {support.preflight.CLAUDE_AUTH_ROOT_ENV: str(root)},
+                    clear=False,
+                ),
+                redirect_stderr(stderr),
+                mock.patch.object(support.preflight._core, "main") as core_main,
+                mock.patch.object(
+                    support.preflight, "_claude_quota_readiness"
+                ) as quota_readiness,
+            ):
+                status = support.preflight.main(argv)
+
+        self.assertEqual(status, 2)
+        core_main.assert_not_called()
+        quota_readiness.assert_not_called()
+        self.assertEqual(
+            json.loads(stderr.getvalue()),
+            {
+                "status": "error",
+                "error": "Claude credential commitment timestamp is invalid",
+            },
+        )
+
     def test_live_call_requires_explicit_provider_bindings(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

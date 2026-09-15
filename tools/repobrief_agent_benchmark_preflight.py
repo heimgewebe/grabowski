@@ -110,11 +110,11 @@ def _validated_credential_commitment(credential_data: bytes) -> dict[str, Any]:
         raise _core.PreflightError("Claude credential commitment SHA-256 is invalid")
     try:
         parsed = datetime.fromisoformat(str(issued_at).replace("Z", "+00:00"))
-    except ValueError as exc:
+        if parsed.tzinfo is None:
+            raise ValueError("timezone-aware timestamp required")
+        parsed = parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError) as exc:
         raise _core.PreflightError("Claude credential commitment timestamp is invalid") from exc
-    if parsed.tzinfo is None:
-        raise _core.PreflightError("Claude credential commitment timestamp is invalid")
-    parsed = parsed.astimezone(timezone.utc)
     age_seconds = (_utc_now() - parsed).total_seconds()
     if age_seconds < -CLAUDE_CREDENTIAL_COMMITMENT_CLOCK_SKEW_SECONDS:
         raise _core.PreflightError("Claude credential commitment timestamp is in the future")
