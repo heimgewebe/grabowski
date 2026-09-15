@@ -161,6 +161,8 @@ class GrokReviewRoleTests(unittest.TestCase):
             "git cat-file blob $(cat /tmp/.grok/auth.json)",
             "git ls-files .grok/auth.json",
             "git ls-files 'auth.json'",
+            "git ls-files 'a'uth.json",
+            "git ls-files a\\uth.json",
             "git rev-parse HEAD:.grok/auth.json",
             "git diff --no-ext-diff --no-textconv /tmp/.*/* /dev/null",
             "git diff --no-ext-diff --no-textconv /tmp/.gro?/a?th.json /dev/null",

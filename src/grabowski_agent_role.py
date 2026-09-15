@@ -590,6 +590,8 @@ def _safe_grok_git_read_command(command: str) -> bool:
         argv = shlex.split(command, posix=True)
     except ValueError:
         return False
+    if any(".grok" in argument or "auth.json" in argument for argument in argv):
+        return False
     if len(argv) < 2 or argv[0] != "git":
         return False
     for argument in argv[2:]:
