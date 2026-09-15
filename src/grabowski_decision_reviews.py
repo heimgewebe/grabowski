@@ -648,6 +648,37 @@ def _binding_matches_pr_head(
     )
 
 
+def _attempt_started_after(candidate: dict[str, Any], prior: dict[str, Any]) -> bool:
+    candidate_created = candidate.get("created_at_unix")
+    prior_created = prior.get("created_at_unix")
+    if (
+        isinstance(candidate_created, bool)
+        or not isinstance(candidate_created, int)
+        or candidate_created < 0
+        or isinstance(prior_created, bool)
+        or not isinstance(prior_created, int)
+        or prior_created < 0
+    ):
+        return False
+    if candidate_created != prior_created:
+        return candidate_created > prior_created
+
+    candidate_ns = candidate.get("started_at_unix_ns")
+    prior_ns = prior.get("started_at_unix_ns")
+    if (
+        isinstance(candidate_ns, bool)
+        or not isinstance(candidate_ns, int)
+        or candidate_ns < 0
+        or isinstance(prior_ns, bool)
+        or not isinstance(prior_ns, int)
+        or prior_ns < 0
+        or candidate_ns // 1_000_000_000 != candidate_created
+        or prior_ns // 1_000_000_000 != prior_created
+    ):
+        return False
+    return candidate_ns > prior_ns
+
+
 def reconcile(
     *,
     repo: str,
@@ -753,7 +784,8 @@ def reconcile(
             "unit": directory.name,
             "slot": binding["slot"],
             "origin_sha256": metadata.get("origin_sha256"),
-            "created_at_unix": metadata.get("created_at_unix"),
+            "created_at_unix": metadata["origin"].get("created_at_unix"),
+            "started_at_unix_ns": metadata["scope"].get("started_at_unix_ns"),
             "terminal": False,
             "terminal_status": None,
             "classification": "unresolved",
@@ -824,11 +856,12 @@ def reconcile(
             attempts.append(attempt)
             continue
         if result is None:
-            if finalization["final_status"] == "succeeded":
-                errors.append(f"decision_review_success_missing_result:{directory.name}")
-                attempt["classification"] = "missing_result"
-            else:
-                attempt["classification"] = "infrastructure_error"
+            # A terminal reviewer that produced no decision marker did not
+            # establish a semantic review outcome. Treat that attempt as
+            # retryable infrastructure evidence rather than permanently
+            # poisoning the slot. The slot still blocks below until a later
+            # PASS exists, while any material REJECT remains globally blocking.
+            attempt["classification"] = "infrastructure_error"
             attempts.append(attempt)
             continue
         attempt["result_sha256"] = sha256_json(result)
@@ -865,8 +898,20 @@ def reconcile(
             for item in slot_attempts
             if item["classification"] == "infrastructure_error"
         ]
+        unsuperseded_infrastructure = []
+        for infrastructure_attempt in infrastructure:
+            if not any(
+                _attempt_started_after(pass_attempt, infrastructure_attempt)
+                for pass_attempt in passes
+            ):
+                unsuperseded_infrastructure.append(infrastructure_attempt)
         if not passes and not rejects:
             errors.append(f"decision_review_slot_without_pass:{slot}")
+        for infrastructure_attempt in unsuperseded_infrastructure:
+            errors.append(
+                "decision_review_infrastructure_not_superseded:"
+                f"{slot}:{infrastructure_attempt['unit']}"
+            )
         slots.append(
             {
                 "slot": slot,

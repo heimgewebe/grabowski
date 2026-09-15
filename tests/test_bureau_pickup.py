@@ -96,6 +96,53 @@ class BureauPickupTests(unittest.TestCase):
                     observed[name.value] = annotations.id
         self.assertEqual(expected, observed)
 
+    def test_server_bureau_run_delegation_uses_complete_live_owner_lease_set(self) -> None:
+        run_id = "BUR-RUN-20260914T120000Z-aaaaaaaaaa"
+        owner = f"bureau-run:{run_id}"
+        resource_evidence = {
+            "schema_version": 1,
+            "kind": "grabowski_live_bureau_run_lease_delegation_evidence",
+            "run_id": run_id,
+            "lease_owner_id": owner,
+            "resource_keys": ["component:expanded", "path:/repo/original.py"],
+            "resource_keys_sha256": "a" * 64,
+            "lease_snapshots": [{"resource_key": "expanded"}],
+            "lease_bindings_sha256": "b" * 64,
+            "minimum_expires_at_unix": 200,
+            "observed_at_unix": 100,
+        }
+        status = {
+            "run_id": run_id,
+            "coordination_sha256": "c" * 64,
+            "coordination": {
+                "status": "coordinated",
+                "run": {
+                    "run_id": run_id,
+                    "task_id": "TASK-1",
+                    "worker_id": "worker-1",
+                },
+                "lease": {"status": "active-bound"},
+            },
+            "execution_binding": {"actively_bound": True},
+        }
+        with (
+            mock.patch.object(
+                pickup, "grabowski_bureau_pickup_status", return_value=status
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "bureau_run_lease_delegation_evidence",
+                return_value=resource_evidence,
+            ) as evidence_read,
+        ):
+            evidence = pickup.server_bureau_run_lease_delegation_evidence(run_id)
+
+        evidence_read.assert_called_once_with(owner)
+        self.assertEqual(resource_evidence["resource_keys"], evidence["resource_keys"])
+        self.assertEqual("TASK-1", evidence["task_id"])
+        self.assertEqual("worker-1", evidence["worker_id"])
+        self.assertEqual("c" * 64, evidence["coordination_sha256"])
+
     def test_execute_request_type_contract_is_complete_and_strict(self) -> None:
         required = {"worker_id", "capabilities"}
         optional = {

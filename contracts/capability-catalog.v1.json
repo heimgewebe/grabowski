@@ -1,6 +1,6 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "00f68b06d747cfb34eb35121dbe6ba8143c8d7a0bbc6aa34c295f75605ab1b09",
+  "capability_source_sha256": "d372f005e8d2c10ab43eca49832071b32d24a2d4bbbc9e7c13829d21913db2e4",
   "contract": "config/runtime-entrypoint.json",
   "contract_sha256": "4e25bada445a7995325a9406df2fe81a4f7b5940faa2df15588120d4a13956e5",
   "integrity": {
@@ -791,7 +791,7 @@
       "description": "Preview an evidence-only terminal transition for one missing or safely retained managed checkout.",
       "effects": [],
       "id": "grabowski_checkout_binding_terminal_preview",
-      "purpose": "Preview one exact evidence-bound terminal reconciliation for either an absent managed checkout or a clean present terminal Work Lane retained without consuming active checkout capacity.",
+      "purpose": "Preview one exact evidence-bound terminal reconciliation for an absent managed checkout, a clean terminal Work Lane, or a present terminal thread_focus checkout whose only admitted local state is hash-bound .review-audits evidence and whose head is exactly retention-bound.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
@@ -807,7 +807,7 @@
         "state-change"
       ],
       "id": "grabowski_checkout_binding_terminal_apply",
-      "purpose": "Apply one fresh compare-and-swap terminal reconciliation: absent checkouts to externally_terminal_missing, or clean present terminal Work Lanes from active to completed_retained while preserving the checkout, retention and cleanup authority boundaries.",
+      "purpose": "Apply one fresh compare-and-swap terminal reconciliation: absent checkouts to externally_terminal_missing; clean terminal Work Lanes to completed_retained; or bounded present terminal thread_focus checkouts with hash-bound review evidence, including an explicit lifecycle-head catch-up only to the already-retained head while preserving checkout, evidence, retention and cleanup authority boundaries.",
       "read_only": false,
       "reversibility": "compare-and-swap-state-transition-with-retained-evidence",
       "risk_class": "medium",

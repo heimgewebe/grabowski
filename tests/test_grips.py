@@ -1710,6 +1710,241 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("pass", checks["lifecycle-only-effect"]["status"])
         self.assertEqual("pass", checks["active-capacity-transition"]["status"])
 
+    def test_checkout_binding_terminal_apply_accepts_identity_catchup_receipt(self) -> None:
+        checkout_key = "a" * 64
+        expected_preview = "c" * 64
+        old_head = "1" * 40
+        new_head = "2" * 40
+        terminal_receipt = {
+            "checkout_key": checkout_key,
+            "owner_id": "owner-a",
+            "preview_sha256": expected_preview,
+            "preview_created_at_unix": 100,
+            "source_evidence_sha256": "d" * 64,
+            "reconciliation_mode": "present_retained",
+            "checkout_preserved": True,
+            "binding_before": {
+                "phase": "active",
+                "expected_head": old_head,
+                "expected_branch": "topic",
+                "owner_id": "owner-a",
+                "source": {"kind": "thread_focus", "id": "thread-focus-id"},
+            },
+            "binding_after": {
+                "phase": "completed_retained",
+                "expected_head": new_head,
+                "expected_branch": "topic",
+                "owner_id": "owner-a",
+            },
+            "retention_before": {
+                "expected_head": new_head,
+                "expected_branch": "topic",
+                "owner_id": "owner-a",
+            },
+            "retention_after": {
+                "expected_head": new_head,
+                "expected_branch": "topic",
+                "owner_id": "owner-a",
+            },
+            "branch_head_rebind": None,
+            "identity_catchup": {
+                "kind": "thread_focus_retention_head_catchup",
+                "binding_expected_head": old_head,
+                "retention_expected_head": new_head,
+            },
+            "effects": [
+                "lifecycle_phase_transition",
+                "active_capacity_release",
+                "thread_focus_retention_head_catchup",
+            ],
+            "receipt_sha256": "e" * 64,
+        }
+        parameters = {
+            "checkout_key": checkout_key,
+            "owner_id": "owner-a",
+            "expected_preview_sha256": expected_preview,
+            "preview_created_at_unix": 100,
+            "confirmation": "reconcile-terminal-missing-checkout",
+        }
+        with patch(
+            "grabowski_checkouts.grabowski_checkout_binding_terminal_apply",
+            return_value={
+                "schema_version": 1,
+                "kind": "checkout_terminal_reconciliation_result",
+                "status": "applied",
+                "receipt": terminal_receipt,
+            },
+        ):
+            result = grips.grip_run(
+                "checkout-binding-terminal-apply",
+                parameters,
+                allow_mutation=True,
+            )
+        self.assertEqual("passed", result["status"])
+        self.assertTrue(result["output"]["capacity_effect"]["active_binding_released"])
+
+    def test_checkout_binding_terminal_apply_accepts_bound_review_snapshot(self) -> None:
+        checkout_key = "a" * 64
+        expected_preview = "c" * 64
+        old_head = "1" * 40
+        new_head = "2" * 40
+        terminal_receipt = {
+            "checkout_key": checkout_key,
+            "owner_id": "owner-a",
+            "preview_sha256": expected_preview,
+            "preview_created_at_unix": 100,
+            "source_evidence_sha256": "d" * 64,
+            "reconciliation_mode": "present_retained",
+            "checkout_preserved": True,
+            "binding_before": {
+                "phase": "active",
+                "expected_head": old_head,
+                "expected_branch": "topic",
+                "owner_id": "owner-a",
+                "source": {"kind": "thread_focus", "id": "thread-focus-id"},
+            },
+            "binding_after": {
+                "phase": "completed_retained",
+                "expected_head": new_head,
+                "expected_branch": "topic",
+                "owner_id": "owner-a",
+            },
+            "retention_before": {
+                "expected_head": new_head,
+                "expected_branch": "topic",
+                "owner_id": "owner-a",
+            },
+            "retention_after": {
+                "expected_head": new_head,
+                "expected_branch": "topic",
+                "owner_id": "owner-a",
+            },
+            "branch_head_rebind": None,
+            "identity_catchup": {
+                "kind": "thread_focus_retention_head_catchup",
+                "binding_expected_head": old_head,
+                "retention_expected_head": new_head,
+            },
+            "effects": [
+                "lifecycle_phase_transition",
+                "active_capacity_release",
+                "thread_focus_retention_head_catchup",
+            ],
+            "receipt_sha256": "e" * 64,
+        }
+        import grabowski_checkout_terminal_reconciliation as reconciliation
+        manifest = {"eligible": True, "manifest_sha256": "f" * 64,
+                    "file_count": 1, "total_bytes": 3}
+        terminal_receipt["review_evidence_manifest"] = manifest
+        terminal_receipt["review_evidence_snapshot"] = reconciliation._review_snapshot_identity(
+            checkout_key, expected_preview, manifest
+        )
+        terminal_receipt["effects"].append("review_evidence_snapshot_retained")
+        parameters = {
+            "checkout_key": checkout_key,
+            "owner_id": "owner-a",
+            "expected_preview_sha256": expected_preview,
+            "preview_created_at_unix": 100,
+            "confirmation": "reconcile-terminal-missing-checkout",
+        }
+        with patch(
+            "grabowski_checkouts.grabowski_checkout_binding_terminal_apply",
+            return_value={
+                "schema_version": 1,
+                "kind": "checkout_terminal_reconciliation_result",
+                "status": "applied",
+                "receipt": terminal_receipt,
+            },
+        ):
+            result = grips.grip_run(
+                "checkout-binding-terminal-apply",
+                parameters,
+                allow_mutation=True,
+            )
+        self.assertEqual("passed", result["status"])
+        self.assertTrue(result["output"]["capacity_effect"]["active_binding_released"])
+
+    def test_checkout_binding_terminal_apply_rejects_wrong_review_snapshot_binding(self) -> None:
+        checkout_key = "a" * 64
+        expected_preview = "c" * 64
+        old_head = "1" * 40
+        new_head = "2" * 40
+        terminal_receipt = {
+            "checkout_key": checkout_key,
+            "owner_id": "owner-a",
+            "preview_sha256": expected_preview,
+            "preview_created_at_unix": 100,
+            "source_evidence_sha256": "d" * 64,
+            "reconciliation_mode": "present_retained",
+            "checkout_preserved": True,
+            "binding_before": {
+                "phase": "active",
+                "expected_head": old_head,
+                "expected_branch": "topic",
+                "owner_id": "owner-a",
+                "source": {"kind": "thread_focus", "id": "thread-focus-id"},
+            },
+            "binding_after": {
+                "phase": "completed_retained",
+                "expected_head": new_head,
+                "expected_branch": "topic",
+                "owner_id": "owner-a",
+            },
+            "retention_before": {
+                "expected_head": new_head,
+                "expected_branch": "topic",
+                "owner_id": "owner-a",
+            },
+            "retention_after": {
+                "expected_head": new_head,
+                "expected_branch": "topic",
+                "owner_id": "owner-a",
+            },
+            "branch_head_rebind": None,
+            "identity_catchup": {
+                "kind": "thread_focus_retention_head_catchup",
+                "binding_expected_head": old_head,
+                "retention_expected_head": new_head,
+            },
+            "effects": [
+                "lifecycle_phase_transition",
+                "active_capacity_release",
+                "thread_focus_retention_head_catchup",
+            ],
+            "receipt_sha256": "e" * 64,
+        }
+        import grabowski_checkout_terminal_reconciliation as reconciliation
+        manifest = {"eligible": True, "manifest_sha256": "f" * 64,
+                    "file_count": 1, "total_bytes": 3}
+        terminal_receipt["review_evidence_manifest"] = manifest
+        terminal_receipt["review_evidence_snapshot"] = reconciliation._review_snapshot_identity(
+            checkout_key, expected_preview, manifest
+        )
+        terminal_receipt["effects"].append("review_evidence_snapshot_retained")
+        terminal_receipt["review_evidence_snapshot"]["preview_sha256"] = "9" * 64
+        parameters = {
+            "checkout_key": checkout_key,
+            "owner_id": "owner-a",
+            "expected_preview_sha256": expected_preview,
+            "preview_created_at_unix": 100,
+            "confirmation": "reconcile-terminal-missing-checkout",
+        }
+        with patch(
+            "grabowski_checkouts.grabowski_checkout_binding_terminal_apply",
+            return_value={
+                "schema_version": 1,
+                "kind": "checkout_terminal_reconciliation_result",
+                "status": "applied",
+                "receipt": terminal_receipt,
+            },
+        ):
+            result = grips.grip_run(
+                "checkout-binding-terminal-apply",
+                parameters,
+                allow_mutation=True,
+            )
+        self.assertEqual("failed", result["status"])
+
     def test_checkout_binding_terminal_apply_accepts_present_retained_receipt(self) -> None:
         checkout_key = "a" * 64
         expected_preview = "c" * 64
@@ -9705,6 +9940,27 @@ class GithubBaseUpdateGuardTests(unittest.TestCase):
 
 
 class CaptainAuthorityPathTests(unittest.TestCase):
+    @staticmethod
+    def _active_bureau_run_status(run_id: str) -> dict[str, object]:
+        return {
+            "run_id": run_id,
+            "coordination_sha256": "f" * 64,
+            "coordination": {
+                "status": "coordinated",
+                "run": {
+                    "run_id": run_id,
+                    "task_id": "TASK-1",
+                    "worker_id": "worker-1",
+                    "state": "running",
+                },
+                "lease": {"status": "active-bound"},
+            },
+            "execution_binding": {
+                "classification": "actively_bound",
+                "actively_bound": True,
+            },
+        }
+
     def setUp(self) -> None:
         self._resource_tempdir = tempfile.TemporaryDirectory()
         self._resource_db_patch = patch.object(
@@ -16300,6 +16556,461 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 captain_request_sha256_value="c" * 64,
                 now_unix=151,
             )
+
+    def test_server_bureau_run_lease_delegation_is_request_bound_and_short_lived(self) -> None:
+        class Session:
+            pass
+
+        run_id = "BUR-RUN-20260914T120000Z-aaaaaaaaaa"
+        owner = f"bureau-run:{run_id}"
+        resource_keys = ["component:test-bureau-delegation"]
+        snapshots = [
+            {
+                "resource_key": resource_keys[0],
+                "owner_id": owner,
+                "acquired_at_unix": 90,
+                "updated_at_unix": 90,
+                "expires_at_unix": 150,
+                "metadata_sha256": "b" * 64,
+            }
+        ]
+        evidence = {
+            "schema_version": 1,
+            "kind": "grabowski_live_bureau_run_lease_delegation_evidence",
+            "run_id": run_id,
+            "task_id": "TASK-1",
+            "worker_id": "worker-1",
+            "lease_owner_id": owner,
+            "resource_keys": resource_keys,
+            "resource_keys_sha256": merge_guard._sha256_json(resource_keys),
+            "lease_snapshots": snapshots,
+            "lease_bindings_sha256": merge_guard._sha256_json(snapshots),
+            "coordination_sha256": "e" * 64,
+            "minimum_expires_at_unix": 150,
+            "observed_at_unix": 100,
+        }
+        actor = merge_guard.issue_server_runtime_actor_identity(
+            Session(), profile="trusted-owner", now_unix=100
+        )
+        delegation = merge_guard.issue_server_bureau_run_lease_delegation(
+            actor,
+            evidence,
+            captain_request_sha256_value="c" * 64,
+            now_unix=100,
+        )
+
+        verified = merge_guard.verify_server_bureau_run_lease_delegation(
+            delegation,
+            actor_identity=actor,
+            captain_request_sha256_value="c" * 64,
+            now_unix=100,
+        )
+        self.assertEqual(run_id, verified["run_id"])
+        self.assertEqual(owner, verified["lease_owner_id"])
+        self.assertEqual(150, verified["expires_at_unix"])
+        self.assertEqual(snapshots, verified["lease_snapshots"])
+        with self.assertRaisesRegex(ValueError, "captain request mismatch"):
+            merge_guard.verify_server_bureau_run_lease_delegation(
+                delegation,
+                actor_identity=actor,
+                captain_request_sha256_value="d" * 64,
+                now_unix=100,
+            )
+        with self.assertRaisesRegex(ValueError, "not current"):
+            merge_guard.verify_server_bureau_run_lease_delegation(
+                delegation,
+                actor_identity=actor,
+                captain_request_sha256_value="c" * 64,
+                now_unix=151,
+            )
+
+    def test_atomic_merge_guard_rejects_unsigned_bureau_run_owner(self) -> None:
+        class Session:
+            pass
+
+        run_id = "BUR-RUN-20260914T120000Z-aaaaaaaaaa"
+        owner = f"bureau-run:{run_id}"
+        parameters = authorized_captain_run_parameters()
+        parameters["execution_intent"]["context"]["lease_owner_id"] = owner
+        parameters["execution_intent"] = captain_execution_intent(
+            parameters, context=parameters["execution_intent"]["context"]
+        )
+        parameters["_server_runtime_actor_identity"] = (
+            merge_guard.issue_server_runtime_actor_identity(
+                Session(), profile="trusted-owner"
+            )
+        )
+        gh = FakeGh()
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        guard = result["output"]["executions"][0]["merge_lease_guard"]
+        self.assertEqual("blocked_before_guard", guard["status"])
+        self.assertIn(
+            "merge_guard_server_bureau_run_lease_delegation_required",
+            guard["errors"],
+        )
+        self.assertEqual([], gh.calls)
+
+    def test_atomic_merge_guard_accepts_live_server_delegated_bureau_run_lease(self) -> None:
+        class Session:
+            pass
+
+        local_repo = merge_guard.merge_guard_repository_root(Path.cwd())
+        changed_path_key = f"path:{local_repo / 'src/changed.py'}"
+        run_id = "BUR-RUN-20260914T120000Z-aaaaaaaaaa"
+        owner = f"bureau-run:{run_id}"
+        extra_key = "component:test-bureau-scope-expansion"
+        resources.acquire_resources(
+            owner,
+            [changed_path_key, extra_key],
+            purpose="live Bureau changed-path lease",
+            ttl_seconds=600,
+            metadata={"run_id": run_id},
+        )
+        resource_evidence = resources.bureau_run_lease_delegation_evidence(owner)
+        self.assertEqual(
+            {changed_path_key, extra_key}, set(resource_evidence["resource_keys"])
+        )
+        evidence = {
+            **resource_evidence,
+            "task_id": "TASK-1",
+            "worker_id": "worker-1",
+            "coordination_sha256": "e" * 64,
+        }
+        parameters = authorized_captain_run_parameters()
+        parameters["execution_intent"]["context"]["lease_owner_id"] = owner
+        parameters["execution_intent"] = captain_execution_intent(
+            parameters, context=parameters["execution_intent"]["context"]
+        )
+        actor = merge_guard.issue_server_runtime_actor_identity(
+            Session(), profile="trusted-owner"
+        )
+        parameters["_server_runtime_actor_identity"] = actor
+        delegation = merge_guard.issue_server_bureau_run_lease_delegation(
+            actor,
+            evidence,
+            captain_request_sha256_value=merge_guard.captain_request_sha256(
+                parameters
+            ),
+        )
+        parameters["_server_bureau_run_lease_delegation"] = delegation
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": CAPTAIN_BASE_SHA,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            }
+        )
+
+        with patch(
+            "grabowski_bureau_pickup.grabowski_bureau_pickup_status",
+            return_value=self._active_bureau_run_status(run_id),
+        ):
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=gh,
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        guard = result["output"]["executions"][0]["merge_lease_guard"]
+        self.assertEqual(
+            "server-runtime-bureau-run-delegation-v1", guard["lease_owner_source"]
+        )
+        self.assertEqual(
+            "bureau_run", guard["lease_owner_binding"]["delegation_kind"]
+        )
+        self.assertEqual(
+            merge_guard._sha256_json([changed_path_key]),
+            guard["delegated_bureau_target_resource_keys_sha256"],
+        )
+        remaining = resources.inspect_resource(changed_path_key)
+        self.assertIsNotNone(remaining)
+        assert remaining is not None
+        self.assertEqual(owner, remaining["owner_id"])
+        self.assertNotIn(
+            delegation["proof_sha256"], json.dumps(guard, sort_keys=True)
+        )
+        self.assertEqual(
+            1, len([call for call in gh.calls if call[:2] == ("pr", "merge")])
+        )
+
+    def test_atomic_merge_guard_rejects_bureau_run_that_becomes_inactive_after_signing(self) -> None:
+        class Session:
+            pass
+
+        local_repo = merge_guard.merge_guard_repository_root(Path.cwd())
+        changed_path_key = f"path:{local_repo / 'src/changed.py'}"
+        run_id = "BUR-RUN-20260914T120000Z-aaaaaaaaaa"
+        owner = f"bureau-run:{run_id}"
+        resources.acquire_resources(
+            owner,
+            [changed_path_key],
+            purpose="live Bureau changed-path lease",
+            ttl_seconds=600,
+            metadata={"run_id": run_id},
+        )
+        resource_evidence = resources.bureau_run_lease_delegation_evidence(owner)
+        evidence = {
+            **resource_evidence,
+            "task_id": "TASK-1",
+            "worker_id": "worker-1",
+            "coordination_sha256": "e" * 64,
+        }
+        parameters = authorized_captain_run_parameters()
+        parameters["execution_intent"]["context"]["lease_owner_id"] = owner
+        parameters["execution_intent"] = captain_execution_intent(
+            parameters, context=parameters["execution_intent"]["context"]
+        )
+        actor = merge_guard.issue_server_runtime_actor_identity(
+            Session(), profile="trusted-owner"
+        )
+        parameters["_server_runtime_actor_identity"] = actor
+        parameters["_server_bureau_run_lease_delegation"] = (
+            merge_guard.issue_server_bureau_run_lease_delegation(
+                actor,
+                evidence,
+                captain_request_sha256_value=merge_guard.captain_request_sha256(
+                    parameters
+                ),
+            )
+        )
+        stale_status = {
+            "run_id": run_id,
+            "coordination_sha256": "f" * 64,
+            "coordination": {
+                "status": "coordinated",
+                "run": {
+                    "run_id": run_id,
+                    "task_id": "TASK-1",
+                    "worker_id": "worker-1",
+                    "state": "failed",
+                },
+                "lease": {"status": "active-bound"},
+            },
+            "execution_binding": {
+                "classification": "stale",
+                "actively_bound": False,
+            },
+        }
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": CAPTAIN_BASE_SHA,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            }
+        )
+
+        with patch(
+            "grabowski_bureau_pickup.grabowski_bureau_pickup_status",
+            return_value=stale_status,
+        ):
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=gh,
+            )
+
+        guard = result["output"]["executions"][0]["merge_lease_guard"]
+        self.assertEqual("blocked_before_guard", guard["status"])
+        self.assertIn(
+            "merge_guard_bureau_run_live_revalidation_failed:ValueError",
+            guard["errors"],
+        )
+        self.assertEqual(
+            [], [call for call in gh.calls if call[:2] == ("pr", "merge")]
+        )
+
+    def test_atomic_merge_guard_rejects_bureau_run_that_drifts_before_dispatch(self) -> None:
+        class Session:
+            pass
+
+        local_repo = merge_guard.merge_guard_repository_root(Path.cwd())
+        changed_path_key = f"path:{local_repo / 'src/changed.py'}"
+        run_id = "BUR-RUN-20260914T120000Z-aaaaaaaaaa"
+        owner = f"bureau-run:{run_id}"
+        resources.acquire_resources(
+            owner,
+            [changed_path_key],
+            purpose="live Bureau changed-path lease",
+            ttl_seconds=600,
+            metadata={"run_id": run_id},
+        )
+        resource_evidence = resources.bureau_run_lease_delegation_evidence(owner)
+        evidence = {
+            **resource_evidence,
+            "task_id": "TASK-1",
+            "worker_id": "worker-1",
+            "coordination_sha256": "e" * 64,
+        }
+        parameters = authorized_captain_run_parameters()
+        parameters["execution_intent"]["context"]["lease_owner_id"] = owner
+        parameters["execution_intent"] = captain_execution_intent(
+            parameters, context=parameters["execution_intent"]["context"]
+        )
+        actor = merge_guard.issue_server_runtime_actor_identity(
+            Session(), profile="trusted-owner"
+        )
+        parameters["_server_runtime_actor_identity"] = actor
+        parameters["_server_bureau_run_lease_delegation"] = (
+            merge_guard.issue_server_bureau_run_lease_delegation(
+                actor,
+                evidence,
+                captain_request_sha256_value=merge_guard.captain_request_sha256(
+                    parameters
+                ),
+            )
+        )
+        stale_status = self._active_bureau_run_status(run_id)
+        stale_status["coordination_sha256"] = "1" * 64
+        stale_status["coordination"]["run"]["state"] = "failed"
+        stale_status["execution_binding"] = {
+            "classification": "stale",
+            "actively_bound": False,
+        }
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": CAPTAIN_BASE_SHA,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            }
+        )
+
+        with patch(
+            "grabowski_bureau_pickup.grabowski_bureau_pickup_status",
+            side_effect=[self._active_bureau_run_status(run_id), stale_status],
+        ):
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=gh,
+            )
+
+        guard = result["output"]["executions"][0]["merge_lease_guard"]
+        self.assertEqual(
+            "blocked_after_guard_revalidation_released", guard["status"]
+        )
+        self.assertIn(
+            "merge_guard_bureau_run_live_revalidation_failed:ValueError",
+            guard["errors"],
+        )
+        self.assertFalse(guard["dispatch_called"])
+        self.assertEqual(
+            [], [call for call in gh.calls if call[:2] == ("pr", "merge")]
+        )
+
+    def test_atomic_merge_guard_rejects_unrelated_server_delegated_bureau_run_lease(self) -> None:
+        class Session:
+            pass
+
+        run_id = "BUR-RUN-20260914T120000Z-aaaaaaaaaa"
+        owner = f"bureau-run:{run_id}"
+        unrelated_key = "component:test-unrelated-bureau-delegation"
+        resources.acquire_resources(
+            owner,
+            [unrelated_key],
+            purpose="live but merge-unrelated Bureau lease",
+            ttl_seconds=600,
+            metadata={"run_id": run_id},
+        )
+        resource_evidence = resources.bureau_run_lease_delegation_evidence(owner)
+        evidence = {
+            **resource_evidence,
+            "task_id": "TASK-1",
+            "worker_id": "worker-1",
+            "coordination_sha256": "e" * 64,
+        }
+        parameters = authorized_captain_run_parameters()
+        parameters["execution_intent"]["context"]["lease_owner_id"] = owner
+        parameters["execution_intent"] = captain_execution_intent(
+            parameters, context=parameters["execution_intent"]["context"]
+        )
+        actor = merge_guard.issue_server_runtime_actor_identity(
+            Session(), profile="trusted-owner"
+        )
+        parameters["_server_runtime_actor_identity"] = actor
+        parameters["_server_bureau_run_lease_delegation"] = (
+            merge_guard.issue_server_bureau_run_lease_delegation(
+                actor,
+                evidence,
+                captain_request_sha256_value=merge_guard.captain_request_sha256(
+                    parameters
+                ),
+            )
+        )
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": CAPTAIN_BASE_SHA,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            }
+        )
+
+        with patch(
+            "grabowski_bureau_pickup.grabowski_bureau_pickup_status",
+            return_value=self._active_bureau_run_status(run_id),
+        ):
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=gh,
+            )
+
+        guard = result["output"]["executions"][0]["merge_lease_guard"]
+        self.assertEqual("blocked_by_live_lease", guard["status"])
+        self.assertTrue(
+            any(
+                "delegated Bureau leases do not bind the merge target" in item
+                for item in guard["errors"]
+            )
+        )
+        self.assertEqual(
+            [], [call for call in gh.calls if call[:2] == ("pr", "merge")]
+        )
 
     def test_atomic_merge_guard_rejects_unsigned_direct_operator_owner(self) -> None:
         class Session:

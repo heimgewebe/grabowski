@@ -341,14 +341,14 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
     },
     "grabowski_checkout_binding_terminal_preview": {
         "category": "checkout-lifecycle",
-        "purpose": "Preview one exact evidence-bound terminal reconciliation for either an absent managed checkout or a clean present terminal Work Lane retained without consuming active checkout capacity.",
+        "purpose": "Preview one exact evidence-bound terminal reconciliation for an absent managed checkout, a clean terminal Work Lane, or a present terminal thread_focus checkout whose only admitted local state is hash-bound .review-audits evidence and whose head is exactly retention-bound.",
         "risk_class": "low",
         "effects": [],
         "reversibility": "not-applicable",
     },
     "grabowski_checkout_binding_terminal_apply": {
         "category": "checkout-lifecycle",
-        "purpose": "Apply one fresh compare-and-swap terminal reconciliation: absent checkouts to externally_terminal_missing, or clean present terminal Work Lanes from active to completed_retained while preserving the checkout, retention and cleanup authority boundaries.",
+        "purpose": "Apply one fresh compare-and-swap terminal reconciliation: absent checkouts to externally_terminal_missing; clean terminal Work Lanes to completed_retained; or bounded present terminal thread_focus checkouts with hash-bound review evidence, including an explicit lifecycle-head catch-up only to the already-retained head while preserving checkout, evidence, retention and cleanup authority boundaries.",
         "risk_class": "medium",
         "effects": ["audit-append", "receipt-create", "resource-lease", "state-change"],
         "reversibility": "compare-and-swap-state-transition-with-retained-evidence",

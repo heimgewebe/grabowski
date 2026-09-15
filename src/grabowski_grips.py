@@ -5503,6 +5503,11 @@ def _run_checkout_binding_terminal_apply(
                 "active_capacity_release",
                 "terminal_head_rebind",
             ],
+            [
+                "lifecycle_phase_transition",
+                "active_capacity_release",
+                "thread_focus_retention_head_catchup",
+            ],
         )
         if binding_after.get("phase") != "completed_retained":
             raise GripActionError("present checkout terminal apply post-state is invalid")
@@ -5510,6 +5515,31 @@ def _run_checkout_binding_terminal_apply(
             raise GripActionError("present checkout terminal apply must preserve checkout")
     else:
         raise GripActionError("checkout terminal apply reconciliation mode is invalid")
+    snapshot = terminal_receipt.get("review_evidence_snapshot")
+    if snapshot is not None:
+        import grabowski_checkout_terminal_reconciliation as reconciliation
+
+        manifest = terminal_receipt.get("review_evidence_manifest")
+        source = binding_before.get("source")
+        if (
+            reconciliation_mode != "present_retained"
+            or not isinstance(source, dict)
+            or source.get("kind") != "thread_focus"
+            or not isinstance(manifest, dict)
+            or manifest.get("eligible") is not True
+        ):
+            raise GripActionError("checkout terminal review snapshot is outside admitted scope")
+        try:
+            expected_snapshot = reconciliation._review_snapshot_identity(
+                checkout_key, expected_preview_sha256, manifest
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise GripActionError("checkout terminal review snapshot is invalid") from exc
+        if snapshot != expected_snapshot:
+            raise GripActionError("checkout terminal review snapshot binding mismatch")
+        allowed_effects = tuple(
+            item + ["review_evidence_snapshot_retained"] for item in allowed_effects
+        )
     if effects not in allowed_effects:
         raise GripActionError("checkout terminal apply exceeded bounded lifecycle effects")
     if "terminal_head_rebind" in effects:
@@ -5529,6 +5559,41 @@ def _run_checkout_binding_terminal_apply(
             or retention_before.get("expected_branch") != retention_after.get("expected_branch")
         ):
             raise GripActionError("checkout terminal head rebind receipt is inconsistent")
+    identity_catchup = terminal_receipt.get("identity_catchup")
+    if "thread_focus_retention_head_catchup" in effects:
+        retention_before = terminal_receipt.get("retention_before")
+        retention_after = terminal_receipt.get("retention_after")
+        binding_source = binding_before.get("source")
+        if (
+            not isinstance(identity_catchup, dict)
+            or identity_catchup.get("kind")
+            != "thread_focus_retention_head_catchup"
+            or not isinstance(binding_source, dict)
+            or binding_source.get("kind") != "thread_focus"
+            or not isinstance(retention_before, dict)
+            or not isinstance(retention_after, dict)
+            or identity_catchup.get("binding_expected_head")
+            != binding_before.get("expected_head")
+            or identity_catchup.get("retention_expected_head")
+            != retention_before.get("expected_head")
+            or binding_after.get("expected_head")
+            != identity_catchup.get("retention_expected_head")
+            or binding_before.get("expected_head")
+            == binding_after.get("expected_head")
+            or retention_after.get("expected_head")
+            != retention_before.get("expected_head")
+            or retention_before.get("owner_id") != retention_after.get("owner_id")
+            or retention_before.get("expected_branch")
+            != retention_after.get("expected_branch")
+            or terminal_receipt.get("branch_head_rebind") is not None
+        ):
+            raise GripActionError(
+                "checkout terminal retention head catch-up receipt is inconsistent"
+            )
+    elif identity_catchup is not None:
+        raise GripActionError(
+            "checkout terminal identity catch-up claim lacks its bounded effect"
+        )
     receipt_sha256 = terminal_receipt.get("receipt_sha256")
     if not _is_sha256_hex(receipt_sha256):
         raise GripActionError("checkout terminal apply lacks durable receipt digest")

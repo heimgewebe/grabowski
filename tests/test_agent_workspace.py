@@ -7871,6 +7871,67 @@ class AgentWorkspaceTests(unittest.TestCase):
         workspace._write_manifest(manifest)
         return manifest
 
+    def test_record_workspace_lifecycle_effect_requires_durable_readback(self) -> None:
+        manifest = self._closed_cleanup_manifest()
+        intent_id = "lifecycle-durable-intent"
+        reference = {
+            "execution_id": "workspace:archive:durable",
+            "status": "succeeded",
+            "receipt_sha256": "a" * 64,
+        }
+        manifest["workspace_cleanup_intent"] = {
+            "intent_id": intent_id,
+            "lifecycle_effects": {},
+        }
+        workspace._write_manifest(manifest)
+
+        recorded = workspace._record_workspace_lifecycle_effect(
+            manifest,
+            intent_id=intent_id,
+            effect_kind="workspace_archive",
+            reference=reference,
+        )
+
+        self.assertEqual(recorded, reference)
+        persisted = workspace._manifest(manifest["workspace_id"])
+        self.assertEqual(
+            persisted["workspace_cleanup_intent"]["lifecycle_effects"][
+                "workspace_archive"
+            ],
+            reference,
+        )
+
+    def test_record_workspace_lifecycle_effect_fails_closed_on_stale_readback(self) -> None:
+        manifest = self._closed_cleanup_manifest()
+        intent_id = "lifecycle-stale-readback-intent"
+        reference = {
+            "execution_id": "workspace:archive:stale",
+            "status": "succeeded",
+            "receipt_sha256": "b" * 64,
+        }
+        manifest["workspace_cleanup_intent"] = {
+            "intent_id": intent_id,
+            "lifecycle_effects": {},
+        }
+        workspace._write_manifest(manifest)
+        stale = dict(manifest)
+        stale["workspace_cleanup_intent"] = {
+            "intent_id": intent_id,
+            "lifecycle_effects": {},
+        }
+
+        with mock.patch.object(workspace, "_manifest", return_value=stale):
+            with self.assertRaisesRegex(
+                workspace.AgentWorkspaceActionError,
+                "was not durably persisted",
+            ):
+                workspace._record_workspace_lifecycle_effect(
+                    manifest,
+                    intent_id=intent_id,
+                    effect_kind="workspace_archive",
+                    reference=reference,
+                )
+
     def _mature_checkout_archive(self, archive_id: str) -> None:
         archive = workspace.checkouts._load_archive(archive_id)
         mature_at = (
@@ -7942,6 +8003,133 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(public["state"], "completed")
         self.assertTrue(public["terminal"])
         self.assertEqual(public["unit"], "writer.service")
+
+    def test_cleanup_checkout_coordination_includes_branch_scoped_snapshot_and_tasks(self) -> None:
+        branch = "feat/writer"
+        branch_key = f"repo:{self.git.repo}:branch:{branch}"
+        branch_task = {"task_id": "branch-only-task", "blocking": True}
+        base = {
+            "resource_leases": [],
+            "tasks": [branch_task],
+            "processes": [],
+            "blocking": True,
+            "blocking_counts": {
+                "resource_leases": 0,
+                "tasks": 1,
+                "processes": 0,
+            },
+        }
+        snapshot = {
+            "complete": True,
+            "error": None,
+            "by_key": {
+                branch_key: {
+                    "resource_key": branch_key,
+                    "owner_id": "foreign-owner",
+                }
+            },
+            "by_owner": {},
+        }
+        with mock.patch.object(
+            workspace.checkouts,
+            "_linked_checkout_coordination",
+            return_value=base,
+        ) as linked:
+            result = workspace._workspace_cleanup_checkout_coordination(
+                self.git.writer,
+                self.git.repo,
+                self.git.repo / ".git",
+                branch=branch,
+                owner_id="workspace-owner",
+                resource_snapshot=snapshot,
+            )
+
+        linked.assert_called_once_with(
+            self.git.writer,
+            self.git.repo,
+            self.git.repo / ".git",
+            branch=branch,
+            owner_id="workspace-owner",
+            include_processes=True,
+            include_tasks=True,
+            include_resources=False,
+        )
+        self.assertEqual(
+            [item["resource_key"] for item in result["resource_leases"]],
+            [branch_key],
+        )
+        self.assertEqual(result["tasks"], [branch_task])
+        self.assertTrue(result["blocking"])
+        self.assertEqual(result["blocking_counts"]["resource_leases"], 1)
+        self.assertEqual(result["blocking_counts"]["tasks"], 1)
+
+    def test_lifecycle_effect_release_requires_durable_terminal_manifest_reference(self) -> None:
+        manifest = self._closed_cleanup_manifest()
+        identifier = manifest["workspace_id"]
+        intent_id = "intent-durable-release"
+        effect_kind = "workspace_archive"
+        execution_id = f"{identifier}:{effect_kind}:{intent_id}"
+        context = {
+            "workspace_id": identifier,
+            "intent_id": intent_id,
+            "effect_kind": effect_kind,
+            "execution_id": execution_id,
+            "plan": {"plan_sha256": "a" * 64},
+            "revalidation": {"revalidation_sha256": "b" * 64},
+            "lease_owner": "effect-owner",
+            "gate_resource": "operation:workspace-effect-test",
+        }
+        ready_reference = {
+            "effect_kind": effect_kind,
+            "execution_id": execution_id,
+            "plan_sha256": "a" * 64,
+            "revalidation_sha256": "b" * 64,
+            "status": "ready",
+        }
+        manifest["workspace_cleanup_intent"] = {
+            "intent_id": intent_id,
+            "lifecycle_effects": {effect_kind: ready_reference},
+        }
+        workspace._write_manifest(manifest)
+        with mock.patch.object(
+            workspace.resources, "release_resources"
+        ) as release:
+            with self.assertRaisesRegex(
+                workspace.AgentWorkspaceActionError,
+                "cannot be released before exact terminal evidence is durable",
+            ):
+                workspace._workspace_lifecycle_effect_release(context)
+            release.assert_not_called()
+
+        terminal_reference = {
+            **ready_reference,
+            "status": "succeeded",
+            "receipt_sha256": "c" * 64,
+        }
+        manifest["workspace_cleanup_intent"]["lifecycle_effects"][
+            effect_kind
+        ] = terminal_reference
+        workspace._write_manifest(manifest)
+        with mock.patch.object(
+            workspace.resources, "release_resources"
+        ) as release:
+            workspace._workspace_lifecycle_effect_release(context)
+        release.assert_called_once_with(
+            "effect-owner", ["operation:workspace-effect-test"]
+        )
+
+        manifest.pop("workspace_cleanup_intent", None)
+        manifest["workspace_cleanup_receipt"] = {
+            "lifecycle_effects": {effect_kind: terminal_reference}
+        }
+        workspace._write_manifest(manifest)
+        with mock.patch.object(
+            workspace.resources, "release_resources"
+        ) as release:
+            workspace._workspace_lifecycle_effect_release(context)
+        release.assert_called_once_with(
+            "effect-owner", ["operation:workspace-effect-test"]
+        )
 
     def test_cleanup_plan_reads_resource_lease_snapshot_once(self) -> None:
         manifest = self._closed_cleanup_manifest()
@@ -8652,6 +8840,303 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertNotEqual(
                 resolved["execution_id"], prior_effect["execution_id"]
             )
+
+    def test_cleanup_recovers_persisted_archive_fence_before_eligibility_gate(self) -> None:
+        manifest = self._closed_cleanup_manifest()
+        checkout_state = self.root / "checkout-state-persisted-archive-recovery"
+        patches = [
+            mock.patch.object(workspace.checkouts, "CHECKOUT_DB", checkout_state / "checkouts.sqlite3"),
+            mock.patch.object(workspace.checkouts, "ARCHIVE_ROOT", checkout_state / "archives"),
+            mock.patch.object(workspace.checkouts, "CHECKOUT_LOCK", checkout_state / "checkouts.lock"),
+            mock.patch.object(workspace.checkouts.resources, "RESOURCE_DB", checkout_state / "resources.sqlite3"),
+            mock.patch.object(workspace.checkouts.tasks, "TASK_DB", checkout_state / "tasks.sqlite3"),
+            mock.patch.object(workspace.checkouts.operator, "_safe_environment", return_value=os.environ.copy()),
+            mock.patch.object(workspace.checkouts.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.checkouts.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.checkouts.base, "_append_audit"),
+            mock.patch.object(workspace.checkouts, "_processes_under", return_value=[]),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+        ]
+        original_archive = workspace.checkouts.grabowski_checkout_archive
+        archive_calls = 0
+
+        def archive_with_durable_failure(*args, **kwargs):
+            nonlocal archive_calls
+            archive_calls += 1
+            return original_archive(*args, **kwargs)
+
+        def fail_archive_audit(record: dict) -> None:
+            if record.get("operation") == "checkout-archive":
+                raise RuntimeError("simulated archive audit failure after durable archive")
+
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patches[8], patches[9], patches[10], patches[11]:
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            with (
+                mock.patch.object(
+                    workspace.checkouts.base,
+                    "_append_audit",
+                    side_effect=fail_archive_audit,
+                ),
+                mock.patch.object(
+                    workspace.checkouts,
+                    "grabowski_checkout_archive",
+                    side_effect=archive_with_durable_failure,
+                ),
+                mock.patch.object(
+                    workspace,
+                    "_workspace_archive_recovery_readback",
+                    side_effect=workspace.AgentWorkspaceActionError(
+                        "simulated interrupted archive recovery"
+                    ),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    workspace.AgentWorkspaceActionError,
+                    "simulated interrupted archive recovery",
+                ):
+                    workspace.grabowski_agent_workspace_cleanup(
+                        manifest["workspace_id"],
+                        plan["plan_sha256"],
+                        "archive-and-remove-worktree",
+                    )
+
+            self.assertEqual(archive_calls, 1)
+            interrupted = workspace._manifest(manifest["workspace_id"])
+            prior_intent = interrupted["workspace_cleanup_intent"]
+            self.assertEqual(prior_intent["state"], "recovery_required")
+            prior_effect = prior_intent["lifecycle_effects"]["workspace_archive"]
+            self.assertEqual(prior_effect["status"], "recovery_required")
+            self.assertFalse(prior_effect["blind_retry_allowed"])
+
+            blocked_plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            self.assertFalse(blocked_plan["eligible"])
+            self.assertEqual(
+                blocked_plan["lifecycle_state"], "cleanup_recovery_required"
+            )
+            self.assertEqual(
+                {item["code"] for item in blocked_plan["blockers"]},
+                {"cleanup_recovery_required", "active_checkout_coordination"},
+            )
+            active_fences = workspace.checkouts._active_checkout_operation_uncertainties()
+            self.assertEqual(len(active_fences), 1)
+            fence = active_fences[0]
+            coordination = blocked_plan["checkout"]["coordination"]
+            self.assertEqual(
+                {item["owner_id"] for item in coordination["resource_leases"]},
+                {fence["lease_owner_id"]},
+            )
+            observed_coordination_keys = {
+                item["resource_key"] for item in coordination["resource_leases"]
+            }
+            self.assertTrue(observed_coordination_keys)
+            self.assertTrue(
+                observed_coordination_keys.issubset(set(fence["resource_keys"]))
+            )
+
+            real_reconcile = workspace._workspace_reconcile_checkout_uncertainty
+
+            def clear_fence_then_fail(**kwargs):
+                result = real_reconcile(**kwargs)
+                if (
+                    kwargs.get("operation") == "archive"
+                    and kwargs.get("release_operation_lease") is True
+                ):
+                    raise workspace.AgentWorkspaceActionError(
+                        "simulated loss after persisted archive fence release"
+                    )
+                return result
+
+            with (
+                mock.patch.object(
+                    workspace.checkouts, "grabowski_checkout_archive"
+                ) as second_archive,
+                mock.patch.object(
+                    workspace,
+                    "_workspace_reconcile_checkout_uncertainty",
+                    side_effect=clear_fence_then_fail,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    workspace.AgentWorkspaceActionError,
+                    "simulated loss after persisted archive fence release",
+                ):
+                    workspace.grabowski_agent_workspace_cleanup(
+                        manifest["workspace_id"],
+                        blocked_plan["plan_sha256"],
+                        "archive-and-remove-worktree",
+                    )
+            second_archive.assert_not_called()
+            self.assertEqual(archive_calls, 1)
+            after_clear = workspace._manifest(manifest["workspace_id"])
+            after_clear_intent = after_clear["workspace_cleanup_intent"]
+            self.assertEqual(after_clear_intent["state"], "recovery_required")
+            self.assertEqual(after_clear_intent["intent_id"], prior_intent["intent_id"])
+            self.assertIsInstance(after_clear_intent.get("archive_id"), str)
+            self.assertEqual(
+                workspace.checkouts._active_checkout_operation_uncertainties(), []
+            )
+
+            durable_plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            self.assertFalse(durable_plan["eligible"])
+            self.assertEqual(
+                {item["code"] for item in durable_plan["blockers"]},
+                {"cleanup_recovery_required"},
+            )
+
+            # A hard process exit is not caught by the cleanup exception handler.
+            # The same durable archive can therefore coexist with the older
+            # `started` intent state after the fence was already reconciled.
+            # Exact archive/checkout identity must still make this recoverable.
+            after_clear_intent["state"] = "started"
+            after_clear["workspace_cleanup_intent"] = after_clear_intent
+            workspace._write_manifest(after_clear)
+            durable_plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            self.assertFalse(durable_plan["eligible"])
+            self.assertEqual(
+                durable_plan["lifecycle_state"], "cleanup_outcome_unknown"
+            )
+            self.assertEqual(
+                {item["code"] for item in durable_plan["blockers"]},
+                {"cleanup_outcome_unknown"},
+            )
+            with mock.patch.object(
+                workspace.checkouts, "grabowski_checkout_archive"
+            ) as third_archive:
+                recovered = workspace.grabowski_agent_workspace_cleanup(
+                    manifest["workspace_id"],
+                    durable_plan["plan_sha256"],
+                    "archive-and-remove-worktree",
+                )
+            third_archive.assert_not_called()
+            self.assertEqual(archive_calls, 1)
+            self.assertIn(
+                recovered["state"],
+                {"archived_waiting_for_cleanup", "archived_ready_for_cleanup"},
+            )
+            resolved = recovered["lifecycle_effect"]
+            self.assertEqual(resolved["status"], "succeeded")
+            self.assertTrue(resolved["execution_id"].endswith(":reconcile"))
+            self.assertEqual(
+                resolved["supersedes"]["receipt_sha256"],
+                prior_effect["receipt_sha256"],
+            )
+            self.assertEqual(
+                resolved["supersedes"]["status"], "recovery_required"
+            )
+            persisted = workspace._manifest(manifest["workspace_id"])
+            self.assertEqual(
+                persisted["workspace_cleanup_intent"]["state"], "archived_ready"
+            )
+
+    def test_persisted_archive_recovery_fence_rejects_replaced_checkout_identity(self) -> None:
+        current_physical_identity = {"physical_identity_sha256": "current-checkout"}
+        archived_physical_identity = {"physical_identity_sha256": "archived-checkout"}
+        plan = {
+            "repository": "/tmp/repo",
+            "writer_worktree": "/tmp/worktree",
+            "checkout": {
+                "checkout_key": "checkout-key",
+                "head": "0123456789abcdef0123456789abcdef01234567",
+                "branch": "feat/writer",
+                "physical_identity": current_physical_identity,
+            },
+        }
+        fence = {
+            "checkout_key": "checkout-key",
+            "operation": "archive",
+            "owner_id": "workspace-owner",
+            "operation_id": "archive-id",
+            "evidence": {
+                "archive_id": "archive-id",
+                "checkout_key": "checkout-key",
+                "owner_id": "workspace-owner",
+                "repo": "/tmp/repo",
+                "checkout_path": "/tmp/worktree",
+                "expected_head": "0123456789abcdef0123456789abcdef01234567",
+                "expected_branch": "feat/writer",
+                "expected_physical_identity": archived_physical_identity,
+            },
+        }
+        with mock.patch.object(
+            workspace.checkouts,
+            "_active_checkout_operation_uncertainties",
+            return_value=[fence],
+        ):
+            with self.assertRaisesRegex(
+                workspace.AgentWorkspaceActionError,
+                "conflicting checkout uncertainty fence",
+            ):
+                workspace._workspace_persisted_archive_uncertainty_fence(
+                    plan, owner="workspace-owner"
+                )
+
+            fence["evidence"]["expected_physical_identity"] = current_physical_identity
+            self.assertIs(
+                workspace._workspace_persisted_archive_uncertainty_fence(
+                    plan, owner="workspace-owner"
+                ),
+                fence,
+            )
+
+    def test_archive_recovery_coordination_rejects_foreign_or_live_activity(self) -> None:
+        fence = {
+            "lease_owner_id": "checkout-op:archive-fence",
+            "resource_keys": [
+                "path:/tmp/worktree",
+                "repo:/tmp/repo:branch:feat/writer",
+            ],
+        }
+        plan = {
+            "checkout": {
+                "coordination": {
+                    "resource_leases": [
+                        {
+                            "owner_id": "checkout-op:archive-fence",
+                            "resource_key": "path:/tmp/worktree",
+                        }
+                    ],
+                    "tasks": [],
+                    "processes": [],
+                }
+            }
+        }
+        self.assertTrue(
+            workspace._workspace_recovery_coordination_matches_fence(plan, fence)
+        )
+
+        plan["checkout"]["coordination"]["resource_leases"].append(
+            {
+                "owner_id": "foreign-owner",
+                "resource_key": "path:/tmp/worktree/child",
+            }
+        )
+        self.assertFalse(
+            workspace._workspace_recovery_coordination_matches_fence(plan, fence)
+        )
+        plan["checkout"]["coordination"]["resource_leases"] = [
+            {
+                "owner_id": "checkout-op:archive-fence",
+                "resource_key": "path:/tmp/worktree",
+            }
+        ]
+        plan["checkout"]["coordination"]["tasks"] = [{"task_id": "foreign-task"}]
+        self.assertFalse(
+            workspace._workspace_recovery_coordination_matches_fence(plan, fence)
+        )
+        plan["checkout"]["coordination"]["tasks"] = []
+        plan["checkout"]["coordination"]["processes"] = [{"pid": 12345}]
+        self.assertFalse(
+            workspace._workspace_recovery_coordination_matches_fence(plan, fence)
+        )
 
     def test_cleanup_reconciles_post_commit_audit_failure_and_clears_fence(self) -> None:
         manifest = self._closed_cleanup_manifest()
@@ -11729,6 +12214,7 @@ class AgentWorkspaceTests(unittest.TestCase):
                 "checkout_key": "key",
                 "head": "a" * 40,
                 "branch": "topic",
+                "physical_identity": {"physical_identity_sha256": "checkout-identity"},
             },
         }
         archive = {"archive_id": "archive-123"}
@@ -11745,6 +12231,9 @@ class AgentWorkspaceTests(unittest.TestCase):
                 "checkout_path": "/repo/wt",
                 "expected_head": "a" * 40,
                 "expected_branch": "topic",
+                "expected_physical_identity": {
+                    "physical_identity_sha256": "checkout-identity"
+                },
             },
         }
         with (
@@ -11773,9 +12262,11 @@ class AgentWorkspaceTests(unittest.TestCase):
                 plan,
                 owner="owner",
             )
-        self.assertEqual(recovered, archive)
+        self.assertEqual(recovered["state"], "archive_verified")
+        self.assertEqual(recovered["archive"], archive)
+        self.assertIs(recovered["fence"], fence)
         post_state.assert_called_once()
-        self.assertTrue(reconcile.call_args.kwargs["release_operation_lease"])
+        reconcile.assert_not_called()
 
     def test_prearchive_recovery_fails_closed_on_conflicting_fence(self) -> None:
         plan = {
@@ -11785,6 +12276,7 @@ class AgentWorkspaceTests(unittest.TestCase):
                 "checkout_key": "key",
                 "head": "a" * 40,
                 "branch": "topic",
+                "physical_identity": {"physical_identity_sha256": "checkout-identity"},
             },
         }
         exact = {
@@ -11800,6 +12292,9 @@ class AgentWorkspaceTests(unittest.TestCase):
                 "checkout_path": "/repo/wt",
                 "expected_head": "a" * 40,
                 "expected_branch": "topic",
+                "expected_physical_identity": {
+                    "physical_identity_sha256": "checkout-identity"
+                },
             },
         }
         conflict = {

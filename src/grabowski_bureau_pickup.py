@@ -7034,6 +7034,39 @@ def grabowski_bureau_pickup_status(run_id: str) -> dict[str, Any]:
     }
 
 
+def server_bureau_run_lease_delegation_evidence(run_id: str) -> dict[str, Any]:
+    """Return exact live lease evidence for one actively bound Bureau run."""
+    status = grabowski_bureau_pickup_status(run_id)
+    normalized_run_id = status["run_id"]
+    coordination = status.get("coordination")
+    execution_binding = status.get("execution_binding")
+    if (
+        not isinstance(coordination, dict)
+        or coordination.get("status") != "coordinated"
+    ):
+        raise ValueError("Bureau run coordination is not live")
+    if (
+        not isinstance(execution_binding, dict)
+        or execution_binding.get("actively_bound") is not True
+    ):
+        raise ValueError("Bureau run is not actively bound")
+    run = coordination.get("run")
+    if not isinstance(run, dict) or run.get("run_id") != normalized_run_id:
+        raise ValueError("Bureau run binding is invalid")
+    lease = coordination.get("lease")
+    if not isinstance(lease, dict) or lease.get("status") != "active-bound":
+        raise ValueError("Bureau run lease binding is not active")
+    owner_id = f"bureau-run:{normalized_run_id}"
+    resource_evidence = resources.bureau_run_lease_delegation_evidence(owner_id)
+    if resource_evidence.get("run_id") != normalized_run_id:
+        raise ValueError("Bureau run lease evidence is not run-bound")
+    return {
+        **resource_evidence,
+        "task_id": run.get("task_id"),
+        "worker_id": run.get("worker_id"),
+        "coordination_sha256": status["coordination_sha256"],
+    }
+
 
 def _validate_acquisition(acquisition: dict[str, Any]) -> None:
     claimed = acquisition.get("acquisition_sha256")
