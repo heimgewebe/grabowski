@@ -12,7 +12,11 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import hmac
+import http.client
+import math
 import os
+import signal
+from contextlib import contextmanager
 from contextvars import ContextVar
 from decimal import Decimal
 import importlib.util
@@ -57,6 +61,11 @@ CLAUDE_CREDENTIAL_COMMITMENT_KIND = "grabowski.claude_credential_commitment"
 CLAUDE_CREDENTIAL_COMMITMENT_DOMAIN = "grabowski.claude-credential-commitment.v1"
 CLAUDE_CREDENTIAL_COMMITMENT_MAX_AGE_SECONDS = 600
 CLAUDE_CREDENTIAL_COMMITMENT_CLOCK_SKEW_SECONDS = 120
+CLAUDE_USAGE_API_HOST = "api.anthropic.com"
+CLAUDE_USAGE_API_PATH = "/api/oauth/usage?at_wall=1&skip_spend=1"
+CLAUDE_USAGE_TIMEOUT_SECONDS = 5
+CLAUDE_USAGE_MAX_RESPONSE_BYTES = 64 * 1024
+CLAUDE_USAGE_MAX_JSON_INTEGER_DIGITS = 128
 
 
 def _utc_now() -> datetime:
@@ -101,11 +110,11 @@ def _validated_credential_commitment(credential_data: bytes) -> dict[str, Any]:
         raise _core.PreflightError("Claude credential commitment SHA-256 is invalid")
     try:
         parsed = datetime.fromisoformat(str(issued_at).replace("Z", "+00:00"))
-    except ValueError as exc:
+        if parsed.tzinfo is None:
+            raise ValueError("timezone-aware timestamp required")
+        parsed = parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError) as exc:
         raise _core.PreflightError("Claude credential commitment timestamp is invalid") from exc
-    if parsed.tzinfo is None:
-        raise _core.PreflightError("Claude credential commitment timestamp is invalid")
-    parsed = parsed.astimezone(timezone.utc)
     age_seconds = (_utc_now() - parsed).total_seconds()
     if age_seconds < -CLAUDE_CREDENTIAL_COMMITMENT_CLOCK_SKEW_SECONDS:
         raise _core.PreflightError("Claude credential commitment timestamp is in the future")
@@ -167,26 +176,242 @@ def _validated_credential_data_adapter(
     return data
 
 
-def _claude_quota_readiness() -> dict[str, Any]:
-    """Bind the fact that remaining Claude subscription quota is not observable here.
 
-    Authentication and an intact local credential prove only that Claude Code can
-    attempt provider access. They do not prove remaining five-hour or weekly quota.
-    The benchmark must never spend a model request merely to discover that state.
-    """
 
+def _bounded_json_int(value: str) -> int:
+    digits = value.lstrip("-")
+    if not digits or len(digits) > CLAUDE_USAGE_MAX_JSON_INTEGER_DIGITS:
+        raise ValueError("JSON integer is outside the quota-evidence bound")
+    return int(value)
+
+
+@contextmanager
+def _quota_request_deadline(seconds: float):
+    """Bound the whole synchronous quota request, including DNS and body reads."""
+
+    try:
+        previous_handler = signal.getsignal(signal.SIGALRM)
+        previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    except (AttributeError, OSError, ValueError) as exc:
+        raise TimeoutError("quota request deadline is unavailable") from exc
+    if previous_timer != (0.0, 0.0):
+        raise TimeoutError("quota request deadline is already in use")
+
+    def _deadline_expired(_signum: int, _frame: Any) -> None:
+        raise TimeoutError("quota request deadline exceeded")
+
+    armed = False
+    try:
+        signal.signal(signal.SIGALRM, _deadline_expired)
+        signal.setitimer(signal.ITIMER_REAL, float(seconds))
+        armed = True
+        yield
+    except (AttributeError, OSError, ValueError) as exc:
+        raise TimeoutError("quota request deadline is unavailable") from exc
+    finally:
+        if armed:
+            signal.setitimer(signal.ITIMER_REAL, 0.0)
+        try:
+            signal.signal(signal.SIGALRM, previous_handler)
+        except (AttributeError, OSError, ValueError):
+            pass
+
+
+def _unknown_claude_quota_readiness(reason: str) -> dict[str, Any]:
     return {
         "status": "unknown",
-        "source": "non_consuming_quota_surface_not_configured",
+        "source": "claude_oauth_usage_at_wall_skip_spend",
+        "reason": reason,
         "authentication_is_quota_evidence": False,
         "provider_available": None,
+        "subscription_quota_not_exhausted": None,
         "remaining_five_hour_quota": None,
         "remaining_weekly_quota": None,
-        "does_not_establish": [
-            "remaining_five_hour_quota",
-            "remaining_weekly_quota",
-            "provider_availability",
-        ],
+        "five_hour": None,
+        "seven_day": None,
+        "spend_and_credits_considered": False,
+        "does_not_establish": ["remaining_five_hour_quota", "remaining_weekly_quota", "provider_availability",
+                               "sufficient_quota_for_complete_benchmark_pair", "model_request_success", "retry_authority"],
+    }
+
+
+def _validated_claude_usage_window(payload: dict[str, Any], key: str) -> dict[str, Any] | None:
+    window = payload.get(key)
+    if not isinstance(window, dict):
+        return None
+    utilization = window.get("utilization")
+    if isinstance(utilization, bool) or not isinstance(utilization, (int, float)):
+        return None
+    if isinstance(utilization, float) and not math.isfinite(utilization):
+        return None
+    if utilization < 0 or utilization > 100:
+        return None
+    utilization_percent = float(utilization)
+    resets_at = window.get("resets_at")
+    if resets_at is not None:
+        if not isinstance(resets_at, str) or not resets_at.strip():
+            return None
+        try:
+            parsed_reset = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
+            if parsed_reset.tzinfo is None:
+                return None
+            normalized_reset = parsed_reset.astimezone(timezone.utc)
+        except (ValueError, OverflowError):
+            return None
+        if normalized_reset <= _utc_now():
+            return None
+    return {
+        "utilization_percent": utilization_percent,
+        "remaining_percent": round(100.0 - utilization_percent, 6),
+        "resets_at": resets_at,
+    }
+
+
+def _claude_quota_readiness(credential_data: bytes | None = None) -> dict[str, Any]:
+    """Read subscription utilization without a model request; malformed evidence stays unknown."""
+
+    if credential_data is None:
+        return _unknown_claude_quota_readiness("oauth_credential_unavailable")
+    try:
+        credential = json.loads(
+            credential_data.decode("utf-8"), parse_int=_bounded_json_int
+        )
+    except (UnicodeDecodeError, ValueError):
+        return _unknown_claude_quota_readiness("credential_json_invalid")
+    if not isinstance(credential, dict):
+        return _unknown_claude_quota_readiness("credential_json_invalid")
+    oauth = credential.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return _unknown_claude_quota_readiness("oauth_access_token_unavailable")
+    access_token = oauth.get("accessToken")
+    if (
+        not isinstance(access_token, str)
+        or not access_token
+        or access_token != access_token.strip()
+        or len(access_token) > 16384
+    ):
+        return _unknown_claude_quota_readiness("oauth_access_token_unavailable")
+
+    connection: http.client.HTTPSConnection | None = None
+    try:
+        with _quota_request_deadline(CLAUDE_USAGE_TIMEOUT_SECONDS):
+            connection = http.client.HTTPSConnection(
+                CLAUDE_USAGE_API_HOST, timeout=CLAUDE_USAGE_TIMEOUT_SECONDS
+            )
+            connection.request(
+                "GET",
+                CLAUDE_USAGE_API_PATH,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                },
+            )
+            response = connection.getresponse()
+            if response.status != 200:
+                return _unknown_claude_quota_readiness(
+                    f"usage_http_status_{response.status}"
+                )
+            raw_response = response.read(CLAUDE_USAGE_MAX_RESPONSE_BYTES + 1)
+    except Exception:
+        return _unknown_claude_quota_readiness("usage_request_failed")
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+    if len(raw_response) > CLAUDE_USAGE_MAX_RESPONSE_BYTES:
+        return _unknown_claude_quota_readiness("usage_response_too_large")
+    try:
+        payload = json.loads(
+            raw_response.decode("utf-8"), parse_int=_bounded_json_int
+        )
+    except (UnicodeDecodeError, ValueError):
+        return _unknown_claude_quota_readiness("usage_response_invalid")
+    if not isinstance(payload, dict):
+        return _unknown_claude_quota_readiness("usage_response_invalid")
+
+    five_hour = _validated_claude_usage_window(payload, "five_hour")
+    seven_day = _validated_claude_usage_window(payload, "seven_day")
+    if five_hour is None or seven_day is None:
+        return _unknown_claude_quota_readiness(
+            "required_usage_windows_unavailable"
+        )
+
+    subscription_quota_not_exhausted = (
+        five_hour["remaining_percent"] > 0
+        and seven_day["remaining_percent"] > 0
+    )
+    return {
+        "status": "observed",
+        "source": "claude_oauth_usage_at_wall_skip_spend",
+        "reason": None,
+        "authentication_is_quota_evidence": False,
+        "provider_available": None,
+        "subscription_quota_not_exhausted": subscription_quota_not_exhausted,
+        "remaining_five_hour_quota": five_hour["remaining_percent"],
+        "remaining_weekly_quota": seven_day["remaining_percent"],
+        "five_hour": five_hour,
+        "seven_day": seven_day,
+        "spend_and_credits_considered": False,
+        "does_not_establish": ["provider_availability", "sufficient_quota_for_complete_benchmark_pair",
+                               "model_request_success", "retry_authority"],
+    }
+
+
+def _validated_live_credential_binding(
+    credential: Path | None,
+) -> tuple[bytes, os.stat_result, dict[str, Any]]:
+    if credential is None:
+        raise _core.PreflightError("live preflight requires credential file")
+    credential_path = credential.expanduser()
+    canonical_credential = _canonical_claude_credential_path()
+    if credential_path != canonical_credential:
+        raise _core.PreflightError("live preflight credential path is not canonical")
+    try:
+        credential_data = _original_validated_credential_data(
+            stream_fixture=None,
+            credential_file=credential,
+        )
+    except _core.runner.RunnerError as exc:
+        raise _core.PreflightError(str(exc)) from exc
+    if credential_data is None:
+        raise _core.PreflightError("live credential binding is unavailable")
+    credential_metadata = credential_path.lstat()
+    if credential_metadata.st_uid != os.getuid() or credential_metadata.st_nlink != 1:
+        raise _core.PreflightError("Claude credential file is not owner-private")
+    commitment = _validated_credential_commitment(credential_data)
+    credential_sha256 = hashlib.sha256(credential_data).hexdigest()
+    authorized_sha256 = _authorized_credential_sha256.get()
+    if authorized_sha256 is None:
+        _authorized_credential_sha256.set(credential_sha256)
+    elif authorized_sha256 != credential_sha256:
+        raise _core.PreflightError(
+            "Claude credential file changed after authorization"
+        )
+    return credential_data, credential_metadata, commitment
+
+
+def _quota_readiness_only_report(credential: Path) -> dict[str, Any]:
+    credential_data, credential_metadata, commitment = _validated_live_credential_binding(credential)
+    readiness = _claude_quota_readiness(credential_data)
+    return {
+        "kind": "grabowski.claude_quota_readiness",
+        "version": "1.0",
+        "status": readiness["status"],
+        "quota_readiness": readiness,
+        "credential": {
+            "bytes": len(credential_data),
+            "mode": oct(credential_metadata.st_mode & 0o777),
+            "credential_digest_public": False,
+            "commitment": commitment,
+        },
+        "provider_process_intents": 0,
+        "model_request_intents": 0,
+        "dispatch_ledger_created": False,
+        "does_not_establish": ["benchmark_authorization", "benchmark_dispatch", "retry_authority"],
     }
 
 
@@ -208,38 +433,19 @@ def _dispatch_provider_binding_adapter(
         raise _core.PreflightError(
             "live preflight requires credential file and Claude executable SHA-256"
         )
-    credential_path = credential.expanduser()
-    canonical_credential = _canonical_claude_credential_path()
-    if credential_path != canonical_credential:
-        raise _core.PreflightError("live preflight credential path is not canonical")
+    credential_data, credential_metadata, commitment = (
+        _validated_live_credential_binding(credential)
+    )
     try:
         executable = _core.runner._validate_provider_executable(
             stream_fixture=None,
             executable=claude,
             expected_sha256=command_sha,
         )
-        credential_data = _original_validated_credential_data(
-            stream_fixture=None,
-            credential_file=credential,
-        )
     except _core.runner.RunnerError as exc:
         raise _core.PreflightError(str(exc)) from exc
-    if credential_data is None:
-        raise _core.PreflightError("live credential binding is unavailable")
-    credential_metadata = credential_path.lstat()
-    if credential_metadata.st_uid != os.getuid() or credential_metadata.st_nlink != 1:
-        raise _core.PreflightError("Claude credential file is not owner-private")
-    commitment = _validated_credential_commitment(credential_data)
     executable_path = Path(executable)
     executable_metadata = executable_path.lstat()
-    credential_sha256 = hashlib.sha256(credential_data).hexdigest()
-    authorized_sha256 = _authorized_credential_sha256.get()
-    if authorized_sha256 is None:
-        _authorized_credential_sha256.set(credential_sha256)
-    elif authorized_sha256 != credential_sha256:
-        raise _core.PreflightError(
-            "Claude credential file changed after authorization"
-        )
     return {
         "mode": "live_provider",
         "claude": {
@@ -253,7 +459,6 @@ def _dispatch_provider_binding_adapter(
             "credential_digest_public": False,
             "commitment": commitment,
         },
-        "quota_readiness": _claude_quota_readiness(),
     }
 
 
@@ -376,14 +581,50 @@ def _adapter_arguments(argv: list[str] | None) -> tuple[argparse.Namespace, list
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument("--claude-credential-file", type=Path)
     parser.add_argument("--claude-command-sha256")
-    parser.add_argument("--claude-credential-commitment-nonce")
-    parser.add_argument("--claude-credential-commitment-sha256")
-    parser.add_argument("--claude-credential-commitment-issued-at")
+    parser.add_argument("--claude-credential-commitment-nonce", "--quota-commitment-nonce", dest="claude_credential_commitment_nonce")
+    parser.add_argument("--claude-credential-commitment-sha256", "--quota-commitment-sha256", dest="claude_credential_commitment_sha256")
+    parser.add_argument("--claude-credential-commitment-issued-at", "--quota-commitment-issued-at", dest="claude_credential_commitment_issued_at")
+    parser.add_argument("--claude-quota-readiness-only", action="store_true")
     return parser.parse_known_args(argv)
+
+
+def _adapter_error(message: str) -> int:
+    print(json.dumps({"status": "error", "error": message}, sort_keys=True), file=sys.stderr)
+    return 2
+
+
+def _quota_readiness_only_main(adapter: argparse.Namespace, remaining: list[str]) -> int:
+    if remaining:
+        return _adapter_error("quota-readiness-only accepts no benchmark arguments")
+    if adapter.claude_credential_file is not None:
+        return _adapter_error("quota-readiness-only derives the canonical credential path internally")
+    commitment = (adapter.claude_credential_commitment_nonce, adapter.claude_credential_commitment_sha256, adapter.claude_credential_commitment_issued_at)
+    if any(value is None for value in commitment):
+        return _adapter_error("quota-readiness-only requires an opaque credential commitment")
+    try:
+        credential = _canonical_claude_credential_path()
+    except _core.PreflightError as exc:
+        return _adapter_error(str(exc))
+    bindings = [(_credential_file, credential), (_credential_commitment_nonce, commitment[0]),
+                (_credential_commitment_sha256, commitment[1]), (_credential_commitment_issued_at, commitment[2]),
+                (_authorized_credential_sha256, None)]
+    tokens = [(variable, variable.set(value)) for variable, value in bindings]
+    try:
+        report = _quota_readiness_only_report(credential)
+    except (_core.PreflightError, _core.runner.RunnerError) as exc:
+        return _adapter_error(str(exc))
+    finally:
+        for variable, token in reversed(tokens):
+            variable.reset(token)
+    json.dump(report, sys.stdout, ensure_ascii=False, sort_keys=True)
+    sys.stdout.write("\n")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     adapter, remaining = _adapter_arguments(argv)
+    if adapter.claude_quota_readiness_only:
+        return _quota_readiness_only_main(adapter, remaining)
     synthetic = (
         "--baseline-stream-fixture" in remaining
         or "--treatment-stream-fixture" in remaining
