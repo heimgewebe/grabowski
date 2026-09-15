@@ -547,6 +547,7 @@ class GrokReviewRoleTests(unittest.TestCase):
                 "_extract_grok_stream_review_document",
                 return_value=(oversized_document, None, {"review_provider_stream_contract": role.GROK_REVIEW_STREAM_CONTRACT}),
             ),
+            mock.patch.object(role, "classify_result", return_value="invalid_review_output"),
             mock.patch.object(role, "write_receipt") as write_receipt,
         ):
             returncode = role.main(
