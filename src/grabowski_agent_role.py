@@ -609,8 +609,19 @@ def _safe_grok_git_read_command(command: str) -> bool:
             return False
         return True
     if subcommand == "cat-file":
-        return len(argv) >= 4 and argv[:3] == ["git", "cat-file", "blob"]
-    return subcommand in {"rev-parse", "merge-base", "ls-files"}
+        return len(argv) == 4 and argv[:3] == ["git", "cat-file", "blob"]
+    if subcommand == "ls-files":
+        separator_seen = False
+        for argument in argv[2:]:
+            if argument == "--":
+                if separator_seen:
+                    return False
+                separator_seen = True
+                continue
+            if not separator_seen and argument.startswith("-"):
+                return False
+        return True
+    return subcommand in {"rev-parse", "merge-base"}
 
 
 def _extract_grok_stream_review_document(

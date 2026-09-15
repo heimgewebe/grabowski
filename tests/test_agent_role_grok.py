@@ -145,6 +145,7 @@ class GrokReviewRoleTests(unittest.TestCase):
             "git rev-parse HEAD",
             "git merge-base main HEAD",
             "git ls-files src tests",
+            "git ls-files -- src tests",
         )
         rejected = (
             "git diff HEAD~1...HEAD",
@@ -171,6 +172,8 @@ class GrokReviewRoleTests(unittest.TestCase):
             "git diff --no-ext-diff --no-textconv ~/private-a ~/private-b",
             "git diff --no-ext-diff --no-textconv ../../private-a ../../private-b",
             "git ls-files --exclude-from=/tmp/excludes",
+            "git ls-files --exclude-from=auth-link",
+            "git ls-files --exclude-per-directory=auth-link",
             "git log -p -1",
             "cat src/app.py",
             "git status\ncat /tmp/.grok/auth.json",
