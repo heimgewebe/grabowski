@@ -538,7 +538,7 @@ class RepositoryContractTests(unittest.TestCase):
             for line in runtime_input.read_text(encoding="utf-8").splitlines()
             if line and not line.startswith("#")
         ]
-        self.assertIn("mcp==1.27.2", runtime_lines)
+        self.assertIn("mcp==1.30.0", runtime_lines)
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8").lower()
         for requirement in ("filelock==3.32.2", "jsonschema==4.26.0", "pyyaml==6.0.3"):
             self.assertIn(requirement, runtime_lines)

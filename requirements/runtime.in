@@ -2,5 +2,5 @@
 # Keep its direct third-party imports explicit and deployment-reproducible.
 filelock==3.32.2
 jsonschema==4.26.0
-mcp==1.27.2
+mcp==1.30.0
 pyyaml==6.0.3
