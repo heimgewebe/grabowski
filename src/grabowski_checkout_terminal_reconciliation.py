@@ -275,6 +275,22 @@ def _review_evidence_ignored_roots(checkout: Path) -> tuple[list[str], list[str]
     return paths, blockers
 
 
+def _review_evidence_index_flags(checkout: Path) -> tuple[list[str], list[str]]:
+    completed = checkouts._git_read(
+        checkout, ["ls-files", "-v", "-z"], check=False
+    )
+    if completed.returncode != 0:
+        return [], ["review-evidence-index-flags-unobservable"]
+    entries = sorted(item for item in completed.stdout.split("\0") if item)
+    tags = [entry[0] for entry in entries]
+    blockers: list[str] = []
+    if any(tag.islower() for tag in tags):
+        blockers.append("review-evidence-assume-unchanged-present")
+    if any(tag.upper() == "S" for tag in tags):
+        blockers.append("review-evidence-skip-worktree-present")
+    return entries, blockers
+
+
 def _thread_focus_review_evidence_paths(
     checkout: Path, status: dict[str, Any]
 ) -> tuple[list[str], list[str]]:
@@ -291,21 +307,8 @@ def _thread_focus_review_evidence_paths(
     ):
         blockers.append("review-evidence-submodules-present")
 
-    index_flags = checkouts._git_read(
-        checkout, ["ls-files", "-v", "-z"], check=False
-    )
-    if index_flags.returncode != 0:
-        blockers.append("review-evidence-index-flags-unobservable")
-    else:
-        index_tags = [
-            entry[0]
-            for entry in index_flags.stdout.split("\0")
-            if entry
-        ]
-        if any(tag.islower() for tag in index_tags):
-            blockers.append("review-evidence-assume-unchanged-present")
-        if any(tag.upper() == "S" for tag in index_tags):
-            blockers.append("review-evidence-skip-worktree-present")
+    _, index_flag_blockers = _review_evidence_index_flags(checkout)
+    blockers.extend(index_flag_blockers)
 
     for label, arguments in (
         ("unstaged", ["diff", "--quiet", "--no-ext-diff", "--"]),
@@ -510,6 +513,8 @@ def _thread_focus_review_evidence_observation(
 ) -> dict[str, Any]:
     checkout = Path(record["path"])
     paths, blockers = _thread_focus_review_evidence_paths(checkout, status)
+    index_flags_before_hash, index_flag_blockers = _review_evidence_index_flags(checkout)
+    blockers.extend(index_flag_blockers)
     ignored_roots_before_hash, ignored_root_blockers = _review_evidence_ignored_roots(
         checkout
     )
@@ -587,6 +592,18 @@ def _thread_focus_review_evidence_observation(
             blockers.extend(ignored_root_blockers)
             if ignored_roots_after_hash != ignored_roots_before_hash:
                 blockers.append("review-evidence-ignored-inventory-drift")
+            final_paths, final_path_blockers = _thread_focus_review_evidence_paths(
+                checkout, status
+            )
+            blockers.extend(final_path_blockers)
+            if final_paths != paths:
+                blockers.append("review-evidence-repository-inventory-drift")
+            index_flags_after_hash, index_flag_blockers = _review_evidence_index_flags(
+                checkout
+            )
+            blockers.extend(index_flag_blockers)
+            if index_flags_after_hash != index_flags_before_hash:
+                blockers.append("review-evidence-index-flags-drift")
             if not _review_evidence_root_unchanged(checkout, root_identity):
                 blockers.append("review-evidence-root-changed-during-read")
     finally:
