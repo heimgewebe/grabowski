@@ -9705,6 +9705,27 @@ class GithubBaseUpdateGuardTests(unittest.TestCase):
 
 
 class CaptainAuthorityPathTests(unittest.TestCase):
+    @staticmethod
+    def _active_bureau_run_status(run_id: str) -> dict[str, object]:
+        return {
+            "run_id": run_id,
+            "coordination_sha256": "f" * 64,
+            "coordination": {
+                "status": "coordinated",
+                "run": {
+                    "run_id": run_id,
+                    "task_id": "TASK-1",
+                    "worker_id": "worker-1",
+                    "state": "running",
+                },
+                "lease": {"status": "active-bound"},
+            },
+            "execution_binding": {
+                "classification": "actively_bound",
+                "actively_bound": True,
+            },
+        }
+
     def setUp(self) -> None:
         self._resource_tempdir = tempfile.TemporaryDirectory()
         self._resource_db_patch = patch.object(
@@ -16460,14 +16481,18 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             }
         )
 
-        result = grips.grip_run(
-            "captain-run",
-            parameters,
-            profile="captain",
-            allow_mutation=True,
-            command_runner=FakeGit(),
-            github_runner=gh,
-        )
+        with patch(
+            "grabowski_bureau_pickup.grabowski_bureau_pickup_status",
+            return_value=self._active_bureau_run_status(run_id),
+        ):
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=gh,
+            )
 
         self.assertEqual("passed", result["receipt"]["status"])
         guard = result["output"]["executions"][0]["merge_lease_guard"]
@@ -16490,6 +16515,188 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         )
         self.assertEqual(
             1, len([call for call in gh.calls if call[:2] == ("pr", "merge")])
+        )
+
+    def test_atomic_merge_guard_rejects_bureau_run_that_becomes_inactive_after_signing(self) -> None:
+        class Session:
+            pass
+
+        local_repo = merge_guard.merge_guard_repository_root(Path.cwd())
+        changed_path_key = f"path:{local_repo / 'src/changed.py'}"
+        run_id = "BUR-RUN-20260914T120000Z-aaaaaaaaaa"
+        owner = f"bureau-run:{run_id}"
+        resources.acquire_resources(
+            owner,
+            [changed_path_key],
+            purpose="live Bureau changed-path lease",
+            ttl_seconds=600,
+            metadata={"run_id": run_id},
+        )
+        resource_evidence = resources.bureau_run_lease_delegation_evidence(owner)
+        evidence = {
+            **resource_evidence,
+            "task_id": "TASK-1",
+            "worker_id": "worker-1",
+            "coordination_sha256": "e" * 64,
+        }
+        parameters = authorized_captain_run_parameters()
+        parameters["execution_intent"]["context"]["lease_owner_id"] = owner
+        parameters["execution_intent"] = captain_execution_intent(
+            parameters, context=parameters["execution_intent"]["context"]
+        )
+        actor = merge_guard.issue_server_runtime_actor_identity(
+            Session(), profile="trusted-owner"
+        )
+        parameters["_server_runtime_actor_identity"] = actor
+        parameters["_server_bureau_run_lease_delegation"] = (
+            merge_guard.issue_server_bureau_run_lease_delegation(
+                actor,
+                evidence,
+                captain_request_sha256_value=merge_guard.captain_request_sha256(
+                    parameters
+                ),
+            )
+        )
+        stale_status = {
+            "run_id": run_id,
+            "coordination_sha256": "f" * 64,
+            "coordination": {
+                "status": "coordinated",
+                "run": {
+                    "run_id": run_id,
+                    "task_id": "TASK-1",
+                    "worker_id": "worker-1",
+                    "state": "failed",
+                },
+                "lease": {"status": "active-bound"},
+            },
+            "execution_binding": {
+                "classification": "stale",
+                "actively_bound": False,
+            },
+        }
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": CAPTAIN_BASE_SHA,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            }
+        )
+
+        with patch(
+            "grabowski_bureau_pickup.grabowski_bureau_pickup_status",
+            return_value=stale_status,
+        ):
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=gh,
+            )
+
+        guard = result["output"]["executions"][0]["merge_lease_guard"]
+        self.assertEqual("blocked_before_guard", guard["status"])
+        self.assertIn(
+            "merge_guard_bureau_run_live_revalidation_failed:ValueError",
+            guard["errors"],
+        )
+        self.assertEqual(
+            [], [call for call in gh.calls if call[:2] == ("pr", "merge")]
+        )
+
+    def test_atomic_merge_guard_rejects_bureau_run_that_drifts_before_dispatch(self) -> None:
+        class Session:
+            pass
+
+        local_repo = merge_guard.merge_guard_repository_root(Path.cwd())
+        changed_path_key = f"path:{local_repo / 'src/changed.py'}"
+        run_id = "BUR-RUN-20260914T120000Z-aaaaaaaaaa"
+        owner = f"bureau-run:{run_id}"
+        resources.acquire_resources(
+            owner,
+            [changed_path_key],
+            purpose="live Bureau changed-path lease",
+            ttl_seconds=600,
+            metadata={"run_id": run_id},
+        )
+        resource_evidence = resources.bureau_run_lease_delegation_evidence(owner)
+        evidence = {
+            **resource_evidence,
+            "task_id": "TASK-1",
+            "worker_id": "worker-1",
+            "coordination_sha256": "e" * 64,
+        }
+        parameters = authorized_captain_run_parameters()
+        parameters["execution_intent"]["context"]["lease_owner_id"] = owner
+        parameters["execution_intent"] = captain_execution_intent(
+            parameters, context=parameters["execution_intent"]["context"]
+        )
+        actor = merge_guard.issue_server_runtime_actor_identity(
+            Session(), profile="trusted-owner"
+        )
+        parameters["_server_runtime_actor_identity"] = actor
+        parameters["_server_bureau_run_lease_delegation"] = (
+            merge_guard.issue_server_bureau_run_lease_delegation(
+                actor,
+                evidence,
+                captain_request_sha256_value=merge_guard.captain_request_sha256(
+                    parameters
+                ),
+            )
+        )
+        stale_status = self._active_bureau_run_status(run_id)
+        stale_status["coordination_sha256"] = "1" * 64
+        stale_status["coordination"]["run"]["state"] = "failed"
+        stale_status["execution_binding"] = {
+            "classification": "stale",
+            "actively_bound": False,
+        }
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": CAPTAIN_BASE_SHA,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            }
+        )
+
+        with patch(
+            "grabowski_bureau_pickup.grabowski_bureau_pickup_status",
+            side_effect=[self._active_bureau_run_status(run_id), stale_status],
+        ):
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=gh,
+            )
+
+        guard = result["output"]["executions"][0]["merge_lease_guard"]
+        self.assertEqual(
+            "blocked_after_guard_revalidation_released", guard["status"]
+        )
+        self.assertIn(
+            "merge_guard_bureau_run_live_revalidation_failed:ValueError",
+            guard["errors"],
+        )
+        self.assertFalse(guard["dispatch_called"])
+        self.assertEqual(
+            [], [call for call in gh.calls if call[:2] == ("pr", "merge")]
         )
 
     def test_atomic_merge_guard_rejects_unrelated_server_delegated_bureau_run_lease(self) -> None:
@@ -16545,14 +16752,18 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             }
         )
 
-        result = grips.grip_run(
-            "captain-run",
-            parameters,
-            profile="captain",
-            allow_mutation=True,
-            command_runner=FakeGit(),
-            github_runner=gh,
-        )
+        with patch(
+            "grabowski_bureau_pickup.grabowski_bureau_pickup_status",
+            return_value=self._active_bureau_run_status(run_id),
+        ):
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=gh,
+            )
 
         guard = result["output"]["executions"][0]["merge_lease_guard"]
         self.assertEqual("blocked_by_live_lease", guard["status"])

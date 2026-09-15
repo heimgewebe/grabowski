@@ -3254,6 +3254,74 @@ class CaptainMergeGuardRunner:
             self.receipt["status"] = "blocked_before_guard"
             self.receipt["errors"] = list(self.static_errors)
 
+    def _revalidate_bureau_run_binding(self, *, phase: str) -> list[str]:
+        delegation = self.server_bureau_run_lease_delegation
+        if delegation is None:
+            return []
+
+        record: dict[str, Any] = {
+            "phase": phase,
+            "run_id": delegation["run_id"],
+            "signed_coordination_sha256": delegation["coordination_sha256"],
+            "status": "blocked",
+            "errors": [],
+        }
+        errors: list[str] = []
+        try:
+            import grabowski_bureau_pickup
+
+            evidence = (
+                grabowski_bureau_pickup.server_bureau_run_lease_delegation_evidence(
+                    str(delegation["run_id"])
+                )
+            )
+        except Exception as exc:
+            errors.append(
+                "merge_guard_bureau_run_live_revalidation_failed:"
+                + type(exc).__name__
+            )
+        else:
+            record["observed_coordination_sha256"] = evidence.get(
+                "coordination_sha256"
+            )
+            comparisons = (
+                ("run_id", "merge_guard_bureau_run_identity_drift"),
+                ("task_id", "merge_guard_bureau_run_task_binding_drift"),
+                ("worker_id", "merge_guard_bureau_run_worker_binding_drift"),
+                ("lease_owner_id", "merge_guard_bureau_run_owner_binding_drift"),
+                (
+                    "resource_keys_sha256",
+                    "merge_guard_bureau_run_resource_binding_drift",
+                ),
+                (
+                    "lease_bindings_sha256",
+                    "merge_guard_bureau_run_lease_binding_drift",
+                ),
+            )
+            for field, error in comparisons:
+                if evidence.get(field) != delegation.get(field):
+                    errors.append(error)
+            if evidence.get("resource_keys") != delegation.get("resource_keys"):
+                errors.append("merge_guard_bureau_run_resource_set_drift")
+
+        record["errors"] = sorted(set(errors))
+        record["status"] = "blocked" if errors else "passed"
+        self.receipt.setdefault("bureau_run_binding_revalidations", []).append(record)
+        return list(record["errors"])
+
+    def _require_live_bureau_run_binding(
+        self, *, phase: str, blocked_status: str
+    ) -> None:
+        errors = self._revalidate_bureau_run_binding(phase=phase)
+        if not errors:
+            return
+        self.receipt["status"] = blocked_status
+        self.receipt["contract_satisfied"] = False
+        self.receipt["errors"] = errors
+        raise RuntimeError(
+            "merge guard Bureau run revalidation blocked: " + "; ".join(errors)
+        )
+
     def _is_repository_policy_query(self, args: list[str]) -> bool:
         target_repo = str(self.action["target"].get("repo", ""))
         return (
@@ -5019,6 +5087,10 @@ class CaptainMergeGuardRunner:
             self.receipt["errors"] = errors
             raise RuntimeError("merge lease guard blocked: " + "; ".join(errors))
 
+        self._require_live_bureau_run_binding(
+            phase="pre-acquisition", blocked_status="blocked_before_guard"
+        )
+
         resources = self.resource_authority
 
         target = self.action["target"]
@@ -5357,6 +5429,10 @@ class CaptainMergeGuardRunner:
                     )
 
                 def mark_dispatch() -> None:
+                    self._require_live_bureau_run_binding(
+                        phase="pre-dispatch",
+                        blocked_status="blocked_after_guard_revalidation",
+                    )
                     self.receipt["dispatch_at_unix_ns"] = time.time_ns()
                     self.receipt["dispatch_called"] = True
                     self.dispatch_called = True
@@ -5377,6 +5453,10 @@ class CaptainMergeGuardRunner:
                 return result
 
             self.receipt["dispatch_mode"] = "github_pr_merge"
+            self._require_live_bureau_run_binding(
+                phase="pre-dispatch",
+                blocked_status="blocked_after_guard_revalidation",
+            )
             self.receipt["dispatch_at_unix_ns"] = time.time_ns()
             self.receipt["dispatch_called"] = True
             self.dispatch_called = True
