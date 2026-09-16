@@ -1293,6 +1293,96 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 with self.subTest(selector=selector), self.assertRaises(runner.RunnerError):
                     runner._pin_treatment_arguments(conflicting, manifest)
 
+    def test_mcp_absolute_interpreter_symlink_resolves_to_bound_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable = root / "python3.real"
+            executable.write_bytes(Path(sys.executable).read_bytes())
+            executable.chmod(0o755)
+            alias = root / "python3"
+            alias.symlink_to(executable)
+            script = root / "server.py"
+            script.write_text("pass\n", encoding="utf-8")
+            manifest = root / "chosen.bundle.manifest.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+
+            argv, bindings = runner._bind_mcp_upstream(
+                [str(alias), str(script), "--bundle-root", str(root)], manifest
+            )
+
+            self.assertEqual(argv[0], str(executable.resolve()))
+            self.assertEqual(bindings[0]["path"], executable.resolve())
+            runner._revalidate_mcp_file(bindings[0], label="MCP executable")
+
+    def test_mcp_proxy_rejects_missing_treatment_request_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            upstream = root / "mcp.py"
+            upstream.write_text("import sys\nsys.stdin.read()\n", encoding="utf-8")
+            payload = json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "tools/call",
+                    "params": {"name": "ask_context", "arguments": {"query": "where"}},
+                }
+            ).encode() + b"\n"
+            completed = subprocess.run(
+                proxy_command(upstream, root), input=payload,
+                capture_output=True, check=False, timeout=5,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn(b"proxy stream failed", completed.stderr)
+
+    def test_mcp_proxy_rejects_malformed_error_responses(self) -> None:
+        errors = (
+            None,
+            {},
+            {"code": True, "message": "failed"},
+            {"code": -32000, "message": 1},
+        )
+        for error in errors:
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                upstream = root / "mcp.py"
+                upstream.write_text(
+                    "import json, sys\n"
+                    "sys.stdin.readline()\n"
+                    f"print(json.dumps({{'jsonrpc':'2.0','id':2,'error':{error!r}}}), flush=True)\n",
+                    encoding="utf-8",
+                )
+                payload = json.dumps(
+                    {"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {}}
+                ).encode() + b"\n"
+                completed = subprocess.run(
+                    proxy_command(upstream, root), input=payload,
+                    capture_output=True, check=False, timeout=5,
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(b"error response is invalid", completed.stderr)
+
+    def test_mcp_proxy_rejects_type_alias_response_ids(self) -> None:
+        for invalid_identifier in (True, 1.0, None, {"nested": "id"}):
+            with self.subTest(identifier=invalid_identifier), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                upstream = root / "mcp.py"
+                encoded = json.dumps(invalid_identifier)
+                upstream.write_text(
+                    "import json, sys\n"
+                    f"INVALID = json.loads({encoded!r})\n"
+                    "sys.stdin.readline()\n"
+                    "print(json.dumps({'jsonrpc':'2.0','id':INVALID,'result':{}}), flush=True)\n",
+                    encoding="utf-8",
+                )
+                payload = json.dumps(
+                    {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
+                ).encode() + b"\n"
+                completed = subprocess.run(
+                    proxy_command(upstream, root), input=payload,
+                    capture_output=True, check=False, timeout=5,
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(b"response envelope is invalid", completed.stderr)
+
     def test_mcp_program_and_script_bindings_reject_symlinks_and_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1344,10 +1434,13 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 self.assertIn(b"response envelope is invalid", completed.stderr)
 
     def test_mcp_proxy_rejects_explicit_null_treatment_request_id(self) -> None:
-        for invalid in (None, True, False, [], {}, float("inf"), float("-inf"), float("nan")):
+        for invalid in (
+            None, True, False, [], {}, 1.5,
+            float("inf"), float("-inf"), float("nan"),
+        ):
             with self.subTest(invalid=invalid):
                 self.assertFalse(runner._valid_jsonrpc_request_id(invalid))
-        for valid in ("", "request-1", 0, -1, 1.5):
+        for valid in ("", "request-1", 0, -1):
             with self.subTest(valid=valid):
                 self.assertTrue(runner._valid_jsonrpc_request_id(valid))
 

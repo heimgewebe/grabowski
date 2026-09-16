@@ -18,7 +18,6 @@ from datetime import datetime, timezone
 import hashlib
 import importlib.util
 import json
-import math
 import os
 import posixpath
 from pathlib import Path
@@ -145,11 +144,9 @@ def sha_bytes(data: bytes) -> str:
 
 
 def _valid_jsonrpc_request_id(value: Any) -> bool:
-    if value is None or isinstance(value, bool):
-        return False
-    if isinstance(value, (str, int)):
-        return True
-    return isinstance(value, float) and math.isfinite(value)
+    return isinstance(value, str) or (
+        isinstance(value, int) and not isinstance(value, bool)
+    )
 
 
 def utc_now() -> datetime:
@@ -769,6 +766,10 @@ def _bind_mcp_upstream(upstream: Sequence[str], manifest: Path) -> tuple[list[st
         if resolved is None:
             raise RunnerError("MCP executable is unavailable")
         executable = Path(resolved)
+    try:
+        executable = executable.resolve(strict=True)
+    except OSError as exc:
+        raise RunnerError("MCP executable is unavailable") from exc
     executable_binding = _bind_mcp_file(executable, label="MCP executable", executable=True)
     argv = [str(executable), *upstream[1:]]
     bindings = [executable_binding]
@@ -898,6 +899,8 @@ def run_mcp_proxy(upstream: Sequence[str], manifest_text: str, manifest_sha256: 
                 identifier = message.get("id")
                 if has_identifier and not _valid_jsonrpc_request_id(identifier):
                     raise RunnerError("MCP client request ID is invalid")
+                if method == "tools/call" and not has_identifier:
+                    raise RunnerError("MCP tools/call request ID is required")
                 if method not in MCP_CLIENT_METHODS:
                     if identifier is not None:
                         _proxy_write(_proxy_error(identifier, "benchmark MCP method is not authorized"), output_lock)
@@ -979,9 +982,12 @@ def run_mcp_proxy(upstream: Sequence[str], manifest_text: str, manifest_sha256: 
             message = json.loads(raw)
             if not isinstance(message, dict):
                 raise RunnerError("MCP upstream message must be an object")
+            has_identifier = "id" in message
             identifier = message.get("id")
-            if "id" not in message and "result" not in message and "error" not in message:
+            if not has_identifier and "result" not in message and "error" not in message:
                 continue
+            if not has_identifier or not _valid_jsonrpc_request_id(identifier):
+                raise RunnerError("MCP upstream response envelope is invalid")
             with state_lock:
                 pending_kind = pending_requests.get(identifier)
                 if (
@@ -990,6 +996,15 @@ def run_mcp_proxy(upstream: Sequence[str], manifest_text: str, manifest_sha256: 
                     or (("result" in message) == ("error" in message))
                 ):
                     raise RunnerError("MCP upstream response envelope is invalid")
+                if "error" in message:
+                    error = message["error"]
+                    if (
+                        not isinstance(error, dict)
+                        or isinstance(error.get("code"), bool)
+                        or not isinstance(error.get("code"), int)
+                        or not isinstance(error.get("message"), str)
+                    ):
+                        raise RunnerError("MCP upstream error response is invalid")
                 pending_requests.pop(identifier, None)
                 resource_call = resource_calls.pop(identifier, None)
                 is_initialize = pending_kind == "initialize"
@@ -1027,6 +1042,8 @@ def run_mcp_proxy(upstream: Sequence[str], manifest_text: str, manifest_sha256: 
         client_thread.join(timeout=1)
         if client_thread.is_alive():
             raise RunnerError("MCP client intake remained active at upstream EOF")
+        if errors:
+            raise RunnerError("benchmark MCP proxy stream failed") from errors[0]
         with state_lock:
             pending_kinds = tuple(pending_requests.values())
         if "tools/list" in pending_kinds or not tools_inventory_validated:
