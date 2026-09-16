@@ -342,9 +342,7 @@ def _historical_binding_drift_is_hygiene(item: dict[str, Any]) -> bool:
         and not item["binding_consistent"]
         and (historical_phase or expired_active_phase or item["dirty"])
         and not item["is_main"]
-        and not item["coordination_blocking"]
-        and not item["processes"]
-        and not item["resource_leases"]
+        and not _dirty_has_resource_overlap(item)
     )
 
 

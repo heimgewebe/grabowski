@@ -2319,6 +2319,12 @@ class CurrentWorkProjectionTests(unittest.TestCase):
             retention_until_unix=2000,
             drift_reasons=["expected-branch-mismatch"],
         )
+        existing["coordination"]["resource_leases"] = [
+            {
+                "owner_id": "operator:unrelated-repo-lease",
+                "resource_key": f"repo:{REPOSITORY}",
+            }
+        ]
         result = project(
             checkout_payloads=[{"repository": REPOSITORY, "worktrees": [existing]}],
             reconciliation_payload={
