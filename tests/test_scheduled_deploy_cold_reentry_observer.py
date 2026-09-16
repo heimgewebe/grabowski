@@ -32,6 +32,10 @@ class ColdReentryObserverIsolationTests(unittest.TestCase):
         "execution_head": "e" * 40,
         "resume_target_head": "f" * 40,
         "resume_binding_sha256": "b" * 64,
+        "execution_source_identity_sha256": "d" * 64,
+        "classification": {
+            "resume_binding": {"source_identity_sha256": "c" * 64},
+        },
     }
 
     @staticmethod
@@ -47,18 +51,24 @@ class ColdReentryObserverIsolationTests(unittest.TestCase):
             "outcome": "completed",
         }
 
+    def _observed_environment_resume(
+        self, observed: dict[str, str | None]
+    ) -> dict[str, object]:
+        observed.update(
+            {
+                name: os.environ.get(name)
+                for name in self.observer_environment
+            }
+        )
+        return self.completed_result()
+
     def test_resume_hides_only_scheduler_observer_discovery_and_restores_it(self) -> None:
         observed: dict[str, str | None] = {}
 
         def fake_resume(**_kwargs: object) -> dict[str, object]:
-            observed.update(
-                {
-                    name: os.environ.get(name)
-                    for name in self.observer_environment
-                }
-            )
+            result = self._observed_environment_resume(observed)
             self.assertEqual(os.environ.get("T084_UNRELATED_SENTINEL"), "preserved")
-            return self.completed_result()
+            return result
 
         environment = {
             **self.observer_environment,
@@ -86,6 +96,69 @@ class ColdReentryObserverIsolationTests(unittest.TestCase):
                 self.assertEqual(os.environ.get(name), value)
             self.assertEqual(os.environ.get("T084_UNRELATED_SENTINEL"), "preserved")
             self.assertEqual(result["outcome"], "completed")
+
+    def test_resume_preserves_observer_when_head_and_source_identity_match(self) -> None:
+        observed: dict[str, str | None] = {}
+        matching_source_identity = "a" * 64
+        decision = {
+            **self.decision,
+            "resume_target_head": self.decision["execution_head"],
+            "execution_source_identity_sha256": matching_source_identity,
+            "classification": {
+                "resume_binding": {
+                    "source_identity_sha256": matching_source_identity,
+                },
+            },
+        }
+
+        with mock.patch.dict(os.environ, self.observer_environment, clear=False):
+            with (
+                mock.patch.object(
+                    runner.deploy_dual,
+                    "resume_production_blue_green_cutover",
+                    side_effect=lambda **_kwargs: self._observed_environment_resume(
+                        observed
+                    ),
+                ),
+                mock.patch.object(runner, "emit"),
+            ):
+                result = runner.run_midcutover_resume(repo=ROOT, decision=decision)
+
+            self.assertEqual(observed, self.observer_environment)
+            for name, value in self.observer_environment.items():
+                self.assertEqual(os.environ.get(name), value)
+            self.assertEqual(result["outcome"], "completed")
+
+    def test_resume_hides_observer_when_only_source_identity_differs(self) -> None:
+        observed: dict[str, str | None] = {}
+        decision = {
+            **self.decision,
+            "resume_target_head": self.decision["execution_head"],
+            "execution_source_identity_sha256": "a" * 64,
+            "classification": {
+                "resume_binding": {"source_identity_sha256": "b" * 64},
+            },
+        }
+
+        with mock.patch.dict(os.environ, self.observer_environment, clear=False):
+            with (
+                mock.patch.object(
+                    runner.deploy_dual,
+                    "resume_production_blue_green_cutover",
+                    side_effect=lambda **_kwargs: self._observed_environment_resume(
+                        observed
+                    ),
+                ),
+                mock.patch.object(runner, "emit"),
+            ):
+                runner.run_midcutover_resume(repo=ROOT, decision=decision)
+
+            self.assertEqual(
+                observed,
+                {name: None for name in self.observer_environment},
+            )
+            for name, value in self.observer_environment.items():
+                self.assertEqual(os.environ.get(name), value)
 
     def test_resume_restores_scheduler_observer_discovery_after_failure(self) -> None:
         with mock.patch.dict(os.environ, self.observer_environment, clear=False):
