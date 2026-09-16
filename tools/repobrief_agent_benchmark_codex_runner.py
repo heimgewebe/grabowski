@@ -814,7 +814,9 @@ def run_mcp_proxy(upstream: Sequence[str]) -> int:
                 filtered = {key: result[key] for key in ("protocolVersion", "serverInfo") if key in result}
                 filtered["capabilities"] = {"tools": caps.get("tools", {}) if isinstance(caps.get("tools", {}), dict) else {}}
                 message = {"jsonrpc":"2.0","id":identifier,"result":filtered}
-            elif is_tools_list and "result" in message:
+            elif is_tools_list:
+                if "error" in message or "result" not in message:
+                    raise RunnerError("MCP tools/list response must contain a successful result")
                 tools = _filtered_treatment_tools(message.get("result"))
                 message = {"jsonrpc":"2.0","id":identifier,"result":{"tools":tools}}
             elif resource_call is not None:

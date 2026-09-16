@@ -1011,6 +1011,31 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(runner.RunnerError, "exactly once"):
             runner._filtered_treatment_tools(duplicate)
 
+    def test_mcp_proxy_rejects_unsuccessful_tools_list_responses(self) -> None:
+        responses = (
+            {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "unavailable"}},
+            {"jsonrpc": "2.0", "id": 1},
+        )
+        for response in responses:
+            with self.subTest(response=response), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                upstream = root / "mcp.py"
+                upstream.write_text(
+                    "import json, sys\n"
+                    "line = sys.stdin.readline()\n"
+                    f"print(json.dumps({response!r}), flush=True)\n",
+                    encoding="utf-8",
+                )
+                payload = json.dumps(
+                    {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+                ).encode() + b"\n"
+                completed = subprocess.run(
+                    [sys.executable, str(MODULE_PATH), "--codex-mcp-proxy", json.dumps([sys.executable, str(upstream)])],
+                    input=payload, capture_output=True, check=False, timeout=5,
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(b"successful result", completed.stderr)
+
     def test_mcp_proxy_exposes_exact_benchmark_surface(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
