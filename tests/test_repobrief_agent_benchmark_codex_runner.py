@@ -35,7 +35,7 @@ def request(*, condition: str = "baseline", commit: str = COMMIT) -> dict:
         repobrief = {
             "manifest": "/bundles/repo.bundle.manifest.json",
             "manifest_sha256": MANIFEST_SHA,
-            "mcp_command": ["python", "repobrief-mcp-stdio.py", "--bundle-root", "/bundles"],
+            "mcp_command": ["/usr/bin/python3", "repobrief-mcp-stdio.py", "--bundle-root", "/bundles"],
         }
     pair_id = "taskset:case:r1"
     request_id = f"{pair_id}:{condition}"
@@ -297,7 +297,6 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertEqual(runner.command_kind("rg --regexp=example src"), "grep")
         self.assertEqual(runner.command_kind("cat src/example.py"), "read_file")
         self.assertEqual(runner.command_kind("sed -n '1,2p' src/example.py"), "read_file")
-        self.assertEqual(runner.command_kind("bash -lc 'cat src/example.py'"), "read_file")
         for command in (
             "ls",
             "git status",
@@ -319,6 +318,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             "rg --files ../other",
             "/usr/bin/cat src/example.py",
             "sh -lc 'cat src/example.py'",
+            "bash -lc 'cat src/example.py'",
         ):
             with self.subTest(command=command):
                 with self.assertRaises(runner.RunnerError):
@@ -813,6 +813,27 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertTrue(launch_kwargs[0].get("start_new_session"))
             self.assertGreaterEqual(killpg.call_count, 1)
 
+    def test_run_bounded_times_out_when_provider_does_not_read_stdin(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "provider.py"
+            script.write_text(
+                "import sys, time\n"
+                "sys.stdout.write('partial-output\\n'); sys.stdout.flush()\n"
+                "sys.stderr.write('partial-diagnostic\\n'); sys.stderr.flush()\n"
+                "time.sleep(5)\n",
+                encoding="utf-8",
+            )
+            capture = runner.run_bounded(
+                [sys.executable, str(script)],
+                cwd=root,
+                timeout_seconds=1,
+                stdin_data=b"x" * (8 * 1024 * 1024),
+            )
+            self.assertEqual(capture["capture_error"], "timeout")
+            self.assertIn(b"partial-output", capture["stdout"])
+            self.assertIn(b"partial-diagnostic", capture["stderr"])
+
     def test_run_bounded_returns_capture_error_instead_of_discarding_partial_streams(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -897,6 +918,33 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertFalse(responses[6]["result"]["isError"])
             frozen = json.loads(responses[6]["result"]["content"][0]["text"])
             self.assertEqual([item["uri"] for item in frozen["resources"]], ["repobrief://frozen/a"])
+
+    def test_mcp_proxy_reaps_failed_upstream_without_detaching_from_provider_group(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_path = root / "upstream.state"
+            upstream = root / "mcp.py"
+            upstream.write_text(
+                "import os, pathlib, sys, time\n"
+                f"pathlib.Path({str(state_path)!r}).write_text(f'{{os.getpid()}},{{os.getpgrp()}},{{os.getpgid(os.getppid())}}')\n"
+                "sys.stderr.write('upstream-diagnostic\\n'); sys.stderr.flush()\n"
+                "sys.stdout.write('not-json\\n'); sys.stdout.flush()\n"
+                "time.sleep(30)\n",
+                encoding="utf-8",
+            )
+            payload = json.dumps(
+                {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}
+            ).encode() + b"\n"
+            completed = subprocess.run(
+                [sys.executable, str(MODULE_PATH), "--codex-mcp-proxy", json.dumps([sys.executable, str(upstream)])],
+                input=payload, capture_output=True, check=False, timeout=5,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn(b"upstream-diagnostic", completed.stderr)
+            pid, pgid, parent_pgid = map(int, state_path.read_text().split(","))
+            self.assertEqual(pgid, parent_pgid)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
 
     def test_resource_freeze_rejects_pagination_and_duplicates(self) -> None:
         with self.assertRaisesRegex(runner.RunnerError, "paginated"):

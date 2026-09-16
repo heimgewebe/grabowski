@@ -658,6 +658,10 @@ def run_mcp_proxy(upstream: Sequence[str]) -> int:
         raise RunnerError("MCP upstream could not be started") from exc
     if process.stdin is None or process.stdout is None or process.stderr is None:
         process.kill()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired as exc:
+            raise RunnerError("MCP upstream could not be reaped") from exc
         raise RunnerError("MCP upstream pipes unavailable")
     output_lock = threading.Lock()
     state_lock = threading.Lock()
@@ -669,6 +673,19 @@ def run_mcp_proxy(upstream: Sequence[str]) -> int:
     errors: list[BaseException] = []
     upstream_stderr = bytearray()
     upstream_stderr_overflow = False
+
+    # Keep the upstream in the inherited provider process group. The outer
+    # runner can therefore still kill Codex, this proxy, and RepoGround as one
+    # containment unit. Proxy-local failures additionally own/reap this child.
+    def terminate_upstream() -> None:
+        if process.poll() is not None:
+            return
+        try:
+            process.kill()
+        except ProcessLookupError:
+            return
+        except OSError as exc:
+            errors.append(exc)
 
     def send(message: Mapping[str, Any]) -> None:
         raw = canonical(message).encode("utf-8") + b"\n"
@@ -688,6 +705,7 @@ def run_mcp_proxy(upstream: Sequence[str]) -> int:
                     upstream_stderr_overflow = True
         except BaseException as exc:
             errors.append(exc)
+            terminate_upstream()
 
     stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
     stderr_thread.start()
@@ -754,6 +772,7 @@ def run_mcp_proxy(upstream: Sequence[str]) -> int:
                 send(message)
         except BaseException as exc:
             errors.append(exc)
+            terminate_upstream()
         finally:
             try:
                 process.stdin.close()
@@ -762,6 +781,7 @@ def run_mcp_proxy(upstream: Sequence[str]) -> int:
 
     client_thread = threading.Thread(target=client_to_upstream, daemon=True)
     client_thread.start()
+    returncode: int | None = None
     try:
         for raw in process.stdout:
             message = json.loads(raw)
@@ -805,13 +825,25 @@ def run_mcp_proxy(upstream: Sequence[str]) -> int:
             _proxy_write(message, output_lock)
         returncode = process.wait(timeout=5)
     finally:
+        if process.poll() is None:
+            terminate_upstream()
+        try:
+            returncode = process.wait(timeout=5)
+        except subprocess.TimeoutExpired as exc:
+            errors.append(exc)
+            terminate_upstream()
+            try:
+                returncode = process.wait(timeout=5)
+            except subprocess.TimeoutExpired as followup:
+                errors.append(followup)
+                returncode = process.returncode if isinstance(process.returncode, int) else -1
         process.stdout.close()
         stderr_thread.join(timeout=5)
+        if upstream_stderr:
+            sys.stderr.buffer.write(bytes(upstream_stderr)); sys.stderr.buffer.flush()
     if errors:
         raise RunnerError("benchmark MCP proxy stream failed") from errors[0]
-    if upstream_stderr:
-        sys.stderr.buffer.write(bytes(upstream_stderr)); sys.stderr.buffer.flush()
-    if upstream_stderr_overflow or returncode != 0 or upstream_stderr:
+    if returncode is None or upstream_stderr_overflow or returncode != 0 or upstream_stderr:
         raise RunnerError("benchmark MCP upstream failed or emitted diagnostics")
     return returncode
 
@@ -889,6 +921,7 @@ def run_bounded(
     except OSError as exc:
         raise RunnerError("Codex process could not be started") from exc
 
+    deadline = time.monotonic() + timeout_seconds
     buffers = {"stdout": bytearray(), "stderr": bytearray()}
     limits = {"stdout": stdout_limit, "stderr": stderr_limit}
     overflow = {"stdout": False, "stderr": False}
@@ -946,20 +979,19 @@ def run_bounded(
             note_error(f"capture_setup_failed:{type(exc).__name__}")
             kill_process_tree()
 
-    if capture_error is None:
+    stdin_pending = memoryview(stdin_data)
+    if selector is not None and capture_error is None:
         assert process.stdin is not None
         try:
-            process.stdin.write(stdin_data)
-            process.stdin.close()
-        except OSError as exc:
-            note_error(f"stdin_write_failed:{type(exc).__name__}")
-            try:
+            os.set_blocking(process.stdin.fileno(), False)
+            if stdin_pending:
+                selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
+            else:
                 process.stdin.close()
-            except OSError:
-                pass
+        except BaseException as exc:
+            note_error(f"stdin_setup_failed:{type(exc).__name__}")
             kill_process_tree()
 
-    deadline = time.monotonic() + timeout_seconds
     if selector is not None and capture_error is None:
         try:
             while selector.get_map():
@@ -967,10 +999,15 @@ def run_bounded(
                 if remaining <= 0 and capture_error is None:
                     note_error("timeout")
                     kill_process_tree()
+                    break
                 wait_for = 0 if process.poll() is not None else max(min(remaining, 0.25), 0)
                 events = selector.select(wait_for)
                 if not events and process.poll() is not None:
                     for key in list(selector.get_map().values()):
+                        if key.data == "stdin":
+                            selector.unregister(key.fileobj)
+                            key.fileobj.close()
+                            continue
                         try:
                             chunk = os.read(key.fileobj.fileno(), 65536)
                         except BlockingIOError:
@@ -981,6 +1018,26 @@ def run_bounded(
                             store(str(key.data), chunk)
                     continue
                 for key, _mask in events:
+                    if key.data == "stdin":
+                        try:
+                            written = os.write(key.fileobj.fileno(), stdin_pending)
+                        except BlockingIOError:
+                            continue
+                        except OSError as exc:
+                            note_error(f"stdin_write_failed:{type(exc).__name__}")
+                            kill_process_tree()
+                            selector.unregister(key.fileobj)
+                            continue
+                        if written <= 0:
+                            note_error("stdin_write_failed:short_write")
+                            kill_process_tree()
+                            selector.unregister(key.fileobj)
+                            continue
+                        stdin_pending = stdin_pending[written:]
+                        if not stdin_pending:
+                            selector.unregister(key.fileobj)
+                            key.fileobj.close()
+                        continue
                     chunk = os.read(key.fileobj.fileno(), 65536)
                     if not chunk:
                         selector.unregister(key.fileobj)
@@ -1335,10 +1392,6 @@ def _sed_kind(parts: Sequence[str]) -> str:
 
 def command_kind(command: str) -> str:
     parts = _split_shell_words(command.strip())
-    if len(parts) >= 3 and parts[0] == "bash" and parts[1] == "-lc":
-        if len(parts) != 3:
-            raise RunnerError("complex shell wrapper is not allowed")
-        parts = _split_shell_words(parts[2].strip())
     if not parts:
         raise RunnerError("empty Codex command")
     executable = parts[0]
