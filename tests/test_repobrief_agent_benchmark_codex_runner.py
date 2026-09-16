@@ -1011,6 +1011,25 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(runner.RunnerError, "exactly once"):
             runner._filtered_treatment_tools(duplicate)
 
+    def test_mcp_proxy_rejects_eof_with_unanswered_tools_list(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            upstream = root / "mcp.py"
+            upstream.write_text(
+                "import sys\n"
+                "sys.stdin.readline()\n",
+                encoding="utf-8",
+            )
+            payload = json.dumps(
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+            ).encode() + b"\n"
+            completed = subprocess.run(
+                [sys.executable, str(MODULE_PATH), "--codex-mcp-proxy", json.dumps([sys.executable, str(upstream)])],
+                input=payload, capture_output=True, check=False, timeout=5,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn(b"inventory was not validated", completed.stderr)
+
     def test_mcp_proxy_rejects_unsuccessful_tools_list_responses(self) -> None:
         responses = (
             {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "unavailable"}},

@@ -675,6 +675,7 @@ def run_mcp_proxy(upstream: Sequence[str]) -> int:
     state_lock = threading.Lock()
     initialize_ids: set[Any] = set()
     tools_list_ids: set[Any] = set()
+    tools_inventory_validated = False
     resource_calls: dict[Any, tuple[str, str | None]] = {}
     frozen_resources: dict[str, Any] | None = None
     frozen_uris: set[str] = set()
@@ -818,6 +819,7 @@ def run_mcp_proxy(upstream: Sequence[str]) -> int:
                 if "error" in message or "result" not in message:
                     raise RunnerError("MCP tools/list response must contain a successful result")
                 tools = _filtered_treatment_tools(message.get("result"))
+                tools_inventory_validated = True
                 message = {"jsonrpc":"2.0","id":identifier,"result":{"tools":tools}}
             elif resource_call is not None:
                 action, _uri = resource_call
@@ -837,6 +839,10 @@ def run_mcp_proxy(upstream: Sequence[str]) -> int:
                     text = canonical(message.get("result")); is_error = False
                 message = {"jsonrpc":"2.0","id":identifier,"result":{"content":[{"type":"text","text":text}],"isError":is_error}}
             _proxy_write(message, output_lock)
+        with state_lock:
+            pending_tools_list = bool(tools_list_ids)
+        if pending_tools_list or not tools_inventory_validated:
+            raise RunnerError("MCP tools/list inventory was not validated before upstream EOF")
         returncode = process.wait(timeout=5)
     finally:
         if process.poll() is None:
