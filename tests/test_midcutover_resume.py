@@ -3345,7 +3345,12 @@ class DeployedFinalizationCompatibilityTests(unittest.TestCase):
 class GreenDrainTargetTests(unittest.TestCase):
     """Green is the publicly routed process, so green is what must be drained."""
 
-    def _runtime(self, topology: str) -> dual.MidCutoverResumeRuntime:
+    def _runtime(
+        self,
+        topology: str,
+        *,
+        phase: str = midcutover.PHASE_PROMOTE_POINTER,
+    ) -> dual.MidCutoverResumeRuntime:
         runtime = dual.MidCutoverResumeRuntime(
             repo=ROOT,
             runtime=Path("/runtime"),
@@ -3362,9 +3367,7 @@ class GreenDrainTargetTests(unittest.TestCase):
                 "classification_sha256": "f0" * 32,
                 "receipt": {"blue_release_id": BLUE_RELEASE},
             },
-            resume_binding=resume_binding_for_phase(
-                midcutover.PHASE_PROMOTE_POINTER
-            ),
+            resume_binding=resume_binding_for_phase(phase),
             timeout_seconds=10,
             green_unit="grabowski-green-operator-0123456789ab.service",
             selector_before=selector_document(),
@@ -3448,6 +3451,113 @@ class GreenDrainTargetTests(unittest.TestCase):
                 else:
                     self.assertNotIn(18181, verify_ports)
                     self.assertIsNone(result["canonical_guard_sha256"])
+
+    def _canonical_admission_observation(
+        self, *, blocking_tools: dict[str, int]
+    ) -> dict[str, object]:
+        blocking = sum(blocking_tools.values())
+        return {
+            "valid": True,
+            "active": True,
+            "state": "active",
+            "admission_gate_installed": True,
+            "token": "t",
+            "expected_head": HEAD_GREEN,
+            "source_identity_sha256": "ab" * 32,
+            "active_tool_calls": blocking,
+            "drain_blocking_tool_calls": blocking,
+            "read_only_active_tool_calls": 0,
+            "effect_classification": dual.OPERATOR_ADMISSION_EFFECT_CLASSIFICATION,
+            "active_tool_calls_by_tool_name": blocking_tools,
+            "active_tool_calls_by_tool_name_truncated": False,
+            "active_tool_calls_by_tool_name_omitted_call_count": 0,
+        }
+
+    def test_s3_retirement_allows_only_its_parent_recovery_call_on_canonical(
+        self,
+    ) -> None:
+        runtime = self._runtime(
+            dual.CANONICAL_OPERATOR_LIVE, phase=midcutover.PHASE_RETIRE_GREEN
+        )
+        runtime.admission_marker = {
+            "token": "t",
+            "expected_head": HEAD_GREEN,
+            "source_identity_sha256": "ab" * 32,
+        }
+        observed = self._canonical_admission_observation(
+            blocking_tools={dual.MIDCUTOVER_RECOVERY_TOOL_NAME: 1}
+        )
+        with (
+            mock.patch.object(
+                dual,
+                "wait_for_operator_deployment_admission",
+                return_value={"supported": True, "blocking_tool_calls": 0},
+            ),
+            mock.patch.object(
+                dual,
+                "verify_operator_deployment_admission",
+                return_value={"guard": True},
+            ) as strict_verify,
+            mock.patch.object(
+                dual, "_operator_admission_observation", return_value=observed
+            ),
+        ):
+            result = runtime.terminalize_effects()
+        strict_verify.assert_called_once_with(
+            runtime.admission_marker, port=dual.GREEN_OPERATOR_LISTENER_PORT
+        )
+        self.assertEqual(result["drain_target_port"], dual.GREEN_OPERATOR_LISTENER_PORT)
+        self.assertIsNotNone(result["canonical_guard_sha256"])
+
+    def test_s3_retirement_rejects_any_additional_canonical_blocker(self) -> None:
+        runtime = self._runtime(
+            dual.CANONICAL_OPERATOR_LIVE, phase=midcutover.PHASE_RETIRE_GREEN
+        )
+        runtime.admission_marker = {
+            "token": "t",
+            "expected_head": HEAD_GREEN,
+            "source_identity_sha256": "ab" * 32,
+        }
+        observed = self._canonical_admission_observation(
+            blocking_tools={
+                dual.MIDCUTOVER_RECOVERY_TOOL_NAME: 1,
+                "grabowski_create_text": 1,
+            }
+        )
+        with (
+            mock.patch.object(
+                dual,
+                "wait_for_operator_deployment_admission",
+                return_value={"supported": True, "blocking_tool_calls": 0},
+            ),
+            mock.patch.object(
+                dual,
+                "verify_operator_deployment_admission",
+                return_value={"guard": True},
+            ),
+            mock.patch.object(
+                dual, "_operator_admission_observation", return_value=observed
+            ),
+        ):
+            with self.assertRaises(dual.core.DeployError):
+                runtime.terminalize_effects()
+
+    def test_strict_final_guard_still_rejects_the_recovery_parent_call(self) -> None:
+        marker = {
+            "token": "t",
+            "expected_head": HEAD_GREEN,
+            "source_identity_sha256": "ab" * 32,
+        }
+        observed = self._canonical_admission_observation(
+            blocking_tools={dual.MIDCUTOVER_RECOVERY_TOOL_NAME: 1}
+        )
+        with mock.patch.object(
+            dual, "_operator_admission_observation", return_value=observed
+        ):
+            with self.assertRaises(dual.core.DeployError):
+                dual.verify_operator_deployment_admission(
+                    marker, port=dual.OPERATOR_LISTENER_PORT
+                )
 
     def test_green_without_admission_support_fails_closed(self) -> None:
         runtime = self._runtime(dual.CANONICAL_OPERATOR_ABSENT)
