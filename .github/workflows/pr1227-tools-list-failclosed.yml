@@ -21,7 +21,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "3294c4d75095e7978cd4b3dcc5ffa390342f270f"
+          test "$(git rev-parse HEAD^)" = "638a0d35bf64bc9bf3265af3fbbad9437e33b54b"
           test "$(git rev-parse HEAD:tools/repobrief_agent_benchmark_codex_runner.py)" = "dfbc8e5ff729ff018a263cadf7e358c4f36848b5"
           test "$(git rev-parse HEAD:tests/test_repobrief_agent_benchmark_codex_runner.py)" = "8984bfb215d50f89ebc961a9c492616f645919ff"
       - name: Apply fix and regression
@@ -36,16 +36,8 @@ jobs:
           runner = runner_path.read_text(encoding="utf-8")
           tests = tests_path.read_text(encoding="utf-8")
 
-          old = '''            elif is_tools_list and "result" in message:
-              tools = _filtered_treatment_tools(message.get("result"))
-              message = {"jsonrpc":"2.0","id":identifier,"result":{"tools":tools}}
-          '''
-          new = '''            elif is_tools_list:
-              if "error" in message or "result" not in message:
-                  raise RunnerError("MCP tools/list response must contain a successful result")
-              tools = _filtered_treatment_tools(message.get("result"))
-              message = {"jsonrpc":"2.0","id":identifier,"result":{"tools":tools}}
-          '''
+          old = 'elif is_tools_list and "result" in message:\n                tools = _filtered_treatment_tools(message.get("result"))\n                message = {"jsonrpc":"2.0","id":identifier,"result":{"tools":tools}}'
+          new = 'elif is_tools_list:\n                if "error" in message or "result" not in message:\n                    raise RunnerError("MCP tools/list response must contain a successful result")\n                tools = _filtered_treatment_tools(message.get("result"))\n                message = {"jsonrpc":"2.0","id":identifier,"result":{"tools":tools}}'
           if runner.count(old) != 1:
               raise SystemExit(f"runner preimage count: {runner.count(old)}")
           runner = runner.replace(old, new, 1)
