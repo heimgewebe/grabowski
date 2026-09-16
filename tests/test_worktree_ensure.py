@@ -1508,6 +1508,27 @@ class WorktreeEnsureTests(unittest.TestCase):
         self.assertEqual(result["absence_semantics"], "unknown_not_no_findings")
         self.assertFalse((worktree / ".adler").exists())
 
+    def test_adler_symlink_is_rejected_before_child_writes(self) -> None:
+        lane_id = "f" * 32
+        worktree = self.worktree_root / "symlinked-adler"
+        worktree.mkdir()
+        foreign = self.root / "foreign-adler-target"
+        foreign.mkdir(mode=0o700)
+        (worktree / ".adler").symlink_to(foreign, target_is_directory=True)
+        inputs = {
+            "lease_owner_id": f"lane:{lane_id}",
+            "source_kind": "work_lane",
+            "source_id": lane_id,
+            "target_path": str(worktree),
+        }
+
+        result = worktree_ensure._configure_adler_sidecar_pointer(inputs)
+
+        self.assertEqual(result["state"], "unavailable")
+        self.assertFalse(result["blocking"])
+        self.assertTrue((worktree / ".adler").is_symlink())
+        self.assertEqual(list(foreign.iterdir()), [])
+
     def test_adler_pointer_problem_is_nonblocking_and_does_not_replace_foreign_metadata(self) -> None:
         lane_id = "b" * 32
         worktree = self.worktree_root / "existing"

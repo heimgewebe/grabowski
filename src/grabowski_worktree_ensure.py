@@ -975,12 +975,16 @@ def _adler_lane_id(inputs: dict[str, Any]) -> str | None:
     return lane_id
 
 
-def _validate_adler_sidecar(sidecar: Path, expected_target: Path) -> None:
+def _validate_adler_sidecar_directory(sidecar: Path) -> None:
     info = sidecar.lstat()
     if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != os.geteuid():
         raise WorktreeEnsureAction(".adler must be an owner-controlled directory")
     if stat.S_IMODE(info.st_mode) & 0o077:
         raise WorktreeEnsureAction(".adler permissions are broader than 0700")
+
+
+def _validate_adler_sidecar(sidecar: Path, expected_target: Path) -> None:
+    _validate_adler_sidecar_directory(sidecar)
     unexpected = {entry.name for entry in sidecar.iterdir()} - {".gitignore", "inbox.json"}
     if unexpected:
         raise WorktreeEnsureAction(".adler contains entries outside the minimal sidecar contract")
@@ -1014,6 +1018,7 @@ def _configure_adler_sidecar_pointer(inputs: dict[str, Any]) -> dict[str, Any]:
             created_dir = True
         except FileExistsError:
             pass
+        _validate_adler_sidecar_directory(sidecar)
         if not os.path.lexists(sidecar / ".gitignore"):
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
             fd = os.open(sidecar / ".gitignore", flags, 0o600)
