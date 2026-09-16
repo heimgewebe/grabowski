@@ -991,7 +991,12 @@ def _adler_lane_id(inputs: dict[str, Any]) -> str | None:
     if match is None:
         return None
     lane_id = match.group(1)
-    if inputs.get("source_kind") != "work_lane" or inputs.get("source_id") != lane_id:
+    # Work-acquire preserves the original lifecycle source for non-direct work
+    # (Bureau task, issue, obligation, thread focus), while lease ownership is
+    # always rebound to the server-derived lane id.  A source explicitly named
+    # work_lane must still match that owner exactly; other validated lifecycle
+    # sources do not replace the lane identity carried by the owner.
+    if inputs.get("source_kind") == "work_lane" and inputs.get("source_id") != lane_id:
         return None
     return lane_id
 

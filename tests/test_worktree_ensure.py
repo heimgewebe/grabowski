@@ -1400,6 +1400,25 @@ class WorktreeEnsureTests(unittest.TestCase):
         self.assertEqual(checkouts._lifecycle_bindings([]), {})
         self.assertEqual(len(self.friction_events), 1)
 
+    def test_non_direct_work_lane_source_still_gets_adler_pointer(self) -> None:
+        lane_id = "7" * 32
+        worktree = self.worktree_root / "obligation-adler-sidecar"
+        worktree.mkdir()
+        inputs = {
+            "lease_owner_id": f"lane:{lane_id}",
+            "source_kind": "operator_obligation",
+            "source_id": "operator-obligation-adler-test",
+            "target_path": str(worktree),
+        }
+        state_root = self.root / "obligation-adler-state"
+
+        with patch.dict(os.environ, {"GROSSER_ADLER_STATE_ROOT": str(state_root)}):
+            result = worktree_ensure._configure_adler_sidecar_pointer(inputs)
+
+        expected = state_root.resolve() / "worktree-inboxes" / f"{lane_id}.json"
+        self.assertEqual(result["state"], "configured")
+        self.assertEqual(os.readlink(worktree / ".adler" / "inbox.json"), str(expected))
+
     def test_work_lane_checkout_gets_minimal_adler_pointer_without_inbox_write(self) -> None:
         lane_id = "a" * 32
         owner = f"lane:{lane_id}"
