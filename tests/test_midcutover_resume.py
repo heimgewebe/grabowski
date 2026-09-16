@@ -2364,6 +2364,28 @@ class DeploymentAdmissionAuthorityTests(unittest.TestCase):
                 timeout_seconds=10,
             )
 
+    def test_receipt_bound_admission_does_not_bind_the_current_deploy_observer(self) -> None:
+        # A scheduled deploy may execute newer current-main code while first
+        # finishing an older already-switched cutover.  The historical marker
+        # must keep the receipt identity; the current job observer is bound to
+        # the newer execution head and must not be rewritten or conflated with it.
+        with tempfile.TemporaryDirectory() as directory:
+            marker_path = Path(directory) / "deployment-admission-drain.json"
+            with (
+                mock.patch.object(dual, "OPERATOR_ADMISSION_MARKER_PATH", marker_path),
+                mock.patch.object(dual.time, "time", return_value=100),
+                mock.patch.object(dual.secrets, "token_hex", return_value="f" * 64),
+                mock.patch.object(dual, "_activate_runtime_deploy_observer") as activate,
+            ):
+                marker = dual.engage_receipt_bound_deployment_admission(
+                    expected_head=HEAD_GREEN,
+                    source_identity_sha256="ab" * 32,
+                    timeout_seconds=10,
+                )
+        activate.assert_not_called()
+        self.assertEqual(HEAD_GREEN, marker["expected_head"])
+        self.assertEqual("ab" * 32, marker["source_identity_sha256"])
+
     def test_productive_deploy_still_needs_blue_continuity_evidence(self) -> None:
         """The cutover's snapshot-continuity gate is exactly as closed as before."""
         topology = mock.Mock(kind="url", server_url_port=18180)
