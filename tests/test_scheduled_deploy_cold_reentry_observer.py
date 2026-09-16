@@ -160,6 +160,35 @@ class ColdReentryObserverIsolationTests(unittest.TestCase):
             for name, value in self.observer_environment.items():
                 self.assertEqual(os.environ.get(name), value)
 
+    def test_legacy_flat_decision_remains_resumable_and_isolates_observer(self) -> None:
+        observed: dict[str, str | None] = {}
+        decision = {
+            "execution_head": "e" * 40,
+            "resume_target_head": "f" * 40,
+            "resume_binding_sha256": "b" * 64,
+        }
+
+        with mock.patch.dict(os.environ, self.observer_environment, clear=False):
+            with (
+                mock.patch.object(
+                    runner.deploy_dual,
+                    "resume_production_blue_green_cutover",
+                    side_effect=lambda **_kwargs: self._observed_environment_resume(
+                        observed
+                    ),
+                ),
+                mock.patch.object(runner, "emit"),
+            ):
+                result = runner.run_midcutover_resume(repo=ROOT, decision=decision)
+
+            self.assertEqual(
+                observed,
+                {name: None for name in self.observer_environment},
+            )
+            for name, value in self.observer_environment.items():
+                self.assertEqual(os.environ.get(name), value)
+            self.assertEqual(result["outcome"], "completed")
+
     def test_resume_restores_scheduler_observer_discovery_after_failure(self) -> None:
         with mock.patch.dict(os.environ, self.observer_environment, clear=False):
             with mock.patch.object(
