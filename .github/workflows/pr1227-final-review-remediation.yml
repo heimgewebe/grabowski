@@ -21,7 +21,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "0ae284ca159f96cbf53d08b25f223db6dac198bd"
+          test "$(git rev-parse HEAD^)" = "1bf418f6311118b174fc69a0ba9c2558f0483efa"
           test "$(git rev-parse HEAD:tools/repobrief_agent_benchmark_codex_runner.py)" = "5e56c730b5bb013cff1cb4bbd97b00fed8a5209a"
           test "$(git rev-parse HEAD:tests/test_repobrief_agent_benchmark_codex_runner.py)" = "672aad2c497590b7f8fa9f8f1d97d81f38a98ccc"
       - name: Apply reviewed fixes and regressions
@@ -135,73 +135,73 @@ jobs:
           )
 
           provider_anchor = '    def test_run_bounded_times_out_when_provider_does_not_read_stdin(self) -> None:\n'
-          provider_test = '''    def test_run_bounded_kills_process_group_left_after_normal_provider_exit(self) -> None:
-              with tempfile.TemporaryDirectory() as temporary:
-                  root = Path(temporary)
-                  child_state = root / "child.pid"
-                  script = root / "provider.py"
-                  script.write_text(
-                      "import os, pathlib, time\\n"
-                      "child = os.fork()\\n"
-                      "if child == 0:\\n"
-                      f"    pathlib.Path({str(child_state)!r}).write_text(str(os.getpid()))\\n"
-                      "    for fd in (0, 1, 2):\\n"
-                      "        try:\\n"
-                      "            os.close(fd)\\n"
-                      "        except OSError:\\n"
-                      "            pass\\n"
-                      "    time.sleep(30)\\n"
-                      "    os._exit(0)\\n"
-                      f"state = pathlib.Path({str(child_state)!r})\\n"
-                      "while not state.exists():\\n"
-                      "    time.sleep(0.01)\\n"
-                      "os._exit(0)\\n",
-                      encoding="utf-8",
-                  )
-                  capture = runner.run_bounded(
-                      [sys.executable, str(script)], cwd=root, timeout_seconds=3, stdin_data=b""
-                  )
-                  self.assertIn("process_group_survived_provider_exit", str(capture["capture_error"]))
-                  child_pid = int(child_state.read_text())
-                  deadline = time.monotonic() + 2
-                  while True:
-                      try:
-                          os.kill(child_pid, 0)
-                      except ProcessLookupError:
-                          break
-                      if time.monotonic() >= deadline:
-                          self.fail("provider descendant survived process-group containment")
-                      time.sleep(0.02)
-
-          '''
+          provider_test = (
+              '    def test_run_bounded_kills_process_group_left_after_normal_provider_exit(self) -> None:\n'
+              '        with tempfile.TemporaryDirectory() as temporary:\n'
+              '            root = Path(temporary)\n'
+              '            child_state = root / "child.pid"\n'
+              '            script = root / "provider.py"\n'
+              '            script.write_text(\n'
+              '                "import os, pathlib, time\\n"\n'
+              '                "child = os.fork()\\n"\n'
+              '                "if child == 0:\\n"\n'
+              '                f"    pathlib.Path({str(child_state)!r}).write_text(str(os.getpid()))\\n"\n'
+              '                "    for fd in (0, 1, 2):\\n"\n'
+              '                "        try:\\n"\n'
+              '                "            os.close(fd)\\n"\n'
+              '                "        except OSError:\\n"\n'
+              '                "            pass\\n"\n'
+              '                "    time.sleep(30)\\n"\n'
+              '                "    os._exit(0)\\n"\n'
+              '                f"state = pathlib.Path({str(child_state)!r})\\n"\n'
+              '                "while not state.exists():\\n"\n'
+              '                "    time.sleep(0.01)\\n"\n'
+              '                "os._exit(0)\\n",\n'
+              '                encoding="utf-8",\n'
+              '            )\n'
+              '            capture = runner.run_bounded(\n'
+              '                [sys.executable, str(script)], cwd=root, timeout_seconds=3, stdin_data=b""\n'
+              '            )\n'
+              '            self.assertIn("process_group_survived_provider_exit", str(capture["capture_error"]))\n'
+              '            child_pid = int(child_state.read_text())\n'
+              '            deadline = time.monotonic() + 2\n'
+              '            while True:\n'
+              '                try:\n'
+              '                    os.kill(child_pid, 0)\n'
+              '                except ProcessLookupError:\n'
+              '                    break\n'
+              '                if time.monotonic() >= deadline:\n'
+              '                    self.fail("provider descendant survived process-group containment")\n'
+              '                time.sleep(0.02)\n\n'
+          )
           tests = replace_once(tests, provider_anchor, provider_test + provider_anchor, "normal-exit group regression")
 
           mcp_anchor = '    def test_mcp_proxy_reaps_failed_upstream_without_detaching_from_provider_group(self) -> None:\n'
-          mcp_test = '''    def test_mcp_proxy_rejects_oversized_upstream_line_before_newline(self) -> None:
-              with tempfile.TemporaryDirectory() as temporary:
-                  root = Path(temporary)
-                  state_path = root / "upstream.pid"
-                  upstream = root / "mcp.py"
-                  upstream.write_text(
-                      "import os, pathlib, sys, time\\n"
-                      f"pathlib.Path({str(state_path)!r}).write_text(str(os.getpid()))\\n"
-                      f"sys.stdout.buffer.write(b'x' * ({runner.base.MAX_MCP_MESSAGE_BYTES} + 1)); sys.stdout.buffer.flush()\\n"
-                      "time.sleep(30)\\n",
-                      encoding="utf-8",
-                  )
-                  started = time.monotonic()
-                  completed = subprocess.run(
-                      [sys.executable, str(MODULE_PATH), "--codex-mcp-proxy", json.dumps([sys.executable, str(upstream)])],
-                      input=b"", capture_output=True, check=False, timeout=8,
-                  )
-                  elapsed = time.monotonic() - started
-                  self.assertNotEqual(completed.returncode, 0)
-                  self.assertLess(elapsed, 5.0)
-                  upstream_pid = int(state_path.read_text())
-                  with self.assertRaises(ProcessLookupError):
-                      os.kill(upstream_pid, 0)
-
-          '''
+          mcp_test = (
+              '    def test_mcp_proxy_rejects_oversized_upstream_line_before_newline(self) -> None:\n'
+              '        with tempfile.TemporaryDirectory() as temporary:\n'
+              '            root = Path(temporary)\n'
+              '            state_path = root / "upstream.pid"\n'
+              '            upstream = root / "mcp.py"\n'
+              '            upstream.write_text(\n'
+              '                "import os, pathlib, sys, time\\n"\n'
+              '                f"pathlib.Path({str(state_path)!r}).write_text(str(os.getpid()))\\n"\n'
+              '                f"sys.stdout.buffer.write(b\'x\' * ({runner.base.MAX_MCP_MESSAGE_BYTES} + 1)); sys.stdout.buffer.flush()\\n"\n'
+              '                "time.sleep(30)\\n",\n'
+              '                encoding="utf-8",\n'
+              '            )\n'
+              '            started = time.monotonic()\n'
+              '            completed = subprocess.run(\n'
+              '                [sys.executable, str(MODULE_PATH), "--codex-mcp-proxy", json.dumps([sys.executable, str(upstream)])],\n'
+              '                input=b"", capture_output=True, check=False, timeout=8,\n'
+              '            )\n'
+              '            elapsed = time.monotonic() - started\n'
+              '            self.assertNotEqual(completed.returncode, 0)\n'
+              '            self.assertLess(elapsed, 5.0)\n'
+              '            upstream_pid = int(state_path.read_text())\n'
+              '            with self.assertRaises(ProcessLookupError):\n'
+              '                os.kill(upstream_pid, 0)\n\n'
+          )
           tests = replace_once(tests, mcp_anchor, mcp_test + mcp_anchor, "bounded MCP upstream regression")
 
           runner_path.write_text(runner, encoding="utf-8")
