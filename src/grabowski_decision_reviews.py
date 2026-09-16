@@ -837,24 +837,54 @@ def reconcile(
         try:
             stdout_text, stdout_tail_sha256 = _read_stdout_tail(directory / "stdout.log")
             attempt["stdout_tail_sha256"] = stdout_tail_sha256
-            role_evidence = _validated_review_role_evidence(metadata, binding, provenance)
-            if role_evidence is not None:
-                attempt["review_role_verified"] = role_evidence["role_verified"]
-                attempt["review_route_verified"] = role_evidence["route_verified"]
-                attempt["independence_verified"] = role_evidence["independence_verified"]
-                attempt["review_role_receipt_sha256"] = role_evidence["role_receipt_sha256"]
-                review_route = role_evidence.get("review_route")
-                if isinstance(review_route, dict):
-                    attempt["review_route_id"] = review_route.get("route_id")
-                    attempt["review_provider_family"] = review_route.get("provider_family")
-                result = role_evidence["result"]
-            else:
-                result = _parse_result_marker(stdout_text, binding)
         except (FileNotFoundError, OSError, ValueError) as exc:
             errors.append(f"decision_review_result_invalid:{directory.name}:{type(exc).__name__}")
             attempt["classification"] = "invalid_result"
             attempts.append(attempt)
             continue
+        try:
+            role_evidence = _validated_review_role_evidence(metadata, binding, provenance)
+        except FileNotFoundError as exc:
+            # A failed provenance-bound reviewer whose role receipt was never
+            # created has no semantic review result. Treat only that exact
+            # pre-result failure like the existing no-marker infrastructure
+            # path so a later exact-bound PASS in the same slot can supersede
+            # it. A succeeded reviewer missing its create-only receipt is
+            # contradictory and remains fail-closed, as do malformed,
+            # unreadable or binding-invalid receipts below.
+            if attempt["terminal_status"] == "failed":
+                attempt["classification"] = "infrastructure_error"
+                attempts.append(attempt)
+                continue
+            errors.append(
+                f"decision_review_result_invalid:{directory.name}:{type(exc).__name__}"
+            )
+            attempt["classification"] = "invalid_result"
+            attempts.append(attempt)
+            continue
+        except (OSError, ValueError) as exc:
+            errors.append(f"decision_review_result_invalid:{directory.name}:{type(exc).__name__}")
+            attempt["classification"] = "invalid_result"
+            attempts.append(attempt)
+            continue
+        if role_evidence is not None:
+            attempt["review_role_verified"] = role_evidence["role_verified"]
+            attempt["review_route_verified"] = role_evidence["route_verified"]
+            attempt["independence_verified"] = role_evidence["independence_verified"]
+            attempt["review_role_receipt_sha256"] = role_evidence["role_receipt_sha256"]
+            review_route = role_evidence.get("review_route")
+            if isinstance(review_route, dict):
+                attempt["review_route_id"] = review_route.get("route_id")
+                attempt["review_provider_family"] = review_route.get("provider_family")
+            result = role_evidence["result"]
+        else:
+            try:
+                result = _parse_result_marker(stdout_text, binding)
+            except ValueError as exc:
+                errors.append(f"decision_review_result_invalid:{directory.name}:{type(exc).__name__}")
+                attempt["classification"] = "invalid_result"
+                attempts.append(attempt)
+                continue
         if result is None:
             # A terminal reviewer that produced no decision marker did not
             # establish a semantic review outcome. Treat that attempt as

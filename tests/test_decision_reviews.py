@@ -659,6 +659,118 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
             {"infrastructure_error", "pass"},
         )
 
+    def test_failed_missing_role_receipt_can_be_replaced_by_later_proven_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp)
+            missing = make_job(
+                jobs,
+                suffix="a00000000039",
+                slot="independent-reviewer",
+                terminal_status="failed",
+                review_result=None,
+                review_role=True,
+                created_at_unix=1_787_000_100,
+            )
+            (missing / "review-role-receipt.json").unlink()
+            make_job(
+                jobs,
+                suffix="a00000000040",
+                slot="independent-reviewer",
+                terminal_status="succeeded",
+                review_result=None,
+                review_role=True,
+                created_at_unix=1_787_000_200,
+            )
+            reconciled = self.reconcile(jobs)
+        self.assertEqual(reconciled["status"], "settled")
+        self.assertEqual(reconciled["errors"], [])
+        slot = reconciled["slots"][0]
+        self.assertEqual(slot["independent_pass_count"], 1)
+        self.assertEqual(slot["infrastructure_error_count"], 1)
+        self.assertEqual(slot["unresolved_count"], 0)
+        self.assertEqual(
+            {item["classification"] for item in reconciled["attempts"]},
+            {"infrastructure_error", "pass"},
+        )
+
+    def test_succeeded_missing_role_receipt_stays_blocking_after_later_proven_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp)
+            missing = make_job(
+                jobs,
+                suffix="a00000000043",
+                slot="independent-reviewer",
+                terminal_status="succeeded",
+                review_result=None,
+                review_role=True,
+                created_at_unix=1_787_000_100,
+            )
+            (missing / "review-role-receipt.json").unlink()
+            make_job(
+                jobs,
+                suffix="a00000000044",
+                slot="independent-reviewer",
+                terminal_status="succeeded",
+                review_result=None,
+                review_role=True,
+                created_at_unix=1_787_000_200,
+            )
+            reconciled = self.reconcile(jobs)
+        self.assertEqual(reconciled["status"], "blocked")
+        self.assertTrue(
+            any(
+                error.startswith(
+                    "decision_review_result_invalid:grabowski-job-a00000000043:FileNotFoundError"
+                )
+                for error in reconciled["errors"]
+            )
+        )
+        slot = reconciled["slots"][0]
+        self.assertEqual(slot["independent_pass_count"], 1)
+        self.assertEqual(slot["infrastructure_error_count"], 0)
+        self.assertEqual(slot["unresolved_count"], 1)
+        self.assertEqual(
+            {item["classification"] for item in reconciled["attempts"]},
+            {"invalid_result", "pass"},
+        )
+
+    def test_malformed_role_receipt_stays_blocking_after_later_proven_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp)
+            malformed = make_job(
+                jobs,
+                suffix="a00000000041",
+                slot="independent-reviewer",
+                terminal_status="succeeded",
+                review_result=None,
+                review_role=True,
+                created_at_unix=1_787_000_100,
+            )
+            write_private(malformed / "review-role-receipt.json", "{}")
+            make_job(
+                jobs,
+                suffix="a00000000042",
+                slot="independent-reviewer",
+                terminal_status="succeeded",
+                review_result=None,
+                review_role=True,
+                created_at_unix=1_787_000_200,
+            )
+            reconciled = self.reconcile(jobs)
+        self.assertEqual(reconciled["status"], "blocked")
+        self.assertTrue(
+            any(
+                error.startswith(
+                    "decision_review_result_invalid:grabowski-job-a00000000041:ValueError"
+                )
+                for error in reconciled["errors"]
+            )
+        )
+        slot = reconciled["slots"][0]
+        self.assertEqual(slot["independent_pass_count"], 1)
+        self.assertEqual(slot["infrastructure_error_count"], 0)
+        self.assertEqual(slot["unresolved_count"], 1)
+
     def test_material_reject_remains_blocking_after_later_proven_pass(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             jobs = Path(tmp)
