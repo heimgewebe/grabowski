@@ -1,0 +1,55 @@
+name: PR1227 null-id follow-up
+
+on:
+  push:
+    branches:
+      - ops/pr1227-null-id-20260916
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout follow-up transport
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Apply, validate, and publish candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_head=dc99d4982a24441b04e0e2590a3faa21520d6028
+          patch=.pr1227-null-id/fix.patch
+          test "$(sha256sum "$patch" | cut -d' ' -f1)" = "87b672e60ad2b683196a6813b92dda92107fc4072ab136cb8ad990844d44cb30"
+          live_head="$(git ls-remote origin refs/heads/fix/rab-codex-stderr-contract-20260915 | cut -f1)"
+          test "$live_head" = "$expected_head"
+
+          git worktree add --detach /tmp/pr1227-null-id "$expected_head"
+          cp "$patch" /tmp/pr1227-null-id/fix.patch
+          cd /tmp/pr1227-null-id
+          git apply --check fix.patch
+          git apply fix.patch
+          rm fix.patch
+
+          python3 -m unittest tests.test_repobrief_agent_benchmark_codex_runner
+          git diff --check
+          python3 tools/check_no_secrets.py
+          python3 -m py_compile tools/repobrief_agent_benchmark_codex_runner.py tests/test_repobrief_agent_benchmark_codex_runner.py
+
+          mapfile -t changed < <(git status --short | sed -E 's/^.. //')
+          test "${#changed[@]}" -eq 2
+          printf '%s\n' "${changed[@]}" | sort > /tmp/changed.actual
+          printf '%s\n' tests/test_repobrief_agent_benchmark_codex_runner.py tools/repobrief_agent_benchmark_codex_runner.py > /tmp/changed.expected
+          diff -u /tmp/changed.expected /tmp/changed.actual
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- tests/test_repobrief_agent_benchmark_codex_runner.py tools/repobrief_agent_benchmark_codex_runner.py
+          git diff --cached --check
+          git commit -m 'fix(pr1227): reject explicit null MCP request ids'
+          test "$(git rev-parse HEAD^)" = "$expected_head"
+          git push origin HEAD:refs/heads/ops/pr1227-ready2-20260916

@@ -1,0 +1,72 @@
+--- a/tools/repobrief_agent_benchmark_codex_runner.py
++++ b/tools/repobrief_agent_benchmark_codex_runner.py
+@@ -18,6 +18,7 @@
+ import hashlib
+ import importlib.util
+ import json
++import math
+ import os
+ import posixpath
+ from pathlib import Path
+@@ -141,6 +142,14 @@
+ 
+ def sha_bytes(data: bytes) -> str:
+     return hashlib.sha256(data).hexdigest()
++
++
++def _valid_jsonrpc_request_id(value: Any) -> bool:
++    if value is None or isinstance(value, bool):
++        return False
++    if isinstance(value, (str, int)):
++        return True
++    return isinstance(value, float) and math.isfinite(value)
+ 
+ 
+ def utc_now() -> datetime:
+@@ -885,7 +894,10 @@
+                 if not isinstance(message, dict):
+                     raise RunnerError("MCP client message must be an object")
+                 method = message.get("method")
++                has_identifier = "id" in message
+                 identifier = message.get("id")
++                if has_identifier and not _valid_jsonrpc_request_id(identifier):
++                    raise RunnerError("MCP client request ID is invalid")
+                 if method not in MCP_CLIENT_METHODS:
+                     if identifier is not None:
+                         _proxy_write(_proxy_error(identifier, "benchmark MCP method is not authorized"), output_lock)
+--- a/tests/test_repobrief_agent_benchmark_codex_runner.py
++++ b/tests/test_repobrief_agent_benchmark_codex_runner.py
+@@ -1343,6 +1343,33 @@
+                 self.assertNotEqual(completed.returncode, 0)
+                 self.assertIn(b"response envelope is invalid", completed.stderr)
+ 
++    def test_mcp_proxy_rejects_explicit_null_treatment_request_id(self) -> None:
++        with tempfile.TemporaryDirectory() as temporary:
++            root = Path(temporary)
++            upstream = root / "mcp.py"
++            upstream.write_text(
++                "import json, sys\n"
++                f"TOOLS = {treatment_tools()!r}\n"
++                "for line in sys.stdin:\n"
++                "    m=json.loads(line); method=m.get('method'); ident=m.get('id')\n"
++                "    if method=='tools/list':\n"
++                "        print(json.dumps({'jsonrpc':'2.0','id':ident,'result':{'tools':TOOLS}}),flush=True)\n",
++                encoding="utf-8",
++            )
++            messages = [
++                {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}},
++                {"jsonrpc":"2.0","id":None,"method":"tools/call","params":{"name":"ask_context","arguments":{"query":"where"}}},
++            ]
++            completed = subprocess.run(
++                proxy_command(upstream, root),
++                input=b"".join(json.dumps(item).encode() + b"\n" for item in messages),
++                capture_output=True,
++                check=False,
++                timeout=5,
++            )
++            self.assertNotEqual(completed.returncode, 0)
++            self.assertIn(b"client request ID is invalid", completed.stderr)
++
+     def test_mcp_proxy_tracks_and_forwards_treatment_tool_responses(self) -> None:
+         with tempfile.TemporaryDirectory() as temporary:
+             root = Path(temporary)
