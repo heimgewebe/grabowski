@@ -35,6 +35,9 @@ class PreparedSandboxCommand:
     probe_executable: str | None = None
 
 
+ANTIGRAVITY_PROFILE = "antigravity-cli-readonly-auth-v1"
+ANTIGRAVITY_SANDBOX_EXECUTABLE = Path("/opt/grabowski-external/agy")
+ANTIGRAVITY_SANDBOX_CONFIG_DIR = Path("/tmp/.gemini/antigravity-cli")
 CLAUDE_PROFILE = "claude-cli-readonly-auth-v1"
 CLAUDE_SANDBOX_EXECUTABLE = Path("/opt/grabowski-external/claude")
 CLAUDE_SANDBOX_CONFIG_DIR = Path("/tmp/.claude")
@@ -199,6 +202,31 @@ def _owner_controlled_directory(path: Path, field: str) -> Path:
     return resolved
 
 
+def _private_parented_directory(path: Path, field: str) -> Path:
+    """Require a private parent while allowing a non-writable provider subdirectory."""
+    candidate = path.expanduser()
+    if not candidate.is_absolute() or candidate.is_symlink():
+        raise AgentSandboxError(f"{field} must be an absolute non-symlink path")
+    _private_directory(candidate.parent, f"{field} parent")
+    return _owner_controlled_directory(candidate, field)
+
+
+def _antigravity_sandbox_auth_files(auth_root: Path) -> tuple[Path, Path]:
+    root = _private_parented_directory(auth_root, "Antigravity auth root")
+    token = _private_regular_file(
+        root / "antigravity-oauth-token", "Antigravity OAuth token"
+    )
+    settings = _private_regular_file(root / "settings.json", "Antigravity settings")
+    return token, settings
+
+
+def _antigravity_command_for_headless_execution(command: list[str]) -> tuple[str, ...]:
+    """Turn the catalogued one-prompt Antigravity route into print mode."""
+    if len(command) == 4 and command[1] == "--model" and not command[-1].startswith("-"):
+        return (*command[:-1], "--print", command[-1])
+    return tuple(command)
+
+
 def _canonical_grok_executable() -> Path:
     """Resolve only the owner-controlled versioned native Grok binary."""
     bin_directory = Path.home() / ".grok" / "bin"
@@ -271,8 +299,40 @@ def prepare_external_agent_command(command: list[str]) -> PreparedSandboxCommand
     if not command:
         raise AgentSandboxError("sandbox command must be non-empty")
     executable_name = Path(command[0]).name
-    if executable_name not in {"claude", "codex", "grok"}:
+    if executable_name not in {"agy", "claude", "codex", "grok"}:
         return PreparedSandboxCommand(tuple(command))
+    if executable_name == "agy":
+        antigravity_command = _antigravity_command_for_headless_execution(command)
+        executable_override = os.environ.get("GRABOWSKI_ANTIGRAVITY_BIN")
+        executable = _owner_controlled_executable(
+            executable_override or command[0], "Antigravity executable"
+        )
+        auth_root = Path(
+            os.environ.get(
+                "GRABOWSKI_ANTIGRAVITY_AUTH_ROOT",
+                str(Path.home() / ".gemini/antigravity-cli"),
+            )
+        ).expanduser()
+        token, settings = _antigravity_sandbox_auth_files(auth_root)
+        return PreparedSandboxCommand(
+            command=(str(ANTIGRAVITY_SANDBOX_EXECUTABLE), *antigravity_command[1:]),
+            extra_read_only=(
+                (executable, ANTIGRAVITY_SANDBOX_EXECUTABLE),
+                (
+                    token,
+                    ANTIGRAVITY_SANDBOX_CONFIG_DIR / "antigravity-oauth-token",
+                ),
+                (settings, ANTIGRAVITY_SANDBOX_CONFIG_DIR / "settings.json"),
+            ),
+            extra_directories=(
+                Path("/opt"),
+                Path("/opt/grabowski-external"),
+                Path("/tmp/.gemini"),
+                ANTIGRAVITY_SANDBOX_CONFIG_DIR,
+            ),
+            profile=ANTIGRAVITY_PROFILE,
+            probe_executable=str(ANTIGRAVITY_SANDBOX_EXECUTABLE),
+        )
     if executable_name == "grok":
         grok_command = _grok_command_for_headless_execution(command)
         executable_override = os.environ.get("GRABOWSKI_GROK_BIN")
