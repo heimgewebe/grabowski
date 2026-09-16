@@ -1,0 +1,235 @@
+name: PR 1227 tool schema contract remediation
+
+on:
+  push:
+    branches:
+      - fix/rab-codex-stderr-contract-20260915
+    paths:
+      - .github/workflows/pr1227-tool-schema-contract.yml
+
+permissions:
+  contents: write
+
+jobs:
+  remediate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Verify exact preimage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "3037ca44ed460bce01676126b26ceb95533f5aef"
+          test "$(git rev-parse HEAD:tools/repobrief_agent_benchmark_codex_runner.py)" = "d942ce87a12e194594fb78e963df53556ac3c730"
+          test "$(git rev-parse HEAD:tests/test_repobrief_agent_benchmark_codex_runner.py)" = "dedf5a3964ec21f843ff4a06675cfa79e3bd9388"
+      - name: Apply schema contract and regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          runner_path = Path("tools/repobrief_agent_benchmark_codex_runner.py")
+          tests_path = Path("tests/test_repobrief_agent_benchmark_codex_runner.py")
+          runner = runner_path.read_text(encoding="utf-8")
+          tests = tests_path.read_text(encoding="utf-8")
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected one preimage, found {count}")
+              return text.replace(old, new, 1)
+
+          contract = '''UPSTREAM_MCP = {"ask_context", "grounding_verify", "live_freshness"}
+          REPOGROUND_MCP_SCHEMA_CONTRACT_COMMIT = "9c24c2887b4b5724686a5051e5feb8aa54783019"
+          _REPOGROUND_SELECTOR_PROPERTIES: dict[str, Any] = {
+              "bundle_manifest": {
+                  "type": ["string", "null"],
+                  "description": "Optional exact manifest path inside the startup bundle root.",
+              },
+              "repo": {
+                  "type": ["string", "null"],
+                  "description": "Repository identity such as owner/repository or repository name.",
+              },
+              "stem": {
+                  "type": ["string", "null"],
+                  "description": "Optional exact snapshot stem.",
+              },
+          }
+
+
+          def _repoground_schema(
+              properties: Mapping[str, Any], required: Sequence[str] = ()
+          ) -> dict[str, Any]:
+              return {
+                  "type": "object",
+                  "properties": {**_REPOGROUND_SELECTOR_PROPERTIES, **dict(properties)},
+                  "required": list(required),
+                  "additionalProperties": False,
+              }
+
+
+          EXPECTED_UPSTREAM_MCP_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
+              "ask_context": _repoground_schema(
+                  {
+                      "query": {"type": "string"},
+                      "task_profile": {"type": "string", "default": "basic_repo_question"},
+                      "max_context_tokens": {"type": "integer", "minimum": 1, "default": 8000},
+                      "max_answer_tokens": {"type": "integer", "minimum": 1, "default": 1200},
+                      "k": {"type": "integer", "minimum": 1, "maximum": 100, "default": 5},
+                      "verbose": {"type": "boolean", "default": False},
+                  },
+                  ("query",),
+              ),
+              "grounding_verify": _repoground_schema(
+                  {
+                      "declaration": {"type": "object"},
+                      "citation_map": {"type": ["string", "null"]},
+                      "task_profile": {"type": ["string", "null"]},
+                      "verbose": {"type": "boolean", "default": False},
+                  },
+                  ("declaration",),
+              ),
+              "live_freshness": _repoground_schema({}),
+          }
+          '''
+          runner = replace_once(
+              runner,
+              'UPSTREAM_MCP = {"ask_context", "grounding_verify", "live_freshness"}\n',
+              contract,
+              "schema contract",
+          )
+
+          runner = replace_once(
+              runner,
+              '''        if name in counts:
+                      counts[str(name)] += 1
+                      filtered.append(item)
+          ''',
+              '''        if name in counts:
+                      expected_schema = EXPECTED_UPSTREAM_MCP_INPUT_SCHEMAS[str(name)]
+                      if item.get("inputSchema") != expected_schema:
+                          raise RunnerError(
+                              f"RepoGround treatment tool inputSchema drifted for {name}"
+                          )
+                      counts[str(name)] += 1
+                      filtered.append(item)
+          ''',
+              "schema validation",
+          )
+
+          helper_anchor = '\n\nclass RepoBriefCodexRunnerTests(unittest.TestCase):\n'
+          helper = '''
+
+          def treatment_tools() -> list[dict]:
+              return [
+                  {
+                      "name": name,
+                      "inputSchema": json.loads(
+                          json.dumps(runner.EXPECTED_UPSTREAM_MCP_INPUT_SCHEMAS[name])
+                      ),
+                  }
+                  for name in sorted(runner.UPSTREAM_MCP)
+              ]
+
+
+          class RepoBriefCodexRunnerTests(unittest.TestCase):
+          '''
+          tests = replace_once(tests, helper_anchor, helper, "test inventory helper")
+
+          old_test = '''    def test_treatment_tools_require_every_upstream_capability_exactly_once(self) -> None:
+                  valid = {
+                      "tools": [
+                          {"name": "ask_context"},
+                          {"name": "grounding_verify"},
+                          {"name": "live_freshness"},
+                          {"name": "find_symbol"},
+                      ]
+                  }
+                  self.assertEqual(
+                      {item["name"] for item in runner._filtered_treatment_tools(valid)},
+                      runner.ALLOWED_MCP,
+                  )
+                  missing = {"tools": [
+                      {"name": "ask_context"},
+                      {"name": "grounding_verify"},
+                      {"name": "find_symbol"},
+                  ]}
+                  with self.assertRaisesRegex(runner.RunnerError, "exactly once"):
+                      runner._filtered_treatment_tools(missing)
+                  duplicate = {"tools": valid["tools"] + [{"name": "ask_context"}]}
+                  with self.assertRaisesRegex(runner.RunnerError, "exactly once"):
+                      runner._filtered_treatment_tools(duplicate)
+          '''
+          new_test = '''    def test_treatment_tools_require_every_upstream_capability_exactly_once(self) -> None:
+                  valid = {"tools": [*treatment_tools(), {"name": "find_symbol"}]}
+                  self.assertEqual(
+                      {item["name"] for item in runner._filtered_treatment_tools(valid)},
+                      runner.ALLOWED_MCP,
+                  )
+                  missing = {
+                      "tools": [
+                          item for item in treatment_tools() if item["name"] != "live_freshness"
+                      ] + [{"name": "find_symbol"}]
+                  }
+                  with self.assertRaisesRegex(runner.RunnerError, "exactly once"):
+                      runner._filtered_treatment_tools(missing)
+                  duplicate = {
+                      "tools": [
+                          *treatment_tools(),
+                          json.loads(json.dumps(treatment_tools()[0])),
+                      ]
+                  }
+                  with self.assertRaisesRegex(runner.RunnerError, "exactly once"):
+                      runner._filtered_treatment_tools(duplicate)
+
+              def test_treatment_tools_require_exact_upstream_input_schemas(self) -> None:
+                  missing_schema = {"tools": treatment_tools()}
+                  missing_schema["tools"][0].pop("inputSchema")
+                  with self.assertRaisesRegex(runner.RunnerError, "inputSchema drifted"):
+                      runner._filtered_treatment_tools(missing_schema)
+
+                  drifted_schema = {"tools": treatment_tools()}
+                  drifted_schema["tools"][0]["inputSchema"]["additionalProperties"] = True
+                  with self.assertRaisesRegex(runner.RunnerError, "inputSchema drifted"):
+                      runner._filtered_treatment_tools(drifted_schema)
+          '''
+          tests = replace_once(tests, old_test, new_test, "schema regression")
+
+          tests = replace_once(
+              tests,
+              '"result": {"tools": [{"name": name} for name in sorted(runner.UPSTREAM_MCP)]},',
+              '"result": {"tools": treatment_tools()},',
+              "race inventory fixture",
+          )
+
+          old_surface = "\"    elif method=='tools/list':\\n\"\n                \"        print(json.dumps({'jsonrpc':'2.0','id':ident,'result':{'tools':[{'name':'ask_context'},{'name':'grounding_verify'},{'name':'live_freshness'},{'name':'find_symbol'}]}}),flush=True)\\n\""
+          surface_inventory = [*[]]
+          new_surface = "\"    elif method=='tools/list':\\n\"\n                f\"        print(json.dumps({{'jsonrpc':'2.0','id':ident,'result':{{'tools':{[ *[{'name': name, 'inputSchema': runner.EXPECTED_UPSTREAM_MCP_INPUT_SCHEMAS[name]} for name in sorted(runner.UPSTREAM_MCP)], {'name': 'find_symbol'} ]!r}}}}}}),flush=True)\\n\""
+          tests = replace_once(tests, old_surface, new_surface, "surface inventory fixture")
+
+          runner_path.write_text(runner, encoding="utf-8")
+          tests_path.write_text(tests, encoding="utf-8")
+          compile(runner, str(runner_path), "exec")
+          compile(tests, str(tests_path), "exec")
+          PY
+      - name: Focused validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/test_repobrief_agent_benchmark_codex_runner.py
+          git diff --check
+          python3 tools/check_no_secrets.py
+      - name: Publish code-only fix and remove bootstrap workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/pr1227-tool-schema-contract.yml
+          git add tools/repobrief_agent_benchmark_codex_runner.py tests/test_repobrief_agent_benchmark_codex_runner.py .github/workflows/pr1227-tool-schema-contract.yml
+          git diff --cached --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix(rab): bind treatment tool input schemas'
+          git push origin HEAD:fix/rab-codex-stderr-contract-20260915
