@@ -3586,6 +3586,29 @@ class AgentWorkspaceTests(unittest.TestCase):
 
         self.assertEqual(arguments, [])
 
+    def _write_adler_lane_receipt(
+        self, lane_root: Path, lane_id: str, worktree: Path
+    ) -> None:
+        lane_root.mkdir(parents=True, mode=0o700)
+        inputs = {
+            "lane_id": lane_id,
+            "lease_owner_id": f"lane:{lane_id}",
+            "target_path": str(worktree.resolve()),
+        }
+        receipt = {
+            "kind": "grabowski.work_lane",
+            "schema_version": 1,
+            "lane_id": lane_id,
+            "state": "ready",
+            "terminal_closeout": None,
+            "inputs": inputs,
+            "inputs_sha256": sandbox._json_sha256(inputs),
+        }
+        receipt["receipt_sha256"] = sandbox._json_sha256(receipt)
+        path = lane_root / f"{lane_id}.json"
+        path.write_text(json.dumps(receipt), encoding="utf-8")
+        path.chmod(0o600)
+
     def test_adler_inbox_target_is_bound_read_only_into_agent_sandbox(self) -> None:
         lane_id = "a" * 32
         state_root = self.root / "adler-state"
@@ -3597,7 +3620,15 @@ class AgentWorkspaceTests(unittest.TestCase):
         sidecar = self.git.repo / ".adler"
         sidecar.mkdir(mode=0o700)
         (sidecar / "inbox.json").symlink_to(target)
-        with mock.patch.dict(os.environ, {"GROSSER_ADLER_STATE_ROOT": str(state_root)}):
+        lane_root = self.root / "adler-test-work-lanes"
+        self._write_adler_lane_receipt(lane_root, lane_id, self.git.repo)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GROSSER_ADLER_STATE_ROOT": str(state_root),
+                "GRABOWSKI_WORK_LANE_ROOT": str(lane_root),
+            },
+        ):
             argv = sandbox.minimal_sandbox_argv(
                 workspace=self.git.repo,
                 command=["/usr/bin/true"],
@@ -3618,7 +3649,44 @@ class AgentWorkspaceTests(unittest.TestCase):
         sidecar = self.git.repo / ".adler"
         sidecar.mkdir(mode=0o700)
         (sidecar / "inbox.json").symlink_to(target)
-        with mock.patch.dict(os.environ, {"GROSSER_ADLER_STATE_ROOT": str(state_root)}):
+        lane_root = self.root / "adler-missing-work-lanes"
+        self._write_adler_lane_receipt(lane_root, lane_id, self.git.repo)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GROSSER_ADLER_STATE_ROOT": str(state_root),
+                "GRABOWSKI_WORK_LANE_ROOT": str(lane_root),
+            },
+        ):
+            argv = sandbox.minimal_sandbox_argv(
+                workspace=self.git.repo,
+                command=["/usr/bin/true"],
+                workspace_writable=False,
+            )
+        self.assertNotIn(str(target), argv)
+
+    def test_adler_inbox_pointer_cannot_cross_authenticated_lane_boundary(self) -> None:
+        lane_id = "c" * 32
+        state_root = self.root / "adler-state-cross-lane"
+        inbox_root = state_root / "worktree-inboxes"
+        inbox_root.mkdir(parents=True, mode=0o700)
+        target = inbox_root / f"{lane_id}.json"
+        target.write_text('{"findings": ["private"]}\n', encoding="utf-8")
+        target.chmod(0o600)
+        sidecar = self.git.repo / ".adler"
+        sidecar.mkdir(mode=0o700)
+        (sidecar / "inbox.json").symlink_to(target)
+        other_worktree = self.root / "other-worktree"
+        other_worktree.mkdir()
+        lane_root = self.root / "cross-lane-work-lanes"
+        self._write_adler_lane_receipt(lane_root, lane_id, other_worktree)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GROSSER_ADLER_STATE_ROOT": str(state_root),
+                "GRABOWSKI_WORK_LANE_ROOT": str(lane_root),
+            },
+        ):
             argv = sandbox.minimal_sandbox_argv(
                 workspace=self.git.repo,
                 command=["/usr/bin/true"],

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import json
 import os
 from pathlib import Path
 import selectors
@@ -536,6 +537,100 @@ def _grosser_adler_inbox_root() -> Path:
     return state_root / "worktree-inboxes"
 
 
+def _grabowski_work_lane_root() -> Path:
+    configured = os.environ.get("GRABOWSKI_WORK_LANE_ROOT")
+    if configured:
+        return Path(configured).expanduser()
+    state_home = Path(
+        os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))
+    ).expanduser()
+    return state_home / "grabowski" / "work-lanes"
+
+
+def _json_sha256(value: object) -> str:
+    raw = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _authenticated_work_lane_target(worktree: Path, lane_id: str) -> bool:
+    """Authenticate one untrusted lane id through Grabowski-owned state."""
+    receipt_path = _grabowski_work_lane_root() / f"{lane_id}.json"
+    try:
+        root = _grabowski_work_lane_root()
+        root_info = root.lstat()
+        if (
+            not stat.S_ISDIR(root_info.st_mode)
+            or stat.S_ISLNK(root_info.st_mode)
+            or root_info.st_uid != os.getuid()
+            or stat.S_IMODE(root_info.st_mode) & 0o077
+        ):
+            return False
+        flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(receipt_path, flags)
+        try:
+            info = os.fstat(fd)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) & 0o077
+                or info.st_size > 1_048_576
+            ):
+                return False
+            chunks: list[bytes] = []
+            remaining = info.st_size
+            while remaining:
+                chunk = os.read(fd, min(remaining, 64 * 1024))
+                if not chunk:
+                    return False
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
+        finally:
+            os.close(fd)
+        receipt = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(receipt, dict):
+        return False
+    if (
+        receipt.get("kind") != "grabowski.work_lane"
+        or receipt.get("schema_version") != 1
+        or receipt.get("lane_id") != lane_id
+        or receipt.get("state") != "ready"
+        or receipt.get("terminal_closeout") is not None
+    ):
+        return False
+    supplied_receipt_sha = receipt.get("receipt_sha256")
+    material = {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+    if (
+        not isinstance(supplied_receipt_sha, str)
+        or supplied_receipt_sha != _json_sha256(material)
+    ):
+        return False
+    inputs = receipt.get("inputs")
+    if (
+        not isinstance(inputs, dict)
+        or receipt.get("inputs_sha256") != _json_sha256(inputs)
+    ):
+        return False
+    if (
+        inputs.get("lane_id") != lane_id
+        or inputs.get("lease_owner_id") != f"lane:{lane_id}"
+    ):
+        return False
+    target_path = inputs.get("target_path")
+    if not isinstance(target_path, str):
+        return False
+    try:
+        authenticated_target = Path(target_path).expanduser().resolve(strict=True)
+    except OSError:
+        return False
+    return authenticated_target == worktree
+
+
 def _adler_inbox_sandbox_binding(worktree: Path) -> tuple[tuple[tuple[Path, Path], ...], tuple[Path, ...]]:
     """Expose only one exact worktree inbox target read-only when safely present.
 
@@ -564,6 +659,8 @@ def _adler_inbox_sandbox_binding(worktree: Path) -> tuple[tuple[tuple[Path, Path
             or len(name[:-5]) != 32
             or any(ch not in "0123456789abcdef" for ch in name[:-5])
         ):
+            return (), ()
+        if not _authenticated_work_lane_target(worktree, name[:-5]):
             return (), ()
         source = _private_regular_file(target, "Großer Adler worktree inbox")
     except (OSError, AgentSandboxError):
