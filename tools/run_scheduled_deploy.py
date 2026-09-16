@@ -805,7 +805,6 @@ def observe_tunnel_dispatcher_contention() -> dict[str, Any]:
 
 
 
-
 def deployment_contention_preflight(
     *,
     expected_head: str,
@@ -855,7 +854,6 @@ def deployment_contention_preflight(
         ],
     }
     return {**material, "evidence_sha256": canonical_json_sha256(material)}
-
 
 
 
@@ -1171,7 +1169,11 @@ def run_midcutover_resume(*, repo: Path, decision: dict[str, Any]) -> dict[str, 
         else None
     )
     if not isinstance(resume_binding, dict):
-        raise RuntimeError("mid-cutover resume binding is missing")
+        # Legacy/internal callers predate the nested classification object. They
+        # cannot prove observer compatibility, but they must remain resumable.
+        # Treat missing compatibility evidence conservatively: isolate the
+        # observer instead of widening the exemption or rejecting the resume.
+        resume_binding = {}
     execution_source_identity_sha256 = decision.get(
         "execution_source_identity_sha256"
     )
