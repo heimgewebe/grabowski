@@ -1485,6 +1485,29 @@ class WorktreeEnsureTests(unittest.TestCase):
         self.assertTrue(Path(os.readlink(pointer)).is_absolute())
         self.assertEqual(os.readlink(pointer), str(expected))
 
+    def test_unresolvable_adler_state_root_is_nonblocking(self) -> None:
+        lane_id = "e" * 32
+        worktree = self.worktree_root / "unresolvable-adler-root"
+        worktree.mkdir()
+        inputs = {
+            "lease_owner_id": f"lane:{lane_id}",
+            "source_kind": "work_lane",
+            "source_id": lane_id,
+            "target_path": str(worktree),
+        }
+        loop_a = self.root / "adler-state-loop-a"
+        loop_b = self.root / "adler-state-loop-b"
+        loop_a.symlink_to(loop_b.name)
+        loop_b.symlink_to(loop_a.name)
+
+        with patch.dict(os.environ, {"GROSSER_ADLER_STATE_ROOT": str(loop_a)}):
+            result = worktree_ensure._configure_adler_sidecar_pointer(inputs)
+
+        self.assertEqual(result["state"], "unavailable")
+        self.assertFalse(result["blocking"])
+        self.assertEqual(result["absence_semantics"], "unknown_not_no_findings")
+        self.assertFalse((worktree / ".adler").exists())
+
     def test_adler_pointer_problem_is_nonblocking_and_does_not_replace_foreign_metadata(self) -> None:
         lane_id = "b" * 32
         worktree = self.worktree_root / "existing"

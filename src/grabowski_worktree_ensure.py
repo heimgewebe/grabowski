@@ -1004,11 +1004,11 @@ def _configure_adler_sidecar_pointer(inputs: dict[str, Any]) -> dict[str, Any]:
         return {"state": "not_applicable", "reason": "checkout_is_not_exact_work_lane_owned"}
     worktree = Path(str(inputs["target_path"]))
     sidecar = worktree / ".adler"
-    expected_target = _grosser_adler_inbox_root() / f"{lane_id}.json"
     created_dir = False
     created_gitignore = False
     created_pointer = False
     try:
+        expected_target = _grosser_adler_inbox_root() / f"{lane_id}.json"
         try:
             sidecar.mkdir(mode=0o700)
             created_dir = True
