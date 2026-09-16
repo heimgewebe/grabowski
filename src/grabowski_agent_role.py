@@ -8,6 +8,7 @@ from pathlib import Path, PurePosixPath
 import stat
 import subprocess
 import sys
+import tempfile
 from typing import Any
 
 from grabowski_agent_sandbox import minimal_sandbox_argv, prepare_external_agent_command, runtime_sandbox_argv, safe_git_environment, run_bounded_capture
@@ -30,6 +31,7 @@ GROK_REVIEW_STREAM_CONTRACT = "grok-streaming-json-bound-diff-review-v2"
 GROK_REVIEW_TOOLS = "todo_write"
 GROK_REVIEW_DISALLOWED_TOOLS = "todo_write,search_tool,use_tool,run_terminal_cmd,run_terminal_command"
 GROK_REVIEW_MAX_TURNS = 2
+GROK_REVIEW_PROMPT_TARGET = Path("/tmp/grabowski-bound-review-prompt")
 GROK_REVIEW_EVENT_TYPES = frozenset(
     {
         "text",
@@ -367,7 +369,13 @@ def _declared_virtualenv_binding(repo: Path, command: list[str]) -> tuple[list[t
     return [(source_root, target_root)], directories
 
 
-def sandbox_argv(repo: Path, command: list[str], *, declared_command: list[str] | None = None) -> list[str]:
+def sandbox_argv(
+    repo: Path,
+    command: list[str],
+    *,
+    declared_command: list[str] | None = None,
+    additional_read_only: tuple[tuple[Path, Path], ...] = (),
+) -> list[str]:
     common_raw = git_text(repo, "rev-parse", "--git-common-dir")
     common = Path(common_raw)
     if not common.is_absolute():
@@ -381,7 +389,7 @@ def sandbox_argv(repo: Path, command: list[str], *, declared_command: list[str] 
         command=actual_command,
         workspace_writable=False,
         git_common_dir=common,
-        extra_read_only=(*prepared.extra_read_only, *venv_read_only),
+        extra_read_only=(*prepared.extra_read_only, *venv_read_only, *additional_read_only),
         extra_read_write=prepared.extra_read_write,
         extra_directories=(*prepared.extra_directories, *venv_directories),
     )
@@ -634,6 +642,27 @@ def _grok_streaming_review_command(
     return tuple(command), prompt
 
 
+
+def _materialize_grok_review_prompt(prompt: bytes) -> Path:
+    """Persist one bound prompt as a private file for Grok's path-only CLI."""
+    handle = tempfile.NamedTemporaryFile(
+        mode="wb",
+        prefix="grabowski-grok-review-",
+        delete=False,
+    )
+    path = Path(handle.name)
+    try:
+        os.fchmod(handle.fileno(), 0o600)
+        handle.write(prompt)
+        handle.flush()
+        os.fsync(handle.fileno())
+    except BaseException:
+        handle.close()
+        path.unlink(missing_ok=True)
+        raise
+    handle.close()
+    return path
+
 def _review_sandbox_argv(
     repo: Path,
     command: list[str],
@@ -641,9 +670,9 @@ def _review_sandbox_argv(
     expected_head: str,
     expected_base_head: str,
     review_diff: bytes,
-) -> tuple[list[str], str | None, bytes | None]:
+) -> tuple[list[str], str | None, bytes | None, Path | None]:
     if Path(command[0]).name != "grok":
-        return sandbox_argv(repo, command), None, None
+        return sandbox_argv(repo, command), None, None, None
     prepared = prepare_external_agent_command(command)
     actual, prompt_bytes = _grok_streaming_review_command(
         prepared.command,
@@ -651,11 +680,22 @@ def _review_sandbox_argv(
         expected_base_head=expected_base_head,
         review_diff=review_diff,
     )
-    return (
-        sandbox_argv(repo, list(actual), declared_command=command),
-        GROK_REVIEW_STREAM_CONTRACT,
-        prompt_bytes,
+    prompt_path = _materialize_grok_review_prompt(prompt_bytes)
+    actual = tuple(
+        str(GROK_REVIEW_PROMPT_TARGET) if item == "/dev/stdin" else item
+        for item in actual
     )
+    try:
+        sandbox = sandbox_argv(
+            repo,
+            list(actual),
+            declared_command=command,
+            additional_read_only=((prompt_path, GROK_REVIEW_PROMPT_TARGET),),
+        )
+    except BaseException:
+        prompt_path.unlink(missing_ok=True)
+        raise
+    return sandbox, GROK_REVIEW_STREAM_CONTRACT, prompt_bytes, prompt_path
 
 
 def _terminal_json_object(text: str) -> dict[str, Any] | None:
@@ -861,6 +901,7 @@ def main(argv: list[str] | None = None) -> int:
     review_input: bytes | None = None
     review_input_source: str | None = None
     review_stdin: bytes | None = None
+    review_prompt_path: Path | None = None
     if args.role == "review":
         if Path(command[0]).name == "grok":
             if expected_dirty:
@@ -879,7 +920,7 @@ def main(argv: list[str] | None = None) -> int:
                 review_input_source = "committed_diff"
         elif review_artifact_declared:
             raise RuntimeError("review input artifact is only valid for Grok review")
-        role_sandbox_argv, review_provider_contract, review_stdin = _review_sandbox_argv(
+        role_sandbox_argv, review_provider_contract, review_stdin, review_prompt_path = _review_sandbox_argv(
             repo,
             command,
             expected_head=args.expected_head,
@@ -895,13 +936,17 @@ def main(argv: list[str] | None = None) -> int:
             if review_provider_contract == GROK_REVIEW_STREAM_CONTRACT
             else MAX_REVIEW_JSON_BYTES
         )
-    completed = run_bounded_capture(
-        runtime_sandbox_argv(role_sandbox_argv),
-        stdout_limit=MAX_ROLE_OUTPUT_BYTES,
-        stderr_limit=MAX_ROLE_OUTPUT_BYTES,
-        stdout_content_limit=review_content_limit,
-        stdin_content=review_stdin,
-    )
+    try:
+        completed = run_bounded_capture(
+            runtime_sandbox_argv(role_sandbox_argv),
+            stdout_limit=MAX_ROLE_OUTPUT_BYTES,
+            stderr_limit=MAX_ROLE_OUTPUT_BYTES,
+            stdout_content_limit=review_content_limit,
+            stdin_content=None if review_prompt_path is not None else review_stdin,
+        )
+    finally:
+        if review_prompt_path is not None:
+            review_prompt_path.unlink(missing_ok=True)
     after_head, after_diff, after_dirty = current_binding(repo, args.expected_base_head)
     payload: dict[str, Any] = {
         "schema_version": 1,
