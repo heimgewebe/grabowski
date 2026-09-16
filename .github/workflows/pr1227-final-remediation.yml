@@ -21,7 +21,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "5b59fa4aed6cf3d95b81069a1205c34c456079a5"
+          test "$(git rev-parse HEAD^)" = "a8544b2f2517ffded6c67b1108e1bb9e25bce5c6"
           test "$(git rev-parse HEAD:tools/repobrief_agent_benchmark_codex_runner.py)" = "b20137c91ef729e4e124c0f07e6ad52c41b5e1ec"
           test "$(git rev-parse HEAD:tests/test_repobrief_agent_benchmark_codex_runner.py)" = "3d4282865c0d92694b4af4d7cb383587a6382a4c"
       - name: Apply reviewed fixes and regression coverage
@@ -132,12 +132,12 @@ jobs:
           tests = replace_once(
               tests,
               '''            "sh -lc 'cat src/example.py'",
-                          "bash -lc 'cat src/example.py'",
+              "bash -lc 'cat src/example.py'",
           ''',
               '''            "sh -lc 'cat src/example.py'",
-                          "bash -lc 'cat src/example.py'",
-                          "rg needle src\\ncat secret",
-                          "cat src/example.py\\r\\nrg needle src",
+              "bash -lc 'cat src/example.py'",
+              "rg needle src\\ncat secret",
+              "cat src/example.py\\r\\nrg needle src",
           ''',
               "line-break rejection cases",
           )
