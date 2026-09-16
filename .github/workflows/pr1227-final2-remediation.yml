@@ -1,0 +1,251 @@
+name: PR 1227 fresh exact-head remediation
+
+on:
+  push:
+    branches:
+      - fix/rab-codex-stderr-contract-20260915
+    paths:
+      - .github/workflows/pr1227-final2-remediation.yml
+
+permissions:
+  contents: write
+
+jobs:
+  remediate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Verify exact preimage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "26a283c561add3c8a2d1d5e5c360ae68cf63c522"
+          test "$(git rev-parse HEAD:tools/repobrief_agent_benchmark_codex_runner.py)" = "a417911a1a93c28dd61fd1eda30cc6dcfabb1c19"
+          test "$(git rev-parse HEAD:tests/test_repobrief_agent_benchmark_codex_runner.py)" = "6ed32b3268a0d9eaec03be48e8876f6a42b44a8d"
+      - name: Apply fixes and regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          runner_path = Path("tools/repobrief_agent_benchmark_codex_runner.py")
+          tests_path = Path("tests/test_repobrief_agent_benchmark_codex_runner.py")
+          runner = runner_path.read_text(encoding="utf-8")
+          tests = tests_path.read_text(encoding="utf-8")
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected one preimage, found {count}")
+              return text.replace(old, new, 1)
+
+          runner = replace_once(
+              runner,
+              "import argparse\nfrom datetime import datetime, timezone\n",
+              "import argparse\nimport ctypes\nfrom datetime import datetime, timezone\n",
+              "ctypes import",
+          )
+
+          run_anchor = "def run_bounded(\n"
+          subreaper = '''def _enable_child_subreaper() -> None:
+              """Adopt orphaned provider descendants so this runner can reap them."""
+              if not sys.platform.startswith("linux"):
+                  raise RunnerError("provider containment requires Linux child-subreaper support")
+              try:
+                  libc = ctypes.CDLL(None, use_errno=True)
+                  prctl = libc.prctl
+              except (OSError, AttributeError) as exc:
+                  raise RunnerError("provider containment cannot access prctl") from exc
+              prctl.argtypes = [
+                  ctypes.c_int,
+                  ctypes.c_ulong,
+                  ctypes.c_ulong,
+                  ctypes.c_ulong,
+                  ctypes.c_ulong,
+              ]
+              prctl.restype = ctypes.c_int
+              if prctl(36, 1, 0, 0, 0) != 0:  # Linux PR_SET_CHILD_SUBREAPER
+                  error = ctypes.get_errno()
+                  raise RunnerError(
+                      f"provider containment cannot enable child subreaper: {os.strerror(error)}"
+                  )
+
+
+          '''
+          runner = replace_once(runner, run_anchor, subreaper + run_anchor, "subreaper helper")
+          runner = replace_once(
+              runner,
+              '    try:\n        process = subprocess.Popen(\n',
+              '    _enable_child_subreaper()\n\n    try:\n        process = subprocess.Popen(\n',
+              "enable subreaper before Popen",
+          )
+          runner = replace_once(
+              runner,
+              '    def contain_surviving_process_group() -> None:\n'
+              '        if not process_group_exists():\n'
+              '            return\n'
+              '        note_error("process_group_survived_provider_exit")\n'
+              '        kill_process_tree()\n'
+              '        cleanup_deadline = time.monotonic() + 1.0\n'
+              '        while time.monotonic() < cleanup_deadline:\n'
+              '            if not process_group_exists():\n'
+              '                return\n'
+              '            time.sleep(0.01)\n'
+              '        if process_group_exists():\n'
+              '            note_error("process_group_cleanup_failed")\n',
+              '    def reap_process_group_children() -> None:\n'
+              '        while True:\n'
+              '            try:\n'
+              '                child_pid, _status = os.waitpid(-process.pid, os.WNOHANG)\n'
+              '            except ChildProcessError:\n'
+              '                return\n'
+              '            except OSError as exc:\n'
+              '                note_error(f"process_group_reap_failed:{type(exc).__name__}")\n'
+              '                return\n'
+              '            if child_pid == 0:\n'
+              '                return\n\n'
+              '    def contain_surviving_process_group() -> None:\n'
+              '        if not process_group_exists():\n'
+              '            return\n'
+              '        note_error("process_group_survived_provider_exit")\n'
+              '        kill_process_tree()\n'
+              '        cleanup_deadline = time.monotonic() + 1.0\n'
+              '        while time.monotonic() < cleanup_deadline:\n'
+              '            reap_process_group_children()\n'
+              '            if not process_group_exists():\n'
+              '                return\n'
+              '            time.sleep(0.01)\n'
+              '        reap_process_group_children()\n'
+              '        if process_group_exists():\n'
+              '            note_error("process_group_cleanup_failed")\n',
+              "subreaper group cleanup",
+          )
+
+          split_anchor = "def _split_shell_words(text: str) -> list[str]:\n"
+          expansion_guard = '''def _reject_unquoted_shell_expansion(text: str) -> None:
+              quote: str | None = None
+              escaped = False
+              for char in text:
+                  if escaped:
+                      escaped = False
+                      continue
+                  if quote == "'":
+                      if char == "'":
+                          quote = None
+                      continue
+                  if char == "\\\\":
+                      escaped = True
+                      continue
+                  if quote == '"':
+                      if char == '"':
+                          quote = None
+                      elif char in {"$", "`"}:
+                          raise RunnerError("shell expansion is not allowed")
+                      continue
+                  if char in {"'", '"'}:
+                      quote = char
+                      continue
+                  if char in {"$", "`", "*", "?", "[", "]", "{", "}", "~", "!", "(", ")"}:
+                      raise RunnerError("shell expansion is not allowed")
+
+
+          '''
+          runner = replace_once(runner, split_anchor, expansion_guard + split_anchor, "shell expansion guard")
+          runner = replace_once(
+              runner,
+              '    if "\\n" in text or "\\r" in text:\n        raise RunnerError("command line breaks are not allowed")\n    if "$(" in text or "`" in text:\n',
+              '    if "\\n" in text or "\\r" in text:\n        raise RunnerError("command line breaks are not allowed")\n    _reject_unquoted_shell_expansion(text)\n    if "$(" in text or "`" in text:\n',
+              "invoke shell expansion guard",
+          )
+
+          runner = replace_once(
+              runner,
+              '        request = json.load(sys.stdin)\n'
+              '        if not isinstance(request, dict):\n'
+              '            raise RunnerError("stdin request must be one JSON object")\n',
+              '        request = base._load_object_bytes(\n'
+              '            base._bounded_stdin(), label="stdin request"\n'
+              '        )\n',
+              "bounded request stdin",
+          )
+
+          tests = replace_once(
+              tests,
+              '        self.assertEqual(runner.command_kind("rg -n \'foo|bar\' src"), "grep")\n',
+              '        self.assertEqual(runner.command_kind("rg -n \'foo|bar\' src"), "grep")\n'
+              '        self.assertEqual(runner.command_kind("rg \'foo{1,3}\' src"), "grep")\n',
+              "quoted expansion-like regex remains allowed",
+          )
+          tests = replace_once(
+              tests,
+              '            "cat src/example.py >| output",\n        ):\n',
+              '            "cat src/example.py >| output",\n'
+              '            "rg {needle,../sibling}",\n'
+              '            "rg needle --glob *.py",\n'
+              '            \'rg "$HOME" src\',\n'
+              '        ):\n',
+              "shell expansion regressions",
+          )
+          tests = replace_once(
+              tests,
+              '            self.assertIn("process_group_survived_provider_exit", str(capture["capture_error"]))\n'
+              '            child_pid = int(child_state.read_text())\n',
+              '            self.assertIn("process_group_survived_provider_exit", str(capture["capture_error"]))\n'
+              '            self.assertNotIn("process_group_cleanup_failed", str(capture["capture_error"]))\n'
+              '            child_pid = int(child_state.read_text())\n',
+              "subreaper cleanup assertion",
+          )
+
+          final_anchor = '\n\n\nif __name__ == "__main__":\n'
+          request_test = '''
+              def test_main_rejects_oversized_request_before_json_decode(self) -> None:
+                  with tempfile.TemporaryDirectory() as temporary:
+                      root = Path(temporary)
+                      command = [
+                          sys.executable,
+                          str(MODULE_PATH),
+                          "--request-root", str(root / "requests"),
+                          "--repository-map", str(root / "repository-map.json"),
+                          "--state-root", str(root / "state"),
+                          "--transcript-root", str(root / "transcripts"),
+                          "--provider-evidence-root", str(root / "provider-evidence"),
+                      ]
+                      completed = subprocess.run(
+                          command,
+                          input=b"x" * (runner.base.MAX_REQUEST_BYTES + 1),
+                          capture_output=True,
+                          check=False,
+                          timeout=5,
+                      )
+                      self.assertEqual(completed.returncode, 2)
+                      self.assertIn(
+                          f"request exceeds {runner.base.MAX_REQUEST_BYTES} bytes".encode(),
+                          completed.stderr,
+                      )
+          '''
+          tests = replace_once(tests, final_anchor, "\n" + request_test + final_anchor, "bounded request regression")
+
+          runner_path.write_text(runner, encoding="utf-8")
+          tests_path.write_text(tests, encoding="utf-8")
+          PY
+      - name: Focused validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/test_repobrief_agent_benchmark_codex_runner.py
+          git diff --check
+          python3 tools/check_no_secrets.py
+      - name: Publish code-only fix and remove bootstrap workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/pr1227-final2-remediation.yml
+          git add tools/repobrief_agent_benchmark_codex_runner.py tests/test_repobrief_agent_benchmark_codex_runner.py .github/workflows/pr1227-final2-remediation.yml
+          git diff --cached --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix(rab): close fresh exact-head review gaps'
+          git push origin HEAD:fix/rab-codex-stderr-contract-20260915
