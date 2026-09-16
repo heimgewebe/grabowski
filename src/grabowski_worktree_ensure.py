@@ -723,6 +723,7 @@ def _public_output(
     replayed: bool,
     recovered: bool,
     lifecycle_override: dict[str, Any] | None = None,
+    adler_sidecar_override: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     result_state = record.get("result_state")
     receipt_status = "passed" if result_state in SUCCESS_STATES else ("blocked" if result_state in {"CONFLICT", "REJECTED_BY_LEASE"} else "failed")
@@ -750,7 +751,11 @@ def _public_output(
         "lifecycle": lifecycle,
         "lifecycle_reservation": record.get("lifecycle_reservation"),
         "work_admission": record.get("work_admission"),
-        "adler_sidecar": record.get("adler_sidecar"),
+        "adler_sidecar": (
+            adler_sidecar_override
+            if adler_sidecar_override is not None
+            else record.get("adler_sidecar")
+        ),
         **(
             {"checkout_capacity": record["checkout_capacity"]}
             if isinstance(record.get("checkout_capacity"), dict)
@@ -950,12 +955,12 @@ LANE_OWNER_RE = re.compile(r"^lane:([0-9a-f]{32})$")
 def _grosser_adler_inbox_root() -> Path:
     configured = os.environ.get("GROSSER_ADLER_STATE_ROOT")
     if configured:
-        state_root = Path(configured).expanduser()
+        state_root = Path(configured).expanduser().resolve()
     else:
         state_home = Path(
             os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))
         ).expanduser()
-        state_root = state_home / "grosser-adler"
+        state_root = (state_home / "grosser-adler").resolve()
     return state_root / "worktree-inboxes"
 
 
@@ -1127,12 +1132,18 @@ def ensure_worktree(
             if result_state in SUCCESS_STATES and not isinstance(lifecycle, dict):
                 assert observation is not None
                 lifecycle = _bind_checkout_lifecycle(inputs, observation, existing["lease"])
+            current_adler_sidecar = (
+                _configure_adler_sidecar_pointer(inputs)
+                if result_state in SUCCESS_STATES
+                else None
+            )
             return _public_output(
                 existing,
                 receipt_path,
                 replayed=True,
                 recovered=False,
                 lifecycle_override=lifecycle if isinstance(lifecycle, dict) else None,
+                adler_sidecar_override=current_adler_sidecar,
             )
 
         recovering_intent = existing is not None and existing.get("state") == "intent"
