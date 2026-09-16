@@ -295,6 +295,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertEqual(runner.command_kind("rg -g '*.py' --files src"), "glob")
         self.assertEqual(runner.command_kind("rg example src"), "grep")
         self.assertEqual(runner.command_kind("rg -n 'foo|bar' src"), "grep")
+        self.assertEqual(runner.command_kind("rg 'foo{1,3}' src"), "grep")
         self.assertEqual(runner.command_kind("rg --regexp=example src"), "grep")
         self.assertEqual(runner.command_kind("cat src/example.py"), "read_file")
         self.assertEqual(runner.command_kind("sed -n '1,2p' src/example.py"), "read_file")
@@ -327,6 +328,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             "cat src/example.py >& output",
             "cat src/example.py <<< data",
             "cat src/example.py >| output",
+            "rg {needle,../sibling}",
+            "rg needle --glob *.py",
+            'rg "$HOME" src',
         ):
             with self.subTest(command=command):
                 with self.assertRaises(runner.RunnerError):
@@ -848,6 +852,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 [sys.executable, str(script)], cwd=root, timeout_seconds=3, stdin_data=b""
             )
             self.assertIn("process_group_survived_provider_exit", str(capture["capture_error"]))
+            self.assertNotIn("process_group_cleanup_failed", str(capture["capture_error"]))
             child_pid = int(child_state.read_text())
             deadline = time.monotonic() + 2
             while True:
@@ -1046,6 +1051,32 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             runner._freeze_resource_result({"resources": [], "nextCursor": "more"})
         with self.assertRaisesRegex(runner.RunnerError, "duplicate"):
             runner._freeze_resource_result({"resources": [{"uri":"x"},{"uri":"x"}]})
+
+
+    def test_main_rejects_oversized_request_before_json_decode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command = [
+                sys.executable,
+                str(MODULE_PATH),
+                "--request-root", str(root / "requests"),
+                "--repository-map", str(root / "repository-map.json"),
+                "--state-root", str(root / "state"),
+                "--transcript-root", str(root / "transcripts"),
+                "--provider-evidence-root", str(root / "provider-evidence"),
+            ]
+            completed = subprocess.run(
+                command,
+                input=b"x" * (runner.base.MAX_REQUEST_BYTES + 1),
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn(
+                f"request exceeds {runner.base.MAX_REQUEST_BYTES} bytes".encode(),
+                completed.stderr,
+            )
 
 
 

@@ -13,6 +13,7 @@ call and are the supported way to qualify the contract before a one-shot run.
 from __future__ import annotations
 
 import argparse
+import ctypes
 from datetime import datetime, timezone
 import hashlib
 import importlib.util
@@ -900,6 +901,30 @@ def build_command(
     return command
 
 
+def _enable_child_subreaper() -> None:
+    """Adopt orphaned provider descendants so this runner can reap them."""
+    if not sys.platform.startswith("linux"):
+        raise RunnerError("provider containment requires Linux child-subreaper support")
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        prctl = libc.prctl
+    except (OSError, AttributeError) as exc:
+        raise RunnerError("provider containment cannot access prctl") from exc
+    prctl.argtypes = [
+        ctypes.c_int,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+    ]
+    prctl.restype = ctypes.c_int
+    if prctl(36, 1, 0, 0, 0) != 0:  # Linux PR_SET_CHILD_SUBREAPER
+        error = ctypes.get_errno()
+        raise RunnerError(
+            f"provider containment cannot enable child subreaper: {os.strerror(error)}"
+        )
+
+
 def run_bounded(
     command: Sequence[str],
     *,
@@ -917,6 +942,8 @@ def run_bounded(
     into ``capture_error`` so already-observed stdout/stderr can be persisted by
     the caller before the benchmark arm fails.
     """
+
+    _enable_child_subreaper()
 
     try:
         process = subprocess.Popen(
@@ -974,6 +1001,18 @@ def run_bounded(
             return True
         return True
 
+    def reap_process_group_children() -> None:
+        while True:
+            try:
+                child_pid, _status = os.waitpid(-process.pid, os.WNOHANG)
+            except ChildProcessError:
+                return
+            except OSError as exc:
+                note_error(f"process_group_reap_failed:{type(exc).__name__}")
+                return
+            if child_pid == 0:
+                return
+
     def contain_surviving_process_group() -> None:
         if not process_group_exists():
             return
@@ -981,9 +1020,11 @@ def run_bounded(
         kill_process_tree()
         cleanup_deadline = time.monotonic() + 1.0
         while time.monotonic() < cleanup_deadline:
+            reap_process_group_children()
             if not process_group_exists():
                 return
             time.sleep(0.01)
+        reap_process_group_children()
         if process_group_exists():
             note_error("process_group_cleanup_failed")
 
@@ -1335,9 +1376,37 @@ _RG_SAFE_VALUE_OPTIONS = {
 }
 
 
+def _reject_unquoted_shell_expansion(text: str) -> None:
+    quote: str | None = None
+    escaped = False
+    for char in text:
+        if escaped:
+            escaped = False
+            continue
+        if quote == "'":
+            if char == "'":
+                quote = None
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if quote == '"':
+            if char == '"':
+                quote = None
+            elif char in {"$", "`"}:
+                raise RunnerError("shell expansion is not allowed")
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            continue
+        if char in {"$", "`", "*", "?", "[", "]", "{", "}", "~", "!", "(", ")"}:
+            raise RunnerError("shell expansion is not allowed")
+
+
 def _split_shell_words(text: str) -> list[str]:
     if "\n" in text or "\r" in text:
         raise RunnerError("command line breaks are not allowed")
+    _reject_unquoted_shell_expansion(text)
     if "$(" in text or "`" in text:
         raise RunnerError("command substitution is not allowed")
     try:
@@ -1768,9 +1837,9 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     args = parser().parse_args(raw)
     try:
-        request = json.load(sys.stdin)
-        if not isinstance(request, dict):
-            raise RunnerError("stdin request must be one JSON object")
+        request = base._load_object_bytes(
+            base._bounded_stdin(), label="stdin request"
+        )
         result = execute(request, args)
     except Exception as exc:
         print(json.dumps({"status": "error", "error": str(exc)}, sort_keys=True), file=sys.stderr)
