@@ -1,0 +1,156 @@
+name: PR 1227 procfs fallback remediation retry
+
+on:
+  push:
+    branches:
+      - fix/rab-codex-stderr-contract-20260915
+    paths:
+      - .github/workflows/pr1227-procfs-fallback2.yml
+
+permissions:
+  contents: write
+
+jobs:
+  remediate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Verify exact preimage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "9c20806dac8e6811a08889df249926254bfba227"
+          test "$(git rev-parse HEAD:tools/repobrief_agent_benchmark_codex_runner.py)" = "864255847c8469664448f2c99da5ff221688c5c4"
+          test "$(git rev-parse HEAD:tests/test_repobrief_agent_benchmark_codex_runner.py)" = "561b76d3f18e7c338dbc8a4e1798bd908a513f8c"
+      - name: Apply fallback and regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          runner_path = Path("tools/repobrief_agent_benchmark_codex_runner.py")
+          tests_path = Path("tests/test_repobrief_agent_benchmark_codex_runner.py")
+          runner = runner_path.read_text(encoding="utf-8")
+          tests = tests_path.read_text(encoding="utf-8")
+
+          old = "\n".join([
+              "def _direct_child_pids() -> set[int]:",
+              "    \"\"\"Return this process' direct Linux children for descendant containment.\"\"\"",
+              "    path = Path(f\"/proc/self/task/{os.getpid()}/children\")",
+              "    try:",
+              "        payload = path.read_text(encoding=\"ascii\").strip()",
+              "    except (OSError, UnicodeError) as exc:",
+              "        raise RunnerError(\"provider containment cannot enumerate child processes\") from exc",
+              "    if not payload:",
+              "        return set()",
+              "    try:",
+              "        return {int(value) for value in payload.split()}",
+              "    except ValueError as exc:",
+              "        raise RunnerError(\"provider containment received invalid child process data\") from exc",
+          ])
+          new = "\n".join([
+              "def _scan_proc_direct_child_pids(parent_pid: int) -> set[int]:",
+              "    \"\"\"Fallback for Linux procfs mounts without task ``children`` files.\"\"\"",
+              "    try:",
+              "        entries = list(Path(\"/proc\").iterdir())",
+              "    except OSError as exc:",
+              "        raise RunnerError(\"provider containment cannot enumerate /proc\") from exc",
+              "    children: set[int] = set()",
+              "    for entry in entries:",
+              "        if not entry.name.isdecimal():",
+              "            continue",
+              "        try:",
+              "            status = (entry / \"status\").read_text(encoding=\"ascii\", errors=\"replace\")",
+              "        except (FileNotFoundError, ProcessLookupError, PermissionError):",
+              "            continue",
+              "        except OSError:",
+              "            continue",
+              "        for line in status.splitlines():",
+              "            if not line.startswith(\"PPid:\"):",
+              "                continue",
+              "            try:",
+              "                ppid = int(line.split(\":\", 1)[1].strip())",
+              "            except ValueError:",
+              "                break",
+              "            if ppid == parent_pid:",
+              "                children.add(int(entry.name))",
+              "            break",
+              "    return children",
+              "",
+              "",
+              "def _direct_child_pids() -> set[int]:",
+              "    \"\"\"Return this process' direct Linux children for descendant containment.\"\"\"",
+              "    parent_pid = os.getpid()",
+              "    path = Path(f\"/proc/self/task/{parent_pid}/children\")",
+              "    try:",
+              "        payload = path.read_text(encoding=\"ascii\").strip()",
+              "    except FileNotFoundError:",
+              "        return _scan_proc_direct_child_pids(parent_pid)",
+              "    except (OSError, UnicodeError) as exc:",
+              "        raise RunnerError(\"provider containment cannot enumerate child processes\") from exc",
+              "    if not payload:",
+              "        return set()",
+              "    try:",
+              "        return {int(value) for value in payload.split()}",
+              "    except ValueError as exc:",
+              "        raise RunnerError(\"provider containment received invalid child process data\") from exc",
+          ])
+          if runner.count(old) != 1:
+              raise SystemExit(f"helper preimage count: {runner.count(old)}")
+          runner = runner.replace(old, new, 1)
+
+          regression = "\n".join([
+              "    def test_direct_child_pids_falls_back_when_task_children_file_is_missing(self) -> None:",
+              "        child = subprocess.Popen(",
+              "            [sys.executable, \"-c\", \"import time; time.sleep(30)\"],",
+              "            stdout=subprocess.DEVNULL,",
+              "            stderr=subprocess.DEVNULL,",
+              "        )",
+              "        real_read_text = Path.read_text",
+              "",
+              "        def read_text_without_task_children(path, *args, **kwargs):",
+              "            if str(path).endswith(\"/children\"):",
+              "                raise FileNotFoundError(str(path))",
+              "            return real_read_text(path, *args, **kwargs)",
+              "",
+              "        try:",
+              "            with patch.object(Path, \"read_text\", new=read_text_without_task_children):",
+              "                self.assertIn(child.pid, runner._direct_child_pids())",
+              "        finally:",
+              "            child.kill()",
+              "            child.wait(timeout=5)",
+              "",
+              "",
+          ])
+          anchor = '    def test_run_bounded_uses_dedicated_process_group_and_kills_it_on_timeout(self) -> None:\n'
+          if tests.count(anchor) != 1:
+              raise SystemExit(f"test anchor count: {tests.count(anchor)}")
+          tests = tests.replace(anchor, regression + anchor, 1)
+
+          runner_path.write_text(runner, encoding="utf-8")
+          tests_path.write_text(tests, encoding="utf-8")
+          compile(runner, str(runner_path), "exec")
+          compile(tests, str(tests_path), "exec")
+          PY
+      - name: Focused validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/test_repobrief_agent_benchmark_codex_runner.py
+          git diff --check
+          python3 tools/check_no_secrets.py
+      - name: Publish code-only fix and remove bootstrap workflows
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/pr1227-procfs-fallback.yml
+          rm .github/workflows/pr1227-procfs-fallback2.yml
+          git add tools/repobrief_agent_benchmark_codex_runner.py tests/test_repobrief_agent_benchmark_codex_runner.py .github/workflows/pr1227-procfs-fallback.yml .github/workflows/pr1227-procfs-fallback2.yml
+          git diff --cached --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix(rab): support procfs child-enumeration fallback'
+          git push origin HEAD:fix/rab-codex-stderr-contract-20260915
