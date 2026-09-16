@@ -1343,6 +1343,39 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertIn(b"response envelope is invalid", completed.stderr)
 
+    def test_mcp_proxy_rejects_explicit_null_treatment_request_id(self) -> None:
+        for invalid in (None, True, False, [], {}, float("inf"), float("-inf"), float("nan")):
+            with self.subTest(invalid=invalid):
+                self.assertFalse(runner._valid_jsonrpc_request_id(invalid))
+        for valid in ("", "request-1", 0, -1, 1.5):
+            with self.subTest(valid=valid):
+                self.assertTrue(runner._valid_jsonrpc_request_id(valid))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            upstream = root / "mcp.py"
+            upstream.write_text(
+                "import json, sys\n"
+                f"TOOLS = {treatment_tools()!r}\n"
+                "for line in sys.stdin:\n"
+                "    m=json.loads(line); method=m.get('method'); ident=m.get('id')\n"
+                "    if method=='tools/list':\n"
+                "        print(json.dumps({'jsonrpc':'2.0','id':ident,'result':{'tools':TOOLS}}),flush=True)\n",
+                encoding="utf-8",
+            )
+            messages = [
+                {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}},
+                {"jsonrpc":"2.0","id":None,"method":"tools/call","params":{"name":"ask_context","arguments":{"query":"where"}}},
+            ]
+            completed = subprocess.run(
+                proxy_command(upstream, root),
+                input=b"".join(json.dumps(item).encode() + b"\n" for item in messages),
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+
     def test_mcp_proxy_tracks_and_forwards_treatment_tool_responses(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

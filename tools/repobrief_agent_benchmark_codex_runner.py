@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import posixpath
 from pathlib import Path
@@ -141,6 +142,14 @@ def canonical(value: Any) -> str:
 
 def sha_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _valid_jsonrpc_request_id(value: Any) -> bool:
+    if value is None or isinstance(value, bool):
+        return False
+    if isinstance(value, (str, int)):
+        return True
+    return isinstance(value, float) and math.isfinite(value)
 
 
 def utc_now() -> datetime:
@@ -885,7 +894,10 @@ def run_mcp_proxy(upstream: Sequence[str], manifest_text: str, manifest_sha256: 
                 if not isinstance(message, dict):
                     raise RunnerError("MCP client message must be an object")
                 method = message.get("method")
+                has_identifier = "id" in message
                 identifier = message.get("id")
+                if has_identifier and not _valid_jsonrpc_request_id(identifier):
+                    raise RunnerError("MCP client request ID is invalid")
                 if method not in MCP_CLIENT_METHODS:
                     if identifier is not None:
                         _proxy_write(_proxy_error(identifier, "benchmark MCP method is not authorized"), output_lock)
