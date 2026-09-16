@@ -805,7 +805,6 @@ def observe_tunnel_dispatcher_contention() -> dict[str, Any]:
 
 
 
-
 def deployment_contention_preflight(
     *,
     expected_head: str,
@@ -855,7 +854,6 @@ def deployment_contention_preflight(
         ],
     }
     return {**material, "evidence_sha256": canonical_json_sha256(material)}
-
 
 
 
@@ -1155,25 +1153,75 @@ def _open_cutover_target_head(classification: dict[str, Any]) -> str | None:
 
 
 def run_midcutover_resume(*, repo: Path, decision: dict[str, Any]) -> dict[str, Any]:
-    """Continue the stranded cutover; deploy nothing."""
-    try:
-        result = deploy_dual.resume_production_blue_green_cutover(
-            repo=repo,
-            expected_head=decision["resume_target_head"],
-            require_resume_binding_sha256=decision["resume_binding_sha256"],
-        )
-    except deploy_dual.ProductionBlueGreenReceiptPersistenceError as exc:
-        result = {
-            "receipt": exc.receipt,
-            "receipt_path": None,
-            "receipt_sha256": exc.receipt_sha256,
-            "receipt_persisted": False,
-            "receipt_persistence_error_type": exc.persistence_error_type,
-            "outcome": exc.outcome,
-            "error": None,
-            "blind_retry_allowed": False,
-            "fresh_classification_required": True,
+    """Continue the stranded cutover; deploy nothing.
+
+    A cold re-entry may execute newer scheduler code while the authentic cutover
+    receipt still binds admission to an older head/source identity. The running
+    predecessor cannot validate an execution-head observer against that historical
+    marker. Preserve the observer only when both identities already match; hide
+    its discovery tuple only for a genuinely cross-bound resume. The admission
+    marker and drain remain strict in either case.
+    """
+    classification = decision.get("classification")
+    resume_binding = (
+        classification.get("resume_binding")
+        if isinstance(classification, dict)
+        else None
+    )
+    if not isinstance(resume_binding, dict):
+        # Legacy/internal callers predate the nested classification object. They
+        # cannot prove observer compatibility, but they must remain resumable.
+        # Treat missing compatibility evidence conservatively: isolate the
+        # observer instead of widening the exemption or rejecting the resume.
+        resume_binding = {}
+    execution_source_identity_sha256 = decision.get(
+        "execution_source_identity_sha256"
+    )
+    observer_binding_matches_resume = (
+        decision.get("execution_head") == decision.get("resume_target_head")
+        and isinstance(execution_source_identity_sha256, str)
+        and execution_source_identity_sha256
+        == resume_binding.get("source_identity_sha256")
+    )
+    isolate_observer = not observer_binding_matches_resume
+    observer_environment_names = (
+        FINALIZATION_ENV["unit"],
+        "GRABOWSKI_JOB_DIRECTORY",
+        FINALIZATION_ENV["metadata"],
+    )
+    observer_environment: dict[str, str] = {}
+    if isolate_observer:
+        observer_environment = {
+            name: os.environ[name]
+            for name in observer_environment_names
+            if name in os.environ
         }
+        for name in observer_environment_names:
+            os.environ.pop(name, None)
+    try:
+        try:
+            result = deploy_dual.resume_production_blue_green_cutover(
+                repo=repo,
+                expected_head=decision["resume_target_head"],
+                require_resume_binding_sha256=decision["resume_binding_sha256"],
+            )
+        except deploy_dual.ProductionBlueGreenReceiptPersistenceError as exc:
+            result = {
+                "receipt": exc.receipt,
+                "receipt_path": None,
+                "receipt_sha256": exc.receipt_sha256,
+                "receipt_persisted": False,
+                "receipt_persistence_error_type": exc.persistence_error_type,
+                "outcome": exc.outcome,
+                "error": None,
+                "blind_retry_allowed": False,
+                "fresh_classification_required": True,
+            }
+    finally:
+        if isolate_observer:
+            for name in observer_environment_names:
+                os.environ.pop(name, None)
+            os.environ.update(observer_environment)
     receipt = result.get("receipt") or {}
     summary = {
         "schema_version": 1,
@@ -1342,7 +1390,12 @@ def main() -> int:
         })
         if recovery_decision["resume_required"]:
             return run_resume_only(
-                {**recovery_decision, "repo": str(repo)}, binding=binding
+                {
+                    **recovery_decision,
+                    "repo": str(repo),
+                    "execution_source_identity_sha256": args.source_identity_sha256,
+                },
+                binding=binding,
             )
         if not recovery_decision.get("deploy_allowed"):
             raise RecoveryClassificationBlocked(
