@@ -557,6 +557,7 @@ def minimal_sandbox_argv(
     writable_paths: Iterable[Path] = (),
     git_common_dir: Path | None = None,
     extra_read_only: Iterable[tuple[Path, Path]] = (),
+    extra_read_only_data_fds: Iterable[tuple[int, Path]] = (),
     extra_read_write: Iterable[tuple[Path, Path]] = (),
     extra_directories: Iterable[Path] = (),
 ) -> list[str]:
@@ -638,6 +639,26 @@ def minimal_sandbox_argv(
             raise AgentSandboxError(f"duplicate sandbox target: {target}")
         seen_targets.add(target)
         arguments.extend(["--ro-bind", str(source), target])
+    for fd_value, target_value in extra_read_only_data_fds:
+        if isinstance(fd_value, bool) or not isinstance(fd_value, int) or fd_value < 0:
+            raise AgentSandboxError("extra_read_only_data_fds fd must be a non-negative integer")
+        target_path = Path(target_value)
+        target_raw = str(target_path)
+        if (
+            not target_path.is_absolute()
+            or "\x00" in target_raw
+            or ".." in target_path.parts
+            or target_path == Path("/tmp")
+            or not target_path.is_relative_to(Path("/tmp"))
+        ):
+            raise AgentSandboxError(
+                "extra_read_only_data_fds target must be a file path below /tmp"
+            )
+        target = target_raw
+        if target in seen_targets:
+            raise AgentSandboxError(f"duplicate sandbox target: {target}")
+        seen_targets.add(target)
+        arguments.extend(["--perms", "0400", "--ro-bind-data", str(fd_value), target])
     for source_value, target_value in extra_read_write:
         source = _private_regular_file(source_value, "extra_read_write source")
         target_path = Path(target_value)

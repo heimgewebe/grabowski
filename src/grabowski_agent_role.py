@@ -30,6 +30,7 @@ GROK_REVIEW_STREAM_CONTRACT = "grok-streaming-json-bound-diff-review-v2"
 GROK_REVIEW_TOOLS = "todo_write"
 GROK_REVIEW_DISALLOWED_TOOLS = "todo_write,search_tool,use_tool,run_terminal_cmd,run_terminal_command"
 GROK_REVIEW_MAX_TURNS = 2
+GROK_REVIEW_PROMPT_TARGET = Path("/tmp/grabowski-bound-review-prompt")
 GROK_REVIEW_EVENT_TYPES = frozenset(
     {
         "text",
@@ -367,7 +368,14 @@ def _declared_virtualenv_binding(repo: Path, command: list[str]) -> tuple[list[t
     return [(source_root, target_root)], directories
 
 
-def sandbox_argv(repo: Path, command: list[str], *, declared_command: list[str] | None = None) -> list[str]:
+def sandbox_argv(
+    repo: Path,
+    command: list[str],
+    *,
+    declared_command: list[str] | None = None,
+    additional_read_only: tuple[tuple[Path, Path], ...] = (),
+    additional_read_only_data_fds: tuple[tuple[int, Path], ...] = (),
+) -> list[str]:
     common_raw = git_text(repo, "rev-parse", "--git-common-dir")
     common = Path(common_raw)
     if not common.is_absolute():
@@ -381,7 +389,8 @@ def sandbox_argv(repo: Path, command: list[str], *, declared_command: list[str] 
         command=actual_command,
         workspace_writable=False,
         git_common_dir=common,
-        extra_read_only=(*prepared.extra_read_only, *venv_read_only),
+        extra_read_only=(*prepared.extra_read_only, *venv_read_only, *additional_read_only),
+        extra_read_only_data_fds=additional_read_only_data_fds,
         extra_read_write=prepared.extra_read_write,
         extra_directories=(*prepared.extra_directories, *venv_directories),
     )
@@ -634,6 +643,7 @@ def _grok_streaming_review_command(
     return tuple(command), prompt
 
 
+
 def _review_sandbox_argv(
     repo: Path,
     command: list[str],
@@ -651,11 +661,17 @@ def _review_sandbox_argv(
         expected_base_head=expected_base_head,
         review_diff=review_diff,
     )
-    return (
-        sandbox_argv(repo, list(actual), declared_command=command),
-        GROK_REVIEW_STREAM_CONTRACT,
-        prompt_bytes,
+    actual = tuple(
+        str(GROK_REVIEW_PROMPT_TARGET) if item == "/dev/stdin" else item
+        for item in actual
     )
+    sandbox = sandbox_argv(
+        repo,
+        list(actual),
+        declared_command=command,
+        additional_read_only_data_fds=((0, GROK_REVIEW_PROMPT_TARGET),),
+    )
+    return sandbox, GROK_REVIEW_STREAM_CONTRACT, prompt_bytes
 
 
 def _terminal_json_object(text: str) -> dict[str, Any] | None:

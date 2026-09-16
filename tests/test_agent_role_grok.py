@@ -392,6 +392,10 @@ class GrokReviewRoleTests(unittest.TestCase):
         self.assertEqual(argv, ["sandbox"])
         self.assertEqual(contract, role.GROK_REVIEW_STREAM_CONTRACT)
         self.assertIn(b"diff", prompt_bytes)
+        self.assertEqual(
+            sandbox_argv.call_args.kwargs["additional_read_only_data_fds"],
+            ((0, role.GROK_REVIEW_PROMPT_TARGET),),
+        )
         actual = sandbox_argv.call_args.args[1]
         self.assertEqual(actual[actual.index("--tools") + 1], "todo_write")
         self.assertEqual(
@@ -399,6 +403,10 @@ class GrokReviewRoleTests(unittest.TestCase):
             "todo_write,search_tool,use_tool,run_terminal_cmd,run_terminal_command",
         )
         self.assertEqual(sandbox_argv.call_args.kwargs["declared_command"], declared)
+        self.assertEqual(
+            actual[actual.index("--prompt-file") + 1],
+            str(role.GROK_REVIEW_PROMPT_TARGET),
+        )
 
     def test_terminal_json_object_accepts_unique_object_suffix_after_prose(self) -> None:
         review = role._terminal_json_object(
