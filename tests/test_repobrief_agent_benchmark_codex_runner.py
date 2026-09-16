@@ -805,6 +805,26 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertIn(b"captured-before-selector-failure", capture["stdout"])
             self.assertIn("capture_stream_failed:OSError", str(capture["capture_error"]))
 
+    def test_direct_child_pids_falls_back_when_task_children_file_is_missing(self) -> None:
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        real_read_text = Path.read_text
+
+        def read_text_without_task_children(path, *args, **kwargs):
+            if str(path).endswith("/children"):
+                raise FileNotFoundError(str(path))
+            return real_read_text(path, *args, **kwargs)
+
+        try:
+            with patch.object(Path, "read_text", new=read_text_without_task_children):
+                self.assertIn(child.pid, runner._direct_child_pids())
+        finally:
+            child.kill()
+            child.wait(timeout=5)
+
     def test_run_bounded_uses_dedicated_process_group_and_kills_it_on_timeout(self) -> None:
         real_popen = runner.subprocess.Popen
         launch_kwargs = []

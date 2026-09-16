@@ -925,11 +925,43 @@ def _enable_child_subreaper() -> None:
         )
 
 
+def _scan_proc_direct_child_pids(parent_pid: int) -> set[int]:
+    """Fallback for Linux procfs mounts without task ``children`` files."""
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError as exc:
+        raise RunnerError("provider containment cannot enumerate /proc") from exc
+    children: set[int] = set()
+    for entry in entries:
+        if not entry.name.isdecimal():
+            continue
+        try:
+            status = (entry / "status").read_text(encoding="ascii", errors="replace")
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+        except OSError:
+            continue
+        for line in status.splitlines():
+            if not line.startswith("PPid:"):
+                continue
+            try:
+                ppid = int(line.split(":", 1)[1].strip())
+            except ValueError:
+                break
+            if ppid == parent_pid:
+                children.add(int(entry.name))
+            break
+    return children
+
+
 def _direct_child_pids() -> set[int]:
     """Return this process' direct Linux children for descendant containment."""
-    path = Path(f"/proc/self/task/{os.getpid()}/children")
+    parent_pid = os.getpid()
+    path = Path(f"/proc/self/task/{parent_pid}/children")
     try:
         payload = path.read_text(encoding="ascii").strip()
+    except FileNotFoundError:
+        return _scan_proc_direct_child_pids(parent_pid)
     except (OSError, UnicodeError) as exc:
         raise RunnerError("provider containment cannot enumerate child processes") from exc
     if not payload:
