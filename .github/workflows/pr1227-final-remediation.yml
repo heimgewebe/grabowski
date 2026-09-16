@@ -21,7 +21,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "05374c4a1852b7d375ef110fc13ba06a188feaee"
+          test "$(git rev-parse HEAD^)" = "1c0e675604400eec2f2c50721bf57efb1f16ee0b"
           test "$(git rev-parse HEAD:tools/repobrief_agent_benchmark_codex_runner.py)" = "b20137c91ef729e4e124c0f07e6ad52c41b5e1ec"
           test "$(git rev-parse HEAD:tests/test_repobrief_agent_benchmark_codex_runner.py)" = "3d4282865c0d92694b4af4d7cb383587a6382a4c"
       - name: Apply reviewed fixes and regression coverage
@@ -132,7 +132,7 @@ jobs:
           tests = replace_once(
               tests,
               "            \"bash -lc 'cat src/example.py'\",\n        ):",
-              "            \"bash -lc 'cat src/example.py'\",\n            \"rg needle src\\\\ncat secret\",\n            \"cat src/example.py\\\\r\\\\nrg needle src\",\n        ):",
+              "            \"bash -lc 'cat src/example.py'\",\n            \"rg needle src\\ncat secret\",\n            \"cat src/example.py\\r\\nrg needle src\",\n        ):",
               "line-break rejection cases",
           )
           anchor = '''    def test_run_bounded_returns_capture_error_instead_of_discarding_partial_streams(self) -> None:
