@@ -1,0 +1,89 @@
+name: PR1227 materialize reviewed fix
+
+on:
+  push:
+    branches:
+      - ops/pr1227-materialize-20260916
+
+permissions:
+  contents: write
+
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout transport branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Materialize, validate, and publish candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import base64, hashlib, io, lzma, tarfile
+
+          chunks = sorted(Path('.pr1227-transport').glob('chunk-*.b64'))
+          if [p.name for p in chunks] != [f'chunk-{i:02d}.b64' for i in range(1, 5)]:
+              raise SystemExit('transport chunk set mismatch')
+          encoded = ''.join(p.read_text(encoding='ascii').strip() for p in chunks)
+          archive = base64.b64decode(encoded, validate=True)
+          if len(archive) != 28004:
+              raise SystemExit('XZ byte count mismatch')
+          if hashlib.sha256(archive).hexdigest() != 'b4b9370d9eb0deba554a138703ac91c18ae45b7e0ba6d691b56eeba1a5678273':
+              raise SystemExit('XZ SHA-256 mismatch')
+          raw = lzma.decompress(archive, format=lzma.FORMAT_XZ)
+          expected = {
+              'tools/repobrief_agent_benchmark_codex_runner.py': (89400, '7050229018b2cd1318b16bdfe5ab303db25ed456133cb413899c63d6ab65377a'),
+              'tests/test_repobrief_agent_benchmark_codex_runner.py': (67291, '89494e9354fc45371569407f7bd172816ed988d21112ac918e3d9d9ecb2d1ee6'),
+          }
+          out = Path('/tmp/pr1227-materialized')
+          with tarfile.open(fileobj=io.BytesIO(raw), mode='r:') as tf:
+              members = tf.getmembers()
+              if [m.name for m in members] != list(expected):
+                  raise SystemExit('archive member set/order mismatch')
+              for member in members:
+                  if not member.isfile() or member.issym() or member.islnk():
+                      raise SystemExit('archive member type mismatch')
+                  handle = tf.extractfile(member)
+                  if handle is None:
+                      raise SystemExit('archive member unreadable')
+                  data = handle.read()
+                  size, digest = expected[member.name]
+                  if len(data) != size or hashlib.sha256(data).hexdigest() != digest:
+                      raise SystemExit(f'file binding mismatch: {member.name}')
+                  target = out / member.name
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_bytes(data)
+          PY
+
+          expected_head=5e5059301f07cedeb8170fef9b19ae50d65cdb21
+          live_head="$(git ls-remote origin refs/heads/fix/rab-codex-stderr-contract-20260915 | cut -f1)"
+          test "$live_head" = "$expected_head"
+
+          git worktree add --detach /tmp/pr1227-final "$expected_head"
+          cp /tmp/pr1227-materialized/tools/repobrief_agent_benchmark_codex_runner.py /tmp/pr1227-final/tools/repobrief_agent_benchmark_codex_runner.py
+          cp /tmp/pr1227-materialized/tests/test_repobrief_agent_benchmark_codex_runner.py /tmp/pr1227-final/tests/test_repobrief_agent_benchmark_codex_runner.py
+          cd /tmp/pr1227-final
+
+          python3 -m unittest tests.test_repobrief_agent_benchmark_codex_runner
+          git diff --check
+          python3 tools/check_no_secrets.py
+          python3 -m py_compile tools/repobrief_agent_benchmark_codex_runner.py tests/test_repobrief_agent_benchmark_codex_runner.py
+
+          mapfile -t changed < <(git status --short | sed -E 's/^.. //')
+          test "${#changed[@]}" -eq 2
+          printf '%s\n' "${changed[@]}" | sort > /tmp/changed.actual
+          printf '%s\n' tests/test_repobrief_agent_benchmark_codex_runner.py tools/repobrief_agent_benchmark_codex_runner.py > /tmp/changed.expected
+          diff -u /tmp/changed.expected /tmp/changed.actual
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- tests/test_repobrief_agent_benchmark_codex_runner.py tools/repobrief_agent_benchmark_codex_runner.py
+          git diff --cached --check
+          git commit -m 'fix(pr1227): address final Codex review findings'
+          test "$(git rev-parse HEAD^)" = "$expected_head"
+          git push origin HEAD:refs/heads/ops/pr1227-ready-20260916
