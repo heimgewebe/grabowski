@@ -21,7 +21,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "638a0d35bf64bc9bf3265af3fbbad9437e33b54b"
+          test "$(git rev-parse HEAD^)" = "2b72df0992cbe50bb9b43c09ae1382d1be3cf865"
           test "$(git rev-parse HEAD:tools/repobrief_agent_benchmark_codex_runner.py)" = "dfbc8e5ff729ff018a263cadf7e358c4f36848b5"
           test "$(git rev-parse HEAD:tests/test_repobrief_agent_benchmark_codex_runner.py)" = "8984bfb215d50f89ebc961a9c492616f645919ff"
       - name: Apply fix and regression
@@ -56,7 +56,7 @@ jobs:
               "                upstream.write_text(",
               "                    \"import json, sys\\n\"",
               "                    \"line = sys.stdin.readline()\\n\"",
-              "                    f\"print(json.dumps({response!r}), flush=True)\\n\"",
+              "                    f\"print(json.dumps({response!r}), flush=True)\\n\",",
               "                    encoding=\"utf-8\",",
               "                )",
               "                payload = json.dumps(",
