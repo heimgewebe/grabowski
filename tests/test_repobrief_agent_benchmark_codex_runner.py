@@ -176,6 +176,18 @@ def fixture_args(root: Path, fixture: Path, *, stderr: Path | None = None, retur
     )
 
 
+def treatment_tools() -> list[dict]:
+    return [
+        {
+            "name": name,
+            "inputSchema": json.loads(
+                json.dumps(runner.EXPECTED_UPSTREAM_MCP_INPUT_SCHEMAS[name])
+            ),
+        }
+        for name in sorted(runner.UPSTREAM_MCP)
+    ]
+
+
 class RepoBriefCodexRunnerTests(unittest.TestCase):
     def test_request_contract_is_exact_and_provider_specific(self) -> None:
         runner.validate_request(request())
@@ -988,28 +1000,37 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertIn(b"diagnostic", capture["stderr"])
 
     def test_treatment_tools_require_every_upstream_capability_exactly_once(self) -> None:
-        valid = {
-            "tools": [
-                {"name": "ask_context"},
-                {"name": "grounding_verify"},
-                {"name": "live_freshness"},
-                {"name": "find_symbol"},
-            ]
-        }
+        valid = {"tools": [*treatment_tools(), {"name": "find_symbol"}]}
         self.assertEqual(
             {item["name"] for item in runner._filtered_treatment_tools(valid)},
             runner.ALLOWED_MCP,
         )
-        missing = {"tools": [
-            {"name": "ask_context"},
-            {"name": "grounding_verify"},
-            {"name": "find_symbol"},
-        ]}
+        missing = {
+            "tools": [
+                item for item in treatment_tools() if item["name"] != "live_freshness"
+            ] + [{"name": "find_symbol"}]
+        }
         with self.assertRaisesRegex(runner.RunnerError, "exactly once"):
             runner._filtered_treatment_tools(missing)
-        duplicate = {"tools": valid["tools"] + [{"name": "ask_context"}]}
+        duplicate = {
+            "tools": [
+                *treatment_tools(),
+                json.loads(json.dumps(treatment_tools()[0])),
+            ]
+        }
         with self.assertRaisesRegex(runner.RunnerError, "exactly once"):
             runner._filtered_treatment_tools(duplicate)
+
+    def test_treatment_tools_require_exact_upstream_input_schemas(self) -> None:
+        missing_schema = {"tools": treatment_tools()}
+        missing_schema["tools"][0].pop("inputSchema")
+        with self.assertRaisesRegex(runner.RunnerError, "inputSchema drifted"):
+            runner._filtered_treatment_tools(missing_schema)
+
+        drifted_schema = {"tools": treatment_tools()}
+        drifted_schema["tools"][0]["inputSchema"]["additionalProperties"] = True
+        with self.assertRaisesRegex(runner.RunnerError, "inputSchema drifted"):
+            runner._filtered_treatment_tools(drifted_schema)
 
     def test_mcp_proxy_rejects_tools_list_arriving_during_upstream_eof(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1018,7 +1039,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             valid_response = {
                 "jsonrpc": "2.0",
                 "id": 1,
-                "result": {"tools": [{"name": name} for name in sorted(runner.UPSTREAM_MCP)]},
+                "result": {"tools": treatment_tools()},
             }
             upstream.write_text(
                 "import json, os, sys, time\n"
@@ -1099,14 +1120,16 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             upstream = root / "mcp.py"
+            upstream_tools = [*treatment_tools(), {"name": "find_symbol"}]
             upstream.write_text(
                 "import json, sys\n"
+                f"TOOLS = {upstream_tools!r}\n"
                 "for line in sys.stdin:\n"
                 "    m=json.loads(line); method=m.get('method'); ident=m.get('id')\n"
                 "    if method=='initialize':\n"
                 "        print(json.dumps({'jsonrpc':'2.0','id':ident,'result':{'protocolVersion':'x','serverInfo':{'name':'fixture'},'capabilities':{'tools':{},'resources':{},'prompts':{}}}}),flush=True)\n"
                 "    elif method=='tools/list':\n"
-                "        print(json.dumps({'jsonrpc':'2.0','id':ident,'result':{'tools':[{'name':'ask_context'},{'name':'grounding_verify'},{'name':'live_freshness'},{'name':'find_symbol'}]}}),flush=True)\n"
+                "        print(json.dumps({'jsonrpc':'2.0','id':ident,'result':{'tools':TOOLS}}),flush=True)\n"
                 "    elif method=='resources/list':\n"
                 "        print(json.dumps({'jsonrpc':'2.0','id':ident,'result':{'resources':[{'uri':'repobrief://frozen/a'}]}}),flush=True)\n",
                 encoding="utf-8",

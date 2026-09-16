@@ -56,6 +56,57 @@ PERMISSION_PROFILE = "rab-benchmark"
 CHATGPT_LOGIN_LINE = "Logged in using ChatGPT"
 ALLOWED_MCP = {"ask_context", "grounding_verify", "live_freshness", "repobrief_resource_read"}
 UPSTREAM_MCP = {"ask_context", "grounding_verify", "live_freshness"}
+REPOGROUND_MCP_SCHEMA_CONTRACT_COMMIT = "9c24c2887b4b5724686a5051e5feb8aa54783019"
+_REPOGROUND_SELECTOR_PROPERTIES: dict[str, Any] = {
+    "bundle_manifest": {
+        "type": ["string", "null"],
+        "description": "Optional exact manifest path inside the startup bundle root.",
+    },
+    "repo": {
+        "type": ["string", "null"],
+        "description": "Repository identity such as owner/repository or repository name.",
+    },
+    "stem": {
+        "type": ["string", "null"],
+        "description": "Optional exact snapshot stem.",
+    },
+}
+
+
+def _repoground_schema(
+    properties: Mapping[str, Any], required: Sequence[str] = ()
+) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {**_REPOGROUND_SELECTOR_PROPERTIES, **dict(properties)},
+        "required": list(required),
+        "additionalProperties": False,
+    }
+
+
+EXPECTED_UPSTREAM_MCP_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
+    "ask_context": _repoground_schema(
+        {
+            "query": {"type": "string"},
+            "task_profile": {"type": "string", "default": "basic_repo_question"},
+            "max_context_tokens": {"type": "integer", "minimum": 1, "default": 8000},
+            "max_answer_tokens": {"type": "integer", "minimum": 1, "default": 1200},
+            "k": {"type": "integer", "minimum": 1, "maximum": 100, "default": 5},
+            "verbose": {"type": "boolean", "default": False},
+        },
+        ("query",),
+    ),
+    "grounding_verify": _repoground_schema(
+        {
+            "declaration": {"type": "object"},
+            "citation_map": {"type": ["string", "null"]},
+            "task_profile": {"type": ["string", "null"]},
+            "verbose": {"type": "boolean", "default": False},
+        },
+        ("declaration",),
+    ),
+    "live_freshness": _repoground_schema({}),
+}
 MCP_CLIENT_METHODS = {"initialize", "notifications/initialized", "ping", "tools/list", "tools/call"}
 MAX_FROZEN_RESOURCES = 512
 
@@ -621,6 +672,11 @@ def _filtered_treatment_tools(value: Any) -> list[dict[str, Any]]:
             continue
         name = item.get("name")
         if name in counts:
+            expected_schema = EXPECTED_UPSTREAM_MCP_INPUT_SCHEMAS[str(name)]
+            if item.get("inputSchema") != expected_schema:
+                raise RunnerError(
+                    f"RepoGround treatment tool inputSchema drifted for {name}"
+                )
             counts[str(name)] += 1
             filtered.append(item)
     invalid = [f"{name}={counts[name]}" for name in sorted(counts) if counts[name] != 1]
