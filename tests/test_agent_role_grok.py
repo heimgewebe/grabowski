@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import sys
 import unittest
@@ -20,238 +23,382 @@ def stream_bytes(events: list[dict]) -> bytes:
     return ("\n".join(json.dumps(event, separators=(",", ":")) for event in events) + "\n").encode()
 
 
-def successful_git_tool_events(
-    command: str = "git status --short --branch",
-    *,
-    call_id: str = "call-1",
-) -> list[dict]:
-    return [
-        {
-            "type": "tool_call",
-            "toolCallId": call_id,
-            "toolName": "run_terminal_command",
-            "rawInput": {"command": command},
-        },
-        {
-            "type": "tool_call_update",
-            "toolCallId": call_id,
-            "status": "completed",
-            "rawOutput": {"exit_code": 0, "command": command},
-        },
-    ]
-
-
 class GrokReviewRoleTests(unittest.TestCase):
-    def test_streaming_review_command_enforces_git_only_read_contract(self) -> None:
-        prepared = (
-            "/opt/grabowski-external/grok",
-            "--model",
-            "grok-4.6",
-            "-p",
-            "review this",
-        )
-
+    def test_streaming_review_command_embeds_bound_diff_without_repository_tools(self) -> None:
+        prepared = ("/opt/grabowski-external/grok", "--model", "grok-4.6", "-p", "review this")
         head = "a" * 40
         base = "b" * 40
-        actual = role._grok_streaming_review_command(
-            prepared, expected_head=head, expected_base_head=base
+        review_diff = b"diff --git a/a.py b/a.py\n+safe = True\n"
+        actual, prompt_bytes = role._grok_streaming_review_command(
+            prepared, expected_head=head, expected_base_head=base, review_diff=review_diff
         )
-
-        self.assertEqual(actual[0:3], prepared[0:3])
-        self.assertNotIn("--always-approve", actual)
-        self.assertEqual(actual[actual.index("--sandbox") + 1], "read-only")
-        self.assertEqual(actual[actual.index("--tools") + 1], "run_terminal_cmd")
-        self.assertEqual(actual[actual.index("--output-format") + 1], "streaming-json")
-        self.assertEqual(actual[actual.index("--max-turns") + 1], str(role.GROK_REVIEW_MAX_TURNS))
-        allow_values = [actual[index + 1] for index, value in enumerate(actual) if value == "--allow"]
-        deny_values = [actual[index + 1] for index, value in enumerate(actual) if value == "--deny"]
+        self.assertEqual(actual[actual.index("--tools") + 1], "todo_write")
         self.assertEqual(
-            tuple(allow_values),
-            (
-                "Bash(git status --short --branch)",
-                f"Bash(git diff --no-ext-diff --no-textconv {base}...{head})",
-            ),
+            actual[actual.index("--disallowed-tools") + 1],
+            "todo_write,search_tool,use_tool,run_terminal_cmd,run_terminal_command",
         )
-        self.assertEqual(tuple(deny_values), role.GROK_REVIEW_DENY_RULES)
-        self.assertIn("Bash(*;*)", deny_values)
-        self.assertIn("Bash(*&*)", deny_values)
-        self.assertIn("Bash(*.grok*)", deny_values)
-        self.assertNotIn("Bash(*--ext-diff*)", deny_values)
-        self.assertNotIn("Bash(*--textconv*)", deny_values)
-        self.assertNotIn("Bash(*--no-index*)", deny_values)
-        self.assertNotIn("Bash(*--output*)", deny_values)
-        self.assertEqual(actual[-2], "-p")
-        self.assertTrue(actual[-1].startswith("review this"))
-        self.assertIn("Do not wrap", actual[-1])
-        self.assertIn("git diff --no-ext-diff --no-textconv", actual[-1])
+        self.assertNotIn("--allow", actual)
+        self.assertNotIn("--deny", actual)
+        self.assertNotIn("-p", actual)
+        self.assertEqual(actual[actual.index("--sandbox") + 1], "read-only")
+        self.assertEqual(actual[actual.index("--prompt-file") + 1], "/dev/stdin")
+        prompt = prompt_bytes.decode("utf-8")
+        self.assertIn(base, prompt)
+        self.assertIn(head, prompt)
+        self.assertIn(hashlib.sha256(review_diff).hexdigest(), prompt)
+        self.assertIn(review_diff.decode(), prompt)
+        self.assertIn("Do not use any tool", prompt)
 
-    def test_streaming_review_prompt_binds_exact_revisions_and_single_command_tools(self) -> None:
-        prepared = (
-            "/opt/grabowski-external/grok",
-            "--model",
-            "grok-4.6",
-            "-p",
-            "review this",
+
+    def test_streaming_review_large_diff_stays_out_of_argv(self) -> None:
+        prepared = ("/opt/grabowski-external/grok", "--model", "grok-4.6", "-p", "review this")
+        review_diff = b"x" * 247_109
+        actual, prompt_bytes = role._grok_streaming_review_command(
+            prepared,
+            expected_head="a" * 40,
+            expected_base_head="b" * 40,
+            review_diff=review_diff,
         )
+        self.assertLess(max(len(item.encode("utf-8")) for item in actual), 4096)
+        self.assertGreater(len(prompt_bytes), len(review_diff))
+        self.assertEqual(actual[actual.index("--prompt-file") + 1], "/dev/stdin")
+
+    def test_streaming_review_command_rejects_oversized_or_non_utf8_diff(self) -> None:
+        prepared = ("/opt/grabowski-external/grok", "--model", "grok-4.6", "-p", "review this")
+        kwargs = {"expected_head": "a" * 40, "expected_base_head": "b" * 40}
+        with self.assertRaisesRegex(RuntimeError, "exceeds"):
+            role._grok_streaming_review_command(
+                prepared, review_diff=b"x" * (role.MAX_GROK_REVIEW_INPUT_BYTES + 1), **kwargs
+            )
+        with self.assertRaisesRegex(RuntimeError, "UTF-8"):
+            role._grok_streaming_review_command(prepared, review_diff=b"\xff", **kwargs)
+
+    def test_bound_review_input_artifact_is_private_hash_bound_and_size_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace_root = root / "gaw-a2345678"
+            workspace_root.mkdir(mode=0o700)
+            patch_path = workspace_root / "writer.patch"
+            patch_bytes = b"diff --git a/src/app.py b/src/app.py\n+dirty = True\n"
+            patch_path.write_bytes(patch_bytes)
+            os.chmod(patch_path, 0o600)
+            patch_sha256 = hashlib.sha256(patch_bytes).hexdigest()
+            self.assertEqual(
+                role.read_bound_review_input_artifact(
+                    str(root), str(patch_path), patch_sha256
+                ),
+                patch_bytes,
+            )
+            with self.assertRaisesRegex(RuntimeError, "SHA-256 mismatch"):
+                role.read_bound_review_input_artifact(
+                    str(root), str(patch_path), "0" * 64
+                )
+            with self.assertRaisesRegex(RuntimeError, "outside the canonical workspace root"):
+                role.read_bound_review_input_artifact(
+                    str(root / "other-root"), str(patch_path), patch_sha256
+                )
+            patch_path.write_bytes(b"x" * (role.MAX_GROK_REVIEW_INPUT_BYTES + 1))
+            os.chmod(patch_path, 0o600)
+            with self.assertRaisesRegex(RuntimeError, "safety boundary"):
+                role.read_bound_review_input_artifact(
+                    str(root),
+                    str(patch_path),
+                    hashlib.sha256(patch_path.read_bytes()).hexdigest(),
+                )
+
+    def test_bound_review_input_artifact_requires_private_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace_root = root / "gaw-a2345678"
+            workspace_root.mkdir(mode=0o700)
+            patch_path = workspace_root / "writer.patch"
+            patch_bytes = b"diff --git a/src/app.py b/src/app.py\n+dirty = True\n"
+            patch_path.write_bytes(patch_bytes)
+            os.chmod(patch_path, 0o600)
+            os.chmod(root, 0o750)
+            with self.assertRaisesRegex(RuntimeError, "workspace root"):
+                role.read_bound_review_input_artifact(
+                    str(root), str(patch_path), hashlib.sha256(patch_bytes).hexdigest()
+                )
+
+    def test_bound_review_input_artifact_rejects_wrong_owner_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace_root = root / "gaw-a2345678"
+            workspace_root.mkdir(mode=0o700)
+            patch_path = workspace_root / "writer.patch"
+            patch_bytes = b"diff --git a/src/app.py b/src/app.py\n+dirty = True\n"
+            patch_path.write_bytes(patch_bytes)
+            os.chmod(patch_path, 0o600)
+            expected_uid = os.getuid() + 1
+            with mock.patch.object(role.os, "getuid", return_value=expected_uid):
+                with self.assertRaisesRegex(RuntimeError, "workspace root"):
+                    role.read_bound_review_input_artifact(
+                        str(root), str(patch_path), hashlib.sha256(patch_bytes).hexdigest()
+                    )
+
+    def test_bound_review_input_artifact_requires_private_workspace_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace_root = root / "gaw-a2345678"
+            workspace_root.mkdir(mode=0o700)
+            patch_path = workspace_root / "writer.patch"
+            patch_bytes = b"diff --git a/src/app.py b/src/app.py\n+dirty = True\n"
+            patch_path.write_bytes(patch_bytes)
+            os.chmod(patch_path, 0o600)
+            os.chmod(workspace_root, 0o750)
+            with self.assertRaisesRegex(RuntimeError, "canonical private workspace patch"):
+                role.read_bound_review_input_artifact(
+                    str(root), str(patch_path), hashlib.sha256(patch_bytes).hexdigest()
+                )
+
+    def test_bound_review_input_artifact_rejects_static_workspace_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            real_workspace = root / "gaw-b2345678"
+            real_workspace.mkdir(mode=0o700)
+            real_patch = real_workspace / "writer.patch"
+            patch_bytes = b"diff --git a/src/app.py b/src/app.py\n+dirty = True\n"
+            real_patch.write_bytes(patch_bytes)
+            os.chmod(real_patch, 0o600)
+            linked_workspace = root / "gaw-a2345678"
+            linked_workspace.symlink_to(real_workspace, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "could not be read safely"):
+                role.read_bound_review_input_artifact(
+                    str(root),
+                    str(linked_workspace / "writer.patch"),
+                    hashlib.sha256(patch_bytes).hexdigest(),
+                )
+
+    def test_bound_review_input_artifact_rejects_patch_symlink_and_hardlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace_root = root / "gaw-a2345678"
+            workspace_root.mkdir(mode=0o700)
+            patch_bytes = b"diff --git a/src/app.py b/src/app.py\n+dirty = True\n"
+            patch_sha256 = hashlib.sha256(patch_bytes).hexdigest()
+
+            symlink_target = workspace_root / "writer-round-0002.patch"
+            symlink_target.write_bytes(patch_bytes)
+            os.chmod(symlink_target, 0o600)
+            patch_path = workspace_root / "writer.patch"
+            patch_path.symlink_to(symlink_target.name)
+            with self.assertRaisesRegex(RuntimeError, "could not be read safely"):
+                role.read_bound_review_input_artifact(
+                    str(root), str(patch_path), patch_sha256
+                )
+
+            patch_path.unlink()
+            hardlink_source = root / "hardlink-source.patch"
+            hardlink_source.write_bytes(patch_bytes)
+            os.chmod(hardlink_source, 0o600)
+            os.link(hardlink_source, patch_path)
+            with self.assertRaisesRegex(RuntimeError, "safety boundary"):
+                role.read_bound_review_input_artifact(
+                    str(root), str(patch_path), patch_sha256
+                )
+
+    def test_bound_review_input_artifact_rejects_exact_one_mib(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace_root = root / "gaw-a2345678"
+            workspace_root.mkdir(mode=0o700)
+            patch_path = workspace_root / "writer.patch"
+            patch_bytes = b"x" * role.MAX_GROK_REVIEW_INPUT_BYTES
+            patch_path.write_bytes(patch_bytes)
+            os.chmod(patch_path, 0o600)
+            with self.assertRaisesRegex(RuntimeError, "safety boundary"):
+                role.read_bound_review_input_artifact(
+                    str(root), str(patch_path), hashlib.sha256(patch_bytes).hexdigest()
+                )
+
+    def test_bound_review_input_artifact_rejects_patch_change_during_read(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace_root = root / "gaw-a2345678"
+            workspace_root.mkdir(mode=0o700)
+            patch_path = workspace_root / "writer.patch"
+            patch_bytes = b"diff --git a/src/app.py b/src/app.py\n+dirty = True\n"
+            patch_path.write_bytes(patch_bytes)
+            os.chmod(patch_path, 0o600)
+            patch_sha256 = hashlib.sha256(patch_bytes).hexdigest()
+            real_read = os.read
+            changed = False
+
+            def racing_read(descriptor, count):
+                nonlocal changed
+                chunk = real_read(descriptor, count)
+                if chunk and not changed:
+                    patch_path.write_bytes(patch_bytes + b"# changed\n")
+                    os.chmod(patch_path, 0o600)
+                    changed = True
+                return chunk
+
+            with mock.patch.object(role.os, "read", side_effect=racing_read):
+                with self.assertRaisesRegex(RuntimeError, "changed while being read"):
+                    role.read_bound_review_input_artifact(
+                        str(root), str(patch_path), patch_sha256
+                    )
+            self.assertTrue(changed)
+
+    def test_bound_review_input_artifact_rejects_intermediate_symlink_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as outside_temporary:
+            root = Path(temporary)
+            workspace_root = root / "gaw-a2345678"
+            workspace_root.mkdir(mode=0o700)
+            patch_path = workspace_root / "writer.patch"
+            patch_bytes = b"diff --git a/src/app.py b/src/app.py\n+dirty = True\n"
+            patch_path.write_bytes(patch_bytes)
+            os.chmod(patch_path, 0o600)
+            outside = Path(outside_temporary)
+            outside_patch = outside / "writer.patch"
+            outside_patch.write_bytes(patch_bytes)
+            os.chmod(outside_patch, 0o600)
+            patch_sha256 = hashlib.sha256(patch_bytes).hexdigest()
+            real_open = os.open
+            swapped = False
+
+            def racing_open(path_value, flags, mode=0o777, *, dir_fd=None):
+                nonlocal swapped
+                fd = real_open(path_value, flags, mode, dir_fd=dir_fd)
+                if not swapped and dir_fd is None and Path(path_value) == root.resolve():
+                    preserved = root / "preserved-workspace"
+                    workspace_root.rename(preserved)
+                    workspace_root.symlink_to(outside, target_is_directory=True)
+                    swapped = True
+                return fd
+
+            with mock.patch.object(role.os, "open", side_effect=racing_open):
+                with self.assertRaisesRegex(RuntimeError, "could not be read safely"):
+                    role.read_bound_review_input_artifact(
+                        str(root), str(patch_path), patch_sha256
+                    )
+            self.assertTrue(swapped)
+
+    def test_dirty_grok_review_uses_frozen_patch_instead_of_committed_diff(self) -> None:
         head = "a" * 40
         base = "b" * 40
-
-        actual = role._grok_streaming_review_command(
-            prepared, expected_head=head, expected_base_head=base
+        diff = "c" * 64
+        patch_bytes = b"diff --git a/src/app.py b/src/app.py\n+dirty = True\n"
+        completed = SimpleNamespace(
+            returncode=0,
+            stdout_sha256=hashlib.sha256(b'{"verdict":"PASS","findings":[]}').hexdigest(),
+            stderr_sha256=hashlib.sha256(b"").hexdigest(),
+            stdout_bytes=len(b'{"verdict":"PASS","findings":[]}'),
+            stderr_bytes=0,
+            stdout_tail="",
+            stderr_tail="",
+            output_limit_exceeded=False,
+            stdout_content_exceeded=False,
+            stdout_content=b'{"verdict":"PASS","findings":[]}',
         )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace_root = root / "gaw-b2345678"
+            workspace_root.mkdir(mode=0o700)
+            patch_path = workspace_root / "writer.patch"
+            patch_path.write_bytes(patch_bytes)
+            os.chmod(patch_path, 0o600)
+            patch_sha256 = hashlib.sha256(patch_bytes).hexdigest()
+            with (
+                mock.patch.object(
+                    role, "current_binding",
+                    side_effect=[(head, diff, True), (head, diff, True)],
+                ),
+                mock.patch.object(role, "committed_diff") as committed_diff,
+                mock.patch.object(
+                    role, "_review_sandbox_argv",
+                    return_value=(["sandbox"], None, b"prompt"),
+                ) as review_sandbox,
+                mock.patch.object(role, "runtime_sandbox_argv", return_value=["runtime"]),
+                mock.patch.object(role, "run_bounded_capture", return_value=completed),
+                mock.patch.object(role, "write_receipt") as write_receipt,
+            ):
+                returncode = role.main(
+                    [
+                        "--role", "review",
+                        "--repository", str(ROOT),
+                        "--expected-head", head,
+                        "--expected-base-head", base,
+                        "--expected-diff-sha256", diff,
+                        "--expected-dirty", "true",
+                        "--review-input-root", str(root),
+                        "--review-input-path", str(patch_path),
+                        "--review-input-sha256", patch_sha256,
+                        "--output", "/tmp/grok-dirty-review-receipt.json",
+                        "--", "grok", "--model", "grok-4.6", "review this",
+                    ]
+                )
 
-        prompt = actual[-1]
-        self.assertIn(f"bound head is {head}", prompt)
-        self.assertIn(f"bound base is {base}", prompt)
-        self.assertIn("one Git command per tool call", prompt)
-        self.assertIn(
-            f"git diff --no-ext-diff --no-textconv {base}...{head}", prompt
-        )
-        self.assertIn("Do not use git log", prompt)
-        self.assertIn("Do not use shell control operators", prompt)
-        self.assertIn("at most two tool calls total", prompt)
-        self.assertIn("Never repeat a command", prompt)
-        self.assertIn("Do not make any additional repository tool calls", prompt)
-        self.assertNotIn("git cat-file blob", prompt)
-        self.assertIn("Reserve the final turn", prompt)
-        self.assertIn("immediately return the final JSON", prompt)
-        self.assertIn("return NEEDS_CHANGE or BLOCK", prompt)
+        self.assertEqual(returncode, 0)
+        committed_diff.assert_not_called()
+        self.assertEqual(review_sandbox.call_args.kwargs["review_diff"], patch_bytes)
+        payload = write_receipt.call_args.args[1]
+        self.assertEqual(payload["review_input_source"], "frozen_writer_patch")
+        self.assertEqual(payload["review_input_sha256"], hashlib.sha256(patch_bytes).hexdigest())
+
+    def test_dirty_grok_review_without_frozen_patch_fails_closed(self) -> None:
+        head = "a" * 40
+        base = "b" * 40
+        diff = "c" * 64
+        with (
+            mock.patch.object(role, "current_binding", return_value=(head, diff, True)),
+            mock.patch.object(role, "committed_diff") as committed_diff,
+            self.assertRaisesRegex(RuntimeError, "requires the frozen writer patch"),
+        ):
+            role.main(
+                [
+                    "--role", "review",
+                    "--repository", str(ROOT),
+                    "--expected-head", head,
+                    "--expected-base-head", base,
+                    "--expected-diff-sha256", diff,
+                    "--expected-dirty", "true",
+                    "--output", "/tmp/grok-missing-dirty-review-receipt.json",
+                    "--", "grok", "--model", "grok-4.6", "review this",
+                ]
+            )
+        committed_diff.assert_not_called()
 
     def test_streaming_review_command_rejects_caller_owned_execution_framing(self) -> None:
         controlled = (
-            "--always-approve",
-            "--yolo",
-            "--dangerously-skip-permissions",
-            "--permission-mode",
-            "--allow",
-            "--deny",
-            "--sandbox",
-            "--tools",
-            "--disallowed-tools",
-            "--output-format",
-            "--max-turns",
-            "--json-schema",
+            "--always-approve", "--yolo", "--dangerously-skip-permissions",
+            "--permission-mode", "--allow", "--deny", "--sandbox", "--tools",
+            "--disallowed-tools", "--output-format", "--max-turns", "--json-schema",
+            "--prompt-file",
         )
         for option in controlled:
-            with self.subTest(option=option, form="separate"):
-                prepared = (
-                    "/opt/grabowski-external/grok",
-                    option,
-                    "value",
-                    "-p",
-                    "review this",
-                )
-                with self.assertRaisesRegex(RuntimeError, "controlled by Grabowski"):
-                    role._grok_streaming_review_command(
-                        prepared, expected_head="a" * 40, expected_base_head="b" * 40
-                    )
-            with self.subTest(option=option, form="attached"):
-                prepared = (
-                    "/opt/grabowski-external/grok",
-                    f"{option}=value",
-                    "-p",
-                    "review this",
-                )
-                with self.assertRaisesRegex(RuntimeError, "controlled by Grabowski"):
-                    role._grok_streaming_review_command(
-                        prepared, expected_head="a" * 40, expected_base_head="b" * 40
-                    )
+            for item in ((option, "value"), (f"{option}=value",)):
+                with self.subTest(option=option, item=item):
+                    prepared = ("/opt/grabowski-external/grok", *item, "-p", "review this")
+                    with self.assertRaisesRegex(RuntimeError, "controlled by Grabowski"):
+                        role._grok_streaming_review_command(
+                            prepared, expected_head="a" * 40, expected_base_head="b" * 40, review_diff=b"diff"
+                        )
 
     def test_review_sandbox_preserves_declared_command_for_provenance(self) -> None:
         repo = Path("/tmp/repo")
         declared = ["grok", "--model", "grok-4.6", "review this"]
         prepared = PreparedSandboxCommand(
-            command=(
-                "/opt/grabowski-external/grok",
-                "--model",
-                "grok-4.6",
-                "-p",
-                "review this",
-            )
+            command=("/opt/grabowski-external/grok", "--model", "grok-4.6", "-p", "review this")
         )
         with (
             mock.patch.object(role, "prepare_external_agent_command", return_value=prepared),
             mock.patch.object(role, "sandbox_argv", return_value=["sandbox"]) as sandbox_argv,
         ):
-            argv, contract = role._review_sandbox_argv(
-                repo,
-                declared,
-                expected_head="a" * 40,
-                expected_base_head="b" * 40,
+            argv, contract, prompt_bytes = role._review_sandbox_argv(
+                repo, declared, expected_head="a" * 40, expected_base_head="b" * 40, review_diff=b"diff"
             )
-
         self.assertEqual(argv, ["sandbox"])
         self.assertEqual(contract, role.GROK_REVIEW_STREAM_CONTRACT)
+        self.assertIn(b"diff", prompt_bytes)
         actual = sandbox_argv.call_args.args[1]
-        self.assertIn("--output-format", actual)
-        self.assertNotIn("--always-approve", actual)
+        self.assertEqual(actual[actual.index("--tools") + 1], "todo_write")
+        self.assertEqual(
+            actual[actual.index("--disallowed-tools") + 1],
+            "todo_write,search_tool,use_tool,run_terminal_cmd,run_terminal_command",
+        )
         self.assertEqual(sandbox_argv.call_args.kwargs["declared_command"], declared)
-
-    def test_safe_grok_git_read_command_accepts_only_exact_bound_read_forms(self) -> None:
-        head = "a" * 40
-        base = "b" * 40
-        accepted = (
-            "git status --short --branch",
-            f"git diff --no-ext-diff --no-textconv {base}...{head}",
-        )
-        rejected = (
-            f"git diff --no-ext-diff --no-textconv {base}...{head} -- src tests",
-            f"git cat-file blob {head}:src/app.py",
-            f"git cat-file blob {base}:src/app.py",
-            f"git cat-file blob {head}:../outside",
-            f"git cat-file blob {head}:/abs/path",
-            f"git cat-file blob {head}:~private",
-            "git rev-parse HEAD",
-            f"git rev-parse --output-file=review-output {head}",
-            f"git merge-base {base} {head}",
-            "git ls-files src tests",
-            "git ls-files -- src tests",
-            f"git diff --no-ext-diff --no-textconv {'c' * 40}...{head}",
-            f"git cat-file blob {'c' * 40}:src/app.py",
-            "git diff HEAD~1...HEAD",
-            "git diff --no-ext-diff --no-textconv HEAD~1...HEAD --ext-diff",
-            "git diff --no-ext-diff --no-textconv --textconv HEAD~1...HEAD",
-            "git diff --no-ext-diff --no-textconv --no-index /etc/passwd /dev/null",
-            "git diff --no-ext-diff --no-textconv HEAD~1...HEAD --output=/tmp/out",
-            "git branch -D main",
-            "git log --no-patch -5 --oneline",
-            "git status --short --branch --ignored",
-            "git status --short --branch; cat /tmp/.grok/auth.json",
-            "git rev-parse HEAD & cat /tmp/.grok/auth.json",
-            "git diff --no-ext-diff --no-textconv HEAD | cat",
-            "git cat-file blob $(cat /tmp/.grok/auth.json)",
-            "git ls-files .grok/auth.json",
-            "git ls-files 'auth.json'",
-            "git ls-files 'a'uth.json",
-            "git ls-files a\\uth.json",
-            "git rev-parse HEAD:.grok/auth.json",
-            "git diff --no-ext-diff --no-textconv /tmp/.*/* /dev/null",
-            "git diff --no-ext-diff --no-textconv /tmp/.gro?/a?th.json /dev/null",
-            "git diff --no-ext-diff --no-textconv /tmp/[.]grok/a[uv]th.json /dev/null",
-            "git diff --no-ext-diff --no-textconv /tmp/.{grok,other}/a{uth,lt}.json /dev/null",
-            "git diff --no-ext-diff --no-textconv ~/private-a ~/private-b",
-            "git diff --no-ext-diff --no-textconv ../../private-a ../../private-b",
-            "git ls-files --exclude-from=/tmp/excludes",
-            "git ls-files --exclude-from=auth-link",
-            "git ls-files --exclude-per-directory=auth-link",
-            "git log -p -1",
-            "cat src/app.py",
-            "git status\ncat /tmp/.grok/auth.json",
-        )
-        for command in accepted:
-            with self.subTest(command=command):
-                self.assertTrue(
-                    role._safe_grok_git_read_command(
-                        command, expected_head=head, expected_base_head=base
-                    )
-                )
-        for command in rejected:
-            with self.subTest(command=command):
-                self.assertFalse(
-                    role._safe_grok_git_read_command(
-                        command, expected_head=head, expected_base_head=base
-                    )
-                )
 
     def test_terminal_json_object_accepts_unique_object_suffix_after_prose(self) -> None:
         review = role._terminal_json_object(
@@ -265,202 +412,62 @@ class GrokReviewRoleTests(unittest.TestCase):
             )
         )
 
-    def test_extract_stream_requires_successful_bounded_git_tool_and_terminal_review(self) -> None:
-        head = "a" * 40
-        base = "b" * 40
-        command = f"git diff --no-ext-diff --no-textconv {base}...{head}"
+    def test_extract_stream_accepts_toolless_terminal_review(self) -> None:
         events = [
-            {"type": "thought", "data": "inspect exact diff"},
-            {"type": "available_commands", "tools": ["run_terminal_command"]},
+            {"type": "thought", "data": "review bound diff"},
+            {"type": "available_commands", "tools": []},
             {"type": "usage", "usage": {"input_tokens": 1}},
-            {"type": "text", "data": "I will inspect."},
-            *successful_git_tool_events(command),
             {"type": "text", "data": "Reviewed.\n\n"},
             {"type": "text", "data": '{"verdict":"PASS","findings":[]}'},
-            {"type": "end", "stopReason": "end_turn", "num_turns": 2},
+            {"type": "end", "stopReason": "end_turn", "num_turns": 1},
         ]
-
         document, error, metadata = role._extract_grok_stream_review_document(
-            stream_bytes(events), expected_head=head, expected_base_head=base
+            stream_bytes(events), expected_head="a" * 40, expected_base_head="b" * 40
         )
-
         self.assertIsNone(error)
         self.assertEqual(json.loads(document), {"verdict": "PASS", "findings": []})
-        self.assertEqual(metadata["review_provider_completed_tool_calls"], 1)
-        self.assertEqual(metadata["review_provider_completed_tools"], ["run_terminal_command"])
-        self.assertEqual(metadata["review_provider_completed_commands"], [command])
-        self.assertEqual(metadata["review_provider_num_turns"], 2)
+        self.assertEqual(metadata["review_provider_completed_tool_calls"], 0)
+        self.assertEqual(metadata["review_provider_num_turns"], 1)
 
-    def test_extract_stream_fails_closed_on_unsafe_or_failed_git_tool(self) -> None:
+    def test_extract_stream_requires_empty_tool_availability_evidence(self) -> None:
+        base_events = [
+            {"type": "text", "data": '{"verdict":"PASS","findings":[]}'},
+            {"type": "end", "stopReason": "end_turn", "num_turns": 1},
+        ]
         cases = (
-            (
-                [
-                    {
-                        "type": "tool_use",
-                        "toolCallId": "write-1",
-                        "toolName": "write_file",
-                        "rawInput": {"path": "src/app.py"},
-                    },
-                    {"type": "end", "stopReason": "end_turn", "num_turns": 2},
-                ],
-                "unsupported event type",
-            ),
-            (
-                [
-                    {
-                        "type": "tool_call",
-                        "toolCallId": "read-1",
-                        "toolName": "read_file",
-                        "rawInput": {"path": "src/app.py"},
-                    },
-                    {"type": "end", "stopReason": "end_turn", "num_turns": 2},
-                ],
-                "disallowed tool",
-            ),
-            (
-                [
-                    {
-                        "type": "tool_call",
-                        "toolCallId": "call-1",
-                        "toolName": "run_terminal_command",
-                        "rawInput": {"command": "git branch -D main"},
-                    },
-                    {"type": "end", "stopReason": "end_turn", "num_turns": 2},
-                ],
-                "non-read-only Git command",
-            ),
-            (
-                [
-                    {
-                        "type": "tool_call",
-                        "toolCallId": "call-1",
-                        "toolName": "run_terminal_command",
-                        "rawInput": {"command": "git status --short --branch"},
-                    },
-                    {
-                        "type": "tool_call_update",
-                        "toolCallId": "call-1",
-                        "status": "completed",
-                        "rawOutput": {"exit_code": 1, "command": "git status --short --branch"},
-                    },
-                    {"type": "end", "stopReason": "end_turn", "num_turns": 2},
-                ],
-                "did not succeed",
-            ),
-            (
-                [
-                    {
-                        "type": "tool_call",
-                        "toolCallId": "call-1",
-                        "toolName": "run_terminal_command",
-                        "rawInput": {"command": "git status --short --branch"},
-                    },
-                    {
-                        "type": "tool_call_update",
-                        "toolCallId": "call-1",
-                        "status": "completed",
-                        "rawOutput": {"exit_code": 0, "command": "git rev-parse HEAD"},
-                    },
-                    {"type": "end", "stopReason": "end_turn", "num_turns": 2},
-                ],
-                "changed between request",
-            ),
+            ([{"type": "available_commands", "tools": ["search_tool"]}, *base_events], "advertised disallowed tools"),
+            (base_events, "did not prove an empty tool surface"),
+            ([{"type": "available_commands", "tools": ""}, *base_events], "available tool evidence is invalid"),
         )
         for events, expected_error in cases:
             with self.subTest(expected_error=expected_error):
-                document, error, _metadata = role._extract_grok_stream_review_document(
-                    stream_bytes(events),
-                    expected_head="a" * 40,
-                    expected_base_head="b" * 40,
+                document, error, _ = role._extract_grok_stream_review_document(
+                    stream_bytes(events), expected_head="a" * 40, expected_base_head="b" * 40
                 )
                 self.assertIsNone(document)
                 self.assertIn(expected_error, error)
 
-    def test_extract_stream_fails_closed_without_complete_tool_review(self) -> None:
-        base_tool = successful_git_tool_events()
+    def test_extract_stream_rejects_any_tool_use(self) -> None:
+        events = [
+            {"type": "tool_call", "toolCallId": "x", "toolName": "run_terminal_command", "rawInput": {"command": "git status"}},
+            {"type": "end", "stopReason": "end_turn", "num_turns": 2},
+        ]
+        document, error, _ = role._extract_grok_stream_review_document(
+            stream_bytes(events), expected_head="a" * 40, expected_base_head="b" * 40
+        )
+        self.assertIsNone(document)
+        self.assertIn("attempted tool use", error)
+
+    def test_extract_stream_fails_closed_on_bad_terminal_shape(self) -> None:
+        availability = {"type": "available_commands", "tools": []}
         cases = (
-            (
-                [
-                    {"type": "text", "data": '{"verdict":"PASS","findings":[]}'},
-                    {"type": "end", "stopReason": "end_turn", "num_turns": 1},
-                ],
-                "completed no read-only",
-            ),
-            (
-                [
-                    base_tool[0],
-                    {
-                        "type": "tool_call_update",
-                        "toolCallId": "call-1",
-                        "status": "failed",
-                    },
-                    {"type": "end", "stopReason": "end_turn", "num_turns": 2},
-                ],
-                "did not complete",
-            ),
-            (
-                [
-                    *base_tool,
-                    {
-                        "type": "tool_call",
-                        "toolCallId": "call-2",
-                        "toolName": "run_terminal_command",
-                        "rawInput": {
-                            "command": (
-                                "git diff --no-ext-diff --no-textconv "
-                                + "b" * 40
-                                + "..."
-                                + "a" * 40
-                            )
-                        },
-                    },
-                    {"type": "text", "data": '{"verdict":"PASS","findings":[]}'},
-                    {"type": "end", "stopReason": "end_turn", "num_turns": 3},
-                ],
-                "left a repository tool call incomplete",
-            ),
-            (
-                [
-                    base_tool[0],
-                    base_tool[0],
-                    base_tool[1],
-                    {"type": "text", "data": '{"verdict":"PASS","findings":[]}'},
-                    {"type": "end", "stopReason": "end_turn", "num_turns": 2},
-                ],
-                "reused a tool call identity",
-            ),
-            (
-                [
-                    *base_tool,
-                    base_tool[1],
-                    {"type": "text", "data": '{"verdict":"PASS","findings":[]}'},
-                    {"type": "end", "stopReason": "end_turn", "num_turns": 2},
-                ],
-                "completed a tool call more than once",
-            ),
-            (
-                [
-                    *base_tool,
-                    {"type": "text", "data": '{"verdict":"PASS","findings":[]}'},
-                    {"type": "end", "stopReason": "cancelled", "num_turns": 2},
-                ],
-                "end_turn",
-            ),
-            (
-                [
-                    *base_tool,
-                    {"type": "text", "data": "```json\n{\"verdict\":\"PASS\",\"findings\":[]}\n```"},
-                    {"type": "end", "stopReason": "end_turn", "num_turns": 2},
-                ],
-                "unique JSON object suffix",
-            ),
+            ([availability, {"type": "text", "data": '{"verdict":"PASS","findings":[]}'}, {"type": "end", "stopReason": "cancelled", "num_turns": 1}], "end_turn"),
+            ([availability, {"type": "text", "data": "```json\n{\"verdict\":\"PASS\",\"findings\":[]}\n```"}, {"type": "end", "stopReason": "end_turn", "num_turns": 1}], "unique JSON object suffix"),
         )
         for events, expected_error in cases:
             with self.subTest(expected_error=expected_error):
-                document, error, _metadata = role._extract_grok_stream_review_document(
-                    stream_bytes(events),
-                    expected_head="a" * 40,
-                    expected_base_head="b" * 40,
+                document, error, _ = role._extract_grok_stream_review_document(
+                    stream_bytes(events), expected_head="a" * 40, expected_base_head="b" * 40
                 )
                 self.assertIsNone(document)
                 self.assertIn(expected_error, error)
@@ -484,7 +491,8 @@ class GrokReviewRoleTests(unittest.TestCase):
         )
         with (
             mock.patch.object(role, "current_binding", side_effect=[(head, diff, False), (head, diff, False)]),
-            mock.patch.object(role, "_review_sandbox_argv", return_value=(["sandbox"], role.GROK_REVIEW_STREAM_CONTRACT)),
+            mock.patch.object(role, "committed_diff", return_value=b"diff"),
+            mock.patch.object(role, "_review_sandbox_argv", return_value=(["sandbox"], role.GROK_REVIEW_STREAM_CONTRACT, b"prompt")),
             mock.patch.object(role, "runtime_sandbox_argv", return_value=["runtime"]),
             mock.patch.object(role, "run_bounded_capture", return_value=completed),
             mock.patch.object(role, "classify_result", return_value="invalid_review_output"),
@@ -505,6 +513,7 @@ class GrokReviewRoleTests(unittest.TestCase):
 
         self.assertEqual(returncode, 126)
         payload = write_receipt.call_args.args[1]
+        self.assertEqual(payload["review_input_source"], "committed_diff")
         self.assertEqual(payload["review_content_limit_bytes"], role.MAX_GROK_REVIEW_STREAM_BYTES)
         self.assertEqual(
             payload["error"],
@@ -541,7 +550,8 @@ class GrokReviewRoleTests(unittest.TestCase):
 
         with (
             mock.patch.object(role, "current_binding", side_effect=[(head, diff, False), (head, diff, False)]),
-            mock.patch.object(role, "_review_sandbox_argv", return_value=(["sandbox"], role.GROK_REVIEW_STREAM_CONTRACT)),
+            mock.patch.object(role, "committed_diff", return_value=b"diff"),
+            mock.patch.object(role, "_review_sandbox_argv", return_value=(["sandbox"], role.GROK_REVIEW_STREAM_CONTRACT, b"prompt")),
             mock.patch.object(role, "runtime_sandbox_argv", return_value=["runtime"]),
             mock.patch.object(role, "run_bounded_capture", return_value=completed),
             mock.patch.object(

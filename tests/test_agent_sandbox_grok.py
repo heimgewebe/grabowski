@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 import stat
@@ -158,6 +159,27 @@ class GrokSandboxTests(unittest.TestCase):
             self.assertNotIn("XAI_API_KEY", joined)
             home_index = argv.index("HOME")
             self.assertEqual(argv[home_index + 1], "/tmp")
+
+
+    def test_bounded_capture_supplies_large_anonymous_stdin(self) -> None:
+        payload = b"x" * 247_109
+        code = (
+            "import hashlib, sys; "
+            "data = sys.stdin.buffer.read(); "
+            "print(len(data)); print(hashlib.sha256(data).hexdigest())"
+        )
+        captured = sandbox.run_bounded_capture(
+            [sys.executable, "-c", code],
+            stdout_limit=4096,
+            stderr_limit=4096,
+            stdout_content_limit=4096,
+            stdin_content=payload,
+        )
+        self.assertEqual(captured.returncode, 0)
+        self.assertIsNotNone(captured.stdout_content)
+        lines = captured.stdout_content.decode("utf-8").splitlines()
+        self.assertEqual(lines[0], str(len(payload)))
+        self.assertEqual(lines[1], hashlib.sha256(payload).hexdigest())
 
     def test_grok_non_review_command_preserves_arguments(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

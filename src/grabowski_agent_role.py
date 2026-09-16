@@ -4,7 +4,6 @@ import argparse
 import hashlib
 import json
 import os
-import shlex
 from pathlib import Path, PurePosixPath
 import stat
 import subprocess
@@ -18,16 +17,19 @@ SHA256 = __import__("re").compile(r"^[0-9a-f]{64}$")
 MAX_ROLE_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_REVIEW_JSON_BYTES = 1024 * 1024
 MAX_GROK_REVIEW_STREAM_BYTES = 2 * 1024 * 1024
+MAX_GROK_REVIEW_INPUT_BYTES = 1024 * 1024
+WORKSPACE_ID = __import__("re").compile(r"^gaw-[a-z0-9][a-z0-9-]{7,79}$")
+WRITER_PATCH_NAME = __import__("re").compile(r"^writer(?:-round-[0-9]{4})?\.patch$")
 MAX_UNTRACKED_FILE_BYTES = 16 * 1024 * 1024
 MAX_UNTRACKED_TOTAL_BYTES = 64 * 1024 * 1024
 SANDBOX_LABEL = "bubblewrap-minimal-root-read-only-worktree-v1"
 TOOLCHAIN_PROBE_OUTPUT_LIMIT = 64 * 1024
 TOOLCHAIN_PROBE_CONTRACT = "role-toolchain-probe-v2"
 REVIEW_DOCUMENT_CONTRACT = "review-document-wrapper-v2"
-GROK_REVIEW_STREAM_CONTRACT = "grok-streaming-json-readonly-review-v1"
-GROK_REVIEW_TOOL_NAMES = frozenset({"run_terminal_command"})
-GROK_REVIEW_TOOLS = "run_terminal_cmd"
-GROK_REVIEW_MAX_TURNS = 8
+GROK_REVIEW_STREAM_CONTRACT = "grok-streaming-json-bound-diff-review-v2"
+GROK_REVIEW_TOOLS = "todo_write"
+GROK_REVIEW_DISALLOWED_TOOLS = "todo_write,search_tool,use_tool,run_terminal_cmd,run_terminal_command"
+GROK_REVIEW_MAX_TURNS = 2
 GROK_REVIEW_EVENT_TYPES = frozenset(
     {
         "text",
@@ -40,28 +42,13 @@ GROK_REVIEW_EVENT_TYPES = frozenset(
         "end",
     }
 )
-GROK_REVIEW_DENY_RULES = (
-    "Bash(*;*)",
-    "Bash(*&*)",
-    "Bash(*&&*)",
-    "Bash(*||*)",
-    "Bash(*|*)",
-    "Bash(*`*)",
-    "Bash(*$*)",
-    "Bash(*>*)",
-    "Bash(*<*)",
-    "Bash(*.grok*)",
-    "Bash(*auth.json*)",
-)
 GROK_REVIEW_PROMPT_SUFFIX = (
-    "\n\nGrabowski review contract: inspect the repository with at least one of the "
-    "available read-only tools before deciding. Do not modify files or state. "
-    "Your final response must end with exactly one JSON object containing "
-    "verdict (PASS, NEEDS_CHANGE, or BLOCK) and findings (an array of objects). "
-    "PASS requires an empty findings array; non-PASS requires at least one finding. "
-    "Do not wrap the final JSON object in Markdown or code fences. "
-    "For repository inspection, use only these safe command forms: "
-    "git status --short --branch and the exact bound git diff command."
+    "\n\nGrabowski review contract: review only the exact bound diff embedded below. "
+    "Do not use any tool and do not attempt to inspect the repository or filesystem. "
+    "Your final response must end with exactly one JSON object containing verdict "
+    "(PASS, NEEDS_CHANGE, or BLOCK) and findings (an array of objects). PASS requires "
+    "an empty findings array; non-PASS requires at least one finding. Do not wrap the "
+    "final JSON object in Markdown or code fences."
 )
 PYTHON_EXECUTABLE_NAMES = frozenset(
     {"python", "python3"} | {f"python3.{minor}" for minor in range(0, 20)}
@@ -143,9 +130,120 @@ def safe_untracked_file(root: Path, relative: PurePosixPath) -> Path:
     return resolved
 
 
+def committed_diff(repo: Path, base: str, head: str) -> bytes:
+    if SHA40.fullmatch(base) is None or SHA40.fullmatch(head) is None:
+        raise RuntimeError("review diff requires exact base and head revisions")
+    return git(
+        repo,
+        "diff",
+        "--binary",
+        "--no-ext-diff",
+        "--no-textconv",
+        f"{base.lower()}...{head.lower()}",
+    )
+
+
+def read_bound_review_input_artifact(
+    root_value: str, path_value: str, expected_sha256: str
+) -> bytes:
+    """Read one canonical private workspace patch with exact root/content binding."""
+    if SHA256.fullmatch(expected_sha256) is None:
+        raise RuntimeError("review input artifact requires an exact SHA-256")
+    root_path = Path(root_value)
+    path = Path(path_value)
+    if not root_path.is_absolute():
+        raise RuntimeError("review input root must be absolute")
+    if not path.is_absolute():
+        raise RuntimeError("review input artifact path must be absolute")
+    try:
+        relative = path.relative_to(root_path)
+    except ValueError as exc:
+        raise RuntimeError("review input artifact is outside the canonical workspace root") from exc
+    if (
+        len(relative.parts) != 2
+        or ".." in root_path.parts
+        or ".." in relative.parts
+        or WORKSPACE_ID.fullmatch(relative.parts[0]) is None
+        or WRITER_PATCH_NAME.fullmatch(relative.parts[1]) is None
+    ):
+        raise RuntimeError("review input artifact path is not a canonical private workspace patch")
+
+    root_descriptor = -1
+    parent_descriptor = -1
+    descriptor = -1
+    directory_flags = (
+        os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+    )
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        # Do not resolve the root or gaw-* component before opening them: resolve()
+        # would follow a symlink and turn the later O_NOFOLLOW checks into a no-op.
+        # Bind the exact two-component lexical shape above, then pin each object
+        # through descriptor-relative no-follow opens.
+        root_descriptor = os.open(root_path, directory_flags)
+        root_metadata = os.fstat(root_descriptor)
+        if (
+            not stat.S_ISDIR(root_metadata.st_mode)
+            or root_metadata.st_uid != os.getuid()
+            or stat.S_IMODE(root_metadata.st_mode) & 0o077
+        ):
+            raise RuntimeError("review input root is not a canonical private workspace root")
+
+        parent_descriptor = os.open(
+            relative.parts[0], directory_flags, dir_fd=root_descriptor
+        )
+        parent_metadata = os.fstat(parent_descriptor)
+        if (
+            not stat.S_ISDIR(parent_metadata.st_mode)
+            or parent_metadata.st_uid != os.getuid()
+            or stat.S_IMODE(parent_metadata.st_mode) & 0o077
+        ):
+            raise RuntimeError("review input artifact path is not a canonical private workspace patch")
+
+        descriptor = os.open(relative.parts[1], file_flags, dir_fd=parent_descriptor)
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != os.getuid()
+            or stat.S_IMODE(before.st_mode) & 0o077
+            or before.st_size <= 0
+            or before.st_size >= MAX_GROK_REVIEW_INPUT_BYTES
+        ):
+            raise RuntimeError("review input artifact exceeds the Grok safety boundary or is unsafe")
+        chunks: list[bytes] = []
+        total = 0
+        digest_value = hashlib.sha256()
+        while chunk := os.read(descriptor, min(1024 * 1024, MAX_GROK_REVIEW_INPUT_BYTES + 1 - total)):
+            total += len(chunk)
+            if total > MAX_GROK_REVIEW_INPUT_BYTES:
+                raise RuntimeError("review input artifact exceeds the Grok safety boundary")
+            chunks.append(chunk)
+            digest_value.update(chunk)
+        after = os.fstat(descriptor)
+        if (
+            total != before.st_size
+            or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        ):
+            raise RuntimeError("review input artifact changed while being read")
+        if digest_value.hexdigest() != expected_sha256:
+            raise RuntimeError("review input artifact SHA-256 mismatch")
+        return b"".join(chunks)
+    except OSError as exc:
+        raise RuntimeError("review input artifact could not be read safely") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+        if root_descriptor >= 0:
+            os.close(root_descriptor)
+
+
 def current_binding(repo: Path, base: str) -> tuple[str, str, bool]:
     head = git_text(repo, "rev-parse", "HEAD").lower()
-    committed = git(repo, "diff", "--binary", "--no-ext-diff", "--no-textconv", f"{base}...{head}")
+    committed = committed_diff(repo, base, head)
     working = git(repo, "diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD")
     raw = git(repo, "ls-files", "--others", "--exclude-standard", "-z")
     untracked: list[dict[str, Any]] = []
@@ -470,25 +568,22 @@ def _normalize_review_object(
     return verdict, findings, None, normalized_empty_object
 
 
-def _grok_review_allow_rules(*, expected_head: str, expected_base_head: str) -> tuple[str, ...]:
-    """Return execution rules no broader than the exact bound review parser."""
-    head = expected_head.lower()
-    base = expected_base_head.lower()
-    return (
-        "Bash(git status --short --branch)",
-        f"Bash(git diff --no-ext-diff --no-textconv {base}...{head})",
-    )
-
-
 def _grok_streaming_review_command(
     prepared_command: tuple[str, ...],
     *,
     expected_head: str,
     expected_base_head: str,
-) -> tuple[str, ...]:
-    """Run Grok reviews as bounded read-only tool sessions with event evidence."""
+    review_diff: bytes,
+) -> tuple[tuple[str, ...], bytes]:
+    """Build one tool-less Grok review command and its exact stdin prompt bytes."""
     if SHA40.fullmatch(expected_head) is None or SHA40.fullmatch(expected_base_head) is None:
         raise RuntimeError("Grok review requires exact bound head and base revisions")
+    if len(review_diff) > MAX_GROK_REVIEW_INPUT_BYTES:
+        raise RuntimeError(f"Grok review input exceeds {MAX_GROK_REVIEW_INPUT_BYTES} bytes")
+    try:
+        diff_text = review_diff.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("Grok review diff is not valid UTF-8") from exc
     command = list(prepared_command)
     if command.count("-p") != 1:
         raise RuntimeError("Grok review command must contain exactly one single-turn prompt")
@@ -496,20 +591,10 @@ def _grok_streaming_review_command(
     if prompt_index != len(command) - 2:
         raise RuntimeError("Grok review prompt must be the final command argument")
     controlled = {
-        "--always-approve",
-        "--yolo",
-        "--dangerously-skip-permissions",
-        "--permission-mode",
-        "--allow",
-        "--deny",
-        "--disable-web-search",
-        "--no-subagents",
-        "--sandbox",
-        "--tools",
-        "--disallowed-tools",
-        "--output-format",
-        "--max-turns",
-        "--json-schema",
+        "--always-approve", "--yolo", "--dangerously-skip-permissions",
+        "--permission-mode", "--allow", "--deny", "--disable-web-search",
+        "--no-subagents", "--sandbox", "--tools", "--disallowed-tools",
+        "--output-format", "--max-turns", "--json-schema", "--prompt-file",
     }
     if any(
         item in controlled
@@ -517,53 +602,36 @@ def _grok_streaming_review_command(
         for item in command
     ):
         raise RuntimeError("Grok review execution framing is controlled by Grabowski")
+    review_sha256 = hashlib.sha256(review_diff).hexdigest()
     prompt = (
         command[-1]
         + GROK_REVIEW_PROMPT_SUFFIX
-        + " The bound head is "
-        + expected_head.lower()
-        + " and the bound base is "
-        + expected_base_head.lower()
-        + ". Run one Git command per tool call. Do not use shell control operators, "
-          "redirections, command substitution, or pipes. Do not use git log. The revision binding is "
-          "already known; do not rediscover it. Inspect the complete bound diff in one "
-          "separate tool call using exactly: git diff --no-ext-diff --no-textconv "
-        + expected_base_head.lower()
-        + "..."
-        + expected_head.lower()
-        + ". Treat the complete bound diff as the complete repository review evidence. "
-          "Do not make any additional repository tool calls after reading it. Hard limit: at "
-          "most two tool calls total: optional exact status, then the mandatory exact full diff. "
-          "Never repeat a command. Reserve the final turn for the required JSON verdict. After "
-          "the bound diff, stop reading and immediately return the final JSON. If material "
-          "uncertainty remains, return NEEDS_CHANGE or BLOCK instead of broadening the tool "
-          "surface or consuming more turns."
-    )
-    command[-1] = prompt
-    review_flags = [
-        "--disable-web-search",
-        "--no-subagents",
-        "--sandbox",
-        "read-only",
-        "--tools",
-        GROK_REVIEW_TOOLS,
-    ]
-    for rule in _grok_review_allow_rules(
-        expected_head=expected_head, expected_base_head=expected_base_head
-    ):
-        review_flags.extend(["--allow", rule])
-    for rule in GROK_REVIEW_DENY_RULES:
-        review_flags.extend(["--deny", rule])
-    review_flags.extend(
+        + f" The bound base is {expected_base_head.lower()} and the bound head is "
+          f"{expected_head.lower()}. The exact diff SHA-256 is {review_sha256}."
+        + "\n\n--- BEGIN GRABOWSKI BOUND DIFF ---\n"
+        + diff_text
+        + "\n--- END GRABOWSKI BOUND DIFF ---"
+    ).encode("utf-8")
+    del command[prompt_index:]
+    command.extend(
         [
+            "--disable-web-search",
+            "--no-subagents",
+            "--sandbox",
+            "read-only",
+            "--tools",
+            GROK_REVIEW_TOOLS,
+            "--disallowed-tools",
+            GROK_REVIEW_DISALLOWED_TOOLS,
             "--output-format",
             "streaming-json",
             "--max-turns",
             str(GROK_REVIEW_MAX_TURNS),
+            "--prompt-file",
+            "/dev/stdin",
         ]
     )
-    command[prompt_index:prompt_index] = review_flags
-    return tuple(command)
+    return tuple(command), prompt
 
 
 def _review_sandbox_argv(
@@ -572,20 +640,21 @@ def _review_sandbox_argv(
     *,
     expected_head: str,
     expected_base_head: str,
-) -> tuple[list[str], str | None]:
+    review_diff: bytes,
+) -> tuple[list[str], str | None, bytes | None]:
     if Path(command[0]).name != "grok":
-        return sandbox_argv(repo, command), None
+        return sandbox_argv(repo, command), None, None
     prepared = prepare_external_agent_command(command)
-    actual = list(
-        _grok_streaming_review_command(
-            prepared.command,
-            expected_head=expected_head,
-            expected_base_head=expected_base_head,
-        )
+    actual, prompt_bytes = _grok_streaming_review_command(
+        prepared.command,
+        expected_head=expected_head,
+        expected_base_head=expected_base_head,
+        review_diff=review_diff,
     )
     return (
-        sandbox_argv(repo, actual, declared_command=command),
+        sandbox_argv(repo, list(actual), declared_command=command),
         GROK_REVIEW_STREAM_CONTRACT,
+        prompt_bytes,
     )
 
 
@@ -610,47 +679,6 @@ def _terminal_json_object(text: str) -> dict[str, Any] | None:
     return candidates[0]
 
 
-def _safe_grok_git_read_command(
-    command: str,
-    *,
-    expected_head: str,
-    expected_base_head: str,
-) -> bool:
-    """Accept only exact revision-bound Git reads exposed to Grok reviews."""
-    if SHA40.fullmatch(expected_head) is None or SHA40.fullmatch(expected_base_head) is None:
-        return False
-    shell_expansion_markers = (
-        "\n", "\r", ";", "&", "|", "`", "$", ">", "<",
-        "*", "?", "[", "]", "{", "}",
-    )
-    if not command or any(marker in command for marker in shell_expansion_markers):
-        return False
-    if ".grok" in command or "auth.json" in command:
-        return False
-    try:
-        argv = shlex.split(command, posix=True)
-    except ValueError:
-        return False
-    if any(".grok" in argument or "auth.json" in argument for argument in argv):
-        return False
-    if len(argv) < 2 or argv[0] != "git":
-        return False
-    for argument in argv[2:]:
-        path_value = argument.split("=", 1)[-1]
-        if path_value.startswith(("/", "~")) or ".." in PurePosixPath(path_value).parts:
-            return False
-    head = expected_head.lower()
-    base = expected_base_head.lower()
-    subcommand = argv[1]
-    if subcommand == "status":
-        return argv == ["git", "status", "--short", "--branch"]
-    if subcommand == "diff":
-        return argv == [
-            "git", "diff", "--no-ext-diff", "--no-textconv", f"{base}...{head}"
-        ]
-    return False
-
-
 def _extract_grok_stream_review_document(
     raw: bytes,
     *,
@@ -661,6 +689,11 @@ def _extract_grok_stream_review_document(
         "review_provider_stream_contract": GROK_REVIEW_STREAM_CONTRACT,
         "review_provider_stream_bytes": len(raw),
         "review_provider_stream_sha256": hashlib.sha256(raw).hexdigest(),
+        "review_provider_completed_tool_calls": 0,
+        "review_provider_completed_tools": [],
+        "review_provider_completed_commands": [],
+        "review_provider_available_tools": [],
+        "review_provider_available_commands_events": 0,
     }
     try:
         text = raw.decode("utf-8", errors="strict")
@@ -681,81 +714,40 @@ def _extract_grok_stream_review_document(
     metadata["review_provider_stream_events"] = len(events)
     if not events:
         return None, "Grok review stream is empty", metadata
-
-    tool_names: dict[str, str] = {}
-    tool_commands: dict[str, str] = {}
-    completed_tools: list[str] = []
-    completed_commands: list[str] = []
-    completed_call_ids: set[str] = set()
-    last_completed_index = -1
     end_events: list[tuple[int, dict[str, Any]]] = []
+    available_tools_proven = False
+    available_commands_events = 0
     for index, event in enumerate(events):
         event_type = event.get("type")
         if event_type not in GROK_REVIEW_EVENT_TYPES:
             return None, f"Grok review stream used unsupported event type: {event_type}", metadata
-        if event_type == "tool_call":
-            call_id = event.get("toolCallId")
-            tool_name = event.get("toolName")
-            if not isinstance(call_id, str) or not call_id or not isinstance(tool_name, str):
-                return None, "Grok review tool_call is missing identity", metadata
-            if call_id in tool_names:
-                return None, "Grok review reused a tool call identity", metadata
-            if tool_name not in GROK_REVIEW_TOOL_NAMES:
-                return None, f"Grok review used disallowed tool: {tool_name}", metadata
-            raw_input = event.get("rawInput")
-            tool_command = raw_input.get("command") if isinstance(raw_input, dict) else None
-            if not isinstance(tool_command, str) or not _safe_grok_git_read_command(
-                tool_command,
-                expected_head=expected_head,
-                expected_base_head=expected_base_head,
-            ):
-                return None, "Grok review requested a non-read-only Git command", metadata
-            tool_names[call_id] = tool_name
-            tool_commands[call_id] = tool_command
-        elif event_type == "tool_call_update" and event.get("status") in {"failed", "cancelled"}:
-            call_id = event.get("toolCallId")
-            if not isinstance(call_id, str) or call_id not in tool_names:
-                return None, "Grok review failed or cancelled an unknown tool call", metadata
-            return None, "Grok review repository tool call did not complete", metadata
-        elif event_type == "tool_call_update" and event.get("status") == "completed":
-            call_id = event.get("toolCallId")
-            if not isinstance(call_id, str) or call_id not in tool_names:
-                return None, "Grok review completed an unknown tool call", metadata
-            if call_id in completed_call_ids:
-                return None, "Grok review completed a tool call more than once", metadata
-            tool_name = tool_names[call_id]
-            raw_output = event.get("rawOutput")
-            if not isinstance(raw_output, dict) or raw_output.get("exit_code") != 0:
-                return None, "Grok review Git command did not succeed", metadata
-            observed_command = raw_output.get("command")
-            if observed_command != tool_commands[call_id]:
-                return None, "Grok review Git command changed between request and completion", metadata
-            completed_tools.append(tool_name)
-            completed_commands.append(tool_commands[call_id])
-            completed_call_ids.add(call_id)
-            last_completed_index = index
-        elif event_type == "end":
+        if event_type == "available_commands":
+            tools = event.get("tools")
+            if not isinstance(tools, list) or any(not isinstance(tool, str) for tool in tools):
+                return None, "Grok review available tool evidence is invalid", metadata
+            if tools:
+                return None, "Grok review advertised disallowed tools", metadata
+            available_tools_proven = True
+            available_commands_events += 1
+        if event_type in {"tool_call", "tool_call_update"}:
+            return None, "Grok review attempted tool use despite bound-diff-only contract", metadata
+        if event_type == "end":
             end_events.append((index, event))
-    metadata["review_provider_completed_tool_calls"] = len(completed_tools)
-    metadata["review_provider_completed_tools"] = completed_tools
-    metadata["review_provider_completed_commands"] = completed_commands
-    if not completed_tools:
-        return None, "Grok review completed no read-only repository tool call", metadata
-    if set(tool_names) != completed_call_ids:
-        return None, "Grok review left a repository tool call incomplete", metadata
+    metadata["review_provider_available_commands_events"] = available_commands_events
+    if not available_tools_proven:
+        return None, "Grok review did not prove an empty tool surface", metadata
     if len(end_events) != 1 or end_events[0][0] != len(events) - 1:
         return None, "Grok review stream must end with exactly one end event", metadata
     end_event = end_events[0][1]
     if end_event.get("stopReason") != "end_turn":
         return None, "Grok review stream did not finish with end_turn", metadata
     turns = end_event.get("num_turns")
-    if not isinstance(turns, int) or isinstance(turns, bool) or turns < 2:
-        return None, "Grok review stream did not establish a tool-using multi-turn review", metadata
+    if not isinstance(turns, int) or isinstance(turns, bool) or turns < 1:
+        return None, "Grok review stream did not establish a completed review turn", metadata
     metadata["review_provider_num_turns"] = turns
-
     terminal_text = "".join(
         event.get("data", "")
-        for event in events[last_completed_index + 1 : -1]
+        for event in events[:-1]
         if event.get("type") == "text" and isinstance(event.get("data"), str)
     )
     metadata["review_provider_terminal_text_sha256"] = hashlib.sha256(
@@ -831,6 +823,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--expected-base-head", required=True)
     parser.add_argument("--expected-diff-sha256", required=True)
     parser.add_argument("--expected-dirty", choices=("true", "false"), required=True)
+    parser.add_argument("--review-input-root")
+    parser.add_argument("--review-input-path")
+    parser.add_argument("--review-input-sha256")
     parser.add_argument("--output", required=True)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
@@ -847,6 +842,14 @@ def main(argv: list[str] | None = None) -> int:
     ):
         parser.error("invalid command or binding")
     expected_dirty = args.expected_dirty == "true"
+    review_artifact_values = (
+        args.review_input_root, args.review_input_path, args.review_input_sha256
+    )
+    review_artifact_declared = any(value is not None for value in review_artifact_values)
+    if review_artifact_declared and any(value is None for value in review_artifact_values):
+        parser.error("review input root, path, and SHA-256 must be supplied together")
+    if args.role != "review" and review_artifact_declared:
+        parser.error("review input artifact is only valid for the review role")
     before_head, before_diff, before_dirty = current_binding(repo, args.expected_base_head)
     if (
         before_head != args.expected_head
@@ -855,12 +858,33 @@ def main(argv: list[str] | None = None) -> int:
     ):
         raise RuntimeError("writer binding changed before read-only role start")
     review_provider_contract: str | None = None
+    review_input: bytes | None = None
+    review_input_source: str | None = None
+    review_stdin: bytes | None = None
     if args.role == "review":
-        role_sandbox_argv, review_provider_contract = _review_sandbox_argv(
+        if Path(command[0]).name == "grok":
+            if expected_dirty:
+                if not review_artifact_declared:
+                    raise RuntimeError("dirty Grok review requires the frozen writer patch artifact")
+                review_input = read_bound_review_input_artifact(
+                    str(args.review_input_root),
+                    str(args.review_input_path),
+                    str(args.review_input_sha256),
+                )
+                review_input_source = "frozen_writer_patch"
+            else:
+                if review_artifact_declared:
+                    raise RuntimeError("clean Grok review must use the exact committed diff")
+                review_input = committed_diff(repo, args.expected_base_head, args.expected_head)
+                review_input_source = "committed_diff"
+        elif review_artifact_declared:
+            raise RuntimeError("review input artifact is only valid for Grok review")
+        role_sandbox_argv, review_provider_contract, review_stdin = _review_sandbox_argv(
             repo,
             command,
             expected_head=args.expected_head,
             expected_base_head=args.expected_base_head,
+            review_diff=review_input or b"",
         )
     else:
         role_sandbox_argv = sandbox_argv(repo, command)
@@ -876,6 +900,7 @@ def main(argv: list[str] | None = None) -> int:
         stdout_limit=MAX_ROLE_OUTPUT_BYTES,
         stderr_limit=MAX_ROLE_OUTPUT_BYTES,
         stdout_content_limit=review_content_limit,
+        stdin_content=review_stdin,
     )
     after_head, after_diff, after_dirty = current_binding(repo, args.expected_base_head)
     payload: dict[str, Any] = {
@@ -899,6 +924,11 @@ def main(argv: list[str] | None = None) -> int:
         "stderr_tail": completed.stderr_tail,
         "output_limit_bytes": MAX_ROLE_OUTPUT_BYTES,
         "review_content_limit_bytes": review_content_limit if args.role == "review" else None,
+        "review_input_source": review_input_source,
+        "review_input_bytes": len(review_input) if review_input is not None else None,
+        "review_input_sha256": hashlib.sha256(review_input).hexdigest() if review_input is not None else None,
+        "review_prompt_bytes": len(review_stdin) if review_stdin is not None else None,
+        "review_prompt_sha256": hashlib.sha256(review_stdin).hexdigest() if review_stdin is not None else None,
         "sandbox": SANDBOX_LABEL,
     }
     if completed.output_limit_exceeded:
