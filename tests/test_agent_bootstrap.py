@@ -413,6 +413,19 @@ class AgentBootstrapTests(unittest.TestCase):
 
     def test_adler_sidecar_contract_is_advisory_and_fail_open_for_local_work(self) -> None:
         module = self.load_module()
+        module.grabowski_friction.friction_summary = lambda **_: {
+            "event_log_integrity": {"integrity_valid": True},
+            "decision_log": {"integrity_valid": True},
+            "fingerprint_sha256": "a" * 64,
+        }
+        module.grabowski_friction.execution_governor_summary = lambda **_: {
+            "ledger_integrity_valid": True,
+            "candidates": [],
+            "minimum_evidence": 5,
+            "decay_seconds": 604800,
+            "live_promotions": [],
+            "summary_sha256": "b" * 64,
+        }
         capsule = module.agent_bootstrap()
         contract = capsule["adler_sidecar"]
         self.assertEqual(contract["path"], ".adler/inbox.json")
