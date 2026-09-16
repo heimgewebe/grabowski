@@ -84,6 +84,21 @@ def request(*, condition: str = "baseline", commit: str = COMMIT) -> dict:
     }
 
 
+def proxy_command(upstream: Path, root: Path) -> list[str]:
+    manifest = root / "bound.bundle.manifest.json"
+    if not manifest.exists():
+        manifest.write_text("{}\n", encoding="utf-8")
+    digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    return [
+        sys.executable,
+        str(MODULE_PATH),
+        "--codex-mcp-proxy",
+        json.dumps([str(Path(sys.executable).resolve()), str(upstream), "--bundle-root", str(root)]),
+        str(manifest),
+        digest,
+    ]
+
+
 def answer() -> dict:
     return {
         "text": "The implementation is in src/example.py.",
@@ -1072,7 +1087,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             process = subprocess.Popen(
-                [sys.executable, str(MODULE_PATH), "--codex-mcp-proxy", json.dumps([sys.executable, str(upstream)])],
+                proxy_command(upstream, root),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
             self.assertIsNotNone(process.stdin)
@@ -1107,7 +1122,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
             ).encode() + b"\n"
             completed = subprocess.run(
-                [sys.executable, str(MODULE_PATH), "--codex-mcp-proxy", json.dumps([sys.executable, str(upstream)])],
+                proxy_command(upstream, root),
                 input=payload, capture_output=True, check=False, timeout=5,
             )
             self.assertNotEqual(completed.returncode, 0)
@@ -1132,11 +1147,14 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
                 ).encode() + b"\n"
                 completed = subprocess.run(
-                    [sys.executable, str(MODULE_PATH), "--codex-mcp-proxy", json.dumps([sys.executable, str(upstream)])],
+                    proxy_command(upstream, root),
                     input=payload, capture_output=True, check=False, timeout=5,
                 )
                 self.assertNotEqual(completed.returncode, 0)
-                self.assertIn(b"successful result", completed.stderr)
+                self.assertTrue(
+                    b"successful result" in completed.stderr
+                    or b"response envelope is invalid" in completed.stderr
+                )
 
     def test_mcp_proxy_exposes_exact_benchmark_surface(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1166,7 +1184,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             ]
             payload = b"".join(json.dumps(item).encode() + b"\n" for item in messages)
             completed = subprocess.run(
-                [sys.executable, str(MODULE_PATH), "--codex-mcp-proxy", json.dumps([sys.executable, str(upstream)])],
+                proxy_command(upstream, root),
                 input=payload, capture_output=True, check=False, timeout=5,
             )
             self.assertEqual(completed.returncode, 0, completed.stderr.decode())
@@ -1187,7 +1205,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             response = {'jsonrpc': '2.0', 'id': 1, 'result': {'tools': treatment_tools()}}
             upstream.write_text('import json, sys\n' 'sys.stdin.readline()\n' f'sys.stdout.write(json.dumps({response!r})); sys.stdout.flush()\n', encoding='utf-8')
             payload = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list', 'params': {}}).encode() + b'\n'
-            completed = subprocess.run([sys.executable, str(MODULE_PATH), '--codex-mcp-proxy', json.dumps([sys.executable, str(upstream)])], input=payload, capture_output=True, check=False, timeout=5)
+            completed = subprocess.run(proxy_command(upstream, root), input=payload, capture_output=True, check=False, timeout=5)
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn(b'newline terminated', completed.stderr)
 
@@ -1205,7 +1223,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             )
             started = time.monotonic()
             completed = subprocess.run(
-                [sys.executable, str(MODULE_PATH), "--codex-mcp-proxy", json.dumps([sys.executable, str(upstream)])],
+                proxy_command(upstream, root),
                 input=b"", capture_output=True, check=False, timeout=8,
             )
             elapsed = time.monotonic() - started
@@ -1232,7 +1250,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}
             ).encode() + b"\n"
             completed = subprocess.run(
-                [sys.executable, str(MODULE_PATH), "--codex-mcp-proxy", json.dumps([sys.executable, str(upstream)])],
+                proxy_command(upstream, root),
                 input=payload, capture_output=True, check=False, timeout=5,
             )
             self.assertNotEqual(completed.returncode, 0)
@@ -1241,6 +1259,126 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertEqual(pgid, parent_pgid)
             with self.assertRaises(ProcessLookupError):
                 os.kill(pid, 0)
+
+    def test_mcp_upstream_is_bound_and_manifest_root_is_forced(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable = root / "python3"
+            executable.write_bytes(Path(sys.executable).read_bytes())
+            executable.chmod(0o755)
+            script = root / "server.py"
+            script.write_text("pass\n", encoding="utf-8")
+            manifest = root / "chosen.bundle.manifest.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+            sibling = root / "sibling.bundle.manifest.json"
+            sibling.write_text("{}\n", encoding="utf-8")
+            argv, bindings = runner._bind_mcp_upstream(
+                [str(executable), str(script), "--bundle-root", str(root)], manifest
+            )
+            self.assertEqual(argv[-1], str(manifest))
+            self.assertEqual([item["path"] for item in bindings], [executable, script])
+
+            message = {
+                "params": {"arguments": {"query": "where", "bundle_manifest": None}}
+            }
+            runner._pin_treatment_arguments(message, manifest)
+            arguments = message["params"]["arguments"]
+            self.assertEqual(arguments["bundle_manifest"], str(manifest))
+            self.assertIsNone(arguments["repo"])
+            self.assertIsNone(arguments["stem"])
+            for selector, value in (
+                ("bundle_manifest", str(sibling)), ("repo", "other/repo"), ("stem", "other")
+            ):
+                conflicting = {"params": {"arguments": {selector: value}}}
+                with self.subTest(selector=selector), self.assertRaises(runner.RunnerError):
+                    runner._pin_treatment_arguments(conflicting, manifest)
+
+    def test_mcp_program_and_script_bindings_reject_symlinks_and_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable = root / "tool"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o755)
+            script = root / "server.py"
+            script.write_text("pass\n", encoding="utf-8")
+            for target, label, executable_flag in (
+                (executable, "MCP executable", True), (script, "MCP script", False)
+            ):
+                link = root / (target.name + ".link")
+                link.symlink_to(target)
+                with self.subTest(label=label), self.assertRaises(runner.RunnerError):
+                    runner._bind_mcp_file(link, label=label, executable=executable_flag)
+                binding = runner._bind_mcp_file(
+                    target, label=label, executable=executable_flag
+                )
+                target.write_bytes(target.read_bytes() + b"# drift\n")
+                with self.assertRaisesRegex(runner.RunnerError, "changed during execution"):
+                    runner._revalidate_mcp_file(binding, label=label)
+
+    def test_mcp_proxy_rejects_malformed_or_unknown_response_envelopes(self) -> None:
+        cases = (
+            {"id": 1, "result": {"tools": treatment_tools()}},
+            {"jsonrpc": "1.0", "id": 1, "result": {"tools": treatment_tools()}},
+            {"jsonrpc": "2.0", "id": 1, "result": {}, "error": {}},
+            {"jsonrpc": "2.0", "id": 1},
+            {"jsonrpc": "2.0", "id": 999, "result": {"tools": treatment_tools()}},
+        )
+        for response in cases:
+            with self.subTest(response=response), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                upstream = root / "mcp.py"
+                upstream.write_text(
+                    "import json, sys\n"
+                    "sys.stdin.readline()\n"
+                    f"print(json.dumps({response!r}), flush=True)\n",
+                    encoding="utf-8",
+                )
+                payload = json.dumps(
+                    {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+                ).encode() + b"\n"
+                completed = subprocess.run(
+                    proxy_command(upstream, root), input=payload, capture_output=True,
+                    check=False, timeout=5,
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(b"response envelope is invalid", completed.stderr)
+
+    def test_mcp_proxy_tracks_and_forwards_treatment_tool_responses(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            seen = root / "seen.json"
+            upstream = root / "mcp.py"
+            upstream.write_text(
+                "import json, pathlib, sys\n"
+                f"SEEN = pathlib.Path({str(seen)!r})\n"
+                f"TOOLS = {treatment_tools()!r}\n"
+                "for line in sys.stdin:\n"
+                "    m=json.loads(line); method=m.get('method'); ident=m.get('id')\n"
+                "    if method=='tools/list':\n"
+                "        print(json.dumps({'jsonrpc':'2.0','id':ident,'result':{'tools':TOOLS}}),flush=True)\n"
+                "    elif method=='tools/call':\n"
+                "        SEEN.write_text(json.dumps(m.get('params',{}).get('arguments',{}), sort_keys=True))\n"
+                "        print(json.dumps({'jsonrpc':'2.0','id':ident,'result':{'content':[{'type':'text','text':'ok'}]}}),flush=True)\n",
+                encoding="utf-8",
+            )
+            messages = [
+                {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}},
+                {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ask_context","arguments":{"query":"where"}}},
+            ]
+            completed = subprocess.run(
+                proxy_command(upstream, root),
+                input=b"".join(json.dumps(item).encode() + b"\n" for item in messages),
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+            responses = {item["id"]: item for item in map(json.loads, completed.stdout.decode().splitlines())}
+            self.assertEqual(responses[2]["result"]["content"][0]["text"], "ok")
+            arguments = json.loads(seen.read_text(encoding="utf-8"))
+            self.assertEqual(arguments["bundle_manifest"], str(root / "bound.bundle.manifest.json"))
+            self.assertIsNone(arguments["repo"])
+            self.assertIsNone(arguments["stem"])
 
     def test_normalize_rejects_boolean_token_counts(self) -> None:
         for field, value in (('input_tokens', True), ('output_tokens', False)):
