@@ -3512,18 +3512,10 @@ def engage_receipt_bound_deployment_admission(
         source_identity_sha256, str
     ):
         raise ValueError("receipt-bound admission requires explicit string evidence")
-    # A cold re-entry can execute from a newer current-main checkout while it
-    # resumes a historical cutover whose admission marker is intentionally bound
-    # to the older target.  The scheduled deploy observer belongs to the *new*
-    # execution identity, so binding it to this historical marker would conflate
-    # two different authorities and deterministically fail.  Keep the marker
-    # receipt-bound and leave the current job observer untouched; ordinary deploys
-    # still activate their exact observer below.
     return _engage_operator_deployment_admission(
         expected_head=expected_head,
         source_identity_sha256=source_identity_sha256,
         timeout_seconds=timeout_seconds,
-        activate_runtime_deploy_observer=False,
     )
 
 
@@ -3532,7 +3524,6 @@ def _engage_operator_deployment_admission(
     expected_head: str,
     source_identity_sha256: str,
     timeout_seconds: int,
-    activate_runtime_deploy_observer: bool = True,
 ) -> dict[str, Any]:
     if OPERATOR_ADMISSION_HEAD_RE.fullmatch(expected_head or "") is None:
         raise ValueError("deployment admission expected_head is invalid")
@@ -3561,12 +3552,11 @@ def _engage_operator_deployment_admission(
         "expires_at_unix": now + lifetime,
     }
     _create_private_admission_marker(OPERATOR_ADMISSION_MARKER_PATH, marker)
-    if activate_runtime_deploy_observer:
-        try:
-            _activate_runtime_deploy_observer(marker)
-        except Exception:
-            release_operator_deployment_admission(marker)
-            raise
+    try:
+        _activate_runtime_deploy_observer(marker)
+    except Exception:
+        release_operator_deployment_admission(marker)
+        raise
     observed = _secure_admission_marker_payload(OPERATOR_ADMISSION_MARKER_PATH)
     if observed != marker:
         core.fail(
