@@ -614,6 +614,45 @@ def _json_sha256(value: object) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _inspect_live_resources(resource_keys: list[str]) -> dict[str, dict[str, object]]:
+    """Read current resource truth; failures deliberately mean no Adler bind."""
+    try:
+        import grabowski_resources as resources
+
+        return resources.inspect_resources(resource_keys)
+    except Exception:
+        return {}
+
+
+def _live_work_lane_checkout_binding(
+    inputs: dict[str, object], lane_id: str, target_path: str
+) -> bool:
+    repo = inputs.get("repo")
+    branch = inputs.get("branch")
+    resource_keys = inputs.get("resource_keys")
+    if (
+        not isinstance(repo, str)
+        or not repo
+        or not isinstance(branch, str)
+        or not branch
+        or not isinstance(resource_keys, list)
+        or any(not isinstance(item, str) for item in resource_keys)
+    ):
+        return False
+    required = [
+        f"path:{target_path}",
+        f"repo:{repo}:branch:{branch}",
+    ]
+    if any(key not in resource_keys for key in required):
+        return False
+    live = _inspect_live_resources(required)
+    owner = f"lane:{lane_id}"
+    return all(
+        isinstance(live.get(key), dict) and live[key].get("owner_id") == owner
+        for key in required
+    )
+
+
 def _authenticated_work_lane_target(worktree: Path, lane_id: str) -> bool:
     """Authenticate one untrusted lane id through Grabowski-owned state."""
     receipt_path = _grabowski_work_lane_root() / f"{lane_id}.json"
@@ -688,7 +727,9 @@ def _authenticated_work_lane_target(worktree: Path, lane_id: str) -> bool:
         authenticated_target = Path(target_path).expanduser().resolve(strict=True)
     except OSError:
         return False
-    return authenticated_target == worktree
+    if authenticated_target != worktree:
+        return False
+    return _live_work_lane_checkout_binding(inputs, lane_id, target_path)
 
 
 def _adler_inbox_sandbox_binding(worktree: Path) -> tuple[tuple[tuple[Path, Path], ...], tuple[Path, ...]]:

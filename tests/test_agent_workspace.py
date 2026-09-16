@@ -3588,12 +3588,23 @@ class AgentWorkspaceTests(unittest.TestCase):
 
     def _write_adler_lane_receipt(
         self, lane_root: Path, lane_id: str, worktree: Path
-    ) -> None:
+    ) -> dict[str, dict[str, object]]:
         lane_root.mkdir(parents=True, mode=0o700)
+        target_path = str(worktree.resolve())
+        repo = target_path
+        branch = "feat/adler-test"
+        owner = f"lane:{lane_id}"
+        resource_keys = [
+            f"path:{target_path}",
+            f"repo:{repo}:branch:{branch}",
+        ]
         inputs = {
             "lane_id": lane_id,
-            "lease_owner_id": f"lane:{lane_id}",
-            "target_path": str(worktree.resolve()),
+            "lease_owner_id": owner,
+            "repo": repo,
+            "branch": branch,
+            "resource_keys": resource_keys,
+            "target_path": target_path,
         }
         receipt = {
             "kind": "grabowski.work_lane",
@@ -3608,6 +3619,10 @@ class AgentWorkspaceTests(unittest.TestCase):
         path = lane_root / f"{lane_id}.json"
         path.write_text(json.dumps(receipt), encoding="utf-8")
         path.chmod(0o600)
+        return {
+            key: {"resource_key": key, "owner_id": owner}
+            for key in resource_keys
+        }
 
     def test_adler_inbox_target_is_bound_read_only_into_agent_sandbox(self) -> None:
         lane_id = "a" * 32
@@ -3621,13 +3636,16 @@ class AgentWorkspaceTests(unittest.TestCase):
         sidecar.mkdir(mode=0o700)
         (sidecar / "inbox.json").symlink_to(target)
         lane_root = self.root / "adler-test-work-lanes"
-        self._write_adler_lane_receipt(lane_root, lane_id, self.git.repo)
-        with mock.patch.dict(
-            os.environ,
-            {
-                "GROSSER_ADLER_STATE_ROOT": str(state_root),
-                "GRABOWSKI_WORK_LANE_ROOT": str(lane_root),
-            },
+        live = self._write_adler_lane_receipt(lane_root, lane_id, self.git.repo)
+        with (
+            mock.patch.object(sandbox, "_inspect_live_resources", return_value=live),
+            mock.patch.dict(
+                os.environ,
+                {
+                    "GROSSER_ADLER_STATE_ROOT": str(state_root),
+                    "GRABOWSKI_WORK_LANE_ROOT": str(lane_root),
+                },
+            ),
         ):
             argv = sandbox.minimal_sandbox_argv(
                 workspace=self.git.repo,
@@ -3650,13 +3668,16 @@ class AgentWorkspaceTests(unittest.TestCase):
         sidecar.mkdir(mode=0o700)
         (sidecar / "inbox.json").symlink_to(target)
         lane_root = self.root / "adler-missing-work-lanes"
-        self._write_adler_lane_receipt(lane_root, lane_id, self.git.repo)
-        with mock.patch.dict(
-            os.environ,
-            {
-                "GROSSER_ADLER_STATE_ROOT": str(state_root),
-                "GRABOWSKI_WORK_LANE_ROOT": str(lane_root),
-            },
+        live = self._write_adler_lane_receipt(lane_root, lane_id, self.git.repo)
+        with (
+            mock.patch.object(sandbox, "_inspect_live_resources", return_value=live),
+            mock.patch.dict(
+                os.environ,
+                {
+                    "GROSSER_ADLER_STATE_ROOT": str(state_root),
+                    "GRABOWSKI_WORK_LANE_ROOT": str(lane_root),
+                },
+            ),
         ):
             argv = sandbox.minimal_sandbox_argv(
                 workspace=self.git.repo,
@@ -3679,13 +3700,16 @@ class AgentWorkspaceTests(unittest.TestCase):
         other_worktree = self.root / "other-worktree"
         other_worktree.mkdir()
         lane_root = self.root / "cross-lane-work-lanes"
-        self._write_adler_lane_receipt(lane_root, lane_id, other_worktree)
-        with mock.patch.dict(
-            os.environ,
-            {
-                "GROSSER_ADLER_STATE_ROOT": str(state_root),
-                "GRABOWSKI_WORK_LANE_ROOT": str(lane_root),
-            },
+        live = self._write_adler_lane_receipt(lane_root, lane_id, other_worktree)
+        with (
+            mock.patch.object(sandbox, "_inspect_live_resources", return_value=live),
+            mock.patch.dict(
+                os.environ,
+                {
+                    "GROSSER_ADLER_STATE_ROOT": str(state_root),
+                    "GRABOWSKI_WORK_LANE_ROOT": str(lane_root),
+                },
+            ),
         ):
             argv = sandbox.minimal_sandbox_argv(
                 workspace=self.git.repo,
@@ -3693,6 +3717,46 @@ class AgentWorkspaceTests(unittest.TestCase):
                 workspace_writable=False,
             )
         self.assertNotIn(str(target), argv)
+
+    def test_adler_inbox_binding_requires_live_lane_checkout_resources(self) -> None:
+        lane_id = "d" * 32
+        state_root = self.root / "adler-state-live-lease"
+        inbox_root = state_root / "worktree-inboxes"
+        inbox_root.mkdir(parents=True, mode=0o700)
+        target = inbox_root / f"{lane_id}.json"
+        target.write_text('{"findings": ["private"]}\n', encoding="utf-8")
+        target.chmod(0o600)
+        sidecar = self.git.repo / ".adler"
+        sidecar.mkdir(mode=0o700)
+        (sidecar / "inbox.json").symlink_to(target)
+        lane_root = self.root / "live-lease-work-lanes"
+        live = self._write_adler_lane_receipt(lane_root, lane_id, self.git.repo)
+        path_key, branch_key = list(live)
+        stale_cases = [
+            {},
+            {
+                path_key: {"resource_key": path_key, "owner_id": "lane:" + "e" * 32},
+                branch_key: live[branch_key],
+            },
+        ]
+        for observed in stale_cases:
+            with (
+                self.subTest(observed=observed),
+                mock.patch.object(sandbox, "_inspect_live_resources", return_value=observed),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "GROSSER_ADLER_STATE_ROOT": str(state_root),
+                        "GRABOWSKI_WORK_LANE_ROOT": str(lane_root),
+                    },
+                ),
+            ):
+                argv = sandbox.minimal_sandbox_argv(
+                    workspace=self.git.repo,
+                    command=["/usr/bin/true"],
+                    workspace_writable=False,
+                )
+            self.assertNotIn(str(target), argv)
 
     def test_claude_profile_binds_binary_and_private_auth_without_home(self) -> None:
         auth_root = self.root / "claude-auth"
