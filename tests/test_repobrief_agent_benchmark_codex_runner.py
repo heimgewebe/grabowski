@@ -1032,6 +1032,15 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(runner.RunnerError, "inputSchema drifted"):
             runner._filtered_treatment_tools(drifted_schema)
 
+        type_confused_schema = {"tools": treatment_tools()}
+        ask_context = next(
+            item for item in type_confused_schema["tools"]
+            if item["name"] == "ask_context"
+        )
+        ask_context["inputSchema"]["properties"]["max_context_tokens"]["minimum"] = True
+        with self.assertRaisesRegex(runner.RunnerError, "inputSchema drifted"):
+            runner._filtered_treatment_tools(type_confused_schema)
+
     def test_mcp_proxy_rejects_tools_list_arriving_during_upstream_eof(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

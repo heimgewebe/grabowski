@@ -673,7 +673,7 @@ def _filtered_treatment_tools(value: Any) -> list[dict[str, Any]]:
         name = item.get("name")
         if name in counts:
             expected_schema = EXPECTED_UPSTREAM_MCP_INPUT_SCHEMAS[str(name)]
-            if item.get("inputSchema") != expected_schema:
+            if canonical(item.get("inputSchema")) != canonical(expected_schema):
                 raise RunnerError(
                     f"RepoGround treatment tool inputSchema drifted for {name}"
                 )
