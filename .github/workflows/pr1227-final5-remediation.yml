@@ -21,7 +21,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "a432e5f33274c37d470186c5fba1036b7c4e47ea"
+          test "$(git rev-parse HEAD^)" = "3715c690da2fb25c66dbe36cd1cebed8b022eba0"
           test "$(git rev-parse HEAD:tools/repobrief_agent_benchmark_codex_runner.py)" = "b62e6a52253057dd3cce9317cba67672e62544ac"
           test "$(git rev-parse HEAD:tests/test_repobrief_agent_benchmark_codex_runner.py)" = "2781c8f6ca2a3dce0a71cde5bccabac58ae1989b"
       - name: Apply fixes and regressions
@@ -177,7 +177,7 @@ jobs:
               "                f\"state = pathlib.Path({str(child_state)!r})\\n\"",
               "                \"while not state.exists():\\n\"",
               "                \"    time.sleep(0.01)\\n\"",
-              "                \"os._exit(0)\\n\"",
+              "                \"os._exit(0)\\n\",",
               "                encoding=\"utf-8\",",
               "            )",
               "            capture = runner.run_bounded(",
