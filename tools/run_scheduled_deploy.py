@@ -1157,26 +1157,46 @@ def _open_cutover_target_head(classification: dict[str, Any]) -> str | None:
 def run_midcutover_resume(*, repo: Path, decision: dict[str, Any]) -> dict[str, Any]:
     """Continue the stranded cutover; deploy nothing.
 
-    A cold re-entry deliberately runs newer scheduler code while the authentic
-    cutover receipt still binds admission to the historical target head.  The
-    scheduler job's deployment-observer contract is execution-head-bound, so it
-    cannot truthfully validate the historical admission marker.  Hide only that
-    observer discovery tuple for the in-process resume call.  The admission
-    marker and drain remain strict; normal deployment keeps its observer intact.
+    A cold re-entry may execute newer scheduler code while the authentic cutover
+    receipt still binds admission to an older head/source identity. The running
+    predecessor cannot validate an execution-head observer against that historical
+    marker. Preserve the observer only when both identities already match; hide
+    its discovery tuple only for a genuinely cross-bound resume. The admission
+    marker and drain remain strict in either case.
     """
+    classification = decision.get("classification")
+    resume_binding = (
+        classification.get("resume_binding")
+        if isinstance(classification, dict)
+        else None
+    )
+    if not isinstance(resume_binding, dict):
+        raise RuntimeError("mid-cutover resume binding is missing")
+    execution_source_identity_sha256 = decision.get(
+        "execution_source_identity_sha256"
+    )
+    observer_binding_matches_resume = (
+        decision.get("execution_head") == decision.get("resume_target_head")
+        and isinstance(execution_source_identity_sha256, str)
+        and execution_source_identity_sha256
+        == resume_binding.get("source_identity_sha256")
+    )
+    isolate_observer = not observer_binding_matches_resume
     observer_environment_names = (
         FINALIZATION_ENV["unit"],
         "GRABOWSKI_JOB_DIRECTORY",
         FINALIZATION_ENV["metadata"],
     )
-    observer_environment = {
-        name: os.environ[name]
-        for name in observer_environment_names
-        if name in os.environ
-    }
-    try:
+    observer_environment: dict[str, str] = {}
+    if isolate_observer:
+        observer_environment = {
+            name: os.environ[name]
+            for name in observer_environment_names
+            if name in os.environ
+        }
         for name in observer_environment_names:
             os.environ.pop(name, None)
+    try:
         try:
             result = deploy_dual.resume_production_blue_green_cutover(
                 repo=repo,
@@ -1196,9 +1216,10 @@ def run_midcutover_resume(*, repo: Path, decision: dict[str, Any]) -> dict[str, 
                 "fresh_classification_required": True,
             }
     finally:
-        for name in observer_environment_names:
-            os.environ.pop(name, None)
-        os.environ.update(observer_environment)
+        if isolate_observer:
+            for name in observer_environment_names:
+                os.environ.pop(name, None)
+            os.environ.update(observer_environment)
     receipt = result.get("receipt") or {}
     summary = {
         "schema_version": 1,
@@ -1367,7 +1388,12 @@ def main() -> int:
         })
         if recovery_decision["resume_required"]:
             return run_resume_only(
-                {**recovery_decision, "repo": str(repo)}, binding=binding
+                {
+                    **recovery_decision,
+                    "repo": str(repo),
+                    "execution_source_identity_sha256": args.source_identity_sha256,
+                },
+                binding=binding,
             )
         if not recovery_decision.get("deploy_allowed"):
             raise RecoveryClassificationBlocked(
