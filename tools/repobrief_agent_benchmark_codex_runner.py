@@ -107,6 +107,16 @@ EXPECTED_UPSTREAM_MCP_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     ),
     "live_freshness": _repoground_schema({}),
 }
+_REPOGROUND_READ_ANNOTATIONS: dict[str, bool] = {
+    'readOnlyHint': True,
+    'destructiveHint': False,
+    'idempotentHint': True,
+}
+EXPECTED_UPSTREAM_MCP_DESCRIPTORS: dict[str, dict[str, Any]] = {
+    'ask_context': {'name': 'ask_context', 'title': 'RepoGround context pack', 'description': 'Build a cited context pack from one existing RepoGround bundle.', 'inputSchema': EXPECTED_UPSTREAM_MCP_INPUT_SCHEMAS['ask_context'], 'annotations': _REPOGROUND_READ_ANNOTATIONS},
+    'grounding_verify': {'name': 'grounding_verify', 'title': 'RepoGround grounding verifier', 'description': 'Verify declared citations and ranges against an existing RepoGround bundle.', 'inputSchema': EXPECTED_UPSTREAM_MCP_INPUT_SCHEMAS['grounding_verify'], 'annotations': _REPOGROUND_READ_ANNOTATIONS},
+    'live_freshness': {'name': 'live_freshness', 'title': 'RepoGround live freshness', 'description': 'Compare snapshot Git provenance with the configured local checkout without refreshing it.', 'inputSchema': EXPECTED_UPSTREAM_MCP_INPUT_SCHEMAS['live_freshness'], 'annotations': _REPOGROUND_READ_ANNOTATIONS},
+}
 MCP_CLIENT_METHODS = {"initialize", "notifications/initialized", "ping", "tools/list", "tools/call"}
 MAX_FROZEN_RESOURCES = 512
 
@@ -677,8 +687,11 @@ def _filtered_treatment_tools(value: Any) -> list[dict[str, Any]]:
                 raise RunnerError(
                     f"RepoGround treatment tool inputSchema drifted for {name}"
                 )
+            expected_descriptor = EXPECTED_UPSTREAM_MCP_DESCRIPTORS[str(name)]
+            if canonical(item) != canonical(expected_descriptor):
+                raise RunnerError(f'RepoGround treatment tool descriptor drifted for {name}')
             counts[str(name)] += 1
-            filtered.append(item)
+            filtered.append(json.loads(json.dumps(expected_descriptor)))
     invalid = [f"{name}={counts[name]}" for name in sorted(counts) if counts[name] != 1]
     if invalid:
         raise RunnerError(
@@ -707,6 +720,8 @@ def _read_bounded_mcp_line(stream: Any, *, peer: str) -> bytes:
     raw = stream.readline(base.MAX_MCP_MESSAGE_BYTES + 1)
     if len(raw) > base.MAX_MCP_MESSAGE_BYTES:
         raise RunnerError(f"MCP {peer} message too large")
+    if raw and not raw.endswith(b'\n'):
+        raise RunnerError(f'MCP {peer} message must be newline terminated')
     return raw
 
 
@@ -1679,8 +1694,10 @@ def normalize(
     output_tokens = usage.get("output_tokens")
     if (
         not isinstance(input_tokens, int)
+        or isinstance(input_tokens, bool)
         or input_tokens < 0
         or not isinstance(output_tokens, int)
+        or isinstance(output_tokens, bool)
         or output_tokens < 0
     ):
         raise RunnerError("Codex usage is invalid")

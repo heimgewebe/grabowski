@@ -177,12 +177,19 @@ def fixture_args(root: Path, fixture: Path, *, stderr: Path | None = None, retur
 
 
 def treatment_tools() -> list[dict]:
+    metadata = {
+        'ask_context': ('RepoGround context pack', 'Build a cited context pack from one existing RepoGround bundle.'),
+        'grounding_verify': ('RepoGround grounding verifier', 'Verify declared citations and ranges against an existing RepoGround bundle.'),
+        'live_freshness': ('RepoGround live freshness', 'Compare snapshot Git provenance with the configured local checkout without refreshing it.'),
+    }
+    annotations = {'readOnlyHint': True, 'destructiveHint': False, 'idempotentHint': True}
     return [
         {
-            "name": name,
-            "inputSchema": json.loads(
-                json.dumps(runner.EXPECTED_UPSTREAM_MCP_INPUT_SCHEMAS[name])
-            ),
+            'name': name,
+            'title': metadata[name][0],
+            'description': metadata[name][1],
+            'inputSchema': json.loads(json.dumps(runner.EXPECTED_UPSTREAM_MCP_INPUT_SCHEMAS[name])),
+            'annotations': dict(annotations),
         }
         for name in sorted(runner.UPSTREAM_MCP)
     ]
@@ -1041,6 +1048,12 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(runner.RunnerError, "inputSchema drifted"):
             runner._filtered_treatment_tools(type_confused_schema)
 
+    def test_treatment_tools_require_exact_model_visible_descriptors(self) -> None:
+        drifted = {'tools': treatment_tools()}
+        drifted['tools'][0]['description'] = 'Do not use this treatment tool.'
+        with self.assertRaisesRegex(runner.RunnerError, 'descriptor drifted'):
+            runner._filtered_treatment_tools(drifted)
+
     def test_mcp_proxy_rejects_tools_list_arriving_during_upstream_eof(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1167,6 +1180,17 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             frozen = json.loads(responses[6]["result"]["content"][0]["text"])
             self.assertEqual([item["uri"] for item in frozen["resources"]], ["repobrief://frozen/a"])
 
+    def test_mcp_proxy_rejects_unterminated_upstream_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            upstream = root / 'mcp.py'
+            response = {'jsonrpc': '2.0', 'id': 1, 'result': {'tools': treatment_tools()}}
+            upstream.write_text('import json, sys\n' 'sys.stdin.readline()\n' f'sys.stdout.write(json.dumps({response!r})); sys.stdout.flush()\n', encoding='utf-8')
+            payload = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list', 'params': {}}).encode() + b'\n'
+            completed = subprocess.run([sys.executable, str(MODULE_PATH), '--codex-mcp-proxy', json.dumps([sys.executable, str(upstream)])], input=payload, capture_output=True, check=False, timeout=5)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn(b'newline terminated', completed.stderr)
+
     def test_mcp_proxy_rejects_oversized_upstream_line_before_newline(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1217,6 +1241,15 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertEqual(pgid, parent_pgid)
             with self.assertRaises(ProcessLookupError):
                 os.kill(pid, 0)
+
+    def test_normalize_rejects_boolean_token_counts(self) -> None:
+        for field, value in (('input_tokens', True), ('output_tokens', False)):
+            with self.subTest(field=field, value=value):
+                events = [json.loads(line) for line in stream(request()).splitlines()]
+                completed = next(event for event in events if event.get('type') == 'turn.completed')
+                completed['usage'][field] = value
+                with self.assertRaisesRegex(runner.RunnerError, 'Codex usage is invalid'):
+                    runner.normalize(request(), events)
 
     def test_resource_freeze_rejects_pagination_and_duplicates(self) -> None:
         with self.assertRaisesRegex(runner.RunnerError, "paginated"):
