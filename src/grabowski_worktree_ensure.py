@@ -1009,7 +1009,7 @@ def _validate_adler_sidecar_directory(sidecar: Path) -> None:
         raise WorktreeEnsureAction(".adler permissions are broader than 0700")
 
 
-def _validate_adler_sidecar(sidecar: Path, expected_target: Path) -> None:
+def _validate_adler_sidecar_static(sidecar: Path) -> None:
     _validate_adler_sidecar_directory(sidecar)
     unexpected = {entry.name for entry in sidecar.iterdir()} - {".gitignore", "inbox.json"}
     if unexpected:
@@ -1020,6 +1020,10 @@ def _validate_adler_sidecar(sidecar: Path, expected_target: Path) -> None:
         raise WorktreeEnsureAction(".adler/.gitignore is not an owner-controlled regular file")
     if stat.S_IMODE(gi.st_mode) & 0o077 or gitignore.read_bytes() != b"*\n":
         raise WorktreeEnsureAction(".adler/.gitignore does not match the minimal ignore contract")
+
+
+def _validate_adler_sidecar(sidecar: Path, expected_target: Path) -> None:
+    _validate_adler_sidecar_static(sidecar)
     pointer = sidecar / "inbox.json"
     pi = pointer.lstat()
     if not stat.S_ISLNK(pi.st_mode) or pi.st_uid != os.geteuid() or pi.st_nlink != 1:
@@ -1092,6 +1096,7 @@ def _configure_adler_sidecar_pointer(
             finally:
                 os.close(fd)
             created_gitignore = True
+        _validate_adler_sidecar_static(sidecar)
         if observed_target is None:
             pointer.symlink_to(expected_target)
             created_pointer = True

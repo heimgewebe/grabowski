@@ -1550,6 +1550,43 @@ class WorktreeEnsureTests(unittest.TestCase):
         self.assertTrue((worktree / ".adler").is_symlink())
         self.assertEqual(list(foreign.iterdir()), [])
 
+    def test_replay_validates_static_sidecar_before_replacing_known_pointer(self) -> None:
+        lane_id = "8" * 32
+        worktree = self.worktree_root / "invalid-static-adler"
+        worktree.mkdir()
+        sidecar = worktree / ".adler"
+        sidecar.mkdir(mode=0o700)
+        gitignore = sidecar / ".gitignore"
+        gitignore.write_bytes(b"foreign\n")
+        gitignore.chmod(0o600)
+        old_target = self.root / "old-known-inbox.json"
+        pointer = sidecar / "inbox.json"
+        pointer.symlink_to(old_target)
+        inputs = {
+            "lease_owner_id": f"lane:{lane_id}",
+            "source_kind": "work_lane",
+            "source_id": lane_id,
+            "target_path": str(worktree),
+        }
+        previous = {
+            "state": "configured",
+            "lane_id": lane_id,
+            "path": str(pointer),
+            "target": str(old_target),
+            "ownership": "grabowski_metadata_only",
+            "absence_semantics": "unknown_not_no_findings",
+        }
+        next_state_root = self.root / "next-invalid-static-state"
+
+        with patch.dict(os.environ, {"GROSSER_ADLER_STATE_ROOT": str(next_state_root)}):
+            result = worktree_ensure._configure_adler_sidecar_pointer(
+                inputs, previous_sidecar=previous
+            )
+
+        self.assertEqual(result["state"], "unavailable")
+        self.assertEqual(os.readlink(pointer), str(old_target))
+        self.assertEqual(gitignore.read_bytes(), b"foreign\n")
+
     def test_replay_does_not_replace_unrecognized_pointer_target(self) -> None:
         lane_id = "9" * 32
         worktree = self.worktree_root / "foreign-adler-pointer"
