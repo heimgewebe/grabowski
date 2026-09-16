@@ -21,7 +21,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "26a283c561add3c8a2d1d5e5c360ae68cf63c522"
+          test "$(git rev-parse HEAD^)" = "bd487d345930e930e6117d749bf6fd6fe25e4d70"
           test "$(git rev-parse HEAD:tools/repobrief_agent_benchmark_codex_runner.py)" = "a417911a1a93c28dd61fd1eda30cc6dcfabb1c19"
           test "$(git rev-parse HEAD:tests/test_repobrief_agent_benchmark_codex_runner.py)" = "6ed32b3268a0d9eaec03be48e8876f6a42b44a8d"
       - name: Apply fixes and regressions
@@ -78,9 +78,22 @@ jobs:
           runner = replace_once(runner, run_anchor, subreaper + run_anchor, "subreaper helper")
           runner = replace_once(
               runner,
-              '    try:\n        process = subprocess.Popen(\n',
-              '    _enable_child_subreaper()\n\n    try:\n        process = subprocess.Popen(\n',
-              "enable subreaper before Popen",
+              '    Before ``Popen`` succeeds, setup errors may raise normally.  After the\n'
+              '    provider process exists, every catchable capture/cleanup failure is converted\n'
+              '    into ``capture_error`` so already-observed stdout/stderr can be persisted by\n'
+              '    the caller before the benchmark arm fails.\n'
+              '    """\n\n'
+              '    try:\n'
+              '        process = subprocess.Popen(\n',
+              '    Before ``Popen`` succeeds, setup errors may raise normally.  After the\n'
+              '    provider process exists, every catchable capture/cleanup failure is converted\n'
+              '    into ``capture_error`` so already-observed stdout/stderr can be persisted by\n'
+              '    the caller before the benchmark arm fails.\n'
+              '    """\n\n'
+              '    _enable_child_subreaper()\n\n'
+              '    try:\n'
+              '        process = subprocess.Popen(\n',
+              "enable subreaper before provider Popen",
           )
           runner = replace_once(
               runner,
