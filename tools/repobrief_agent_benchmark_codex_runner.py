@@ -18,7 +18,6 @@ from datetime import datetime, timezone
 import hashlib
 import importlib.util
 import json
-import math
 import os
 import posixpath
 from pathlib import Path
@@ -142,14 +141,6 @@ def canonical(value: Any) -> str:
 
 def sha_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
-
-
-def _valid_jsonrpc_request_id(value: Any) -> bool:
-    if value is None or isinstance(value, bool):
-        return False
-    if isinstance(value, (str, int)):
-        return True
-    return isinstance(value, float) and math.isfinite(value)
 
 
 def utc_now() -> datetime:
@@ -734,95 +725,85 @@ def _read_bounded_mcp_line(stream: Any, *, peer: str) -> bytes:
     return raw
 
 
-def _bind_mcp_file(path: Path, *, label: str, executable: bool) -> dict[str, Any]:
-    if not path.is_absolute():
-        raise RunnerError(f"{label} path must be absolute")
-    try:
-        linked = path.lstat()
-    except OSError as exc:
-        raise RunnerError(f"{label} is unavailable") from exc
-    if stat.S_ISLNK(linked.st_mode) or not stat.S_ISREG(linked.st_mode):
-        raise RunnerError(f"{label} must be a regular non-symlink file")
-    if executable and linked.st_mode & 0o111 == 0:
-        raise RunnerError(f"{label} is not executable")
-    data = _read_bound_regular_file(path, label=label, max_bytes=MAX_PROVIDER_EXECUTABLE_BYTES)
-    after = path.lstat()
-    return {
-        "path": path,
-        "identity": (after.st_dev, after.st_ino, after.st_size, after.st_mode),
-        "sha256": sha_bytes(data),
-    }
-
-
-def _revalidate_mcp_file(binding: Mapping[str, Any], *, label: str) -> None:
-    current = _bind_mcp_file(
-        Path(binding["path"]), label=label, executable=label == "MCP executable"
-    )
-    if current["identity"] != binding["identity"] or current["sha256"] != binding["sha256"]:
-        raise RunnerError(f"{label} changed during execution")
-
-
-def _bind_mcp_upstream(upstream: Sequence[str], manifest: Path) -> tuple[list[str], list[dict[str, Any]]]:
+def _bind_mcp_program(upstream: Sequence[str]) -> tuple[list[str], list[tuple[Path, tuple[int, int, int, int], str]]]:
+    """Resolve and bind the executable and an applicable interpreter script."""
     executable = Path(upstream[0])
     if not executable.is_absolute():
-        resolved = shutil.which(upstream[0], path=provider_env().get("PATH"))
-        if resolved is None:
-            raise RunnerError("MCP executable is unavailable")
-        executable = Path(resolved)
-    executable_binding = _bind_mcp_file(executable, label="MCP executable", executable=True)
-    argv = [str(executable), *upstream[1:]]
-    bindings = [executable_binding]
-    if len(argv) > 1 and Path(executable).name.startswith("python"):
-        script = Path(argv[1])
+        found = shutil.which(str(executable), path=provider_env().get("PATH"))
+        if found is None:
+            raise RunnerError("MCP upstream executable could not be resolved")
+        executable = Path(found)
+    try:
+        if stat.S_ISLNK(executable.lstat().st_mode):
+            raise RunnerError("MCP upstream executable must not be a symlink")
+        executable = executable.resolve(strict=True)
+    except OSError as exc:
+        raise RunnerError("MCP upstream executable could not be resolved") from exc
+
+    paths = [executable]
+    resolved = [str(executable), *upstream[1:]]
+    if executable.name.startswith("python") and len(upstream) > 1:
+        script = Path(upstream[1])
         if not script.is_absolute():
-            script = (Path.cwd() / script).absolute()
-        script_binding = _bind_mcp_file(script, label="MCP script", executable=False)
-        argv[1] = str(script)
-        bindings.append(script_binding)
-    if "--bundle-root" not in argv:
-        raise RunnerError("MCP upstream must declare --bundle-root")
-    index = argv.index("--bundle-root")
-    if index + 1 >= len(argv) or argv.count("--bundle-root") != 1:
-        raise RunnerError("MCP upstream bundle root is invalid")
-    argv[index + 1] = str(manifest)
-    return argv, bindings
+            script = Path.cwd() / script
+        try:
+            linked = script.lstat()
+            if stat.S_ISLNK(linked.st_mode):
+                raise RunnerError("MCP upstream script must not be a symlink")
+            script = script.resolve(strict=True)
+        except OSError as exc:
+            raise RunnerError("MCP upstream script could not be resolved") from exc
+        paths.append(script)
+        resolved[1] = str(script)
+
+    bindings: list[tuple[Path, tuple[int, int, int, int], str]] = []
+    for path in paths:
+        data = _read_bound_regular_file(
+            path, label="MCP upstream implementation", max_bytes=MAX_PROVIDER_EXECUTABLE_BYTES
+        )
+        current = path.stat()
+        bindings.append(
+            (path, (current.st_dev, current.st_ino, current.st_size, current.st_mode), sha_bytes(data))
+        )
+    return resolved, bindings
 
 
-def _pin_treatment_arguments(message: dict[str, Any], manifest: Path) -> None:
-    params = message.get("params")
-    if not isinstance(params, dict):
-        raise RunnerError("MCP tools/call params must be an object")
-    arguments = params.get("arguments")
+def _revalidate_mcp_program(
+    bindings: Sequence[tuple[Path, tuple[int, int, int, int], str]]
+) -> None:
+    for path, identity, digest in bindings:
+        data = _read_bound_regular_file(
+            path, label="MCP upstream implementation", max_bytes=MAX_PROVIDER_EXECUTABLE_BYTES
+        )
+        current = path.stat()
+        if (current.st_dev, current.st_ino, current.st_size, current.st_mode) != identity:
+            raise RunnerError("MCP upstream implementation identity changed")
+        if sha_bytes(data) != digest:
+            raise RunnerError("MCP upstream implementation content changed")
+
+
+def _bound_treatment_arguments(arguments: Any, manifest: str) -> dict[str, Any]:
     if not isinstance(arguments, dict):
-        arguments = {}
-        params["arguments"] = arguments
-    expected = str(manifest)
-    supplied = arguments.get("bundle_manifest")
-    if supplied not in (None, expected):
-        raise RunnerError("MCP bundle_manifest conflicts with the bound manifest")
-    for selector in ("repo", "stem"):
-        if arguments.get(selector) is not None:
-            raise RunnerError(f"MCP {selector} selector conflicts with the bound manifest")
-    arguments["bundle_manifest"] = expected
-    arguments["repo"] = None
-    arguments["stem"] = None
+        raise RunnerError("MCP treatment tool arguments must be an object")
+    result = dict(arguments)
+    for selector in ("bundle_manifest", "repo", "stem"):
+        value = result.get(selector)
+        if value is not None and not (selector == "bundle_manifest" and value == manifest):
+            raise RunnerError(f"MCP treatment selector {selector} conflicts with bound manifest")
+    result.update({"bundle_manifest": manifest, "repo": None, "stem": None})
+    return result
 
 
-def run_mcp_proxy(upstream: Sequence[str], manifest_text: str, manifest_sha256: str) -> int:
+def run_mcp_proxy(upstream: Sequence[str], manifest: str, manifest_sha256: str) -> int:
     if not upstream or any(not isinstance(item, str) or not item for item in upstream):
         raise RunnerError("invalid MCP upstream argv")
-    manifest = Path(manifest_text)
-    manifest_data = _read_bound_regular_file(
-        manifest, label="RepoGround manifest", max_bytes=MAX_MANIFEST_BYTES
+    manifest_path = Path(manifest)
+    manifest_bytes = _read_bound_regular_file(
+        manifest_path, label="RepoGround manifest", max_bytes=MAX_MANIFEST_BYTES
     )
-    if sha_bytes(manifest_data) != manifest_sha256:
+    if sha_bytes(manifest_bytes) != manifest_sha256:
         raise RunnerError("RepoGround manifest SHA mismatch")
-    manifest_metadata = manifest.lstat()
-    manifest_identity = (
-        manifest_metadata.st_dev, manifest_metadata.st_ino,
-        manifest_metadata.st_size, manifest_metadata.st_mode,
-    )
-    bound_upstream, upstream_bindings = _bind_mcp_upstream(upstream, manifest)
+    bound_upstream, program_bindings = _bind_mcp_program(upstream)
     try:
         process = subprocess.Popen(
             bound_upstream, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -839,9 +820,11 @@ def run_mcp_proxy(upstream: Sequence[str], manifest_text: str, manifest_sha256: 
         raise RunnerError("MCP upstream pipes unavailable")
     output_lock = threading.Lock()
     state_lock = threading.Lock()
-    pending_requests: dict[Any, str] = {}
+    initialize_ids: set[Any] = set()
+    tools_list_ids: set[Any] = set()
     tools_inventory_validated = False
     resource_calls: dict[Any, tuple[str, str | None]] = {}
+    pending_ids: set[Any] = set()
     frozen_resources: dict[str, Any] | None = None
     frozen_uris: set[str] = set()
     errors: list[BaseException] = []
@@ -894,19 +877,17 @@ def run_mcp_proxy(upstream: Sequence[str], manifest_text: str, manifest_sha256: 
                 if not isinstance(message, dict):
                     raise RunnerError("MCP client message must be an object")
                 method = message.get("method")
-                has_identifier = "id" in message
                 identifier = message.get("id")
-                if has_identifier and not _valid_jsonrpc_request_id(identifier):
-                    raise RunnerError("MCP client request ID is invalid")
                 if method not in MCP_CLIENT_METHODS:
                     if identifier is not None:
                         _proxy_write(_proxy_error(identifier, "benchmark MCP method is not authorized"), output_lock)
                     continue
-                pending_kind: str | None = None
-                if method == "initialize":
-                    pending_kind = "initialize"
-                elif method == "tools/list":
-                    pending_kind = "tools/list"
+                if method == "initialize" and identifier is not None:
+                    with state_lock:
+                        initialize_ids.add(identifier)
+                elif method == "tools/list" and identifier is not None:
+                    with state_lock:
+                        tools_list_ids.add(identifier)
                 elif method == "tools/call":
                     params = message.get("params") if isinstance(message.get("params"), dict) else {}
                     name = params.get("name")
@@ -936,28 +917,29 @@ def run_mcp_proxy(upstream: Sequence[str], manifest_text: str, manifest_sha256: 
                             _proxy_write({"jsonrpc":"2.0","id":identifier,"result":{"content":[{"type":"text","text":error}],"isError":True}}, output_lock)
                             continue
                         with state_lock:
-                            if identifier in pending_requests:
-                                raise RunnerError("MCP client reused a pending request ID")
-                            pending_requests[identifier] = "resource"
                             resource_calls[identifier] = (str(action), str(uri) if uri is not None else None)
+                            if identifier in pending_ids:
+                                raise RunnerError("duplicate pending MCP request ID")
+                            pending_ids.add(identifier)
                         if action == "list":
-                            send({"jsonrpc":"2.0","id":identifier,"method":"resources/list","params":{}})
+                            send({"jsonrpc":"2.0","id":identifier,"method":"resources/list","params":{"bundle_manifest":str(manifest_path),"repo":None,"stem":None}})
                         else:
-                            send({"jsonrpc":"2.0","id":identifier,"method":"resources/read","params":{"uri":uri}})
+                            send({"jsonrpc":"2.0","id":identifier,"method":"resources/read","params":{"uri":uri,"bundle_manifest":str(manifest_path),"repo":None,"stem":None}})
                         continue
                     if name not in UPSTREAM_MCP:
                         if identifier is not None:
                             _proxy_write(_proxy_error(identifier, "benchmark MCP tool is not authorized"), output_lock)
                         continue
-                    _pin_treatment_arguments(message, manifest)
-                    pending_kind = "tools/call"
-                elif identifier is not None:
-                    pending_kind = "passthrough"
+                    arguments = params.get("arguments")
+                    params = dict(params)
+                    params["arguments"] = _bound_treatment_arguments(arguments, str(manifest_path))
+                    message = dict(message)
+                    message["params"] = params
                 if identifier is not None:
                     with state_lock:
-                        if identifier in pending_requests:
-                            raise RunnerError("MCP client reused a pending request ID")
-                        pending_requests[identifier] = pending_kind or "passthrough"
+                        if identifier in pending_ids:
+                            raise RunnerError("duplicate pending MCP request ID")
+                        pending_ids.add(identifier)
                 send(message)
         except BaseException as exc:
             errors.append(exc)
@@ -980,20 +962,21 @@ def run_mcp_proxy(upstream: Sequence[str], manifest_text: str, manifest_sha256: 
             if not isinstance(message, dict):
                 raise RunnerError("MCP upstream message must be an object")
             identifier = message.get("id")
-            if "id" not in message and "result" not in message and "error" not in message:
+            if identifier is None:
                 continue
             with state_lock:
-                pending_kind = pending_requests.get(identifier)
-                if (
-                    message.get("jsonrpc") != "2.0"
-                    or pending_kind is None
-                    or (("result" in message) == ("error" in message))
-                ):
-                    raise RunnerError("MCP upstream response envelope is invalid")
-                pending_requests.pop(identifier, None)
+                if message.get("jsonrpc") != "2.0":
+                    raise RunnerError("MCP upstream response has invalid JSON-RPC version")
+                if identifier not in pending_ids:
+                    raise RunnerError("MCP upstream response ID is not pending")
+                if ("result" in message) == ("error" in message):
+                    raise RunnerError("MCP upstream response must contain exactly one of result or error")
+                pending_ids.remove(identifier)
+                is_initialize = identifier in initialize_ids
+                is_tools_list = identifier in tools_list_ids
                 resource_call = resource_calls.pop(identifier, None)
-                is_initialize = pending_kind == "initialize"
-                is_tools_list = pending_kind == "tools/list"
+                initialize_ids.discard(identifier)
+                tools_list_ids.discard(identifier)
             if is_initialize and "result" in message:
                 result = message.get("result") if isinstance(message.get("result"), dict) else {}
                 caps = result.get("capabilities") if isinstance(result.get("capabilities"), dict) else {}
@@ -1028,11 +1011,9 @@ def run_mcp_proxy(upstream: Sequence[str], manifest_text: str, manifest_sha256: 
         if client_thread.is_alive():
             raise RunnerError("MCP client intake remained active at upstream EOF")
         with state_lock:
-            pending_kinds = tuple(pending_requests.values())
-        if "tools/list" in pending_kinds or not tools_inventory_validated:
+            pending_tools_list = bool(tools_list_ids)
+        if pending_tools_list or not tools_inventory_validated:
             raise RunnerError("MCP tools/list inventory was not validated before upstream EOF")
-        if pending_kinds:
-            raise RunnerError("MCP upstream responses remained pending at upstream EOF")
         returncode = process.wait(timeout=5)
     finally:
         if process.poll() is None:
@@ -1051,20 +1032,12 @@ def run_mcp_proxy(upstream: Sequence[str], manifest_text: str, manifest_sha256: 
         stderr_thread.join(timeout=5)
         if upstream_stderr:
             sys.stderr.buffer.write(bytes(upstream_stderr)); sys.stderr.buffer.flush()
-        for index, binding in enumerate(upstream_bindings):
-            _revalidate_mcp_file(
-                binding, label="MCP executable" if index == 0 else "MCP script"
-            )
+        _revalidate_mcp_program(program_bindings)
         current_manifest = _read_bound_regular_file(
-            manifest, label="RepoGround manifest", max_bytes=MAX_MANIFEST_BYTES
+            manifest_path, label="RepoGround manifest", max_bytes=MAX_MANIFEST_BYTES
         )
-        current_metadata = manifest.lstat()
-        current_identity = (
-            current_metadata.st_dev, current_metadata.st_ino,
-            current_metadata.st_size, current_metadata.st_mode,
-        )
-        if current_identity != manifest_identity or sha_bytes(current_manifest) != manifest_sha256:
-            raise RunnerError("RepoGround manifest changed during execution")
+        if sha_bytes(current_manifest) != manifest_sha256:
+            raise RunnerError("RepoGround manifest changed during MCP execution")
     if errors:
         raise RunnerError("benchmark MCP proxy stream failed") from errors[0]
     if returncode is None or upstream_stderr_overflow or returncode != 0 or upstream_stderr:
@@ -1105,10 +1078,10 @@ def build_command(
     ]
     if request["condition"] == "treatment":
         upstream = [str(item) for item in request["repobrief"]["mcp_command"]]
-        binding = request["repobrief"]
+        upstream[0] = str(Path(upstream[0]).resolve(strict=True))
         proxy_args = [
             str(Path(__file__).resolve()), "--codex-mcp-proxy", canonical(upstream),
-            str(binding["manifest"]), str(binding["manifest_sha256"]),
+            str(request["repobrief"]["manifest"]), str(request["repobrief"]["manifest_sha256"]),
         ]
         command[2:2] = [
             "-c", 'mcp_servers.repobrief.command="/usr/bin/python3"',
