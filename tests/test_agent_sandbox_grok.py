@@ -161,6 +161,35 @@ class GrokSandboxTests(unittest.TestCase):
             self.assertEqual(argv[home_index + 1], "/tmp")
 
 
+    def test_minimal_sandbox_materializes_anonymous_fd_as_read_only_tmp_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory) / "repo"
+            worktree.mkdir()
+            argv = sandbox.minimal_sandbox_argv(
+                workspace=worktree,
+                command=["/usr/bin/true"],
+                workspace_writable=False,
+                extra_read_only_data_fds=((0, Path("/tmp/grabowski-bound-review-prompt")),),
+            )
+        bind_index = argv.index("--ro-bind-data")
+        self.assertEqual(argv[bind_index - 2 : bind_index + 3], [
+            "--perms", "0400", "--ro-bind-data", "0", "/tmp/grabowski-bound-review-prompt"
+        ])
+        self.assertNotIn("grabowski-grok-review-", "\n".join(argv))
+
+    def test_minimal_sandbox_rejects_unsafe_read_only_data_fd_bindings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory) / "repo"
+            worktree.mkdir()
+            for binding in ((-1, Path("/tmp/prompt")), (0, Path("/etc/prompt")), (0, Path("relative"))):
+                with self.subTest(binding=binding), self.assertRaises(sandbox.AgentSandboxError):
+                    sandbox.minimal_sandbox_argv(
+                        workspace=worktree,
+                        command=["/usr/bin/true"],
+                        workspace_writable=False,
+                        extra_read_only_data_fds=(binding,),
+                    )
+
     def test_bounded_capture_supplies_large_anonymous_stdin(self) -> None:
         payload = b"x" * 247_109
         code = (
