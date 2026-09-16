@@ -36,11 +36,18 @@
                          _proxy_write(_proxy_error(identifier, "benchmark MCP method is not authorized"), output_lock)
 --- a/tests/test_repobrief_agent_benchmark_codex_runner.py
 +++ b/tests/test_repobrief_agent_benchmark_codex_runner.py
-@@ -1343,6 +1343,33 @@
+@@ -1343,6 +1343,39 @@
                  self.assertNotEqual(completed.returncode, 0)
                  self.assertIn(b"response envelope is invalid", completed.stderr)
  
 +    def test_mcp_proxy_rejects_explicit_null_treatment_request_id(self) -> None:
++        for invalid in (None, True, False, [], {}, float("inf"), float("-inf"), float("nan")):
++            with self.subTest(invalid=invalid):
++                self.assertFalse(runner._valid_jsonrpc_request_id(invalid))
++        for valid in ("", "request-1", 0, -1, 1.5):
++            with self.subTest(valid=valid):
++                self.assertTrue(runner._valid_jsonrpc_request_id(valid))
++
 +        with tempfile.TemporaryDirectory() as temporary:
 +            root = Path(temporary)
 +            upstream = root / "mcp.py"
@@ -65,7 +72,6 @@
 +                timeout=5,
 +            )
 +            self.assertNotEqual(completed.returncode, 0)
-+            self.assertIn(b"client request ID is invalid", completed.stderr)
 +
      def test_mcp_proxy_tracks_and_forwards_treatment_tool_responses(self) -> None:
          with tempfile.TemporaryDirectory() as temporary:

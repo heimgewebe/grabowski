@@ -24,7 +24,7 @@ jobs:
           set -euo pipefail
           expected_head=dc99d4982a24441b04e0e2590a3faa21520d6028
           patch=.pr1227-null-id/fix.patch
-          test "$(sha256sum "$patch" | cut -d' ' -f1)" = "87b672e60ad2b683196a6813b92dda92107fc4072ab136cb8ad990844d44cb30"
+          test "$(sha256sum "$patch" | cut -d' ' -f1)" = "f618e453ff7f9a3ef429d821b9958dd9f5a787eab36c6990fbbf7e96eb5b8c7a"
           live_head="$(git ls-remote origin refs/heads/fix/rab-codex-stderr-contract-20260915 | cut -f1)"
           test "$live_head" = "$expected_head"
 
