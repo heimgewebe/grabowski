@@ -6,6 +6,11 @@
 Grabowski-Runtime, erhält aber einen eigenen Principal, getrennte Secrets und
 eine serverseitig erzwungene Least-Privilege-Toolpolicy.
 
+Nicht verwechseln mit **der kleine maulwurf**: Das ist ein eigenständiger
+Grabowski-Sekundäroperator/Fallback mit eigener Runtime und Betriebsrolle.
+`maulwurf x` ist weder sein Vorgänger noch sein Nachfolger oder Ersatz; beide
+Systeme haben getrennte technische und operative Zuständigkeiten.
+
 Der kanonische Produktionspfad ist genau:
 
 ```text
