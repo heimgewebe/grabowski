@@ -72,6 +72,9 @@ _RESULT_FIELDS = frozenset(
 _TERMINAL_STATUSES = frozenset(
     {"succeeded", "failed", "timed_out", "signalled", "terminated_unclear"}
 )
+_PRE_RESULT_INFRASTRUCTURE_STATUSES = frozenset(
+    {"failed", "timed_out", "signalled", "terminated_unclear"}
+)
 _VERDICTS = frozenset({"PASS_THIS_REVISION", "REJECT_THIS_REVISION"})
 
 
@@ -845,14 +848,14 @@ def reconcile(
         try:
             role_evidence = _validated_review_role_evidence(metadata, binding, provenance)
         except FileNotFoundError as exc:
-            # A failed provenance-bound reviewer whose role receipt was never
-            # created has no semantic review result. Treat only that exact
-            # pre-result failure like the existing no-marker infrastructure
-            # path so a later exact-bound PASS in the same slot can supersede
-            # it. A succeeded reviewer missing its create-only receipt is
-            # contradictory and remains fail-closed, as do malformed,
+            # A non-success terminal provenance-bound reviewer whose role
+            # receipt was never created has no semantic review result. Treat
+            # only the known pre-result termination states like the existing
+            # no-marker infrastructure path so a later exact-bound PASS can
+            # supersede them. A succeeded reviewer missing its create-only
+            # receipt is contradictory and remains fail-closed, as do malformed,
             # unreadable or binding-invalid receipts below.
-            if attempt["terminal_status"] == "failed":
+            if attempt["terminal_status"] in _PRE_RESULT_INFRASTRUCTURE_STATUSES:
                 attempt["classification"] = "infrastructure_error"
                 attempts.append(attempt)
                 continue

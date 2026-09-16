@@ -659,39 +659,41 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
             {"infrastructure_error", "pass"},
         )
 
-    def test_failed_missing_role_receipt_can_be_replaced_by_later_proven_pass(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            jobs = Path(tmp)
-            missing = make_job(
-                jobs,
-                suffix="a00000000039",
-                slot="independent-reviewer",
-                terminal_status="failed",
-                review_result=None,
-                review_role=True,
-                created_at_unix=1_787_000_100,
-            )
-            (missing / "review-role-receipt.json").unlink()
-            make_job(
-                jobs,
-                suffix="a00000000040",
-                slot="independent-reviewer",
-                terminal_status="succeeded",
-                review_result=None,
-                review_role=True,
-                created_at_unix=1_787_000_200,
-            )
-            reconciled = self.reconcile(jobs)
-        self.assertEqual(reconciled["status"], "settled")
-        self.assertEqual(reconciled["errors"], [])
-        slot = reconciled["slots"][0]
-        self.assertEqual(slot["independent_pass_count"], 1)
-        self.assertEqual(slot["infrastructure_error_count"], 1)
-        self.assertEqual(slot["unresolved_count"], 0)
-        self.assertEqual(
-            {item["classification"] for item in reconciled["attempts"]},
-            {"infrastructure_error", "pass"},
-        )
+    def test_unsuccessful_missing_role_receipt_can_be_replaced_by_later_proven_pass(self) -> None:
+        for terminal_status in ("failed", "timed_out", "signalled", "terminated_unclear"):
+            with self.subTest(terminal_status=terminal_status):
+                with tempfile.TemporaryDirectory() as tmp:
+                    jobs = Path(tmp)
+                    missing = make_job(
+                        jobs,
+                        suffix="a00000000039",
+                        slot="independent-reviewer",
+                        terminal_status=terminal_status,
+                        review_result=None,
+                        review_role=True,
+                        created_at_unix=1_787_000_100,
+                    )
+                    (missing / "review-role-receipt.json").unlink()
+                    make_job(
+                        jobs,
+                        suffix="a00000000040",
+                        slot="independent-reviewer",
+                        terminal_status="succeeded",
+                        review_result=None,
+                        review_role=True,
+                        created_at_unix=1_787_000_200,
+                    )
+                    reconciled = self.reconcile(jobs)
+                self.assertEqual(reconciled["status"], "settled")
+                self.assertEqual(reconciled["errors"], [])
+                slot = reconciled["slots"][0]
+                self.assertEqual(slot["independent_pass_count"], 1)
+                self.assertEqual(slot["infrastructure_error_count"], 1)
+                self.assertEqual(slot["unresolved_count"], 0)
+                self.assertEqual(
+                    {item["classification"] for item in reconciled["attempts"]},
+                    {"infrastructure_error", "pass"},
+                )
 
     def test_succeeded_missing_role_receipt_stays_blocking_after_later_proven_pass(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
