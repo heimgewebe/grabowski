@@ -925,6 +925,20 @@ def _enable_child_subreaper() -> None:
         )
 
 
+def _direct_child_pids() -> set[int]:
+    """Return this process' direct Linux children for descendant containment."""
+    path = Path(f"/proc/self/task/{os.getpid()}/children")
+    try:
+        payload = path.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError) as exc:
+        raise RunnerError("provider containment cannot enumerate child processes") from exc
+    if not payload:
+        return set()
+    try:
+        return {int(value) for value in payload.split()}
+    except ValueError as exc:
+        raise RunnerError("provider containment received invalid child process data") from exc
+
 def run_bounded(
     command: Sequence[str],
     *,
@@ -944,6 +958,7 @@ def run_bounded(
     """
 
     _enable_child_subreaper()
+    baseline_children = _direct_child_pids()
 
     try:
         process = subprocess.Popen(
@@ -1001,33 +1016,61 @@ def run_bounded(
             return True
         return True
 
-    def reap_process_group_children() -> None:
-        while True:
+    def adopted_provider_children() -> set[int]:
+        try:
+            return _direct_child_pids() - baseline_children
+        except RunnerError:
+            note_error("provider_child_scan_failed")
+            return set()
+
+    def kill_adopted_children(children: set[int]) -> None:
+        for child_pid in sorted(children):
             try:
-                child_pid, _status = os.waitpid(-process.pid, os.WNOHANG)
-            except ChildProcessError:
-                return
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                continue
             except OSError as exc:
-                note_error(f"process_group_reap_failed:{type(exc).__name__}")
-                return
-            if child_pid == 0:
-                return
+                note_error(f"adopted_child_kill_failed:{type(exc).__name__}")
+
+    def reap_adopted_children(children: set[int]) -> None:
+        for child_pid in sorted(children):
+            try:
+                os.waitpid(child_pid, os.WNOHANG)
+            except ChildProcessError:
+                continue
+            except OSError as exc:
+                note_error(f"adopted_child_reap_failed:{type(exc).__name__}")
 
     def contain_surviving_process_group() -> None:
-        if not process_group_exists():
+        group_present = process_group_exists()
+        adopted = adopted_provider_children()
+        if not group_present and not adopted:
             return
-        note_error("process_group_survived_provider_exit")
-        kill_process_tree()
+        if group_present:
+            note_error("process_group_survived_provider_exit")
+            kill_process_tree()
+        if adopted:
+            note_error("adopted_descendant_survived_provider_exit")
+            kill_adopted_children(adopted)
         cleanup_deadline = time.monotonic() + 1.0
         while time.monotonic() < cleanup_deadline:
-            reap_process_group_children()
-            if not process_group_exists():
+            adopted = adopted_provider_children()
+            if adopted:
+                kill_adopted_children(adopted)
+                reap_adopted_children(adopted)
+            group_present = process_group_exists()
+            adopted = adopted_provider_children()
+            if not group_present and not adopted:
                 return
+            if group_present:
+                kill_process_tree()
             time.sleep(0.01)
-        reap_process_group_children()
-        if process_group_exists():
+        adopted = adopted_provider_children()
+        if adopted:
+            kill_adopted_children(adopted)
+            reap_adopted_children(adopted)
+        if process_group_exists() or adopted_provider_children():
             note_error("process_group_cleanup_failed")
-
     def store(label: str, chunk: bytes) -> None:
         if not chunk or overflow[label]:
             return
@@ -1411,6 +1454,7 @@ def _split_shell_words(text: str) -> list[str]:
         raise RunnerError("command substitution is not allowed")
     try:
         lexer = shlex.shlex(text.strip(), posix=True, punctuation_chars=";&|<>")
+        lexer.commenters = ""
         lexer.whitespace_split = True
         parts = list(lexer)
     except ValueError as exc:

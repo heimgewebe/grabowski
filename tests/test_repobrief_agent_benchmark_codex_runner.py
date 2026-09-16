@@ -296,6 +296,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertEqual(runner.command_kind("rg example src"), "grep")
         self.assertEqual(runner.command_kind("rg -n 'foo|bar' src"), "grep")
         self.assertEqual(runner.command_kind("rg 'foo{1,3}' src"), "grep")
+        self.assertEqual(runner.command_kind("rg foo#bar src"), "grep")
         self.assertEqual(runner.command_kind("rg --regexp=example src"), "grep")
         self.assertEqual(runner.command_kind("cat src/example.py"), "read_file")
         self.assertEqual(runner.command_kind("sed -n '1,2p' src/example.py"), "read_file")
@@ -331,6 +332,8 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             "rg {needle,../sibling}",
             "rg needle --glob *.py",
             'rg "$HOME" src',
+            "rg foo#bar | id",
+            "rg foo#bar ../outside",
         ):
             with self.subTest(command=command):
                 with self.assertRaises(runner.RunnerError):
@@ -863,6 +866,39 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 if time.monotonic() >= deadline:
                     self.fail("provider descendant survived process-group containment")
                 time.sleep(0.02)
+
+    def test_run_bounded_reaps_descendant_that_detaches_from_provider_group(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            child_state = root / "detached.pid"
+            script = root / "provider.py"
+            script.write_text(
+                "import os, pathlib, time\n"
+                "child = os.fork()\n"
+                "if child == 0:\n"
+                "    os.setsid()\n"
+                f"    pathlib.Path({str(child_state)!r}).write_text(str(os.getpid()))\n"
+                "    for fd in (0, 1, 2):\n"
+                "        try:\n"
+                "            os.close(fd)\n"
+                "        except OSError:\n"
+                "            pass\n"
+                "    time.sleep(30)\n"
+                "    os._exit(0)\n"
+                f"state = pathlib.Path({str(child_state)!r})\n"
+                "while not state.exists():\n"
+                "    time.sleep(0.01)\n"
+                "os._exit(0)\n",
+                encoding="utf-8",
+            )
+            capture = runner.run_bounded(
+                [sys.executable, str(script)], cwd=root, timeout_seconds=3, stdin_data=b""
+            )
+            self.assertIn("adopted_descendant_survived_provider_exit", str(capture["capture_error"]))
+            self.assertNotIn("process_group_cleanup_failed", str(capture["capture_error"]))
+            child_pid = int(child_state.read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child_pid, 0)
 
     def test_run_bounded_times_out_when_provider_does_not_read_stdin(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
