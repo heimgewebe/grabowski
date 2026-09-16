@@ -11,6 +11,7 @@ import subprocess
 import stat
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -319,6 +320,8 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             "/usr/bin/cat src/example.py",
             "sh -lc 'cat src/example.py'",
             "bash -lc 'cat src/example.py'",
+            "rg needle src\ncat secret",
+            "cat src/example.py\r\nrg needle src",
         ):
             with self.subTest(command=command):
                 with self.assertRaises(runner.RunnerError):
@@ -833,6 +836,31 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertEqual(capture["capture_error"], "timeout")
             self.assertIn(b"partial-output", capture["stdout"])
             self.assertIn(b"partial-diagnostic", capture["stderr"])
+
+    def test_run_bounded_applies_wall_deadline_after_stdio_closes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "provider.py"
+            script.write_text(
+                "import os, time\n"
+                "for fd in (0, 1, 2):\n"
+                "    try:\n"
+                "        os.close(fd)\n"
+                "    except OSError:\n"
+                "        pass\n"
+                "time.sleep(5)\n",
+                encoding="utf-8",
+            )
+            started = time.monotonic()
+            capture = runner.run_bounded(
+                [sys.executable, str(script)],
+                cwd=root,
+                timeout_seconds=1,
+                stdin_data=b"",
+            )
+            elapsed = time.monotonic() - started
+            self.assertEqual(capture["capture_error"], "timeout")
+            self.assertLess(elapsed, 3.0)
 
     def test_run_bounded_returns_capture_error_instead_of_discarding_partial_streams(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

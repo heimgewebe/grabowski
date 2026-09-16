@@ -996,7 +996,7 @@ def run_bounded(
         try:
             while selector.get_map():
                 remaining = deadline - time.monotonic()
-                if remaining <= 0 and capture_error is None:
+                if remaining <= 0:
                     note_error("timeout")
                     kill_process_tree()
                     break
@@ -1055,16 +1055,28 @@ def run_bounded(
 
     if capture_error is not None:
         kill_process_tree()
-    try:
-        returncode = process.wait(timeout=5)
-    except BaseException as exc:
-        note_error(f"process_wait_failed:{type(exc).__name__}")
-        kill_process_tree()
+
+    if capture_error is None and process.poll() is None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            note_error("timeout")
+            kill_process_tree()
+        else:
+            try:
+                process.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                note_error("timeout")
+                kill_process_tree()
+            except BaseException as exc:
+                note_error(f"process_wait_failed:{type(exc).__name__}")
+                kill_process_tree()
+
+    if process.poll() is None:
         try:
             process.wait(timeout=5)
         except BaseException as followup:
             note_error(f"process_reap_failed:{type(followup).__name__}")
-        returncode = process.returncode if isinstance(process.returncode, int) else -1
+    returncode = process.returncode if isinstance(process.returncode, int) else -1
 
     # After a capture fault, drain whatever bytes the terminated process left in
     # its pipes.  This is best-effort and bounded; failures themselves become
@@ -1288,10 +1300,12 @@ _RG_SAFE_VALUE_OPTIONS = {
 
 
 def _split_shell_words(text: str) -> list[str]:
+    if "\n" in text or "\r" in text:
+        raise RunnerError("command line breaks are not allowed")
     if "$(" in text or "`" in text:
         raise RunnerError("command substitution is not allowed")
     try:
-        lexer = shlex.shlex(text, posix=True, punctuation_chars=";&|<>")
+        lexer = shlex.shlex(text.strip(), posix=True, punctuation_chars=";&|<>")
         lexer.whitespace_split = True
         parts = list(lexer)
     except ValueError as exc:
@@ -1391,7 +1405,7 @@ def _sed_kind(parts: Sequence[str]) -> str:
 
 
 def command_kind(command: str) -> str:
-    parts = _split_shell_words(command.strip())
+    parts = _split_shell_words(command)
     if not parts:
         raise RunnerError("empty Codex command")
     executable = parts[0]
