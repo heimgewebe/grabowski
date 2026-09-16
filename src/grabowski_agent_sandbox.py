@@ -524,6 +524,59 @@ def _validate_writable_tree(target: Path) -> None:
             raise AgentSandboxError(f"writable path is not stable: {directory}") from exc
 
 
+def _grosser_adler_inbox_root() -> Path:
+    configured = os.environ.get("GROSSER_ADLER_STATE_ROOT")
+    if configured:
+        state_root = Path(configured).expanduser()
+    else:
+        state_home = Path(
+            os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))
+        ).expanduser()
+        state_root = state_home / "grosser-adler"
+    return state_root / "worktree-inboxes"
+
+
+def _adler_inbox_sandbox_binding(worktree: Path) -> tuple[tuple[tuple[Path, Path], ...], tuple[Path, ...]]:
+    """Expose only one exact worktree inbox target read-only when safely present.
+
+    The worktree-local pointer is Grabowski metadata.  A missing, dangling or
+    malformed pointer is deliberately non-blocking: it means unknown Adler
+    evidence, never "no findings".
+    """
+    pointer = worktree / ".adler" / "inbox.json"
+    try:
+        metadata = pointer.lstat()
+        if (
+            not stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+        ):
+            return (), ()
+        raw_target = os.readlink(pointer)
+        target = Path(raw_target)
+        root = _grosser_adler_inbox_root().absolute()
+        if not target.is_absolute() or target.parent != root:
+            return (), ()
+        name = target.name
+        if (
+            not name.endswith(".json")
+            or len(name) != 37
+            or len(name[:-5]) != 32
+            or any(ch not in "0123456789abcdef" for ch in name[:-5])
+        ):
+            return (), ()
+        source = _private_regular_file(target, "Großer Adler worktree inbox")
+    except (OSError, AgentSandboxError):
+        return (), ()
+    reserved = {Path("/tmp"), Path("/usr"), Path("/etc"), Path("/proc"), Path("/dev")}
+    directories = tuple(
+        parent
+        for parent in reversed(target.parents)
+        if parent != Path("/") and parent not in reserved
+    )
+    return ((source, target),), directories
+
+
 def _normalized_writable_paths(worktree: Path, values: Iterable[Path]) -> list[Path]:
     candidates: list[Path] = []
     for value in values:
@@ -575,6 +628,7 @@ def minimal_sandbox_argv(
         directory=True,
     )
     writable = _normalized_writable_paths(worktree, writable_paths)
+    adler_read_only, adler_directories = _adler_inbox_sandbox_binding(worktree)
     if workspace_writable and not writable:
         raise AgentSandboxError("writer sandbox requires at least one bounded writable path")
     if not workspace_writable and writable:
@@ -602,7 +656,7 @@ def minimal_sandbox_argv(
         arguments.extend(["--symlink", "usr/lib64", "/lib64"])
     arguments.extend(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/etc"])
     normalized_directories: list[str] = []
-    for value in extra_directories:
+    for value in (*adler_directories, *tuple(extra_directories)):
         raw = str(value)
         path = Path(raw)
         if not path.is_absolute() or raw in {"/", "/proc", "/dev", "/usr", "/etc"} or "\x00" in raw or ".." in path.parts:
@@ -630,7 +684,7 @@ def minimal_sandbox_argv(
     seen_targets = {str(worktree), *(str(item) for item in writable)}
     if common is not None:
         seen_targets.add(str(common))
-    for source_value, target_value in extra_read_only:
+    for source_value, target_value in (*adler_read_only, *tuple(extra_read_only)):
         source = _safe_existing_path(source_value, "extra_read_only source")
         if not target_value.is_absolute() or "\x00" in str(target_value):
             raise AgentSandboxError("extra_read_only target must be absolute")
