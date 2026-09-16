@@ -21,7 +21,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "68f2545e77062f595689dcba4154b16bc7486cce"
+          test "$(git rev-parse HEAD^)" = "6c13fe5b639885b4c6f0d3ed4cb847ca85b64f3c"
           test "$(git rev-parse HEAD:tools/repobrief_agent_benchmark_codex_runner.py)" = "b62e6a52253057dd3cce9317cba67672e62544ac"
           test "$(git rev-parse HEAD:tests/test_repobrief_agent_benchmark_codex_runner.py)" = "2781c8f6ca2a3dce0a71cde5bccabac58ae1989b"
       - name: Apply fixes and regressions
@@ -157,40 +157,40 @@ jobs:
           )
 
           detached_anchor = '    def test_run_bounded_times_out_when_provider_does_not_read_stdin(self) -> None:\n'
-          detached_test = '''    def test_run_bounded_reaps_descendant_that_detaches_from_provider_group(self) -> None:
-              with tempfile.TemporaryDirectory() as temporary:
-                  root = Path(temporary)
-                  child_state = root / "detached.pid"
-                  script = root / "provider.py"
-                  script.write_text(
-                      "import os, pathlib, time\\n"
-                      "child = os.fork()\\n"
-                      "if child == 0:\\n"
-                      "    os.setsid()\\n"
-                      f"    pathlib.Path({str(child_state)!r}).write_text(str(os.getpid()))\\n"
-                      "    for fd in (0, 1, 2):\\n"
-                      "        try:\\n"
-                      "            os.close(fd)\\n"
-                      "        except OSError:\\n"
-                      "            pass\\n"
-                      "    time.sleep(30)\\n"
-                      "    os._exit(0)\\n"
-                      f"state = pathlib.Path({str(child_state)!r})\\n"
-                      "while not state.exists():\\n"
-                      "    time.sleep(0.01)\\n"
-                      "os._exit(0)\\n",
-                      encoding="utf-8",
-                  )
-                  capture = runner.run_bounded(
-                      [sys.executable, str(script)], cwd=root, timeout_seconds=3, stdin_data=b""
-                  )
-                  self.assertIn("adopted_descendant_survived_provider_exit", str(capture["capture_error"]))
-                  self.assertNotIn("process_group_cleanup_failed", str(capture["capture_error"]))
-                  child_pid = int(child_state.read_text())
-                  with self.assertRaises(ProcessLookupError):
-                      os.kill(child_pid, 0)
-
-          '''
+          detached_test = (
+              '    def test_run_bounded_reaps_descendant_that_detaches_from_provider_group(self) -> None:\n'
+              '        with tempfile.TemporaryDirectory() as temporary:\n'
+              '            root = Path(temporary)\n'
+              '            child_state = root / "detached.pid"\n'
+              '            script = root / "provider.py"\n'
+              '            script.write_text(\n'
+              '                "import os, pathlib, time\\n"\n'
+              '                "child = os.fork()\\n"\n'
+              '                "if child == 0:\\n"\n'
+              '                "    os.setsid()\\n"\n'
+              '                f"    pathlib.Path({str(child_state)!r}).write_text(str(os.getpid()))\\n"\n'
+              '                "    for fd in (0, 1, 2):\\n"\n'
+              '                "        try:\\n"\n'
+              '                "            os.close(fd)\\n"\n'
+              '                "        except OSError:\\n"\n'
+              '                "            pass\\n"\n'
+              '                "    time.sleep(30)\\n"\n'
+              '                "    os._exit(0)\\n"\n'
+              '                f"state = pathlib.Path({str(child_state)!r})\\n"\n'
+              '                "while not state.exists():\\n"\n'
+              '                "    time.sleep(0.01)\\n"\n'
+              '                "os._exit(0)\\n",\n'
+              '                encoding="utf-8",\n'
+              '            )\n'
+              '            capture = runner.run_bounded(\n'
+              '                [sys.executable, str(script)], cwd=root, timeout_seconds=3, stdin_data=b""\n'
+              '            )\n'
+              '            self.assertIn("adopted_descendant_survived_provider_exit", str(capture["capture_error"]))\n'
+              '            self.assertNotIn("process_group_cleanup_failed", str(capture["capture_error"]))\n'
+              '            child_pid = int(child_state.read_text())\n'
+              '            with self.assertRaises(ProcessLookupError):\n'
+              '                os.kill(child_pid, 0)\n\n'
+          )
           tests = replace_once(tests, detached_anchor, detached_test + detached_anchor, "detached descendant regression")
 
           runner_path.write_text(runner, encoding="utf-8")
