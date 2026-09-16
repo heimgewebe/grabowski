@@ -1,0 +1,258 @@
+name: PR 1227 final independent-review remediation
+
+on:
+  push:
+    branches:
+      - fix/rab-codex-stderr-contract-20260915
+    paths:
+      - .github/workflows/pr1227-final-review-remediation.yml
+
+permissions:
+  contents: write
+
+jobs:
+  remediate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Verify exact preimage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "f57362dcaad8655ac85d70830273d011e904d4c4"
+          test "$(git rev-parse HEAD:tools/repobrief_agent_benchmark_codex_runner.py)" = "5e56c730b5bb013cff1cb4bbd97b00fed8a5209a"
+          test "$(git rev-parse HEAD:tests/test_repobrief_agent_benchmark_codex_runner.py)" = "672aad2c497590b7f8fa9f8f1d97d81f38a98ccc"
+      - name: Apply reviewed fixes and regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          runner_path = Path("tools/repobrief_agent_benchmark_codex_runner.py")
+          tests_path = Path("tests/test_repobrief_agent_benchmark_codex_runner.py")
+          runner = runner_path.read_text(encoding="utf-8")
+          tests = tests_path.read_text(encoding="utf-8")
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected one preimage, found {count}")
+              return text.replace(old, new, 1)
+
+          runner = replace_once(
+              runner,
+              '''    if any(part in {";", "&", "&&", "|", "||", ">", ">>", "<", "<<"} for part in parts):
+                  raise RunnerError("chained, piped, or redirected command is not allowed")
+          ''',
+              '''    if any(re.fullmatch(r"[;&|<>]+", part) is not None for part in parts):
+                  raise RunnerError("chained, piped, or redirected command is not allowed")
+          ''',
+              "compound shell punctuation",
+          )
+
+          runner = replace_once(
+              runner,
+              '''def run_mcp_proxy(upstream: Sequence[str]) -> int:
+          ''',
+              '''def _read_bounded_mcp_line(stream: Any, *, peer: str) -> bytes:
+                  raw = stream.readline(base.MAX_MCP_MESSAGE_BYTES + 1)
+                  if len(raw) > base.MAX_MCP_MESSAGE_BYTES:
+                      raise RunnerError(f"MCP {peer} message too large")
+                  return raw
+
+
+              def run_mcp_proxy(upstream: Sequence[str]) -> int:
+          ''',
+              "bounded MCP line helper",
+          )
+          runner = replace_once(
+              runner,
+              '''        try:
+                          for raw in sys.stdin.buffer:
+                              if len(raw) > base.MAX_MCP_MESSAGE_BYTES:
+                                  raise RunnerError("MCP client message too large")
+                              message = json.loads(raw)
+          ''',
+              '''        try:
+                          while True:
+                              raw = _read_bounded_mcp_line(sys.stdin.buffer, peer="client")
+                              if not raw:
+                                  break
+                              message = json.loads(raw)
+          ''',
+              "bounded MCP client input",
+          )
+          runner = replace_once(
+              runner,
+              '''    try:
+                      for raw in process.stdout:
+                          message = json.loads(raw)
+          ''',
+              '''    try:
+                      while True:
+                          raw = _read_bounded_mcp_line(process.stdout, peer="upstream")
+                          if not raw:
+                              break
+                          message = json.loads(raw)
+          ''',
+              "bounded MCP upstream output",
+          )
+
+          runner = replace_once(
+              runner,
+              '''    def store(label: str, chunk: bytes) -> None:
+          ''',
+              '''    def process_group_exists() -> bool:
+                  try:
+                      os.killpg(process.pid, 0)
+                  except ProcessLookupError:
+                      return False
+                  except OSError as exc:
+                      note_error(f"process_group_probe_failed:{type(exc).__name__}")
+                      return True
+                  return True
+
+              def contain_surviving_process_group() -> None:
+                  if not process_group_exists():
+                      return
+                  note_error("process_group_survived_provider_exit")
+                  kill_process_tree()
+                  cleanup_deadline = time.monotonic() + 1.0
+                  while time.monotonic() < cleanup_deadline:
+                      if not process_group_exists():
+                          return
+                      time.sleep(0.01)
+                  if process_group_exists():
+                      note_error("process_group_cleanup_failed")
+
+              def store(label: str, chunk: bytes) -> None:
+          ''',
+              "post-exit process-group containment",
+          )
+          runner = replace_once(
+              runner,
+              '''    returncode = process.returncode if isinstance(process.returncode, int) else -1
+
+                  # After a capture fault, drain whatever bytes the terminated process left in
+          ''',
+              '''    returncode = process.returncode if isinstance(process.returncode, int) else -1
+              if process.poll() is not None:
+                  contain_surviving_process_group()
+
+                  # After a capture fault, drain whatever bytes the terminated process left in
+          ''',
+              "invoke post-exit containment",
+          )
+
+          tests = replace_once(
+              tests,
+              '''            "cat src/example.py\\r\\nrg needle src",
+                      ):
+          ''',
+              '''            "cat src/example.py\\r\\nrg needle src",
+                          "rg needle src |& id",
+                          "cat src/example.py &> output",
+                          "cat src/example.py >& output",
+                          "cat src/example.py <<< data",
+                          "cat src/example.py >| output",
+                      ):
+          ''',
+              "compound shell regressions",
+          )
+
+          provider_anchor = '''    def test_run_bounded_times_out_when_provider_does_not_read_stdin(self) -> None:
+          '''
+          provider_test = '''    def test_run_bounded_kills_process_group_left_after_normal_provider_exit(self) -> None:
+                  with tempfile.TemporaryDirectory() as temporary:
+                      root = Path(temporary)
+                      child_state = root / "child.pid"
+                      script = root / "provider.py"
+                      script.write_text(
+                          "import os, pathlib, time\\n"
+                          "child = os.fork()\\n"
+                          "if child == 0:\\n"
+                          f"    pathlib.Path({str(child_state)!r}).write_text(str(os.getpid()))\\n"
+                          "    for fd in (0, 1, 2):\\n"
+                          "        try:\\n"
+                          "            os.close(fd)\\n"
+                          "        except OSError:\\n"
+                          "            pass\\n"
+                          "    time.sleep(30)\\n"
+                          "    os._exit(0)\\n"
+                          f"state = pathlib.Path({str(child_state)!r})\\n"
+                          "while not state.exists():\\n"
+                          "    time.sleep(0.01)\\n"
+                          "os._exit(0)\\n",
+                          encoding="utf-8",
+                      )
+                      capture = runner.run_bounded(
+                          [sys.executable, str(script)], cwd=root, timeout_seconds=3, stdin_data=b""
+                      )
+                      self.assertIn("process_group_survived_provider_exit", str(capture["capture_error"]))
+                      child_pid = int(child_state.read_text())
+                      deadline = time.monotonic() + 2
+                      while True:
+                          try:
+                              os.kill(child_pid, 0)
+                          except ProcessLookupError:
+                              break
+                          if time.monotonic() >= deadline:
+                              self.fail("provider descendant survived process-group containment")
+                          time.sleep(0.02)
+
+          '''
+          tests = replace_once(tests, provider_anchor, provider_test + provider_anchor, "normal-exit group regression")
+
+          mcp_anchor = '''    def test_mcp_proxy_reaps_failed_upstream_without_detaching_from_provider_group(self) -> None:
+          '''
+          mcp_test = '''    def test_mcp_proxy_rejects_oversized_upstream_line_before_newline(self) -> None:
+                  with tempfile.TemporaryDirectory() as temporary:
+                      root = Path(temporary)
+                      state_path = root / "upstream.pid"
+                      upstream = root / "mcp.py"
+                      upstream.write_text(
+                          "import os, pathlib, sys, time\\n"
+                          f"pathlib.Path({str(state_path)!r}).write_text(str(os.getpid()))\\n"
+                          f"sys.stdout.buffer.write(b'x' * ({runner.base.MAX_MCP_MESSAGE_BYTES} + 1)); sys.stdout.buffer.flush()\\n"
+                          "time.sleep(30)\\n",
+                          encoding="utf-8",
+                      )
+                      started = time.monotonic()
+                      completed = subprocess.run(
+                          [sys.executable, str(MODULE_PATH), "--codex-mcp-proxy", json.dumps([sys.executable, str(upstream)])],
+                          input=b"", capture_output=True, check=False, timeout=8,
+                      )
+                      elapsed = time.monotonic() - started
+                      self.assertNotEqual(completed.returncode, 0)
+                      self.assertLess(elapsed, 5.0)
+                      upstream_pid = int(state_path.read_text())
+                      with self.assertRaises(ProcessLookupError):
+                          os.kill(upstream_pid, 0)
+
+          '''
+          tests = replace_once(tests, mcp_anchor, mcp_test + mcp_anchor, "bounded MCP upstream regression")
+
+          runner_path.write_text(runner, encoding="utf-8")
+          tests_path.write_text(tests, encoding="utf-8")
+          PY
+      - name: Focused validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/test_repobrief_agent_benchmark_codex_runner.py
+          git diff --check
+          python3 tools/check_no_secrets.py
+      - name: Publish code-only fix and remove bootstrap workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/pr1227-final-review-remediation.yml
+          git add tools/repobrief_agent_benchmark_codex_runner.py tests/test_repobrief_agent_benchmark_codex_runner.py .github/workflows/pr1227-final-review-remediation.yml
+          git diff --cached --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix(rab): close final independent review gaps'
+          git push origin HEAD:fix/rab-codex-stderr-contract-20260915
