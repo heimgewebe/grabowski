@@ -646,6 +646,13 @@ def _filtered_treatment_tools(value: Any) -> list[dict[str, Any]]:
     return filtered
 
 
+def _read_bounded_mcp_line(stream: Any, *, peer: str) -> bytes:
+    raw = stream.readline(base.MAX_MCP_MESSAGE_BYTES + 1)
+    if len(raw) > base.MAX_MCP_MESSAGE_BYTES:
+        raise RunnerError(f"MCP {peer} message too large")
+    return raw
+
+
 def run_mcp_proxy(upstream: Sequence[str]) -> int:
     if not upstream or any(not isinstance(item, str) or not item for item in upstream):
         raise RunnerError("invalid MCP upstream argv")
@@ -712,9 +719,10 @@ def run_mcp_proxy(upstream: Sequence[str]) -> int:
 
     def client_to_upstream() -> None:
         try:
-            for raw in sys.stdin.buffer:
-                if len(raw) > base.MAX_MCP_MESSAGE_BYTES:
-                    raise RunnerError("MCP client message too large")
+            while True:
+                raw = _read_bounded_mcp_line(sys.stdin.buffer, peer="client")
+                if not raw:
+                    break
                 message = json.loads(raw)
                 if not isinstance(message, dict):
                     raise RunnerError("MCP client message must be an object")
@@ -783,7 +791,10 @@ def run_mcp_proxy(upstream: Sequence[str]) -> int:
     client_thread.start()
     returncode: int | None = None
     try:
-        for raw in process.stdout:
+        while True:
+            raw = _read_bounded_mcp_line(process.stdout, peer="upstream")
+            if not raw:
+                break
             message = json.loads(raw)
             if not isinstance(message, dict):
                 raise RunnerError("MCP upstream message must be an object")
@@ -953,6 +964,29 @@ def run_bounded(
         except OSError as exc:
             note_error(f"process_kill_failed:{type(exc).__name__}")
 
+    def process_group_exists() -> bool:
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            return False
+        except OSError as exc:
+            note_error(f"process_group_probe_failed:{type(exc).__name__}")
+            return True
+        return True
+
+    def contain_surviving_process_group() -> None:
+        if not process_group_exists():
+            return
+        note_error("process_group_survived_provider_exit")
+        kill_process_tree()
+        cleanup_deadline = time.monotonic() + 1.0
+        while time.monotonic() < cleanup_deadline:
+            if not process_group_exists():
+                return
+            time.sleep(0.01)
+        if process_group_exists():
+            note_error("process_group_cleanup_failed")
+
     def store(label: str, chunk: bytes) -> None:
         if not chunk or overflow[label]:
             return
@@ -1077,6 +1111,8 @@ def run_bounded(
         except BaseException as followup:
             note_error(f"process_reap_failed:{type(followup).__name__}")
     returncode = process.returncode if isinstance(process.returncode, int) else -1
+    if process.poll() is not None:
+        contain_surviving_process_group()
 
     # After a capture fault, drain whatever bytes the terminated process left in
     # its pipes.  This is best-effort and bounded; failures themselves become
@@ -1310,7 +1346,7 @@ def _split_shell_words(text: str) -> list[str]:
         parts = list(lexer)
     except ValueError as exc:
         raise RunnerError("unparseable Codex command") from exc
-    if any(part in {";", "&", "&&", "|", "||", ">", ">>", "<", "<<"} for part in parts):
+    if any(re.fullmatch(r"[;&|<>]+", part) is not None for part in parts):
         raise RunnerError("chained, piped, or redirected command is not allowed")
     return parts
 

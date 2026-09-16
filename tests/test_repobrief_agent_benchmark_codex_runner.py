@@ -322,6 +322,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             "bash -lc 'cat src/example.py'",
             "rg needle src\ncat secret",
             "cat src/example.py\r\nrg needle src",
+            "rg needle src |& id",
+            "cat src/example.py &> output",
+            "cat src/example.py >& output",
+            "cat src/example.py <<< data",
+            "cat src/example.py >| output",
         ):
             with self.subTest(command=command):
                 with self.assertRaises(runner.RunnerError):
@@ -816,6 +821,44 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertTrue(launch_kwargs[0].get("start_new_session"))
             self.assertGreaterEqual(killpg.call_count, 1)
 
+    def test_run_bounded_kills_process_group_left_after_normal_provider_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            child_state = root / "child.pid"
+            script = root / "provider.py"
+            script.write_text(
+                "import os, pathlib, time\n"
+                "child = os.fork()\n"
+                "if child == 0:\n"
+                f"    pathlib.Path({str(child_state)!r}).write_text(str(os.getpid()))\n"
+                "    for fd in (0, 1, 2):\n"
+                "        try:\n"
+                "            os.close(fd)\n"
+                "        except OSError:\n"
+                "            pass\n"
+                "    time.sleep(30)\n"
+                "    os._exit(0)\n"
+                f"state = pathlib.Path({str(child_state)!r})\n"
+                "while not state.exists():\n"
+                "    time.sleep(0.01)\n"
+                "os._exit(0)\n",
+                encoding="utf-8",
+            )
+            capture = runner.run_bounded(
+                [sys.executable, str(script)], cwd=root, timeout_seconds=3, stdin_data=b""
+            )
+            self.assertIn("process_group_survived_provider_exit", str(capture["capture_error"]))
+            child_pid = int(child_state.read_text())
+            deadline = time.monotonic() + 2
+            while True:
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    break
+                if time.monotonic() >= deadline:
+                    self.fail("provider descendant survived process-group containment")
+                time.sleep(0.02)
+
     def test_run_bounded_times_out_when_provider_does_not_read_stdin(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -946,6 +989,30 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertFalse(responses[6]["result"]["isError"])
             frozen = json.loads(responses[6]["result"]["content"][0]["text"])
             self.assertEqual([item["uri"] for item in frozen["resources"]], ["repobrief://frozen/a"])
+
+    def test_mcp_proxy_rejects_oversized_upstream_line_before_newline(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_path = root / "upstream.pid"
+            upstream = root / "mcp.py"
+            upstream.write_text(
+                "import os, pathlib, sys, time\n"
+                f"pathlib.Path({str(state_path)!r}).write_text(str(os.getpid()))\n"
+                f"sys.stdout.buffer.write(b'x' * ({runner.base.MAX_MCP_MESSAGE_BYTES} + 1)); sys.stdout.buffer.flush()\n"
+                "time.sleep(30)\n",
+                encoding="utf-8",
+            )
+            started = time.monotonic()
+            completed = subprocess.run(
+                [sys.executable, str(MODULE_PATH), "--codex-mcp-proxy", json.dumps([sys.executable, str(upstream)])],
+                input=b"", capture_output=True, check=False, timeout=8,
+            )
+            elapsed = time.monotonic() - started
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertLess(elapsed, 5.0)
+            upstream_pid = int(state_path.read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(upstream_pid, 0)
 
     def test_mcp_proxy_reaps_failed_upstream_without_detaching_from_provider_group(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
