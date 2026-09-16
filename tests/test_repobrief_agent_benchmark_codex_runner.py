@@ -790,6 +790,29 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertIn(b"captured-before-selector-failure", capture["stdout"])
             self.assertIn("capture_stream_failed:OSError", str(capture["capture_error"]))
 
+    def test_run_bounded_uses_dedicated_process_group_and_kills_it_on_timeout(self) -> None:
+        real_popen = runner.subprocess.Popen
+        launch_kwargs = []
+
+        def observing_popen(*args, **kwargs):
+            launch_kwargs.append(dict(kwargs))
+            return real_popen(*args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "provider.py"
+            script.write_text("import time\ntime.sleep(2)\n", encoding="utf-8")
+            with (
+                patch.object(runner.subprocess, "Popen", side_effect=observing_popen),
+                patch.object(runner.os, "killpg", wraps=runner.os.killpg) as killpg,
+            ):
+                capture = runner.run_bounded(
+                    [sys.executable, str(script)], cwd=root, timeout_seconds=1, stdin_data=b""
+                )
+            self.assertEqual(capture["capture_error"], "timeout")
+            self.assertTrue(launch_kwargs[0].get("start_new_session"))
+            self.assertGreaterEqual(killpg.call_count, 1)
+
     def test_run_bounded_returns_capture_error_instead_of_discarding_partial_streams(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -810,6 +833,30 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertEqual(capture["capture_error"], "timeout")
             self.assertIn(b"before-timeout", capture["stdout"])
             self.assertIn(b"diagnostic", capture["stderr"])
+
+    def test_treatment_tools_require_every_upstream_capability_exactly_once(self) -> None:
+        valid = {
+            "tools": [
+                {"name": "ask_context"},
+                {"name": "grounding_verify"},
+                {"name": "live_freshness"},
+                {"name": "find_symbol"},
+            ]
+        }
+        self.assertEqual(
+            {item["name"] for item in runner._filtered_treatment_tools(valid)},
+            runner.ALLOWED_MCP,
+        )
+        missing = {"tools": [
+            {"name": "ask_context"},
+            {"name": "grounding_verify"},
+            {"name": "find_symbol"},
+        ]}
+        with self.assertRaisesRegex(runner.RunnerError, "exactly once"):
+            runner._filtered_treatment_tools(missing)
+        duplicate = {"tools": valid["tools"] + [{"name": "ask_context"}]}
+        with self.assertRaisesRegex(runner.RunnerError, "exactly once"):
+            runner._filtered_treatment_tools(duplicate)
 
     def test_mcp_proxy_exposes_exact_benchmark_surface(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

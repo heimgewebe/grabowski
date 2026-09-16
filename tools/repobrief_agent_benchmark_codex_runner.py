@@ -22,6 +22,7 @@ import posixpath
 from pathlib import Path
 import re
 import selectors
+import signal
 import shlex
 import shutil
 import stat
@@ -609,6 +610,42 @@ def _proxy_error(identifier: Any, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": identifier, "error": {"code": -32601, "message": message}}
 
 
+def _filtered_treatment_tools(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, dict) or not isinstance(value.get("tools"), list):
+        raise RunnerError("RepoGround tools/list result is missing a tools array")
+    counts = {name: 0 for name in UPSTREAM_MCP}
+    filtered: list[dict[str, Any]] = []
+    for item in value["tools"]:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if name in counts:
+            counts[str(name)] += 1
+            filtered.append(item)
+    invalid = [f"{name}={counts[name]}" for name in sorted(counts) if counts[name] != 1]
+    if invalid:
+        raise RunnerError(
+            "RepoGround tools/list must expose every required treatment tool exactly once: "
+            + ", ".join(invalid)
+        )
+    filtered.append(
+        {
+            "name": "repobrief_resource_read",
+            "description": "List frozen RepoGround resources or read one exact frozen resource URI.",
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["action"],
+                "properties": {
+                    "action": {"enum": ["list", "read"]},
+                    "uri": {"type": "string"},
+                },
+            },
+        }
+    )
+    return filtered
+
+
 def run_mcp_proxy(upstream: Sequence[str]) -> int:
     if not upstream or any(not isinstance(item, str) or not item for item in upstream):
         raise RunnerError("invalid MCP upstream argv")
@@ -746,9 +783,7 @@ def run_mcp_proxy(upstream: Sequence[str]) -> int:
                 filtered["capabilities"] = {"tools": caps.get("tools", {}) if isinstance(caps.get("tools", {}), dict) else {}}
                 message = {"jsonrpc":"2.0","id":identifier,"result":filtered}
             elif is_tools_list and "result" in message:
-                result = message.get("result") if isinstance(message.get("result"), dict) else {}
-                tools = [item for item in result.get("tools", []) if isinstance(item, dict) and item.get("name") in UPSTREAM_MCP]
-                tools.append({"name":"repobrief_resource_read","description":"List frozen RepoGround resources or read one exact frozen resource URI.","inputSchema":{"type":"object","additionalProperties":False,"required":["action"],"properties":{"action":{"enum":["list","read"]},"uri":{"type":"string"}}}})
+                tools = _filtered_treatment_tools(message.get("result"))
                 message = {"jsonrpc":"2.0","id":identifier,"result":{"tools":tools}}
             elif resource_call is not None:
                 action, _uri = resource_call
@@ -849,6 +884,7 @@ def run_bounded(
             stderr=subprocess.PIPE,
             env=dict(environment) if environment is not None else provider_env(),
             shell=False,
+            start_new_session=True,
         )
     except OSError as exc:
         raise RunnerError("Codex process could not be started") from exc
@@ -866,6 +902,24 @@ def run_bounded(
         elif marker not in capture_error.split(";"):
             capture_error += ";" + marker
 
+    def kill_process_tree() -> None:
+        group_killed = False
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+            group_killed = True
+        except ProcessLookupError:
+            return
+        except OSError as exc:
+            note_error(f"process_group_kill_failed:{type(exc).__name__}")
+        if group_killed or process.poll() is not None:
+            return
+        try:
+            process.kill()
+        except ProcessLookupError:
+            return
+        except OSError as exc:
+            note_error(f"process_kill_failed:{type(exc).__name__}")
+
     def store(label: str, chunk: bytes) -> None:
         if not chunk or overflow[label]:
             return
@@ -875,25 +929,12 @@ def run_bounded(
         if len(buffers[label]) > limit:
             overflow[label] = True
             note_error(f"{label}_limit_exceeded")
-            try:
-                process.kill()
-            except (OSError, ProcessLookupError) as exc:
-                note_error(f"process_kill_failed:{type(exc).__name__}")
-
-    def kill_process() -> None:
-        if process.poll() is not None:
-            return
-        try:
-            process.kill()
-        except ProcessLookupError:
-            return
-        except OSError as exc:
-            note_error(f"process_kill_failed:{type(exc).__name__}")
+            kill_process_tree()
 
     streams = ((process.stdout, "stdout"), (process.stderr, "stderr"))
     if process.stdin is None or process.stdout is None or process.stderr is None:
         note_error("capture_pipe_unavailable")
-        kill_process()
+        kill_process_tree()
     else:
         try:
             selector = selectors.DefaultSelector()
@@ -903,7 +944,7 @@ def run_bounded(
                 selector.register(stream, selectors.EVENT_READ, label)
         except BaseException as exc:
             note_error(f"capture_setup_failed:{type(exc).__name__}")
-            kill_process()
+            kill_process_tree()
 
     if capture_error is None:
         assert process.stdin is not None
@@ -916,7 +957,7 @@ def run_bounded(
                 process.stdin.close()
             except OSError:
                 pass
-            kill_process()
+            kill_process_tree()
 
     deadline = time.monotonic() + timeout_seconds
     if selector is not None and capture_error is None:
@@ -925,7 +966,7 @@ def run_bounded(
                 remaining = deadline - time.monotonic()
                 if remaining <= 0 and capture_error is None:
                     note_error("timeout")
-                    kill_process()
+                    kill_process_tree()
                 wait_for = 0 if process.poll() is not None else max(min(remaining, 0.25), 0)
                 events = selector.select(wait_for)
                 if not events and process.poll() is not None:
@@ -947,7 +988,7 @@ def run_bounded(
                     store(str(key.data), chunk)
         except BaseException as exc:
             note_error(f"capture_stream_failed:{type(exc).__name__}")
-            kill_process()
+            kill_process_tree()
 
     if selector is not None:
         try:
@@ -956,12 +997,12 @@ def run_bounded(
             note_error(f"selector_cleanup_failed:{type(exc).__name__}")
 
     if capture_error is not None:
-        kill_process()
+        kill_process_tree()
     try:
         returncode = process.wait(timeout=5)
     except BaseException as exc:
         note_error(f"process_wait_failed:{type(exc).__name__}")
-        kill_process()
+        kill_process_tree()
         try:
             process.wait(timeout=5)
         except BaseException as followup:
