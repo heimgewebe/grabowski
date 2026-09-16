@@ -308,7 +308,7 @@ class GrokReviewRoleTests(unittest.TestCase):
                 mock.patch.object(role, "committed_diff") as committed_diff,
                 mock.patch.object(
                     role, "_review_sandbox_argv",
-                    return_value=(["sandbox"], None, b"prompt", None),
+                    return_value=(["sandbox"], None, b"prompt"),
                 ) as review_sandbox,
                 mock.patch.object(role, "runtime_sandbox_argv", return_value=["runtime"]),
                 mock.patch.object(role, "run_bounded_capture", return_value=completed),
@@ -386,21 +386,16 @@ class GrokReviewRoleTests(unittest.TestCase):
             mock.patch.object(role, "prepare_external_agent_command", return_value=prepared),
             mock.patch.object(role, "sandbox_argv", return_value=["sandbox"]) as sandbox_argv,
         ):
-            argv, contract, prompt_bytes, prompt_path = role._review_sandbox_argv(
+            argv, contract, prompt_bytes = role._review_sandbox_argv(
                 repo, declared, expected_head="a" * 40, expected_base_head="b" * 40, review_diff=b"diff"
             )
         self.assertEqual(argv, ["sandbox"])
         self.assertEqual(contract, role.GROK_REVIEW_STREAM_CONTRACT)
         self.assertIn(b"diff", prompt_bytes)
-        self.assertIsNotNone(prompt_path)
-        assert prompt_path is not None
-        try:
-            self.assertEqual(prompt_path.read_bytes(), prompt_bytes)
-            self.assertEqual(prompt_path.stat().st_mode & 0o777, 0o600)
-            binding = sandbox_argv.call_args.kwargs["additional_read_only"]
-            self.assertEqual(binding, ((prompt_path, role.GROK_REVIEW_PROMPT_TARGET),))
-        finally:
-            prompt_path.unlink(missing_ok=True)
+        self.assertEqual(
+            sandbox_argv.call_args.kwargs["additional_read_only_data_fds"],
+            ((0, role.GROK_REVIEW_PROMPT_TARGET),),
+        )
         actual = sandbox_argv.call_args.args[1]
         self.assertEqual(actual[actual.index("--tools") + 1], "todo_write")
         self.assertEqual(
@@ -505,7 +500,7 @@ class GrokReviewRoleTests(unittest.TestCase):
         with (
             mock.patch.object(role, "current_binding", side_effect=[(head, diff, False), (head, diff, False)]),
             mock.patch.object(role, "committed_diff", return_value=b"diff"),
-            mock.patch.object(role, "_review_sandbox_argv", return_value=(["sandbox"], role.GROK_REVIEW_STREAM_CONTRACT, b"prompt", None)),
+            mock.patch.object(role, "_review_sandbox_argv", return_value=(["sandbox"], role.GROK_REVIEW_STREAM_CONTRACT, b"prompt")),
             mock.patch.object(role, "runtime_sandbox_argv", return_value=["runtime"]),
             mock.patch.object(role, "run_bounded_capture", return_value=completed),
             mock.patch.object(role, "classify_result", return_value="invalid_review_output"),
@@ -564,7 +559,7 @@ class GrokReviewRoleTests(unittest.TestCase):
         with (
             mock.patch.object(role, "current_binding", side_effect=[(head, diff, False), (head, diff, False)]),
             mock.patch.object(role, "committed_diff", return_value=b"diff"),
-            mock.patch.object(role, "_review_sandbox_argv", return_value=(["sandbox"], role.GROK_REVIEW_STREAM_CONTRACT, b"prompt", None)),
+            mock.patch.object(role, "_review_sandbox_argv", return_value=(["sandbox"], role.GROK_REVIEW_STREAM_CONTRACT, b"prompt")),
             mock.patch.object(role, "runtime_sandbox_argv", return_value=["runtime"]),
             mock.patch.object(role, "run_bounded_capture", return_value=completed),
             mock.patch.object(
