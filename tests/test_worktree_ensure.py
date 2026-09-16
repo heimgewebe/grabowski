@@ -1400,5 +1400,58 @@ class WorktreeEnsureTests(unittest.TestCase):
         self.assertEqual(checkouts._lifecycle_bindings([]), {})
         self.assertEqual(len(self.friction_events), 1)
 
+    def test_work_lane_checkout_gets_minimal_adler_pointer_without_inbox_write(self) -> None:
+        lane_id = "a" * 32
+        owner = f"lane:{lane_id}"
+        parameters = self._parameters(
+            key="adler-sidecar-pointer",
+            branch="feat/adler-sidecar-pointer",
+            target=self.worktree_root / "adler-sidecar-pointer",
+            owner=owner,
+        )
+        parameters["source_kind"] = "work_lane"
+        parameters["source_id"] = lane_id
+        state_root = self.root / "adler-state"
+        def lane_lease(resource_key: str) -> dict[str, object]:
+            return {
+                "resource_key": resource_key,
+                "owner_id": owner,
+                "expires_at_unix": int(time.time()) + 3600,
+            }
+        with patch.dict(os.environ, {"GROSSER_ADLER_STATE_ROOT": str(state_root)}):
+            created = self._ensure(parameters, inspect_lease=lane_lease)
+        self.assertEqual(created["result_state"], "CREATED")
+        sidecar = Path(str(parameters["target_path"])) / ".adler"
+        expected = state_root / "worktree-inboxes" / f"{lane_id}.json"
+        self.assertEqual(created["adler_sidecar"]["state"], "configured")
+        self.assertEqual(os.readlink(sidecar / "inbox.json"), str(expected))
+        self.assertEqual((sidecar / ".gitignore").read_bytes(), b"*\n")
+        self.assertFalse(expected.exists())
+        self.assertEqual(
+            self._git(Path(str(parameters["target_path"])), "status", "--porcelain=v1").stdout,
+            "",
+        )
+
+    def test_adler_pointer_problem_is_nonblocking_and_does_not_replace_foreign_metadata(self) -> None:
+        lane_id = "b" * 32
+        worktree = self.worktree_root / "existing"
+        worktree.mkdir()
+        sidecar = worktree / ".adler"
+        sidecar.mkdir(mode=0o755)
+        foreign = sidecar / "foreign"
+        foreign.write_text("keep", encoding="utf-8")
+        inputs = {
+            "lease_owner_id": f"lane:{lane_id}",
+            "source_kind": "work_lane",
+            "source_id": lane_id,
+            "target_path": str(worktree),
+        }
+        result = worktree_ensure._configure_adler_sidecar_pointer(inputs)
+        self.assertEqual(result["state"], "unavailable")
+        self.assertFalse(result["blocking"])
+        self.assertEqual(foreign.read_text(encoding="utf-8"), "keep")
+        self.assertFalse((sidecar / "inbox.json").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -750,6 +750,7 @@ def _public_output(
         "lifecycle": lifecycle,
         "lifecycle_reservation": record.get("lifecycle_reservation"),
         "work_admission": record.get("work_admission"),
+        "adler_sidecar": record.get("adler_sidecar"),
         **(
             {"checkout_capacity": record["checkout_capacity"]}
             if isinstance(record.get("checkout_capacity"), dict)
@@ -943,6 +944,117 @@ def _bind_checkout_lifecycle(
     }
 
 
+LANE_OWNER_RE = re.compile(r"^lane:([0-9a-f]{32})$")
+
+
+def _grosser_adler_inbox_root() -> Path:
+    configured = os.environ.get("GROSSER_ADLER_STATE_ROOT")
+    if configured:
+        state_root = Path(configured).expanduser()
+    else:
+        state_home = Path(
+            os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))
+        ).expanduser()
+        state_root = state_home / "grosser-adler"
+    return state_root / "worktree-inboxes"
+
+
+def _adler_lane_id(inputs: dict[str, Any]) -> str | None:
+    owner = str(inputs.get("lease_owner_id") or "")
+    match = LANE_OWNER_RE.fullmatch(owner)
+    if match is None:
+        return None
+    lane_id = match.group(1)
+    if inputs.get("source_kind") != "work_lane" or inputs.get("source_id") != lane_id:
+        return None
+    return lane_id
+
+
+def _validate_adler_sidecar(sidecar: Path, expected_target: Path) -> None:
+    info = sidecar.lstat()
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != os.geteuid():
+        raise WorktreeEnsureAction(".adler must be an owner-controlled directory")
+    if stat.S_IMODE(info.st_mode) & 0o077:
+        raise WorktreeEnsureAction(".adler permissions are broader than 0700")
+    unexpected = {entry.name for entry in sidecar.iterdir()} - {".gitignore", "inbox.json"}
+    if unexpected:
+        raise WorktreeEnsureAction(".adler contains entries outside the minimal sidecar contract")
+    gitignore = sidecar / ".gitignore"
+    gi = gitignore.lstat()
+    if not stat.S_ISREG(gi.st_mode) or stat.S_ISLNK(gi.st_mode) or gi.st_uid != os.geteuid() or gi.st_nlink != 1:
+        raise WorktreeEnsureAction(".adler/.gitignore is not an owner-controlled regular file")
+    if stat.S_IMODE(gi.st_mode) & 0o077 or gitignore.read_bytes() != b"*\n":
+        raise WorktreeEnsureAction(".adler/.gitignore does not match the minimal ignore contract")
+    pointer = sidecar / "inbox.json"
+    pi = pointer.lstat()
+    if not stat.S_ISLNK(pi.st_mode) or pi.st_uid != os.geteuid() or pi.st_nlink != 1:
+        raise WorktreeEnsureAction(".adler/inbox.json is not the expected owner-controlled symlink")
+    if os.readlink(pointer) != str(expected_target):
+        raise WorktreeEnsureAction(".adler/inbox.json targets a different Adler inbox")
+
+
+def _configure_adler_sidecar_pointer(inputs: dict[str, Any]) -> dict[str, Any]:
+    lane_id = _adler_lane_id(inputs)
+    if lane_id is None:
+        return {"state": "not_applicable", "reason": "checkout_is_not_exact_work_lane_owned"}
+    worktree = Path(str(inputs["target_path"]))
+    sidecar = worktree / ".adler"
+    expected_target = _grosser_adler_inbox_root() / f"{lane_id}.json"
+    created_dir = False
+    created_gitignore = False
+    created_pointer = False
+    try:
+        try:
+            sidecar.mkdir(mode=0o700)
+            created_dir = True
+        except FileExistsError:
+            pass
+        if not os.path.lexists(sidecar / ".gitignore"):
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(sidecar / ".gitignore", flags, 0o600)
+            try:
+                os.write(fd, b"*\n")
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            created_gitignore = True
+        pointer = sidecar / "inbox.json"
+        if not os.path.lexists(pointer):
+            pointer.symlink_to(expected_target)
+            created_pointer = True
+        _validate_adler_sidecar(sidecar, expected_target)
+        directory_fd = os.open(sidecar, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return {
+            "state": "configured",
+            "lane_id": lane_id,
+            "path": str(pointer),
+            "target": str(expected_target),
+            "ownership": "grabowski_metadata_only",
+            "absence_semantics": "unknown_not_no_findings",
+        }
+    except Exception as exc:
+        try:
+            if created_pointer:
+                (sidecar / "inbox.json").unlink(missing_ok=True)
+            if created_gitignore:
+                (sidecar / ".gitignore").unlink(missing_ok=True)
+            if created_dir:
+                sidecar.rmdir()
+        except OSError:
+            pass
+        return {
+            "state": "unavailable",
+            "lane_id": lane_id,
+            "error": _bounded_text(exc, 1024),
+            "blocking": False,
+            "absence_semantics": "unknown_not_no_findings",
+        }
+
+
 def _after_worktree_mutation() -> None:
     """Fault-injection seam used by tests; production behavior is intentionally empty."""
 
@@ -1057,6 +1169,7 @@ def ensure_worktree(
                 )
                 record["lease"] = lease
                 record["recovery_without_live_lease"] = not lease["valid"]
+                record["adler_sidecar"] = _configure_adler_sidecar_pointer(inputs)
                 record["lifecycle"] = _bind_checkout_lifecycle(inputs, observation, lease)
                 written = _write_receipt(receipt_path, record)
                 return _public_output(written, receipt_path, replayed=True, recovered=True)
@@ -1126,6 +1239,7 @@ def ensure_worktree(
                 error="",
             )
             record["lease"] = lease
+            record["adler_sidecar"] = _configure_adler_sidecar_pointer(inputs)
             record["lifecycle"] = _bind_checkout_lifecycle(inputs, observation, lease)
             written = _write_receipt(receipt_path, record)
             return _public_output(written, receipt_path, replayed=False, recovered=False)
@@ -1319,6 +1433,7 @@ def ensure_worktree(
             )
             record["lease"] = lease
             record["work_admission"] = admission
+            record["adler_sidecar"] = _configure_adler_sidecar_pointer(inputs)
             record["lifecycle"] = _bind_checkout_lifecycle(inputs, post_state, lease)
             record["mutation"] = {
                 "returncode": _returncode(mutation),
