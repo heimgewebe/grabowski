@@ -19,168 +19,51 @@ jobs:
           ref: fix/rab-codex-stderr-contract-20260915
           fetch-depth: 0
 
-      - name: Verify exact preimage
+      - name: Verify exact bootstrap preimage
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "b8d21e6970739a289dcd5e649944d3241a91ae20"
+          test "$(git rev-parse HEAD^)" = "452ae94ecd62212a9b0a0fccd707ee29470a794d"
+          test "$(git rev-parse HEAD^^)" = "b8d21e6970739a289dcd5e649944d3241a91ae20"
           test "$(git rev-parse --abbrev-ref HEAD)" = "fix/rab-codex-stderr-contract-20260915"
 
-      - name: Apply reviewed remediation
+      - name: Reuse reviewed patch with corrected test indentation
         shell: bash
         run: |
           set -euo pipefail
+          git show HEAD^:.github/workflows/pr1227-review-remediation.yml > /tmp/pr1227-bootstrap-v1.yml
           python3 <<'PY'
           from pathlib import Path
+          import textwrap
 
-          def replace_once(text: str, old: str, new: str, label: str) -> str:
-              count = text.count(old)
-              if count != 1:
-                  raise SystemExit(f"{label}: expected exactly one preimage, found {count}")
-              return text.replace(old, new, 1)
-
-          tests_path = Path("tests/test_repobrief_agent_benchmark_codex_runner.py")
-          tests = tests_path.read_text(encoding="utf-8")
-          tests = replace_once(
-              tests,
-              '            "mcp_command": ["python", "repobrief-mcp-stdio.py", "--bundle-root", "/bundles"],',
-              '            "mcp_command": ["/usr/bin/python3", "repobrief-mcp-stdio.py", "--bundle-root", "/bundles"],',
-              "absolute treatment interpreter",
-          )
-          tests = replace_once(
-              tests,
-              '        self.assertEqual(runner.command_kind("bash -lc \'cat src/example.py\'"), "read_file")\n',
-              '',
-              "remove login-shell acceptance",
-          )
-          tests = replace_once(
-              tests,
-              '            "sh -lc \'cat src/example.py\'",\n',
-              '            "sh -lc \'cat src/example.py\'",\n            "bash -lc \'cat src/example.py\'",\n',
-              "reject login shell",
-          )
-          marker = '    def test_run_bounded_returns_capture_error_instead_of_discarding_partial_streams(self) -> None:\n'
-          insertion = r'''    def test_run_bounded_times_out_when_provider_does_not_read_stdin(self) -> None:
-              with tempfile.TemporaryDirectory() as temporary:
-                  root = Path(temporary)
-                  script = root / "provider.py"
-                  script.write_text(
-                      "import sys, time\n"
-                      "sys.stdout.write('partial-output\\n'); sys.stdout.flush()\n"
-                      "sys.stderr.write('partial-diagnostic\\n'); sys.stderr.flush()\n"
-                      "time.sleep(5)\n",
-                      encoding="utf-8",
-                  )
-                  capture = runner.run_bounded(
-                      [sys.executable, str(script)],
-                      cwd=root,
-                      timeout_seconds=1,
-                      stdin_data=b"x" * (8 * 1024 * 1024),
-                  )
-                  self.assertEqual(capture["capture_error"], "timeout")
-                  self.assertIn(b"partial-output", capture["stdout"])
-                  self.assertIn(b"partial-diagnostic", capture["stderr"])
-
-          '''
-          tests = replace_once(tests, marker, insertion + marker, "blocked stdin regression")
-
-          marker = '    def test_resource_freeze_rejects_pagination_and_duplicates(self) -> None:\n'
-          insertion = r'''    def test_mcp_proxy_reaps_failed_upstream_without_detaching_from_provider_group(self) -> None:
-              with tempfile.TemporaryDirectory() as temporary:
-                  root = Path(temporary)
-                  state_path = root / "upstream.state"
-                  upstream = root / "mcp.py"
-                  upstream.write_text(
-                      "import os, pathlib, sys, time\n"
-                      f"pathlib.Path({str(state_path)!r}).write_text(f'{{os.getpid()}},{{os.getpgrp()}},{{os.getpgid(os.getppid())}}')\n"
-                      "sys.stderr.write('upstream-diagnostic\\n'); sys.stderr.flush()\n"
-                      "sys.stdout.write('not-json\\n'); sys.stdout.flush()\n"
-                      "time.sleep(30)\n",
-                      encoding="utf-8",
-                  )
-                  payload = json.dumps(
-                      {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}
-                  ).encode() + b"\n"
-                  completed = subprocess.run(
-                      [sys.executable, str(MODULE_PATH), "--codex-mcp-proxy", json.dumps([sys.executable, str(upstream)])],
-                      input=payload, capture_output=True, check=False, timeout=5,
-                  )
-                  self.assertNotEqual(completed.returncode, 0)
-                  self.assertIn(b"upstream-diagnostic", completed.stderr)
-                  pid, pgid, parent_pgid = map(int, state_path.read_text().split(","))
-                  self.assertEqual(pgid, parent_pgid)
-                  with self.assertRaises(ProcessLookupError):
-                      os.kill(pid, 0)
-
-          '''
-          tests = replace_once(tests, marker, insertion + marker, "MCP cleanup containment regression")
-          tests_path.write_text(tests, encoding="utf-8")
-
-          runner_path = Path("tools/repobrief_agent_benchmark_codex_runner.py")
-          runner = runner_path.read_text(encoding="utf-8")
-          runner = replace_once(
-              runner,
-              '''    if process.stdin is None or process.stdout is None or process.stderr is None:\n        process.kill()\n        raise RunnerError("MCP upstream pipes unavailable")\n''',
-              '''    if process.stdin is None or process.stdout is None or process.stderr is None:\n        process.kill()\n        try:\n            process.wait(timeout=5)\n        except subprocess.TimeoutExpired as exc:\n            raise RunnerError("MCP upstream could not be reaped") from exc\n        raise RunnerError("MCP upstream pipes unavailable")\n''',
-              "MCP pipe cleanup",
-          )
-          runner = replace_once(
-              runner,
-              '''    upstream_stderr = bytearray()\n    upstream_stderr_overflow = False\n\n    def send(message: Mapping[str, Any]) -> None:\n''',
-              '''    upstream_stderr = bytearray()\n    upstream_stderr_overflow = False\n\n    # Keep the upstream in the inherited provider process group. The outer\n    # runner can therefore still kill Codex, this proxy, and RepoGround as one\n    # containment unit. Proxy-local failures additionally own/reap this child.\n    def terminate_upstream() -> None:\n        if process.poll() is not None:\n            return\n        try:\n            process.kill()\n        except ProcessLookupError:\n            return\n        except OSError as exc:\n            errors.append(exc)\n\n    def send(message: Mapping[str, Any]) -> None:\n''',
-              "MCP direct-child ownership helper",
-          )
-          runner = replace_once(
-              runner,
-              '''        except BaseException as exc:\n            errors.append(exc)\n\n    stderr_thread = threading.Thread(target=drain_stderr, daemon=True)\n''',
-              '''        except BaseException as exc:\n            errors.append(exc)\n            terminate_upstream()\n\n    stderr_thread = threading.Thread(target=drain_stderr, daemon=True)\n''',
-              "stderr failure containment",
-          )
-          runner = replace_once(
-              runner,
-              '''        except BaseException as exc:\n            errors.append(exc)\n        finally:\n            try:\n                process.stdin.close()\n''',
-              '''        except BaseException as exc:\n            errors.append(exc)\n            terminate_upstream()\n        finally:\n            try:\n                process.stdin.close()\n''',
-              "client failure containment",
-          )
-          old = '''    client_thread = threading.Thread(target=client_to_upstream, daemon=True)\n    client_thread.start()\n    try:\n        for raw in process.stdout:\n            message = json.loads(raw)\n            if not isinstance(message, dict):\n                raise RunnerError("MCP upstream message must be an object")\n            identifier = message.get("id")\n            if identifier is None:\n                continue\n            with state_lock:\n                is_initialize = identifier in initialize_ids\n                is_tools_list = identifier in tools_list_ids\n                resource_call = resource_calls.pop(identifier, None)\n                initialize_ids.discard(identifier)\n                tools_list_ids.discard(identifier)\n            if is_initialize and "result" in message:\n                result = message.get("result") if isinstance(message.get("result"), dict) else {}\n                caps = result.get("capabilities") if isinstance(result.get("capabilities"), dict) else {}\n                filtered = {key: result[key] for key in ("protocolVersion", "serverInfo") if key in result}\n                filtered["capabilities"] = {"tools": caps.get("tools", {}) if isinstance(caps.get("tools", {}), dict) else {}}\n                message = {"jsonrpc":"2.0","id":identifier,"result":filtered}\n            elif is_tools_list and "result" in message:\n                tools = _filtered_treatment_tools(message.get("result"))\n                message = {"jsonrpc":"2.0","id":identifier,"result":{"tools":tools}}\n            elif resource_call is not None:\n                action, _uri = resource_call\n                if "error" in message:\n                    text = canonical(message["error"]); is_error = True\n                elif action == "list":\n                    try:\n                        frozen, uris = _freeze_resource_result(message.get("result"))\n                    except RunnerError as exc:\n                        text = str(exc); is_error = True\n                    else:\n                        with state_lock:\n                            frozen_resources = frozen\n                            frozen_uris = uris\n                        text = canonical(frozen); is_error = False\n                else:\n                    text = canonical(message.get("result")); is_error = False\n                message = {"jsonrpc":"2.0","id":identifier,"result":{"content":[{"type":"text","text":text}],"isError":is_error}}\n            _proxy_write(message, output_lock)\n        returncode = process.wait(timeout=5)\n    finally:\n        process.stdout.close()\n        stderr_thread.join(timeout=5)\n    if errors:\n        raise RunnerError("benchmark MCP proxy stream failed") from errors[0]\n    if upstream_stderr:\n        sys.stderr.buffer.write(bytes(upstream_stderr)); sys.stderr.buffer.flush()\n    if upstream_stderr_overflow or returncode != 0 or upstream_stderr:\n        raise RunnerError("benchmark MCP upstream failed or emitted diagnostics")\n    return returncode\n'''
-          new = '''    client_thread = threading.Thread(target=client_to_upstream, daemon=True)\n    client_thread.start()\n    returncode: int | None = None\n    try:\n        for raw in process.stdout:\n            message = json.loads(raw)\n            if not isinstance(message, dict):\n                raise RunnerError("MCP upstream message must be an object")\n            identifier = message.get("id")\n            if identifier is None:\n                continue\n            with state_lock:\n                is_initialize = identifier in initialize_ids\n                is_tools_list = identifier in tools_list_ids\n                resource_call = resource_calls.pop(identifier, None)\n                initialize_ids.discard(identifier)\n                tools_list_ids.discard(identifier)\n            if is_initialize and "result" in message:\n                result = message.get("result") if isinstance(message.get("result"), dict) else {}\n                caps = result.get("capabilities") if isinstance(result.get("capabilities"), dict) else {}\n                filtered = {key: result[key] for key in ("protocolVersion", "serverInfo") if key in result}\n                filtered["capabilities"] = {"tools": caps.get("tools", {}) if isinstance(caps.get("tools", {}), dict) else {}}\n                message = {"jsonrpc":"2.0","id":identifier,"result":filtered}\n            elif is_tools_list and "result" in message:\n                tools = _filtered_treatment_tools(message.get("result"))\n                message = {"jsonrpc":"2.0","id":identifier,"result":{"tools":tools}}\n            elif resource_call is not None:\n                action, _uri = resource_call\n                if "error" in message:\n                    text = canonical(message["error"]); is_error = True\n                elif action == "list":\n                    try:\n                        frozen, uris = _freeze_resource_result(message.get("result"))\n                    except RunnerError as exc:\n                        text = str(exc); is_error = True\n                    else:\n                        with state_lock:\n                            frozen_resources = frozen\n                            frozen_uris = uris\n                        text = canonical(frozen); is_error = False\n                else:\n                    text = canonical(message.get("result")); is_error = False\n                message = {"jsonrpc":"2.0","id":identifier,"result":{"content":[{"type":"text","text":text}],"isError":is_error}}\n            _proxy_write(message, output_lock)\n        returncode = process.wait(timeout=5)\n    finally:\n        if process.poll() is None:\n            terminate_upstream()\n        try:\n            returncode = process.wait(timeout=5)\n        except subprocess.TimeoutExpired as exc:\n            errors.append(exc)\n            terminate_upstream()\n            try:\n                returncode = process.wait(timeout=5)\n            except subprocess.TimeoutExpired as followup:\n                errors.append(followup)\n                returncode = process.returncode if isinstance(process.returncode, int) else -1\n        process.stdout.close()\n        stderr_thread.join(timeout=5)\n        if upstream_stderr:\n            sys.stderr.buffer.write(bytes(upstream_stderr)); sys.stderr.buffer.flush()\n    if errors:\n        raise RunnerError("benchmark MCP proxy stream failed") from errors[0]\n    if returncode is None or upstream_stderr_overflow or returncode != 0 or upstream_stderr:\n        raise RunnerError("benchmark MCP upstream failed or emitted diagnostics")\n    return returncode\n'''
-          runner = replace_once(runner, old, new, "MCP fail-closed cleanup")
-
-          runner = replace_once(
-              runner,
-              '''    buffers = {"stdout": bytearray(), "stderr": bytearray()}\n''',
-              '''    deadline = time.monotonic() + timeout_seconds\n    buffers = {"stdout": bytearray(), "stderr": bytearray()}\n''',
-              "provider wall-clock start",
-          )
-          old = '''    if capture_error is None:\n        assert process.stdin is not None\n        try:\n            process.stdin.write(stdin_data)\n            process.stdin.close()\n        except OSError as exc:\n            note_error(f"stdin_write_failed:{type(exc).__name__}")\n            try:\n                process.stdin.close()\n            except OSError:\n                pass\n            kill_process_tree()\n\n    deadline = time.monotonic() + timeout_seconds\n'''
-          new = '''    stdin_pending = memoryview(stdin_data)\n    if selector is not None and capture_error is None:\n        assert process.stdin is not None\n        try:\n            os.set_blocking(process.stdin.fileno(), False)\n            if stdin_pending:\n                selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")\n            else:\n                process.stdin.close()\n        except BaseException as exc:\n            note_error(f"stdin_setup_failed:{type(exc).__name__}")\n            kill_process_tree()\n\n'''
-          runner = replace_once(runner, old, new, "bounded provider stdin setup")
-          runner = replace_once(
-              runner,
-              '''                if remaining <= 0 and capture_error is None:\n                    note_error("timeout")\n                    kill_process_tree()\n                wait_for = 0 if process.poll() is not None else max(min(remaining, 0.25), 0)\n''',
-              '''                if remaining <= 0 and capture_error is None:\n                    note_error("timeout")\n                    kill_process_tree()\n                    break\n                wait_for = 0 if process.poll() is not None else max(min(remaining, 0.25), 0)\n''',
-              "provider timeout break",
-          )
-          runner = replace_once(
-              runner,
-              '''                    for key in list(selector.get_map().values()):\n                        try:\n                            chunk = os.read(key.fileobj.fileno(), 65536)\n''',
-              '''                    for key in list(selector.get_map().values()):\n                        if key.data == "stdin":\n                            selector.unregister(key.fileobj)\n                            key.fileobj.close()\n                            continue\n                        try:\n                            chunk = os.read(key.fileobj.fileno(), 65536)\n''',
-              "stdin cleanup after provider exit",
-          )
-          runner = replace_once(
-              runner,
-              '''                for key, _mask in events:\n                    chunk = os.read(key.fileobj.fileno(), 65536)\n''',
-              '''                for key, _mask in events:\n                    if key.data == "stdin":\n                        try:\n                            written = os.write(key.fileobj.fileno(), stdin_pending)\n                        except BlockingIOError:\n                            continue\n                        except OSError as exc:\n                            note_error(f"stdin_write_failed:{type(exc).__name__}")\n                            kill_process_tree()\n                            selector.unregister(key.fileobj)\n                            continue\n                        if written <= 0:\n                            note_error("stdin_write_failed:short_write")\n                            kill_process_tree()\n                            selector.unregister(key.fileobj)\n                            continue\n                        stdin_pending = stdin_pending[written:]\n                        if not stdin_pending:\n                            selector.unregister(key.fileobj)\n                            key.fileobj.close()\n                        continue\n                    chunk = os.read(key.fileobj.fileno(), 65536)\n''',
-              "nonblocking provider stdin writes",
-          )
-          runner = replace_once(
-              runner,
-              '''    if len(parts) >= 3 and parts[0] == "bash" and parts[1] == "-lc":\n        if len(parts) != 3:\n            raise RunnerError("complex shell wrapper is not allowed")\n        parts = _split_shell_words(parts[2].strip())\n''',
-              '',
-              "remove login-shell normalization",
-          )
-          runner_path.write_text(runner, encoding="utf-8")
+          source = Path('/tmp/pr1227-bootstrap-v1.yml').read_text(encoding='utf-8')
+          start = "          python3 <<'PY'\n"
+          end = "          PY\n\n      - name: Focused validation"
+          if source.count(start) != 1 or source.count(end) != 1:
+              raise SystemExit('could not recover exact prior remediation script')
+          body = source.split(start, 1)[1].split(end, 1)[0]
+          script = textwrap.dedent(body)
+          lines = script.splitlines()
+          fixed: list[str] = []
+          in_test = False
+          for line in lines:
+              if line.startswith("insertion = r'''    def test_run_bounded_times_out_when_provider_does_not_read_stdin") or line.startswith("insertion = r'''    def test_mcp_proxy_reaps_failed_upstream_without_detaching_from_provider_group"):
+                  in_test = True
+                  fixed.append(line)
+                  continue
+              if in_test and line == "'''":
+                  in_test = False
+                  fixed.append(line)
+                  continue
+              if in_test and line:
+                  fixed.append('    ' + line)
+              else:
+                  fixed.append(line)
+          if in_test:
+              raise SystemExit('unterminated regression-test insertion')
+          Path('/tmp/apply-pr1227.py').write_text('\n'.join(fixed) + '\n', encoding='utf-8')
           PY
+          python3 /tmp/apply-pr1227.py
 
       - name: Focused validation
         shell: bash
