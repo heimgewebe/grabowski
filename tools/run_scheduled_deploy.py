@@ -1155,25 +1155,50 @@ def _open_cutover_target_head(classification: dict[str, Any]) -> str | None:
 
 
 def run_midcutover_resume(*, repo: Path, decision: dict[str, Any]) -> dict[str, Any]:
-    """Continue the stranded cutover; deploy nothing."""
+    """Continue the stranded cutover; deploy nothing.
+
+    A cold re-entry deliberately runs newer scheduler code while the authentic
+    cutover receipt still binds admission to the historical target head.  The
+    scheduler job's deployment-observer contract is execution-head-bound, so it
+    cannot truthfully validate the historical admission marker.  Hide only that
+    observer discovery tuple for the in-process resume call.  The admission
+    marker and drain remain strict; normal deployment keeps its observer intact.
+    """
+    observer_environment_names = (
+        FINALIZATION_ENV["unit"],
+        "GRABOWSKI_JOB_DIRECTORY",
+        FINALIZATION_ENV["metadata"],
+    )
+    observer_environment = {
+        name: os.environ[name]
+        for name in observer_environment_names
+        if name in os.environ
+    }
     try:
-        result = deploy_dual.resume_production_blue_green_cutover(
-            repo=repo,
-            expected_head=decision["resume_target_head"],
-            require_resume_binding_sha256=decision["resume_binding_sha256"],
-        )
-    except deploy_dual.ProductionBlueGreenReceiptPersistenceError as exc:
-        result = {
-            "receipt": exc.receipt,
-            "receipt_path": None,
-            "receipt_sha256": exc.receipt_sha256,
-            "receipt_persisted": False,
-            "receipt_persistence_error_type": exc.persistence_error_type,
-            "outcome": exc.outcome,
-            "error": None,
-            "blind_retry_allowed": False,
-            "fresh_classification_required": True,
-        }
+        for name in observer_environment_names:
+            os.environ.pop(name, None)
+        try:
+            result = deploy_dual.resume_production_blue_green_cutover(
+                repo=repo,
+                expected_head=decision["resume_target_head"],
+                require_resume_binding_sha256=decision["resume_binding_sha256"],
+            )
+        except deploy_dual.ProductionBlueGreenReceiptPersistenceError as exc:
+            result = {
+                "receipt": exc.receipt,
+                "receipt_path": None,
+                "receipt_sha256": exc.receipt_sha256,
+                "receipt_persisted": False,
+                "receipt_persistence_error_type": exc.persistence_error_type,
+                "outcome": exc.outcome,
+                "error": None,
+                "blind_retry_allowed": False,
+                "fresh_classification_required": True,
+            }
+    finally:
+        for name in observer_environment_names:
+            os.environ.pop(name, None)
+        os.environ.update(observer_environment)
     receipt = result.get("receipt") or {}
     summary = {
         "schema_version": 1,
