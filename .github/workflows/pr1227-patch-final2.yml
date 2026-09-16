@@ -1,0 +1,120 @@
+name: PR1227 patch final review gaps
+
+on:
+  push:
+    branches:
+      - ops/pr1227-patch-final2-20260916
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout transport branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Apply exact-head patch, validate, and stage candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_head=df879979911bb953b27e37b7256ca701fc1de879
+          live_head="$(git ls-remote origin refs/heads/fix/rab-codex-stderr-contract-20260915 | cut -f1)"
+          test "$live_head" = "$expected_head"
+
+          git worktree add --detach /tmp/pr1227-final2 "$expected_head"
+          cd /tmp/pr1227-final2
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          runner = Path('tools/repobrief_agent_benchmark_codex_runner.py')
+          tests = Path('tests/test_repobrief_agent_benchmark_codex_runner.py')
+
+          def replace_once(path: Path, old: str, new: str, label: str) -> None:
+              text = path.read_text(encoding='utf-8')
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label}: expected one match, found {count}')
+              path.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          replace_once(
+              runner,
+              'import json\nimport math\nimport os\n',
+              'import json\nimport os\n',
+              'remove permissive float-ID helper dependency',
+          )
+          replace_once(
+              runner,
+              '''def _valid_jsonrpc_request_id(value: Any) -> bool:\n    if value is None or isinstance(value, bool):\n        return False\n    if isinstance(value, (str, int)):\n        return True\n    return isinstance(value, float) and math.isfinite(value)\n''',
+              '''def _valid_jsonrpc_request_id(value: Any) -> bool:\n    return isinstance(value, str) or (\n        isinstance(value, int) and not isinstance(value, bool)\n    )\n''',
+              'tighten JSON-RPC ID type contract',
+          )
+          replace_once(
+              runner,
+              '''    if not executable.is_absolute():\n        resolved = shutil.which(upstream[0], path=provider_env().get("PATH"))\n        if resolved is None:\n            raise RunnerError("MCP executable is unavailable")\n        executable = Path(resolved)\n    executable_binding = _bind_mcp_file(executable, label="MCP executable", executable=True)\n''',
+              '''    if not executable.is_absolute():\n        resolved = shutil.which(upstream[0], path=provider_env().get("PATH"))\n        if resolved is None:\n            raise RunnerError("MCP executable is unavailable")\n        executable = Path(resolved)\n    try:\n        executable = executable.resolve(strict=True)\n    except OSError as exc:\n        raise RunnerError("MCP executable is unavailable") from exc\n    executable_binding = _bind_mcp_file(executable, label="MCP executable", executable=True)\n''',
+              'resolve interpreter symlink before binding',
+          )
+          replace_once(
+              runner,
+              '''                if has_identifier and not _valid_jsonrpc_request_id(identifier):\n                    raise RunnerError("MCP client request ID is invalid")\n                if method not in MCP_CLIENT_METHODS:\n''',
+              '''                if has_identifier and not _valid_jsonrpc_request_id(identifier):\n                    raise RunnerError("MCP client request ID is invalid")\n                if method == "tools/call" and not has_identifier:\n                    raise RunnerError("MCP tools/call request ID is required")\n                if method not in MCP_CLIENT_METHODS:\n''',
+              'require trackable treatment tools/call ID',
+          )
+          replace_once(
+              runner,
+              '''            identifier = message.get("id")\n            if "id" not in message and "result" not in message and "error" not in message:\n                continue\n            with state_lock:\n''',
+              '''            has_identifier = "id" in message\n            identifier = message.get("id")\n            if not has_identifier and "result" not in message and "error" not in message:\n                continue\n            if not has_identifier or not _valid_jsonrpc_request_id(identifier):\n                raise RunnerError("MCP upstream response envelope is invalid")\n            with state_lock:\n''',
+              'validate upstream response ID before pending lookup',
+          )
+          replace_once(
+              runner,
+              '''                if (\n                    message.get("jsonrpc") != "2.0"\n                    or pending_kind is None\n                    or (("result" in message) == ("error" in message))\n                ):\n                    raise RunnerError("MCP upstream response envelope is invalid")\n                pending_requests.pop(identifier, None)\n''',
+              '''                if (\n                    message.get("jsonrpc") != "2.0"\n                    or pending_kind is None\n                    or (("result" in message) == ("error" in message))\n                ):\n                    raise RunnerError("MCP upstream response envelope is invalid")\n                if "error" in message:\n                    error = message["error"]\n                    if (\n                        not isinstance(error, dict)\n                        or isinstance(error.get("code"), bool)\n                        or not isinstance(error.get("code"), int)\n                        or not isinstance(error.get("message"), str)\n                    ):\n                        raise RunnerError("MCP upstream error response is invalid")\n                pending_requests.pop(identifier, None)\n''',
+              'validate JSON-RPC error object before settling request',
+          )
+          replace_once(
+              runner,
+              '''        client_thread.join(timeout=1)\n        if client_thread.is_alive():\n            raise RunnerError("MCP client intake remained active at upstream EOF")\n        with state_lock:\n''',
+              '''        client_thread.join(timeout=1)\n        if client_thread.is_alive():\n            raise RunnerError("MCP client intake remained active at upstream EOF")\n        if errors:\n            raise RunnerError("benchmark MCP proxy stream failed") from errors[0]\n        with state_lock:\n''',
+              'surface client intake validation errors before EOF settlement',
+          )
+
+          replace_once(
+              tests,
+              '''        for invalid in (None, True, False, [], {}, float("inf"), float("-inf"), float("nan")):\n            with self.subTest(invalid=invalid):\n                self.assertFalse(runner._valid_jsonrpc_request_id(invalid))\n        for valid in ("", "request-1", 0, -1, 1.5):\n            with self.subTest(valid=valid):\n                self.assertTrue(runner._valid_jsonrpc_request_id(valid))\n''',
+              '''        for invalid in (\n            None, True, False, [], {}, 1.5,\n            float("inf"), float("-inf"), float("nan"),\n        ):\n            with self.subTest(invalid=invalid):\n                self.assertFalse(runner._valid_jsonrpc_request_id(invalid))\n        for valid in ("", "request-1", 0, -1):\n            with self.subTest(valid=valid):\n                self.assertTrue(runner._valid_jsonrpc_request_id(valid))\n''',
+              'tighten ID helper regression expectations',
+          )
+
+          marker = '''    def test_mcp_program_and_script_bindings_reject_symlinks_and_drift(self) -> None:\n'''
+          block = '''    def test_mcp_absolute_interpreter_symlink_resolves_to_bound_target(self) -> None:\n        with tempfile.TemporaryDirectory() as temporary:\n            root = Path(temporary)\n            executable = root / "python3.real"\n            executable.write_bytes(Path(sys.executable).read_bytes())\n            executable.chmod(0o755)\n            alias = root / "python3"\n            alias.symlink_to(executable)\n            script = root / "server.py"\n            script.write_text("pass\\n", encoding="utf-8")\n            manifest = root / "chosen.bundle.manifest.json"\n            manifest.write_text("{}\\n", encoding="utf-8")\n\n            argv, bindings = runner._bind_mcp_upstream(\n                [str(alias), str(script), "--bundle-root", str(root)], manifest\n            )\n\n            self.assertEqual(argv[0], str(executable.resolve()))\n            self.assertEqual(bindings[0]["path"], executable.resolve())\n            runner._revalidate_mcp_file(bindings[0], label="MCP executable")\n\n    def test_mcp_proxy_rejects_missing_treatment_request_id(self) -> None:\n        with tempfile.TemporaryDirectory() as temporary:\n            root = Path(temporary)\n            upstream = root / "mcp.py"\n            upstream.write_text("import sys\\nsys.stdin.read()\\n", encoding="utf-8")\n            payload = json.dumps(\n                {\n                    "jsonrpc": "2.0",\n                    "method": "tools/call",\n                    "params": {"name": "ask_context", "arguments": {"query": "where"}},\n                }\n            ).encode() + b"\\n"\n            completed = subprocess.run(\n                proxy_command(upstream, root), input=payload,\n                capture_output=True, check=False, timeout=5,\n            )\n            self.assertNotEqual(completed.returncode, 0)\n            self.assertIn(b"proxy stream failed", completed.stderr)\n\n    def test_mcp_proxy_rejects_malformed_error_responses(self) -> None:\n        errors = (\n            None,\n            {},\n            {"code": True, "message": "failed"},\n            {"code": -32000, "message": 1},\n        )\n        for error in errors:\n            with self.subTest(error=error), tempfile.TemporaryDirectory() as temporary:\n                root = Path(temporary)\n                upstream = root / "mcp.py"\n                upstream.write_text(\n                    "import json, sys\\n"\n                    "sys.stdin.readline()\\n"\n                    f"print(json.dumps({{'jsonrpc':'2.0','id':2,'error':{error!r}}}), flush=True)\\n",\n                    encoding="utf-8",\n                )\n                payload = json.dumps(\n                    {"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {}}\n                ).encode() + b"\\n"\n                completed = subprocess.run(\n                    proxy_command(upstream, root), input=payload,\n                    capture_output=True, check=False, timeout=5,\n                )\n                self.assertNotEqual(completed.returncode, 0)\n                self.assertIn(b"error response is invalid", completed.stderr)\n\n    def test_mcp_proxy_rejects_type_alias_response_ids(self) -> None:\n        for invalid_identifier in (True, 1.0, None, {"nested": "id"}):\n            with self.subTest(identifier=invalid_identifier), tempfile.TemporaryDirectory() as temporary:\n                root = Path(temporary)\n                upstream = root / "mcp.py"\n                encoded = json.dumps(invalid_identifier)\n                upstream.write_text(\n                    "import json, sys\\n"\n                    f"INVALID = json.loads({encoded!r})\\n"\n                    "sys.stdin.readline()\\n"\n                    "print(json.dumps({'jsonrpc':'2.0','id':INVALID,'result':{}}), flush=True)\\n",\n                    encoding="utf-8",\n                )\n                payload = json.dumps(\n                    {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}\n                ).encode() + b"\\n"\n                completed = subprocess.run(\n                    proxy_command(upstream, root), input=payload,\n                    capture_output=True, check=False, timeout=5,\n                )\n                self.assertNotEqual(completed.returncode, 0)\n                self.assertIn(b"response envelope is invalid", completed.stderr)\n\n'''
+          text = tests.read_text(encoding='utf-8')
+          if text.count(marker) != 1:
+              raise SystemExit('test insertion marker mismatch')
+          tests.write_text(text.replace(marker, block + marker, 1), encoding='utf-8')
+          PY
+
+          python3 -m unittest tests.test_repobrief_agent_benchmark_codex_runner
+          git diff --check
+          python3 tools/check_no_secrets.py
+          python3 -m py_compile tools/repobrief_agent_benchmark_codex_runner.py tests/test_repobrief_agent_benchmark_codex_runner.py
+
+          mapfile -t changed < <(git status --short | sed -E 's/^.. //')
+          test "${#changed[@]}" -eq 2
+          printf '%s\n' "${changed[@]}" | sort > /tmp/changed.actual
+          printf '%s\n' tests/test_repobrief_agent_benchmark_codex_runner.py tools/repobrief_agent_benchmark_codex_runner.py > /tmp/changed.expected
+          diff -u /tmp/changed.expected /tmp/changed.actual
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- tests/test_repobrief_agent_benchmark_codex_runner.py tools/repobrief_agent_benchmark_codex_runner.py
+          git diff --cached --check
+          git commit -m 'fix(pr1227): close remaining MCP review gaps'
+          test "$(git rev-parse HEAD^)" = "$expected_head"
+          git push origin HEAD:refs/heads/ops/pr1227-ready-final2-20260916
