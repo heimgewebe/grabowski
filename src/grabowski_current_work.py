@@ -325,11 +325,11 @@ def _historical_binding_drift_is_hygiene(item: dict[str, Any]) -> bool:
     """Keep coordination-free historical identity drift out of operative work.
 
     Completed/archived drift is historical hygiene as before.  An active-phase
-    binding whose retention has expired is also historical once the checkout is
-    non-main and no lease, process or coordination overlap remains.  This changes
-    only the current-work projection: lifecycle repair and cleanup authority stay
+    binding is also hygiene once retention has expired, or when a dirty linked
+    checkout has no lease, process or coordination overlap.  This changes only
+    the current-work projection: lifecycle repair and cleanup authority stay
     fail-closed. Dirty state remains visible/actionable; prunable/missing,
-    unobservable, retained or otherwise live surfaces remain blocking.
+    unobservable and clean retained surfaces remain blocking.
     """
     historical_phase = item["binding_phase"] in {"completed_retained", "archived"}
     expired_active_phase = (
@@ -340,11 +340,9 @@ def _historical_binding_drift_is_hygiene(item: dict[str, Any]) -> bool:
         item["lifecycle_state"] in {"managed_lifecycle_drift", "dirty"}
         and item["binding_present"]
         and not item["binding_consistent"]
-        and (historical_phase or expired_active_phase)
+        and (historical_phase or expired_active_phase or item["dirty"])
         and not item["is_main"]
-        and not item["coordination_blocking"]
-        and not item["processes"]
-        and not item["resource_leases"]
+        and not _dirty_has_resource_overlap(item)
     )
 
 
