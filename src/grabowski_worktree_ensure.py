@@ -952,15 +952,36 @@ def _bind_checkout_lifecycle(
 LANE_OWNER_RE = re.compile(r"^lane:([0-9a-f]{32})$")
 
 
+def _resolve_adler_state_root(path: Path) -> Path:
+    """Resolve existing prefixes strictly while allowing a not-yet-created state root."""
+    candidate = path.expanduser()
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    missing: list[str] = []
+    cursor = candidate
+    while not os.path.lexists(cursor):
+        parent = cursor.parent
+        if parent == cursor:
+            raise WorktreeEnsureAction("Adler state root has no resolvable directory prefix")
+        missing.append(cursor.name)
+        cursor = parent
+    resolved = cursor.resolve(strict=True)
+    if not resolved.is_dir():
+        raise WorktreeEnsureAction("Adler state root prefix is not a directory")
+    for name in reversed(missing):
+        resolved = resolved / name
+    return resolved
+
+
 def _grosser_adler_inbox_root() -> Path:
     configured = os.environ.get("GROSSER_ADLER_STATE_ROOT")
     if configured:
-        state_root = Path(configured).expanduser().resolve()
+        state_root = _resolve_adler_state_root(Path(configured))
     else:
         state_home = Path(
             os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))
-        ).expanduser()
-        state_root = (state_home / "grosser-adler").resolve()
+        )
+        state_root = _resolve_adler_state_root(state_home / "grosser-adler")
     return state_root / "worktree-inboxes"
 
 
@@ -1002,7 +1023,29 @@ def _validate_adler_sidecar(sidecar: Path, expected_target: Path) -> None:
         raise WorktreeEnsureAction(".adler/inbox.json targets a different Adler inbox")
 
 
-def _configure_adler_sidecar_pointer(inputs: dict[str, Any]) -> dict[str, Any]:
+def _trusted_previous_adler_pointer(
+    previous_sidecar: dict[str, Any] | None,
+    *,
+    lane_id: str,
+    pointer: Path,
+    observed_target: str,
+) -> bool:
+    return bool(
+        isinstance(previous_sidecar, dict)
+        and previous_sidecar.get("state") == "configured"
+        and previous_sidecar.get("lane_id") == lane_id
+        and previous_sidecar.get("path") == str(pointer)
+        and previous_sidecar.get("target") == observed_target
+        and previous_sidecar.get("ownership") == "grabowski_metadata_only"
+        and previous_sidecar.get("absence_semantics") == "unknown_not_no_findings"
+    )
+
+
+def _configure_adler_sidecar_pointer(
+    inputs: dict[str, Any],
+    *,
+    previous_sidecar: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     lane_id = _adler_lane_id(inputs)
     if lane_id is None:
         return {"state": "not_applicable", "reason": "checkout_is_not_exact_work_lane_owned"}
@@ -1011,6 +1054,8 @@ def _configure_adler_sidecar_pointer(inputs: dict[str, Any]) -> dict[str, Any]:
     created_dir = False
     created_gitignore = False
     created_pointer = False
+    replaced_pointer_target: str | None = None
+    temporary_pointer: Path | None = None
     try:
         expected_target = _grosser_adler_inbox_root() / f"{lane_id}.json"
         try:
@@ -1019,6 +1064,20 @@ def _configure_adler_sidecar_pointer(inputs: dict[str, Any]) -> dict[str, Any]:
         except FileExistsError:
             pass
         _validate_adler_sidecar_directory(sidecar)
+        pointer = sidecar / "inbox.json"
+        observed_target: str | None = None
+        if os.path.lexists(pointer):
+            pi = pointer.lstat()
+            if not stat.S_ISLNK(pi.st_mode) or pi.st_uid != os.geteuid() or pi.st_nlink != 1:
+                raise WorktreeEnsureAction(".adler/inbox.json is not the expected owner-controlled symlink")
+            observed_target = os.readlink(pointer)
+            if observed_target != str(expected_target) and not _trusted_previous_adler_pointer(
+                previous_sidecar,
+                lane_id=lane_id,
+                pointer=pointer,
+                observed_target=observed_target,
+            ):
+                raise WorktreeEnsureAction(".adler/inbox.json targets unrecognized metadata")
         if not os.path.lexists(sidecar / ".gitignore"):
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
             fd = os.open(sidecar / ".gitignore", flags, 0o600)
@@ -1028,10 +1087,15 @@ def _configure_adler_sidecar_pointer(inputs: dict[str, Any]) -> dict[str, Any]:
             finally:
                 os.close(fd)
             created_gitignore = True
-        pointer = sidecar / "inbox.json"
-        if not os.path.lexists(pointer):
+        if observed_target is None:
             pointer.symlink_to(expected_target)
             created_pointer = True
+        elif observed_target != str(expected_target):
+            temporary_pointer = sidecar / f".inbox.json.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+            temporary_pointer.symlink_to(expected_target)
+            os.replace(temporary_pointer, pointer)
+            temporary_pointer = None
+            replaced_pointer_target = observed_target
         _validate_adler_sidecar(sidecar, expected_target)
         directory_fd = os.open(sidecar, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
         try:
@@ -1048,7 +1112,16 @@ def _configure_adler_sidecar_pointer(inputs: dict[str, Any]) -> dict[str, Any]:
         }
     except Exception as exc:
         try:
-            if created_pointer:
+            if temporary_pointer is not None:
+                temporary_pointer.unlink(missing_ok=True)
+            if replaced_pointer_target is not None:
+                restore_pointer = sidecar / f".inbox.json.{os.getpid()}.{uuid.uuid4().hex}.restore"
+                try:
+                    restore_pointer.symlink_to(replaced_pointer_target)
+                    os.replace(restore_pointer, sidecar / "inbox.json")
+                finally:
+                    restore_pointer.unlink(missing_ok=True)
+            elif created_pointer:
                 (sidecar / "inbox.json").unlink(missing_ok=True)
             if created_gitignore:
                 (sidecar / ".gitignore").unlink(missing_ok=True)
@@ -1138,7 +1211,9 @@ def ensure_worktree(
                 assert observation is not None
                 lifecycle = _bind_checkout_lifecycle(inputs, observation, existing["lease"])
             current_adler_sidecar = (
-                _configure_adler_sidecar_pointer(inputs)
+                _configure_adler_sidecar_pointer(
+                    inputs, previous_sidecar=existing.get("adler_sidecar")
+                )
                 if result_state in SUCCESS_STATES
                 else None
             )

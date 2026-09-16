@@ -1454,16 +1454,18 @@ class WorktreeEnsureTests(unittest.TestCase):
 
         with patch.dict(os.environ, {"GROSSER_ADLER_STATE_ROOT": str(state_root)}):
             created = self._ensure(parameters, inspect_lease=lane_lease)
-            self.assertEqual(created["adler_sidecar"]["state"], "configured")
-            sidecar = Path(str(parameters["target_path"])) / ".adler"
-            (sidecar / "inbox.json").unlink()
-            (sidecar / ".gitignore").unlink()
-            sidecar.rmdir()
+        self.assertEqual(created["adler_sidecar"]["state"], "configured")
+        sidecar = Path(str(parameters["target_path"])) / ".adler"
+        first_target = os.readlink(sidecar / "inbox.json")
+
+        next_state_root = self.root / "adler-replay-state-next"
+        with patch.dict(os.environ, {"GROSSER_ADLER_STATE_ROOT": str(next_state_root)}):
             replayed = self._ensure(parameters, inspect_lease=lane_lease)
 
-        expected = state_root.resolve() / "worktree-inboxes" / f"{lane_id}.json"
+        expected = next_state_root.resolve() / "worktree-inboxes" / f"{lane_id}.json"
         self.assertTrue(replayed["replayed"])
         self.assertEqual(replayed["adler_sidecar"]["state"], "configured")
+        self.assertNotEqual(first_target, str(expected))
         self.assertEqual(os.readlink(sidecar / "inbox.json"), str(expected))
 
     def test_relative_adler_state_root_produces_absolute_pointer(self) -> None:
@@ -1528,6 +1530,40 @@ class WorktreeEnsureTests(unittest.TestCase):
         self.assertFalse(result["blocking"])
         self.assertTrue((worktree / ".adler").is_symlink())
         self.assertEqual(list(foreign.iterdir()), [])
+
+    def test_replay_does_not_replace_unrecognized_pointer_target(self) -> None:
+        lane_id = "9" * 32
+        worktree = self.worktree_root / "foreign-adler-pointer"
+        worktree.mkdir()
+        sidecar = worktree / ".adler"
+        sidecar.mkdir(mode=0o700)
+        (sidecar / ".gitignore").write_bytes(b"*\n")
+        (sidecar / ".gitignore").chmod(0o600)
+        foreign_target = self.root / "foreign-inbox.json"
+        pointer = sidecar / "inbox.json"
+        pointer.symlink_to(foreign_target)
+        inputs = {
+            "lease_owner_id": f"lane:{lane_id}",
+            "source_kind": "work_lane",
+            "source_id": lane_id,
+            "target_path": str(worktree),
+        }
+        previous = {
+            "state": "configured",
+            "lane_id": lane_id,
+            "path": str(pointer),
+            "target": str(self.root / "different-prior-inbox.json"),
+            "ownership": "grabowski_metadata_only",
+            "absence_semantics": "unknown_not_no_findings",
+        }
+
+        result = worktree_ensure._configure_adler_sidecar_pointer(
+            inputs, previous_sidecar=previous
+        )
+
+        self.assertEqual(result["state"], "unavailable")
+        self.assertEqual(os.readlink(pointer), str(foreign_target))
+        self.assertEqual((sidecar / ".gitignore").read_bytes(), b"*\n")
 
     def test_adler_pointer_problem_is_nonblocking_and_does_not_replace_foreign_metadata(self) -> None:
         lane_id = "b" * 32
