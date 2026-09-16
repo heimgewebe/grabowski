@@ -839,6 +839,9 @@ def run_mcp_proxy(upstream: Sequence[str]) -> int:
                     text = canonical(message.get("result")); is_error = False
                 message = {"jsonrpc":"2.0","id":identifier,"result":{"content":[{"type":"text","text":text}],"isError":is_error}}
             _proxy_write(message, output_lock)
+        client_thread.join(timeout=1)
+        if client_thread.is_alive():
+            raise RunnerError("MCP client intake remained active at upstream EOF")
         with state_lock:
             pending_tools_list = bool(tools_list_ids)
         if pending_tools_list or not tools_inventory_validated:

@@ -1011,6 +1011,46 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(runner.RunnerError, "exactly once"):
             runner._filtered_treatment_tools(duplicate)
 
+    def test_mcp_proxy_rejects_tools_list_arriving_during_upstream_eof(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            upstream = root / "mcp.py"
+            valid_response = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"tools": [{"name": name} for name in sorted(runner.UPSTREAM_MCP)]},
+            }
+            upstream.write_text(
+                "import json, os, sys, time\n"
+                "sys.stdin.readline()\n"
+                f"print(json.dumps({valid_response!r}), flush=True)\n"
+                "os.close(1)\n"
+                "time.sleep(2)\n",
+                encoding="utf-8",
+            )
+            process = subprocess.Popen(
+                [sys.executable, str(MODULE_PATH), "--codex-mcp-proxy", json.dumps([sys.executable, str(upstream)])],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertIsNotNone(process.stdin)
+            self.assertIsNotNone(process.stdout)
+            self.assertIsNotNone(process.stderr)
+            first = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}).encode() + b"\n"
+            second = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}).encode() + b"\n"
+            process.stdin.write(first)
+            process.stdin.flush()
+            self.assertTrue(process.stdout.readline())
+            process.stdin.write(second)
+            process.stdin.flush()
+            process.stdin.close()
+            stderr = process.stderr.read()
+            returncode = process.wait(timeout=5)
+            self.assertNotEqual(returncode, 0)
+            self.assertTrue(
+                b"inventory was not validated" in stderr
+                or b"client intake remained active" in stderr
+            )
+
     def test_mcp_proxy_rejects_eof_with_unanswered_tools_list(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
