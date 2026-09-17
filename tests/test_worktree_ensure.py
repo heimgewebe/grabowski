@@ -1488,6 +1488,66 @@ class WorktreeEnsureTests(unittest.TestCase):
         self.assertEqual(os.readlink(sidecar / "inbox.json"), str(expected))
 
 
+    def test_interrupted_sidecar_configuration_preserves_provenance_for_root_change(self) -> None:
+        lane_id = "4" * 32
+        owner = f"lane:{lane_id}"
+        parameters = self._parameters(
+            key="adler-sidecar-interrupted-provenance",
+            branch="feat/adler-sidecar-interrupted-provenance",
+            target=self.worktree_root / "adler-sidecar-interrupted-provenance",
+            owner=owner,
+        )
+        parameters["source_kind"] = "work_lane"
+        parameters["source_id"] = lane_id
+
+        def live_lease(resource_key: str) -> dict[str, object]:
+            return {
+                "resource_key": resource_key,
+                "owner_id": owner,
+                "expires_at_unix": int(time.time()) + 3600,
+            }
+
+        first_state_root = self.root / "adler-interrupted-state-a"
+        with patch.dict(
+            os.environ,
+            {
+                "GRABOWSKI_WORKTREE_ENSURE_RECEIPT_ROOT": str(self.receipt_root),
+                "GROSSER_ADLER_STATE_ROOT": str(first_state_root),
+            },
+        ), patch.object(
+            worktree_ensure,
+            "_bind_checkout_lifecycle",
+            side_effect=SystemExit("simulated process loss after sidecar mutation"),
+        ):
+            with self.assertRaises(SystemExit):
+                worktree_ensure.ensure_worktree(
+                    parameters,
+                    grips._default_command_runner,
+                    live_lease,
+                    record_friction=self._record_friction,
+                    resolve_friction=self._resolve_friction,
+                )
+
+        sidecar = Path(str(parameters["target_path"])) / ".adler"
+        pointer = sidecar / "inbox.json"
+        first_target = first_state_root.resolve() / "worktree-inboxes" / f"{lane_id}.json"
+        self.assertEqual(os.readlink(pointer), str(first_target))
+        receipt_files = list(self.receipt_root.glob("*.json"))
+        self.assertEqual(len(receipt_files), 1)
+        interrupted_receipt = json.loads(receipt_files[0].read_text(encoding="utf-8"))
+        self.assertEqual(interrupted_receipt["state"], "intent")
+        self.assertEqual(interrupted_receipt["adler_sidecar_plan"]["target"], str(first_target))
+
+        next_state_root = self.root / "adler-interrupted-state-b"
+        with patch.dict(os.environ, {"GROSSER_ADLER_STATE_ROOT": str(next_state_root)}):
+            recovered = self._ensure(parameters, inspect_lease=live_lease)
+
+        expected = next_state_root.resolve() / "worktree-inboxes" / f"{lane_id}.json"
+        self.assertEqual(recovered["result_state"], "CREATED")
+        self.assertTrue(recovered["recovered_after_interruption"])
+        self.assertEqual(recovered["adler_sidecar"]["state"], "configured")
+        self.assertEqual(os.readlink(pointer), str(expected))
+
     def test_successful_replay_with_expired_lease_does_not_mutate_adler_pointer(self) -> None:
         lane_id = "1" * 32
         owner = f"lane:{lane_id}"

@@ -1001,6 +1001,37 @@ def _adler_lane_id(inputs: dict[str, Any]) -> str | None:
     return lane_id
 
 
+def _adler_sidecar_plan(inputs: dict[str, Any]) -> dict[str, Any] | None:
+    lane_id = _adler_lane_id(inputs)
+    if lane_id is None:
+        return None
+    try:
+        target = _grosser_adler_inbox_root() / f"{lane_id}.json"
+    except Exception:
+        # Planning remains advisory. The configuration path reports the concrete
+        # failure later without turning Adler delivery into a worktree blocker.
+        return None
+    pointer = Path(str(inputs["target_path"])) / ".adler" / "inbox.json"
+    return {
+        "state": "planned",
+        "lane_id": lane_id,
+        "path": str(pointer),
+        "target": str(target),
+        "ownership": "grabowski_metadata_only",
+        "absence_semantics": "unknown_not_no_findings",
+    }
+
+
+def _previous_adler_sidecar_evidence(record: dict[str, Any]) -> dict[str, Any] | None:
+    sidecar = record.get("adler_sidecar")
+    if isinstance(sidecar, dict) and sidecar.get("state") == "configured":
+        return sidecar
+    plan = record.get("adler_sidecar_plan")
+    if isinstance(plan, dict):
+        return plan
+    return sidecar if isinstance(sidecar, dict) else None
+
+
 def _validate_adler_sidecar_directory(sidecar: Path) -> None:
     info = sidecar.lstat()
     if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != os.geteuid():
@@ -1045,7 +1076,7 @@ def _trusted_previous_adler_pointer(
 ) -> bool:
     return bool(
         isinstance(previous_sidecar, dict)
-        and previous_sidecar.get("state") == "configured"
+        and previous_sidecar.get("state") in {"configured", "planned"}
         and previous_sidecar.get("lane_id") == lane_id
         and previous_sidecar.get("path") == str(pointer)
         and previous_sidecar.get("target") == observed_target
@@ -1253,7 +1284,7 @@ def ensure_worktree(
                 _configure_adler_sidecar_pointer_with_live_lease(
                     inputs,
                     inspect_lease,
-                    previous_sidecar=existing.get("adler_sidecar"),
+                    previous_sidecar=_previous_adler_sidecar_evidence(existing),
                 )
                 if result_state in SUCCESS_STATES
                 else None
@@ -1301,9 +1332,13 @@ def ensure_worktree(
                 )
                 record["lease"] = lease
                 record["recovery_without_live_lease"] = not lease["valid"]
+                previous_sidecar = _previous_adler_sidecar_evidence(existing)
                 record["adler_sidecar"] = _configure_adler_sidecar_pointer_with_live_lease(
-                    inputs, inspect_lease
+                    inputs, inspect_lease, previous_sidecar=previous_sidecar
                 )
+                sidecar_plan = existing.get("adler_sidecar_plan")
+                if isinstance(sidecar_plan, dict):
+                    record["adler_sidecar_plan"] = sidecar_plan
                 record["lifecycle"] = _bind_checkout_lifecycle(inputs, observation, lease)
                 written = _write_receipt(receipt_path, record)
                 return _public_output(written, receipt_path, replayed=True, recovered=True)
@@ -1363,6 +1398,22 @@ def ensure_worktree(
         if observation is None:
             observation = _observe(inputs, runner)
         if observation["classification"] == "ALREADY_CORRECT":
+            sidecar_plan = _adler_sidecar_plan(inputs)
+            intent_created_at: int | None = None
+            if sidecar_plan is not None:
+                intent = _durable_record(
+                    inputs=inputs,
+                    parameters_sha256=parameters_sha256,
+                    state="intent",
+                    result_state=None,
+                    post_state=observation,
+                    error_class=None,
+                    error="",
+                )
+                intent["lease"] = lease
+                intent["adler_sidecar_plan"] = sidecar_plan
+                journaled = _write_receipt(receipt_path, intent)
+                intent_created_at = int(journaled["created_at_unix"])
             record = _durable_record(
                 inputs=inputs,
                 parameters_sha256=parameters_sha256,
@@ -1371,11 +1422,14 @@ def ensure_worktree(
                 post_state=observation,
                 error_class=None,
                 error="",
+                created_at_unix=intent_created_at,
             )
             record["lease"] = lease
             record["adler_sidecar"] = _configure_adler_sidecar_pointer_with_live_lease(
-                inputs, inspect_lease
+                inputs, inspect_lease, previous_sidecar=sidecar_plan
             )
+            if sidecar_plan is not None:
+                record["adler_sidecar_plan"] = sidecar_plan
             record["lifecycle"] = _bind_checkout_lifecycle(inputs, observation, lease)
             written = _write_receipt(receipt_path, record)
             return _public_output(written, receipt_path, replayed=False, recovered=False)
@@ -1569,9 +1623,19 @@ def ensure_worktree(
             )
             record["lease"] = lease
             record["work_admission"] = admission
+            sidecar_plan = _adler_sidecar_plan(inputs)
+            if sidecar_plan is not None:
+                if not isinstance(existing, dict) or existing.get("state") != "intent":
+                    raise WorktreeEnsureAction("Adler sidecar provenance requires an intent receipt")
+                journaled_intent = dict(existing)
+                journaled_intent["adler_sidecar_plan"] = sidecar_plan
+                journaled_intent["updated_at_unix"] = int(time.time())
+                existing = _write_receipt(receipt_path, journaled_intent)
             record["adler_sidecar"] = _configure_adler_sidecar_pointer_with_live_lease(
-                inputs, inspect_lease
+                inputs, inspect_lease, previous_sidecar=sidecar_plan
             )
+            if sidecar_plan is not None:
+                record["adler_sidecar_plan"] = sidecar_plan
             record["lifecycle"] = _bind_checkout_lifecycle(inputs, post_state, lease)
             record["mutation"] = {
                 "returncode": _returncode(mutation),
