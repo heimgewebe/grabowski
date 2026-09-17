@@ -1547,5 +1547,25 @@ class RepoBriefAgentBenchmarkPreflightLedgerTests(unittest.TestCase):
             self.assertFalse(events[-1]["payload"]["retry_permitted"])
 
 
+class McpCommandFileIdentityTests(unittest.TestCase):
+    def test_mcp_relative_script_is_authorized_against_explicit_preflight_base(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "server.py"
+            script.write_text("pass\n", encoding="utf-8")
+            executable = Path(sys.executable).resolve()
+            identities = support.preflight._core._command_file_identities(
+                [str(executable), "server.py"], relative_to=root
+            )
+            self.assertEqual(
+                [item["path"] for item in identities],
+                [str(executable), str(script.resolve())],
+            )
+            legacy = support.preflight._core._command_file_identities(
+                [str(executable), "server.py"]
+            )
+            self.assertEqual([item["path"] for item in legacy], [str(executable)])
+
+
 if __name__ == "__main__":
     unittest.main()

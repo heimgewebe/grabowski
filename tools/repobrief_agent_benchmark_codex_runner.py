@@ -849,11 +849,10 @@ def _load_preflight_mcp_authorization(
         raise RunnerError("preflight dispatch authorization does not bind this pair/state root")
     requests = binding.get("requests")
     treatment = requests.get("treatment") if isinstance(requests, dict) else None
-    projection = _preflight_request_projection(request)
     if (
         not isinstance(treatment, dict)
         or treatment.get("request_id") != request.get("request_id")
-        or treatment.get("sha256") != base._sha256_json(projection)
+        or treatment.get("sha256") != base._sha256_json(request)
     ):
         raise RunnerError("preflight dispatch authorization does not bind this treatment request")
     repobrief = request.get("repobrief")
@@ -924,12 +923,23 @@ def _bind_mcp_upstream(
     except OSError as exc:
         raise RunnerError("MCP executable is unavailable") from exc
     executable_binding = _bind_mcp_file(executable, label="MCP executable", executable=True)
+    expected = _normalized_authorized_mcp_files(list(authorized_files))
     argv = [str(executable), *upstream[1:]]
     bindings = [executable_binding]
     if len(argv) > 1 and Path(executable).name.startswith("python"):
-        script = Path(argv[1])
+        script = Path(argv[1]).expanduser()
         if not script.is_absolute():
-            script = Path.cwd() / script
+            if len(expected) < 2:
+                raise RunnerError("relative MCP script lacks a preflight-authorized file identity")
+            authorized_script = Path(expected[1]["path"])
+            relative_parts = script.parts
+            if (
+                not relative_parts
+                or ".." in relative_parts
+                or tuple(authorized_script.parts[-len(relative_parts):]) != relative_parts
+            ):
+                raise RunnerError("relative MCP script does not match preflight-authorized path")
+            script = authorized_script
         try:
             script = script.resolve(strict=True)
         except OSError as exc:
@@ -937,7 +947,6 @@ def _bind_mcp_upstream(
         script_binding = _bind_mcp_file(script, label="MCP script", executable=False)
         argv[1] = str(script)
         bindings.append(script_binding)
-    expected = _normalized_authorized_mcp_files(list(authorized_files))
     current = [_mcp_authorization_identity(binding) for binding in bindings]
     if canonical(current) != canonical(expected):
         raise RunnerError("MCP program does not match preflight-authorized file identities")
@@ -1062,6 +1071,8 @@ def run_mcp_proxy(
                     raise RunnerError("MCP client message must be an object")
                 if message.get("jsonrpc") != "2.0":
                     raise RunnerError("MCP client JSON-RPC version is invalid")
+                if "params" in message and not isinstance(message.get("params"), (dict, list)):
+                    raise RunnerError("MCP client JSON-RPC params are invalid")
                 method = message.get("method")
                 has_identifier = "id" in message
                 identifier = message.get("id")

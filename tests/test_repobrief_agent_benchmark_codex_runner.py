@@ -111,9 +111,7 @@ def write_dispatch_authorization(
         "requests": {
             "treatment": {
                 "request_id": value["request_id"],
-                "sha256": runner.base._sha256_json(
-                    runner._preflight_request_projection(value)
-                ),
+                "sha256": runner.base._sha256_json(value),
             }
         },
         "state_root": str(state_root.resolve()),
@@ -1685,6 +1683,76 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 completed.stderr,
             )
 
+
+    def test_preflight_authorization_rejects_legacy_projected_request_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "server.py"
+            script.write_text("pass\n", encoding="utf-8")
+            manifest = root / "chosen.bundle.manifest.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+            value = request(condition="treatment")
+            value["repobrief"]["manifest"] = str(manifest)
+            value["repobrief"]["manifest_sha256"] = hashlib.sha256(manifest.read_bytes()).hexdigest()
+            value["repobrief"]["mcp_command"] = [str(Path(sys.executable).resolve()), str(script), "--bundle-root", str(root)]
+            authorized = [file_identity(Path(sys.executable)), file_identity(script)]
+            state_root = write_dispatch_authorization(root, value, authorized)
+            authorization_path = next((state_root / "preflight-dispatch-ledger").glob("*/authorization.json"))
+            authorization = json.loads(authorization_path.read_text(encoding="utf-8"))
+            authorization["binding"]["requests"]["treatment"]["sha256"] = runner.base._sha256_json(
+                runner._preflight_request_projection(value)
+            )
+            authorization["contract_sha256"] = runner.base._sha256_json(authorization["binding"])
+            authorization_path.write_text(json.dumps(authorization, sort_keys=True), encoding="utf-8")
+            authorization_path.chmod(0o600)
+            with self.assertRaisesRegex(runner.RunnerError, "treatment request"):
+                runner._load_preflight_mcp_authorization(value, state_root)
+
+    def test_relative_mcp_script_uses_preflight_authorized_absolute_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable = root / "python3"
+            executable.write_bytes(Path(sys.executable).read_bytes())
+            executable.chmod(0o755)
+            script = root / "server.py"
+            script.write_text("pass\n", encoding="utf-8")
+            manifest = root / "chosen.bundle.manifest.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+            authorized = [file_identity(executable), file_identity(script)]
+            with patch.object(runner.Path, "cwd", side_effect=AssertionError("runtime cwd must not resolve an authorized relative script")):
+                argv, bindings = runner._bind_mcp_upstream(
+                    [str(executable), "server.py", "--bundle-root", str(root)],
+                    manifest,
+                    authorized,
+                )
+            self.assertEqual(argv[1], str(script.resolve()))
+            self.assertEqual(bindings[1]["path"], script.resolve())
+
+    def test_mcp_proxy_rejects_invalid_client_params_before_forwarding(self) -> None:
+        for params in (None, 1, "invalid", True):
+            with self.subTest(params=params), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                marker = root / "forwarded"
+                upstream = root / "mcp.py"
+                upstream.write_text(
+                    "import pathlib, sys\n"
+                    f"marker = pathlib.Path({str(marker)!r})\n"
+                    "line = sys.stdin.readline()\n"
+                    "if line:\n"
+                    "    marker.write_text(line, encoding='utf-8')\n",
+                    encoding="utf-8",
+                )
+                message = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": params}
+                completed = subprocess.run(
+                    proxy_command(upstream, root),
+                    input=json.dumps(message).encode() + b"\n",
+                    capture_output=True,
+                    check=False,
+                    timeout=5,
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(b"benchmark MCP proxy stream failed", completed.stderr)
+                self.assertFalse(marker.exists())
 
 
 if __name__ == "__main__":

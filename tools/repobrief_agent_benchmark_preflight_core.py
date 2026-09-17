@@ -210,14 +210,21 @@ def _file_identity(
     }
 
 
-def _command_file_identities(command: Sequence[Any]) -> list[dict[str, Any]]:
+def _command_file_identities(
+    command: Sequence[Any], *, relative_to: Path | None = None
+) -> list[dict[str, Any]]:
     identities: list[dict[str, Any]] = []
     seen: set[str] = set()
+    relative_root = None if relative_to is None else relative_to.expanduser().resolve()
     for raw in command:
         if not isinstance(raw, str) or not raw:
             continue
         candidate = Path(raw).expanduser()
-        if not candidate.is_absolute() or not candidate.exists():
+        if not candidate.is_absolute():
+            if relative_root is None:
+                continue
+            candidate = relative_root / candidate
+        if not candidate.exists():
             continue
         resolved = candidate.resolve()
         key = str(resolved)
@@ -342,7 +349,9 @@ def _dispatch_binding(
             label="RepoBrief manifest",
         ),
         "mcp_command_sha256": _sha256_json(mcp_command),
-        "mcp_command_files": _command_file_identities(mcp_command),
+        "mcp_command_files": _command_file_identities(
+            mcp_command, relative_to=Path.cwd()
+        ),
         "state_root": str(state_root.expanduser().resolve()),
         "transcript_root": str(transcript_root.expanduser().resolve()),
         "evidence_root": str(evidence_root.expanduser().resolve()),
