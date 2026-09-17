@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import json
 import os
 from pathlib import Path
 import selectors
@@ -584,6 +585,196 @@ def _validate_writable_tree(target: Path) -> None:
             raise AgentSandboxError(f"writable path is not stable: {directory}") from exc
 
 
+def _grosser_adler_inbox_root() -> Path:
+    configured = os.environ.get("GROSSER_ADLER_STATE_ROOT")
+    if configured:
+        state_root = Path(configured).expanduser()
+    else:
+        state_home = Path(
+            os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))
+        ).expanduser()
+        state_root = state_home / "grosser-adler"
+    return state_root / "worktree-inboxes"
+
+
+def _grabowski_work_lane_root() -> Path:
+    configured = os.environ.get("GRABOWSKI_WORK_LANE_ROOT")
+    if configured:
+        return Path(configured).expanduser()
+    state_home = Path(
+        os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))
+    ).expanduser()
+    return state_home / "grabowski" / "work-lanes"
+
+
+def _json_sha256(value: object) -> str:
+    raw = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _inspect_live_resources(resource_keys: list[str]) -> dict[str, dict[str, object]]:
+    """Read current resource truth; failures deliberately mean no Adler bind."""
+    try:
+        import grabowski_resources as resources
+
+        return resources.inspect_resources(resource_keys)
+    except Exception:
+        return {}
+
+
+def _live_work_lane_checkout_binding(
+    inputs: dict[str, object], lane_id: str, target_path: str
+) -> bool:
+    repo = inputs.get("repo")
+    branch = inputs.get("branch")
+    resource_keys = inputs.get("resource_keys")
+    if (
+        not isinstance(repo, str)
+        or not repo
+        or not isinstance(branch, str)
+        or not branch
+        or not isinstance(resource_keys, list)
+        or any(not isinstance(item, str) for item in resource_keys)
+    ):
+        return False
+    required = [
+        f"path:{target_path}",
+        f"repo:{repo}:branch:{branch}",
+    ]
+    if any(key not in resource_keys for key in required):
+        return False
+    live = _inspect_live_resources(required)
+    owner = f"lane:{lane_id}"
+    return all(
+        isinstance(live.get(key), dict) and live[key].get("owner_id") == owner
+        for key in required
+    )
+
+
+def _authenticated_work_lane_target(worktree: Path, lane_id: str) -> bool:
+    """Authenticate one untrusted lane id through Grabowski-owned state."""
+    receipt_path = _grabowski_work_lane_root() / f"{lane_id}.json"
+    try:
+        root = _grabowski_work_lane_root()
+        root_info = root.lstat()
+        if (
+            not stat.S_ISDIR(root_info.st_mode)
+            or stat.S_ISLNK(root_info.st_mode)
+            or root_info.st_uid != os.getuid()
+            or stat.S_IMODE(root_info.st_mode) & 0o077
+        ):
+            return False
+        flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(receipt_path, flags)
+        try:
+            info = os.fstat(fd)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) & 0o077
+                or info.st_size > 1_048_576
+            ):
+                return False
+            chunks: list[bytes] = []
+            remaining = info.st_size
+            while remaining:
+                chunk = os.read(fd, min(remaining, 64 * 1024))
+                if not chunk:
+                    return False
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
+        finally:
+            os.close(fd)
+        receipt = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(receipt, dict):
+        return False
+    if (
+        receipt.get("kind") != "grabowski.work_lane"
+        or receipt.get("schema_version") != 1
+        or receipt.get("lane_id") != lane_id
+        or receipt.get("state") != "ready"
+        or receipt.get("terminal_closeout") is not None
+    ):
+        return False
+    supplied_receipt_sha = receipt.get("receipt_sha256")
+    material = {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+    if (
+        not isinstance(supplied_receipt_sha, str)
+        or supplied_receipt_sha != _json_sha256(material)
+    ):
+        return False
+    inputs = receipt.get("inputs")
+    if (
+        not isinstance(inputs, dict)
+        or receipt.get("inputs_sha256") != _json_sha256(inputs)
+    ):
+        return False
+    if (
+        inputs.get("lane_id") != lane_id
+        or inputs.get("lease_owner_id") != f"lane:{lane_id}"
+    ):
+        return False
+    target_path = inputs.get("target_path")
+    if not isinstance(target_path, str):
+        return False
+    try:
+        authenticated_target = Path(target_path).expanduser().resolve(strict=True)
+    except OSError:
+        return False
+    if authenticated_target != worktree:
+        return False
+    return _live_work_lane_checkout_binding(inputs, lane_id, target_path)
+
+
+def _adler_inbox_sandbox_binding(worktree: Path) -> tuple[tuple[tuple[Path, Path], ...], tuple[Path, ...]]:
+    """Expose only one exact worktree inbox target read-only when safely present.
+
+    The worktree-local pointer is Grabowski metadata.  A missing, dangling or
+    malformed pointer is deliberately non-blocking: it means unknown Adler
+    evidence, never "no findings".
+    """
+    pointer = worktree / ".adler" / "inbox.json"
+    try:
+        metadata = pointer.lstat()
+        if (
+            not stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+        ):
+            return (), ()
+        raw_target = os.readlink(pointer)
+        target = Path(raw_target)
+        root = _grosser_adler_inbox_root().resolve(strict=True)
+        if not target.is_absolute() or target.parent != root:
+            return (), ()
+        name = target.name
+        if (
+            not name.endswith(".json")
+            or len(name) != 37
+            or len(name[:-5]) != 32
+            or any(ch not in "0123456789abcdef" for ch in name[:-5])
+        ):
+            return (), ()
+        if not _authenticated_work_lane_target(worktree, name[:-5]):
+            return (), ()
+        source = _private_regular_file(target, "Großer Adler worktree inbox")
+    except (OSError, RuntimeError, AgentSandboxError):
+        return (), ()
+    reserved = {Path("/tmp"), Path("/usr"), Path("/etc"), Path("/proc"), Path("/dev")}
+    directories = tuple(
+        parent
+        for parent in reversed(target.parents)
+        if parent != Path("/") and parent not in reserved
+    )
+    return ((source, target),), directories
+
+
 def _normalized_writable_paths(worktree: Path, values: Iterable[Path]) -> list[Path]:
     candidates: list[Path] = []
     for value in values:
@@ -635,6 +826,7 @@ def minimal_sandbox_argv(
         directory=True,
     )
     writable = _normalized_writable_paths(worktree, writable_paths)
+    adler_read_only, adler_directories = _adler_inbox_sandbox_binding(worktree)
     if workspace_writable and not writable:
         raise AgentSandboxError("writer sandbox requires at least one bounded writable path")
     if not workspace_writable and writable:
@@ -662,7 +854,7 @@ def minimal_sandbox_argv(
         arguments.extend(["--symlink", "usr/lib64", "/lib64"])
     arguments.extend(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/etc"])
     normalized_directories: list[str] = []
-    for value in extra_directories:
+    for value in (*adler_directories, *tuple(extra_directories)):
         raw = str(value)
         path = Path(raw)
         if not path.is_absolute() or raw in {"/", "/proc", "/dev", "/usr", "/etc"} or "\x00" in raw or ".." in path.parts:
@@ -690,7 +882,7 @@ def minimal_sandbox_argv(
     seen_targets = {str(worktree), *(str(item) for item in writable)}
     if common is not None:
         seen_targets.add(str(common))
-    for source_value, target_value in extra_read_only:
+    for source_value, target_value in (*adler_read_only, *tuple(extra_read_only)):
         source = _safe_existing_path(source_value, "extra_read_only source")
         if not target_value.is_absolute() or "\x00" in str(target_value):
             raise AgentSandboxError("extra_read_only target must be absolute")

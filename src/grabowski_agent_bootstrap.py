@@ -32,6 +32,7 @@ ENTRY_SEQUENCE = (
     "read_repository_head_dirty_state_and_leases",
     "classify_one_next_operation",
     "discover_existing_capability_or_route",
+    "read_adler_inbox_if_present",
     "read_relevant_historical_recall_when_high_value_or_repeat_signal",
     "request_execution_shape_for_nontrivial_or_mutating_work",
     "perform_exactly_one_bounded_effect",
@@ -81,6 +82,27 @@ HISTORICAL_RECALL = {
         "task_completion",
     ],
 }
+
+ADLER_SIDECAR = {
+    "authority": "advisory_evidence_only",
+    "path": ".adler/inbox.json",
+    "on_lane_entry": "read_if_present",
+    "before_commit": "reread_if_present",
+    "absence_semantics": "unknown_not_no_findings",
+    "failure_semantics": "local_reversible_work_may_continue",
+    "requirements": [
+        "consider_present_findings_as_advisory_evidence",
+        "do_not_infer_no_findings_from_missing_inbox",
+        "reread_present_inbox_before_commit",
+    ],
+    "does_not_establish": [
+        "work_authority",
+        "blocking_authority",
+        "acknowledgement_or_delivery_state",
+        "finding_freshness_beyond_the_inbox_checkpoint",
+    ],
+}
+
 
 REUSE_BEFORE_BUILD = {
     "authority": "discovery_order_only",
@@ -280,6 +302,7 @@ def agent_bootstrap(*, friction_limit: int = 100, outcome_limit: int = 200) -> d
         "adaptive_mode": "shadow" if adaptive_enabled else "disabled_fail_closed",
         "automatic_live_routing_enabled": False,
         "entry_sequence": list(ENTRY_SEQUENCE),
+        "adler_sidecar": ADLER_SIDECAR,
         "historical_recall": HISTORICAL_RECALL,
         "reuse_before_build": REUSE_BEFORE_BUILD,
         "call_rules": {
