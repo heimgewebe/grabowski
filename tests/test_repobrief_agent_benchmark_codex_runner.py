@@ -84,11 +84,65 @@ def request(*, condition: str = "baseline", commit: str = COMMIT) -> dict:
     }
 
 
+def file_identity(path: Path) -> dict:
+    resolved = path.resolve(strict=True)
+    metadata = resolved.lstat()
+    return {
+        "path": str(resolved),
+        "bytes": metadata.st_size,
+        "sha256": hashlib.sha256(resolved.read_bytes()).hexdigest(),
+        "mode": oct(metadata.st_mode & 0o777),
+    }
+
+
+def write_dispatch_authorization(
+    root: Path, value: dict, mcp_files: list[dict]
+) -> Path:
+    state_root = root / "state"
+    state_root.mkdir(mode=0o700)
+    ledger_root = state_root / "preflight-dispatch-ledger"
+    ledger_root.mkdir(mode=0o700)
+    pair_digest = hashlib.sha256(value["pair_id"].encode("utf-8")).hexdigest()
+    pair_root = ledger_root / pair_digest
+    pair_root.mkdir(mode=0o700)
+    manifest = Path(value["repobrief"]["manifest"])
+    binding = {
+        "pair_id": value["pair_id"],
+        "requests": {
+            "treatment": {
+                "request_id": value["request_id"],
+                "sha256": runner.base._sha256_json(
+                    runner._preflight_request_projection(value)
+                ),
+            }
+        },
+        "state_root": str(state_root.resolve()),
+        "manifest": file_identity(manifest),
+        "mcp_command_sha256": runner.base._sha256_json(
+            value["repobrief"]["mcp_command"]
+        ),
+        "mcp_command_files": mcp_files,
+    }
+    authorization = {
+        "kind": runner.PREFLIGHT_LEDGER_KIND,
+        "version": runner.PREFLIGHT_LEDGER_VERSION,
+        "created_at": "2026-09-17T00:00:00Z",
+        "contract_sha256": runner.base._sha256_json(binding),
+        "binding": binding,
+        "retry_permitted": False,
+    }
+    path = pair_root / "authorization.json"
+    path.write_text(json.dumps(authorization, sort_keys=True), encoding="utf-8")
+    path.chmod(0o600)
+    return state_root
+
+
 def proxy_command(upstream: Path, root: Path) -> list[str]:
     manifest = root / "bound.bundle.manifest.json"
     if not manifest.exists():
         manifest.write_text("{}\n", encoding="utf-8")
     digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    authorized = [file_identity(Path(sys.executable)), file_identity(upstream)]
     return [
         sys.executable,
         str(MODULE_PATH),
@@ -96,6 +150,7 @@ def proxy_command(upstream: Path, root: Path) -> list[str]:
         json.dumps([str(Path(sys.executable).resolve()), str(upstream), "--bundle-root", str(root)]),
         str(manifest),
         digest,
+        json.dumps(authorized, sort_keys=True),
     ]
 
 
@@ -384,7 +439,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 request(), "/opt/codex", checkout, schema, codex_home
             )
             treatment = runner.build_command(
-                request(condition="treatment"), "/opt/codex", checkout, schema, codex_home
+                request(condition="treatment"), "/opt/codex", checkout, schema, codex_home,
+                authorized_mcp_files=[
+                    {"path": "/usr/bin/python3", "bytes": 1, "sha256": "0" * 64, "mode": "0o755"}
+                ],
             )
         baseline_joined = " ".join(baseline)
         treatment_joined = " ".join(treatment)
@@ -1272,8 +1330,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             manifest.write_text("{}\n", encoding="utf-8")
             sibling = root / "sibling.bundle.manifest.json"
             sibling.write_text("{}\n", encoding="utf-8")
+            authorized = [file_identity(executable), file_identity(script)]
             argv, bindings = runner._bind_mcp_upstream(
-                [str(executable), str(script), "--bundle-root", str(root)], manifest
+                [str(executable), str(script), "--bundle-root", str(root)],
+                manifest,
+                authorized,
             )
             self.assertEqual(argv[-1], str(manifest))
             self.assertEqual([item["path"] for item in bindings], [executable, script])
@@ -1306,13 +1367,90 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             manifest = root / "chosen.bundle.manifest.json"
             manifest.write_text("{}\n", encoding="utf-8")
 
+            authorized = [file_identity(executable), file_identity(script)]
             argv, bindings = runner._bind_mcp_upstream(
-                [str(alias), str(script), "--bundle-root", str(root)], manifest
+                [str(alias), str(script), "--bundle-root", str(root)],
+                manifest,
+                authorized,
             )
 
             self.assertEqual(argv[0], str(executable.resolve()))
             self.assertEqual(bindings[0]["path"], executable.resolve())
             runner._revalidate_mcp_file(bindings[0], label="MCP executable")
+
+    def test_preflight_mcp_authorization_binds_exact_program_files_before_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable = root / "python3"
+            executable.write_bytes(Path(sys.executable).read_bytes())
+            executable.chmod(0o755)
+            script = root / "server.py"
+            script.write_text("pass\n", encoding="utf-8")
+            manifest = root / "chosen.bundle.manifest.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+            value = request(condition="treatment")
+            value["repobrief"]["manifest"] = str(manifest)
+            value["repobrief"]["manifest_sha256"] = hashlib.sha256(
+                manifest.read_bytes()
+            ).hexdigest()
+            value["repobrief"]["mcp_command"] = [
+                str(executable), str(script), "--bundle-root", str(root)
+            ]
+            authorized = [file_identity(executable), file_identity(script)]
+            state_root = write_dispatch_authorization(root, value, authorized)
+            loaded = runner._load_preflight_mcp_authorization(value, state_root)
+            self.assertEqual(loaded, authorized)
+            argv, _bindings = runner._bind_mcp_upstream(
+                value["repobrief"]["mcp_command"], manifest, loaded
+            )
+            self.assertEqual(argv[0], str(executable.resolve()))
+            script.write_text("# drift after authorization\n", encoding="utf-8")
+            with self.assertRaisesRegex(runner.RunnerError, "preflight-authorized"):
+                runner._bind_mcp_upstream(
+                    value["repobrief"]["mcp_command"], manifest, loaded
+                )
+
+    def test_preflight_mcp_authorization_rejects_request_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "server.py"
+            script.write_text("pass\n", encoding="utf-8")
+            manifest = root / "chosen.bundle.manifest.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+            value = request(condition="treatment")
+            value["repobrief"]["manifest"] = str(manifest)
+            value["repobrief"]["manifest_sha256"] = hashlib.sha256(
+                manifest.read_bytes()
+            ).hexdigest()
+            value["repobrief"]["mcp_command"] = [
+                str(Path(sys.executable).resolve()), str(script), "--bundle-root", str(root)
+            ]
+            authorized = [file_identity(Path(sys.executable)), file_identity(script)]
+            state_root = write_dispatch_authorization(root, value, authorized)
+            value["prompt"] = "drifted after authorization"
+            with self.assertRaisesRegex(runner.RunnerError, "treatment request"):
+                runner._load_preflight_mcp_authorization(value, state_root)
+
+    def test_mcp_proxy_rejects_invalid_client_jsonrpc_versions(self) -> None:
+        cases = (
+            {"id": 1, "method": "tools/list", "params": {}},
+            {"jsonrpc": "1.0", "id": 1, "method": "tools/list", "params": {}},
+            {"jsonrpc": 2, "id": 1, "method": "tools/list", "params": {}},
+        )
+        for message in cases:
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                upstream = root / "mcp.py"
+                upstream.write_text("import sys\nsys.stdin.read()\n", encoding="utf-8")
+                completed = subprocess.run(
+                    proxy_command(upstream, root),
+                    input=json.dumps(message).encode() + b"\n",
+                    capture_output=True,
+                    check=False,
+                    timeout=5,
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(b"proxy stream failed", completed.stderr)
 
     def test_mcp_proxy_rejects_missing_treatment_request_id(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

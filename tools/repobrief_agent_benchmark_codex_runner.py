@@ -52,6 +52,9 @@ MAX_STDERR_BYTES = 256 * 1024
 MAX_PROVIDER_EXECUTABLE_BYTES = 512 * 1024 * 1024
 MAX_AUTH_BYTES = 64 * 1024
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
+MAX_DISPATCH_AUTHORIZATION_BYTES = 16 * 1024 * 1024
+PREFLIGHT_LEDGER_KIND = "repobrief.agent_benchmark_preflight_dispatch_ledger"
+PREFLIGHT_LEDGER_VERSION = "1.0"
 PERMISSION_PROFILE = "rab-benchmark"
 CHATGPT_LOGIN_LINE = "Logged in using ChatGPT"
 ALLOWED_MCP = {"ask_context", "grounding_verify", "live_freshness", "repobrief_resource_read"}
@@ -157,8 +160,8 @@ def iso(value: datetime) -> str:
     return value.isoformat().replace("+00:00", "Z")
 
 
-def validate_request(request: Mapping[str, Any]) -> None:
-    """Validate provider-neutral invariants, then bind the exact Codex contract."""
+def _preflight_request_projection(request: Mapping[str, Any]) -> dict[str, Any]:
+    """Project a Codex request onto the provider-neutral preflight request contract."""
 
     shadow = json.loads(json.dumps(request))
     shadow["runner"] = {
@@ -167,7 +170,13 @@ def validate_request(request: Mapping[str, Any]) -> None:
         "model": "claude-haiku-4-5-20251001",
         "sampling": {},
     }
-    base.validate_request(shadow)
+    return shadow
+
+
+def validate_request(request: Mapping[str, Any]) -> None:
+    """Validate provider-neutral invariants, then bind the exact Codex contract."""
+
+    base.validate_request(_preflight_request_projection(request))
     expected = {
         "execution_contract": EXECUTION_CONTRACT,
         "provider": PROVIDER,
@@ -731,6 +740,146 @@ def _read_bounded_mcp_line(stream: Any, *, peer: str) -> bytes:
     return raw
 
 
+
+def _normalized_authorized_mcp_files(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or not value:
+        raise RunnerError("preflight MCP command file authorization is missing")
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    expected_keys = {"path", "bytes", "sha256", "mode"}
+    for item in value:
+        if not isinstance(item, dict) or set(item) != expected_keys:
+            raise RunnerError("preflight MCP command file authorization is invalid")
+        path_text = item.get("path")
+        size = item.get("bytes")
+        digest = item.get("sha256")
+        mode = item.get("mode")
+        if (
+            not isinstance(path_text, str)
+            or not Path(path_text).is_absolute()
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or size < 0
+            or size > MAX_PROVIDER_EXECUTABLE_BYTES
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or not isinstance(mode, str)
+            or re.fullmatch(r"0o[0-7]{3}", mode) is None
+            or path_text in seen
+        ):
+            raise RunnerError("preflight MCP command file authorization is invalid")
+        seen.add(path_text)
+        result.append({"path": path_text, "bytes": size, "sha256": digest, "mode": mode})
+    return result
+
+
+def _mcp_authorization_identity(binding: Mapping[str, Any]) -> dict[str, Any]:
+    identity = binding.get("identity")
+    digest = binding.get("sha256")
+    path = binding.get("path")
+    if (
+        not isinstance(identity, tuple)
+        or len(identity) != 4
+        or not isinstance(path, Path)
+        or not isinstance(digest, str)
+    ):
+        raise RunnerError("MCP runtime file binding is invalid")
+    return {
+        "path": str(path.resolve(strict=True)),
+        "bytes": int(identity[2]),
+        "sha256": digest,
+        "mode": oct(stat.S_IMODE(int(identity[3]))),
+    }
+
+
+def _require_private_ledger_directory(path: Path, *, label: str) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise RunnerError(f"{label} is unavailable") from exc
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_mode & 0o077
+    ):
+        raise RunnerError(f"{label} is unsafe")
+
+
+def _load_preflight_mcp_authorization(
+    request: Mapping[str, Any], state_root: Path
+) -> list[dict[str, Any]]:
+    if request.get("condition") != "treatment":
+        raise RunnerError("preflight MCP authorization is only valid for treatment")
+    pair_id = request.get("pair_id")
+    if not isinstance(pair_id, str) or not pair_id:
+        raise RunnerError("preflight MCP authorization pair ID is invalid")
+    pair_digest = hashlib.sha256(pair_id.encode("utf-8")).hexdigest()
+    ledger_root = state_root / "preflight-dispatch-ledger"
+    pair_root = ledger_root / pair_digest
+    _require_private_ledger_directory(ledger_root, label="preflight dispatch ledger")
+    _require_private_ledger_directory(pair_root, label="preflight dispatch pair ledger")
+    authorization_path = pair_root / "authorization.json"
+    raw = _read_bound_regular_file(
+        authorization_path,
+        label="preflight dispatch authorization",
+        max_bytes=MAX_DISPATCH_AUTHORIZATION_BYTES,
+    )
+    try:
+        metadata = authorization_path.lstat()
+    except OSError as exc:
+        raise RunnerError("preflight dispatch authorization disappeared") from exc
+    if metadata.st_mode & 0o077:
+        raise RunnerError("preflight dispatch authorization permissions are unsafe")
+    authorization = base._load_object_bytes(raw, label="preflight dispatch authorization")
+    if (
+        authorization.get("kind") != PREFLIGHT_LEDGER_KIND
+        or authorization.get("version") != PREFLIGHT_LEDGER_VERSION
+        or authorization.get("retry_permitted") is not False
+    ):
+        raise RunnerError("preflight dispatch authorization contract is invalid")
+    binding = authorization.get("binding")
+    contract_sha256 = authorization.get("contract_sha256")
+    if (
+        not isinstance(binding, dict)
+        or not isinstance(contract_sha256, str)
+        or contract_sha256 != base._sha256_json(binding)
+    ):
+        raise RunnerError("preflight dispatch authorization binding is invalid")
+    if binding.get("pair_id") != pair_id or binding.get("state_root") != str(state_root.resolve()):
+        raise RunnerError("preflight dispatch authorization does not bind this pair/state root")
+    requests = binding.get("requests")
+    treatment = requests.get("treatment") if isinstance(requests, dict) else None
+    projection = _preflight_request_projection(request)
+    if (
+        not isinstance(treatment, dict)
+        or treatment.get("request_id") != request.get("request_id")
+        or treatment.get("sha256") != base._sha256_json(projection)
+    ):
+        raise RunnerError("preflight dispatch authorization does not bind this treatment request")
+    repobrief = request.get("repobrief")
+    if not isinstance(repobrief, dict):
+        raise RunnerError("treatment RepoGround binding is invalid")
+    command = repobrief.get("mcp_command")
+    if binding.get("mcp_command_sha256") != base._sha256_json(command):
+        raise RunnerError("preflight dispatch authorization MCP command mismatch")
+    manifest = Path(str(repobrief.get("manifest")))
+    manifest_data = _read_bound_regular_file(
+        manifest, label="RepoGround manifest", max_bytes=MAX_MANIFEST_BYTES
+    )
+    manifest_metadata = manifest.lstat()
+    current_manifest = {
+        "path": str(manifest.resolve(strict=True)),
+        "bytes": len(manifest_data),
+        "sha256": sha_bytes(manifest_data),
+        "mode": oct(manifest_metadata.st_mode & 0o777),
+    }
+    if (
+        current_manifest["sha256"] != repobrief.get("manifest_sha256")
+        or canonical(binding.get("manifest")) != canonical(current_manifest)
+    ):
+        raise RunnerError("preflight dispatch authorization manifest mismatch")
+    return _normalized_authorized_mcp_files(binding.get("mcp_command_files"))
+
 def _bind_mcp_file(path: Path, *, label: str, executable: bool) -> dict[str, Any]:
     if not path.is_absolute():
         raise RunnerError(f"{label} path must be absolute")
@@ -759,7 +908,11 @@ def _revalidate_mcp_file(binding: Mapping[str, Any], *, label: str) -> None:
         raise RunnerError(f"{label} changed during execution")
 
 
-def _bind_mcp_upstream(upstream: Sequence[str], manifest: Path) -> tuple[list[str], list[dict[str, Any]]]:
+def _bind_mcp_upstream(
+    upstream: Sequence[str],
+    manifest: Path,
+    authorized_files: Sequence[Mapping[str, Any]],
+) -> tuple[list[str], list[dict[str, Any]]]:
     executable = Path(upstream[0])
     if not executable.is_absolute():
         resolved = shutil.which(upstream[0], path=provider_env().get("PATH"))
@@ -776,10 +929,18 @@ def _bind_mcp_upstream(upstream: Sequence[str], manifest: Path) -> tuple[list[st
     if len(argv) > 1 and Path(executable).name.startswith("python"):
         script = Path(argv[1])
         if not script.is_absolute():
-            script = (Path.cwd() / script).absolute()
+            script = Path.cwd() / script
+        try:
+            script = script.resolve(strict=True)
+        except OSError as exc:
+            raise RunnerError("MCP script is unavailable") from exc
         script_binding = _bind_mcp_file(script, label="MCP script", executable=False)
         argv[1] = str(script)
         bindings.append(script_binding)
+    expected = _normalized_authorized_mcp_files(list(authorized_files))
+    current = [_mcp_authorization_identity(binding) for binding in bindings]
+    if canonical(current) != canonical(expected):
+        raise RunnerError("MCP program does not match preflight-authorized file identities")
     if "--bundle-root" not in argv:
         raise RunnerError("MCP upstream must declare --bundle-root")
     index = argv.index("--bundle-root")
@@ -809,7 +970,10 @@ def _pin_treatment_arguments(message: dict[str, Any], manifest: Path) -> None:
     arguments["stem"] = None
 
 
-def run_mcp_proxy(upstream: Sequence[str], manifest_text: str, manifest_sha256: str) -> int:
+def run_mcp_proxy(
+    upstream: Sequence[str], manifest_text: str, manifest_sha256: str,
+    authorized_files: Sequence[Mapping[str, Any]],
+) -> int:
     if not upstream or any(not isinstance(item, str) or not item for item in upstream):
         raise RunnerError("invalid MCP upstream argv")
     manifest = Path(manifest_text)
@@ -823,7 +987,9 @@ def run_mcp_proxy(upstream: Sequence[str], manifest_text: str, manifest_sha256: 
         manifest_metadata.st_dev, manifest_metadata.st_ino,
         manifest_metadata.st_size, manifest_metadata.st_mode,
     )
-    bound_upstream, upstream_bindings = _bind_mcp_upstream(upstream, manifest)
+    bound_upstream, upstream_bindings = _bind_mcp_upstream(
+        upstream, manifest, authorized_files
+    )
     try:
         process = subprocess.Popen(
             bound_upstream, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -894,6 +1060,8 @@ def run_mcp_proxy(upstream: Sequence[str], manifest_text: str, manifest_sha256: 
                 message = json.loads(raw)
                 if not isinstance(message, dict):
                     raise RunnerError("MCP client message must be an object")
+                if message.get("jsonrpc") != "2.0":
+                    raise RunnerError("MCP client JSON-RPC version is invalid")
                 method = message.get("method")
                 has_identifier = "id" in message
                 identifier = message.get("id")
@@ -1101,7 +1269,8 @@ def _toml_string(value: str) -> str:
 
 
 def build_command(
-    request: Mapping[str, Any], codex: str, checkout: Path, schema: Path, codex_home: Path
+    request: Mapping[str, Any], codex: str, checkout: Path, schema: Path, codex_home: Path,
+    *, authorized_mcp_files: Sequence[Mapping[str, Any]] | None = None,
 ) -> list[str]:
     filesystem = (
         '{":minimal"="read",":workspace_roots"={"."="read"},'
@@ -1121,11 +1290,14 @@ def build_command(
         "--cd", str(checkout), "--output-schema", str(schema), "-",
     ]
     if request["condition"] == "treatment":
+        if authorized_mcp_files is None:
+            raise RunnerError("treatment requires preflight-authorized MCP file identities")
         upstream = [str(item) for item in request["repobrief"]["mcp_command"]]
         binding = request["repobrief"]
         proxy_args = [
             str(Path(__file__).resolve()), "--codex-mcp-proxy", canonical(upstream),
             str(binding["manifest"]), str(binding["manifest_sha256"]),
+            canonical(list(authorized_mcp_files)),
         ]
         command[2:2] = [
             "-c", 'mcp_servers.repobrief.command="/usr/bin/python3"',
@@ -2028,6 +2200,9 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
         _directory_fd_matches(state_path, state_fd)
     finally:
         os.close(state_fd)
+    authorized_mcp_files: list[dict[str, Any]] | None = None
+    if not synthetic and request["condition"] == "treatment":
+        authorized_mcp_files = _load_preflight_mcp_authorization(request, state_path)
     evidence_plan = prepare_provider_evidence(
         request, args.transcript_root, args.provider_evidence_root
     )
@@ -2044,7 +2219,10 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
             assert codex is not None and auth_data is not None
             codex_home = stage_codex_home(args.state_root, auth_data)
             try:
-                command = build_command(request, codex, checkout, schema, codex_home)
+                command = build_command(
+                    request, codex, checkout, schema, codex_home,
+                    authorized_mcp_files=authorized_mcp_files,
+                )
                 capture = run_bounded(
                     command, cwd=checkout,
                     timeout_seconds=int(request["budgets"]["wall_seconds"]),
@@ -2137,12 +2315,17 @@ def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     if raw and raw[0] == "--codex-mcp-proxy":
         try:
-            if len(raw) != 4:
-                raise RunnerError("codex MCP proxy requires upstream argv, manifest, and SHA")
+            if len(raw) != 5:
+                raise RunnerError(
+                    "codex MCP proxy requires upstream argv, manifest, SHA, and authorized files"
+                )
             upstream = json.loads(raw[1])
+            authorized_files = json.loads(raw[4])
             if not isinstance(upstream, list):
                 raise RunnerError("codex MCP proxy upstream argv must be a list")
-            return run_mcp_proxy(upstream, raw[2], raw[3])
+            if not isinstance(authorized_files, list):
+                raise RunnerError("codex MCP proxy authorized files must be a list")
+            return run_mcp_proxy(upstream, raw[2], raw[3], authorized_files)
         except Exception as exc:
             print(f"codex MCP proxy failed: {exc}", file=sys.stderr)
             return 2
