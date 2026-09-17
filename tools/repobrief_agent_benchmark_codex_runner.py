@@ -707,6 +707,31 @@ def _freeze_resource_result(value: Any) -> tuple[dict[str, Any], set[str]]:
     return {"resources": frozen}, uris
 
 
+def _validated_resource_read_result(value: Any, *, expected_uri: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {"contents", "_meta"}:
+        raise RunnerError("RepoGround resource read result is malformed")
+    contents = value.get("contents")
+    if not isinstance(contents, list) or len(contents) != 1:
+        raise RunnerError("RepoGround resource read result must contain exactly one item")
+    item = contents[0]
+    if not isinstance(item, dict) or set(item) != {"uri", "mimeType", "text"}:
+        raise RunnerError("RepoGround resource read content item is malformed")
+    if item.get("uri") != expected_uri:
+        raise RunnerError("RepoGround resource read URI does not match the frozen request")
+    mime_type = item.get("mimeType")
+    if (
+        not isinstance(mime_type, str)
+        or not mime_type
+        or len(mime_type.encode("utf-8")) > 256
+    ):
+        raise RunnerError("RepoGround resource read mimeType is invalid")
+    if not isinstance(item.get("text"), str):
+        raise RunnerError("RepoGround resource read text is invalid")
+    if not isinstance(value.get("_meta"), dict):
+        raise RunnerError("RepoGround resource read metadata is malformed")
+    return json.loads(json.dumps(value))
+
+
 def _proxy_error(identifier: Any, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": identifier, "error": {"code": -32601, "message": message}}
 
@@ -1648,7 +1673,12 @@ def run_mcp_proxy(
                             text = canonical(frozen_resources)
                         is_error = False
                 else:
-                    text = canonical(message.get("result")); is_error = False
+                    if not isinstance(_uri, str):
+                        raise RunnerError("MCP resource-read request URI is unavailable")
+                    validated_read = _validated_resource_read_result(
+                        message.get("result"), expected_uri=_uri
+                    )
+                    text = canonical(validated_read); is_error = False
                 if action == "list":
                     with state_lock:
                         if resource_list_upstream_id != identifier:

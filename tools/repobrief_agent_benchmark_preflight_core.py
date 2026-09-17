@@ -167,6 +167,32 @@ def _write_report_artifacts(report_path: Path, value: Mapping[str, Any]) -> None
         raise
 
 
+def _remove_report_artifacts(report_path: Path) -> None:
+    report_path = report_path.expanduser().resolve()
+    digest_path = Path(str(report_path) + ".sha256")
+    failures: list[str] = []
+    for path in (digest_path, report_path):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            failures.append(f"{path.name}:{type(exc).__name__}")
+    try:
+        descriptor = os.open(report_path.parent, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0))
+    except OSError as exc:
+        failures.append(f"parent:{type(exc).__name__}")
+    else:
+        try:
+            os.fsync(descriptor)
+        except OSError as exc:
+            failures.append(f"parent-fsync:{type(exc).__name__}")
+        finally:
+            os.close(descriptor)
+    if failures:
+        raise PreflightError(
+            "cannot remove incomplete preflight report artifacts: " + ",".join(failures)
+        )
+
+
 def _file_identity(
     path: Path,
     *,
@@ -1494,6 +1520,7 @@ def authorize_dispatch(
         provider_binding=provider_binding,
     )
     ledger = _initialize_dispatch_ledger(binding=binding, state_root=state_root)
+    report_persisted = False
     try:
         _assert_output_paths_available(
             baseline=baseline,
@@ -1555,6 +1582,7 @@ def authorize_dispatch(
         # Durable producer evidence must exist before the capability becomes
         # consumable.  A report/digest failure therefore leaves no authorization.
         _write_report_artifacts(report_out, report)
+        report_persisted = True
 
         publication_source = source_state(source)
         _assert_source_unchanged(before, publication_source)
@@ -1576,7 +1604,15 @@ def authorize_dispatch(
         _publish_dispatch_authorization(ledger, binding, prepared=publication)
         return report
     except Exception as exc:
-        _record_preflight_failure(ledger, exc)
+        cleanup_error: Exception | None = None
+        if report_persisted and ledger.get("authorization_sha256") is None:
+            try:
+                _remove_report_artifacts(report_out)
+            except Exception as report_cleanup_exc:
+                cleanup_error = report_cleanup_exc
+        _record_preflight_failure(ledger, cleanup_error or exc)
+        if cleanup_error is not None:
+            raise cleanup_error from exc
         raise
 
 def execute_preflight(

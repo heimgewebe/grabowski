@@ -1340,6 +1340,61 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             )
             self.assertEqual(count_path.read_text(), "1")
 
+    def test_mcp_proxy_rejects_malformed_resource_read_result(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            upstream = root / "mcp.py"
+            upstream.write_text(
+                "import json, sys\n"
+                f"TOOLS = {treatment_tools()!r}\n"
+                "for line in sys.stdin:\n"
+                "    m=json.loads(line); method=m.get('method'); ident=m.get('id')\n"
+                "    if method=='tools/list':\n"
+                "        print(json.dumps({'jsonrpc':'2.0','id':ident,'result':{'tools':TOOLS}}),flush=True)\n"
+                "    elif method=='resources/list':\n"
+                "        print(json.dumps({'jsonrpc':'2.0','id':ident,'result':{'resources':[{'uri':'repobrief://frozen/a'}]}}),flush=True)\n"
+                "    elif method=='resources/read':\n"
+                "        print(json.dumps({'jsonrpc':'2.0','id':ident,'result':None}),flush=True)\n",
+                encoding="utf-8",
+            )
+            process = subprocess.Popen(
+                proxy_command(upstream, root),
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertIsNotNone(process.stdin)
+            self.assertIsNotNone(process.stdout)
+            self.assertIsNotNone(process.stderr)
+
+            def roundtrip(message: dict) -> dict:
+                assert process.stdin is not None and process.stdout is not None
+                process.stdin.write(json.dumps(message).encode() + b"\n")
+                process.stdin.flush()
+                return json.loads(process.stdout.readline())
+
+            tools = roundtrip(
+                {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}
+            )
+            self.assertIn("result", tools)
+            listed = roundtrip(
+                {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                    "name":"repobrief_resource_read",
+                    "arguments":{"action":"list"},
+                }}
+            )
+            self.assertFalse(listed["result"]["isError"])
+            process.stdin.write(json.dumps(
+                {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+                    "name":"repobrief_resource_read",
+                    "arguments":{"action":"read","uri":"repobrief://frozen/a"},
+                }}
+            ).encode() + b"\n")
+            process.stdin.flush()
+            process.stdin.close()
+            stderr = process.stderr.read()
+            returncode = process.wait(timeout=5)
+            self.assertNotEqual(returncode, 0)
+            self.assertIn(b"resource read result is malformed", stderr)
+
     def test_mcp_proxy_exposes_exact_benchmark_surface(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -1923,6 +1923,78 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
             self.assertNotIn("authorized", [event["event"] for event in events])
             self.assertEqual(events[-1]["event"], "preflight-failed")
 
+    def test_post_report_revalidation_failure_removes_success_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = support.fixture_environment(root)
+            pair_id, _, _ = self._codex_pair(environment)
+            state_root = root / "state"
+            report_out = root / "preflight-report.json"
+            codex = root / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            codex.chmod(0o755)
+            codex_sha256 = hashlib.sha256(codex.read_bytes()).hexdigest()
+            original_source_state = codex_preflight.core.source_state
+            calls = 0
+
+            def mutate_after_report(source: Path) -> dict:
+                nonlocal calls
+                calls += 1
+                if calls == 3:
+                    (source / "post-report-drift.txt").write_text(
+                        "changed", encoding="utf-8"
+                    )
+                return original_source_state(source)
+
+            with (
+                mock.patch.object(
+                    codex_preflight.codex_runner,
+                    "validate_executable",
+                    return_value=str(codex.resolve()),
+                ),
+                mock.patch.object(codex_preflight.codex_runner, "validate_toolchain"),
+                mock.patch.object(
+                    codex_preflight.codex_runner,
+                    "validate_chatgpt_subscription",
+                    return_value=b'{"tokens":{}}',
+                ),
+                mock.patch.object(
+                    codex_preflight.core,
+                    "source_state",
+                    side_effect=mutate_after_report,
+                ),
+                self.assertRaisesRegex(
+                    codex_preflight.core.PreflightError, "source checkout changed"
+                ),
+            ):
+                codex_preflight.authorize_pair(
+                    pair_id=pair_id,
+                    request_root=environment["request_root"],
+                    repository_map=environment["repository_map"],
+                    state_root=state_root,
+                    transcript_root=root / "transcripts",
+                    evidence_root=root / "evidence",
+                    report_out=report_out,
+                    codex_command=str(codex.resolve()),
+                    codex_command_sha256=codex_sha256,
+                    max_cost_usd=support.Decimal("1.00"),
+                    validator_command=codex_preflight.core._command_array(
+                        environment["validator_command"]
+                    ),
+                )
+
+            self.assertFalse(report_out.exists())
+            self.assertFalse(Path(str(report_out) + ".sha256").exists())
+            pair_digest = hashlib.sha256(pair_id.encode("utf-8")).hexdigest()
+            pair_root = state_root / "preflight-dispatch-ledger" / pair_digest
+            self.assertFalse((pair_root / "authorization.json").exists())
+            events = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in sorted((pair_root / "events").glob("*.json"))
+            ]
+            self.assertNotIn("authorized", [event["event"] for event in events])
+            self.assertEqual(events[-1]["event"], "preflight-failed")
+
     def test_provider_specific_request_validation_has_no_cross_provider_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
