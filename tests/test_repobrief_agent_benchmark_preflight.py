@@ -2069,6 +2069,140 @@ class McpCommandFileIdentityTests(unittest.TestCase):
             )
             self.assertEqual([item["path"] for item in legacy], [str(executable)])
 
+    def test_freshness_rpc_rejects_missing_jsonrpc_envelope(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            server = root / "mcp.py"
+            server.write_text(
+                "import json, sys\n"
+                "first=json.loads(sys.stdin.readline())\n"
+                "print(json.dumps({'jsonrpc':'2.0','id':first['id'],'result':{}}), flush=True)\n"
+                "second=json.loads(sys.stdin.readline())\n"
+                "print(json.dumps({'id':second['id'],'result':{'structuredContent':{'status':'fresh'}}}), flush=True)\n",
+                encoding="utf-8",
+            )
+            process = support.preflight._core.subprocess.Popen(
+                [sys.executable, str(server)],
+                stdin=support.preflight._core.subprocess.PIPE,
+                stdout=support.preflight._core.subprocess.PIPE,
+                stderr=support.preflight._core.subprocess.PIPE,
+            )
+            try:
+                support.preflight._core._rpc(
+                    process,
+                    {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}},
+                    timeout_seconds=2,
+                )
+                with self.assertRaisesRegex(
+                    support.preflight._core.PreflightError,
+                    "response envelope is invalid",
+                ):
+                    support.preflight._core._rpc(
+                        process,
+                        {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{}},
+                        timeout_seconds=2,
+                    )
+            finally:
+                if process.stdin is not None:
+                    process.stdin.close()
+                process.wait(timeout=2)
+                if process.stdout is not None:
+                    process.stdout.close()
+                if process.stderr is not None:
+                    process.stderr.close()
+
+    def test_freshness_rpc_rejects_unterminated_response_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            server = root / "mcp.py"
+            server.write_text(
+                "import json, sys\n"
+                "request=json.loads(sys.stdin.readline())\n"
+                "sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':{'structuredContent':{'status':'fresh'}}}))\n"
+                "sys.stdout.flush()\n",
+                encoding="utf-8",
+            )
+            process = support.preflight._core.subprocess.Popen(
+                [sys.executable, str(server)],
+                stdin=support.preflight._core.subprocess.PIPE,
+                stdout=support.preflight._core.subprocess.PIPE,
+                stderr=support.preflight._core.subprocess.PIPE,
+            )
+            try:
+                with self.assertRaisesRegex(
+                    support.preflight._core.PreflightError,
+                    "not newline terminated",
+                ):
+                    support.preflight._core._rpc(
+                        process,
+                        {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{}},
+                        timeout_seconds=2,
+                    )
+            finally:
+                if process.stdin is not None:
+                    process.stdin.close()
+                process.wait(timeout=2)
+                if process.stdout is not None:
+                    process.stdout.close()
+                if process.stderr is not None:
+                    process.stderr.close()
+
+    def test_mcp_path_executable_uses_explicit_runtime_search_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime_bin = root / "runtime-bin"
+            runtime_bin.mkdir()
+            executable = runtime_bin / "python3"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o755)
+            script = root / "server.py"
+            script.write_text("pass\n", encoding="utf-8")
+
+            identities = support.preflight._core._command_file_identities(
+                ["python3", "server.py"],
+                relative_to=root,
+                executable_search_path=str(runtime_bin),
+            )
+
+            self.assertEqual(
+                [item["path"] for item in identities],
+                [str(executable.resolve()), str(script.resolve())],
+            )
+            with self.assertRaisesRegex(
+                support.preflight._core.PreflightError,
+                "MCP command executable is unavailable on the runtime PATH",
+            ):
+                support.preflight._core._command_file_identities(
+                    ["missing-python", "server.py"],
+                    relative_to=root,
+                    executable_search_path=str(runtime_bin),
+                )
+
+    def test_codex_code_identity_rejects_post_startup_source_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = support.fixture_environment(root)
+            _, _, treatment = CodexProductionAuthorizationTests._codex_pair(environment)
+            source = root / "repobrief_agent_benchmark_codex_preflight.py"
+            source.write_text("before = 1\n", encoding="utf-8")
+            _, identity = codex_preflight.core._read_startup_source_snapshot(
+                source, label="test preflight source"
+            )
+            codex_preflight.core._register_startup_code_identity(identity)
+            key = str(source.resolve())
+            try:
+                source.write_text("after = 2\n", encoding="utf-8")
+                with mock.patch.object(
+                    codex_preflight.core, "CODEX_PREFLIGHT_PATH", source
+                ):
+                    with self.assertRaisesRegex(
+                        codex_preflight.core.PreflightError,
+                        "preflight code file changed after module load",
+                    ):
+                        codex_preflight.core._preflight_code_identity(treatment)
+            finally:
+                codex_preflight.core._STARTUP_CODE_IDENTITIES.pop(key, None)
+
 
 if __name__ == "__main__":
     unittest.main()

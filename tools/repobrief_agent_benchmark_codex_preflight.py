@@ -10,21 +10,82 @@ from __future__ import annotations
 
 import argparse
 from decimal import Decimal, InvalidOperation
+import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import stat
 import sys
 from typing import Any
 
 
+SOURCE_SNAPSHOT_MAX_BYTES = 16 * 1024 * 1024
+
+
+def _read_source_snapshot(path: Path) -> tuple[bytes, dict[str, Any]]:
+    requested = path.expanduser()
+    before = requested.lstat()
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise RuntimeError(f"cannot safely load {path.name}")
+    if before.st_size <= 0 or before.st_size > SOURCE_SNAPSHOT_MAX_BYTES:
+        raise RuntimeError(f"cannot safely load {path.name}")
+    descriptor = os.open(
+        requested, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino, opened.st_size) != (
+            before.st_dev, before.st_ino, before.st_size
+        ):
+            raise RuntimeError(f"{path.name} changed before load")
+        data = bytearray()
+        while len(data) <= SOURCE_SNAPSHOT_MAX_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(1024 * 1024, SOURCE_SNAPSHOT_MAX_BYTES + 1 - len(data)),
+            )
+            if not chunk:
+                break
+            data.extend(chunk)
+    finally:
+        os.close(descriptor)
+    after = requested.lstat()
+    if (
+        len(data) != opened.st_size
+        or len(data) > SOURCE_SNAPSHOT_MAX_BYTES
+        or (after.st_dev, after.st_ino, after.st_size)
+        != (opened.st_dev, opened.st_ino, opened.st_size)
+    ):
+        raise RuntimeError(f"{path.name} changed during load")
+    resolved = requested.resolve()
+    return bytes(data), {
+        "path": str(resolved),
+        "name": resolved.name,
+        "bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+
+
+_SELF_SOURCE_RAW, _SELF_SOURCE_IDENTITY = _read_source_snapshot(Path(__file__))
+
+
 def _load(name: str, path: Path) -> Any:
+    raw, identity = _read_source_snapshot(path)
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load {path.name}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
-    spec.loader.exec_module(module)
+    try:
+        exec(compile(raw, str(path), "exec"), module.__dict__)
+        _after_raw, after_identity = _read_source_snapshot(path)
+        if after_identity != identity:
+            raise RuntimeError(f"{path.name} changed while being loaded")
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    module.__grabowski_source_identity__ = dict(identity)
     return module
 
 
@@ -32,6 +93,9 @@ CORE_PATH = Path(__file__).with_name("repobrief_agent_benchmark_preflight_core.p
 CODEX_RUNNER_PATH = Path(__file__).with_name("repobrief_agent_benchmark_codex_runner.py")
 core = _load("repobrief_agent_benchmark_preflight_core_for_codex", CORE_PATH)
 codex_runner = _load("repobrief_agent_benchmark_codex_runner_for_authorization", CODEX_RUNNER_PATH)
+core._register_startup_code_identity(core.__grabowski_source_identity__)
+core._register_startup_code_identity(_SELF_SOURCE_IDENTITY)
+core._register_startup_code_identity(codex_runner.__grabowski_source_identity__)
 
 
 def _validated_codex_provider_binding(

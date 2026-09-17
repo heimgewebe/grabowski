@@ -24,16 +24,118 @@ import time
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-MODULE_PATH = Path(__file__).with_name("repobrief_agent_benchmark_runner.py")
-SPEC = importlib.util.spec_from_file_location("repobrief_agent_benchmark_runner", MODULE_PATH)
-if SPEC is None or SPEC.loader is None:
-    raise RuntimeError("cannot load RepoBrief benchmark runner")
-runner = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = runner
-SPEC.loader.exec_module(runner)
+SOURCE_SNAPSHOT_MAX_BYTES = 16 * 1024 * 1024
 
+
+def _read_startup_source_snapshot(path: Path, *, label: str) -> tuple[bytes, dict[str, Any]]:
+    requested = path.expanduser()
+    try:
+        before = requested.lstat()
+    except OSError as exc:
+        raise RuntimeError(f"{label} is unavailable") from exc
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise RuntimeError(f"{label} must be a regular non-symlink file")
+    if before.st_size <= 0 or before.st_size > SOURCE_SNAPSHOT_MAX_BYTES:
+        raise RuntimeError(f"{label} is empty or oversized")
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(requested, flags)
+    except OSError as exc:
+        raise RuntimeError(f"{label} could not be opened safely") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino, opened.st_size) != (
+            before.st_dev, before.st_ino, before.st_size
+        ):
+            raise RuntimeError(f"{label} changed before load")
+        data = bytearray()
+        while len(data) <= SOURCE_SNAPSHOT_MAX_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(1024 * 1024, SOURCE_SNAPSHOT_MAX_BYTES + 1 - len(data)),
+            )
+            if not chunk:
+                break
+            data.extend(chunk)
+    finally:
+        os.close(descriptor)
+    try:
+        after = requested.lstat()
+    except OSError as exc:
+        raise RuntimeError(f"{label} disappeared during load") from exc
+    if (
+        len(data) != opened.st_size
+        or len(data) > SOURCE_SNAPSHOT_MAX_BYTES
+        or (after.st_dev, after.st_ino, after.st_size)
+        != (opened.st_dev, opened.st_ino, opened.st_size)
+    ):
+        raise RuntimeError(f"{label} changed during load")
+    resolved = requested.resolve()
+    identity = {
+        "path": str(resolved),
+        "name": resolved.name,
+        "bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+    return bytes(data), identity
+
+
+def _record_startup_code_identity(identity: Mapping[str, Any]) -> None:
+    path = identity.get("path")
+    if not isinstance(path, str) or not path:
+        raise RuntimeError("preflight startup code identity is invalid")
+    current = {
+        "path": path,
+        "name": identity.get("name"),
+        "bytes": identity.get("bytes"),
+        "sha256": identity.get("sha256"),
+    }
+    previous = _STARTUP_CODE_IDENTITIES.get(path)
+    if previous is not None and previous != current:
+        raise RuntimeError("preflight code changed between module loads")
+    _STARTUP_CODE_IDENTITIES[path] = current
+
+
+def _load_startup_source_module(
+    name: str, path: Path, raw: bytes, identity: Mapping[str, Any]
+) -> Any:
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {path.name}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        exec(compile(raw, str(path), "exec"), module.__dict__)
+        _after_raw, after_identity = _read_startup_source_snapshot(
+            path, label=f"{path.name} source"
+        )
+        if dict(identity) != after_identity:
+            raise RuntimeError(f"{path.name} changed while being loaded")
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    module.__grabowski_source_identity__ = dict(identity)
+    return module
+
+
+MODULE_PATH = Path(__file__).with_name("repobrief_agent_benchmark_runner.py")
 CODEX_MODULE_PATH = Path(__file__).with_name("repobrief_agent_benchmark_codex_runner.py")
 CODEX_PREFLIGHT_PATH = Path(__file__).with_name("repobrief_agent_benchmark_codex_preflight.py")
+_STARTUP_CODE_IDENTITIES: dict[str, dict[str, Any]] = {}
+_CORE_SOURCE_RAW, _CORE_SOURCE_IDENTITY = _read_startup_source_snapshot(
+    Path(__file__), label="preflight core source"
+)
+_RUNNER_SOURCE_RAW, _RUNNER_SOURCE_IDENTITY = _read_startup_source_snapshot(
+    MODULE_PATH, label="benchmark runner source"
+)
+_record_startup_code_identity(_CORE_SOURCE_IDENTITY)
+_record_startup_code_identity(_RUNNER_SOURCE_IDENTITY)
+runner = _load_startup_source_module(
+    "repobrief_agent_benchmark_runner",
+    MODULE_PATH,
+    _RUNNER_SOURCE_RAW,
+    _RUNNER_SOURCE_IDENTITY,
+)
 _codex_runner_cache: Any | None = None
 
 
@@ -41,14 +143,19 @@ def _codex_runner_module() -> Any:
     global _codex_runner_cache
     if _codex_runner_cache is not None:
         return _codex_runner_cache
-    spec = importlib.util.spec_from_file_location(
-        "repobrief_agent_benchmark_codex_runner_for_preflight", CODEX_MODULE_PATH
-    )
-    if spec is None or spec.loader is None:
-        raise PreflightError("cannot load Codex benchmark runner")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+    try:
+        raw, identity = _read_startup_source_snapshot(
+            CODEX_MODULE_PATH, label="Codex benchmark runner source"
+        )
+        _record_startup_code_identity(identity)
+        module = _load_startup_source_module(
+            "repobrief_agent_benchmark_codex_runner_for_preflight",
+            CODEX_MODULE_PATH,
+            raw,
+            identity,
+        )
+    except RuntimeError as exc:
+        raise PreflightError(str(exc)) from exc
     _codex_runner_cache = module
     return module
 
@@ -84,6 +191,13 @@ DOES_NOT_ESTABLISH = (
 
 class PreflightError(ValueError):
     """The preflight contract or evidence is invalid."""
+
+
+def _register_startup_code_identity(identity: Mapping[str, Any]) -> None:
+    try:
+        _record_startup_code_identity(identity)
+    except RuntimeError as exc:
+        raise PreflightError(str(exc)) from exc
 
 
 def _utc_now() -> datetime:
@@ -257,19 +371,28 @@ def _file_identity(
 
 
 def _command_file_identities(
-    command: Sequence[Any], *, relative_to: Path | None = None
+    command: Sequence[Any],
+    *,
+    relative_to: Path | None = None,
+    executable_search_path: str | None = None,
 ) -> list[dict[str, Any]]:
     identities: list[dict[str, Any]] = []
     seen: set[str] = set()
     relative_root = None if relative_to is None else relative_to.expanduser().resolve()
-    for raw in command:
+    for index, raw in enumerate(command):
         if not isinstance(raw, str) or not raw:
             continue
         candidate = Path(raw).expanduser()
         if not candidate.is_absolute():
-            if relative_root is None:
+            if index == 0 and executable_search_path is not None:
+                resolved_executable = shutil.which(raw, path=executable_search_path)
+                if resolved_executable is None:
+                    raise PreflightError("MCP command executable is unavailable on the runtime PATH")
+                candidate = Path(resolved_executable)
+            elif relative_root is None:
                 continue
-            candidate = relative_root / candidate
+            else:
+                candidate = relative_root / candidate
         if not candidate.exists():
             continue
         resolved = candidate.resolve()
@@ -335,21 +458,33 @@ def _preflight_code_identity(request: Mapping[str, Any]) -> dict[str, Any]:
             MODULE_PATH.resolve(),
             CODEX_MODULE_PATH.resolve(),
         )
+    require_startup_binding = selected is not runner
     files: list[dict[str, Any]] = []
     for path in paths:
-        if path.is_symlink() or not path.is_file():
-            raise PreflightError(f"preflight code file is unavailable: {path.name}")
-        try:
-            raw = path.read_bytes()
-        except OSError as exc:
-            raise PreflightError(f"cannot read preflight code file: {path.name}") from exc
-        if not raw or len(raw) > MAX_LEDGER_ARTIFACT_BYTES:
-            raise PreflightError(f"preflight code file is empty or oversized: {path.name}")
+        current = _file_identity(
+            path,
+            maximum=MAX_LEDGER_ARTIFACT_BYTES,
+            label=f"preflight code file {path.name}",
+        )
+        startup = _STARTUP_CODE_IDENTITIES.get(str(path.resolve()))
+        if startup is not None:
+            if (
+                startup.get("name") != path.name
+                or startup.get("bytes") != current.get("bytes")
+                or startup.get("sha256") != current.get("sha256")
+            ):
+                raise PreflightError(
+                    f"preflight code file changed after module load: {path.name}"
+                )
+        elif require_startup_binding:
+            raise PreflightError(
+                f"preflight code file lacks startup binding: {path.name}"
+            )
         files.append(
             {
                 "name": path.name,
-                "bytes": len(raw),
-                "sha256": _sha256_bytes(raw),
+                "bytes": current["bytes"],
+                "sha256": current["sha256"],
             }
         )
     return {
@@ -431,7 +566,13 @@ def _dispatch_binding(
         ),
         "mcp_command_sha256": _sha256_json(mcp_command),
         "mcp_command_files": _command_file_identities(
-            mcp_command, relative_to=Path.cwd()
+            mcp_command,
+            relative_to=Path.cwd(),
+            executable_search_path=(
+                _request_validation_runner(treatment).provider_env().get("PATH")
+                if treatment.get("runner", {}).get("provider") == "openai-codex-cli"
+                else None
+            ),
         ),
         "state_root": str(state_root.expanduser().resolve()),
         "transcript_root": str(transcript_root.expanduser().resolve()),
@@ -1171,6 +1312,8 @@ def _readline_with_timeout(stream, *, timeout_seconds: float) -> bytes:
         raise PreflightError("RepoBrief MCP closed before responding")
     if len(line) > MAX_MCP_LINE_BYTES:
         raise PreflightError("RepoBrief MCP response is oversized")
+    if not line.endswith(b"\n"):
+        raise PreflightError("RepoBrief MCP response is not newline terminated")
     return line
 
 
@@ -1184,9 +1327,17 @@ def _rpc(process: subprocess.Popen, message: Mapping[str, Any], *, timeout_secon
         response = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise PreflightError("RepoBrief MCP returned invalid JSON") from exc
-    if not isinstance(response, dict) or response.get("id") != message.get("id"):
-        raise PreflightError("RepoBrief MCP response identity mismatch")
-    if "error" in response:
+    if (
+        not isinstance(response, dict)
+        or response.get("jsonrpc") != "2.0"
+        or response.get("id") != message.get("id")
+    ):
+        raise PreflightError("RepoBrief MCP response envelope is invalid")
+    has_result = "result" in response
+    has_error = "error" in response
+    if has_result == has_error:
+        raise PreflightError("RepoBrief MCP response envelope is invalid")
+    if has_error:
         raise PreflightError("RepoBrief MCP returned a JSON-RPC error")
     result = response.get("result")
     if not isinstance(result, dict):
