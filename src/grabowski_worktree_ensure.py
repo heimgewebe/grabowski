@@ -1009,11 +1009,15 @@ def _validate_adler_sidecar_directory(sidecar: Path) -> None:
         raise WorktreeEnsureAction(".adler permissions are broader than 0700")
 
 
-def _validate_adler_sidecar_static(sidecar: Path) -> None:
-    _validate_adler_sidecar_directory(sidecar)
+def _validate_adler_sidecar_entries(sidecar: Path) -> None:
     unexpected = {entry.name for entry in sidecar.iterdir()} - {".gitignore", "inbox.json"}
     if unexpected:
         raise WorktreeEnsureAction(".adler contains entries outside the minimal sidecar contract")
+
+
+def _validate_adler_sidecar_static(sidecar: Path) -> None:
+    _validate_adler_sidecar_directory(sidecar)
+    _validate_adler_sidecar_entries(sidecar)
     gitignore = sidecar / ".gitignore"
     gi = gitignore.lstat()
     if not stat.S_ISREG(gi.st_mode) or stat.S_ISLNK(gi.st_mode) or gi.st_uid != os.geteuid() or gi.st_nlink != 1:
@@ -1073,6 +1077,7 @@ def _configure_adler_sidecar_pointer(
         except FileExistsError:
             pass
         _validate_adler_sidecar_directory(sidecar)
+        _validate_adler_sidecar_entries(sidecar)
         pointer = sidecar / "inbox.json"
         observed_target: str | None = None
         if os.path.lexists(pointer):
@@ -1148,6 +1153,30 @@ def _configure_adler_sidecar_pointer(
         }
 
 
+def _configure_adler_sidecar_pointer_with_live_lease(
+    inputs: dict[str, Any],
+    inspect_lease: LeaseInspector,
+    *,
+    previous_sidecar: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    lane_id = _adler_lane_id(inputs)
+    if lane_id is None:
+        return {"state": "not_applicable", "reason": "checkout_is_not_exact_work_lane_owned"}
+    lease = _lease_state(inputs, inspect_lease)
+    if not lease["valid"]:
+        return {
+            "state": "unavailable",
+            "lane_id": lane_id,
+            "error": "Adler sidecar mutation skipped because the required lease is not live and owner-bound",
+            "lease_reasons": list(lease.get("reasons", [])),
+            "blocking": False,
+            "absence_semantics": "unknown_not_no_findings",
+        }
+    return _configure_adler_sidecar_pointer(
+        inputs, previous_sidecar=previous_sidecar
+    )
+
+
 def _after_worktree_mutation() -> None:
     """Fault-injection seam used by tests; production behavior is intentionally empty."""
 
@@ -1221,8 +1250,10 @@ def ensure_worktree(
                 assert observation is not None
                 lifecycle = _bind_checkout_lifecycle(inputs, observation, existing["lease"])
             current_adler_sidecar = (
-                _configure_adler_sidecar_pointer(
-                    inputs, previous_sidecar=existing.get("adler_sidecar")
+                _configure_adler_sidecar_pointer_with_live_lease(
+                    inputs,
+                    inspect_lease,
+                    previous_sidecar=existing.get("adler_sidecar"),
                 )
                 if result_state in SUCCESS_STATES
                 else None
@@ -1270,7 +1301,9 @@ def ensure_worktree(
                 )
                 record["lease"] = lease
                 record["recovery_without_live_lease"] = not lease["valid"]
-                record["adler_sidecar"] = _configure_adler_sidecar_pointer(inputs)
+                record["adler_sidecar"] = _configure_adler_sidecar_pointer_with_live_lease(
+                    inputs, inspect_lease
+                )
                 record["lifecycle"] = _bind_checkout_lifecycle(inputs, observation, lease)
                 written = _write_receipt(receipt_path, record)
                 return _public_output(written, receipt_path, replayed=True, recovered=True)
@@ -1340,7 +1373,9 @@ def ensure_worktree(
                 error="",
             )
             record["lease"] = lease
-            record["adler_sidecar"] = _configure_adler_sidecar_pointer(inputs)
+            record["adler_sidecar"] = _configure_adler_sidecar_pointer_with_live_lease(
+                inputs, inspect_lease
+            )
             record["lifecycle"] = _bind_checkout_lifecycle(inputs, observation, lease)
             written = _write_receipt(receipt_path, record)
             return _public_output(written, receipt_path, replayed=False, recovered=False)
@@ -1534,7 +1569,9 @@ def ensure_worktree(
             )
             record["lease"] = lease
             record["work_admission"] = admission
-            record["adler_sidecar"] = _configure_adler_sidecar_pointer(inputs)
+            record["adler_sidecar"] = _configure_adler_sidecar_pointer_with_live_lease(
+                inputs, inspect_lease
+            )
             record["lifecycle"] = _bind_checkout_lifecycle(inputs, post_state, lease)
             record["mutation"] = {
                 "returncode": _returncode(mutation),
