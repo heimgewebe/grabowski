@@ -26,6 +26,27 @@ support = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = support
 SPEC.loader.exec_module(support)
 
+
+def _load_tool_module(name: str, filename: str):
+    path = ROOT / "tools" / filename
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {filename}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+codex_runner = _load_tool_module(
+    "repobrief_agent_benchmark_codex_runner_for_preflight_tests",
+    "repobrief_agent_benchmark_codex_runner.py",
+)
+codex_preflight = _load_tool_module(
+    "repobrief_agent_benchmark_codex_preflight_for_tests",
+    "repobrief_agent_benchmark_codex_preflight.py",
+)
+
 _ORIGINAL_EXECUTE_PREFLIGHT = support.preflight.execute_preflight
 _TEST_PROVIDER_BINDING_ISSUED_AT: dict[Path, str] = {}
 
@@ -1545,6 +1566,224 @@ class RepoBriefAgentBenchmarkPreflightLedgerTests(unittest.TestCase):
             self.assertEqual(events[-1]["event"], "preflight-failed")
             self.assertEqual(events[-1]["payload"]["fixture_intents"], 2)
             self.assertFalse(events[-1]["payload"]["retry_permitted"])
+
+
+class CodexProductionAuthorizationTests(unittest.TestCase):
+    @staticmethod
+    def _codex_pair(environment: dict) -> tuple[str, dict, dict]:
+        pair_id = f"{support.TASKSET}:{support.CASE}:r2"
+        requests = []
+        for original in (environment["baseline"], environment["treatment"]):
+            value = json.loads(json.dumps(original))
+            condition = value["condition"]
+            request_id = f"{pair_id}:{condition}"
+            value["pair_id"] = pair_id
+            value["repetition"] = 2
+            value["request_id"] = request_id
+            value["session_id"] = f"session:{request_id}"
+            value["workspace_id"] = f"workspace:{request_id}"
+            value["runner"] = {
+                "execution_contract": codex_runner.EXECUTION_CONTRACT,
+                "provider": codex_runner.PROVIDER,
+                "model": codex_runner.MODEL,
+                "sampling": codex_runner.SAMPLING,
+            }
+            requests.append(value)
+        request_root = environment["request_root"]
+        for path in request_root.glob("*.json"):
+            path.unlink()
+        for value in requests:
+            filename = value["request_id"].replace(":", "__") + ".json"
+            (request_root / filename).write_text(
+                json.dumps(value, sort_keys=True), encoding="utf-8"
+            )
+        environment["baseline"], environment["treatment"] = requests
+        return pair_id, requests[0], requests[1]
+
+    def test_codex_producer_ledger_is_consumable_by_exact_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = support.fixture_environment(root)
+            pair_id, baseline, treatment = self._codex_pair(environment)
+            state_root = root / "state"
+            transcript_root = root / "transcripts"
+            evidence_root = root / "evidence"
+            report_out = root / "preflight-report.json"
+            codex = root / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            codex.chmod(0o755)
+            codex_sha256 = hashlib.sha256(codex.read_bytes()).hexdigest()
+
+            with (
+                mock.patch.object(
+                    codex_preflight.codex_runner,
+                    "validate_executable",
+                    return_value=str(codex.resolve()),
+                ),
+                mock.patch.object(codex_preflight.codex_runner, "validate_toolchain"),
+                mock.patch.object(
+                    codex_preflight.codex_runner,
+                    "validate_chatgpt_subscription",
+                    return_value=b'{"tokens":{}}',
+                ),
+            ):
+                report = codex_preflight.authorize_pair(
+                    pair_id=pair_id,
+                    request_root=environment["request_root"],
+                    repository_map=environment["repository_map"],
+                    state_root=state_root,
+                    transcript_root=transcript_root,
+                    evidence_root=evidence_root,
+                    report_out=report_out,
+                    codex_command=str(codex.resolve()),
+                    codex_command_sha256=codex_sha256,
+                    max_cost_usd=support.Decimal("1.00"),
+                    validator_command=codex_preflight.core._command_array(
+                        environment["validator_command"]
+                    ),
+                )
+
+            self.assertEqual(report["status"], "authorized")
+            authorization_path = Path(report["dispatch_ledger"]["authorization"])
+            authorization = json.loads(authorization_path.read_text(encoding="utf-8"))
+            binding = authorization["binding"]
+            self.assertEqual(
+                binding["requests"]["treatment"]["sha256"],
+                codex_runner.base._sha256_json(treatment),
+            )
+            self.assertEqual(
+                binding["requests"]["baseline"]["sha256"],
+                codex_runner.base._sha256_json(baseline),
+            )
+            self.assertGreaterEqual(len(binding["mcp_command_files"]), 2)
+            code_files = {item["name"]: item for item in binding["code"]["files"]}
+            self.assertIn(Path(codex_runner.__file__).name, code_files)
+
+            consumed = codex_runner._load_preflight_dispatch_authorization(
+                treatment, state_root
+            )
+            self.assertEqual(
+                consumed["proxy_code"]["sha256"],
+                code_files[Path(codex_runner.__file__).name]["sha256"],
+            )
+            self.assertEqual(
+                [str(item["path"]) for item in consumed["mcp_files"]],
+                [item["path"] for item in binding["mcp_command_files"]],
+            )
+
+    def test_authorize_dispatch_rejects_cross_provider_binding_before_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = support.fixture_environment(root)
+            claude_baseline, _ = support.preflight.load_pair(
+                environment["request_root"], support.PAIR_ID
+            )
+            pair_id, _, _ = self._codex_pair(environment)
+            bad_state = root / "bad-state"
+            with self.assertRaisesRegex(
+                codex_preflight.core.PreflightError,
+                "provider binding does not match treatment runner contract",
+            ):
+                codex_preflight.core.authorize_dispatch(
+                    pair_id=pair_id,
+                    request_root=environment["request_root"],
+                    repository_map=environment["repository_map"],
+                    state_root=bad_state,
+                    transcript_root=root / "transcripts",
+                    evidence_root=root / "evidence",
+                    report_out=root / "report.json",
+                    provider_binding={
+                        "mode": "live_provider",
+                        "runner": dict(claude_baseline["runner"]),
+                    },
+                    max_cost_usd=support.Decimal("1.00"),
+                    validator_command=codex_preflight.core._command_array(
+                        environment["validator_command"]
+                    ),
+                )
+            self.assertFalse(bad_state.exists())
+
+    def test_authorize_dispatch_rejects_nonfinite_cost_before_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = support.fixture_environment(root)
+            pair_id, _, treatment = self._codex_pair(environment)
+            bad_state = root / "nan-state"
+            with self.assertRaisesRegex(
+                codex_preflight.core.PreflightError, "max cost must be finite"
+            ):
+                codex_preflight.core.authorize_dispatch(
+                    pair_id=pair_id,
+                    request_root=environment["request_root"],
+                    repository_map=environment["repository_map"],
+                    state_root=bad_state,
+                    transcript_root=root / "transcripts",
+                    evidence_root=root / "evidence",
+                    report_out=root / "report.json",
+                    provider_binding={
+                        "mode": "live_provider",
+                        "runner": dict(treatment["runner"]),
+                    },
+                    max_cost_usd=support.Decimal("NaN"),
+                    validator_command=codex_preflight.core._command_array(
+                        environment["validator_command"]
+                    ),
+                )
+            self.assertFalse(bad_state.exists())
+
+    def test_provider_specific_request_validation_has_no_cross_provider_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = support.fixture_environment(root)
+            claude_baseline, claude_treatment = support.preflight.load_pair(
+                environment["request_root"], support.PAIR_ID
+            )
+            self.assertIs(
+                support.preflight._core._request_validation_runner(claude_treatment),
+                support.preflight._core.runner,
+            )
+
+            pair_id, codex_baseline, codex_treatment = self._codex_pair(environment)
+            loaded_baseline, loaded_treatment = codex_preflight.core.load_pair(
+                environment["request_root"], pair_id
+            )
+            self.assertEqual(loaded_baseline["runner"], codex_baseline["runner"])
+            self.assertEqual(loaded_treatment["runner"], codex_treatment["runner"])
+
+            drift_cases = {
+                "execution_contract": "wrong-contract",
+                "provider": "anthropic-claude-code",
+                "model": "wrong-model",
+                "sampling": {"temperature": 0},
+            }
+            treatment_path = next(
+                path for path in environment["request_root"].glob("*.json")
+                if "treatment" in path.name
+            )
+            original_text = treatment_path.read_text(encoding="utf-8")
+            for field, value in drift_cases.items():
+                with self.subTest(field=field):
+                    candidate = json.loads(original_text)
+                    candidate["runner"][field] = value
+                    treatment_path.write_text(
+                        json.dumps(candidate, sort_keys=True), encoding="utf-8"
+                    )
+                    with self.assertRaises(codex_preflight.core.PreflightError):
+                        codex_preflight.core.load_pair(environment["request_root"], pair_id)
+                    treatment_path.write_text(original_text, encoding="utf-8")
+
+            mixed = json.loads(json.dumps(codex_baseline))
+            mixed["runner"] = dict(claude_baseline["runner"])
+            baseline_path = next(
+                path for path in environment["request_root"].glob("*.json")
+                if "baseline" in path.name
+            )
+            baseline_path.write_text(json.dumps(mixed, sort_keys=True), encoding="utf-8")
+            with self.assertRaisesRegex(
+                codex_preflight.core.PreflightError,
+                "paired requests use different provider contracts",
+            ):
+                codex_preflight.core.load_pair(environment["request_root"], pair_id)
 
 
 class McpCommandFileIdentityTests(unittest.TestCase):

@@ -161,7 +161,7 @@ def iso(value: datetime) -> str:
 
 
 def _preflight_request_projection(request: Mapping[str, Any]) -> dict[str, Any]:
-    """Project a Codex request onto the provider-neutral preflight request contract."""
+    """Legacy Claude projection retained only for negative authorization regression tests."""
 
     shadow = json.loads(json.dumps(request))
     shadow["runner"] = {
@@ -176,7 +176,7 @@ def _preflight_request_projection(request: Mapping[str, Any]) -> dict[str, Any]:
 def validate_request(request: Mapping[str, Any]) -> None:
     """Validate provider-neutral invariants, then bind the exact Codex contract."""
 
-    base.validate_request(_preflight_request_projection(request))
+    base._validate_request_common(request)
     expected = {
         "execution_contract": EXECUTION_CONTRACT,
         "provider": PROVIDER,
@@ -805,9 +805,9 @@ def _require_private_ledger_directory(path: Path, *, label: str) -> None:
         raise RunnerError(f"{label} is unsafe")
 
 
-def _load_preflight_mcp_authorization(
+def _load_preflight_dispatch_authorization(
     request: Mapping[str, Any], state_root: Path
-) -> list[dict[str, Any]]:
+) -> dict[str, Any]:
     if request.get("condition") != "treatment":
         raise RunnerError("preflight MCP authorization is only valid for treatment")
     pair_id = request.get("pair_id")
@@ -877,7 +877,37 @@ def _load_preflight_mcp_authorization(
         or canonical(binding.get("manifest")) != canonical(current_manifest)
     ):
         raise RunnerError("preflight dispatch authorization manifest mismatch")
-    return _normalized_authorized_mcp_files(binding.get("mcp_command_files"))
+    code = binding.get("code")
+    code_files = code.get("files") if isinstance(code, dict) else None
+    if not isinstance(code_files, list):
+        raise RunnerError("preflight dispatch authorization code identity is missing")
+    proxy_matches = [
+        item for item in code_files
+        if isinstance(item, dict) and item.get("name") == Path(__file__).name
+    ]
+    if len(proxy_matches) != 1:
+        raise RunnerError("preflight dispatch authorization proxy identity is ambiguous")
+    proxy_code = proxy_matches[0]
+    proxy_bytes = proxy_code.get("bytes")
+    proxy_sha256 = proxy_code.get("sha256")
+    if (
+        not isinstance(proxy_bytes, int) or isinstance(proxy_bytes, bool)
+        or proxy_bytes <= 0 or not isinstance(proxy_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", proxy_sha256) is None
+    ):
+        raise RunnerError("preflight dispatch authorization proxy identity is invalid")
+    return {
+        "mcp_files": _normalized_authorized_mcp_files(binding.get("mcp_command_files")),
+        "proxy_code": {
+            "name": Path(__file__).name, "bytes": proxy_bytes, "sha256": proxy_sha256
+        },
+    }
+
+
+def _load_preflight_mcp_authorization(
+    request: Mapping[str, Any], state_root: Path
+) -> list[dict[str, Any]]:
+    return list(_load_preflight_dispatch_authorization(request, state_root)["mcp_files"])
 
 def _bind_mcp_file(path: Path, *, label: str, executable: bool) -> dict[str, Any]:
     if not path.is_absolute():
@@ -905,6 +935,60 @@ def _revalidate_mcp_file(binding: Mapping[str, Any], *, label: str) -> None:
     )
     if current["identity"] != binding["identity"] or current["sha256"] != binding["sha256"]:
         raise RunnerError(f"{label} changed during execution")
+
+
+def stage_mcp_proxy(state_root: Path, expected_code: Mapping[str, Any]) -> dict[str, Any]:
+    source = Path(__file__).resolve()
+    raw = _read_bound_regular_file(
+        source, label="Codex MCP proxy source", max_bytes=MAX_PROVIDER_EXECUTABLE_BYTES
+    )
+    if (
+        expected_code.get("name") != source.name
+        or expected_code.get("bytes") != len(raw)
+        or expected_code.get("sha256") != sha_bytes(raw)
+    ):
+        raise RunnerError("Codex MCP proxy source does not match preflight authorization")
+    parent_path, parent_fd = _open_private_directory(state_root / "codex-mcp-proxy-runtime")
+    try:
+        name = "proxy-" + sha_bytes(os.urandom(32))[:24] + ".py"
+        _write_private_dirfd(parent_fd, name, raw)
+        _directory_fd_matches(parent_path, parent_fd)
+        staged = parent_path / name
+        bound = _bind_mcp_file(staged, label="Codex MCP proxy stage", executable=False)
+        if bound["sha256"] != expected_code.get("sha256"):
+            raise RunnerError("staged Codex MCP proxy SHA mismatch")
+        bound["expected_code"] = dict(expected_code)
+        return bound
+    finally:
+        os.close(parent_fd)
+
+
+def _revalidate_staged_mcp_proxy(binding: Mapping[str, Any]) -> None:
+    current = _bind_mcp_file(
+        Path(binding["path"]), label="Codex MCP proxy stage", executable=False
+    )
+    if current["identity"] != binding["identity"] or current["sha256"] != binding["sha256"]:
+        raise RunnerError("Codex MCP proxy stage changed during execution")
+
+
+def cleanup_staged_mcp_proxy(binding: Mapping[str, Any]) -> str | None:
+    try:
+        _revalidate_staged_mcp_proxy(binding)
+        path = Path(binding["path"])
+        parent_path, parent_fd = _open_private_directory(path.parent, create_final=False)
+        try:
+            _directory_fd_matches(parent_path, parent_fd)
+            linked = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            expected = binding["identity"]
+            if (linked.st_dev, linked.st_ino, linked.st_size, linked.st_mode) != expected:
+                raise RunnerError("Codex MCP proxy stage changed before cleanup")
+            os.unlink(path.name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    except BaseException as exc:
+        return type(exc).__name__
+    return None
 
 
 def _bind_mcp_upstream(
@@ -1282,6 +1366,7 @@ def _toml_string(value: str) -> str:
 def build_command(
     request: Mapping[str, Any], codex: str, checkout: Path, schema: Path, codex_home: Path,
     *, authorized_mcp_files: Sequence[Mapping[str, Any]] | None = None,
+    proxy_path: Path | None = None,
 ) -> list[str]:
     filesystem = (
         '{":minimal"="read",":workspace_roots"={"."="read"},'
@@ -1303,10 +1388,12 @@ def build_command(
     if request["condition"] == "treatment":
         if authorized_mcp_files is None:
             raise RunnerError("treatment requires preflight-authorized MCP file identities")
+        if proxy_path is None or not proxy_path.is_absolute():
+            raise RunnerError("treatment requires a bound absolute MCP proxy path")
         upstream = [str(item) for item in request["repobrief"]["mcp_command"]]
         binding = request["repobrief"]
         proxy_args = [
-            str(Path(__file__).resolve()), "--codex-mcp-proxy", canonical(upstream),
+            str(proxy_path), "--codex-mcp-proxy", canonical(upstream),
             str(binding["manifest"]), str(binding["manifest_sha256"]),
             canonical(list(authorized_mcp_files)),
         ]
@@ -2212,8 +2299,11 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
     finally:
         os.close(state_fd)
     authorized_mcp_files: list[dict[str, Any]] | None = None
+    authorized_proxy_code: dict[str, Any] | None = None
     if not synthetic and request["condition"] == "treatment":
-        authorized_mcp_files = _load_preflight_mcp_authorization(request, state_path)
+        dispatch_authorization = _load_preflight_dispatch_authorization(request, state_path)
+        authorized_mcp_files = list(dispatch_authorization["mcp_files"])
+        authorized_proxy_code = dict(dispatch_authorization["proxy_code"])
     evidence_plan = prepare_provider_evidence(
         request, args.transcript_root, args.provider_evidence_root
     )
@@ -2229,10 +2319,16 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
         else:
             assert codex is not None and auth_data is not None
             codex_home = stage_codex_home(args.state_root, auth_data)
+            proxy_binding: dict[str, Any] | None = None
             try:
+                if request["condition"] == "treatment":
+                    if authorized_proxy_code is None:
+                        raise RunnerError("treatment proxy code authorization is missing")
+                    proxy_binding = stage_mcp_proxy(args.state_root, authorized_proxy_code)
                 command = build_command(
                     request, codex, checkout, schema, codex_home,
                     authorized_mcp_files=authorized_mcp_files,
+                    proxy_path=None if proxy_binding is None else Path(proxy_binding["path"]),
                 )
                 capture = run_bounded(
                     command, cwd=checkout,
@@ -2241,20 +2337,32 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                     environment=provider_env(codex=codex, codex_home=codex_home),
                 )
             except BaseException as exc:
+                proxy_cleanup_error = None if proxy_binding is None else cleanup_staged_mcp_proxy(proxy_binding)
                 cleanup_error = cleanup_codex_home(codex_home)
-                if cleanup_error is not None:
+                if proxy_cleanup_error is not None or cleanup_error is not None:
                     raise RunnerError(
-                        f"Codex failed before capture completion and runtime-home cleanup failed: {cleanup_error}"
+                        "Codex failed before capture completion and private runtime cleanup failed: "
+                        f"proxy={proxy_cleanup_error} home={cleanup_error}"
                     ) from exc
                 raise
+            capture = dict(capture)
+            if proxy_binding is not None:
+                try:
+                    _revalidate_staged_mcp_proxy(proxy_binding)
+                except BaseException as exc:
+                    marker = f"mcp_proxy_revalidate_failed:{type(exc).__name__}"
+                    previous = capture.get("capture_error")
+                    capture["capture_error"] = marker if previous is None else f"{previous};{marker}"
+                proxy_cleanup_error = cleanup_staged_mcp_proxy(proxy_binding)
+                if proxy_cleanup_error is not None:
+                    marker = f"mcp_proxy_cleanup_failed:{proxy_cleanup_error}"
+                    previous = capture.get("capture_error")
+                    capture["capture_error"] = marker if previous is None else f"{previous};{marker}"
             cleanup_error = cleanup_codex_home(codex_home)
             if cleanup_error is not None:
-                capture = dict(capture)
                 cleanup_marker = f"codex_home_cleanup_failed:{cleanup_error}"
                 previous = capture.get("capture_error")
-                capture["capture_error"] = (
-                    cleanup_marker if previous is None else f"{previous};{cleanup_marker}"
-                )
+                capture["capture_error"] = cleanup_marker if previous is None else f"{previous};{cleanup_marker}"
         ended = utc_now()
         evidence = persist_provider_capture(
             request, transcript_root=args.transcript_root,

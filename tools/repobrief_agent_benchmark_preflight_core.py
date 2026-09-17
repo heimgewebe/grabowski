@@ -32,6 +32,26 @@ runner = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = runner
 SPEC.loader.exec_module(runner)
 
+CODEX_MODULE_PATH = Path(__file__).with_name("repobrief_agent_benchmark_codex_runner.py")
+CODEX_PREFLIGHT_PATH = Path(__file__).with_name("repobrief_agent_benchmark_codex_preflight.py")
+_codex_runner_cache: Any | None = None
+
+
+def _codex_runner_module() -> Any:
+    global _codex_runner_cache
+    if _codex_runner_cache is not None:
+        return _codex_runner_cache
+    spec = importlib.util.spec_from_file_location(
+        "repobrief_agent_benchmark_codex_runner_for_preflight", CODEX_MODULE_PATH
+    )
+    if spec is None or spec.loader is None:
+        raise PreflightError("cannot load Codex benchmark runner")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    _codex_runner_cache = module
+    return module
+
 REPORT_KIND = "repobrief.agent_benchmark_live_preflight"
 FIXTURE_REPORT_KIND = "repobrief.agent_benchmark_preflight_fixture_report"
 VERSION = "1.0"
@@ -250,13 +270,47 @@ def _dispatch_provider_binding(claude: str, synthetic: bool) -> dict[str, Any]:
     raise PreflightError("live preflight provider binding adapter is unavailable")
 
 
-def _preflight_code_identity() -> dict[str, Any]:
+def _request_validation_runner(request: Mapping[str, Any]) -> Any:
+    contract = request.get("runner")
+    if not isinstance(contract, Mapping):
+        raise PreflightError("request runner contract is invalid")
+    provider = contract.get("provider")
+    if provider == runner.PROVIDER:
+        return runner
+    if provider == "openai-codex-cli":
+        codex_runner = _codex_runner_module()
+        if contract.get("execution_contract") != codex_runner.EXECUTION_CONTRACT:
+            raise PreflightError("Codex request execution contract mismatch")
+        return codex_runner
+    raise PreflightError("request provider is not supported by benchmark preflight")
+
+
+def _validate_provider_request(request: Mapping[str, Any]) -> Any:
+    selected = _request_validation_runner(request)
+    try:
+        selected.validate_request(request)
+    except selected.RunnerError as exc:
+        raise PreflightError(str(exc)) from exc
+    return selected
+
+
+def _preflight_code_identity(request: Mapping[str, Any]) -> dict[str, Any]:
+    selected = _request_validation_runner(request)
+    if selected is runner:
+        paths = (
+            Path(__file__).resolve(),
+            Path(__file__).with_name("repobrief_agent_benchmark_preflight.py").resolve(),
+            MODULE_PATH.resolve(),
+        )
+    else:
+        paths = (
+            Path(__file__).resolve(),
+            CODEX_PREFLIGHT_PATH.resolve(),
+            MODULE_PATH.resolve(),
+            CODEX_MODULE_PATH.resolve(),
+        )
     files: list[dict[str, Any]] = []
-    for path in (
-        Path(__file__).resolve(),
-        Path(__file__).with_name("repobrief_agent_benchmark_preflight.py").resolve(),
-        MODULE_PATH.resolve(),
-    ):
+    for path in paths:
         if path.is_symlink() or not path.is_file():
             raise PreflightError(f"preflight code file is unavailable: {path.name}")
         try:
@@ -292,6 +346,7 @@ def _dispatch_binding(
     max_cost_usd: Decimal,
     validator_command: Sequence[str],
     synthetic: bool,
+    provider_binding: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     repobrief = treatment.get("repobrief")
     if not isinstance(repobrief, Mapping):
@@ -365,8 +420,12 @@ def _dispatch_binding(
         "validator_command_sha256": _sha256_json(list(validator_command)),
         "validator_command_files": _command_file_identities(validator_command),
         "synthetic_fixture": synthetic,
-        "provider": _dispatch_provider_binding(claude, synthetic),
-        "code": _preflight_code_identity(),
+        "provider": (
+            dict(provider_binding)
+            if provider_binding is not None
+            else _dispatch_provider_binding(claude, synthetic)
+        ),
+        "code": _preflight_code_identity(treatment),
     }
 
 
@@ -900,8 +959,10 @@ def load_pair(request_root: Path, pair_id: str) -> tuple[dict[str, Any], dict[st
         raise PreflightError("pair must contain baseline and treatment")
     baseline = by_condition["baseline"]
     treatment = by_condition["treatment"]
-    runner.validate_request(baseline)
-    runner.validate_request(treatment)
+    baseline_runner = _validate_provider_request(baseline)
+    treatment_runner = _validate_provider_request(treatment)
+    if baseline_runner is not treatment_runner:
+        raise PreflightError("paired requests use different provider contracts")
     _validate_pair(baseline, treatment)
     runner.load_planned_request(baseline, request_root)
     runner.load_planned_request(treatment, request_root)
@@ -1312,6 +1373,99 @@ def _claude_identity(claude: str) -> dict[str, Any]:
         "version": None,
         "version_probed": False,
     }
+
+
+def authorize_dispatch(
+    *,
+    pair_id: str,
+    request_root: Path,
+    repository_map: Path,
+    state_root: Path,
+    transcript_root: Path,
+    evidence_root: Path,
+    report_out: Path | None,
+    provider_binding: Mapping[str, Any],
+    max_cost_usd: Decimal,
+    validator_command: Sequence[str],
+) -> dict[str, Any]:
+    """Create one live provider dispatch authorization without launching a provider."""
+
+    if (
+        not max_cost_usd.is_finite()
+        or max_cost_usd <= 0
+        or max_cost_usd > MAX_PER_RUN_COST_USD
+    ):
+        raise PreflightError(f"max cost must be finite, > 0 and <= {MAX_PER_RUN_COST_USD}")
+    if not isinstance(provider_binding, Mapping) or provider_binding.get("mode") != "live_provider":
+        raise PreflightError("live provider binding is invalid")
+    baseline, treatment = load_pair(request_root, pair_id)
+    provider_runner = provider_binding.get("runner")
+    if (
+        not isinstance(provider_runner, Mapping)
+        or _canonical_json(provider_runner) != _canonical_json(treatment.get("runner"))
+    ):
+        raise PreflightError(
+            "live provider binding does not match treatment runner contract"
+        )
+    binding = _dispatch_binding(
+        baseline=baseline,
+        treatment=treatment,
+        request_root=request_root,
+        repository_map=repository_map,
+        state_root=state_root,
+        transcript_root=transcript_root,
+        evidence_root=evidence_root,
+        report_out=report_out,
+        claude="",
+        max_cost_usd=max_cost_usd,
+        validator_command=validator_command,
+        synthetic=False,
+        provider_binding=provider_binding,
+    )
+    ledger = _initialize_dispatch_ledger(binding=binding, state_root=state_root)
+    try:
+        _assert_output_paths_available(
+            baseline=baseline,
+            treatment=treatment,
+            transcript_root=transcript_root,
+            evidence_root=evidence_root,
+            report_out=report_out,
+        )
+        source = runner.load_repository_root(baseline, repository_map)
+        before = source_state(source)
+        snapshot, snapshot_preparation_ms = prepare_snapshot(treatment)
+        freshness, freshness_check_ms = probe_freshness(treatment)
+        if freshness["status"] != "fresh":
+            raise PreflightError(
+                f"treatment snapshot is not fresh: {freshness['status']}"
+            )
+        after = source_state(source)
+        _assert_source_unchanged(before, after)
+        return {
+            "kind": "repobrief.agent_benchmark_preflight_dispatch_authorization",
+            "version": VERSION,
+            "status": "authorized",
+            "pair_id": pair_id,
+            "synthetic_fixture": False,
+            "dispatch_ledger": _dispatch_ledger_report(ledger),
+            "request_sha256": {
+                "baseline": _sha256_json(baseline),
+                "treatment": _sha256_json(treatment),
+            },
+            "snapshot": {**snapshot, **freshness},
+            "source_before": before,
+            "source_after": after,
+            "timings": {
+                "snapshot_preparation_ms": snapshot_preparation_ms,
+                "freshness_check_ms": freshness_check_ms,
+            },
+            "provider": dict(provider_binding),
+            "default_promoted": False,
+            "does_not_establish": list(DOES_NOT_ESTABLISH),
+        }
+    except Exception as exc:
+        _record_preflight_failure(ledger, exc)
+        raise
 
 
 def execute_preflight(

@@ -120,6 +120,13 @@ def write_dispatch_authorization(
             value["repobrief"]["mcp_command"]
         ),
         "mcp_command_files": mcp_files,
+        "code": {
+            "files": [{
+                "name": MODULE_PATH.name,
+                "bytes": MODULE_PATH.stat().st_size,
+                "sha256": hashlib.sha256(MODULE_PATH.read_bytes()).hexdigest(),
+            }]
+        },
     }
     authorization = {
         "kind": runner.PREFLIGHT_LEDGER_KIND,
@@ -441,6 +448,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 authorized_mcp_files=[
                     {"path": "/usr/bin/python3", "bytes": 1, "sha256": "0" * 64, "mode": "0o755"}
                 ],
+                proxy_path=(root / "bound-proxy.py").resolve(),
             )
         baseline_joined = " ".join(baseline)
         treatment_joined = " ".join(treatment)
@@ -1683,6 +1691,56 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 completed.stderr,
             )
 
+
+    def test_staged_proxy_survives_later_source_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "state"; state_root.mkdir(mode=0o700)
+            source = root / MODULE_PATH.name; source.write_bytes(MODULE_PATH.read_bytes())
+            expected = {"name": source.name, "bytes": source.stat().st_size, "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+            with patch.object(runner, "__file__", str(source)):
+                binding = runner.stage_mcp_proxy(state_root, expected)
+            staged = Path(binding["path"]); original = staged.read_bytes()
+            source.write_text("# replaced source\n", encoding="utf-8")
+            self.assertEqual(staged.read_bytes(), original)
+            runner._revalidate_staged_mcp_proxy(binding)
+            self.assertIsNone(runner.cleanup_staged_mcp_proxy(binding))
+            self.assertFalse(staged.exists())
+
+    def test_staged_proxy_mutation_fails_closed_and_is_retained(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "state"; state_root.mkdir(mode=0o700)
+            source = root / MODULE_PATH.name; source.write_bytes(MODULE_PATH.read_bytes())
+            expected = {"name": source.name, "bytes": source.stat().st_size, "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+            with patch.object(runner, "__file__", str(source)):
+                binding = runner.stage_mcp_proxy(state_root, expected)
+            staged = Path(binding["path"]); staged.write_text("# mutated stage\n", encoding="utf-8")
+            with self.assertRaisesRegex(runner.RunnerError, "proxy stage changed during execution"):
+                runner._revalidate_staged_mcp_proxy(binding)
+            self.assertEqual(runner.cleanup_staged_mcp_proxy(binding), "RunnerError")
+            self.assertTrue(staged.exists())
+
+    def test_treatment_command_references_only_bound_proxy_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "state"; state_root.mkdir(mode=0o700)
+            source = root / MODULE_PATH.name; source.write_bytes(MODULE_PATH.read_bytes())
+            expected = {"name": source.name, "bytes": source.stat().st_size, "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+            with patch.object(runner, "__file__", str(source)):
+                binding = runner.stage_mcp_proxy(state_root, expected)
+            source.write_text("# replaced after staging\n", encoding="utf-8")
+            checkout = root / "repo"; checkout.mkdir()
+            schema = root / "schema.json"
+            codex_home = root / "codex-home"; (codex_home / "tmp").mkdir(parents=True)
+            command = runner.build_command(
+                request(condition="treatment"), "/opt/codex", checkout, schema, codex_home,
+                authorized_mcp_files=[], proxy_path=Path(binding["path"]),
+            )
+            encoded = next(item for item in command if item.startswith("mcp_servers.repobrief.args="))
+            self.assertIn(str(binding["path"]), encoded)
+            self.assertNotIn(str(source), encoded)
+            self.assertIsNone(runner.cleanup_staged_mcp_proxy(binding))
 
     def test_preflight_authorization_rejects_legacy_projected_request_hash(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
