@@ -123,7 +123,7 @@ codex_extra = r'''
                     timeout=5,
                 )
                 self.assertNotEqual(completed.returncode, 0)
-                self.assertIn(b"params are invalid", completed.stderr)
+                self.assertIn(b"benchmark MCP proxy stream failed", completed.stderr)
                 self.assertFalse(marker.exists())
 
 '''
