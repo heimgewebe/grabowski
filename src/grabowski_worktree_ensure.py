@@ -23,6 +23,8 @@ FrictionResolver = Callable[..., dict[str, Any]]
 
 SCHEMA_VERSION = 1
 RECEIPT_KIND = "grabowski.worktree_ensure_receipt"
+ADLER_SIDECAR_PROVENANCE_KIND = "grabowski.adler_sidecar_provenance"
+ADLER_SIDECAR_PROVENANCE_MAX_TARGETS = 8
 IDEMPOTENCY_KEY_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z_.:-]{0,127}$")
 SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -213,6 +215,96 @@ def _write_receipt(path: Path, value: dict[str, Any]) -> dict[str, Any]:
         raise WorktreeEnsureAction("durable receipt exceeds size limit before write")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     descriptor = _open_regular_nofollow(temporary, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return material
+
+
+def _adler_sidecar_provenance_path(receipt_path: Path) -> Path:
+    return receipt_path.with_suffix(".adler-sidecar-provenance")
+
+
+def _read_adler_sidecar_provenance(
+    path: Path, parameters_sha256: str
+) -> dict[str, Any] | None:
+    try:
+        descriptor = _open_regular_nofollow(path, os.O_RDONLY)
+    except WorktreeEnsureAction as exc:
+        if not os.path.lexists(path):
+            return None
+        raise exc
+    with os.fdopen(descriptor, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if info.st_size > MAX_RECEIPT_BYTES:
+            raise WorktreeEnsureAction(f"Adler provenance journal exceeds size limit: {path}")
+        raw_bytes = handle.read(MAX_RECEIPT_BYTES + 1)
+    if len(raw_bytes) > MAX_RECEIPT_BYTES:
+        raise WorktreeEnsureAction(f"Adler provenance journal exceeds size limit: {path}")
+    try:
+        value = json.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise WorktreeEnsureAction(f"Adler provenance journal is invalid JSON: {path}") from exc
+    if not isinstance(value, dict):
+        raise WorktreeEnsureAction(f"Adler provenance journal must be a JSON object: {path}")
+    if (
+        value.get("kind") != ADLER_SIDECAR_PROVENANCE_KIND
+        or value.get("schema_version") != 1
+        or value.get("parameters_sha256") != parameters_sha256
+    ):
+        raise WorktreeEnsureAction(f"Adler provenance journal binding is invalid: {path}")
+    supplied = value.get("provenance_sha256")
+    material = {key: item for key, item in value.items() if key != "provenance_sha256"}
+    if not isinstance(supplied, str) or supplied != _sha256_json(material):
+        raise WorktreeEnsureAction(f"Adler provenance journal integrity mismatch: {path}")
+    evidence = value.get("evidence")
+    if not isinstance(evidence, dict):
+        raise WorktreeEnsureAction(f"Adler provenance journal evidence is invalid: {path}")
+    targets = evidence.get("trusted_targets")
+    if (
+        evidence.get("state") != "journaled"
+        or not isinstance(evidence.get("lane_id"), str)
+        or not isinstance(evidence.get("path"), str)
+        or evidence.get("ownership") != "grabowski_metadata_only"
+        or evidence.get("absence_semantics") != "unknown_not_no_findings"
+        or not isinstance(targets, list)
+        or not targets
+        or len(targets) > ADLER_SIDECAR_PROVENANCE_MAX_TARGETS
+        or any(not isinstance(target, str) or not target for target in targets)
+    ):
+        raise WorktreeEnsureAction(f"Adler provenance journal evidence shape is invalid: {path}")
+    return evidence
+
+
+def _write_adler_sidecar_provenance(
+    path: Path, parameters_sha256: str, evidence: dict[str, Any]
+) -> dict[str, Any]:
+    material: dict[str, Any] = {
+        "kind": ADLER_SIDECAR_PROVENANCE_KIND,
+        "schema_version": 1,
+        "parameters_sha256": parameters_sha256,
+        "evidence": evidence,
+        "updated_at_unix": int(time.time()),
+    }
+    material["provenance_sha256"] = _sha256_json(material)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    data = (json.dumps(material, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    if len(data) > MAX_RECEIPT_BYTES:
+        raise WorktreeEnsureAction("Adler provenance journal exceeds size limit before write")
+    descriptor = _open_regular_nofollow(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(data)
@@ -1022,7 +1114,62 @@ def _adler_sidecar_plan(inputs: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def _previous_adler_sidecar_evidence(record: dict[str, Any]) -> dict[str, Any] | None:
+def _adler_sidecar_evidence_targets(evidence: dict[str, Any] | None) -> list[str]:
+    if not isinstance(evidence, dict):
+        return []
+    state = evidence.get("state")
+    if state in {"configured", "planned"}:
+        target = evidence.get("target")
+        return [target] if isinstance(target, str) and target else []
+    if state == "journaled":
+        targets = evidence.get("trusted_targets")
+        if isinstance(targets, list):
+            return [target for target in targets if isinstance(target, str) and target]
+    return []
+
+
+def _adler_sidecar_provenance_evidence(
+    previous: dict[str, Any] | None,
+    planned: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(planned, dict):
+        return None
+    lane_id = planned.get("lane_id")
+    path = planned.get("path")
+    if not isinstance(lane_id, str) or not isinstance(path, str):
+        return None
+    targets: list[str] = []
+    if (
+        isinstance(previous, dict)
+        and previous.get("lane_id") == lane_id
+        and previous.get("path") == path
+        and previous.get("ownership") == "grabowski_metadata_only"
+        and previous.get("absence_semantics") == "unknown_not_no_findings"
+    ):
+        for target in _adler_sidecar_evidence_targets(previous):
+            if target not in targets:
+                targets.append(target)
+    planned_target = planned.get("target")
+    if isinstance(planned_target, str) and planned_target and planned_target not in targets:
+        targets.append(planned_target)
+    if not targets:
+        return None
+    return {
+        "state": "journaled",
+        "lane_id": lane_id,
+        "path": path,
+        "trusted_targets": targets[-ADLER_SIDECAR_PROVENANCE_MAX_TARGETS:],
+        "ownership": "grabowski_metadata_only",
+        "absence_semantics": "unknown_not_no_findings",
+    }
+
+
+def _previous_adler_sidecar_evidence(
+    record: dict[str, Any],
+    provenance: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    if isinstance(provenance, dict):
+        return provenance
     sidecar = record.get("adler_sidecar")
     if isinstance(sidecar, dict) and sidecar.get("state") == "configured":
         return sidecar
@@ -1076,10 +1223,10 @@ def _trusted_previous_adler_pointer(
 ) -> bool:
     return bool(
         isinstance(previous_sidecar, dict)
-        and previous_sidecar.get("state") in {"configured", "planned"}
+        and previous_sidecar.get("state") in {"configured", "planned", "journaled"}
         and previous_sidecar.get("lane_id") == lane_id
         and previous_sidecar.get("path") == str(pointer)
-        and previous_sidecar.get("target") == observed_target
+        and observed_target in _adler_sidecar_evidence_targets(previous_sidecar)
         and previous_sidecar.get("ownership") == "grabowski_metadata_only"
         and previous_sidecar.get("absence_semantics") == "unknown_not_no_findings"
     )
@@ -1189,6 +1336,7 @@ def _configure_adler_sidecar_pointer_with_live_lease(
     inspect_lease: LeaseInspector,
     *,
     previous_sidecar: dict[str, Any] | None = None,
+    before_mutation: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     lane_id = _adler_lane_id(inputs)
     if lane_id is None:
@@ -1203,6 +1351,18 @@ def _configure_adler_sidecar_pointer_with_live_lease(
             "blocking": False,
             "absence_semantics": "unknown_not_no_findings",
         }
+    if before_mutation is not None:
+        try:
+            before_mutation()
+        except Exception as exc:
+            return {
+                "state": "unavailable",
+                "lane_id": lane_id,
+                "error": "Adler sidecar provenance could not be journaled before mutation: "
+                + _bounded_text(exc, 768),
+                "blocking": False,
+                "absence_semantics": "unknown_not_no_findings",
+            }
     return _configure_adler_sidecar_pointer(
         inputs, previous_sidecar=previous_sidecar
     )
@@ -1253,6 +1413,18 @@ def ensure_worktree(
                 "non_claims": ["the existing durable receipt was not overwritten"],
             }
 
+        adler_provenance_path = _adler_sidecar_provenance_path(receipt_path)
+        adler_provenance: dict[str, Any] | None = None
+        if _adler_lane_id(inputs) is not None:
+            try:
+                adler_provenance = _read_adler_sidecar_provenance(
+                    adler_provenance_path, parameters_sha256
+                )
+            except WorktreeEnsureAction:
+                # Adler remains advisory: unreadable provenance prevents pointer
+                # replacement but must not block otherwise valid local work.
+                adler_provenance = None
+
         if existing is not None and existing.get("state") == "complete":
             result_state = existing.get("result_state")
             if result_state in SUCCESS_STATES:
@@ -1280,11 +1452,32 @@ def ensure_worktree(
             if result_state in SUCCESS_STATES and not isinstance(lifecycle, dict):
                 assert observation is not None
                 lifecycle = _bind_checkout_lifecycle(inputs, observation, existing["lease"])
+            previous_sidecar = _previous_adler_sidecar_evidence(
+                existing, adler_provenance
+            )
+            sidecar_plan = (
+                _adler_sidecar_plan(inputs) if result_state in SUCCESS_STATES else None
+            )
+            replay_provenance = _adler_sidecar_provenance_evidence(
+                previous_sidecar, sidecar_plan
+            )
+
+            def journal_replay_provenance() -> None:
+                if replay_provenance is not None:
+                    _write_adler_sidecar_provenance(
+                        adler_provenance_path, parameters_sha256, replay_provenance
+                    )
+
             current_adler_sidecar = (
                 _configure_adler_sidecar_pointer_with_live_lease(
                     inputs,
                     inspect_lease,
-                    previous_sidecar=_previous_adler_sidecar_evidence(existing),
+                    previous_sidecar=replay_provenance or previous_sidecar,
+                    before_mutation=(
+                        journal_replay_provenance
+                        if replay_provenance is not None
+                        else None
+                    ),
                 )
                 if result_state in SUCCESS_STATES
                 else None
@@ -1332,11 +1525,46 @@ def ensure_worktree(
                 )
                 record["lease"] = lease
                 record["recovery_without_live_lease"] = not lease["valid"]
-                previous_sidecar = _previous_adler_sidecar_evidence(existing)
-                record["adler_sidecar"] = _configure_adler_sidecar_pointer_with_live_lease(
-                    inputs, inspect_lease, previous_sidecar=previous_sidecar
+                previous_sidecar = _previous_adler_sidecar_evidence(
+                    existing, adler_provenance
                 )
-                sidecar_plan = existing.get("adler_sidecar_plan")
+                current_sidecar_plan = _adler_sidecar_plan(inputs)
+                recovery_provenance = _adler_sidecar_provenance_evidence(
+                    previous_sidecar, current_sidecar_plan
+                )
+
+                def journal_recovery_provenance() -> None:
+                    nonlocal existing
+                    if (
+                        isinstance(current_sidecar_plan, dict)
+                        and not isinstance(existing.get("adler_sidecar_plan"), dict)
+                    ):
+                        journaled_intent = dict(existing)
+                        journaled_intent["adler_sidecar_plan"] = current_sidecar_plan
+                        journaled_intent["updated_at_unix"] = int(time.time())
+                        existing = _write_receipt(receipt_path, journaled_intent)
+                    if recovery_provenance is not None:
+                        _write_adler_sidecar_provenance(
+                            adler_provenance_path,
+                            parameters_sha256,
+                            recovery_provenance,
+                        )
+
+                record["adler_sidecar"] = _configure_adler_sidecar_pointer_with_live_lease(
+                    inputs,
+                    inspect_lease,
+                    previous_sidecar=recovery_provenance or previous_sidecar,
+                    before_mutation=(
+                        journal_recovery_provenance
+                        if recovery_provenance is not None
+                        else None
+                    ),
+                )
+                sidecar_plan = (
+                    current_sidecar_plan
+                    if isinstance(current_sidecar_plan, dict)
+                    else existing.get("adler_sidecar_plan")
+                )
                 if isinstance(sidecar_plan, dict):
                     record["adler_sidecar_plan"] = sidecar_plan
                 record["lifecycle"] = _bind_checkout_lifecycle(inputs, observation, lease)
