@@ -10456,26 +10456,6 @@ def _saga_captain_audit_binding(
     if completion.get("execution_result_sha256") != sha256_json(execution_result):
         raise GripPreflightError("Captain audit execution result digest mismatch")
     identity_keys = {"status", "receipt_sha256", "output_sha256"}
-    provenance_keys = {
-        "provenance_schema_version",
-        "execution_invoked",
-        "verification_passed",
-        "remote_mutation_observed",
-        "merge_completion_verified",
-        "external_merge_observed",
-        "observed_merge_sha",
-        "provenance_mode",
-    }
-    unknown_result_keys = set(execution_result) - identity_keys - provenance_keys
-    if unknown_result_keys:
-        raise GripPreflightError(
-            "Captain audit reference execution result shape is not canonical"
-        )
-    present_provenance_keys = set(execution_result) & provenance_keys
-    if present_provenance_keys and present_provenance_keys != provenance_keys:
-        raise GripPreflightError(
-            "Captain audit merge provenance is incomplete"
-        )
     if not identity_keys.issubset(execution_result):
         raise GripPreflightError(
             "Captain audit reference execution result identity is incomplete"
@@ -10496,55 +10476,12 @@ def _saga_captain_audit_binding(
         if result_identity != receipt_identity:
             raise GripPreflightError("Captain audit completion differs from Captain receipt")
 
-    provenance: dict[str, Any] | None = None
-    if "provenance_schema_version" in execution_result:
-        provenance = {key: execution_result.get(key) for key in provenance_keys}
-        if provenance["provenance_schema_version"] != 1:
-            raise GripPreflightError("Captain audit merge provenance schema is unsupported")
-        for key in (
-            "execution_invoked",
-            "verification_passed",
-            "remote_mutation_observed",
-            "merge_completion_verified",
-            "external_merge_observed",
-        ):
-            if not isinstance(provenance[key], bool):
-                raise GripPreflightError(
-                    f"Captain audit merge provenance {key} must be boolean"
-                )
-        observed_merge_sha = provenance["observed_merge_sha"]
-        if observed_merge_sha is not None and not _is_hex_sha(
-            observed_merge_sha, lengths=(40,)
-        ):
-            raise GripPreflightError(
-                "Captain audit merge provenance observed_merge_sha is invalid"
-            )
-        mode = provenance["provenance_mode"]
-        if mode not in {
-            "captain_dispatch_verified",
-            "external_merge_reconciled",
-            "captain_queue_dispatch_pending",
-            "unverified",
-        }:
-            raise GripPreflightError("Captain audit merge provenance mode is invalid")
-        if mode == "captain_dispatch_verified" and not (
-            provenance["execution_invoked"]
-            and provenance["verification_passed"]
-            and observed_merge_sha is not None
-            and not provenance["external_merge_observed"]
-        ):
-            raise GripPreflightError(
-                "Captain audit dispatch provenance is internally inconsistent"
-            )
-        if mode == "external_merge_reconciled" and not (
-            not provenance["execution_invoked"]
-            and provenance["verification_passed"]
-            and provenance["external_merge_observed"]
-            and observed_merge_sha is not None
-        ):
-            raise GripPreflightError(
-                "Captain audit external merge provenance is internally inconsistent"
-            )
+    try:
+        provenance = grabowski_grip_orchestration._captain_merge_provenance_from_execution_result(
+            execution_result
+        )
+    except grabowski_grip_orchestration.SagaError as exc:
+        raise GripPreflightError(str(exc)) from exc
     body = {
         "schema_version": 1,
         "kind": grabowski_grip_orchestration.CAPTAIN_AUDIT_BINDING_KIND,
@@ -13784,6 +13721,7 @@ def _run_captain_pr_merge(
         execution_result["verification_error"] = "; ".join(verify_errors)
         return execution_result
     execution_result["verification_passed"] = True
+    execution_result["merge_completion_verified"] = True
     return execution_result
 
 

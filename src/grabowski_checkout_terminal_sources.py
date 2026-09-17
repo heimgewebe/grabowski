@@ -350,15 +350,19 @@ def _thread_focus_terminal_work_lane_evidence(source_id: str) -> dict[str, Any]:
     for path in paths:
         record = work_acquire._read_state(path)
         if not isinstance(record, dict):
-            continue
+            raise RuntimeError("thread focus work-lane evidence scan is incomplete")
+        lane_id = record.get("lane_id")
+        if not isinstance(lane_id, str) or re.fullmatch(r"[0-9a-f]{32}", lane_id) is None:
+            raise RuntimeError("thread focus work-lane identity is invalid")
+        if path.name != f"{lane_id}.json":
+            raise RuntimeError("thread focus work-lane canonical identity is invalid")
         inputs = record.get("inputs")
         source = inputs.get("source") if isinstance(inputs, dict) else None
         if source != {"kind": "thread_focus", "id": source_id}:
             continue
-        lane_id = record.get("lane_id")
-        if not isinstance(lane_id, str) or re.fullmatch(r"[0-9a-f]{32}", lane_id) is None:
-            raise RuntimeError("thread focus work-lane identity is invalid")
         terminal = work_lane_terminal_evidence(lane_id)
+        if terminal.get("source_binding") != source:
+            raise RuntimeError("thread focus work-lane source binding changed")
         if terminal.get("terminal_state") not in THREAD_FOCUS_COMPLETING_WORK_LANE_STATES:
             raise RuntimeError(
                 "thread focus work lane is terminal but does not establish completion"

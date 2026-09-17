@@ -12393,40 +12393,69 @@ def _captain_audit_execution_result_material(
     if execution is None or execution.get("action") != "pr-merge":
         return material
 
+    execution_invoked = execution.get("execution_invoked") is True
+    dispatch_succeeded = (
+        execution_invoked
+        and execution.get("execution_attempted") is True
+        and execution.get("command_returned") is True
+        and execution.get("merge_returncode") == 0
+    )
+    verification_passed = execution.get("verification_passed") is True
+    remote_mutation_observed = execution.get("remote_mutation_observed") is True
+    merge_completion_verified = execution.get("merge_completion_verified") is True
+    merge_queued = execution.get("merge_queued") is True
     viewed = execution.get("verified_pr")
     observed_merge_sha = (
         grabowski_grips._captain_merge_commit_oid(viewed)
-        if isinstance(viewed, dict)
+        if merge_completion_verified and isinstance(viewed, dict)
         else None
     )
     external = execution.get("external_merge_reconciliation")
-    execution_invoked = execution.get("execution_invoked") is True
-    verification_passed = execution.get("verification_passed") is True
-    merge_completion_verified = (
-        execution.get("merge_completion_verified") is True
-        or (verification_passed and observed_merge_sha is not None)
-    )
     external_merge_observed = (
         isinstance(external, dict)
         and external.get("external_merge_observed") is True
+        and external.get("dispatch_called") is False
     ) or (not execution_invoked and merge_completion_verified)
-    if merge_completion_verified and execution_invoked:
+
+    if (
+        dispatch_succeeded
+        and verification_passed
+        and remote_mutation_observed
+        and merge_completion_verified
+        and observed_merge_sha is not None
+        and not external_merge_observed
+    ):
         provenance_mode = "captain_dispatch_verified"
-    elif merge_completion_verified:
+    elif (
+        not execution_invoked
+        and verification_passed
+        and remote_mutation_observed
+        and merge_completion_verified
+        and observed_merge_sha is not None
+        and external_merge_observed
+    ):
         provenance_mode = "external_merge_reconciled"
-    elif execution.get("merge_queued") is True and execution_invoked:
+    elif (
+        execution_invoked
+        and verification_passed
+        and merge_queued
+        and not merge_completion_verified
+        and observed_merge_sha is None
+        and not external_merge_observed
+    ):
         provenance_mode = "captain_queue_dispatch_pending"
     else:
         provenance_mode = "unverified"
 
     material.update(
         {
-            "provenance_schema_version": 1,
+            "provenance_schema_version": 2,
             "execution_invoked": execution_invoked,
+            "dispatch_succeeded": dispatch_succeeded,
             "verification_passed": verification_passed,
-            "remote_mutation_observed": execution.get("remote_mutation_observed")
-            is True,
+            "remote_mutation_observed": remote_mutation_observed,
             "merge_completion_verified": merge_completion_verified,
+            "merge_queued": merge_queued,
             "external_merge_observed": external_merge_observed,
             "observed_merge_sha": observed_merge_sha,
             "provenance_mode": provenance_mode,

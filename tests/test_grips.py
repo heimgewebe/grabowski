@@ -3076,11 +3076,13 @@ class GripFoundationTests(unittest.TestCase):
         execution_result = dict(completion["execution_result"])
         execution_result.update(
             {
-                "provenance_schema_version": 1,
+                "provenance_schema_version": 2,
                 "execution_invoked": True,
+                "dispatch_succeeded": True,
                 "verification_passed": True,
                 "remote_mutation_observed": True,
                 "merge_completion_verified": True,
+                "merge_queued": False,
                 "external_merge_observed": False,
                 "observed_merge_sha": "9" * 40,
                 "provenance_mode": "captain_dispatch_verified",
@@ -3130,11 +3132,13 @@ class GripFoundationTests(unittest.TestCase):
             "pr-settlement", _saga_pr_target(), "t121-audit-binding-provenance"
         )
         provenance = {
-            "provenance_schema_version": 1,
+            "provenance_schema_version": 2,
             "execution_invoked": True,
+            "dispatch_succeeded": True,
             "verification_passed": True,
             "remote_mutation_observed": True,
             "merge_completion_verified": True,
+            "merge_queued": False,
             "external_merge_observed": False,
             "observed_merge_sha": "9" * 40,
             "provenance_mode": "captain_dispatch_verified",
@@ -3174,6 +3178,107 @@ class GripFoundationTests(unittest.TestCase):
                 binding, plan_value=plan, captain_result_value=ref
             )
         self.assertEqual(provenance, validated["merge_provenance"])
+
+    def test_saga_orchestration_rejects_receipt_binding_that_strips_verified_provenance(self) -> None:
+        plan = sagas.build_plan(
+            "pr-settlement", _saga_pr_target(), "t121-audit-binding-strip"
+        )
+        provenance = {
+            "provenance_schema_version": 2,
+            "execution_invoked": True,
+            "dispatch_succeeded": True,
+            "verification_passed": True,
+            "remote_mutation_observed": True,
+            "merge_completion_verified": True,
+            "merge_queued": False,
+            "external_merge_observed": False,
+            "observed_merge_sha": "9" * 40,
+            "provenance_mode": "captain_dispatch_verified",
+        }
+        expected = plan["expected_identity"]
+        output = {"decision": "executed", "actions": [], "executions": []}
+        receipt = {
+            "kind": "grabowski.operator_grip_receipt",
+            "schema_version": 1,
+            "grip": {"name": "captain-run"},
+            "status": "passed",
+            "output_sha256": sagas.sha256_json(output),
+        }
+        receipt["receipt_sha256"] = sagas.sha256_json(receipt)
+        captain = {
+            "status": "passed",
+            "receipt_sha256": receipt["receipt_sha256"],
+            "receipt": receipt,
+            "output": output,
+            "captain_audit": {
+                "status": "complete",
+                "completion": {"audit_record_sha256": "d" * 64},
+            },
+        }
+        trusted = {
+            "intent_record_sha256": "c" * 64,
+            "completion_record_sha256": "d" * 64,
+            "action": plan["captain_handoff"]["action"],
+            "target_sha256": grips.sha256_json(plan["captain_handoff"]["target"]),
+            "expected_head": expected["expected_head"],
+            "expected_base": expected["base"],
+            "expected_base_sha": expected["expected_base_sha"],
+            "receipt_sha256": receipt["receipt_sha256"],
+            "output_sha256": receipt["output_sha256"],
+            "status": "passed",
+            "merge_provenance": provenance,
+        }
+        body = {
+            "schema_version": 1,
+            "kind": grip_orchestration.CAPTAIN_AUDIT_BINDING_KIND,
+            "authority": "verified_grabowski_audit_chain",
+            "intent_record_sha256": "c" * 64,
+            "completion_record_sha256": "d" * 64,
+            "action": trusted["action"],
+            "target_sha256": trusted["target_sha256"],
+            "expected_head": trusted["expected_head"],
+            "expected_base": trusted["expected_base"],
+            "expected_base_sha": trusted["expected_base_sha"],
+            "receipt_sha256": receipt["receipt_sha256"],
+            "output_sha256": receipt["output_sha256"],
+            "status": "passed",
+        }
+        binding = {**body, "binding_sha256": grips.sha256_json(body)}
+        with (
+            patch.object(
+                grip_orchestration,
+                "_verified_captain_audit_reference_identity",
+                return_value=trusted,
+            ),
+            self.assertRaisesRegex(
+                grip_orchestration.SagaError,
+                "merge provenance differs from verified audit evidence",
+            ),
+        ):
+            grip_orchestration.validate_captain_audit_binding(
+                binding, plan_value=plan, captain_result_value=captain
+            )
+
+    def test_saga_orchestration_rejects_inconsistent_unverified_provenance_mode(self) -> None:
+        result = {
+            "status": "passed",
+            "receipt_sha256": "1" * 64,
+            "output_sha256": "2" * 64,
+            "provenance_schema_version": 2,
+            "execution_invoked": True,
+            "dispatch_succeeded": True,
+            "verification_passed": True,
+            "remote_mutation_observed": True,
+            "merge_completion_verified": True,
+            "merge_queued": False,
+            "external_merge_observed": False,
+            "observed_merge_sha": "9" * 40,
+            "provenance_mode": "unverified",
+        }
+        with self.assertRaisesRegex(
+            grip_orchestration.SagaError, "mode is internally inconsistent"
+        ):
+            grip_orchestration._captain_merge_provenance_from_execution_result(result)
 
     def test_saga_orchestration_rejects_partial_execution_result_provenance(self) -> None:
         with self.assertRaisesRegex(

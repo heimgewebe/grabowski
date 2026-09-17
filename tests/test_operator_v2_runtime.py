@@ -3133,6 +3133,9 @@ class CaptainAuditTrailTests(unittest.TestCase):
                 {
                     "action": "pr-merge",
                     "execution_invoked": True,
+                    "execution_attempted": True,
+                    "command_returned": True,
+                    "merge_returncode": 0,
                     "verification_passed": True,
                     "remote_mutation_observed": True,
                     "merge_completion_verified": True,
@@ -3148,6 +3151,30 @@ class CaptainAuditTrailTests(unittest.TestCase):
         self.assertEqual(merge_sha, material["observed_merge_sha"])
         self.assertTrue(material["execution_invoked"])
         self.assertFalse(material["external_merge_observed"])
+
+        ambiguous = {
+            **base_result,
+            "output": {
+                "executions": [
+                    {
+                        "action": "pr-merge",
+                        "execution_invoked": True,
+                        "execution_attempted": True,
+                        "command_returned": True,
+                        "merge_returncode": 1,
+                        "verification_passed": True,
+                        "remote_mutation_observed": True,
+                        "merge_completion_verified": True,
+                        "verified_pr": {"mergeCommit": {"oid": merge_sha}},
+                    }
+                ]
+            },
+        }
+        material = grabowski_mcp._captain_audit_execution_result_material(
+            ambiguous, action="pr-merge"
+        )
+        self.assertEqual("unverified", material["provenance_mode"])
+        self.assertFalse(material["dispatch_succeeded"])
 
         external = {
             **base_result,
