@@ -136,7 +136,6 @@ def main(argv: list[str] | None = None) -> int:
             max_cost_usd=max_cost,
             validator_command=core._command_array(args.validator_command),
         )
-        core._write_report_artifacts(args.report_out, report)
     except (core.PreflightError, codex_runner.RunnerError) as exc:
         print(json.dumps({"status": "error", "error": str(exc)}, sort_keys=True), file=sys.stderr)
         return 2

@@ -1692,8 +1692,14 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
             code_files = {item["name"]: item for item in binding["code"]["files"]}
             self.assertIn(Path(codex_runner.__file__).name, code_files)
 
+            runtime_binding = {
+                "request_root": environment["request_root"],
+                "repository_map": environment["repository_map"],
+                "transcript_root": transcript_root,
+                "evidence_root": evidence_root,
+            }
             consumed = codex_runner._load_preflight_dispatch_authorization(
-                treatment, state_root
+                treatment, state_root, runtime_binding=runtime_binding
             )
             self.assertEqual(
                 consumed["proxy_code"]["sha256"],
@@ -1703,6 +1709,55 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
                 [str(item["path"]) for item in consumed["mcp_files"]],
                 [item["path"] for item in binding["mcp_command_files"]],
             )
+            self.assertIsInstance(consumed["repository_map_bytes"], bytes)
+            self.assertEqual(
+                codex_runner._repository_root_from_authorized_map_bytes(
+                    treatment, consumed["repository_map_bytes"]
+                ),
+                environment["source"].resolve(),
+            )
+
+            # Baseline consumes the same pair/provider/runtime authorization,
+            # without inheriting treatment-only MCP/RepoGround requirements.
+            baseline_consumed = codex_runner._load_preflight_dispatch_authorization(
+                baseline, state_root, runtime_binding=runtime_binding
+            )
+            self.assertEqual(baseline_consumed["mcp_files"], [])
+            self.assertIsNone(baseline_consumed["proxy_code"])
+            self.assertIsNone(baseline_consumed["manifest"])
+
+            wrong_runtime = dict(runtime_binding)
+            wrong_runtime["transcript_root"] = root / "other-transcripts"
+            with self.assertRaisesRegex(
+                codex_runner.RunnerError, "runtime binding mismatch: transcript_root"
+            ):
+                codex_runner._load_preflight_dispatch_authorization(
+                    baseline, state_root, runtime_binding=wrong_runtime
+                )
+
+            original_map = environment["repository_map"].read_bytes()
+            environment["repository_map"].write_bytes(original_map + b"\n")
+            try:
+                with self.assertRaisesRegex(
+                    codex_runner.RunnerError, "repository map identity mismatch"
+                ):
+                    codex_runner._load_preflight_dispatch_authorization(
+                        baseline, state_root, runtime_binding=runtime_binding
+                    )
+            finally:
+                environment["repository_map"].write_bytes(original_map)
+
+            hidden = authorization_path.with_name("authorization.hidden")
+            authorization_path.rename(hidden)
+            try:
+                with self.assertRaisesRegex(
+                    codex_runner.RunnerError, "preflight dispatch authorization is unavailable"
+                ):
+                    codex_runner._load_preflight_dispatch_authorization(
+                        baseline, state_root, runtime_binding=runtime_binding
+                    )
+            finally:
+                hidden.rename(authorization_path)
 
     def test_authorize_dispatch_rejects_cross_provider_binding_before_ledger(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1808,6 +1863,65 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
             self.assertNotIn("authorized", [event["event"] for event in events])
             self.assertEqual(events[-1]["event"], "preflight-failed")
             self.assertFalse(events[-1]["payload"]["retry_permitted"])
+
+    def test_report_persistence_failure_leaves_no_dispatch_authorization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = support.fixture_environment(root)
+            pair_id, _, _ = self._codex_pair(environment)
+            state_root = root / "state"
+            report_out = root / "preflight-report.json"
+            codex = root / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            codex.chmod(0o755)
+            codex_sha256 = hashlib.sha256(codex.read_bytes()).hexdigest()
+
+            with (
+                mock.patch.object(
+                    codex_preflight.codex_runner,
+                    "validate_executable",
+                    return_value=str(codex.resolve()),
+                ),
+                mock.patch.object(codex_preflight.codex_runner, "validate_toolchain"),
+                mock.patch.object(
+                    codex_preflight.codex_runner,
+                    "validate_chatgpt_subscription",
+                    return_value=b'{"tokens":{}}',
+                ),
+                mock.patch.object(
+                    codex_preflight.core,
+                    "_write_report_artifacts",
+                    side_effect=codex_preflight.core.PreflightError("report persistence failed"),
+                ),
+                self.assertRaisesRegex(
+                    codex_preflight.core.PreflightError, "report persistence failed"
+                ),
+            ):
+                codex_preflight.authorize_pair(
+                    pair_id=pair_id,
+                    request_root=environment["request_root"],
+                    repository_map=environment["repository_map"],
+                    state_root=state_root,
+                    transcript_root=root / "transcripts",
+                    evidence_root=root / "evidence",
+                    report_out=report_out,
+                    codex_command=str(codex.resolve()),
+                    codex_command_sha256=codex_sha256,
+                    max_cost_usd=support.Decimal("1.00"),
+                    validator_command=codex_preflight.core._command_array(
+                        environment["validator_command"]
+                    ),
+                )
+
+            pair_digest = hashlib.sha256(pair_id.encode("utf-8")).hexdigest()
+            pair_root = state_root / "preflight-dispatch-ledger" / pair_digest
+            self.assertFalse((pair_root / "authorization.json").exists())
+            events = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in sorted((pair_root / "events").glob("*.json"))
+            ]
+            self.assertNotIn("authorized", [event["event"] for event in events])
+            self.assertEqual(events[-1]["event"], "preflight-failed")
 
     def test_provider_specific_request_validation_has_no_cross_provider_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -566,14 +566,29 @@ def _initialize_dispatch_ledger(
     }
 
 
-def _publish_dispatch_authorization(
-    ledger: dict[str, Any], binding: Mapping[str, Any]
-) -> None:
+def _prepare_dispatch_publication(
+    ledger: Mapping[str, Any], binding: Mapping[str, Any]
+) -> dict[str, Any]:
     if _sha256_json(binding) != ledger["contract_sha256"]:
         raise PreflightError("dispatch authorization binding changed before publication")
-    authorization_path = ledger["root"] / "authorization.json"
+    authorization_path = Path(ledger["root"]) / "authorization.json"
     if ledger.get("authorization_sha256") is not None or authorization_path.exists():
         raise PreflightError("dispatch authorization is already published")
+    sequence = int(ledger["next_sequence"])
+    event = {
+        "kind": LEDGER_EVENT_KIND,
+        "version": LEDGER_VERSION,
+        "sequence": sequence,
+        "event": "authorized",
+        "recorded_at": _iso(_utc_now()),
+        "pair_id": ledger["pair_id"],
+        "contract_sha256": ledger["contract_sha256"],
+        "previous_event_sha256": ledger["previous_event_sha256"],
+        "payload": {
+            "synthetic_fixture": bool(binding["synthetic_fixture"]),
+            "max_provider_processes": int(binding["max_provider_processes"]),
+        },
+    }
     authorization = {
         "kind": LEDGER_KIND,
         "version": LEDGER_VERSION,
@@ -582,17 +597,59 @@ def _publish_dispatch_authorization(
         "binding": dict(binding),
         "retry_permitted": False,
     }
-    _append_ledger_event(
-        ledger,
-        "authorized",
-        {
-            "synthetic_fixture": bool(binding["synthetic_fixture"]),
-            "max_provider_processes": int(binding["max_provider_processes"]),
-        },
-    )
-    _write_private_exclusive(authorization_path, authorization)
-    ledger["authorization_sha256"] = _sha256_json(authorization)
+    return {
+        "event": event,
+        "event_path": Path(ledger["events_root"]) / f"{sequence:04d}-authorized.json",
+        "event_sha256": _sha256_json(event),
+        "authorization": authorization,
+        "authorization_path": authorization_path,
+        "authorization_sha256": _sha256_json(authorization),
+    }
 
+
+def _dispatch_ledger_report_after_publication(
+    ledger: Mapping[str, Any], publication: Mapping[str, Any]
+) -> dict[str, Any]:
+    report = _dispatch_ledger_report(ledger)
+    report["authorization_sha256"] = publication["authorization_sha256"]
+    report["event_count"] = int(ledger["next_sequence"]) + 1
+    report["final_event_sha256"] = publication["event_sha256"]
+    return report
+
+
+def _publish_dispatch_authorization(
+    ledger: dict[str, Any],
+    binding: Mapping[str, Any],
+    *,
+    prepared: Mapping[str, Any] | None = None,
+) -> None:
+    publication = (
+        _prepare_dispatch_publication(ledger, binding)
+        if prepared is None
+        else dict(prepared)
+    )
+    if _sha256_json(binding) != ledger["contract_sha256"]:
+        raise PreflightError("dispatch authorization binding changed before publication")
+    if publication.get("authorization_sha256") != _sha256_json(publication["authorization"]):
+        raise PreflightError("prepared dispatch authorization identity is invalid")
+    if publication.get("event_sha256") != _sha256_json(publication["event"]):
+        raise PreflightError("prepared dispatch authorization event identity is invalid")
+    if int(publication["event"].get("sequence", -1)) != int(ledger["next_sequence"]):
+        raise PreflightError("prepared dispatch authorization sequence is stale")
+    if publication["event"].get("previous_event_sha256") != ledger["previous_event_sha256"]:
+        raise PreflightError("prepared dispatch authorization event chain is stale")
+    authorization_path = Path(publication["authorization_path"])
+    event_path = Path(publication["event_path"])
+    if authorization_path.exists() or event_path.exists():
+        raise PreflightError("dispatch authorization publication path already exists")
+
+    # The report/digest is already durable at this point.  These are the final
+    # create-only publication writes; no success-path persistence follows.
+    _write_private_exclusive(event_path, publication["event"])
+    ledger["next_sequence"] = int(ledger["next_sequence"]) + 1
+    ledger["previous_event_sha256"] = publication["event_sha256"]
+    _write_private_exclusive(authorization_path, publication["authorization"])
+    ledger["authorization_sha256"] = publication["authorization_sha256"]
 
 def _append_ledger_event(
     ledger: dict[str, Any], event_type: str, payload: Mapping[str, Any]
@@ -1408,6 +1465,8 @@ def authorize_dispatch(
         or max_cost_usd > MAX_PER_RUN_COST_USD
     ):
         raise PreflightError(f"max cost must be finite, > 0 and <= {MAX_PER_RUN_COST_USD}")
+    if report_out is None:
+        raise PreflightError("live dispatch authorization requires a durable report output")
     if not isinstance(provider_binding, Mapping) or provider_binding.get("mode") != "live_provider":
         raise PreflightError("live provider binding is invalid")
     baseline, treatment = load_pair(request_root, pair_id)
@@ -1468,14 +1527,15 @@ def authorize_dispatch(
             synthetic=False,
             provider_binding=provider_binding,
         )
-        _publish_dispatch_authorization(ledger, binding)
-        return {
+
+        publication = _prepare_dispatch_publication(ledger, binding)
+        report = {
             "kind": "repobrief.agent_benchmark_preflight_dispatch_authorization",
             "version": VERSION,
             "status": "authorized",
             "pair_id": pair_id,
             "synthetic_fixture": False,
-            "dispatch_ledger": _dispatch_ledger_report(ledger),
+            "dispatch_ledger": _dispatch_ledger_report_after_publication(ledger, publication),
             "request_sha256": {
                 "baseline": _sha256_json(baseline),
                 "treatment": _sha256_json(treatment),
@@ -1491,10 +1551,33 @@ def authorize_dispatch(
             "default_promoted": False,
             "does_not_establish": list(DOES_NOT_ESTABLISH),
         }
+
+        # Durable producer evidence must exist before the capability becomes
+        # consumable.  A report/digest failure therefore leaves no authorization.
+        _write_report_artifacts(report_out, report)
+
+        publication_source = source_state(source)
+        _assert_source_unchanged(before, publication_source)
+        _assert_dispatch_binding_unchanged(
+            binding,
+            pair_id=pair_id,
+            request_root=request_root,
+            repository_map=repository_map,
+            state_root=state_root,
+            transcript_root=transcript_root,
+            evidence_root=evidence_root,
+            report_out=report_out,
+            claude="",
+            max_cost_usd=max_cost_usd,
+            validator_command=validator_command,
+            synthetic=False,
+            provider_binding=provider_binding,
+        )
+        _publish_dispatch_authorization(ledger, binding, prepared=publication)
+        return report
     except Exception as exc:
         _record_preflight_failure(ledger, exc)
         raise
-
 
 def execute_preflight(
     *,

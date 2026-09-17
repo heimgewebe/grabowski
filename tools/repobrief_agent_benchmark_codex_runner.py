@@ -376,30 +376,54 @@ def _read_bound_regular_file(path: Path, *, label: str, max_bytes: int) -> bytes
 
 
 def validate_chatgpt_subscription(codex: str) -> bytes:
-    environment = provider_env(codex=codex)
-    try:
-        completed = subprocess.run(
-            [codex, "login", "status"], stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment,
-            shell=False, timeout=10, check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RunnerError("Codex ChatGPT login status could not be verified") from exc
-    try:
-        text = completed.stdout.decode("utf-8") + "\n" + completed.stderr.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise RunnerError("Codex ChatGPT login status was not UTF-8") from exc
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    status_lines = [line for line in lines if not any(
-        pattern.fullmatch(line) for pattern in QUALIFIED_BENIGN_STDERR_PATTERNS
-    )]
-    if completed.returncode != 0 or status_lines != [CHATGPT_LOGIN_LINE]:
-        raise RunnerError("Codex must be logged in using the ChatGPT subscription")
-    home_text = environment.get("HOME")
+    source_environment = provider_env(codex=codex)
+    home_text = source_environment.get("HOME")
     if not home_text or not Path(home_text).is_absolute():
         raise RunnerError("HOME is unavailable for Codex ChatGPT authentication")
-    return _read_chatgpt_auth_file(Path(home_text))
+    auth_data = _read_chatgpt_auth_file(Path(home_text))
 
+    # Snapshot the exact credential bytes before asking Codex what login mode
+    # they represent.  The real run later stages these returned bytes again, so
+    # status validation and provider execution are byte-identical even if the
+    # user's mutable ~/.codex/auth.json changes concurrently.
+    with tempfile.TemporaryDirectory(prefix="grabowski-codex-auth-") as temporary:
+        snapshot_root = Path(temporary)
+        snapshot_root.chmod(0o700)
+        snapshot_home = stage_codex_home(snapshot_root, auth_data)
+        try:
+            environment = provider_env(codex=codex, codex_home=snapshot_home)
+            try:
+                completed = subprocess.run(
+                    [codex, "login", "status"], stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment,
+                    shell=False, timeout=10, check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise RunnerError("Codex ChatGPT login status could not be verified") from exc
+            try:
+                text = completed.stdout.decode("utf-8") + "\n" + completed.stderr.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise RunnerError("Codex ChatGPT login status was not UTF-8") from exc
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            status_lines = [line for line in lines if not any(
+                pattern.fullmatch(line) for pattern in QUALIFIED_BENIGN_STDERR_PATTERNS
+            )]
+            if completed.returncode != 0 or status_lines != [CHATGPT_LOGIN_LINE]:
+                raise RunnerError("Codex must be logged in using the ChatGPT subscription")
+            staged = _read_bound_regular_file(
+                snapshot_home / "auth.json",
+                label="staged Codex ChatGPT auth file",
+                max_bytes=MAX_AUTH_BYTES,
+            )
+            if staged != auth_data:
+                raise RunnerError("staged Codex ChatGPT auth bytes changed during validation")
+        except BaseException:
+            cleanup_codex_home(snapshot_home)
+            raise
+        cleanup_error = cleanup_codex_home(snapshot_home)
+        if cleanup_error is not None:
+            raise RunnerError("Codex ChatGPT auth snapshot cleanup failed")
+    return auth_data
 
 def stage_codex_home(state_root: Path, auth_data: bytes) -> Path:
     parent_path, parent_fd = _open_private_directory(state_root / "codex-runtime")
@@ -902,14 +926,153 @@ def _assert_authorized_codex_executable(
         raise RunnerError("Codex executable does not match preflight authorization")
 
 
+def _runtime_file_snapshot(
+    path: Path, *, label: str, max_bytes: int
+) -> tuple[dict[str, Any], bytes]:
+    requested = path.expanduser()
+    if not requested.is_absolute():
+        raise RunnerError(f"{label} path must be absolute")
+    try:
+        linked = requested.lstat()
+    except OSError as exc:
+        raise RunnerError(f"{label} is unavailable") from exc
+    if stat.S_ISLNK(linked.st_mode) or not stat.S_ISREG(linked.st_mode):
+        raise RunnerError(f"{label} must be a regular non-symlink file")
+    if linked.st_size < 0 or linked.st_size > max_bytes:
+        raise RunnerError(f"{label} size is invalid")
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(requested, flags)
+    except OSError as exc:
+        raise RunnerError(f"{label} could not be opened safely") from exc
+    try:
+        opened = os.fstat(descriptor)
+        data = bytearray()
+        while len(data) <= max_bytes:
+            chunk = os.read(
+                descriptor, min(1024 * 1024, max_bytes + 1 - len(data))
+            )
+            if not chunk:
+                break
+            data.extend(chunk)
+    finally:
+        os.close(descriptor)
+    try:
+        after = requested.lstat()
+        resolved = requested.resolve(strict=True)
+    except OSError as exc:
+        raise RunnerError(f"{label} disappeared during validation") from exc
+    initial_identity = (linked.st_dev, linked.st_ino, linked.st_size, linked.st_mode)
+    opened_identity = (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mode)
+    after_identity = (after.st_dev, after.st_ino, after.st_size, after.st_mode)
+    if initial_identity != opened_identity or opened_identity != after_identity:
+        raise RunnerError(f"{label} changed during validation")
+    if len(data) != opened.st_size or len(data) > max_bytes:
+        raise RunnerError(f"{label} changed or exceeds its bound")
+    raw = bytes(data)
+    return (
+        {
+            "path": str(resolved),
+            "bytes": len(raw),
+            "sha256": sha_bytes(raw),
+            "mode": oct(opened.st_mode & 0o777),
+        },
+        raw,
+    )
+
+
+def _runtime_file_identity(path: Path, *, label: str, max_bytes: int) -> dict[str, Any]:
+    identity, _raw = _runtime_file_snapshot(path, label=label, max_bytes=max_bytes)
+    return identity
+
+
+def _repository_root_from_authorized_map_bytes(
+    request: Mapping[str, Any], raw: bytes
+) -> Path:
+    document = base._load_object_bytes(raw, label="authorized repository map")
+    repository = base._mapping(request.get("repository"))
+    repository_id = str(repository.get("id"))
+    entry = base._mapping(document.get(repository_id))
+    if set(entry) != {"repository", "root"}:
+        raise RunnerError(f"repository map misses strict entry for {repository_id}")
+    if entry.get("repository") != repository.get("repository"):
+        raise RunnerError("repository map owner/name mismatch")
+    root = Path(
+        base._require_string(entry.get("root"), "repository map root")
+    ).expanduser().resolve()
+    if not root.is_dir() or not (root / ".git").exists():
+        raise RunnerError("repository map root is not a Git checkout")
+    return root
+
+def _assert_authorized_runtime_binding(
+    binding: Mapping[str, Any],
+    request: Mapping[str, Any],
+    *,
+    request_root: Path,
+    repository_map: Path,
+    state_root: Path,
+    transcript_root: Path,
+    evidence_root: Path,
+) -> bytes:
+    actual_paths = {
+        "request_root": str(request_root.expanduser().resolve()),
+        "state_root": str(state_root.expanduser().resolve()),
+        "transcript_root": str(transcript_root.expanduser().resolve()),
+        "evidence_root": str(evidence_root.expanduser().resolve()),
+    }
+    for field, actual in actual_paths.items():
+        if binding.get(field) != actual:
+            raise RunnerError(f"preflight dispatch authorization runtime binding mismatch: {field}")
+
+    expected_map = binding.get("repository_map")
+    if not isinstance(expected_map, dict):
+        raise RunnerError("preflight dispatch authorization repository map identity is missing")
+    current_map, repository_map_bytes = _runtime_file_snapshot(
+        repository_map.expanduser(), label="repository map", max_bytes=base.MAX_REQUEST_BYTES
+    )
+    if canonical(expected_map) != canonical(current_map):
+        raise RunnerError("preflight dispatch authorization repository map identity mismatch")
+
+    condition = request.get("condition")
+    requests = binding.get("requests")
+    expected_request = requests.get(condition) if isinstance(requests, dict) else None
+    if not isinstance(condition, str) or not isinstance(expected_request, dict):
+        raise RunnerError("preflight dispatch authorization request binding is missing")
+    if (
+        expected_request.get("request_id") != request.get("request_id")
+        or expected_request.get("sha256") != base._sha256_json(request)
+    ):
+        raise RunnerError(
+            f"preflight dispatch authorization does not bind this {condition} request"
+        )
+    expected_file = expected_request.get("file")
+    if not isinstance(expected_file, dict) or not isinstance(expected_file.get("path"), str):
+        raise RunnerError("preflight dispatch authorization request file identity is missing")
+    expected_path = Path(expected_file["path"])
+    try:
+        expected_path.resolve(strict=True).relative_to(request_root.expanduser().resolve())
+    except (OSError, ValueError) as exc:
+        raise RunnerError("preflight dispatch authorization request file escapes request root") from exc
+    current_request_file = _runtime_file_identity(
+        expected_path, label=f"{condition} request", max_bytes=base.MAX_REQUEST_BYTES
+    )
+    if canonical(expected_file) != canonical(current_request_file):
+        raise RunnerError("preflight dispatch authorization request file identity mismatch")
+    return repository_map_bytes
+
+
 def _load_preflight_dispatch_authorization(
-    request: Mapping[str, Any], state_root: Path
+    request: Mapping[str, Any],
+    state_root: Path,
+    *,
+    runtime_binding: Mapping[str, Path] | None = None,
 ) -> dict[str, Any]:
-    if request.get("condition") != "treatment":
-        raise RunnerError("preflight MCP authorization is only valid for treatment")
+    condition = request.get("condition")
+    if condition not in {"baseline", "treatment"}:
+        raise RunnerError("preflight dispatch authorization condition is invalid")
     pair_id = request.get("pair_id")
     if not isinstance(pair_id, str) or not pair_id:
-        raise RunnerError("preflight MCP authorization pair ID is invalid")
+        raise RunnerError("preflight dispatch authorization pair ID is invalid")
     pair_digest = hashlib.sha256(pair_id.encode("utf-8")).hexdigest()
     ledger_root = state_root / "preflight-dispatch-ledger"
     pair_root = ledger_root / pair_digest
@@ -944,14 +1107,49 @@ def _load_preflight_dispatch_authorization(
         raise RunnerError("preflight dispatch authorization binding is invalid")
     if binding.get("pair_id") != pair_id or binding.get("state_root") != str(state_root.resolve()):
         raise RunnerError("preflight dispatch authorization does not bind this pair/state root")
+
     requests = binding.get("requests")
-    treatment = requests.get("treatment") if isinstance(requests, dict) else None
+    selected = requests.get(condition) if isinstance(requests, dict) else None
     if (
-        not isinstance(treatment, dict)
-        or treatment.get("request_id") != request.get("request_id")
-        or treatment.get("sha256") != base._sha256_json(request)
+        not isinstance(selected, dict)
+        or selected.get("request_id") != request.get("request_id")
+        or selected.get("sha256") != base._sha256_json(request)
     ):
-        raise RunnerError("preflight dispatch authorization does not bind this treatment request")
+        raise RunnerError(
+            f"preflight dispatch authorization does not bind this {condition} request"
+        )
+
+    repository_map_bytes: bytes | None = None
+    if runtime_binding is not None:
+        required = {"request_root", "repository_map", "transcript_root", "evidence_root"}
+        if set(runtime_binding) != required or not all(
+            isinstance(runtime_binding[name], Path) for name in required
+        ):
+            raise RunnerError("runtime dispatch binding inputs are incomplete")
+        repository_map_bytes = _assert_authorized_runtime_binding(
+            binding,
+            request,
+            request_root=runtime_binding["request_root"],
+            repository_map=runtime_binding["repository_map"],
+            state_root=state_root,
+            transcript_root=runtime_binding["transcript_root"],
+            evidence_root=runtime_binding["evidence_root"],
+        )
+
+    code_files = _validated_authorized_runtime_code(binding.get("code"))
+    provider_codex = _validated_authorized_codex_provider(binding.get("provider"))
+    result: dict[str, Any] = {
+        "mcp_files": [],
+        "proxy_code": None,
+        "manifest": None,
+        "provider_codex": provider_codex,
+        "code_files": [dict(code_files[name]) for name in _AUTHORIZED_RUNTIME_CODE_NAMES],
+        "binding": dict(binding),
+        "repository_map_bytes": repository_map_bytes,
+    }
+    if condition == "baseline":
+        return result
+
     repobrief = request.get("repobrief")
     if not isinstance(repobrief, dict):
         raise RunnerError("treatment RepoGround binding is invalid")
@@ -959,30 +1157,22 @@ def _load_preflight_dispatch_authorization(
     if binding.get("mcp_command_sha256") != base._sha256_json(command):
         raise RunnerError("preflight dispatch authorization MCP command mismatch")
     manifest = Path(str(repobrief.get("manifest")))
-    manifest_data = _read_bound_regular_file(
+    current_manifest = _runtime_file_identity(
         manifest, label="RepoGround manifest", max_bytes=MAX_MANIFEST_BYTES
     )
-    manifest_metadata = manifest.lstat()
-    current_manifest = {
-        "path": str(manifest.resolve(strict=True)),
-        "bytes": len(manifest_data),
-        "sha256": sha_bytes(manifest_data),
-        "mode": oct(manifest_metadata.st_mode & 0o777),
-    }
     if (
         current_manifest["sha256"] != repobrief.get("manifest_sha256")
         or canonical(binding.get("manifest")) != canonical(current_manifest)
     ):
         raise RunnerError("preflight dispatch authorization manifest mismatch")
-    code_files = _validated_authorized_runtime_code(binding.get("code"))
-    proxy_code = code_files[Path(__file__).name]
-    return {
-        "mcp_files": _normalized_authorized_mcp_files(binding.get("mcp_command_files")),
-        "proxy_code": dict(proxy_code),
-        "manifest": dict(current_manifest),
-        "provider_codex": _validated_authorized_codex_provider(binding.get("provider")),
-        "code_files": [dict(code_files[name]) for name in _AUTHORIZED_RUNTIME_CODE_NAMES],
-    }
+    result.update(
+        {
+            "mcp_files": _normalized_authorized_mcp_files(binding.get("mcp_command_files")),
+            "proxy_code": dict(code_files[Path(__file__).name]),
+            "manifest": dict(current_manifest),
+        }
+    )
+    return result
 
 
 def _load_preflight_mcp_authorization(
@@ -1246,6 +1436,8 @@ def run_mcp_proxy(
     resource_calls: dict[Any, tuple[str, str | None]] = {}
     frozen_resources: dict[str, Any] | None = None
     frozen_uris: set[str] = set()
+    resource_list_upstream_id: Any | None = None
+    resource_list_waiters: list[Any] = []
     errors: list[BaseException] = []
     upstream_stderr = bytearray()
     upstream_stderr_overflow = False
@@ -1287,6 +1479,7 @@ def run_mcp_proxy(
     stderr_thread.start()
 
     def client_to_upstream() -> None:
+        nonlocal resource_list_upstream_id
         try:
             while True:
                 raw = _read_bounded_mcp_line(sys.stdin.buffer, peer="client")
@@ -1326,11 +1519,18 @@ def run_mcp_proxy(
                             if identifier is not None:
                                 _proxy_write(_proxy_error(identifier, "invalid resource request"), output_lock)
                             continue
+                        coalesced = False
                         with state_lock:
+                            if identifier in pending_requests:
+                                raise RunnerError("MCP client reused a pending request ID")
                             if action == "list" and frozen_resources is not None:
                                 cached = canonical(frozen_resources)
                             else:
                                 cached = None
+                            if action == "list" and frozen_resources is None and resource_list_upstream_id is not None:
+                                pending_requests[identifier] = "resource-list-waiter"
+                                resource_list_waiters.append(identifier)
+                                coalesced = True
                             if action == "read" and frozen_resources is None:
                                 error = "list frozen resources before reading"
                             elif action == "read" and (not isinstance(uri, str) or uri not in frozen_uris):
@@ -1340,14 +1540,16 @@ def run_mcp_proxy(
                         if cached is not None:
                             _proxy_write({"jsonrpc":"2.0","id":identifier,"result":{"content":[{"type":"text","text":cached}],"isError":False}}, output_lock)
                             continue
+                        if coalesced:
+                            continue
                         if error is not None:
                             _proxy_write({"jsonrpc":"2.0","id":identifier,"result":{"content":[{"type":"text","text":error}],"isError":True}}, output_lock)
                             continue
                         with state_lock:
-                            if identifier in pending_requests:
-                                raise RunnerError("MCP client reused a pending request ID")
                             pending_requests[identifier] = "resource"
                             resource_calls[identifier] = (str(action), str(uri) if uri is not None else None)
+                            if action == "list":
+                                resource_list_upstream_id = identifier
                         if action == "list":
                             send({"jsonrpc":"2.0","id":identifier,"method":"resources/list","params":{}})
                         else:
@@ -1428,6 +1630,7 @@ def run_mcp_proxy(
                 message = {"jsonrpc":"2.0","id":identifier,"result":{"tools":tools}}
             elif resource_call is not None:
                 action, _uri = resource_call
+                waiter_ids: list[Any] = []
                 if "error" in message:
                     text = canonical(message["error"]); is_error = True
                 elif action == "list":
@@ -1437,12 +1640,28 @@ def run_mcp_proxy(
                         text = str(exc); is_error = True
                     else:
                         with state_lock:
-                            frozen_resources = frozen
-                            frozen_uris = uris
-                        text = canonical(frozen); is_error = False
+                            if resource_list_upstream_id != identifier:
+                                raise RunnerError("MCP resource-list response identity is inconsistent")
+                            if frozen_resources is None:
+                                frozen_resources = frozen
+                                frozen_uris = uris
+                            text = canonical(frozen_resources)
+                        is_error = False
                 else:
                     text = canonical(message.get("result")); is_error = False
+                if action == "list":
+                    with state_lock:
+                        if resource_list_upstream_id != identifier:
+                            raise RunnerError("MCP resource-list response identity is inconsistent")
+                        resource_list_upstream_id = None
+                        waiter_ids = list(resource_list_waiters)
+                        resource_list_waiters.clear()
+                        for waiter_id in waiter_ids:
+                            if pending_requests.pop(waiter_id, None) != "resource-list-waiter":
+                                raise RunnerError("MCP resource-list waiter state is inconsistent")
                 message = {"jsonrpc":"2.0","id":identifier,"result":{"content":[{"type":"text","text":text}],"isError":is_error}}
+                for waiter_id in waiter_ids:
+                    _proxy_write({"jsonrpc":"2.0","id":waiter_id,"result":message["result"]}, output_lock)
             _proxy_write(message, output_lock)
         client_thread.join(timeout=1)
         if client_thread.is_alive():
@@ -2415,7 +2634,6 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
         codex_command_sha256=args.codex_command_sha256,
     )
     base.load_planned_request(request, args.request_root)
-    source = base.load_repository_root(request, args.repository_map)
     synthetic = args.stream_fixture is not None
 
     # Bind every static live input before consuming the create-only workspace id.
@@ -2435,8 +2653,6 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
         codex = validate_executable(
             args.codex_command, args.codex_command_sha256, require_read_only_mount=True
         )
-        validate_toolchain(codex)
-        auth_data = validate_chatgpt_subscription(codex)
 
     state_path, state_fd = _open_private_directory(args.state_root)
     try:
@@ -2446,14 +2662,48 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
     authorized_mcp_files: list[dict[str, Any]] | None = None
     authorized_proxy_code: dict[str, Any] | None = None
     authorized_manifest: dict[str, Any] | None = None
-    if not synthetic and request["condition"] == "treatment":
-        dispatch_authorization = _load_preflight_dispatch_authorization(request, state_path)
-        authorized_mcp_files = list(dispatch_authorization["mcp_files"])
-        authorized_proxy_code = dict(dispatch_authorization["proxy_code"])
-        authorized_manifest = dict(dispatch_authorization["manifest"])
+    dispatch_authorization: dict[str, Any] | None = None
+    if not synthetic:
         assert codex is not None
+        dispatch_authorization = _load_preflight_dispatch_authorization(
+            request,
+            state_path,
+            runtime_binding={
+                "request_root": args.request_root,
+                "repository_map": args.repository_map,
+                "transcript_root": args.transcript_root,
+                "evidence_root": args.provider_evidence_root,
+            },
+        )
         _assert_authorized_codex_executable(
             codex, str(args.codex_command_sha256), dispatch_authorization["provider_codex"]
+        )
+        validate_toolchain(codex)
+        auth_data = validate_chatgpt_subscription(codex)
+        if request["condition"] == "treatment":
+            authorized_mcp_files = list(dispatch_authorization["mcp_files"])
+            proxy_code = dispatch_authorization["proxy_code"]
+            manifest_authorization = dispatch_authorization["manifest"]
+            if not isinstance(proxy_code, dict) or not isinstance(manifest_authorization, dict):
+                raise RunnerError("treatment runtime authorization is incomplete")
+            authorized_proxy_code = dict(proxy_code)
+            authorized_manifest = dict(manifest_authorization)
+
+    if dispatch_authorization is None:
+        source = base.load_repository_root(request, args.repository_map)
+    else:
+        repository_map_bytes = dispatch_authorization.get("repository_map_bytes")
+        if not isinstance(repository_map_bytes, bytes):
+            raise RunnerError("authorized repository map snapshot is unavailable")
+        source = _repository_root_from_authorized_map_bytes(request, repository_map_bytes)
+        _assert_authorized_runtime_binding(
+            dispatch_authorization["binding"],
+            request,
+            request_root=args.request_root,
+            repository_map=args.repository_map,
+            state_root=state_path,
+            transcript_root=args.transcript_root,
+            evidence_root=args.provider_evidence_root,
         )
     evidence_plan = prepare_provider_evidence(
         request, args.transcript_root, args.provider_evidence_root

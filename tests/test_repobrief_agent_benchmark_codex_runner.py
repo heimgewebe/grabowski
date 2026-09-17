@@ -345,6 +345,39 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 with self.assertRaisesRegex(runner.RunnerError, "ChatGPT subscription"):
                     runner.validate_chatgpt_subscription("/opt/codex")
 
+    def test_chatgpt_subscription_status_uses_exact_staged_auth_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary) / "home"
+            auth_dir = home / ".codex"
+            auth_dir.mkdir(parents=True, mode=0o700)
+            auth = auth_dir / "auth.json"
+            auth.write_bytes(b"credential-A")
+            auth.chmod(0o600)
+            observed: dict[str, bytes | str] = {}
+
+            def status(argv, **kwargs):
+                environment = kwargs["env"]
+                snapshot_home = Path(environment["CODEX_HOME"])
+                observed["home"] = str(snapshot_home)
+                observed["bytes"] = (snapshot_home / "auth.json").read_bytes()
+                # Mutate the original only after the snapshot exists.  The status
+                # probe and returned runtime bytes must remain credential-A.
+                auth.write_bytes(b"credential-B")
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout=b"Logged in using ChatGPT\n", stderr=b""
+                )
+
+            with (
+                patch.dict(os.environ, {"HOME": str(home)}, clear=True),
+                patch.object(runner, "validate_toolchain", return_value="/usr/bin:/bin"),
+                patch.object(runner.subprocess, "run", side_effect=status),
+            ):
+                returned = runner.validate_chatgpt_subscription("/opt/codex")
+
+            self.assertEqual(observed["bytes"], b"credential-A")
+            self.assertEqual(returned, b"credential-A")
+            self.assertEqual(auth.read_bytes(), b"credential-B")
+
     def test_staged_codex_home_is_private_and_cleanup_is_explicit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary) / "state"
@@ -718,6 +751,38 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertFalse((root / "state").exists())
             self.assertFalse((root / "transcripts").exists())
             self.assertFalse((root / "provider-evidence").exists())
+
+    def test_live_baseline_requires_dispatch_authorization_before_codex_status_or_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, commit = repository(root)
+            value = request(commit=commit)
+            planned_request_root(root, value)
+            repository_map(root, source)
+            args = Namespace(
+                request_root=root / "requests",
+                repository_map=root / "repositories.json",
+                state_root=root / "state",
+                transcript_root=root / "transcripts",
+                provider_evidence_root=root / "provider-evidence",
+                codex_command="/opt/codex",
+                codex_command_sha256="1" * 64,
+                allow_live_provider=True,
+                stream_fixture=None,
+                stderr_fixture=None,
+                fixture_returncode=0,
+            )
+            with (
+                patch.object(runner, "validate_executable", return_value="/opt/codex"),
+                patch.object(runner, "validate_toolchain") as toolchain,
+                patch.object(runner, "validate_chatgpt_subscription") as login_status,
+                patch.object(runner, "run_bounded") as provider_launch,
+                self.assertRaisesRegex(runner.RunnerError, "preflight dispatch ledger"),
+            ):
+                runner.execute(value, args)
+            toolchain.assert_not_called()
+            login_status.assert_not_called()
+            provider_launch.assert_not_called()
 
     def test_treatment_manifest_mismatch_fails_before_workspace_consumption(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1232,6 +1297,48 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     b"successful result" in completed.stderr
                     or b"response envelope is invalid" in completed.stderr
                 )
+
+    def test_mcp_proxy_coalesces_pipelined_resource_lists_to_first_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            count_path = root / "resource-list-count.txt"
+            upstream = root / "mcp.py"
+            upstream.write_text(
+                "import json, pathlib, sys\n"
+                f"COUNT = pathlib.Path({str(count_path)!r})\n"
+                f"TOOLS = {treatment_tools()!r}\n"
+                "resource_lists = 0\n"
+                "for line in sys.stdin:\n"
+                "    m=json.loads(line); method=m.get('method'); ident=m.get('id')\n"
+                "    if method=='tools/list':\n"
+                "        print(json.dumps({'jsonrpc':'2.0','id':ident,'result':{'tools':TOOLS}}),flush=True)\n"
+                "    elif method=='resources/list':\n"
+                "        resource_lists += 1\n"
+                "        uri = 'repobrief://first' if resource_lists == 1 else 'repobrief://second'\n"
+                "        print(json.dumps({'jsonrpc':'2.0','id':ident,'result':{'resources':[{'uri':uri}]}}),flush=True)\n"
+                "COUNT.write_text(str(resource_lists))\n",
+                encoding="utf-8",
+            )
+            messages = [
+                {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}},
+                {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"repobrief_resource_read","arguments":{"action":"list"}}},
+                {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"repobrief_resource_read","arguments":{"action":"list"}}},
+            ]
+            completed = subprocess.run(
+                proxy_command(upstream, root),
+                input=b"".join(json.dumps(item).encode() + b"\n" for item in messages),
+                capture_output=True, check=False, timeout=5,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+            responses = {item["id"]: item for item in map(json.loads, completed.stdout.decode().splitlines())}
+            first = responses[2]["result"]["content"][0]["text"]
+            second = responses[3]["result"]["content"][0]["text"]
+            self.assertEqual(first, second)
+            self.assertEqual(
+                [item["uri"] for item in json.loads(first)["resources"]],
+                ["repobrief://first"],
+            )
+            self.assertEqual(count_path.read_text(), "1")
 
     def test_mcp_proxy_exposes_exact_benchmark_surface(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
