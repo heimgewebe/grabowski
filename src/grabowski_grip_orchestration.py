@@ -1342,6 +1342,7 @@ def _verified_captain_audit_reference_identity(
     audit_ref: dict[str, Any],
     *,
     receipt_sha256_json: ReceiptHasher | None = None,
+    require_passed: bool = True,
 ) -> dict[str, Any]:
     try:
         import grabowski_audit_query
@@ -1413,7 +1414,10 @@ def _verified_captain_audit_reference_identity(
     provenance = _captain_merge_provenance_from_execution_result(execution_result)
     if not _CAPTAIN_AUDIT_RESULT_IDENTITY_KEYS.issubset(execution_result):
         raise SagaError("Captain audit reference execution result identity is incomplete")
-    if execution_result.get("status") != "passed":
+    result_status = execution_result.get("status")
+    if result_status not in {"passed", "blocked", "failed"}:
+        raise SagaError("Captain audit execution result status is invalid")
+    if require_passed and result_status != "passed":
         raise SagaError("Captain audit reference requires a passed Captain result")
     receipt_sha = _sha256(
         execution_result.get("receipt_sha256"),
@@ -1433,7 +1437,7 @@ def _verified_captain_audit_reference_identity(
         "expected_base_sha": expected_base_sha,
         "receipt_sha256": receipt_sha,
         "output_sha256": output_sha,
-        "status": "passed",
+        "status": result_status,
     }
     if provenance is not None:
         identity["merge_provenance"] = provenance
@@ -1811,6 +1815,7 @@ def validate_captain_audit_binding(
                     "completion_record_sha256": completion_sha,
                 },
                 receipt_sha256_json=receipt_hasher,
+                require_passed=False,
             )
         elif plan["captain_handoff"]["action"] == "pr-merge":
             raise SagaError(
