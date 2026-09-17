@@ -9650,16 +9650,13 @@ class AgentWorkspaceTests(unittest.TestCase):
 
         tmux.assert_called_once_with(["has-session", "-t", "=gaw-bound-session"])
 
-    def test_tmux_exact_session_identity_uses_exact_inventory_match(self) -> None:
+    def test_tmux_exact_session_identity_uses_exact_target(self) -> None:
         with mock.patch.object(
             workspace,
             "_tmux_result",
             return_value={
                 "returncode": 0,
-                "stdout": (
-                    "gaw-bound-session-prefix\t$16\t1784736999\n"
-                    "gaw-bound-session\t$17\t1784737000\n"
-                ),
+                "stdout": "$17\t1784737000\n",
                 "stderr": "",
             },
         ) as tmux:
@@ -9670,25 +9667,32 @@ class AgentWorkspaceTests(unittest.TestCase):
         )
         tmux.assert_called_once_with(
             [
-                "list-sessions",
-                "-F",
-                "#{session_name}\t#{session_id}\t#{session_created}",
+                "display-message",
+                "-p",
+                "-t",
+                "=gaw-bound-session",
+                "#{session_id}\t#{session_created}",
             ]
         )
 
-    def test_tmux_exact_session_identity_returns_none_without_exact_inventory_match(self) -> None:
+    def test_tmux_exact_session_identity_returns_none_when_exact_target_missing(self) -> None:
         with mock.patch.object(
             workspace,
             "_tmux_result",
-            return_value={
-                "returncode": 0,
-                "stdout": "gaw-bound-session-prefix\t$16\t1784736999\n",
-                "stderr": "",
-            },
-        ):
+            return_value={"returncode": 1, "stdout": "", "stderr": "missing"},
+        ) as tmux:
             result = workspace._tmux_exact_session_identity("gaw-bound-session")
 
         self.assertIsNone(result)
+        tmux.assert_called_once_with(
+            [
+                "display-message",
+                "-p",
+                "-t",
+                "=gaw-bound-session",
+                "#{session_id}\t#{session_created}",
+            ]
+        )
 
     def test_idle_tmux_transition_refuses_prefix_only_session_without_kill(self) -> None:
         manifest = self.manifest()
