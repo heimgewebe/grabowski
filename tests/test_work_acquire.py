@@ -2618,6 +2618,25 @@ class WorkAcquireTests(unittest.TestCase):
         )
         assess.assert_not_called()
 
+    def test_audit_only_closeout_rejects_repo_and_target_drift(self) -> None:
+        params = self.parameters()
+        stored_inputs, _receipt = self.store_lane(params)
+        lane_id = str(stored_inputs["lane_id"])
+
+        drift_cases = {
+            "repo": str(self.repo.parent),
+            "target_path": str(self.target.parent / "different-worktree"),
+        }
+        for field, value in drift_cases.items():
+            with self.subTest(field=field):
+                drifted = dict(params)
+                drifted[field] = value
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "terminal closeout parameters do not match stored work lane inputs",
+                ):
+                    work_acquire._closeout_inputs(drifted, lane_id)
+
     def test_mcp_entry_reuses_stored_system_convergence_plan_on_closeout(self) -> None:
         params = self.parameters()
         params["system_convergence"] = {"system_id": "example"}

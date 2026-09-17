@@ -203,10 +203,11 @@ def _closeout_inputs(parameters: dict[str, Any], lane_id: str) -> dict[str, Any]
         _text(parameters.get("source_kind"), "source_kind"),
         _text(parameters.get("source_id"), "source_id"),
     )
-    _text(parameters.get("repo"), "repo")
+    repo = Path(_text(parameters.get("repo"), "repo")).expanduser().resolve(strict=False)
     target = Path(_text(parameters.get("target_path"), "target_path")).expanduser()
     if not target.is_absolute():
         raise ValueError("target_path must be absolute")
+    target = target.resolve(strict=False)
     branch = _text(parameters.get("branch"), "branch")
     base_head = _text(parameters.get("base_head"), "base_head").lower()
     if SHA40_RE.fullmatch(base_head) is None:
@@ -260,8 +261,10 @@ def _closeout_inputs(parameters: dict[str, Any], lane_id: str) -> dict[str, Any]
         "source": {"kind": source_kind, "id": source_id},
         "controller": {"actor": controller_actor, "role": "controller"},
         "scoped_writer": ({"actor": writer, "role": "scoped_writer"} if writer else None),
+        "repo": str(repo),
         "base_head": base_head,
         "branch": branch,
+        "target_path": str(target),
         "purpose": purpose,
         "artifact_class": artifact_class,
         "retention_until_unix": retention,
