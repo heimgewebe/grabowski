@@ -332,6 +332,75 @@ def operator_obligation_terminal_evidence(source_id: str) -> dict[str, Any]:
     )
 
 
+THREAD_FOCUS_WORK_LANE_SCAN_LIMIT = 4096
+THREAD_FOCUS_COMPLETING_WORK_LANE_STATES = frozenset({"pr_merged", "deployed", "no_change_proven"})
+
+
+def _thread_focus_terminal_work_lane_evidence(source_id: str) -> dict[str, Any]:
+    import grabowski_work_acquire as work_acquire
+
+    root = work_acquire._state_root()
+    if not root.exists():
+        raise RuntimeError("thread focus source has no acceptance-bound completion")
+    paths = sorted(root.glob("*.json"))
+    if len(paths) > THREAD_FOCUS_WORK_LANE_SCAN_LIMIT:
+        raise RuntimeError("thread focus work-lane evidence scan is incomplete")
+
+    lane_evidence: list[dict[str, Any]] = []
+    for path in paths:
+        record = work_acquire._read_state(path)
+        if not isinstance(record, dict):
+            raise RuntimeError("thread focus work-lane evidence scan is incomplete")
+        lane_id = record.get("lane_id")
+        if not isinstance(lane_id, str) or re.fullmatch(r"[0-9a-f]{32}", lane_id) is None:
+            raise RuntimeError("thread focus work-lane identity is invalid")
+        if path.name != f"{lane_id}.json":
+            raise RuntimeError("thread focus work-lane canonical identity is invalid")
+        inputs = record.get("inputs")
+        source = inputs.get("source") if isinstance(inputs, dict) else None
+        if source != {"kind": "thread_focus", "id": source_id}:
+            continue
+        terminal = work_lane_terminal_evidence(lane_id)
+        if terminal.get("source_binding") != source:
+            raise RuntimeError("thread focus work-lane source binding changed")
+        if terminal.get("terminal_state") not in THREAD_FOCUS_COMPLETING_WORK_LANE_STATES:
+            raise RuntimeError(
+                "thread focus work lane is terminal but does not establish completion"
+            )
+        lane_evidence.append(terminal)
+
+    if not lane_evidence:
+        raise RuntimeError("thread focus source has no acceptance-bound completion")
+
+    lanes = sorted(
+        [
+            {
+                "lane_id": item["source_id"],
+                "terminal_state": item["terminal_state"],
+                "terminal_head_sha": item.get("terminal_head_sha"),
+                "assessment_sha256": item["assessment_sha256"],
+                "terminal_closeout_audit_record_sha256": item[
+                    "terminal_closeout_audit_record_sha256"
+                ],
+                "evidence_sha256": item["evidence_sha256"],
+            }
+            for item in lane_evidence
+        ],
+        key=lambda item: item["lane_id"],
+    )
+    return _terminal_evidence(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "kind": "thread_focus",
+            "source_id": source_id,
+            "terminal_state": "completed_without_current_obligation",
+            "completion_basis": "terminal_work_lanes",
+            "work_lanes": lanes,
+            "work_lane_set_sha256": checkouts._sha256_json(lanes),
+        }
+    )
+
+
 def thread_focus_terminal_evidence(source_id: str) -> dict[str, Any]:
     listed = operator_obligation.list_obligations(
         {
@@ -343,8 +412,10 @@ def thread_focus_terminal_evidence(source_id: str) -> dict[str, Any]:
     )
     if listed.get("scan_truncated") is True or listed.get("integrity_errors"):
         raise RuntimeError("thread focus obligation evidence is incomplete")
-    if listed.get("attention_required") is True or not listed.get("records"):
-        raise RuntimeError("thread focus source still requires continuation or has no receipt")
+    if listed.get("attention_required") is True:
+        raise RuntimeError("thread focus source still requires continuation")
+    if not listed.get("records"):
+        return _thread_focus_terminal_work_lane_evidence(source_id)
     statuses = [
         operator_obligation.status_obligation(record["obligation_id"])
         for record in listed["records"]

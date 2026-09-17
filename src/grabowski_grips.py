@@ -10455,23 +10455,33 @@ def _saga_captain_audit_binding(
         raise GripPreflightError("Captain audit completion lacks execution result binding")
     if completion.get("execution_result_sha256") != sha256_json(execution_result):
         raise GripPreflightError("Captain audit execution result digest mismatch")
+    identity_keys = {"status", "receipt_sha256", "output_sha256"}
+    if not identity_keys.issubset(execution_result):
+        raise GripPreflightError(
+            "Captain audit reference execution result identity is incomplete"
+        )
+    result_identity = {key: execution_result[key] for key in identity_keys}
     if audit_ref is not None:
-        if set(execution_result) != {"status", "receipt_sha256", "output_sha256"}:
-            raise GripPreflightError("Captain audit reference execution result shape is not canonical")
         if execution_result.get("status") != "passed":
             raise GripPreflightError("Captain audit reference requires a passed Captain result")
         if not _is_sha256_hex(execution_result.get("receipt_sha256")) or not _is_sha256_hex(execution_result.get("output_sha256")):
             raise GripPreflightError("Captain audit reference result identity is invalid")
-        result_identity = execution_result
     else:
         assert receipt is not None
-        result_identity = {
+        receipt_identity = {
             "status": receipt["status"],
             "receipt_sha256": receipt["receipt_sha256"],
             "output_sha256": receipt["output_sha256"],
         }
-        if execution_result != result_identity:
+        if result_identity != receipt_identity:
             raise GripPreflightError("Captain audit completion differs from Captain receipt")
+
+    try:
+        provenance = grabowski_grip_orchestration._captain_merge_provenance_from_execution_result(
+            execution_result
+        )
+    except grabowski_grip_orchestration.SagaError as exc:
+        raise GripPreflightError(str(exc)) from exc
     body = {
         "schema_version": 1,
         "kind": grabowski_grip_orchestration.CAPTAIN_AUDIT_BINDING_KIND,
@@ -10487,6 +10497,8 @@ def _saga_captain_audit_binding(
         "output_sha256": result_identity["output_sha256"],
         "status": result_identity["status"],
     }
+    if provenance is not None:
+        body["merge_provenance"] = provenance
     return {**body, "binding_sha256": sha256_json(body)}
 
 
@@ -13709,6 +13721,7 @@ def _run_captain_pr_merge(
         execution_result["verification_error"] = "; ".join(verify_errors)
         return execution_result
     execution_result["verification_passed"] = True
+    execution_result["merge_completion_verified"] = True
     return execution_result
 
 

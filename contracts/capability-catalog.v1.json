@@ -515,7 +515,7 @@
     },
     {
       "category": "work-coordination",
-      "description": "Acquire a work lane, or persist its evidence-bound terminal closeout.",
+      "description": "Acquire a work lane, persist terminal closeout, or repair only its missing audit.",
       "effects": [
         "resource-lease",
         "git-worktree-create",
