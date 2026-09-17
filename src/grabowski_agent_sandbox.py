@@ -750,7 +750,7 @@ def _adler_inbox_sandbox_binding(worktree: Path) -> tuple[tuple[tuple[Path, Path
             return (), ()
         raw_target = os.readlink(pointer)
         target = Path(raw_target)
-        root = _grosser_adler_inbox_root().absolute()
+        root = _grosser_adler_inbox_root().resolve(strict=True)
         if not target.is_absolute() or target.parent != root:
             return (), ()
         name = target.name
