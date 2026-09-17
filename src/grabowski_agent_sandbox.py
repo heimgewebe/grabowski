@@ -764,7 +764,7 @@ def _adler_inbox_sandbox_binding(worktree: Path) -> tuple[tuple[tuple[Path, Path
         if not _authenticated_work_lane_target(worktree, name[:-5]):
             return (), ()
         source = _private_regular_file(target, "Großer Adler worktree inbox")
-    except (OSError, AgentSandboxError):
+    except (OSError, RuntimeError, AgentSandboxError):
         return (), ()
     reserved = {Path("/tmp"), Path("/usr"), Path("/etc"), Path("/proc"), Path("/dev")}
     directories = tuple(
