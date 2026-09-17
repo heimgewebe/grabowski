@@ -333,6 +333,7 @@ def operator_obligation_terminal_evidence(source_id: str) -> dict[str, Any]:
 
 
 THREAD_FOCUS_WORK_LANE_SCAN_LIMIT = 4096
+THREAD_FOCUS_COMPLETING_WORK_LANE_STATES = frozenset({"pr_merged", "deployed", "no_change_proven"})
 
 
 def _thread_focus_terminal_work_lane_evidence(source_id: str) -> dict[str, Any]:
@@ -357,7 +358,12 @@ def _thread_focus_terminal_work_lane_evidence(source_id: str) -> dict[str, Any]:
         lane_id = record.get("lane_id")
         if not isinstance(lane_id, str) or re.fullmatch(r"[0-9a-f]{32}", lane_id) is None:
             raise RuntimeError("thread focus work-lane identity is invalid")
-        lane_evidence.append(work_lane_terminal_evidence(lane_id))
+        terminal = work_lane_terminal_evidence(lane_id)
+        if terminal.get("terminal_state") not in THREAD_FOCUS_COMPLETING_WORK_LANE_STATES:
+            raise RuntimeError(
+                "thread focus work lane is terminal but does not establish completion"
+            )
+        lane_evidence.append(terminal)
 
     if not lane_evidence:
         raise RuntimeError("thread focus source has no acceptance-bound completion")

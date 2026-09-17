@@ -1797,6 +1797,59 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
         self.assertEqual(lane_id, evidence["work_lanes"][0]["lane_id"])
         self.assertEqual("c" * 64, evidence["work_lanes"][0]["terminal_closeout_audit_record_sha256"])
 
+    def test_thread_focus_rejects_terminal_work_lane_that_requires_continuation(self) -> None:
+        source_id = "thread-focus-id"
+        lane_id = "a" * 32
+        lane_root = self.root / "work-lanes"
+        lane_root.mkdir()
+        (lane_root / f"{lane_id}.json").write_text("{}\n", encoding="utf-8")
+        lane_record = {
+            "lane_id": lane_id,
+            "inputs": {"source": {"kind": "thread_focus", "id": source_id}},
+        }
+        with (
+            patch.object(
+                sources.operator_obligation,
+                "list_obligations",
+                return_value={
+                    "scan_truncated": False,
+                    "integrity_errors": [],
+                    "attention_required": False,
+                    "records": [],
+                },
+            ),
+            patch.object(work_acquire, "_state_root", return_value=lane_root),
+            patch.object(work_acquire, "_read_state", return_value=lane_record),
+        ):
+            for terminal_state in (
+                "pr_opened",
+                "pr_updated",
+                "candidate_adopted",
+                "blocked_with_durable_followup",
+            ):
+                with (
+                    self.subTest(terminal_state=terminal_state),
+                    patch.object(
+                        sources,
+                        "work_lane_terminal_evidence",
+                        return_value={
+                            "schema_version": 1,
+                            "kind": "work_lane",
+                            "source_id": lane_id,
+                            "terminal_state": terminal_state,
+                            "terminal_head_sha": self.head,
+                            "assessment_sha256": "b" * 64,
+                            "terminal_closeout_audit_record_sha256": "c" * 64,
+                            "evidence_sha256": "d" * 64,
+                        },
+                    ),
+                    self.assertRaisesRegex(
+                        RuntimeError,
+                        "terminal but does not establish completion",
+                    ),
+                ):
+                    sources.thread_focus_terminal_evidence(source_id)
+
     def test_bureau_json_runs_bound_runtime_from_control_root(self) -> None:
         completed = subprocess.CompletedProcess(
             ["bureau"], 0, stdout=json.dumps({"result": {"tasks": []}}), stderr=""
