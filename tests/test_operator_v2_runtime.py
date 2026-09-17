@@ -3203,6 +3203,23 @@ class CaptainAuditTrailTests(unittest.TestCase):
         self.assertFalse(material["execution_invoked"])
         self.assertTrue(material["external_merge_observed"])
 
+    def test_completion_material_rejects_pr_merge_without_canonical_execution(self) -> None:
+        result = {
+            "status": "passed",
+            "receipt": {
+                "status": "passed",
+                "receipt_sha256": "a" * 64,
+                "output_sha256": "b" * 64,
+            },
+            "output": {"executions": []},
+        }
+        with self.assertRaisesRegex(
+            RuntimeError, "pr-merge audit completion lacks canonical execution evidence"
+        ):
+            grabowski_mcp._captain_audit_execution_result_material(
+                result, action="pr-merge"
+            )
+
     def test_verified_append_returns_the_exact_appended_record_digest(self) -> None:
         with (
             patch.object(

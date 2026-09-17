@@ -1812,6 +1812,10 @@ def validate_captain_audit_binding(
                 },
                 receipt_sha256_json=receipt_hasher,
             )
+        elif plan["captain_handoff"]["action"] == "pr-merge":
+            raise SagaError(
+                "captain_result lacks complete audit evidence for pr-merge"
+            )
         elif "merge_provenance" in binding:
             raise SagaError(
                 "captain_result lacks complete audit evidence for merge provenance"
@@ -1837,6 +1841,24 @@ def validate_captain_audit_binding(
             "output_sha256": receipt["output_sha256"],
             "status": receipt["status"],
         }
+
+    if trusted_audit_identity is not None and receipt is not None:
+        receipt_identity = {
+            "receipt_sha256": receipt["receipt_sha256"],
+            "output_sha256": receipt["output_sha256"],
+            "status": receipt["status"],
+        }
+        receipt_drift = [
+            key
+            for key, observed in receipt_identity.items()
+            if trusted_audit_identity.get(key) != observed
+        ]
+        if receipt_drift:
+            raise SagaError(
+                "captain_result receipt identity differs from verified audit evidence: "
+                + ", ".join(receipt_drift)
+            )
+        expected_values = trusted_audit_identity
 
     expected_provenance = (
         trusted_audit_identity.get("merge_provenance")

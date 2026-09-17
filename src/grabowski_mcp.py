@@ -12391,7 +12391,9 @@ def _captain_audit_execution_result_material(
         else None
     )
     if execution is None or execution.get("action") != "pr-merge":
-        return material
+        raise RuntimeError(
+            "Captain pr-merge audit completion lacks canonical execution evidence"
+        )
 
     execution_invoked = execution.get("execution_invoked") is True
     dispatch_succeeded = (
