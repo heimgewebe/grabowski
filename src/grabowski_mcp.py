@@ -12359,12 +12359,80 @@ def _captain_audit_action_material(parameters: dict[str, Any]) -> dict[str, Any]
     return {
         "action": action.get("action"),
         "target_sha256": grabowski_grips.sha256_json(target),
+        "target_repo": target.get("repo") or target.get("repository"),
+        "target_pr": target.get("pr") or target.get("pull_request"),
         "expected_head": parameters.get("expected_head") or target.get("expected_head") or target.get("head_sha"),
         "expected_base": parameters.get("expected_base") or target.get("base"),
         "expected_base_sha": parameters.get("expected_base_sha") or target.get("expected_base_sha"),
         "context_sha256": grabowski_grips.sha256_json(context if isinstance(context, dict) else {}),
         "request_sha256": grabowski_merge_guard.captain_request_sha256(parameters),
     }
+
+
+def _captain_audit_execution_result_material(
+    result: dict[str, Any], *, action: str | None
+) -> dict[str, Any]:
+    material: dict[str, Any] = {
+        "status": result.get("status") or result.get("receipt", {}).get("status"),
+        "receipt_sha256": result.get("receipt_sha256")
+        or result.get("receipt", {}).get("receipt_sha256"),
+        "output_sha256": result.get("receipt", {}).get("output_sha256"),
+    }
+    if action != "pr-merge":
+        return material
+
+    output = result.get("output")
+    executions = output.get("executions") if isinstance(output, dict) else None
+    execution = (
+        executions[0]
+        if isinstance(executions, list)
+        and len(executions) == 1
+        and isinstance(executions[0], dict)
+        else None
+    )
+    if execution is None or execution.get("action") != "pr-merge":
+        return material
+
+    viewed = execution.get("verified_pr")
+    observed_merge_sha = (
+        grabowski_grips._captain_merge_commit_oid(viewed)
+        if isinstance(viewed, dict)
+        else None
+    )
+    external = execution.get("external_merge_reconciliation")
+    execution_invoked = execution.get("execution_invoked") is True
+    verification_passed = execution.get("verification_passed") is True
+    merge_completion_verified = (
+        execution.get("merge_completion_verified") is True
+        or (verification_passed and observed_merge_sha is not None)
+    )
+    external_merge_observed = (
+        isinstance(external, dict)
+        and external.get("external_merge_observed") is True
+    ) or (not execution_invoked and merge_completion_verified)
+    if merge_completion_verified and execution_invoked:
+        provenance_mode = "captain_dispatch_verified"
+    elif merge_completion_verified:
+        provenance_mode = "external_merge_reconciled"
+    elif execution.get("merge_queued") is True and execution_invoked:
+        provenance_mode = "captain_queue_dispatch_pending"
+    else:
+        provenance_mode = "unverified"
+
+    material.update(
+        {
+            "provenance_schema_version": 1,
+            "execution_invoked": execution_invoked,
+            "verification_passed": verification_passed,
+            "remote_mutation_observed": execution.get("remote_mutation_observed")
+            is True,
+            "merge_completion_verified": merge_completion_verified,
+            "external_merge_observed": external_merge_observed,
+            "observed_merge_sha": observed_merge_sha,
+            "provenance_mode": provenance_mode,
+        }
+    )
+    return material
 
 
 def _append_verified_captain_audit(record: dict[str, Any]) -> dict[str, Any]:
@@ -12430,11 +12498,9 @@ def _captain_audit_completion(
 ) -> dict[str, Any]:
     actor = grabowski_merge_guard.verify_server_runtime_actor_identity(actor_identity)
     material = _captain_audit_action_material(parameters)
-    result_material = {
-        "status": result.get("status") or result.get("receipt", {}).get("status"),
-        "receipt_sha256": result.get("receipt_sha256") or result.get("receipt", {}).get("receipt_sha256"),
-        "output_sha256": result.get("receipt", {}).get("output_sha256"),
-    }
+    result_material = _captain_audit_execution_result_material(
+        result, action=material.get("action")
+    )
     return _append_verified_captain_completion_audit(
         {
             "operation": "captain-run-audit-completion",

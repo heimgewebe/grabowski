@@ -10455,23 +10455,96 @@ def _saga_captain_audit_binding(
         raise GripPreflightError("Captain audit completion lacks execution result binding")
     if completion.get("execution_result_sha256") != sha256_json(execution_result):
         raise GripPreflightError("Captain audit execution result digest mismatch")
+    identity_keys = {"status", "receipt_sha256", "output_sha256"}
+    provenance_keys = {
+        "provenance_schema_version",
+        "execution_invoked",
+        "verification_passed",
+        "remote_mutation_observed",
+        "merge_completion_verified",
+        "external_merge_observed",
+        "observed_merge_sha",
+        "provenance_mode",
+    }
+    unknown_result_keys = set(execution_result) - identity_keys - provenance_keys
+    if unknown_result_keys:
+        raise GripPreflightError(
+            "Captain audit reference execution result shape is not canonical"
+        )
+    present_provenance_keys = set(execution_result) & provenance_keys
+    if present_provenance_keys and present_provenance_keys != provenance_keys:
+        raise GripPreflightError(
+            "Captain audit merge provenance is incomplete"
+        )
+    if not identity_keys.issubset(execution_result):
+        raise GripPreflightError(
+            "Captain audit reference execution result identity is incomplete"
+        )
+    result_identity = {key: execution_result[key] for key in identity_keys}
     if audit_ref is not None:
-        if set(execution_result) != {"status", "receipt_sha256", "output_sha256"}:
-            raise GripPreflightError("Captain audit reference execution result shape is not canonical")
         if execution_result.get("status") != "passed":
             raise GripPreflightError("Captain audit reference requires a passed Captain result")
         if not _is_sha256_hex(execution_result.get("receipt_sha256")) or not _is_sha256_hex(execution_result.get("output_sha256")):
             raise GripPreflightError("Captain audit reference result identity is invalid")
-        result_identity = execution_result
     else:
         assert receipt is not None
-        result_identity = {
+        receipt_identity = {
             "status": receipt["status"],
             "receipt_sha256": receipt["receipt_sha256"],
             "output_sha256": receipt["output_sha256"],
         }
-        if execution_result != result_identity:
+        if result_identity != receipt_identity:
             raise GripPreflightError("Captain audit completion differs from Captain receipt")
+
+    provenance: dict[str, Any] | None = None
+    if "provenance_schema_version" in execution_result:
+        provenance = {key: execution_result.get(key) for key in provenance_keys}
+        if provenance["provenance_schema_version"] != 1:
+            raise GripPreflightError("Captain audit merge provenance schema is unsupported")
+        for key in (
+            "execution_invoked",
+            "verification_passed",
+            "remote_mutation_observed",
+            "merge_completion_verified",
+            "external_merge_observed",
+        ):
+            if not isinstance(provenance[key], bool):
+                raise GripPreflightError(
+                    f"Captain audit merge provenance {key} must be boolean"
+                )
+        observed_merge_sha = provenance["observed_merge_sha"]
+        if observed_merge_sha is not None and not _is_hex_sha(
+            observed_merge_sha, lengths=(40,)
+        ):
+            raise GripPreflightError(
+                "Captain audit merge provenance observed_merge_sha is invalid"
+            )
+        mode = provenance["provenance_mode"]
+        if mode not in {
+            "captain_dispatch_verified",
+            "external_merge_reconciled",
+            "captain_queue_dispatch_pending",
+            "unverified",
+        }:
+            raise GripPreflightError("Captain audit merge provenance mode is invalid")
+        if mode == "captain_dispatch_verified" and not (
+            provenance["execution_invoked"]
+            and provenance["verification_passed"]
+            and observed_merge_sha is not None
+            and not provenance["external_merge_observed"]
+        ):
+            raise GripPreflightError(
+                "Captain audit dispatch provenance is internally inconsistent"
+            )
+        if mode == "external_merge_reconciled" and not (
+            not provenance["execution_invoked"]
+            and provenance["verification_passed"]
+            and provenance["external_merge_observed"]
+            and observed_merge_sha is not None
+        ):
+            raise GripPreflightError(
+                "Captain audit external merge provenance is internally inconsistent"
+            )
     body = {
         "schema_version": 1,
         "kind": grabowski_grip_orchestration.CAPTAIN_AUDIT_BINDING_KIND,
@@ -10487,6 +10560,8 @@ def _saga_captain_audit_binding(
         "output_sha256": result_identity["output_sha256"],
         "status": result_identity["status"],
     }
+    if provenance is not None:
+        body["merge_provenance"] = provenance
     return {**body, "binding_sha256": sha256_json(body)}
 
 

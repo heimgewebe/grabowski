@@ -3068,6 +3068,126 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("2" * 64, binding["output_sha256"])
         self.assertEqual("passed", binding["status"])
 
+    def test_saga_audit_result_reference_preserves_explicit_merge_provenance(self) -> None:
+        plan = sagas.build_plan(
+            "pr-settlement", _saga_pr_target(), "t121-audit-result-provenance"
+        )
+        intent_sha, completion_sha, intent, completion, ref = _saga_audit_records(plan)
+        execution_result = dict(completion["execution_result"])
+        execution_result.update(
+            {
+                "provenance_schema_version": 1,
+                "execution_invoked": True,
+                "verification_passed": True,
+                "remote_mutation_observed": True,
+                "merge_completion_verified": True,
+                "external_merge_observed": False,
+                "observed_merge_sha": "9" * 40,
+                "provenance_mode": "captain_dispatch_verified",
+            }
+        )
+        completion["execution_result"] = execution_result
+        completion["execution_result_sha256"] = grips.sha256_json(execution_result)
+        with (
+            patch.object(grips, "_saga_verified_audit_record", return_value=completion),
+            patch.object(
+                grips,
+                "_saga_verified_audit_records",
+                return_value={intent_sha: intent, completion_sha: completion},
+            ),
+        ):
+            binding = grips._saga_captain_audit_binding(plan, ref)
+        provenance = binding["merge_provenance"]
+        self.assertEqual("captain_dispatch_verified", provenance["provenance_mode"])
+        self.assertEqual("9" * 40, provenance["observed_merge_sha"])
+        self.assertTrue(provenance["execution_invoked"])
+        self.assertFalse(provenance["external_merge_observed"])
+
+    def test_saga_audit_result_reference_rejects_partial_merge_provenance(self) -> None:
+        plan = sagas.build_plan(
+            "pr-settlement", _saga_pr_target(), "t121-audit-result-partial-provenance"
+        )
+        intent_sha, completion_sha, intent, completion, ref = _saga_audit_records(plan)
+        execution_result = dict(completion["execution_result"])
+        execution_result["execution_invoked"] = True
+        completion["execution_result"] = execution_result
+        completion["execution_result_sha256"] = grips.sha256_json(execution_result)
+        with (
+            patch.object(grips, "_saga_verified_audit_record", return_value=completion),
+            patch.object(
+                grips,
+                "_saga_verified_audit_records",
+                return_value={intent_sha: intent, completion_sha: completion},
+            ),
+            self.assertRaisesRegex(
+                grips.GripPreflightError, "merge provenance is incomplete"
+            ),
+        ):
+            grips._saga_captain_audit_binding(plan, ref)
+
+    def test_saga_orchestration_accepts_verified_merge_provenance_binding(self) -> None:
+        plan = sagas.build_plan(
+            "pr-settlement", _saga_pr_target(), "t121-audit-binding-provenance"
+        )
+        provenance = {
+            "provenance_schema_version": 1,
+            "execution_invoked": True,
+            "verification_passed": True,
+            "remote_mutation_observed": True,
+            "merge_completion_verified": True,
+            "external_merge_observed": False,
+            "observed_merge_sha": "9" * 40,
+            "provenance_mode": "captain_dispatch_verified",
+        }
+        expected = plan["expected_identity"]
+        trusted = {
+            "intent_record_sha256": "c" * 64,
+            "completion_record_sha256": "d" * 64,
+            "action": plan["captain_handoff"]["action"],
+            "target_sha256": grips.sha256_json(plan["captain_handoff"]["target"]),
+            "expected_head": expected["expected_head"],
+            "expected_base": expected["base"],
+            "expected_base_sha": expected["expected_base_sha"],
+            "receipt_sha256": "1" * 64,
+            "output_sha256": "2" * 64,
+            "status": "passed",
+            "merge_provenance": provenance,
+        }
+        body = {
+            "schema_version": 1,
+            "kind": grip_orchestration.CAPTAIN_AUDIT_BINDING_KIND,
+            "authority": "verified_grabowski_audit_chain",
+            **trusted,
+        }
+        binding = {**body, "binding_sha256": grips.sha256_json(body)}
+        ref = {
+            "schema_version": 1,
+            "kind": grip_orchestration.CAPTAIN_AUDIT_RESULT_REF_KIND,
+            "completion_record_sha256": "d" * 64,
+        }
+        with patch.object(
+            grip_orchestration,
+            "_verified_captain_audit_reference_identity",
+            return_value=trusted,
+        ):
+            validated = grip_orchestration.validate_captain_audit_binding(
+                binding, plan_value=plan, captain_result_value=ref
+            )
+        self.assertEqual(provenance, validated["merge_provenance"])
+
+    def test_saga_orchestration_rejects_partial_execution_result_provenance(self) -> None:
+        with self.assertRaisesRegex(
+            grip_orchestration.SagaError, "merge provenance is incomplete"
+        ):
+            grip_orchestration._captain_merge_provenance_from_execution_result(
+                {
+                    "status": "passed",
+                    "receipt_sha256": "1" * 64,
+                    "output_sha256": "2" * 64,
+                    "execution_invoked": True,
+                }
+            )
+
     def test_saga_verified_audit_record_search_is_not_tail_limited(self) -> None:
         import grabowski_audit_query
 

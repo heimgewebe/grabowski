@@ -1231,6 +1231,84 @@ def _verified_captain_audit_record(
     )
 
 
+_CAPTAIN_AUDIT_RESULT_IDENTITY_KEYS = frozenset(
+    {"status", "receipt_sha256", "output_sha256"}
+)
+_CAPTAIN_MERGE_PROVENANCE_KEYS = frozenset(
+    {
+        "provenance_schema_version",
+        "execution_invoked",
+        "verification_passed",
+        "remote_mutation_observed",
+        "merge_completion_verified",
+        "external_merge_observed",
+        "observed_merge_sha",
+        "provenance_mode",
+    }
+)
+_CAPTAIN_MERGE_PROVENANCE_MODES = frozenset(
+    {
+        "captain_dispatch_verified",
+        "external_merge_reconciled",
+        "captain_queue_dispatch_pending",
+        "unverified",
+    }
+)
+
+
+def _captain_merge_provenance_from_execution_result(
+    execution_result: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    unknown = (
+        set(execution_result)
+        - _CAPTAIN_AUDIT_RESULT_IDENTITY_KEYS
+        - _CAPTAIN_MERGE_PROVENANCE_KEYS
+    )
+    if unknown:
+        raise SagaError("Captain audit reference execution result shape is not canonical")
+    present = set(execution_result) & _CAPTAIN_MERGE_PROVENANCE_KEYS
+    if not present:
+        return None
+    if present != _CAPTAIN_MERGE_PROVENANCE_KEYS:
+        raise SagaError("Captain audit merge provenance is incomplete")
+
+    provenance = {
+        key: execution_result.get(key) for key in _CAPTAIN_MERGE_PROVENANCE_KEYS
+    }
+    if provenance["provenance_schema_version"] != 1:
+        raise SagaError("Captain audit merge provenance schema is unsupported")
+    for key in (
+        "execution_invoked",
+        "verification_passed",
+        "remote_mutation_observed",
+        "merge_completion_verified",
+        "external_merge_observed",
+    ):
+        if not isinstance(provenance[key], bool):
+            raise SagaError(f"Captain audit merge provenance {key} must be boolean")
+    merge_sha = provenance["observed_merge_sha"]
+    if merge_sha is not None:
+        _sha40(merge_sha, "Captain audit merge provenance observed_merge_sha")
+    mode = provenance["provenance_mode"]
+    if mode not in _CAPTAIN_MERGE_PROVENANCE_MODES:
+        raise SagaError("Captain audit merge provenance mode is invalid")
+    if mode == "captain_dispatch_verified" and not (
+        provenance["execution_invoked"]
+        and provenance["verification_passed"]
+        and merge_sha is not None
+        and not provenance["external_merge_observed"]
+    ):
+        raise SagaError("Captain audit dispatch provenance is internally inconsistent")
+    if mode == "external_merge_reconciled" and not (
+        not provenance["execution_invoked"]
+        and provenance["verification_passed"]
+        and provenance["external_merge_observed"]
+        and merge_sha is not None
+    ):
+        raise SagaError("Captain audit external merge provenance is internally inconsistent")
+    return provenance
+
+
 def _verified_captain_audit_reference_identity(
     plan: dict[str, Any],
     audit_ref: dict[str, Any],
@@ -1304,8 +1382,9 @@ def _verified_captain_audit_reference_identity(
         raise SagaError("Captain audit completion lacks execution result binding")
     if completion.get("execution_result_sha256") != receipt_hasher(execution_result):
         raise SagaError("Captain audit execution result digest mismatch")
-    if set(execution_result) != {"status", "receipt_sha256", "output_sha256"}:
-        raise SagaError("Captain audit reference execution result shape is not canonical")
+    provenance = _captain_merge_provenance_from_execution_result(execution_result)
+    if not _CAPTAIN_AUDIT_RESULT_IDENTITY_KEYS.issubset(execution_result):
+        raise SagaError("Captain audit reference execution result identity is incomplete")
     if execution_result.get("status") != "passed":
         raise SagaError("Captain audit reference requires a passed Captain result")
     receipt_sha = _sha256(
@@ -1316,7 +1395,7 @@ def _verified_captain_audit_reference_identity(
         execution_result.get("output_sha256"),
         "Captain audit execution_result.output_sha256",
     )
-    return {
+    identity = {
         "intent_record_sha256": intent_sha,
         "completion_record_sha256": completion_sha,
         "action": expected_common["action"],
@@ -1328,6 +1407,9 @@ def _verified_captain_audit_reference_identity(
         "output_sha256": output_sha,
         "status": "passed",
     }
+    if provenance is not None:
+        identity["merge_provenance"] = provenance
+    return identity
 
 
 def _validate_mechanic_result(
@@ -1652,7 +1734,8 @@ def validate_captain_audit_binding(
         "expected_head", "expected_base", "expected_base_sha",
         "receipt_sha256", "output_sha256", "status", "binding_sha256",
     }
-    if set(binding) != required:
+    allowed = required | {"merge_provenance"}
+    if not required.issubset(binding) or not set(binding).issubset(allowed):
         raise SagaError("captain_audit_binding shape is not canonical")
     if (
         binding.get("schema_version") != SCHEMA_VERSION
@@ -1682,6 +1765,35 @@ def validate_captain_audit_binding(
         expected_values = trusted_audit_identity
     else:
         assert receipt is not None
+        if "merge_provenance" in binding:
+            captain_audit = captain.get("captain_audit")
+            completion_meta = (
+                captain_audit.get("completion")
+                if isinstance(captain_audit, Mapping)
+                else None
+            )
+            completion_sha = (
+                completion_meta.get("audit_record_sha256")
+                if isinstance(completion_meta, Mapping)
+                else None
+            )
+            if (
+                not isinstance(captain_audit, Mapping)
+                or captain_audit.get("status") != "complete"
+                or not isinstance(completion_sha, str)
+            ):
+                raise SagaError(
+                    "captain_result lacks complete audit evidence for merge provenance"
+                )
+            trusted_audit_identity = _verified_captain_audit_reference_identity(
+                plan,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "kind": CAPTAIN_AUDIT_RESULT_REF_KIND,
+                    "completion_record_sha256": completion_sha,
+                },
+                receipt_sha256_json=receipt_hasher,
+            )
         expected_identity = plan["expected_identity"]
         expected_base = (
             expected_identity.get("base")
@@ -1703,6 +1815,21 @@ def validate_captain_audit_binding(
             "output_sha256": receipt["output_sha256"],
             "status": receipt["status"],
         }
+
+    expected_provenance = (
+        trusted_audit_identity.get("merge_provenance")
+        if isinstance(trusted_audit_identity, Mapping)
+        else None
+    )
+    if expected_provenance is None:
+        if "merge_provenance" in binding:
+            raise SagaError(
+                "captain_audit_binding merge provenance lacks verified audit evidence"
+            )
+    elif binding.get("merge_provenance") != expected_provenance:
+        raise SagaError(
+            "captain_audit_binding merge provenance differs from verified audit evidence"
+        )
 
     drift = [
         key for key, expected in expected_values.items()
