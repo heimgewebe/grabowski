@@ -2178,6 +2178,41 @@ class McpCommandFileIdentityTests(unittest.TestCase):
                     executable_search_path=str(runtime_bin),
                 )
 
+    def test_direct_codex_preflight_executes_captured_source_before_dependencies(self) -> None:
+        source = Path(codex_preflight.__file__).resolve()
+        payload = (
+            "import hashlib\n"
+            "assert globals().get('__grabowski_captured_entrypoint_active__') is True\n"
+            "raw = globals().get('__grabowski_captured_entrypoint_raw__')\n"
+            "identity = globals().get('__grabowski_captured_entrypoint_identity__')\n"
+            "assert isinstance(raw, bytes)\n"
+            "assert identity['sha256'] == hashlib.sha256(raw).hexdigest()\n"
+            "raise SystemExit(37)\n"
+        ).encode("utf-8")
+        identity = {
+            "path": str(source),
+            "name": source.name,
+            "bytes": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+        with (
+            mock.patch.object(codex_preflight, "__name__", "__main__"),
+            mock.patch.object(codex_preflight, "_CAPTURED_ENTRYPOINT_ACTIVE", False),
+            mock.patch.object(
+                codex_preflight,
+                "_read_source_snapshot",
+                return_value=(payload, identity),
+            ),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            codex_preflight._execute_captured_entrypoint_if_needed()
+        self.assertEqual(raised.exception.code, 37)
+
+        source_text = source.read_text(encoding="utf-8")
+        bootstrap_call = source_text.index("\n_execute_captured_entrypoint_if_needed()\n")
+        dependency_loader = source_text.index("\ndef _load(name: str, path: Path) -> Any:\n")
+        self.assertLess(bootstrap_call, dependency_loader)
+
     def test_codex_code_identity_rejects_post_startup_source_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

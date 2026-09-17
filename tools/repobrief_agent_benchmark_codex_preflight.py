@@ -67,7 +67,62 @@ def _read_source_snapshot(path: Path) -> tuple[bytes, dict[str, Any]]:
     }
 
 
-_SELF_SOURCE_RAW, _SELF_SOURCE_IDENTITY = _read_source_snapshot(Path(__file__))
+_CAPTURED_ENTRYPOINT_ACTIVE = (
+    globals().get("__grabowski_captured_entrypoint_active__") is True
+)
+_CAPTURED_ENTRYPOINT_RAW = globals().get("__grabowski_captured_entrypoint_raw__")
+_CAPTURED_ENTRYPOINT_IDENTITY = globals().get(
+    "__grabowski_captured_entrypoint_identity__"
+)
+
+
+def _validated_captured_self_source(
+    raw: Any, identity: Any, source: Path
+) -> tuple[bytes, dict[str, Any]]:
+    if not isinstance(raw, (bytes, bytearray)) or not isinstance(identity, dict):
+        raise RuntimeError("captured Codex preflight source binding is invalid")
+    data = bytes(raw)
+    resolved = source.expanduser().resolve()
+    expected = {
+        "path": str(resolved),
+        "name": resolved.name,
+        "bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+    if identity != expected:
+        raise RuntimeError("captured Codex preflight source identity mismatch")
+    return data, expected
+
+
+def _execute_captured_entrypoint_if_needed() -> None:
+    if __name__ != "__main__" or _CAPTURED_ENTRYPOINT_ACTIVE:
+        return
+    source = Path(__file__).expanduser().resolve()
+    raw, identity = _read_source_snapshot(source)
+    raw, identity = _validated_captured_self_source(raw, identity, source)
+    namespace = {
+        "__name__": "__main__",
+        "__file__": str(source),
+        "__package__": None,
+        "__builtins__": __builtins__,
+        "__grabowski_captured_entrypoint_active__": True,
+        "__grabowski_captured_entrypoint_raw__": raw,
+        "__grabowski_captured_entrypoint_identity__": identity,
+    }
+    exec(compile(raw, str(source), "exec"), namespace)
+    raise RuntimeError("captured Codex preflight entrypoint returned unexpectedly")
+
+
+_execute_captured_entrypoint_if_needed()
+
+if _CAPTURED_ENTRYPOINT_ACTIVE:
+    _SELF_SOURCE_RAW, _SELF_SOURCE_IDENTITY = _validated_captured_self_source(
+        _CAPTURED_ENTRYPOINT_RAW,
+        _CAPTURED_ENTRYPOINT_IDENTITY,
+        Path(__file__),
+    )
+else:
+    _SELF_SOURCE_RAW, _SELF_SOURCE_IDENTITY = _read_source_snapshot(Path(__file__))
 
 
 def _load(name: str, path: Path) -> Any:
