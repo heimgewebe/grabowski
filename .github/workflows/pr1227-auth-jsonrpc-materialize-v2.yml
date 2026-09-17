@@ -1,0 +1,43 @@
+name: PR1227 auth/jsonrpc marker-safe materializer
+
+on:
+  push:
+    branches:
+      - ops/pr1227-auth-jsonrpc-20260917
+
+permissions:
+  contents: write
+
+jobs:
+  materialize-v2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Materialize and test exact-head candidate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git clone --quiet --single-branch --branch ops/pr1227-auth-jsonrpc-20260917 \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo
+          cd repo
+          cp tools/pr1227_auth_jsonrpc_patch.py /tmp/pr1227_auth_jsonrpc_patch.py
+          git checkout --quiet --detach 1868494deaa3b13c126badc31de85d34b20bfb72
+          test "$(git rev-parse HEAD)" = "1868494deaa3b13c126badc31de85d34b20bfb72"
+          python3 /tmp/pr1227_auth_jsonrpc_patch.py
+          python3 -m py_compile tools/repobrief_agent_benchmark_codex_runner.py tests/test_repobrief_agent_benchmark_codex_runner.py
+          python3 -m unittest tests.test_repobrief_agent_benchmark_codex_runner
+          git diff --check
+          python3 tools/check_no_secrets.py
+          mapfile -t changed < <(git diff --name-only)
+          printf 'changed: %s\n' "${changed[*]}"
+          test "${#changed[@]}" -eq 2
+          test "${changed[0]}" = "tests/test_repobrief_agent_benchmark_codex_runner.py"
+          test "${changed[1]}" = "tools/repobrief_agent_benchmark_codex_runner.py"
+          git config user.name "grabowski-materializer"
+          git config user.email "grabowski-materializer@users.noreply.github.com"
+          git add tools/repobrief_agent_benchmark_codex_runner.py tests/test_repobrief_agent_benchmark_codex_runner.py
+          git commit -m "Harden Codex MCP preflight authorization"
+          test "$(git rev-parse HEAD^)" = "1868494deaa3b13c126badc31de85d34b20bfb72"
+          git push origin HEAD:refs/heads/ops/pr1227-candidate-auth-jsonrpc-20260917
