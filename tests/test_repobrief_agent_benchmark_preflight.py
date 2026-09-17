@@ -1286,7 +1286,7 @@ class RepoBriefAgentBenchmarkPreflightLedgerTests(unittest.TestCase):
             events = support.ledger_events(root / "state")
             self.assertEqual(
                 [event["event"] for event in events],
-                ["authorized", "preflight-failed"],
+                ["preflight-failed"],
             )
             self.assertEqual(events[-1]["payload"]["fixture_intents"], 0)
             self.assertFalse(events[-1]["payload"]["retry_permitted"])
@@ -1532,9 +1532,42 @@ class RepoBriefAgentBenchmarkPreflightLedgerTests(unittest.TestCase):
             events = support.ledger_events(root / "state")
             self.assertEqual(
                 [event["event"] for event in events],
-                ["authorized", "preflight-failed"],
+                ["preflight-failed"],
             )
             self.assertEqual(events[-1]["payload"]["fixture_intents"], 0)
+
+    def test_source_mutation_before_authorization_publishes_no_authorization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = support.fixture_environment(root)
+            kwargs = _fixture_kwargs(root, environment)
+            original = support.preflight._core.source_state
+            calls = 0
+
+            def mutating_source_state(source: Path) -> dict:
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    (source / "mutation-before-authorization.txt").write_text(
+                        "changed", encoding="utf-8"
+                    )
+                return original(source)
+
+            with mock.patch.object(
+                support.preflight._core,
+                "source_state",
+                side_effect=mutating_source_state,
+            ):
+                with self.assertRaisesRegex(
+                    support.preflight.PreflightError, "source checkout changed"
+                ):
+                    _ORIGINAL_EXECUTE_PREFLIGHT(**kwargs)
+            pair_root = next((root / "state" / "preflight-dispatch-ledger").iterdir())
+            self.assertFalse((pair_root / "authorization.json").exists())
+            events = support.ledger_events(root / "state")
+            self.assertEqual([event["event"] for event in events], ["preflight-failed"])
+            self.assertEqual(events[-1]["payload"]["fixture_intents"], 0)
+            self.assertFalse(events[-1]["payload"]["retry_permitted"])
 
     def test_source_mutation_records_terminal_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1547,7 +1580,7 @@ class RepoBriefAgentBenchmarkPreflightLedgerTests(unittest.TestCase):
             def mutating_source_state(source: Path) -> dict:
                 nonlocal calls
                 calls += 1
-                if calls == 2:
+                if calls == 3:
                     (source / "mutation.txt").write_text(
                         "changed", encoding="utf-8"
                     )
@@ -1730,6 +1763,51 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
                     ),
                 )
             self.assertFalse(bad_state.exists())
+
+    def test_failed_late_authorization_does_not_publish_authorization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = support.fixture_environment(root)
+            pair_id, _, treatment = self._codex_pair(environment)
+            state_root = root / "state"
+            with (
+                mock.patch.object(
+                    codex_preflight.core,
+                    "probe_freshness",
+                    side_effect=codex_preflight.core.PreflightError("late preflight failure"),
+                ),
+                self.assertRaisesRegex(
+                    codex_preflight.core.PreflightError, "late preflight failure"
+                ),
+            ):
+                codex_preflight.core.authorize_dispatch(
+                    pair_id=pair_id,
+                    request_root=environment["request_root"],
+                    repository_map=environment["repository_map"],
+                    state_root=state_root,
+                    transcript_root=root / "transcripts",
+                    evidence_root=root / "evidence",
+                    report_out=root / "report.json",
+                    provider_binding={
+                        "mode": "live_provider",
+                        "runner": dict(treatment["runner"]),
+                    },
+                    max_cost_usd=support.Decimal("1.00"),
+                    validator_command=codex_preflight.core._command_array(
+                        environment["validator_command"]
+                    ),
+                )
+            pair_digest = hashlib.sha256(pair_id.encode("utf-8")).hexdigest()
+            pair_root = state_root / "preflight-dispatch-ledger" / pair_digest
+            self.assertTrue(pair_root.is_dir())
+            self.assertFalse((pair_root / "authorization.json").exists())
+            events = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in sorted((pair_root / "events").glob("*.json"))
+            ]
+            self.assertNotIn("authorized", [event["event"] for event in events])
+            self.assertEqual(events[-1]["event"], "preflight-failed")
+            self.assertFalse(events[-1]["payload"]["retry_permitted"])
 
     def test_provider_specific_request_validation_has_no_cross_provider_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

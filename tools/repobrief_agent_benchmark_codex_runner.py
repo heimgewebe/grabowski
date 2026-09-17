@@ -805,6 +805,103 @@ def _require_private_ledger_directory(path: Path, *, label: str) -> None:
         raise RunnerError(f"{label} is unsafe")
 
 
+_AUTHORIZED_RUNTIME_CODE_NAMES = (
+    "repobrief_agent_benchmark_preflight_core.py",
+    "repobrief_agent_benchmark_codex_preflight.py",
+    "repobrief_agent_benchmark_runner.py",
+    Path(__file__).name,
+)
+
+
+def _runtime_code_path(name: str) -> Path:
+    if name not in _AUTHORIZED_RUNTIME_CODE_NAMES:
+        raise RunnerError("preflight dispatch authorization code identity is unexpected")
+    try:
+        path = Path(__file__).with_name(name).resolve(strict=True)
+    except OSError as exc:
+        raise RunnerError(f"authorized runtime code is unavailable: {name}") from exc
+    return path
+
+
+def _validated_authorized_runtime_code(code: Any) -> dict[str, dict[str, Any]]:
+    files = code.get("files") if isinstance(code, dict) else None
+    bundle_sha256 = code.get("bundle_sha256") if isinstance(code, dict) else None
+    if (
+        not isinstance(files, list)
+        or len(files) != len(_AUTHORIZED_RUNTIME_CODE_NAMES)
+        or not isinstance(bundle_sha256, str)
+        or bundle_sha256 != base._sha256_json(files)
+    ):
+        raise RunnerError("preflight dispatch authorization code identity is invalid")
+    by_name: dict[str, dict[str, Any]] = {}
+    for item in files:
+        if not isinstance(item, dict):
+            raise RunnerError("preflight dispatch authorization code identity is invalid")
+        name = item.get("name")
+        size = item.get("bytes")
+        digest = item.get("sha256")
+        if (
+            not isinstance(name, str)
+            or name in by_name
+            or name not in _AUTHORIZED_RUNTIME_CODE_NAMES
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size <= 0
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            raise RunnerError("preflight dispatch authorization code identity is invalid")
+        path = _runtime_code_path(name)
+        current = _read_bound_regular_file(
+            path, label=f"authorized runtime code {name}",
+            max_bytes=MAX_PROVIDER_EXECUTABLE_BYTES,
+        )
+        if len(current) != size or sha_bytes(current) != digest:
+            raise RunnerError(f"authorized runtime code changed after preflight: {name}")
+        by_name[name] = {"name": name, "bytes": size, "sha256": digest}
+    if set(by_name) != set(_AUTHORIZED_RUNTIME_CODE_NAMES):
+        raise RunnerError("preflight dispatch authorization code identity is incomplete")
+    return by_name
+
+
+def _validated_authorized_codex_provider(provider: Any) -> dict[str, Any]:
+    codex = provider.get("codex") if isinstance(provider, dict) else None
+    if not isinstance(codex, dict):
+        raise RunnerError("preflight dispatch authorization Codex identity is missing")
+    path = codex.get("path")
+    size = codex.get("bytes")
+    digest = codex.get("sha256")
+    if (
+        not isinstance(path, str)
+        or not Path(path).is_absolute()
+        or not isinstance(size, int)
+        or isinstance(size, bool)
+        or size <= 0
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+    ):
+        raise RunnerError("preflight dispatch authorization Codex identity is invalid")
+    return {"path": path, "bytes": size, "sha256": digest}
+
+
+def _assert_authorized_codex_executable(
+    codex: str, codex_command_sha256: str, expected: Mapping[str, Any]
+) -> None:
+    path = Path(codex)
+    try:
+        metadata = path.lstat()
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise RunnerError("Codex executable disappeared after validation") from exc
+    current = {
+        "path": str(resolved),
+        "bytes": metadata.st_size,
+        "sha256": codex_command_sha256,
+    }
+    if canonical(current) != canonical(dict(expected)):
+        raise RunnerError("Codex executable does not match preflight authorization")
+
+
 def _load_preflight_dispatch_authorization(
     request: Mapping[str, Any], state_root: Path
 ) -> dict[str, Any]:
@@ -877,30 +974,14 @@ def _load_preflight_dispatch_authorization(
         or canonical(binding.get("manifest")) != canonical(current_manifest)
     ):
         raise RunnerError("preflight dispatch authorization manifest mismatch")
-    code = binding.get("code")
-    code_files = code.get("files") if isinstance(code, dict) else None
-    if not isinstance(code_files, list):
-        raise RunnerError("preflight dispatch authorization code identity is missing")
-    proxy_matches = [
-        item for item in code_files
-        if isinstance(item, dict) and item.get("name") == Path(__file__).name
-    ]
-    if len(proxy_matches) != 1:
-        raise RunnerError("preflight dispatch authorization proxy identity is ambiguous")
-    proxy_code = proxy_matches[0]
-    proxy_bytes = proxy_code.get("bytes")
-    proxy_sha256 = proxy_code.get("sha256")
-    if (
-        not isinstance(proxy_bytes, int) or isinstance(proxy_bytes, bool)
-        or proxy_bytes <= 0 or not isinstance(proxy_sha256, str)
-        or re.fullmatch(r"[0-9a-f]{64}", proxy_sha256) is None
-    ):
-        raise RunnerError("preflight dispatch authorization proxy identity is invalid")
+    code_files = _validated_authorized_runtime_code(binding.get("code"))
+    proxy_code = code_files[Path(__file__).name]
     return {
         "mcp_files": _normalized_authorized_mcp_files(binding.get("mcp_command_files")),
-        "proxy_code": {
-            "name": Path(__file__).name, "bytes": proxy_bytes, "sha256": proxy_sha256
-        },
+        "proxy_code": dict(proxy_code),
+        "manifest": dict(current_manifest),
+        "provider_codex": _validated_authorized_codex_provider(binding.get("provider")),
+        "code_files": [dict(code_files[name]) for name in _AUTHORIZED_RUNTIME_CODE_NAMES],
     }
 
 
@@ -982,6 +1063,67 @@ def cleanup_staged_mcp_proxy(binding: Mapping[str, Any]) -> str | None:
             expected = binding["identity"]
             if (linked.st_dev, linked.st_ino, linked.st_size, linked.st_mode) != expected:
                 raise RunnerError("Codex MCP proxy stage changed before cleanup")
+            os.unlink(path.name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    except BaseException as exc:
+        return type(exc).__name__
+    return None
+
+
+def stage_repoground_manifest(
+    state_root: Path, expected_manifest: Mapping[str, Any]
+) -> dict[str, Any]:
+    source = Path(str(expected_manifest.get("path")))
+    raw = _read_bound_regular_file(
+        source, label="RepoGround manifest", max_bytes=MAX_MANIFEST_BYTES
+    )
+    metadata = source.lstat()
+    current = {
+        "path": str(source.resolve(strict=True)),
+        "bytes": len(raw),
+        "sha256": sha_bytes(raw),
+        "mode": oct(metadata.st_mode & 0o777),
+    }
+    if canonical(current) != canonical(dict(expected_manifest)):
+        raise RunnerError("RepoGround manifest changed after preflight authorization")
+    parent_path, parent_fd = _open_private_directory(
+        state_root / "repoground-manifest-runtime"
+    )
+    try:
+        name = "manifest-" + sha_bytes(os.urandom(32))[:24] + ".bundle.manifest.json"
+        _write_private_dirfd(parent_fd, name, raw)
+        _directory_fd_matches(parent_path, parent_fd)
+        staged = parent_path / name
+        bound = _bind_mcp_file(staged, label="RepoGround manifest stage", executable=False)
+        if bound["sha256"] != expected_manifest.get("sha256"):
+            raise RunnerError("staged RepoGround manifest SHA mismatch")
+        bound["expected_manifest"] = dict(expected_manifest)
+        return bound
+    finally:
+        os.close(parent_fd)
+
+
+def _revalidate_staged_repoground_manifest(binding: Mapping[str, Any]) -> None:
+    current = _bind_mcp_file(
+        Path(binding["path"]), label="RepoGround manifest stage", executable=False
+    )
+    if current["identity"] != binding["identity"] or current["sha256"] != binding["sha256"]:
+        raise RunnerError("RepoGround manifest stage changed during execution")
+
+
+def cleanup_staged_repoground_manifest(binding: Mapping[str, Any]) -> str | None:
+    try:
+        _revalidate_staged_repoground_manifest(binding)
+        path = Path(binding["path"])
+        parent_path, parent_fd = _open_private_directory(path.parent, create_final=False)
+        try:
+            _directory_fd_matches(parent_path, parent_fd)
+            linked = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            expected = binding["identity"]
+            if (linked.st_dev, linked.st_ino, linked.st_size, linked.st_mode) != expected:
+                raise RunnerError("RepoGround manifest stage changed before cleanup")
             os.unlink(path.name, dir_fd=parent_fd)
             os.fsync(parent_fd)
         finally:
@@ -1367,6 +1509,7 @@ def build_command(
     request: Mapping[str, Any], codex: str, checkout: Path, schema: Path, codex_home: Path,
     *, authorized_mcp_files: Sequence[Mapping[str, Any]] | None = None,
     proxy_path: Path | None = None,
+    manifest_path: Path | None = None,
 ) -> list[str]:
     filesystem = (
         '{":minimal"="read",":workspace_roots"={"."="read"},'
@@ -1390,11 +1533,13 @@ def build_command(
             raise RunnerError("treatment requires preflight-authorized MCP file identities")
         if proxy_path is None or not proxy_path.is_absolute():
             raise RunnerError("treatment requires a bound absolute MCP proxy path")
+        if manifest_path is None or not manifest_path.is_absolute():
+            raise RunnerError("treatment requires a staged absolute RepoGround manifest path")
         upstream = [str(item) for item in request["repobrief"]["mcp_command"]]
         binding = request["repobrief"]
         proxy_args = [
             str(proxy_path), "--codex-mcp-proxy", canonical(upstream),
-            str(binding["manifest"]), str(binding["manifest_sha256"]),
+            str(manifest_path), str(binding["manifest_sha256"]),
             canonical(list(authorized_mcp_files)),
         ]
         command[2:2] = [
@@ -2300,10 +2445,16 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
         os.close(state_fd)
     authorized_mcp_files: list[dict[str, Any]] | None = None
     authorized_proxy_code: dict[str, Any] | None = None
+    authorized_manifest: dict[str, Any] | None = None
     if not synthetic and request["condition"] == "treatment":
         dispatch_authorization = _load_preflight_dispatch_authorization(request, state_path)
         authorized_mcp_files = list(dispatch_authorization["mcp_files"])
         authorized_proxy_code = dict(dispatch_authorization["proxy_code"])
+        authorized_manifest = dict(dispatch_authorization["manifest"])
+        assert codex is not None
+        _assert_authorized_codex_executable(
+            codex, str(args.codex_command_sha256), dispatch_authorization["provider_codex"]
+        )
     evidence_plan = prepare_provider_evidence(
         request, args.transcript_root, args.provider_evidence_root
     )
@@ -2320,15 +2471,20 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
             assert codex is not None and auth_data is not None
             codex_home = stage_codex_home(args.state_root, auth_data)
             proxy_binding: dict[str, Any] | None = None
+            manifest_binding: dict[str, Any] | None = None
             try:
                 if request["condition"] == "treatment":
-                    if authorized_proxy_code is None:
-                        raise RunnerError("treatment proxy code authorization is missing")
+                    if authorized_proxy_code is None or authorized_manifest is None:
+                        raise RunnerError("treatment runtime authorization is incomplete")
                     proxy_binding = stage_mcp_proxy(args.state_root, authorized_proxy_code)
+                    manifest_binding = stage_repoground_manifest(
+                        args.state_root, authorized_manifest
+                    )
                 command = build_command(
                     request, codex, checkout, schema, codex_home,
                     authorized_mcp_files=authorized_mcp_files,
                     proxy_path=None if proxy_binding is None else Path(proxy_binding["path"]),
+                    manifest_path=None if manifest_binding is None else Path(manifest_binding["path"]),
                 )
                 capture = run_bounded(
                     command, cwd=checkout,
@@ -2337,15 +2493,35 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                     environment=provider_env(codex=codex, codex_home=codex_home),
                 )
             except BaseException as exc:
+                manifest_cleanup_error = (
+                    None if manifest_binding is None
+                    else cleanup_staged_repoground_manifest(manifest_binding)
+                )
                 proxy_cleanup_error = None if proxy_binding is None else cleanup_staged_mcp_proxy(proxy_binding)
                 cleanup_error = cleanup_codex_home(codex_home)
-                if proxy_cleanup_error is not None or cleanup_error is not None:
+                if (
+                    manifest_cleanup_error is not None
+                    or proxy_cleanup_error is not None
+                    or cleanup_error is not None
+                ):
                     raise RunnerError(
                         "Codex failed before capture completion and private runtime cleanup failed: "
-                        f"proxy={proxy_cleanup_error} home={cleanup_error}"
+                        f"manifest={manifest_cleanup_error} proxy={proxy_cleanup_error} home={cleanup_error}"
                     ) from exc
                 raise
             capture = dict(capture)
+            if manifest_binding is not None:
+                try:
+                    _revalidate_staged_repoground_manifest(manifest_binding)
+                except BaseException as exc:
+                    marker = f"manifest_revalidate_failed:{type(exc).__name__}"
+                    previous = capture.get("capture_error")
+                    capture["capture_error"] = marker if previous is None else f"{previous};{marker}"
+                manifest_cleanup_error = cleanup_staged_repoground_manifest(manifest_binding)
+                if manifest_cleanup_error is not None:
+                    marker = f"manifest_cleanup_failed:{manifest_cleanup_error}"
+                    previous = capture.get("capture_error")
+                    capture["capture_error"] = marker if previous is None else f"{previous};{marker}"
             if proxy_binding is not None:
                 try:
                     _revalidate_staged_mcp_proxy(proxy_binding)

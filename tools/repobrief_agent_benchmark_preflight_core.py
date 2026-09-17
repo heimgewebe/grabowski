@@ -443,6 +443,7 @@ def _assert_dispatch_binding_unchanged(
     max_cost_usd: Decimal,
     validator_command: Sequence[str],
     synthetic: bool,
+    provider_binding: Mapping[str, Any] | None = None,
 ) -> None:
     baseline, treatment = load_pair(request_root, pair_id)
     current = _dispatch_binding(
@@ -458,6 +459,7 @@ def _assert_dispatch_binding_unchanged(
         max_cost_usd=max_cost_usd,
         validator_command=validator_command,
         synthetic=synthetic,
+        provider_binding=provider_binding,
     )
     if _sha256_json(current) != _sha256_json(expected):
         raise PreflightError(
@@ -547,21 +549,12 @@ def _initialize_dispatch_ledger(
         os.mkdir(events_root, 0o700)
     except OSError as exc:
         raise PreflightError("cannot create dispatch ledger event directory") from exc
-    authorization = {
-        "kind": LEDGER_KIND,
-        "version": LEDGER_VERSION,
-        "created_at": _iso(_utc_now()),
-        "contract_sha256": contract_sha256,
-        "binding": dict(binding),
-        "retry_permitted": False,
-    }
-    _write_private_exclusive(pair_root / "authorization.json", authorization)
-    ledger: dict[str, Any] = {
+    return {
         "root": pair_root,
         "events_root": events_root,
         "pair_id": binding["pair_id"],
         "contract_sha256": contract_sha256,
-        "authorization_sha256": _sha256_json(authorization),
+        "authorization_sha256": None,
         "next_sequence": 0,
         "previous_event_sha256": contract_sha256,
         "condition_intents": [],
@@ -571,6 +564,24 @@ def _initialize_dispatch_ledger(
         "failure_recorded": False,
         "terminal_recorded": False,
     }
+
+
+def _publish_dispatch_authorization(
+    ledger: dict[str, Any], binding: Mapping[str, Any]
+) -> None:
+    if _sha256_json(binding) != ledger["contract_sha256"]:
+        raise PreflightError("dispatch authorization binding changed before publication")
+    authorization_path = ledger["root"] / "authorization.json"
+    if ledger.get("authorization_sha256") is not None or authorization_path.exists():
+        raise PreflightError("dispatch authorization is already published")
+    authorization = {
+        "kind": LEDGER_KIND,
+        "version": LEDGER_VERSION,
+        "created_at": _iso(_utc_now()),
+        "contract_sha256": ledger["contract_sha256"],
+        "binding": dict(binding),
+        "retry_permitted": False,
+    }
     _append_ledger_event(
         ledger,
         "authorized",
@@ -579,7 +590,8 @@ def _initialize_dispatch_ledger(
             "max_provider_processes": int(binding["max_provider_processes"]),
         },
     )
-    return ledger
+    _write_private_exclusive(authorization_path, authorization)
+    ledger["authorization_sha256"] = _sha256_json(authorization)
 
 
 def _append_ledger_event(
@@ -1441,6 +1453,22 @@ def authorize_dispatch(
             )
         after = source_state(source)
         _assert_source_unchanged(before, after)
+        _assert_dispatch_binding_unchanged(
+            binding,
+            pair_id=pair_id,
+            request_root=request_root,
+            repository_map=repository_map,
+            state_root=state_root,
+            transcript_root=transcript_root,
+            evidence_root=evidence_root,
+            report_out=report_out,
+            claude="",
+            max_cost_usd=max_cost_usd,
+            validator_command=validator_command,
+            synthetic=False,
+            provider_binding=provider_binding,
+        )
+        _publish_dispatch_authorization(ledger, binding)
         return {
             "kind": "repobrief.agent_benchmark_preflight_dispatch_authorization",
             "version": VERSION,
@@ -1533,6 +1561,23 @@ def execute_preflight(
             if synthetic
             else _claude_identity(claude)
         )
+        authorization_source = source_state(source)
+        _assert_source_unchanged(before, authorization_source)
+        _assert_dispatch_binding_unchanged(
+            binding,
+            pair_id=pair_id,
+            request_root=request_root,
+            repository_map=repository_map,
+            state_root=state_root,
+            transcript_root=transcript_root,
+            evidence_root=evidence_root,
+            report_out=report_out,
+            claude=claude,
+            max_cost_usd=max_cost_usd,
+            validator_command=validator_command,
+            synthetic=synthetic,
+        )
+        _publish_dispatch_authorization(ledger, binding)
 
         ordered = sorted([baseline, treatment], key=lambda item: int(item["order"]))
         fixture_by_condition = {

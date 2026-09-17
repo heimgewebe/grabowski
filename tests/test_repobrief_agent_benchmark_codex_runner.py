@@ -120,13 +120,25 @@ def write_dispatch_authorization(
             value["repobrief"]["mcp_command"]
         ),
         "mcp_command_files": mcp_files,
-        "code": {
-            "files": [{
-                "name": MODULE_PATH.name,
-                "bytes": MODULE_PATH.stat().st_size,
-                "sha256": hashlib.sha256(MODULE_PATH.read_bytes()).hexdigest(),
-            }]
+        "provider": {
+            "codex": {
+                "path": str(Path(sys.executable).resolve()),
+                "bytes": Path(sys.executable).resolve().stat().st_size,
+                "sha256": hashlib.sha256(Path(sys.executable).resolve().read_bytes()).hexdigest(),
+            }
         },
+    }
+    code_files = []
+    for name in runner._AUTHORIZED_RUNTIME_CODE_NAMES:
+        code_path = runner._runtime_code_path(name)
+        code_raw = code_path.read_bytes()
+        code_files.append({
+            "name": name, "bytes": len(code_raw),
+            "sha256": hashlib.sha256(code_raw).hexdigest(),
+        })
+    binding["code"] = {
+        "files": code_files,
+        "bundle_sha256": runner.base._sha256_json(code_files),
     }
     authorization = {
         "kind": runner.PREFLIGHT_LEDGER_KIND,
@@ -449,6 +461,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     {"path": "/usr/bin/python3", "bytes": 1, "sha256": "0" * 64, "mode": "0o755"}
                 ],
                 proxy_path=(root / "bound-proxy.py").resolve(),
+                manifest_path=(root / "bound.bundle.manifest.json").resolve(),
             )
         baseline_joined = " ".join(baseline)
         treatment_joined = " ".join(treatment)
@@ -1733,14 +1746,86 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             checkout = root / "repo"; checkout.mkdir()
             schema = root / "schema.json"
             codex_home = root / "codex-home"; (codex_home / "tmp").mkdir(parents=True)
+            staged_manifest = root / "staged.bundle.manifest.json"
+            staged_manifest.write_text("{}\n", encoding="utf-8")
             command = runner.build_command(
                 request(condition="treatment"), "/opt/codex", checkout, schema, codex_home,
                 authorized_mcp_files=[], proxy_path=Path(binding["path"]),
+                manifest_path=staged_manifest.resolve(),
             )
             encoded = next(item for item in command if item.startswith("mcp_servers.repobrief.args="))
             self.assertIn(str(binding["path"]), encoded)
             self.assertNotIn(str(source), encoded)
             self.assertIsNone(runner.cleanup_staged_mcp_proxy(binding))
+
+
+    def test_codex_executable_must_match_preflight_provider_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            authorized = root / "codex-a"
+            launched = root / "codex-b"
+            authorized.write_bytes(b"authorized-codex")
+            launched.write_bytes(b"different-codex!")
+            authorized.chmod(0o755); launched.chmod(0o755)
+            expected_identity = {
+                "path": str(authorized.resolve()),
+                "bytes": authorized.stat().st_size,
+                "sha256": hashlib.sha256(authorized.read_bytes()).hexdigest(),
+            }
+            with self.assertRaisesRegex(
+                runner.RunnerError, "does not match preflight authorization"
+            ):
+                runner._assert_authorized_codex_executable(
+                    str(launched.resolve()),
+                    hashlib.sha256(launched.read_bytes()).hexdigest(),
+                    expected_identity,
+                )
+
+    def test_authorized_runtime_code_rejects_base_runner_drift(self) -> None:
+        code_files = []
+        original_paths = {}
+        for name in runner._AUTHORIZED_RUNTIME_CODE_NAMES:
+            path = runner._runtime_code_path(name)
+            original_paths[name] = path
+            data = path.read_bytes()
+            code_files.append({
+                "name": name, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()
+            })
+        code = {"files": code_files, "bundle_sha256": runner.base._sha256_json(code_files)}
+        with tempfile.TemporaryDirectory() as temporary:
+            replacement = Path(temporary) / "repobrief_agent_benchmark_runner.py"
+            replacement.write_bytes(original_paths[replacement.name].read_bytes() + b"\n# drift\n")
+            def runtime_path(name: str) -> Path:
+                return replacement if name == replacement.name else original_paths[name]
+            with patch.object(runner, "_runtime_code_path", side_effect=runtime_path):
+                with self.assertRaisesRegex(runner.RunnerError, "runtime code changed after preflight"):
+                    runner._validated_authorized_runtime_code(code)
+
+    def test_staged_manifest_survives_original_replacement_and_binds_command(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "state"; state_root.mkdir(mode=0o700)
+            manifest = root / "chosen.bundle.manifest.json"
+            manifest.write_text('{"version": 1}\n', encoding="utf-8")
+            expected = file_identity(manifest)
+            binding = runner.stage_repoground_manifest(state_root, expected)
+            staged = Path(binding["path"]); staged_bytes = staged.read_bytes()
+            manifest.write_text('{"version": 2}\n', encoding="utf-8")
+            self.assertEqual(staged.read_bytes(), staged_bytes)
+            checkout = root / "repo"; checkout.mkdir()
+            schema = root / "schema.json"
+            codex_home = root / "codex-home"; (codex_home / "tmp").mkdir(parents=True)
+            command = runner.build_command(
+                request(condition="treatment"), "/opt/codex", checkout, schema, codex_home,
+                authorized_mcp_files=[], proxy_path=(root / "bound-proxy.py").resolve(),
+                manifest_path=staged.resolve(),
+            )
+            encoded = next(item for item in command if item.startswith("mcp_servers.repobrief.args="))
+            self.assertIn(str(staged), encoded)
+            self.assertNotIn(str(manifest), encoded)
+            runner._revalidate_staged_repoground_manifest(binding)
+            self.assertIsNone(runner.cleanup_staged_repoground_manifest(binding))
+            self.assertFalse(staged.exists())
 
     def test_preflight_authorization_rejects_legacy_projected_request_hash(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
