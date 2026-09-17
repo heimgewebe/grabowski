@@ -732,6 +732,27 @@ def _validated_resource_read_result(value: Any, *, expected_uri: str) -> dict[st
     return json.loads(json.dumps(value))
 
 
+def _validated_treatment_tool_result(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {"content", "structuredContent", "isError"}:
+        raise RunnerError("RepoGround treatment tool result is malformed")
+    content = value.get("content")
+    if not isinstance(content, list) or len(content) != 1:
+        raise RunnerError("RepoGround treatment tool result is malformed")
+    item = content[0]
+    if (
+        not isinstance(item, dict)
+        or set(item) != {"type", "text"}
+        or item.get("type") != "text"
+        or not isinstance(item.get("text"), str)
+    ):
+        raise RunnerError("RepoGround treatment tool result is malformed")
+    if not isinstance(value.get("structuredContent"), dict):
+        raise RunnerError("RepoGround treatment tool result is malformed")
+    if not isinstance(value.get("isError"), bool):
+        raise RunnerError("RepoGround treatment tool result is malformed")
+    return json.loads(json.dumps(value))
+
+
 def _proxy_error(identifier: Any, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": identifier, "error": {"code": -32601, "message": message}}
 
@@ -1637,6 +1658,8 @@ def run_mcp_proxy(
                         or not isinstance(error.get("message"), str)
                     ):
                         raise RunnerError("MCP upstream error response is invalid")
+                elif pending_kind == "tools/call":
+                    message["result"] = _validated_treatment_tool_result(message["result"])
                 pending_requests.pop(identifier, None)
                 resource_call = resource_calls.pop(identifier, None)
                 is_initialize = pending_kind == "initialize"
