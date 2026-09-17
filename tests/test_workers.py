@@ -1309,6 +1309,23 @@ globalThis.fetch = async () => ({
         self.assertEqual(policy["adapter_id"], "chrome-cdp")
         self.assertEqual(policy["selection_role"], "reproducible-test")
 
+    def test_chrome_channel_detection_ignores_unrelated_ancestor_names(self) -> None:
+        stable = workers._browser_adapter_policy(
+            "/tmp/random-dev-parent/google-chrome"
+        )
+        self.assertEqual(stable["family"], "chrome-stable")
+        self.assertEqual(stable["selection_role"], "canonical-operator")
+
+        for path in (
+            "/usr/bin/google-chrome-beta",
+            "/usr/bin/google-chrome-unstable",
+            "/opt/google/chrome-dev/chrome",
+        ):
+            with self.subTest(path=path):
+                policy = workers._browser_adapter_policy(path)
+                self.assertEqual(policy["family"], "chrome-nonstable")
+                self.assertEqual(policy["selection_role"], "fallback-test")
+
     def test_non_chromium_browser_fails_closed_before_profile_creation(self) -> None:
         firefox = self.root / "firefox"
         firefox.write_text("#!/bin/sh\nexit 0\n")
