@@ -3660,6 +3660,63 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertIn((str(target.resolve()), str(target)), bindings)
         self.assertNotIn("--bind", argv)
 
+    def test_adler_inbox_target_accepts_symlinked_state_root(self) -> None:
+        lane_id = "e" * 32
+        real_state_root = self.root / "adler-state-real"
+        inbox_root = real_state_root / "worktree-inboxes"
+        inbox_root.mkdir(parents=True, mode=0o700)
+        configured_state_root = self.root / "adler-state-link"
+        configured_state_root.symlink_to(real_state_root, target_is_directory=True)
+        target = inbox_root / f"{lane_id}.json"
+        target.write_text('{"findings": []}\n', encoding="utf-8")
+        target.chmod(0o600)
+        sidecar = self.git.repo / ".adler"
+        sidecar.mkdir(mode=0o700)
+        (sidecar / "inbox.json").symlink_to(target)
+        lane_root = self.root / "adler-symlink-root-work-lanes"
+        live = self._write_adler_lane_receipt(lane_root, lane_id, self.git.repo)
+        with (
+            mock.patch.object(sandbox, "_inspect_live_resources", return_value=live),
+            mock.patch.dict(
+                os.environ,
+                {
+                    "GROSSER_ADLER_STATE_ROOT": str(configured_state_root),
+                    "GRABOWSKI_WORK_LANE_ROOT": str(lane_root),
+                },
+            ),
+        ):
+            argv = sandbox.minimal_sandbox_argv(
+                workspace=self.git.repo,
+                command=["/usr/bin/true"],
+                workspace_writable=False,
+            )
+        bindings = [
+            (argv[index + 1], argv[index + 2])
+            for index, item in enumerate(argv)
+            if item == "--ro-bind"
+        ]
+        self.assertIn((str(target.resolve()), str(target)), bindings)
+
+    def test_symlink_loop_adler_state_root_does_not_block_agent_sandbox(self) -> None:
+        loop_a = self.root / "adler-state-loop-a"
+        loop_b = self.root / "adler-state-loop-b"
+        loop_a.symlink_to(loop_b, target_is_directory=True)
+        loop_b.symlink_to(loop_a, target_is_directory=True)
+        sidecar = self.git.repo / ".adler"
+        sidecar.mkdir(mode=0o700)
+        target = self.root / "unreachable-adler-inbox.json"
+        (sidecar / "inbox.json").symlink_to(target)
+        with mock.patch.dict(
+            os.environ,
+            {"GROSSER_ADLER_STATE_ROOT": str(loop_a)},
+        ):
+            argv = sandbox.minimal_sandbox_argv(
+                workspace=self.git.repo,
+                command=["/usr/bin/true"],
+                workspace_writable=False,
+            )
+        self.assertNotIn(str(target), argv)
+
     def test_missing_adler_inbox_target_does_not_block_agent_sandbox(self) -> None:
         lane_id = "b" * 32
         state_root = self.root / "adler-state-missing"
