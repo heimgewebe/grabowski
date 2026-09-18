@@ -1607,6 +1607,7 @@ def _default_command_runner(repo: Path, argv: list[str]) -> dict[str, Any]:
         {
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_GRAFT_FILE": os.devnull,
             "GIT_CONFIG_COUNT": str(len(command_config)),
             "GIT_PAGER": "cat",
             "PAGER": "cat",

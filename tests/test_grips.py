@@ -10202,6 +10202,7 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual(30, calls["timeout"])
         self.assertEqual("0", env["GIT_TERMINAL_PROMPT"])
         self.assertEqual("0", env["GIT_OPTIONAL_LOCKS"])
+        self.assertEqual(grips.os.devnull, env["GIT_GRAFT_FILE"])
         self.assertEqual("3", env["GIT_CONFIG_COUNT"])
         self.assertEqual("core.fsmonitor", env["GIT_CONFIG_KEY_0"])
         self.assertEqual("false", env["GIT_CONFIG_VALUE_0"])
