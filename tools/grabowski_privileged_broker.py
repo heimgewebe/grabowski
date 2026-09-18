@@ -33,6 +33,8 @@ from grabowski_privileged_broker import (
     parse_transport_request,
     publish_recovery_marker,
     resolve_execution,
+    resolve_non_secret_execution,
+    resolve_secret_pty_execution,
     validate_secret_pty_session_authority,
     _require_kill_switch_clear,
 )
@@ -2114,7 +2116,21 @@ def main() -> int:
         data, reference_parser=parse_reference
     )
     config = load_root_config(CONFIG)
-    execution = resolve_execution(config, reference)
+    actions = config.get("actions")
+    candidate = (
+        actions.get(reference["action"])
+        if isinstance(actions, dict)
+        else None
+    )
+    secret_pty_mode = (
+        isinstance(candidate, dict)
+        and candidate.get("mode") == "secret-pty"
+    )
+    execution = (
+        resolve_secret_pty_execution(config, reference)
+        if secret_pty_mode
+        else resolve_non_secret_execution(config, reference)
+    )
     operator_peer: dict[str, object] | None = None
     if execution.get("mode") == "secret-pty":
         operator_peer = _validate_secret_pty_peer(execution)
@@ -2158,7 +2174,7 @@ def main() -> int:
             "action_schema", "privilege_context", "required_resource_keys",
             "redaction_contract_sha256", "prompt_contract_sha256",
         )
-        refreshed = resolve_execution(config, reference)
+        refreshed = resolve_secret_pty_execution(config, reference)
         if any(refreshed.get(key) != execution.get(key) for key in identity_keys):
             raise PermissionError("secret PTY execution contract changed before spawn")
         first_gate = execution.get("gate")
@@ -2227,7 +2243,7 @@ def main() -> int:
         raise ValueError("privileged cwd is not an existing directory")
     claim_once(STATE / "used", str(reference["request_id"]))
     if reference.get("action") == POWER_ACTION:
-        refreshed_execution = resolve_execution(config, reference)
+        refreshed_execution = resolve_non_secret_execution(config, reference)
         stable_fields = (
             "mode", "argv", "cwd", "timeout_seconds",
             "allowed_peer_uid", "allowed_peer_unit",
@@ -2241,7 +2257,7 @@ def main() -> int:
         cwd = execution.get("cwd")
         if cwd is not None and not Path(str(cwd)).is_dir():
             raise ValueError("privileged cwd changed before final gate")
-        final_execution = resolve_execution(config, reference)
+        final_execution = resolve_non_secret_execution(config, reference)
         if any(final_execution.get(key) != execution.get(key) for key in stable_fields):
             raise PermissionError("power execution contract changed at final gate")
         execution = final_execution

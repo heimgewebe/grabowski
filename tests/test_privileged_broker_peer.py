@@ -678,7 +678,7 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
             mock.patch.object(broker_tool.sys, "stdin", fake_stdin),
             mock.patch.object(broker_tool, "parse_reference", return_value=reference),
             mock.patch.object(broker_tool, "load_root_config", return_value={}),
-            mock.patch.object(broker_tool, "resolve_execution", return_value=execution),
+            mock.patch.object(broker_tool, "resolve_non_secret_execution", return_value=execution),
             mock.patch.object(
                 broker_tool,
                 "_validate_blockade_lifecycle_peer",
@@ -711,7 +711,7 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
             mock.patch.object(broker_tool.sys, "stdin", fake_stdin),
             mock.patch.object(broker_tool, "parse_reference", return_value=reference),
             mock.patch.object(broker_tool, "load_root_config", return_value={}),
-            mock.patch.object(broker_tool, "resolve_execution", return_value=execution),
+            mock.patch.object(broker_tool, "resolve_non_secret_execution", return_value=execution),
             mock.patch.object(
                 broker_tool,
                 "_validate_blockade_lifecycle_peer",
@@ -746,7 +746,7 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
             mock.patch.object(broker_tool.sys, "stdin", fake_stdin),
             mock.patch.object(broker_tool, "parse_reference", return_value=reference),
             mock.patch.object(broker_tool, "load_root_config", return_value={}),
-            mock.patch.object(broker_tool, "resolve_execution", return_value=execution),
+            mock.patch.object(broker_tool, "resolve_non_secret_execution", return_value=execution),
             mock.patch.object(
                 broker_tool,
                 "_validate_blockade_lifecycle_peer",
@@ -789,7 +789,7 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
             mock.patch.object(broker_tool.sys, "stdin", fake_stdin),
             mock.patch.object(broker_tool, "parse_reference", return_value=reference),
             mock.patch.object(broker_tool, "load_root_config", return_value={}),
-            mock.patch.object(broker_tool, "resolve_execution", return_value=execution),
+            mock.patch.object(broker_tool, "resolve_non_secret_execution", return_value=execution),
             mock.patch.object(
                 broker_tool, "_validate_blockade_lifecycle_peer", return_value=self.peer()
             ),
@@ -838,7 +838,7 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
             mock.patch.object(broker_tool.sys, "stdin", fake_stdin),
             mock.patch.object(broker_tool, "parse_reference", return_value=reference),
             mock.patch.object(broker_tool, "load_root_config", return_value={}),
-            mock.patch.object(broker_tool, "resolve_execution", return_value=execution),
+            mock.patch.object(broker_tool, "resolve_non_secret_execution", return_value=execution),
             mock.patch.object(
                 broker_tool, "_validate_blockade_lifecycle_peer", return_value=self.peer()
             ),
@@ -933,7 +933,7 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
             mock.patch.object(broker_tool, "parse_reference", return_value=reference),
             mock.patch.object(broker_tool, "load_root_config", return_value={}),
             mock.patch.object(
-                broker_tool, "resolve_execution",
+                broker_tool, "resolve_non_secret_execution",
                 side_effect=[execution, PermissionError("power kill-switch is engaged")],
             ) as resolve,
             mock.patch.object(
@@ -1015,7 +1015,7 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
             mock.patch.object(broker_tool.sys, "stdin", fake_stdin),
             mock.patch.object(broker_tool, "parse_reference", return_value=reference),
             mock.patch.object(broker_tool, "load_root_config", return_value={}),
-            mock.patch.object(broker_tool, "resolve_execution", return_value=execution),
+            mock.patch.object(broker_tool, "resolve_non_secret_execution", return_value=execution),
             mock.patch.object(
                 broker_tool, "_validate_blockade_lifecycle_peer", return_value=self.peer()
             ),
@@ -1222,7 +1222,7 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
             mock.patch.object(broker_tool.sys, "stdin", fake_stdin),
             mock.patch.object(broker_tool, "parse_reference", return_value=reference),
             mock.patch.object(broker_tool, "load_root_config", return_value={}),
-            mock.patch.object(broker_tool, "resolve_execution", return_value=execution),
+            mock.patch.object(broker_tool, "resolve_non_secret_execution", return_value=execution),
             mock.patch.object(
                 broker_tool,
                 "_validate_blockade_lifecycle_peer",
@@ -1261,7 +1261,7 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
             mock.patch.object(broker_tool.sys, "stdin", fake_stdin),
             mock.patch.object(broker_tool, "parse_reference", return_value=reference),
             mock.patch.object(broker_tool, "load_root_config", return_value={}),
-            mock.patch.object(broker_tool, "resolve_execution", return_value=execution),
+            mock.patch.object(broker_tool, "resolve_non_secret_execution", return_value=execution),
             mock.patch.object(
                 broker_tool,
                 "_validate_blockade_lifecycle_peer",

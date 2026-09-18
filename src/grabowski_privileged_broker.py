@@ -1846,17 +1846,46 @@ def _resolve_power_argv_action(
     return execution
 
 
-def resolve_execution(config: dict[str, Any], reference: dict[str, Any]) -> dict[str, Any]:
-    candidate = config["actions"].get(reference["action"])
+def _configured_action(
+    config: dict[str, Any], reference: dict[str, Any]
+) -> dict[str, Any]:
+    actions = config.get("actions")
+    candidate = (
+        actions.get(reference["action"])
+        if isinstance(actions, dict)
+        else None
+    )
     if not isinstance(candidate, dict):
         raise PermissionError("privileged action is not configured")
+    return candidate
+
+
+def resolve_secret_pty_execution(
+    config: dict[str, Any], reference: dict[str, Any]
+) -> dict[str, Any]:
+    """Resolve only the secret-bearing PTY mode.
+
+    Keeping this path separate prevents non-secret broker response and audit
+    sinks from inheriting a secret-tainted dispatcher return value.
+    """
+    candidate = _configured_action(config, reference)
+    if candidate.get("mode") != "secret-pty":
+        raise PermissionError("privileged action is not a secret PTY action")
+    return _resolve_secret_pty_action(candidate, reference)
+
+
+def resolve_non_secret_execution(
+    config: dict[str, Any], reference: dict[str, Any]
+) -> dict[str, Any]:
+    """Resolve only modes whose execution object is safe for normal output paths."""
+    candidate = _configured_action(config, reference)
     mode = candidate.get("mode", "template")
+    if mode == "secret-pty":
+        raise PermissionError("secret PTY action requires the dedicated resolver")
     if mode == "template":
         return _resolve_template_action(candidate, reference)
     if mode == "argv-json":
         return _resolve_power_argv_action(candidate, reference)
-    if mode == "secret-pty":
-        return _resolve_secret_pty_action(candidate, reference)
     if mode == "recovery-marker-publish":
         return _resolve_recovery_marker_publish_action(candidate, reference)
     if mode == "blockade-marker-lifecycle":
@@ -1868,6 +1897,14 @@ def resolve_execution(config: dict[str, Any], reference: dict[str, Any]) -> dict
     if mode == "root-task-systemd":
         return _resolve_root_task_systemd_action(candidate, reference)
     raise PermissionError("privileged action mode is disabled or malformed")
+
+
+def resolve_execution(config: dict[str, Any], reference: dict[str, Any]) -> dict[str, Any]:
+    """Compatibility dispatcher; root output paths should use the split resolvers."""
+    candidate = _configured_action(config, reference)
+    if candidate.get("mode", "template") == "secret-pty":
+        return resolve_secret_pty_execution(config, reference)
+    return resolve_non_secret_execution(config, reference)
 
 
 def resolve_action(config: dict[str, Any], reference: dict[str, Any]) -> tuple[list[str], int]:

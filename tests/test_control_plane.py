@@ -2764,6 +2764,35 @@ class SecretPtyContractTests(unittest.TestCase):
                     stale_authority, resource_db=database, now=1000
                 )
 
+    def test_secret_pty_resolver_isolated_from_non_secret_output_path(self) -> None:
+        reference = privileged_broker.parse_reference(
+            json.dumps(self._reference()).encode(), now=1000
+        )
+        with self.assertRaisesRegex(
+            PermissionError, "dedicated resolver"
+        ):
+            privileged_broker.resolve_non_secret_execution(
+                self._secret_pty_config(), reference
+            )
+        gate = {
+            "recovery_marker_sha256": "1" * 64,
+            "recovery_marker_source_sha256": "2" * 64,
+            "recovery_marker_timestamp_unix": 999,
+            "recovery_marker_age_seconds": 1,
+            "recovery_marker_max_age_seconds": 86400,
+            "recovery_marker_freshness_reason": "fresh",
+            "recovery_marker_configured_target": "local-backup-disk:test",
+        }
+        with patch.object(
+            privileged_broker, "_require_kill_switch_clear"
+        ), patch.object(
+            privileged_broker, "_validate_recovery_gate", return_value=gate
+        ):
+            execution = privileged_broker.resolve_secret_pty_execution(
+                self._secret_pty_config(), reference
+            )
+        self.assertEqual(execution["mode"], "secret-pty")
+
     def test_secret_pty_profile_is_recovery_gated_and_non_shell(self) -> None:
         reference = privileged_broker.parse_reference(
             json.dumps(self._reference()).encode(), now=1000
