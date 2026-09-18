@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import sqlite3
 import subprocess
 from pathlib import Path
 import sys
@@ -60,6 +61,42 @@ if _BROKER_SPEC is None or _BROKER_SPEC.loader is None:
 privileged_broker = importlib.util.module_from_spec(_BROKER_SPEC)
 sys.modules[_BROKER_SPEC.name] = privileged_broker
 _BROKER_SPEC.loader.exec_module(privileged_broker)
+
+
+def _load_root_broker_tool():
+    spec = importlib.util.spec_from_file_location(
+        "grabowski_privileged_broker_root_tool_test",
+        ROOT / "tools" / "grabowski_privileged_broker.py",
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("root broker tool module could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get("grabowski_privileged_broker")
+    original_path = list(sys.path)
+    sys.modules["grabowski_privileged_broker"] = privileged_broker
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path[:] = original_path
+        if previous is None:
+            sys.modules.pop("grabowski_privileged_broker", None)
+        else:
+            sys.modules["grabowski_privileged_broker"] = previous
+    return module
+
+
+def _load_privileged_request_tool():
+    spec = importlib.util.spec_from_file_location(
+        "grabowski_privileged_request_tool_test",
+        ROOT / "tools" / "grabowski_privileged_request.py",
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("privileged request tool module could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _write(path: Path, value: object) -> None:
@@ -2364,3 +2401,446 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class SecretPtyContractTests(unittest.TestCase):
+    def _reference(self, *, now: int = 1000) -> dict[str, object]:
+        value: dict[str, object] = {
+            "schema_version": 1,
+            "execution": "unprivileged-reference-only",
+            "may_execute": False,
+            "requires_external_privileged_agent": True,
+            "replay_policy": "single-use-external-broker",
+            "action": "operator_secret_pty_getpass_probe",
+            "target": "probe",
+            "justification": "Run the root-owned harmless double-getpass PTY probe",
+            "request_id": "b" * 32,
+            "created_at_unix": now,
+            "expires_at_unix": now + 300,
+        }
+        value["reference_sha256"] = privileged_broker.canonical_sha256(value)
+        return value
+
+    def _lease_snapshot(
+        self,
+        *,
+        owner_id: str = "task:GRABOWSKI-OPERATOR-SURFACE-V1-T172",
+        expires_at_unix: int = 1400,
+    ) -> dict[str, object]:
+        return {
+            "resource_key": "host:heim-pc",
+            "owner_id": owner_id,
+            "acquired_at_unix": 900,
+            "updated_at_unix": 950,
+            "expires_at_unix": expires_at_unix,
+            "metadata_sha256": "d" * 64,
+        }
+
+    def _session_authority(
+        self,
+        secret_sha256: str,
+        *,
+        now: int = 1000,
+        lease: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        leases = [dict(self._lease_snapshot() if lease is None else lease)]
+        script = (
+            "import getpass; a=getpass.getpass('LUKS passphrase: '); "
+            "b=getpass.getpass('Repeat LUKS passphrase: '); "
+            "raise SystemExit(0 if a and a == b else 3)"
+        )
+        value: dict[str, object] = {
+            "schema_version": 1,
+            "kind": "grabowski_secret_pty_session_authority",
+            "task_id": "GRABOWSKI-OPERATOR-SURFACE-V1-T172",
+            "host": "heim-pc",
+            "session_id": "c" * 32,
+            "action": "operator_secret_pty_getpass_probe",
+            "action_schema": "grabowski.secret-pty.getpass.v1",
+            "privilege_context": "root",
+            "lease_owner_id": leases[0]["owner_id"],
+            "resource_leases": leases,
+            "resource_lease_bindings_sha256": privileged_broker.canonical_sha256(leases),
+            "created_at_unix": now,
+            "expires_at_unix": now + 300,
+            "timeout_seconds": 30,
+            "input_max_bytes": 4096,
+            "output_max_bytes": 262144,
+            "source_sha256": secret_sha256,
+            "argv_sha256": privileged_broker.canonical_sha256(
+                [sys.executable, "-c", script]
+            ),
+            "redaction_contract_sha256": (
+                "59534d36a9b51064f09c6d1509440a36"
+                "ea92b47e39be3d9ba442c889589852bd"
+            ),
+        }
+        value["authority_sha256"] = privileged_broker.canonical_sha256(value)
+        return value
+
+    def _secret_pty_config(self) -> dict[str, object]:
+        return {
+            "schema_version": 2,
+            "actions": {
+                "operator_secret_pty_getpass_probe": {
+                    "enabled": True,
+                    "mode": "secret-pty",
+                    "target_pattern": "probe",
+                    "argv": [
+                        sys.executable,
+                        "-c",
+                        "import getpass; a=getpass.getpass('LUKS passphrase: '); b=getpass.getpass('Repeat LUKS passphrase: '); raise SystemExit(0 if a and a == b else 3)",
+                    ],
+                    "cwd": "/",
+                    "timeout_seconds": 30,
+                    "prompt_sequence": [
+                        "LUKS passphrase: ",
+                        "Repeat LUKS passphrase: ",
+                    ],
+                    "max_secret_bytes": 4096,
+                    "max_output_bytes": 262144,
+                    "kill_switch_path": "/var/lib/grabowski/operator-blockade/operator-kill-switch",
+                    "legacy_kill_switch_path": "/home/alex/.local/state/grabowski/operator-kill-switch",
+                    "recovery_gate": {
+                        "recovery_marker_path": "/var/lib/grabowski/power-worker-recovery-gate.json",
+                        "max_recovery_age_seconds": 86400,
+                        "require_root_owned_gate_files": True,
+                        "configured_target": "local-backup-disk:test",
+                    },
+                    "allowed_peer_uid": os.getuid(),
+                    "allowed_peer_unit": "grabowski-operator.service",
+                    "allowed_peer_executable": "/usr/local/bin/grabowski-privileged-request",
+                    "authority_task_id": "GRABOWSKI-OPERATOR-SURFACE-V1-T172",
+                    "authority_host": "heim-pc",
+                    "action_schema": "grabowski.secret-pty.getpass.v1",
+                    "privilege_context": "root",
+                    "required_resource_keys": ["host:heim-pc"],
+                    "redaction_contract_sha256": (
+                        "59534d36a9b51064f09c6d1509440a36"
+                        "ea92b47e39be3d9ba442c889589852bd"
+                    ),
+                }
+            },
+        }
+
+    def test_transport_envelope_is_hash_bound_and_contains_no_secret_bytes(self) -> None:
+        secret = os.urandom(32)
+        reference = self._reference()
+        secret_sha256 = hashlib.sha256(secret).hexdigest()
+        envelope: dict[str, object] = {
+            "schema_version": 1,
+            "kind": "grabowski_privileged_transport",
+            "reference": reference,
+            "secret_fd": 7,
+            "secret_sha256": secret_sha256,
+            "session_authority": self._session_authority(secret_sha256),
+        }
+        envelope["transport_sha256"] = privileged_broker.canonical_sha256(envelope)
+        raw = json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode()
+        parsed, transport = privileged_broker.parse_transport_request(raw, now=1000)
+        assert transport is not None
+        self.assertEqual(parsed["reference_sha256"], reference["reference_sha256"])
+        self.assertEqual(transport["secret_fd"], 7)
+        self.assertEqual(transport["secret_sha256"], hashlib.sha256(secret).hexdigest())
+        self.assertNotIn(secret, raw)
+        broken = dict(envelope)
+        broken["secret_fd"] = 8
+        with self.assertRaisesRegex(ValueError, "transport hash"):
+            privileged_broker.parse_transport_request(
+                json.dumps(broken, sort_keys=True, separators=(",", ":")).encode(),
+                now=1000,
+            )
+
+        foreign_lease = self._lease_snapshot(owner_id="task:OTHER-TASK")
+        foreign = dict(envelope)
+        foreign["session_authority"] = self._session_authority(
+            secret_sha256, lease=foreign_lease
+        )
+        foreign["transport_sha256"] = privileged_broker.canonical_sha256(
+            {key: value for key, value in foreign.items() if key != "transport_sha256"}
+        )
+        with self.assertRaisesRegex(PermissionError, "identity is not authorized"):
+            privileged_broker.parse_transport_request(
+                json.dumps(foreign, sort_keys=True, separators=(",", ":")).encode(),
+                now=1000,
+            )
+
+    def test_request_client_never_treats_unclear_secret_pty_as_success(self) -> None:
+        request_tool = _load_privileged_request_tool()
+        self.assertTrue(request_tool._response_succeeded({
+            "mode": "secret-pty",
+            "outcome": "COMPLETED",
+            "returncode": 0,
+            "readback_required": False,
+            "timed_out": False,
+        }))
+        self.assertFalse(request_tool._response_succeeded({
+            "mode": "secret-pty",
+            "outcome": "UNCLEAR",
+            "returncode": 0,
+            "readback_required": True,
+            "timed_out": False,
+        }))
+        self.assertFalse(request_tool._response_succeeded({
+            "mode": "secret-pty",
+            "outcome": "COMPLETED",
+            "returncode": 0,
+            "readback_required": False,
+            "timed_out": True,
+        }))
+
+    def test_request_client_revalidates_missing_stale_and_changed_leases(self) -> None:
+        request_tool = _load_privileged_request_tool()
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "resources.sqlite3"
+            database.touch(mode=0o600)
+            lease = self._lease_snapshot()
+            with sqlite3.connect(database) as connection:
+                connection.execute(
+                    "CREATE TABLE leases ("
+                    "resource_key TEXT PRIMARY KEY, owner_id TEXT NOT NULL, "
+                    "acquired_at_unix INTEGER NOT NULL, updated_at_unix INTEGER NOT NULL, "
+                    "expires_at_unix INTEGER NOT NULL, metadata_sha256 TEXT NOT NULL)"
+                )
+                connection.execute(
+                    "INSERT INTO leases VALUES (?, ?, ?, ?, ?, ?)",
+                    tuple(
+                        lease[key]
+                        for key in (
+                            "resource_key", "owner_id", "acquired_at_unix",
+                            "updated_at_unix", "expires_at_unix", "metadata_sha256",
+                        )
+                    ),
+                )
+            authority = self._session_authority("f" * 64, lease=lease)
+            request_tool._validate_live_resource_leases(
+                authority, resource_db=database, now=1000
+            )
+            with sqlite3.connect(database) as connection:
+                connection.execute(
+                    "UPDATE leases SET updated_at_unix=? WHERE resource_key=?",
+                    (951, "host:heim-pc"),
+                )
+            with self.assertRaisesRegex(PermissionError, "changed or is foreign"):
+                request_tool._validate_live_resource_leases(
+                    authority, resource_db=database, now=1000
+                )
+            with sqlite3.connect(database) as connection:
+                connection.execute("DELETE FROM leases")
+            with self.assertRaisesRegex(PermissionError, "missing"):
+                request_tool._validate_live_resource_leases(
+                    authority, resource_db=database, now=1000
+                )
+            stale = self._lease_snapshot(expires_at_unix=1000)
+            with sqlite3.connect(database) as connection:
+                connection.execute(
+                    "INSERT INTO leases VALUES (?, ?, ?, ?, ?, ?)",
+                    tuple(
+                        stale[key]
+                        for key in (
+                            "resource_key", "owner_id", "acquired_at_unix",
+                            "updated_at_unix", "expires_at_unix", "metadata_sha256",
+                        )
+                    ),
+                )
+            stale_authority = self._session_authority(
+                "f" * 64, now=700, lease=stale
+            )
+            with self.assertRaisesRegex(PermissionError, "stale"):
+                request_tool._validate_live_resource_leases(
+                    stale_authority, resource_db=database, now=1000
+                )
+
+    def test_secret_pty_profile_is_recovery_gated_and_non_shell(self) -> None:
+        reference = privileged_broker.parse_reference(
+            json.dumps(self._reference()).encode(), now=1000
+        )
+        gate = {
+            "recovery_marker_sha256": "1" * 64,
+            "recovery_marker_source_sha256": "2" * 64,
+            "recovery_marker_timestamp_unix": 999,
+            "recovery_marker_age_seconds": 1,
+            "recovery_marker_max_age_seconds": 86400,
+            "recovery_marker_freshness_reason": "fresh",
+            "recovery_marker_configured_target": "local-backup-disk:test",
+        }
+        with patch.object(
+            privileged_broker, "_require_kill_switch_clear"
+        ), patch.object(
+            privileged_broker, "_validate_recovery_gate", return_value=gate
+        ):
+            execution = privileged_broker.resolve_execution(
+                self._secret_pty_config(), reference
+            )
+        self.assertEqual(execution["mode"], "secret-pty")
+        self.assertEqual(execution["prompt_sequence"], [
+            "LUKS passphrase: ", "Repeat LUKS passphrase: "
+        ])
+        self.assertEqual(execution["gate"]["recovery_marker_sha256"], "1" * 64)
+        authority = self._session_authority("e" * 64)
+        bound = privileged_broker.validate_secret_pty_session_authority(
+            authority, execution
+        )
+        self.assertEqual(bound["task_id"], "GRABOWSKI-OPERATOR-SURFACE-V1-T172")
+        mismatched = dict(authority)
+        mismatched["host"] = "other-host"
+        with self.assertRaisesRegex(PermissionError, "root-owned action contract"):
+            privileged_broker.validate_secret_pty_session_authority(
+                mismatched, execution
+            )
+        unsafe = self._secret_pty_config()
+        unsafe["actions"]["operator_secret_pty_getpass_probe"]["argv"] = [
+            "/bin/sh", "-c", "true"
+        ]
+        with patch.object(
+            privileged_broker, "_require_kill_switch_clear"
+        ), patch.object(
+            privileged_broker, "_validate_recovery_gate", return_value=gate
+        ):
+            with self.assertRaisesRegex(ValueError, "non-shell"):
+                privileged_broker.resolve_execution(unsafe, reference)
+
+    def test_peer_bound_secret_reads_only_exact_hash_bound_descriptor(self) -> None:
+        root_tool = _load_root_broker_tool()
+        secret = os.urandom(48)
+        descriptor = os.memfd_create("t172-test-secret", getattr(os, "MFD_CLOEXEC", 0))
+        self.addCleanup(os.close, descriptor)
+        os.write(descriptor, secret)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        parent_pid, starttime = root_tool._process_identity(
+            os.getpid(), proc_root=Path("/proc")
+        )
+        peer = {
+            "pid": os.getpid(),
+            "uid": os.getuid(),
+            "parent_pid": parent_pid,
+            "starttime_ticks": starttime,
+        }
+        execution = {"max_secret_bytes": 4096}
+        transport = {
+            "kind": "peer-fd-v1",
+            "secret_fd": descriptor,
+            "secret_sha256": hashlib.sha256(secret).hexdigest(),
+        }
+        observed = root_tool._read_peer_bound_secret(
+            transport, peer, execution, proc_root=Path("/proc")
+        )
+        self.assertEqual(bytes(observed), secret)
+        bad = dict(transport)
+        bad["secret_sha256"] = "0" * 64
+        with self.assertRaisesRegex(PermissionError, "hash"):
+            root_tool._read_peer_bound_secret(
+                bad, peer, execution, proc_root=Path("/proc")
+            )
+
+    def test_secret_pty_session_id_is_single_use(self) -> None:
+        root_tool = _load_root_broker_tool()
+        reference = self._reference()
+        authority = self._session_authority("f" * 64)
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            root_tool._claim_secret_pty_authority(
+                reference, authority, state=state
+            )
+            second = dict(reference)
+            second["request_id"] = "d" * 32
+            with self.assertRaises(FileExistsError):
+                root_tool._claim_secret_pty_authority(
+                    second, authority, state=state
+                )
+
+    def _pty_execution(self, script: str, prompts: list[str], *, timeout: int = 3):
+        return {
+            "argv": [sys.executable, "-c", script],
+            "cwd": "/",
+            "timeout_seconds": timeout,
+            "prompt_sequence": prompts,
+            "max_output_bytes": 262144,
+            "prompt_contract_sha256": privileged_broker.canonical_sha256(prompts),
+        }
+
+    def test_secret_pty_double_getpass_completes_without_echo_or_transcript(self) -> None:
+        root_tool = _load_root_broker_tool()
+        secret = bytearray(os.urandom(32).hex().encode())
+        execution = self._pty_execution(
+            "import getpass; a=getpass.getpass('LUKS passphrase: '); b=getpass.getpass('Repeat LUKS passphrase: '); raise SystemExit(0 if a and a == b else 3)",
+            ["LUKS passphrase: ", "Repeat LUKS passphrase: "],
+        )
+        result = root_tool._run_secret_pty_process(
+            execution=execution, secret=secret, peer_alive=lambda: True
+        )
+        self.assertEqual(result["outcome"], "COMPLETED")
+        self.assertEqual(result["returncode"], 0)
+        self.assertEqual(result["prompt_count"], 2)
+        self.assertFalse(result["secret_echo_detected"])
+        self.assertNotIn(bytes(secret).decode(), json.dumps(result))
+
+    def test_secret_pty_echo_is_detected_without_returning_secret(self) -> None:
+        root_tool = _load_root_broker_tool()
+        secret = bytearray(os.urandom(24).hex().encode())
+        execution = self._pty_execution(
+            "input('LUKS passphrase: ')",
+            ["LUKS passphrase: "],
+        )
+        result = root_tool._run_secret_pty_process(
+            execution=execution, secret=secret, peer_alive=lambda: True
+        )
+        self.assertEqual(result["outcome"], "UNCLEAR")
+        self.assertTrue(result["secret_echo_detected"])
+        self.assertTrue(result["readback_required"])
+        self.assertFalse(result["retry_safe"])
+        self.assertNotIn(bytes(secret).decode(), json.dumps(result))
+
+    def test_secret_pty_repeated_prompt_fails_closed(self) -> None:
+        root_tool = _load_root_broker_tool()
+        secret = bytearray(os.urandom(24).hex().encode())
+        execution = self._pty_execution(
+            "import getpass; getpass.getpass('LUKS passphrase: '); "
+            "getpass.getpass('LUKS passphrase: ')",
+            ["LUKS passphrase: "],
+        )
+        result = root_tool._run_secret_pty_process(
+            execution=execution, secret=secret, peer_alive=lambda: True
+        )
+        self.assertEqual(result["outcome"], "UNCLEAR")
+        self.assertEqual(result["failure_reason"], "prompt-repeated")
+        self.assertTrue(result["readback_required"])
+        self.assertFalse(result["retry_safe"])
+
+    def test_secret_pty_unknown_prompt_times_out_without_feeding_secret(self) -> None:
+        root_tool = _load_root_broker_tool()
+        secret = bytearray(os.urandom(24).hex().encode())
+        execution = self._pty_execution(
+            "import getpass; getpass.getpass('Unexpected prompt: ')",
+            ["LUKS passphrase: "],
+            timeout=1,
+        )
+        result = root_tool._run_secret_pty_process(
+            execution=execution, secret=secret, peer_alive=lambda: True
+        )
+        self.assertEqual(result["outcome"], "UNCLEAR")
+        self.assertEqual(result["prompt_count"], 0)
+        self.assertEqual(result["failure_reason"], "timeout")
+        self.assertTrue(result["readback_required"])
+
+    def test_secret_pty_peer_loss_cancels_child_and_requires_readback(self) -> None:
+        root_tool = _load_root_broker_tool()
+        secret = bytearray(os.urandom(24).hex().encode())
+        calls = 0
+
+        def peer_alive() -> bool:
+            nonlocal calls
+            calls += 1
+            return calls < 2
+
+        execution = self._pty_execution(
+            "import time; time.sleep(10)",
+            ["LUKS passphrase: "],
+            timeout=5,
+        )
+        result = root_tool._run_secret_pty_process(
+            execution=execution, secret=secret, peer_alive=peer_alive
+        )
+        self.assertEqual(result["outcome"], "UNCLEAR")
+        self.assertEqual(result["failure_reason"], "peer-disconnected")
+        self.assertTrue(result["readback_required"])
+        self.assertFalse(result["retry_safe"])

@@ -8,6 +8,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pty
+import select
 import re
 import pwd
 import signal
@@ -28,8 +30,10 @@ from grabowski_privileged_broker import (
     claim_once,
     load_root_config,
     parse_reference,
+    parse_transport_request,
     publish_recovery_marker,
     resolve_execution,
+    validate_secret_pty_session_authority,
     _require_kill_switch_clear,
 )
 
@@ -47,6 +51,8 @@ PACKAGE_UPDATE_APPLY_CONSUMED_ROOT = STATE / "package-update-apply-consumed"
 PACKAGE_OUTPUT_EVIDENCE_MAX_AGE_SECONDS = 3600
 MAX_OUTPUT_EVIDENCE_FILES = 4096
 MAX_OUTPUT_BYTES = 250_000
+SECRET_PTY_MAX_TRANSCRIPT_BYTES = 512 * 1024
+SECRET_PTY_TERMINATE_GRACE_SECONDS = 2.0
 POWER_ACTION = "operator_power_argv"
 BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
 ROOTBROKER_CUTOVER_ACTION = "operator_rootbroker_cutover"
@@ -1517,6 +1523,290 @@ def _assert_local_backup_smart_pre_spawn(
         raise PermissionError(f"{label} By-ID identity changed before spawn")
 
 
+def _validate_secret_pty_peer(
+    execution: dict[str, object],
+    *,
+    descriptor: int = 0,
+    proc_root: Path = Path("/proc"),
+    cgroup_root: Path = CGROUP_ROOT,
+    unit_identity: dict[str, object] | None = None,
+) -> dict[str, object]:
+    pid, uid, gid = _socket_peer_credentials(descriptor)
+    expected_uid = execution.get("allowed_peer_uid")
+    expected_unit = execution.get("allowed_peer_unit")
+    expected_executable = execution.get("allowed_peer_executable")
+    if (
+        isinstance(expected_uid, bool)
+        or not isinstance(expected_uid, int)
+        or uid != expected_uid
+        or not isinstance(expected_unit, str)
+        or not expected_unit
+        or not isinstance(expected_executable, str)
+        or not expected_executable.startswith("/")
+    ):
+        raise PermissionError("secret PTY peer identity is not authorized")
+    observed_unit = (
+        _operator_system_unit_identity(expected_uid, expected_unit)
+        if unit_identity is None
+        else dict(unit_identity)
+    )
+    main_pid = observed_unit.get("main_pid")
+    control_group = observed_unit.get("control_group")
+    if not isinstance(main_pid, int) or main_pid <= 1 or not isinstance(control_group, str):
+        raise PermissionError("secret PTY operator unit identity is invalid")
+    unified_path = _unified_cgroup_path(pid, proc_root=proc_root)
+    if unified_path != control_group or not unified_path.endswith("/" + expected_unit):
+        raise PermissionError("secret PTY peer is outside the operator service")
+    _validate_system_cgroup_authority(unified_path, cgroup_root=cgroup_root)
+    parent_pid, starttime_ticks = _process_identity(pid, proc_root=proc_root)
+    if parent_pid != main_pid:
+        raise PermissionError("secret PTY peer is not a direct operator child")
+    argv = _process_cmdline(pid, proc_root=proc_root)
+    expected_path = Path(expected_executable)
+    try:
+        metadata = expected_path.lstat()
+    except OSError as exc:
+        raise PermissionError("secret PTY peer executable is unavailable") from exc
+    if (
+        expected_path.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_mode & 0o022
+    ):
+        raise PermissionError("secret PTY peer executable is not root-controlled")
+    direct = argv[0] == expected_executable
+    shebang = len(argv) >= 2 and argv[1] == expected_executable
+    if not direct and not shebang:
+        raise PermissionError("secret PTY peer executable is unauthorized")
+    parent_after, starttime_after = _process_identity(pid, proc_root=proc_root)
+    if parent_after != parent_pid or starttime_after != starttime_ticks:
+        raise PermissionError("secret PTY peer identity changed during validation")
+    return {
+        "pid": pid,
+        "uid": uid,
+        "gid": gid,
+        "parent_pid": parent_pid,
+        "starttime_ticks": starttime_ticks,
+        "cgroup": unified_path,
+        "unit": expected_unit,
+        "executable": expected_executable,
+    }
+
+
+def _read_peer_bound_secret(
+    transport: dict[str, object] | None,
+    peer: dict[str, object],
+    execution: dict[str, object],
+    *,
+    proc_root: Path = Path("/proc"),
+) -> bytearray:
+    if transport is None or transport.get("kind") != "peer-fd-v1":
+        raise PermissionError("secret PTY requires peer-bound FD transport")
+    peer_pid = peer.get("pid")
+    peer_uid = peer.get("uid")
+    peer_parent = peer.get("parent_pid")
+    peer_starttime = peer.get("starttime_ticks")
+    secret_fd = transport.get("secret_fd")
+    expected_hash = transport.get("secret_sha256")
+    max_secret_bytes = execution.get("max_secret_bytes")
+    if (
+        not isinstance(peer_pid, int)
+        or not isinstance(peer_uid, int)
+        or not isinstance(peer_parent, int)
+        or not isinstance(peer_starttime, int)
+        or isinstance(secret_fd, bool)
+        or not isinstance(secret_fd, int)
+        or not isinstance(expected_hash, str)
+        or isinstance(max_secret_bytes, bool)
+        or not isinstance(max_secret_bytes, int)
+    ):
+        raise PermissionError("secret PTY transport binding is malformed")
+    path = proc_root / str(peer_pid) / "fd" / str(secret_fd)
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != peer_uid
+            or metadata.st_size <= 0
+            or metadata.st_size > max_secret_bytes
+        ):
+            raise PermissionError("secret PTY descriptor is not an allowed bounded secret")
+        parent_after, starttime_after = _process_identity(peer_pid, proc_root=proc_root)
+        if parent_after != peer_parent or starttime_after != peer_starttime:
+            raise PermissionError("secret PTY peer changed before secret read")
+        raw = os.pread(descriptor, metadata.st_size + 1, 0)
+        if len(raw) != metadata.st_size or hashlib.sha256(raw).hexdigest() != expected_hash:
+            raise PermissionError("secret PTY descriptor hash does not match its binding")
+        return bytearray(raw)
+    finally:
+        os.close(descriptor)
+
+
+def _claim_secret_pty_authority(
+    reference: dict[str, object],
+    session_authority: dict[str, object],
+    *,
+    state: Path = STATE,
+) -> None:
+    request_id = reference.get("request_id")
+    session_id = session_authority.get("session_id")
+    if not isinstance(request_id, str) or not isinstance(session_id, str):
+        raise PermissionError("secret PTY replay identity is invalid")
+    claim_once(state / "used-secret-pty-sessions", session_id)
+    claim_once(state / "used", request_id)
+
+
+def _terminate_secret_pty_child(pid: int) -> int | None:
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    deadline = time.monotonic() + SECRET_PTY_TERMINATE_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        waited, status = os.waitpid(pid, os.WNOHANG)
+        if waited == pid:
+            return status
+        time.sleep(0.02)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        _waited, status = os.waitpid(pid, 0)
+        return status
+    except ChildProcessError:
+        return None
+
+
+def _run_secret_pty_process(
+    *,
+    execution: dict[str, object],
+    secret: bytearray,
+    peer_alive,
+) -> dict[str, object]:
+    argv = execution["argv"]
+    cwd = execution["cwd"]
+    timeout = execution["timeout_seconds"]
+    prompts = execution["prompt_sequence"]
+    output_limit = execution.get("max_output_bytes")
+    assert isinstance(argv, list) and all(isinstance(item, str) for item in argv)
+    assert isinstance(cwd, str) and isinstance(timeout, int)
+    assert isinstance(prompts, list) and all(isinstance(item, str) for item in prompts)
+    if (
+        isinstance(output_limit, bool)
+        or not isinstance(output_limit, int)
+        or not 1 <= output_limit <= SECRET_PTY_MAX_TRANSCRIPT_BYTES
+    ):
+        raise PermissionError("secret PTY output bound is invalid")
+    prompt_bytes = [item.encode("utf-8") for item in prompts]
+    started = time.monotonic()
+    pid, master_fd = pty.fork()
+    if pid == 0:
+        try:
+            os.chdir(cwd)
+            os.execve(argv[0], argv, SAFE_ENV)
+        except BaseException:
+            os._exit(127)
+    os.set_blocking(master_fd, False)
+    prompt_index = 0
+    bytes_seen = 0
+    secret_echo_detected = False
+    failure_reason: str | None = None
+    timed_out = False
+    status: int | None = None
+    window = bytearray()
+    try:
+        while status is None:
+            if time.monotonic() - started >= timeout:
+                timed_out = True
+                failure_reason = "timeout"
+                break
+            try:
+                if not peer_alive():
+                    failure_reason = "peer-disconnected"
+                    break
+                _require_execution_kill_switch_clear(execution)
+            except (OSError, PermissionError, RuntimeError, ValueError):
+                failure_reason = "authority-lost"
+                break
+            ready, _write_ready, _errors = select.select([master_fd], [], [], 0.1)
+            if ready:
+                try:
+                    chunk = os.read(master_fd, 8192)
+                except BlockingIOError:
+                    chunk = b""
+                except OSError as exc:
+                    if exc.errno == 5:
+                        chunk = b""
+                    else:
+                        raise
+                if chunk:
+                    bytes_seen += len(chunk)
+                    if bytes_seen > output_limit:
+                        failure_reason = "output-limit"
+                        break
+                    window.extend(chunk)
+                    if bytes(secret) in window:
+                        secret_echo_detected = True
+                        failure_reason = "secret-echo"
+                        break
+                    while prompt_index < len(prompt_bytes):
+                        positions = [
+                            (index, window.find(prompt))
+                            for index, prompt in enumerate(prompt_bytes)
+                            if window.find(prompt) >= 0
+                        ]
+                        if not positions:
+                            break
+                        observed_index, position = min(positions, key=lambda item: item[1])
+                        if observed_index != prompt_index:
+                            failure_reason = "prompt-out-of-order"
+                            break
+                        prompt = prompt_bytes[prompt_index]
+                        os.write(master_fd, secret + b"\n")
+                        prompt_index += 1
+                        del window[: position + len(prompt)]
+                    if failure_reason is not None:
+                        break
+                    if prompt_index == len(prompt_bytes) and any(
+                        prompt in window for prompt in prompt_bytes
+                    ):
+                        failure_reason = "prompt-repeated"
+                        break
+                    if len(window) > 64 * 1024:
+                        del window[: len(window) - 4096]
+            waited, child_status = os.waitpid(pid, os.WNOHANG)
+            if waited == pid:
+                status = child_status
+        if status is None:
+            status = _terminate_secret_pty_child(pid)
+    finally:
+        os.close(master_fd)
+    returncode = os.waitstatus_to_exitcode(status) if status is not None else None
+    complete = (
+        failure_reason is None
+        and not timed_out
+        and not secret_echo_detected
+        and prompt_index == len(prompt_bytes)
+        and returncode == 0
+    )
+    return {
+        "outcome": "COMPLETED" if complete else "UNCLEAR",
+        "returncode": returncode,
+        "timed_out": timed_out,
+        "retry_safe": False,
+        "readback_required": not complete,
+        "prompt_count": prompt_index,
+        "expected_prompt_count": len(prompt_bytes),
+        "prompt_contract_sha256": execution.get("prompt_contract_sha256"),
+        "pty_bytes_observed": bytes_seen,
+        "secret_echo_detected": secret_echo_detected,
+        "failure_reason": failure_reason,
+        "duration_seconds": round(time.monotonic() - started, 3),
+    }
+
+
 def _require_execution_kill_switch_clear(execution: dict[str, object]) -> None:
     kill_switch_value = execution.get("kill_switch_path")
     legacy_switch_value = execution.get("legacy_kill_switch_path")
@@ -1724,11 +2014,15 @@ def main() -> int:
     if os.geteuid() != 0:
         raise PermissionError("privileged broker must run as root")
     data = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
-    reference = parse_reference(data)
+    reference, secret_transport = parse_transport_request(
+        data, reference_parser=parse_reference
+    )
     config = load_root_config(CONFIG)
     execution = resolve_execution(config, reference)
     operator_peer: dict[str, object] | None = None
-    if (
+    if execution.get("mode") == "secret-pty":
+        operator_peer = _validate_secret_pty_peer(execution)
+    elif (
         reference.get("action") in {
             POWER_ACTION,
             BLOCKADE_LIFECYCLE_ACTION,
@@ -1739,12 +2033,126 @@ def main() -> int:
     ):
         operator_peer = _validate_blockade_lifecycle_peer(execution)
     if execution.get("mode") == "recovery-marker-publish":
+        if secret_transport is not None:
+            raise PermissionError("secret transport is not allowed for this action")
         return _run_recovery_publication(reference, execution)
     if execution.get("mode") == "blockade-marker-lifecycle":
+        if secret_transport is not None:
+            raise PermissionError("secret transport is not allowed for this action")
         assert operator_peer is not None
         return _run_blockade_lifecycle(
             reference, execution, peer=operator_peer
         )
+    if execution.get("mode") == "secret-pty":
+        assert operator_peer is not None
+        if secret_transport is None:
+            raise PermissionError("secret PTY action requires peer-bound FD transport")
+        session_authority = validate_secret_pty_session_authority(
+            secret_transport.get("session_authority"), execution
+        )
+        cwd_value = execution.get("cwd")
+        if not isinstance(cwd_value, str) or not Path(cwd_value).is_dir():
+            raise ValueError("secret PTY cwd is not an existing directory")
+        _claim_secret_pty_authority(reference, session_authority)
+        identity_keys = (
+            "mode", "argv", "cwd", "timeout_seconds", "prompt_sequence",
+            "max_secret_bytes", "max_output_bytes", "kill_switch_path",
+            "legacy_kill_switch_path", "allowed_peer_uid", "allowed_peer_unit",
+            "allowed_peer_executable", "authority_task_id", "authority_host",
+            "action_schema", "privilege_context", "required_resource_keys",
+            "redaction_contract_sha256", "prompt_contract_sha256",
+        )
+        refreshed = resolve_execution(config, reference)
+        if any(refreshed.get(key) != execution.get(key) for key in identity_keys):
+            raise PermissionError("secret PTY execution contract changed before spawn")
+        first_gate = execution.get("gate")
+        refreshed_gate = refreshed.get("gate")
+        if not isinstance(first_gate, dict) or not isinstance(refreshed_gate, dict):
+            raise PermissionError("secret PTY recovery gate is unavailable")
+        for key in ("recovery_marker_sha256", "recovery_marker_source_sha256"):
+            if refreshed_gate.get(key) != first_gate.get(key):
+                raise PermissionError("secret PTY recovery authority changed before spawn")
+        execution = refreshed
+        session_authority = validate_secret_pty_session_authority(
+            session_authority, execution
+        )
+        refreshed_peer = _validate_secret_pty_peer(execution)
+        if (
+            refreshed_peer.get("pid") != operator_peer.get("pid")
+            or refreshed_peer.get("starttime_ticks") != operator_peer.get("starttime_ticks")
+        ):
+            raise PermissionError("secret PTY peer identity changed before spawn")
+        operator_peer = refreshed_peer
+        secret = _read_peer_bound_secret(secret_transport, operator_peer, execution)
+        peer_pid = int(operator_peer["pid"])
+        peer_parent = int(operator_peer["parent_pid"])
+        peer_starttime = int(operator_peer["starttime_ticks"])
+
+        def peer_alive() -> bool:
+            try:
+                parent_now, start_now = _process_identity(peer_pid, proc_root=Path("/proc"))
+            except PermissionError:
+                return False
+            return parent_now == peer_parent and start_now == peer_starttime
+
+        pty_started = time.monotonic()
+        try:
+            result = _run_secret_pty_process(
+                execution=execution,
+                secret=secret,
+                peer_alive=peer_alive,
+            )
+        finally:
+            for index in range(len(secret)):
+                secret[index] = 0
+        record = {
+            **_base_audit_record(reference, execution, pty_started),
+            **_operator_peer_audit_fields(operator_peer),
+            "secret_binding_sha256": secret_transport["secret_sha256"],
+            "secret_transport_sha256": secret_transport["transport_sha256"],
+            "session_id": session_authority["session_id"],
+            "task_id": session_authority["task_id"],
+            "host": session_authority["host"],
+            "action_schema": session_authority["action_schema"],
+            "session_authority_sha256": session_authority["authority_sha256"],
+            "resource_lease_bindings_sha256": session_authority[
+                "resource_lease_bindings_sha256"
+            ],
+            "redaction_contract_sha256": session_authority[
+                "redaction_contract_sha256"
+            ],
+            "prompt_contract_sha256": execution.get("prompt_contract_sha256"),
+            "prompt_count": result["prompt_count"],
+            "expected_prompt_count": result["expected_prompt_count"],
+            "pty_bytes_observed": result["pty_bytes_observed"],
+            "secret_echo_detected": result["secret_echo_detected"],
+            "outcome": result["outcome"],
+            "returncode": result["returncode"],
+            "timed_out": result["timed_out"],
+            "retry_safe": False,
+            "readback_required": result["readback_required"],
+            "failure_reason": result["failure_reason"],
+        }
+        append_audit(record)
+        print(json.dumps({
+            "schema_version": 1,
+            "request_id": reference["request_id"],
+            "action": reference["action"],
+            "mode": "secret-pty",
+            "session_id": session_authority["session_id"],
+            "task_id": session_authority["task_id"],
+            "host": session_authority["host"],
+            "action_schema": session_authority["action_schema"],
+            "session_authority_sha256": session_authority["authority_sha256"],
+            "resource_lease_bindings_sha256": session_authority[
+                "resource_lease_bindings_sha256"
+            ],
+            **result,
+            "audit": _public_audit_record(record),
+        }, ensure_ascii=False, sort_keys=True))
+        return 0
+    if secret_transport is not None:
+        raise PermissionError("secret transport is not allowed for this action")
     argv = execution["argv"]
     timeout = execution["timeout_seconds"]
     cwd = execution.get("cwd")

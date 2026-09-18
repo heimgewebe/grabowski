@@ -143,6 +143,10 @@ def _rootbroker_cutover_action() -> dict[str, object]:
     return _bound_action(cutover.ROOTBROKER_CUTOVER_ACTION)
 
 
+def _secret_pty_action() -> dict[str, object]:
+    return _bound_action(cutover.SECRET_PTY_ACTION)
+
+
 def _platform_connector_capture_action() -> dict[str, object]:
     return _bound_action(cutover.PLATFORM_CONNECTOR_CAPTURE_ACTION)
 
@@ -204,6 +208,7 @@ def _example_config_text() -> str:
                 cutover.BOOTSTRAP_RECOVERY_ACTION: _bootstrap_recovery_action(),
                 cutover.OPERATOR_SERVICE_CONTROL_ACTION: _operator_service_control_action(),
                 cutover.ROOTBROKER_CUTOVER_ACTION: _rootbroker_cutover_action(),
+                cutover.SECRET_PTY_ACTION: _secret_pty_action(),
                 **_local_backup_ntfs_actions(),
             },
         },
@@ -830,6 +835,7 @@ class RootbrokerCutoverTests(unittest.TestCase):
                 cutover.BLOCKADE_LIFECYCLE_ACTION: lifecycle,
                 cutover.OPERATOR_SERVICE_CONTROL_ACTION: service_control,
                 cutover.ROOTBROKER_CUTOVER_ACTION: _rootbroker_cutover_action(),
+                cutover.SECRET_PTY_ACTION: _secret_pty_action(),
                 cutover.PLATFORM_CONNECTOR_CAPTURE_ACTION: _platform_connector_capture_action(),
                 **_local_backup_ntfs_actions(),
             },
@@ -881,6 +887,7 @@ class RootbrokerCutoverTests(unittest.TestCase):
             cutover.PLATFORM_CONNECTOR_CAPTURE_ACTION,
             attestation["action_sha256"],
         )
+        self.assertIn(cutover.SECRET_PTY_ACTION, attestation["action_sha256"])
         unsigned = dict(attestation)
         digest = unsigned.pop("attestation_sha256")
         self.assertEqual(digest, cutover._sha256(cutover._canonical_json(unsigned)))
@@ -897,6 +904,7 @@ class RootbrokerCutoverTests(unittest.TestCase):
                 cutover.BLOCKADE_LIFECYCLE_ACTION: lifecycle,
                 cutover.OPERATOR_SERVICE_CONTROL_ACTION: _operator_service_control_action(),
                 cutover.ROOTBROKER_CUTOVER_ACTION: _rootbroker_cutover_action(),
+                cutover.SECRET_PTY_ACTION: _secret_pty_action(),
                 cutover.PLATFORM_CONNECTOR_CAPTURE_ACTION: _platform_connector_capture_action(),
             },
         }
@@ -1059,6 +1067,82 @@ class RootbrokerCutoverTests(unittest.TestCase):
             ).hexdigest(),
         )
 
+    def test_merge_adds_commit_bound_secret_pty_action(self) -> None:
+        merged, evidence = cutover.merge_privileged_config(
+            _installed_config(),
+            publisher=_canonical_publisher(),
+            power=_power_action(),
+            lifecycle=_lifecycle(),
+            secret_pty=_secret_pty_action(),
+        )
+
+        self.assertEqual(
+            merged["actions"][cutover.SECRET_PTY_ACTION],
+            _secret_pty_action(),
+        )
+        self.assertFalse(evidence["secret_pty_preexisting"])
+        self.assertIsNone(evidence["secret_pty_before_sha256"])
+        self.assertEqual(
+            evidence["secret_pty_sha256"],
+            hashlib.sha256(
+                cutover._canonical_json(_secret_pty_action())
+            ).hexdigest(),
+        )
+
+    def test_merge_rejects_drifted_preexisting_secret_pty_action(self) -> None:
+        current = _installed_config()
+        drifted = _secret_pty_action()
+        drifted["timeout_seconds"] = 31
+        current["actions"][cutover.SECRET_PTY_ACTION] = drifted
+
+        with self.assertRaisesRegex(
+            cutover.CutoverError,
+            "secret PTY action differs from commit-bound contract",
+        ):
+            cutover.merge_privileged_config(
+                current,
+                publisher=_canonical_publisher(),
+                power=_power_action(),
+                lifecycle=_lifecycle(),
+                secret_pty=_secret_pty_action(),
+            )
+
+    def test_secret_pty_loader_rejects_prompt_or_authority_drift(self) -> None:
+        exact = cutover._secret_pty_action_from_repository(
+            Path("/tmp/repository"),
+            expected_head=HEAD,
+            runner=FakeRunner(),
+        )
+        self.assertEqual(exact, _secret_pty_action())
+
+        example = json.loads(_example_config_text())
+        example["actions"][cutover.SECRET_PTY_ACTION]["prompt_sequence"].append(
+            "Unexpected: "
+        )
+        with self.assertRaisesRegex(cutover.CutoverError, "bounds or prompt"):
+            cutover._secret_pty_action_from_repository(
+                Path("/tmp/repository"),
+                expected_head=HEAD,
+                runner=FakeRunner(
+                    blobs={
+                        "config/privileged-actions.example.json": json.dumps(example)
+                    }
+                ),
+            )
+
+        example = json.loads(_example_config_text())
+        example["actions"][cutover.SECRET_PTY_ACTION]["authority_task_id"] = "other"
+        with self.assertRaisesRegex(cutover.CutoverError, "authority binding"):
+            cutover._secret_pty_action_from_repository(
+                Path("/tmp/repository"),
+                expected_head=HEAD,
+                runner=FakeRunner(
+                    blobs={
+                        "config/privileged-actions.example.json": json.dumps(example)
+                    }
+                ),
+            )
+
     def test_merge_adds_commit_bound_runtime_bootstrap_recovery_action(self) -> None:
         merged, evidence = cutover.merge_privileged_config(
             _installed_config(),
@@ -1126,6 +1210,7 @@ class RootbrokerCutoverTests(unittest.TestCase):
             bootstrap_recovery=_bootstrap_recovery_action(),
             operator_service_control=_operator_service_control_action(),
             rootbroker_cutover=_rootbroker_cutover_action(),
+            secret_pty=_secret_pty_action(),
             allow_controlled_updates=True,
         )
 
@@ -1141,6 +1226,10 @@ class RootbrokerCutoverTests(unittest.TestCase):
         self.assertEqual(
             merged["actions"][cutover.ROOTBROKER_CUTOVER_ACTION],
             _rootbroker_cutover_action(),
+        )
+        self.assertEqual(
+            merged["actions"][cutover.SECRET_PTY_ACTION],
+            _secret_pty_action(),
         )
         self.assertEqual(
             merged["actions"][cutover.ROOT_TASK_ACTION],
@@ -1647,6 +1736,90 @@ class RootbrokerCutoverTests(unittest.TestCase):
             "lock_path": root / "cutover.lock",
         }
 
+    def test_build_plan_binds_secret_pty_action_into_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repository = Path(raw)
+            source_artifacts = {
+                Path("/tmp/fake-artifact"): (
+                    b"artifact\n",
+                    0o644,
+                    hashlib.sha256(b"artifact\n").hexdigest(),
+                )
+            }
+            current = _installed_config()
+            current_data = json.dumps(current, sort_keys=True).encode("utf-8")
+            metadata = SimpleNamespace(st_mode=stat.S_IFREG | 0o600)
+            merged = json.loads(json.dumps(current))
+            secret_pty = _secret_pty_action()
+            with (
+                patch.object(cutover, "_repository_head", return_value=HEAD),
+                patch.object(cutover, "_source_artifacts", return_value=source_artifacts),
+                patch.object(cutover, "_validate_source_artifacts"),
+                patch.object(cutover, "_verify_running_helper"),
+                patch.object(cutover, "_power_action_from_repository", return_value=_power_action()),
+                patch.object(cutover, "_publisher_from_repository", return_value=_canonical_publisher()),
+                patch.object(cutover, "_lifecycle_from_repository", return_value=_lifecycle()),
+                patch.object(cutover, "_root_task_action_from_repository", return_value=_root_task_action()),
+                patch.object(
+                    cutover,
+                    "_process_observer_action_from_repository",
+                    return_value=_bound_action(cutover.PROCESS_OBSERVER_ACTION),
+                ),
+                patch.object(
+                    cutover,
+                    "_platform_connector_capture_action_from_repository",
+                    return_value=_platform_connector_capture_action(),
+                ),
+                patch.object(
+                    cutover,
+                    "_bootstrap_recovery_action_from_repository",
+                    return_value=_bootstrap_recovery_action(),
+                ),
+                patch.object(
+                    cutover,
+                    "_operator_service_control_action_from_repository",
+                    return_value=_operator_service_control_action(),
+                ),
+                patch.object(
+                    cutover,
+                    "_rootbroker_cutover_action_from_repository",
+                    return_value=_rootbroker_cutover_action(),
+                ),
+                patch.object(
+                    cutover,
+                    "_secret_pty_action_from_repository",
+                    return_value=secret_pty,
+                ),
+                patch.object(
+                    cutover,
+                    "_local_backup_ntfs_actions_from_repository",
+                    return_value=_local_backup_ntfs_actions(),
+                ),
+                patch.object(cutover, "_validate_recovery_source_dropin"),
+                patch.object(
+                    cutover,
+                    "_read_regular_file",
+                    return_value=(current_data, metadata),
+                ),
+                patch.object(
+                    cutover,
+                    "merge_privileged_config",
+                    return_value=(merged, {"secret_pty_bound": True}),
+                ) as merge,
+            ):
+                plan = cutover.build_plan(
+                    repository=repository,
+                    expected_head=HEAD,
+                    runner=FakeRunner(),
+                )
+
+            self.assertFalse(plan["root_mutation"])
+            self.assertTrue(plan["merge_evidence"]["secret_pty_bound"])
+            self.assertEqual(
+                merge.call_args.kwargs["secret_pty"],
+                secret_pty,
+            )
+
     def test_apply_installs_exact_artifacts_and_writes_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             layout = self._layout(Path(raw))
@@ -1706,6 +1879,10 @@ class RootbrokerCutoverTests(unittest.TestCase):
             self.assertEqual(
                 installed_config["actions"][cutover.OPERATOR_SERVICE_CONTROL_ACTION],
                 _operator_service_control_action(),
+            )
+            self.assertEqual(
+                installed_config["actions"][cutover.SECRET_PTY_ACTION],
+                _secret_pty_action(),
             )
             self.assertEqual(layout["config_target"].stat().st_mode & 0o777, 0o600)
             receipt_path = Path(receipt["receipt_path"])
