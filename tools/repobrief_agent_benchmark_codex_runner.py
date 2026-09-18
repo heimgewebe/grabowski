@@ -60,6 +60,60 @@ CHATGPT_LOGIN_LINE = "Logged in using ChatGPT"
 ALLOWED_MCP = {"ask_context", "grounding_verify", "live_freshness", "repobrief_resource_read"}
 UPSTREAM_MCP = {"ask_context", "grounding_verify", "live_freshness"}
 REPOGROUND_MCP_SCHEMA_CONTRACT_COMMIT = "9c24c2887b4b5724686a5051e5feb8aa54783019"
+EXPECTED_REPOGROUND_READ_ONLY_KIND = "repobrief.mcp.read_only_frontdoor"
+EXPECTED_REPOGROUND_READ_ONLY_VERSION = "v1"
+EXPECTED_REPOGROUND_FRESHNESS_VALUES = ("fresh", "stale", "unknown", "not_comparable")
+EXPECTED_REPOGROUND_FRESHNESS_DOES_NOT_ESTABLISH = (
+    "freshness_against_remote",
+    "remote_branch_state",
+    "pull_request_diff_current",
+    "runtime_correctness",
+    "repo_understood",
+    "merge_readiness",
+)
+EXPECTED_REPOGROUND_FRONTDOOR_DOES_NOT_ESTABLISH = (
+    "truth",
+    "correctness",
+    "completeness",
+    "runtime_behavior",
+    "test_sufficiency",
+    "regression_absence",
+    "repo_understood",
+    "claims_true",
+    "forensic_ready",
+    "review_complete",
+    "pr_mergeable",
+    "mcp_server_available",
+)
+EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH = (
+    "actual_reading_proven",
+    "answer_correct",
+    "repo_understood",
+    "all_relevant_context_used",
+    "claims_true",
+    "test_sufficiency",
+    "regression_absence",
+    "runtime_behavior",
+    "forensic_ready",
+    "merge_readiness",
+    "security_correctness",
+)
+EXPECTED_ASK_CONTEXT_FORBIDDEN_OPERATIONS = (
+    "implicit_refresh",
+    "git_mutation",
+    "snapshot_creation_on_read",
+    "patch_application",
+    "pull_request_mutation",
+    "shell_execution",
+    "merge_authorization",
+)
+EXPECTED_ASK_CONTEXT_PACK_KIND = "repobrief.ask_context_pack"
+EXPECTED_ASK_CONTEXT_PACK_VERSION = "1.0"
+EXPECTED_GROUNDING_VERDICT_KIND = "repobrief.answer_grounding_verdict"
+EXPECTED_GROUNDING_VERDICT_VERSION = "1.0"
+EXPECTED_GROUNDING_VERDICT_STATUSES = frozenset(
+    {"pass", "fail", "warn", "degraded", "not_applicable"}
+)
 _REPOGROUND_SELECTOR_PROPERTIES: dict[str, Any] = {
     "bundle_manifest": {
         "type": ["string", "null"],
@@ -732,7 +786,248 @@ def _validated_resource_read_result(value: Any, *, expected_uri: str) -> dict[st
     return json.loads(json.dumps(value))
 
 
-def _validated_treatment_tool_result(value: Any) -> dict[str, Any]:
+def _validated_live_freshness_payload(
+    value: Any, *, expected_manifest: Path
+) -> dict[str, Any]:
+    common = {
+        "kind", "version", "status", "reason", "bundle_manifest", "repo_root",
+        "read_only_git_probe", "implicit_refresh", "does_not_establish",
+    }
+    extended = common | {"freshness_values", "snapshot_provenance", "current_provenance"}
+    if not isinstance(value, dict) or frozenset(value) not in {frozenset(common), frozenset(extended)}:
+        raise RunnerError("RepoGround live_freshness payload is malformed")
+    if (
+        value.get("kind") != "repobrief.live_freshness"
+        or value.get("version") != "v1"
+        or value.get("status") not in EXPECTED_REPOGROUND_FRESHNESS_VALUES
+        or not isinstance(value.get("reason"), str)
+        or not value.get("reason")
+        or value.get("bundle_manifest") != str(expected_manifest)
+        or (value.get("repo_root") is not None and not isinstance(value.get("repo_root"), str))
+        or not isinstance(value.get("read_only_git_probe"), bool)
+        or value.get("implicit_refresh") is not False
+        or value.get("does_not_establish") != list(EXPECTED_REPOGROUND_FRESHNESS_DOES_NOT_ESTABLISH)
+    ):
+        raise RunnerError("RepoGround live_freshness payload is malformed")
+    if set(value) == extended:
+        if (
+            value.get("freshness_values") != list(EXPECTED_REPOGROUND_FRESHNESS_VALUES)
+            or (value.get("snapshot_provenance") is not None and not isinstance(value.get("snapshot_provenance"), dict))
+            or (value.get("current_provenance") is not None and not isinstance(value.get("current_provenance"), dict))
+        ):
+            raise RunnerError("RepoGround live_freshness payload is malformed")
+    return json.loads(json.dumps(value))
+
+
+def _validated_read_only_frontdoor_projection(value: Mapping[str, Any]) -> None:
+    boundary = value.get("mutation_boundary")
+    if not isinstance(boundary, dict) or boundary.get("writes") != []:
+        raise RunnerError("RepoGround treatment tool read-only boundary is malformed")
+    guarded_booleans = {
+        "read_only": True,
+        "read_paths_do_not_refresh": True,
+        "not_reachable_from_snapshot_create": True,
+        "explicit_write_tool": False,
+    }
+    for field, expected in guarded_booleans.items():
+        if field in boundary and boundary.get(field) is not expected:
+            raise RunnerError("RepoGround treatment tool read-only boundary is malformed")
+    forbidden = boundary.get("forbidden_operations")
+    if forbidden is not None and (
+        not isinstance(forbidden, list)
+        or not {"secret_read", "snapshot_create_side_effect"}.issubset(set(forbidden))
+    ):
+        raise RunnerError("RepoGround treatment tool read-only boundary is malformed")
+    dne = value.get("does_not_establish")
+    expected_items = list(EXPECTED_REPOGROUND_FRONTDOOR_DOES_NOT_ESTABLISH)
+    if isinstance(dne, list):
+        valid_dne = dne == expected_items
+    elif isinstance(dne, dict):
+        valid_dne = (
+            set(dne) == {"ref", "items"}
+            and dne.get("ref") == "repobrief.does_not_establish.default.v1"
+            and dne.get("items") == expected_items
+        )
+    else:
+        valid_dne = False
+    if not valid_dne:
+        raise RunnerError("RepoGround treatment tool non-claim projection is malformed")
+
+
+def _validated_ask_context_pack(value: Any) -> dict[str, Any]:
+    base_keys = {
+        "kind", "version", "request_id", "snapshot_ref", "freshness",
+        "availability", "required_reading", "retrieval",
+        "retrieval_infrastructure", "retrieval_hits", "resolved_ranges",
+        "answer_scaffold", "budget", "forbidden_operations",
+        "does_not_establish",
+    }
+    if not isinstance(value, dict) or frozenset(value) not in {
+        frozenset(base_keys), frozenset(base_keys | {"structured_evidence"})
+    }:
+        raise RunnerError("RepoGround ask_context context pack is malformed")
+    request_id = value.get("request_id")
+    if (
+        value.get("kind") != EXPECTED_ASK_CONTEXT_PACK_KIND
+        or value.get("version") != EXPECTED_ASK_CONTEXT_PACK_VERSION
+        or not isinstance(request_id, str)
+        or re.fullmatch(r"[0-9a-f]{16}", request_id) is None
+        or not all(isinstance(value.get(name), dict) for name in (
+            "snapshot_ref", "freshness", "availability", "required_reading",
+            "retrieval", "retrieval_infrastructure", "answer_scaffold", "budget"
+        ))
+        or not isinstance(value.get("retrieval_hits"), list)
+        or not isinstance(value.get("resolved_ranges"), list)
+        or value.get("forbidden_operations") != list(EXPECTED_ASK_CONTEXT_FORBIDDEN_OPERATIONS)
+        or value.get("does_not_establish") != list(EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH)
+        or ("structured_evidence" in value and not isinstance(value.get("structured_evidence"), dict))
+    ):
+        raise RunnerError("RepoGround ask_context context pack is malformed")
+    freshness = value["freshness"]
+    availability = value["availability"]
+    infrastructure = value["retrieval_infrastructure"]
+    if (
+        freshness.get("status") not in {"fresh", "stale", "unknown", "not_comparable", "not_applicable"}
+        or availability.get("status") not in {"available", "partial", "missing", "unknown"}
+        or infrastructure.get("status") not in {"available", "missing", "invalid", "unknown"}
+    ):
+        raise RunnerError("RepoGround ask_context context pack is malformed")
+    scaffold = value["answer_scaffold"]
+    if (
+        set(scaffold) != {"citation_obligations", "caveats_to_surface", "non_claims_to_surface"}
+        or not isinstance(scaffold.get("citation_obligations"), list)
+        or not isinstance(scaffold.get("caveats_to_surface"), list)
+        or scaffold.get("non_claims_to_surface") != list(EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH)
+    ):
+        raise RunnerError("RepoGround ask_context context pack is malformed")
+    budget = value["budget"]
+    budget_keys = {
+        "max_context_tokens", "token_derived_byte_ceiling", "max_context_bytes",
+        "max_answer_tokens", "context_bytes_used",
+        "context_unicode_characters_used", "approx_context_chars_used",
+        "byte_budget_is_hard", "unit", "accounting", "omissions",
+        "truncated", "does_not_establish_quality",
+    }
+    integer_fields = (
+        "max_context_tokens", "token_derived_byte_ceiling", "max_context_bytes",
+        "max_answer_tokens", "context_bytes_used",
+        "context_unicode_characters_used", "approx_context_chars_used",
+    )
+    if (
+        set(budget) != budget_keys
+        or any(
+            isinstance(budget.get(name), bool)
+            or not isinstance(budget.get(name), int)
+            or budget.get(name) < 0
+            for name in integer_fields
+        )
+        or budget.get("byte_budget_is_hard") is not True
+        or budget.get("unit") != "utf8_bytes"
+        or not isinstance(budget.get("accounting"), str)
+        or not budget.get("accounting")
+        or not isinstance(budget.get("omissions"), list)
+        or not isinstance(budget.get("truncated"), bool)
+        or budget.get("does_not_establish_quality") is not True
+    ):
+        raise RunnerError("RepoGround ask_context context pack is malformed")
+    return json.loads(json.dumps(value))
+
+
+def _validated_grounding_verdict(value: Any) -> dict[str, Any]:
+    expected_keys = {
+        "kind", "version", "status", "checked_declaration", "snapshot_ref",
+        "citation_checks", "range_checks", "required_reading_checks",
+        "diagnostics", "freshness_caveats", "availability_caveats",
+        "does_not_establish",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected_keys
+        or value.get("kind") != EXPECTED_GROUNDING_VERDICT_KIND
+        or value.get("version") != EXPECTED_GROUNDING_VERDICT_VERSION
+        or value.get("status") not in EXPECTED_GROUNDING_VERDICT_STATUSES
+        or not isinstance(value.get("checked_declaration"), dict)
+        or not isinstance(value.get("snapshot_ref"), dict)
+        or any(
+            not isinstance(value.get(name), list)
+            for name in (
+                "citation_checks", "range_checks", "required_reading_checks",
+                "diagnostics", "freshness_caveats", "availability_caveats"
+            )
+        )
+        or any(
+            not isinstance(item, dict)
+            for name in ("citation_checks", "range_checks", "required_reading_checks", "diagnostics")
+            for item in value.get(name, [])
+        )
+        or value.get("does_not_establish") != list(EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH)
+    ):
+        raise RunnerError("RepoGround grounding_verify verdict is malformed")
+    return json.loads(json.dumps(value))
+
+
+def _validated_treatment_structured_payload(
+    value: Any, *, tool_name: str, expected_manifest: Path, is_error: bool
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise RunnerError("RepoGround treatment tool structured payload is malformed")
+    if is_error:
+        if (
+            set(value) != {"status", "tool", "error"}
+            or value.get("status") != "error"
+            or value.get("tool") != tool_name
+            or not isinstance(value.get("error"), str)
+            or not value.get("error")
+        ):
+            raise RunnerError("RepoGround treatment tool structured payload is malformed")
+        return json.loads(json.dumps(value))
+    if tool_name == "live_freshness":
+        return _validated_live_freshness_payload(value, expected_manifest=expected_manifest)
+    common = {
+        "kind", "version", "tool", "status", "mutation_boundary",
+        "does_not_establish", "live_freshness",
+    }
+    if tool_name == "ask_context":
+        expected_keys = common | {"context_pack", "request_semantics", "context_pack_semantics"}
+        valid = (
+            set(value) == expected_keys
+            and value.get("kind") == EXPECTED_REPOGROUND_READ_ONLY_KIND
+            and value.get("version") == EXPECTED_REPOGROUND_READ_ONLY_VERSION
+            and value.get("tool") == "ask_context"
+            and value.get("status") == "ok"
+            and value.get("request_semantics") == "repobrief.ask_request.v1"
+            and value.get("context_pack_semantics") == "repobrief.ask_context_pack.v1"
+        )
+    elif tool_name == "grounding_verify":
+        expected_keys = common | {"verdict", "declaration_semantics", "verdict_semantics"}
+        verdict = _validated_grounding_verdict(value.get("verdict"))
+        verdict_status = verdict["status"]
+        valid = (
+            set(value) == expected_keys
+            and value.get("kind") == EXPECTED_REPOGROUND_READ_ONLY_KIND
+            and value.get("version") == EXPECTED_REPOGROUND_READ_ONLY_VERSION
+            and value.get("tool") == "grounding_verify"
+            and isinstance(value.get("status"), str)
+            and value.get("status") == verdict_status
+            and value.get("declaration_semantics") == "repobrief.answer_grounding_declaration.v1"
+            and value.get("verdict_semantics") == "repobrief.answer_grounding_verdict.v1"
+        )
+    else:
+        raise RunnerError("RepoGround treatment tool response is not authorized")
+    if not valid:
+        raise RunnerError("RepoGround treatment tool structured payload is malformed")
+    _validated_read_only_frontdoor_projection(value)
+    if tool_name == "ask_context":
+        _validated_ask_context_pack(value.get("context_pack"))
+    _validated_live_freshness_payload(
+        value.get("live_freshness"), expected_manifest=expected_manifest
+    )
+    return json.loads(json.dumps(value))
+
+
+def _validated_treatment_tool_result(
+    value: Any, *, tool_name: str, expected_manifest: Path
+) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != {"content", "structuredContent", "isError"}:
         raise RunnerError("RepoGround treatment tool result is malformed")
     content = value.get("content")
@@ -744,12 +1039,18 @@ def _validated_treatment_tool_result(value: Any) -> dict[str, Any]:
         or set(item) != {"type", "text"}
         or item.get("type") != "text"
         or not isinstance(item.get("text"), str)
+        or not item.get("text")
     ):
         raise RunnerError("RepoGround treatment tool result is malformed")
-    if not isinstance(value.get("structuredContent"), dict):
+    is_error = value.get("isError")
+    if not isinstance(is_error, bool):
         raise RunnerError("RepoGround treatment tool result is malformed")
-    if not isinstance(value.get("isError"), bool):
-        raise RunnerError("RepoGround treatment tool result is malformed")
+    value["structuredContent"] = _validated_treatment_structured_payload(
+        value.get("structuredContent"),
+        tool_name=tool_name,
+        expected_manifest=expected_manifest,
+        is_error=is_error,
+    )
     return json.loads(json.dumps(value))
 
 
@@ -1187,6 +1488,7 @@ def _load_preflight_dispatch_authorization(
     result: dict[str, Any] = {
         "mcp_files": [],
         "proxy_code": None,
+        "proxy_base_code": None,
         "manifest": None,
         "provider_codex": provider_codex,
         "code_files": [dict(code_files[name]) for name in _AUTHORIZED_RUNTIME_CODE_NAMES],
@@ -1215,6 +1517,7 @@ def _load_preflight_dispatch_authorization(
         {
             "mcp_files": _normalized_authorized_mcp_files(binding.get("mcp_command_files")),
             "proxy_code": dict(code_files[Path(__file__).name]),
+            "proxy_base_code": dict(code_files[BASE_PATH.name]),
             "manifest": dict(current_manifest),
         }
     )
@@ -1254,30 +1557,253 @@ def _revalidate_mcp_file(binding: Mapping[str, Any], *, label: str) -> None:
         raise RunnerError(f"{label} changed during execution")
 
 
-def stage_mcp_proxy(state_root: Path, expected_code: Mapping[str, Any]) -> dict[str, Any]:
-    source = Path(__file__).resolve()
+def _create_private_stage_directory(parent: Path, *, prefix: str) -> tuple[Path, int]:
+    parent_path, parent_fd = _open_private_directory(parent)
+    child_fd: int | None = None
+    runtime_name: str | None = None
+    try:
+        for _attempt in range(4):
+            candidate = prefix + sha_bytes(os.urandom(32))[:24]
+            try:
+                os.mkdir(candidate, 0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                continue
+            runtime_name = candidate
+            break
+        if runtime_name is None:
+            raise RunnerError("could not allocate unique private runtime stage")
+        child_fd = os.open(runtime_name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+        child = os.fstat(child_fd)
+        if child.st_uid != os.geteuid() or stat.S_IMODE(child.st_mode) != 0o700:
+            raise RunnerError("private runtime stage permissions are unsafe")
+        _directory_fd_matches(parent_path, parent_fd)
+        os.fsync(parent_fd)
+        return parent_path / runtime_name, child_fd
+    except BaseException:
+        if child_fd is not None:
+            try:
+                os.close(child_fd)
+            except OSError:
+                pass
+            child_fd = None
+        if runtime_name is not None:
+            try:
+                os.rmdir(runtime_name, dir_fd=parent_fd)
+            except OSError:
+                pass
+        raise
+    finally:
+        os.close(parent_fd)
+
+
+def _write_private_relative_file(root_fd: int, relative: Path, data: bytes) -> None:
+    if relative.is_absolute() or not relative.parts or any(
+        part in {"", ".", ".."} for part in relative.parts
+    ):
+        raise RunnerError("private relative artifact path is unsafe")
+    descriptor = os.dup(root_fd)
+    try:
+        for component in relative.parts[:-1]:
+            try:
+                child = os.open(component, _DIRECTORY_FLAGS, dir_fd=descriptor)
+            except FileNotFoundError:
+                os.mkdir(component, 0o700, dir_fd=descriptor)
+                child = os.open(component, _DIRECTORY_FLAGS, dir_fd=descriptor)
+            metadata = os.fstat(child)
+            if (
+                metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o700
+            ):
+                os.close(child)
+                raise RunnerError("private artifact directory permissions are unsafe")
+            os.close(descriptor)
+            descriptor = child
+        _write_private_dirfd(descriptor, relative.name, data)
+    finally:
+        os.close(descriptor)
+
+
+def _manifest_artifact_paths(source: Path, raw: bytes) -> list[tuple[Path, Path]]:
+    document = base._load_object_bytes(raw, label="RepoGround manifest")
+    artifacts = document.get("artifacts")
+    if artifacts is None:
+        artifacts = []
+    if not isinstance(artifacts, list):
+        raise RunnerError("RepoGround manifest artifacts contract is invalid")
+    root = source.parent.resolve(strict=True)
+    result: list[tuple[Path, Path]] = []
+    seen: set[Path] = set()
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        raw_path = artifact.get("path")
+        if raw_path is None:
+            continue
+        if not isinstance(raw_path, str) or not raw_path:
+            raise RunnerError("RepoGround manifest artifact path is invalid")
+        relative = Path(raw_path)
+        if (
+            relative.is_absolute()
+            or not relative.parts
+            or any(part == ".." for part in relative.parts)
+        ):
+            raise RunnerError("RepoGround manifest artifact path is not safely stageable")
+        candidate = root / relative
+        try:
+            normalized = candidate.resolve(strict=False).relative_to(root)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise RunnerError(
+                "RepoGround manifest artifact path escapes the bundle root"
+            ) from exc
+        if normalized != relative:
+            raise RunnerError(
+                "RepoGround manifest artifact path changes through filesystem indirection"
+            )
+        if relative not in seen:
+            seen.add(relative)
+            result.append((relative, candidate))
+    return result
+
+
+def _stage_code_source(
+    source: Path, expected_code: Mapping[str, Any], *, label: str
+) -> bytes:
     raw = _read_bound_regular_file(
-        source, label="Codex MCP proxy source", max_bytes=MAX_PROVIDER_EXECUTABLE_BYTES
+        source, label=label, max_bytes=MAX_PROVIDER_EXECUTABLE_BYTES
     )
     if (
         expected_code.get("name") != source.name
         or expected_code.get("bytes") != len(raw)
         or expected_code.get("sha256") != sha_bytes(raw)
     ):
-        raise RunnerError("Codex MCP proxy source does not match preflight authorization")
-    parent_path, parent_fd = _open_private_directory(state_root / "codex-mcp-proxy-runtime")
+        raise RunnerError(f"{label} does not match preflight authorization")
+    return raw
+
+
+def _private_directory_identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
+    return (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_uid)
+
+
+def _revalidate_private_stage_tree(
+    binding: Mapping[str, Any], file_bindings: Sequence[Mapping[str, Any]]
+) -> None:
+    runtime_dir = Path(binding["runtime_dir"])
+    opened_path, descriptor = _open_private_directory(runtime_dir, create_final=False)
     try:
-        name = "proxy-" + sha_bytes(os.urandom(32))[:24] + ".py"
-        _write_private_dirfd(parent_fd, name, raw)
-        _directory_fd_matches(parent_path, parent_fd)
-        staged = parent_path / name
-        bound = _bind_mcp_file(staged, label="Codex MCP proxy stage", executable=False)
+        _directory_fd_matches(opened_path, descriptor)
+        current_identity = _private_directory_identity(os.fstat(descriptor))
+    finally:
+        os.close(descriptor)
+    expected_identity = tuple(binding["runtime_identity"])
+    if current_identity != expected_identity:
+        raise RunnerError("private runtime stage changed during execution")
+
+    expected_files: set[Path] = set()
+    expected_directories: set[Path] = set()
+    for file_binding in file_bindings:
+        candidate = Path(file_binding["path"])
+        try:
+            relative = candidate.relative_to(runtime_dir)
+        except ValueError as exc:
+            raise RunnerError("private runtime stage file escapes its root") from exc
+        if not relative.parts:
+            raise RunnerError("private runtime stage file path is invalid")
+        expected_files.add(relative)
+        for parent in relative.parents:
+            if parent != Path("."):
+                expected_directories.add(parent)
+
+    actual_files: set[Path] = set()
+    actual_directories: set[Path] = set()
+    for directory, dirnames, filenames in os.walk(runtime_dir, followlinks=False):
+        root = Path(directory)
+        relative_root = root.relative_to(runtime_dir)
+        for name in dirnames:
+            candidate = root / name
+            metadata = candidate.lstat()
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o700
+            ):
+                raise RunnerError("private runtime stage directory is unsafe")
+            actual_directories.add(relative_root / name)
+        for name in filenames:
+            candidate = root / name
+            metadata = candidate.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                raise RunnerError("private runtime stage file is unsafe")
+            actual_files.add(relative_root / name)
+
+    if actual_files != expected_files or actual_directories != expected_directories:
+        raise RunnerError("private runtime stage contains unexpected entries")
+
+    reopened_path, descriptor = _open_private_directory(runtime_dir, create_final=False)
+    try:
+        _directory_fd_matches(reopened_path, descriptor)
+        final_identity = _private_directory_identity(os.fstat(descriptor))
+    finally:
+        os.close(descriptor)
+    if final_identity != expected_identity:
+        raise RunnerError("private runtime stage changed during validation")
+
+
+def stage_mcp_proxy(
+    state_root: Path,
+    expected_code: Mapping[str, Any],
+    expected_base_code: Mapping[str, Any],
+) -> dict[str, Any]:
+    source = Path(__file__).resolve()
+    base_source = BASE_PATH.resolve(strict=True)
+    raw = _stage_code_source(
+        source, expected_code, label="Codex MCP proxy source"
+    )
+    base_raw = _stage_code_source(
+        base_source, expected_base_code, label="RepoBrief benchmark base source"
+    )
+    stage_root: Path | None = None
+    stage_fd: int | None = None
+    try:
+        stage_root, stage_fd = _create_private_stage_directory(
+            state_root / "codex-mcp-proxy-runtime", prefix="stage-"
+        )
+        _write_private_dirfd(stage_fd, source.name, raw)
+        _write_private_dirfd(stage_fd, base_source.name, base_raw)
+        _directory_fd_matches(stage_root, stage_fd)
+        staged = stage_root / source.name
+        staged_base = stage_root / base_source.name
+        bound = _bind_mcp_file(
+            staged, label="Codex MCP proxy stage", executable=False
+        )
+        bound_base = _bind_mcp_file(
+            staged_base, label="RepoBrief benchmark base stage", executable=False
+        )
         if bound["sha256"] != expected_code.get("sha256"):
             raise RunnerError("staged Codex MCP proxy SHA mismatch")
+        if bound_base["sha256"] != expected_base_code.get("sha256"):
+            raise RunnerError("staged RepoBrief benchmark base SHA mismatch")
         bound["expected_code"] = dict(expected_code)
+        bound["runtime_dir"] = stage_root
+        bound["runtime_identity"] = _private_directory_identity(os.fstat(stage_fd))
+        bound["base_path"] = bound_base["path"]
+        bound["base_identity"] = bound_base["identity"]
+        bound["base_sha256"] = bound_base["sha256"]
+        bound["expected_base_code"] = dict(expected_base_code)
         return bound
+    except BaseException:
+        if stage_fd is not None:
+            try:
+                os.close(stage_fd)
+            except OSError:
+                pass
+            stage_fd = None
+        if stage_root is not None:
+            shutil.rmtree(stage_root, ignore_errors=True)
+        raise
     finally:
-        os.close(parent_fd)
+        if stage_fd is not None:
+            os.close(stage_fd)
 
 
 def _revalidate_staged_mcp_proxy(binding: Mapping[str, Any]) -> None:
@@ -1286,23 +1812,32 @@ def _revalidate_staged_mcp_proxy(binding: Mapping[str, Any]) -> None:
     )
     if current["identity"] != binding["identity"] or current["sha256"] != binding["sha256"]:
         raise RunnerError("Codex MCP proxy stage changed during execution")
+    current_base = _bind_mcp_file(
+        Path(binding["base_path"]),
+        label="RepoBrief benchmark base stage",
+        executable=False,
+    )
+    if (
+        current_base["identity"] != binding["base_identity"]
+        or current_base["sha256"] != binding["base_sha256"]
+    ):
+        raise RunnerError("RepoBrief benchmark base stage changed during execution")
+    _revalidate_private_stage_tree(
+        binding,
+        (
+            {"path": binding["path"]},
+            {"path": binding["base_path"]},
+        ),
+    )
 
 
 def cleanup_staged_mcp_proxy(binding: Mapping[str, Any]) -> str | None:
     try:
         _revalidate_staged_mcp_proxy(binding)
-        path = Path(binding["path"])
-        parent_path, parent_fd = _open_private_directory(path.parent, create_final=False)
-        try:
-            _directory_fd_matches(parent_path, parent_fd)
-            linked = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
-            expected = binding["identity"]
-            if (linked.st_dev, linked.st_ino, linked.st_size, linked.st_mode) != expected:
-                raise RunnerError("Codex MCP proxy stage changed before cleanup")
-            os.unlink(path.name, dir_fd=parent_fd)
-            os.fsync(parent_fd)
-        finally:
-            os.close(parent_fd)
+        runtime_dir = Path(binding["runtime_dir"])
+        if Path(binding["path"]).parent != runtime_dir or Path(binding["base_path"]).parent != runtime_dir:
+            raise RunnerError("Codex MCP proxy runtime binding is inconsistent")
+        shutil.rmtree(runtime_dir)
     except BaseException as exc:
         return type(exc).__name__
     return None
@@ -1311,34 +1846,79 @@ def cleanup_staged_mcp_proxy(binding: Mapping[str, Any]) -> str | None:
 def stage_repoground_manifest(
     state_root: Path, expected_manifest: Mapping[str, Any]
 ) -> dict[str, Any]:
-    source = Path(str(expected_manifest.get("path")))
-    raw = _read_bound_regular_file(
+    source = Path(str(expected_manifest.get("path"))).expanduser()
+    current, raw = _runtime_file_snapshot(
         source, label="RepoGround manifest", max_bytes=MAX_MANIFEST_BYTES
     )
-    metadata = source.lstat()
-    current = {
-        "path": str(source.resolve(strict=True)),
-        "bytes": len(raw),
-        "sha256": sha_bytes(raw),
-        "mode": oct(metadata.st_mode & 0o777),
-    }
     if canonical(current) != canonical(dict(expected_manifest)):
         raise RunnerError("RepoGround manifest changed after preflight authorization")
-    parent_path, parent_fd = _open_private_directory(
-        state_root / "repoground-manifest-runtime"
-    )
+    artifact_paths = _manifest_artifact_paths(source, raw)
+    stage_root: Path | None = None
+    stage_fd: int | None = None
     try:
-        name = "manifest-" + sha_bytes(os.urandom(32))[:24] + ".bundle.manifest.json"
-        _write_private_dirfd(parent_fd, name, raw)
-        _directory_fd_matches(parent_path, parent_fd)
-        staged = parent_path / name
-        bound = _bind_mcp_file(staged, label="RepoGround manifest stage", executable=False)
+        stage_root, stage_fd = _create_private_stage_directory(
+            state_root / "repoground-manifest-runtime", prefix="bundle-"
+        )
+        artifact_bindings: list[dict[str, Any]] = []
+        absent_artifacts: list[Path] = []
+        for relative, candidate in artifact_paths:
+            try:
+                metadata = candidate.lstat()
+            except FileNotFoundError:
+                absent_artifacts.append(stage_root / relative)
+                continue
+            except OSError as exc:
+                raise RunnerError("RepoGround bundle artifact is unavailable") from exc
+            if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+                absent_artifacts.append(stage_root / relative)
+                continue
+            _snapshot, artifact_raw = _runtime_file_snapshot(
+                candidate,
+                label=f"RepoGround bundle artifact {relative}",
+                max_bytes=MAX_PROVIDER_EXECUTABLE_BYTES,
+            )
+            _write_private_relative_file(stage_fd, relative, artifact_raw)
+            staged_artifact = stage_root / relative
+            artifact_bound = _bind_mcp_file(
+                staged_artifact,
+                label=f"staged RepoGround bundle artifact {relative}",
+                executable=False,
+            )
+            artifact_bindings.append(
+                {
+                    "path": artifact_bound["path"],
+                    "identity": artifact_bound["identity"],
+                    "sha256": artifact_bound["sha256"],
+                }
+            )
+        manifest_name = source.resolve(strict=True).name
+        _write_private_dirfd(stage_fd, manifest_name, raw)
+        _directory_fd_matches(stage_root, stage_fd)
+        staged = stage_root / manifest_name
+        bound = _bind_mcp_file(
+            staged, label="RepoGround manifest stage", executable=False
+        )
         if bound["sha256"] != expected_manifest.get("sha256"):
             raise RunnerError("staged RepoGround manifest SHA mismatch")
         bound["expected_manifest"] = dict(expected_manifest)
+        bound["runtime_dir"] = stage_root
+        bound["runtime_identity"] = _private_directory_identity(os.fstat(stage_fd))
+        bound["artifact_bindings"] = artifact_bindings
+        bound["absent_artifacts"] = absent_artifacts
         return bound
+    except BaseException:
+        if stage_fd is not None:
+            try:
+                os.close(stage_fd)
+            except OSError:
+                pass
+            stage_fd = None
+        if stage_root is not None:
+            shutil.rmtree(stage_root, ignore_errors=True)
+        raise
     finally:
-        os.close(parent_fd)
+        if stage_fd is not None:
+            os.close(stage_fd)
 
 
 def _revalidate_staged_repoground_manifest(binding: Mapping[str, Any]) -> None:
@@ -1347,23 +1927,36 @@ def _revalidate_staged_repoground_manifest(binding: Mapping[str, Any]) -> None:
     )
     if current["identity"] != binding["identity"] or current["sha256"] != binding["sha256"]:
         raise RunnerError("RepoGround manifest stage changed during execution")
+    for artifact in binding.get("artifact_bindings", []):
+        current_artifact = _bind_mcp_file(
+            Path(artifact["path"]),
+            label="staged RepoGround bundle artifact",
+            executable=False,
+        )
+        if (
+            current_artifact["identity"] != artifact["identity"]
+            or current_artifact["sha256"] != artifact["sha256"]
+        ):
+            raise RunnerError("RepoGround bundle artifact stage changed during execution")
+    for path in binding.get("absent_artifacts", []):
+        try:
+            Path(path).lstat()
+        except FileNotFoundError:
+            continue
+        raise RunnerError("absent RepoGround bundle artifact appeared during execution")
+    _revalidate_private_stage_tree(
+        binding,
+        (binding, *binding.get("artifact_bindings", [])),
+    )
 
 
 def cleanup_staged_repoground_manifest(binding: Mapping[str, Any]) -> str | None:
     try:
         _revalidate_staged_repoground_manifest(binding)
-        path = Path(binding["path"])
-        parent_path, parent_fd = _open_private_directory(path.parent, create_final=False)
-        try:
-            _directory_fd_matches(parent_path, parent_fd)
-            linked = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
-            expected = binding["identity"]
-            if (linked.st_dev, linked.st_ino, linked.st_size, linked.st_mode) != expected:
-                raise RunnerError("RepoGround manifest stage changed before cleanup")
-            os.unlink(path.name, dir_fd=parent_fd)
-            os.fsync(parent_fd)
-        finally:
-            os.close(parent_fd)
+        runtime_dir = Path(binding["runtime_dir"])
+        if Path(binding["path"]).parent != runtime_dir:
+            raise RunnerError("RepoGround manifest runtime binding is inconsistent")
+        shutil.rmtree(runtime_dir)
     except BaseException as exc:
         return type(exc).__name__
     return None
@@ -1478,6 +2071,7 @@ def run_mcp_proxy(
     output_lock = threading.Lock()
     state_lock = threading.Lock()
     pending_requests: dict[Any, str] = {}
+    pending_treatment_tools: dict[Any, str] = {}
     tools_inventory_validated = False
     resource_calls: dict[Any, tuple[str, str | None]] = {}
     frozen_resources: dict[str, Any] | None = None
@@ -1550,6 +2144,7 @@ def run_mcp_proxy(
                         _proxy_write(_proxy_error(identifier, "benchmark MCP method is not authorized"), output_lock)
                     continue
                 pending_kind: str | None = None
+                pending_treatment_tool: str | None = None
                 if method == "initialize":
                     pending_kind = "initialize"
                 elif method == "tools/list":
@@ -1607,6 +2202,7 @@ def run_mcp_proxy(
                         continue
                     _pin_treatment_arguments(message, manifest)
                     pending_kind = "tools/call"
+                    pending_treatment_tool = str(name)
                 elif identifier is not None:
                     pending_kind = "passthrough"
                 if identifier is not None:
@@ -1614,6 +2210,8 @@ def run_mcp_proxy(
                         if identifier in pending_requests:
                             raise RunnerError("MCP client reused a pending request ID")
                         pending_requests[identifier] = pending_kind or "passthrough"
+                        if pending_treatment_tool is not None:
+                            pending_treatment_tools[identifier] = pending_treatment_tool
                 send(message)
         except BaseException as exc:
             errors.append(exc)
@@ -1659,8 +2257,16 @@ def run_mcp_proxy(
                     ):
                         raise RunnerError("MCP upstream error response is invalid")
                 elif pending_kind == "tools/call":
-                    message["result"] = _validated_treatment_tool_result(message["result"])
+                    treatment_tool = pending_treatment_tools.get(identifier)
+                    if treatment_tool not in UPSTREAM_MCP:
+                        raise RunnerError("MCP treatment tool response binding is missing")
+                    message["result"] = _validated_treatment_tool_result(
+                        message["result"],
+                        tool_name=treatment_tool,
+                        expected_manifest=manifest,
+                    )
                 pending_requests.pop(identifier, None)
+                pending_treatment_tools.pop(identifier, None)
                 resource_call = resource_calls.pop(identifier, None)
                 is_initialize = pending_kind == "initialize"
                 is_tools_list = pending_kind == "tools/list"
@@ -1723,6 +2329,9 @@ def run_mcp_proxy(
             raise RunnerError("benchmark MCP proxy stream failed") from errors[0]
         with state_lock:
             pending_kinds = tuple(pending_requests.values())
+            pending_treatment = tuple(pending_treatment_tools.values())
+        if pending_treatment:
+            raise RunnerError("MCP treatment tool response bindings remained pending at upstream EOF")
         if "tools/list" in pending_kinds or not tools_inventory_validated:
             raise RunnerError("MCP tools/list inventory was not validated before upstream EOF")
         if pending_kinds:
@@ -1810,7 +2419,7 @@ def build_command(
         upstream = [str(item) for item in request["repobrief"]["mcp_command"]]
         binding = request["repobrief"]
         proxy_args = [
-            str(proxy_path), "--codex-mcp-proxy", canonical(upstream),
+            "-B", str(proxy_path), "--codex-mcp-proxy", canonical(upstream),
             str(manifest_path), str(binding["manifest_sha256"]),
             canonical(list(authorized_mcp_files)),
         ]
@@ -2714,6 +3323,7 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
         os.close(state_fd)
     authorized_mcp_files: list[dict[str, Any]] | None = None
     authorized_proxy_code: dict[str, Any] | None = None
+    authorized_proxy_base_code: dict[str, Any] | None = None
     authorized_manifest: dict[str, Any] | None = None
     dispatch_authorization: dict[str, Any] | None = None
     if not synthetic:
@@ -2736,10 +3346,16 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
         if request["condition"] == "treatment":
             authorized_mcp_files = list(dispatch_authorization["mcp_files"])
             proxy_code = dispatch_authorization["proxy_code"]
+            proxy_base_code = dispatch_authorization["proxy_base_code"]
             manifest_authorization = dispatch_authorization["manifest"]
-            if not isinstance(proxy_code, dict) or not isinstance(manifest_authorization, dict):
+            if (
+                not isinstance(proxy_code, dict)
+                or not isinstance(proxy_base_code, dict)
+                or not isinstance(manifest_authorization, dict)
+            ):
                 raise RunnerError("treatment runtime authorization is incomplete")
             authorized_proxy_code = dict(proxy_code)
+            authorized_proxy_base_code = dict(proxy_base_code)
             authorized_manifest = dict(manifest_authorization)
 
     if dispatch_authorization is None:
@@ -2777,9 +3393,17 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
             manifest_binding: dict[str, Any] | None = None
             try:
                 if request["condition"] == "treatment":
-                    if authorized_proxy_code is None or authorized_manifest is None:
+                    if (
+                        authorized_proxy_code is None
+                        or authorized_proxy_base_code is None
+                        or authorized_manifest is None
+                    ):
                         raise RunnerError("treatment runtime authorization is incomplete")
-                    proxy_binding = stage_mcp_proxy(args.state_root, authorized_proxy_code)
+                    proxy_binding = stage_mcp_proxy(
+                        args.state_root,
+                        authorized_proxy_code,
+                        authorized_proxy_base_code,
+                    )
                     manifest_binding = stage_repoground_manifest(
                         args.state_root, authorized_manifest
                     )

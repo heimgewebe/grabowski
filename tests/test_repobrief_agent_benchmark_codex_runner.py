@@ -95,6 +95,16 @@ def file_identity(path: Path) -> dict:
     }
 
 
+def runtime_code_identity(path: Path) -> dict:
+    resolved = path.resolve(strict=True)
+    raw = resolved.read_bytes()
+    return {
+        "name": resolved.name,
+        "bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
 def write_dispatch_authorization(
     root: Path, value: dict, mcp_files: list[dict]
 ) -> Path:
@@ -1817,6 +1827,187 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             responses = [json.loads(line) for line in completed.stdout.decode().splitlines()]
             self.assertNotIn(2, {item.get("id") for item in responses})
 
+    def test_mcp_proxy_rejects_tool_specific_treatment_payload_drift(self) -> None:
+        cases = (
+            ("ask_context", {"query": "where"}),
+            ("grounding_verify", {"declaration": {}}),
+            ("live_freshness", {}),
+        )
+        for tool_name, arguments in cases:
+            with self.subTest(tool=tool_name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                upstream = root / "mcp.py"
+                upstream.write_text(
+                    "import json, sys\n"
+                    f"TOOLS = {treatment_tools()!r}\n"
+                    "for line in sys.stdin:\n"
+                    "    m=json.loads(line); method=m.get('method'); ident=m.get('id')\n"
+                    "    if method=='tools/list':\n"
+                    "        print(json.dumps({'jsonrpc':'2.0','id':ident,'result':{'tools':TOOLS}}),flush=True)\n"
+                    "    elif method=='tools/call':\n"
+                    "        print(json.dumps({'jsonrpc':'2.0','id':ident,'result':{'content':[{'type':'text','text':'ok'}],'structuredContent':{},'isError':False}}),flush=True)\n",
+                    encoding="utf-8",
+                )
+                messages = [
+                    {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}},
+                    {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool_name,"arguments":arguments}},
+                ]
+                completed = subprocess.run(
+                    proxy_command(upstream, root),
+                    input=b"".join(json.dumps(item).encode() + b"\n" for item in messages),
+                    capture_output=True, check=False, timeout=5,
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(b"is malformed", completed.stderr)
+                responses = [json.loads(line) for line in completed.stdout.decode().splitlines()]
+                self.assertNotIn(2, {item.get("id") for item in responses})
+
+    def test_treatment_result_accepts_pinned_tool_specific_payloads(self) -> None:
+        manifest = Path("/frozen/repo.bundle.manifest.json")
+        freshness = {
+            "kind": "repobrief.live_freshness",
+            "version": "v1",
+            "status": "not_comparable",
+            "reason": "repo_root_not_configured",
+            "bundle_manifest": str(manifest),
+            "repo_root": None,
+            "read_only_git_probe": False,
+            "implicit_refresh": False,
+            "does_not_establish": list(runner.EXPECTED_REPOGROUND_FRESHNESS_DOES_NOT_ESTABLISH),
+        }
+        context_pack = {
+            "kind": runner.EXPECTED_ASK_CONTEXT_PACK_KIND,
+            "version": runner.EXPECTED_ASK_CONTEXT_PACK_VERSION,
+            "request_id": "0123456789abcdef",
+            "snapshot_ref": {},
+            "freshness": {"status": "fresh"},
+            "availability": {"status": "available"},
+            "required_reading": {"status": "available"},
+            "retrieval": {},
+            "retrieval_infrastructure": {"status": "available"},
+            "retrieval_hits": [],
+            "resolved_ranges": [],
+            "answer_scaffold": {
+                "citation_obligations": [],
+                "caveats_to_surface": [],
+                "non_claims_to_surface": list(runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH),
+            },
+            "budget": {
+                "max_context_tokens": 1,
+                "token_derived_byte_ceiling": 4,
+                "max_context_bytes": 4,
+                "max_answer_tokens": 1,
+                "context_bytes_used": 0,
+                "context_unicode_characters_used": 0,
+                "approx_context_chars_used": 0,
+                "byte_budget_is_hard": True,
+                "unit": "utf8_bytes",
+                "accounting": "pinned test contract",
+                "omissions": [],
+                "truncated": False,
+                "does_not_establish_quality": True,
+            },
+            "forbidden_operations": list(runner.EXPECTED_ASK_CONTEXT_FORBIDDEN_OPERATIONS),
+            "does_not_establish": list(runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH),
+        }
+        verdict = {
+            "kind": runner.EXPECTED_GROUNDING_VERDICT_KIND,
+            "version": runner.EXPECTED_GROUNDING_VERDICT_VERSION,
+            "status": "degraded",
+            "checked_declaration": {},
+            "snapshot_ref": {},
+            "citation_checks": [],
+            "range_checks": [],
+            "required_reading_checks": [],
+            "diagnostics": [],
+            "freshness_caveats": [],
+            "availability_caveats": [],
+            "does_not_establish": list(runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH),
+        }
+        projection = {
+            "mutation_boundary": {
+                "ref": "repobrief.mutation_boundary.read_only_frontdoor.v1",
+                "writes": [],
+                "read_only": True,
+                "read_paths_do_not_refresh": True,
+                "not_reachable_from_snapshot_create": True,
+                "forbidden_operations": ["secret_read", "snapshot_create_side_effect"],
+            },
+            "does_not_establish": {
+                "ref": "repobrief.does_not_establish.default.v1",
+                "items": list(runner.EXPECTED_REPOGROUND_FRONTDOOR_DOES_NOT_ESTABLISH),
+            },
+        }
+        cases = {
+            "ask_context": {
+                "kind": runner.EXPECTED_REPOGROUND_READ_ONLY_KIND,
+                "version": runner.EXPECTED_REPOGROUND_READ_ONLY_VERSION,
+                "tool": "ask_context",
+                "status": "ok",
+                "context_pack": context_pack,
+                "request_semantics": "repobrief.ask_request.v1",
+                "context_pack_semantics": "repobrief.ask_context_pack.v1",
+                **projection,
+                "live_freshness": freshness,
+            },
+            "grounding_verify": {
+                "kind": runner.EXPECTED_REPOGROUND_READ_ONLY_KIND,
+                "version": runner.EXPECTED_REPOGROUND_READ_ONLY_VERSION,
+                "tool": "grounding_verify",
+                "status": "degraded",
+                "verdict": verdict,
+                "declaration_semantics": "repobrief.answer_grounding_declaration.v1",
+                "verdict_semantics": "repobrief.answer_grounding_verdict.v1",
+                **projection,
+                "live_freshness": freshness,
+            },
+            "live_freshness": freshness,
+        }
+        for tool_name, payload in cases.items():
+            with self.subTest(tool=tool_name):
+                result = {
+                    "content": [{"type": "text", "text": "ok"}],
+                    "structuredContent": payload,
+                    "isError": False,
+                }
+                validated = runner._validated_treatment_tool_result(
+                    result, tool_name=tool_name, expected_manifest=manifest
+                )
+                self.assertEqual(validated["structuredContent"], payload)
+
+        nested_drifts = {
+            "ask_context": "context_pack",
+            "grounding_verify": "verdict",
+        }
+        for tool_name, field in nested_drifts.items():
+            with self.subTest(tool=tool_name, drift=field):
+                payload = json.loads(json.dumps(cases[tool_name]))
+                payload[field] = {}
+                with self.assertRaises(runner.RunnerError):
+                    runner._validated_treatment_tool_result(
+                        {
+                            "content": [{"type": "text", "text": "ok"}],
+                            "structuredContent": payload,
+                            "isError": False,
+                        },
+                        tool_name=tool_name,
+                        expected_manifest=manifest,
+                    )
+
+        error = {
+            "content": [{"type": "text", "text": "error"}],
+            "structuredContent": {
+                "status": "error", "tool": "ask_context", "error": "boom"
+            },
+            "isError": True,
+        }
+        self.assertEqual(
+            runner._validated_treatment_tool_result(
+                error, tool_name="ask_context", expected_manifest=manifest
+            )["structuredContent"],
+            error["structuredContent"],
+        )
+
     def test_mcp_proxy_tracks_and_forwards_treatment_tool_responses(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1831,8 +2022,14 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "    if method=='tools/list':\n"
                 "        print(json.dumps({'jsonrpc':'2.0','id':ident,'result':{'tools':TOOLS}}),flush=True)\n"
                 "    elif method=='tools/call':\n"
-                "        SEEN.write_text(json.dumps(m.get('params',{}).get('arguments',{}), sort_keys=True))\n"
-                "        print(json.dumps({'jsonrpc':'2.0','id':ident,'result':{'content':[{'type':'text','text':'ok'}],'structuredContent':{'status':'ok'},'isError':False}}),flush=True)\n",
+                "        args=m.get('params',{}).get('arguments',{})\n"
+                "        SEEN.write_text(json.dumps(args, sort_keys=True))\n"
+                "        fresh={'kind':'repobrief.live_freshness','version':'v1','status':'not_comparable','reason':'repo_root_not_configured','bundle_manifest':args.get('bundle_manifest'),'repo_root':None,'read_only_git_probe':False,'implicit_refresh':False,'does_not_establish':['freshness_against_remote','remote_branch_state','pull_request_diff_current','runtime_correctness','repo_understood','merge_readiness']}\n"
+                "        pack={'kind':'repobrief.ask_context_pack','version':'1.0','request_id':'0123456789abcdef','snapshot_ref':{},'freshness':{'status':'fresh'},'availability':{'status':'available'},'required_reading':{'status':'available'},'retrieval':{},'retrieval_infrastructure':{'status':'available'},'retrieval_hits':[],'resolved_ranges':[],'answer_scaffold':{'citation_obligations':[],'caveats_to_surface':[],'non_claims_to_surface':['actual_reading_proven','answer_correct','repo_understood','all_relevant_context_used','claims_true','test_sufficiency','regression_absence','runtime_behavior','forensic_ready','merge_readiness','security_correctness']},'budget':{'max_context_tokens':1,'token_derived_byte_ceiling':4,'max_context_bytes':4,'max_answer_tokens':1,'context_bytes_used':0,'context_unicode_characters_used':0,'approx_context_chars_used':0,'byte_budget_is_hard':True,'unit':'utf8_bytes','accounting':'pinned test contract','omissions':[],'truncated':False,'does_not_establish_quality':True},'forbidden_operations':['implicit_refresh','git_mutation','snapshot_creation_on_read','patch_application','pull_request_mutation','shell_execution','merge_authorization'],'does_not_establish':['actual_reading_proven','answer_correct','repo_understood','all_relevant_context_used','claims_true','test_sufficiency','regression_absence','runtime_behavior','forensic_ready','merge_readiness','security_correctness']}\n"
+                "        boundary={'ref':'repobrief.mutation_boundary.read_only_frontdoor.v1','writes':[],'read_only':True,'read_paths_do_not_refresh':True,'not_reachable_from_snapshot_create':True,'forbidden_operations':['secret_read','snapshot_create_side_effect']}\n"
+                "        nonclaims={'ref':'repobrief.does_not_establish.default.v1','items':['truth','correctness','completeness','runtime_behavior','test_sufficiency','regression_absence','repo_understood','claims_true','forensic_ready','review_complete','pr_mergeable','mcp_server_available']}\n"
+                "        payload={'kind':'repobrief.mcp.read_only_frontdoor','version':'v1','tool':'ask_context','status':'ok','context_pack':pack,'request_semantics':'repobrief.ask_request.v1','context_pack_semantics':'repobrief.ask_context_pack.v1','mutation_boundary':boundary,'does_not_establish':nonclaims,'live_freshness':fresh}\n"
+                "        print(json.dumps({'jsonrpc':'2.0','id':ident,'result':{'content':[{'type':'text','text':'ok'}],'structuredContent':payload,'isError':False}}),flush=True)\n",
                 encoding="utf-8",
             )
             messages = [
@@ -1903,13 +2100,43 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             source = root / MODULE_PATH.name; source.write_bytes(MODULE_PATH.read_bytes())
             expected = {"name": source.name, "bytes": source.stat().st_size, "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
             with patch.object(runner, "__file__", str(source)):
-                binding = runner.stage_mcp_proxy(state_root, expected)
+                binding = runner.stage_mcp_proxy(
+                    state_root, expected, runtime_code_identity(runner.BASE_PATH)
+                )
             staged = Path(binding["path"]); original = staged.read_bytes()
             source.write_text("# replaced source\n", encoding="utf-8")
             self.assertEqual(staged.read_bytes(), original)
             runner._revalidate_staged_mcp_proxy(binding)
             self.assertIsNone(runner.cleanup_staged_mcp_proxy(binding))
             self.assertFalse(staged.exists())
+
+    def test_staged_proxy_contains_authorized_base_and_starts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "state"
+            state_root.mkdir(mode=0o700)
+            binding = runner.stage_mcp_proxy(
+                state_root,
+                runtime_code_identity(MODULE_PATH),
+                runtime_code_identity(runner.BASE_PATH),
+            )
+            staged = Path(binding["path"])
+            self.assertEqual(staged.name, MODULE_PATH.name)
+            self.assertTrue(staged.with_name(runner.BASE_PATH.name).is_file())
+            completed = subprocess.run(
+                [sys.executable, "-B", str(staged), "--help"],
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            self.assertEqual(
+                completed.returncode,
+                0,
+                completed.stderr.decode("utf-8", errors="replace"),
+            )
+            self.assertFalse((staged.parent / "__pycache__").exists())
+            self.assertIsNone(runner.cleanup_staged_mcp_proxy(binding))
+            self.assertFalse(staged.parent.exists())
 
     def test_staged_proxy_mutation_fails_closed_and_is_retained(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1918,7 +2145,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             source = root / MODULE_PATH.name; source.write_bytes(MODULE_PATH.read_bytes())
             expected = {"name": source.name, "bytes": source.stat().st_size, "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
             with patch.object(runner, "__file__", str(source)):
-                binding = runner.stage_mcp_proxy(state_root, expected)
+                binding = runner.stage_mcp_proxy(
+                    state_root, expected, runtime_code_identity(runner.BASE_PATH)
+                )
             staged = Path(binding["path"]); staged.write_text("# mutated stage\n", encoding="utf-8")
             with self.assertRaisesRegex(runner.RunnerError, "proxy stage changed during execution"):
                 runner._revalidate_staged_mcp_proxy(binding)
@@ -1932,7 +2161,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             source = root / MODULE_PATH.name; source.write_bytes(MODULE_PATH.read_bytes())
             expected = {"name": source.name, "bytes": source.stat().st_size, "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
             with patch.object(runner, "__file__", str(source)):
-                binding = runner.stage_mcp_proxy(state_root, expected)
+                binding = runner.stage_mcp_proxy(
+                    state_root, expected, runtime_code_identity(runner.BASE_PATH)
+                )
             source.write_text("# replaced after staging\n", encoding="utf-8")
             checkout = root / "repo"; checkout.mkdir()
             schema = root / "schema.json"
@@ -1945,9 +2176,25 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 manifest_path=staged_manifest.resolve(),
             )
             encoded = next(item for item in command if item.startswith("mcp_servers.repobrief.args="))
-            self.assertIn(str(binding["path"]), encoded)
+            proxy_args = json.loads(encoded.split("=", 1)[1])
+            self.assertEqual(proxy_args[:2], ["-B", str(binding["path"])])
             self.assertNotIn(str(source), encoded)
             self.assertIsNone(runner.cleanup_staged_mcp_proxy(binding))
+
+    def test_staged_proxy_cleanup_rejects_unexpected_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "state"
+            state_root.mkdir(mode=0o700)
+            binding = runner.stage_mcp_proxy(
+                state_root,
+                runtime_code_identity(MODULE_PATH),
+                runtime_code_identity(runner.BASE_PATH),
+            )
+            unexpected = Path(binding["runtime_dir"]) / "unexpected.txt"
+            unexpected.write_text("unexpected\n", encoding="utf-8")
+            self.assertEqual(runner.cleanup_staged_mcp_proxy(binding), "RunnerError")
+            self.assertTrue(unexpected.exists())
 
 
     def test_codex_executable_must_match_preflight_provider_binding(self) -> None:
@@ -2017,6 +2264,50 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             runner._revalidate_staged_repoground_manifest(binding)
             self.assertIsNone(runner.cleanup_staged_repoground_manifest(binding))
             self.assertFalse(staged.exists())
+
+    def test_staged_manifest_preserves_relative_artifact_context(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "state"
+            state_root.mkdir(mode=0o700)
+            bundle = root / "bundle"
+            (bundle / "nested").mkdir(parents=True)
+            artifact = bundle / "nested" / "brief.md"
+            artifact.write_text("authorized artifact\n", encoding="utf-8")
+            manifest = bundle / "chosen.bundle.manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "artifacts": [
+                            {
+                                "role": "canonical_md",
+                                "path": "nested/brief.md",
+                            }
+                        ]
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            binding = runner.stage_repoground_manifest(
+                state_root, file_identity(manifest)
+            )
+            staged = Path(binding["path"])
+            staged_artifact = staged.parent / "nested" / "brief.md"
+            self.assertEqual(staged.name, manifest.name)
+            self.assertEqual(
+                staged_artifact.read_text(encoding="utf-8"),
+                "authorized artifact\n",
+            )
+            artifact.write_text("drifted original\n", encoding="utf-8")
+            self.assertEqual(
+                staged_artifact.read_text(encoding="utf-8"),
+                "authorized artifact\n",
+            )
+            runner._revalidate_staged_repoground_manifest(binding)
+            self.assertIsNone(runner.cleanup_staged_repoground_manifest(binding))
+            self.assertFalse(staged.parent.exists())
 
     def test_preflight_authorization_rejects_legacy_projected_request_hash(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
