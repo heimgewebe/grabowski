@@ -8744,6 +8744,20 @@ class GripFoundationTests(unittest.TestCase):
         )
         operator.grabowski_git.assert_called_once()
 
+    def test_remote_head_materialize_replay_rejects_non_ancestor_local_preimage(
+        self,
+    ) -> None:
+        fake = FakeRemoteMaterializeGit(head="b" * 40, fast_forward=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            result, fake, operator = self._run_remote_materialize_case(
+                tmp, fake_git=fake
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("non-fast-forward", result["output"]["error"])
+        self.assertFalse(any("fetch" in call for call in fake.calls))
+        operator.grabowski_git.assert_not_called()
+
     def test_remote_head_materialize_replays_without_fetch_when_head_is_already_exact(
         self,
     ) -> None:
