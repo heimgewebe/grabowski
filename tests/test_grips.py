@@ -8403,6 +8403,7 @@ class GripFoundationTests(unittest.TestCase):
         fake_git: FakeRemoteMaterializeGit | None = None,
         missing_lease: bool = False,
         lease_reads: list[object] | None = None,
+        read_state_reads: list[object] | None = None,
         locked_terminal: bool = False,
         locked_terminal_after_initial: bool = False,
     ) -> tuple[dict[str, object], FakeRemoteMaterializeGit, types.ModuleType]:
@@ -8444,7 +8445,9 @@ class GripFoundationTests(unittest.TestCase):
         if locked_terminal:
             locked_record["terminal_closeout"] = {"state": "terminal"}
         read_state = Mock(return_value=locked_record)
-        if locked_terminal_after_initial:
+        if read_state_reads is not None:
+            read_state.side_effect = read_state_reads
+        elif locked_terminal_after_initial:
             read_state.side_effect = [
                 locked_record,
                 {**locked_record, "terminal_closeout": {"state": "terminal"}},
@@ -8582,6 +8585,32 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("a" * 40, fake.head)
         operator.grabowski_git.assert_not_called()
 
+    def test_remote_head_materialize_receipts_locked_lane_read_failure_after_object_import(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            git, _operator, lane_inputs, _leases = self._remote_materialize_lane_case(tmp)
+            ready = {
+                "lane_id": "1" * 32,
+                "state": "ready",
+                "inputs": lane_inputs,
+            }
+            result, fake, operator = self._run_remote_materialize_case(
+                tmp,
+                fake_git=git,
+                read_state_reads=[
+                    ready,
+                    RuntimeError("work-lane receipt integrity mismatch"),
+                ],
+            )
+
+        self.assertEqual("failed", result["receipt"]["status"])
+        self.assertEqual("action", result["receipt"]["phase"])
+        self.assertIn("durable Work Lane", result["output"]["error"])
+        self.assertTrue(any("fetch" in call for call in fake.calls))
+        self.assertEqual("a" * 40, fake.head)
+        operator.grabowski_git.assert_not_called()
+
     def test_remote_head_materialize_rejects_shallow_repository_before_fetch(
         self,
     ) -> None:
@@ -8611,6 +8640,34 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("blocked", result["receipt"]["status"])
         self.assertIn("effective SSH remote", result["output"]["error"])
         self.assertFalse(any("fetch" in call for call in fake.calls))
+        operator.grabowski_git.assert_not_called()
+
+    def test_remote_head_materialize_rejects_chained_rewrite_of_validated_url(
+        self,
+    ) -> None:
+        fake = FakeRemoteMaterializeGit(
+            configured_urls=["https://github.com/heimgewebe/grabowski.git"],
+            effective_fetch_urls=["git@github.com:heimgewebe/grabowski.git"],
+        )
+        fake.push_config_entries = [
+            ("url.git@evil.example:.insteadof", "git@github.com:"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            result, fake, operator = self._run_remote_materialize_case(
+                tmp, fake_git=fake
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("preflight", result["receipt"]["phase"])
+        self.assertIn("chained URL rewrite", result["output"]["error"])
+        self.assertIn(
+            ("config", "--get-regexp", r"^url\..*\.insteadof$"),
+            fake.calls,
+        )
+        self.assertFalse(any("fetch" in call for call in fake.calls))
+        self.assertFalse(
+            any(call[:2] == ("ls-remote", "--exit-code") for call in fake.calls)
+        )
         operator.grabowski_git.assert_not_called()
 
     def test_remote_head_materialize_pins_network_effects_to_validated_effective_url(
@@ -8652,6 +8709,30 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("blocked", result["receipt"]["status"])
         self.assertIn("expected_remote_head", result["output"]["error"])
         self.assertFalse(any("fetch" in call for call in fake.calls))
+        operator.grabowski_git.assert_not_called()
+
+    def test_remote_head_materialize_classifies_malformed_post_fetch_readback_as_action_failure(
+        self,
+    ) -> None:
+        valid = "b" * 40
+        malformed = (
+            valid
+            + "\trefs/heads/fix/pr-head\n"
+            + "c" * 40
+        )
+        fake = FakeRemoteMaterializeGit(
+            remote_head=valid,
+            remote_heads=[valid, malformed],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            result, fake, operator = self._run_remote_materialize_case(
+                tmp, fake_git=fake
+            )
+
+        self.assertEqual("failed", result["receipt"]["status"])
+        self.assertEqual("action", result["receipt"]["phase"])
+        self.assertIn("exactly one advertised remote branch", result["output"]["error"])
+        self.assertTrue(any("fetch" in call for call in fake.calls))
         operator.grabowski_git.assert_not_called()
 
     def test_remote_head_materialize_rejects_non_fast_forward_after_object_import(

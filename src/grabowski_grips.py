@@ -6373,6 +6373,41 @@ def _validate_remote_materialization_target(
         raise GripPreflightError(
             "remote-head-materialize requires exactly one configured and effective remote URL"
         )
+    rewrite_config = _git_optional(
+        repo,
+        runner,
+        ["config", "--get-regexp", r"^url\..*\.insteadof$"],
+    )
+    rewrite_returncode = int(rewrite_config.get("returncode", 1))
+    if rewrite_returncode not in {0, 1}:
+        _check(receipt, "fetch_remote_target", "fail", "url_rewrite_query_failed")
+        raise GripPreflightError(
+            "remote-head-materialize could not verify URL rewrite configuration"
+        )
+    effective_url = effective_urls[0]
+    if rewrite_returncode == 0:
+        for line in str(rewrite_config.get("stdout", "")).splitlines():
+            parts = line.split(maxsplit=1)
+            if len(parts) != 2 or not parts[1]:
+                _check(
+                    receipt,
+                    "fetch_remote_target",
+                    "fail",
+                    "malformed_url_rewrite_configuration",
+                )
+                raise GripPreflightError(
+                    "remote-head-materialize found malformed URL rewrite configuration"
+                )
+            if effective_url.startswith(parts[1]):
+                _check(
+                    receipt,
+                    "fetch_remote_target",
+                    "fail",
+                    "chained_url_rewrite",
+                )
+                raise GripPreflightError(
+                    "remote-head-materialize refuses a chained URL rewrite of the validated network target"
+                )
     configured_identity = _remote_target_identity(configured_urls[0])
     effective_identity = _remote_target_identity(effective_urls[0])
     if configured_identity is None or effective_identity is None:
@@ -6416,15 +6451,18 @@ def _remote_materialization_head(
     runner: CommandRunner,
     check_id: str,
     expected_head: str,
+    *,
+    effect_started: bool = False,
 ) -> str:
     ref = f"refs/heads/{branch}"
     result = _git(repo, runner, ["ls-remote", "--exit-code", remote, ref])
     lines = [
         line for line in str(result.get("stdout", "")).splitlines() if line.strip()
     ]
+    failure = GripActionError if effect_started else GripPreflightError
     if len(lines) != 1:
         _check(receipt, check_id, "fail", f"match_count={len(lines)}")
-        raise GripPreflightError(
+        raise failure(
             "remote-head-materialize requires exactly one advertised remote branch"
         )
     parts = lines[0].split()
@@ -6436,7 +6474,7 @@ def _remote_materialization_head(
         or advertised_ref != ref
     ):
         _check(receipt, check_id, "fail", "malformed_remote_readback")
-        raise GripPreflightError(
+        raise failure(
             "remote-head-materialize could not bind the advertised remote head"
         )
     _check(receipt, check_id, "pass", head)
@@ -6567,7 +6605,17 @@ def _run_remote_head_materialize(
         *,
         effect_started: bool = False,
     ) -> None:
-        locked_record = work_acquire._read_state(lane_receipt_path)
+        try:
+            locked_record = work_acquire._read_state(lane_receipt_path)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            _check(receipt, check_id, "fail", f"read_error={type(exc).__name__}")
+            message = (
+                "remote-head-materialize could not verify the durable Work Lane "
+                "during locked materialization validation"
+            )
+            if effect_started:
+                raise GripActionError(message) from exc
+            raise GripPreflightError(message) from exc
         locked_inputs = (
             locked_record.get("inputs")
             if isinstance(locked_record, dict)
@@ -6745,6 +6793,7 @@ def _run_remote_head_materialize(
             runner,
             "remote_head_after_import",
             expected_remote_head,
+            effect_started=True,
         )
         != expected_remote_head
     ):
@@ -6778,6 +6827,7 @@ def _run_remote_head_materialize(
             runner,
             "remote_head_after",
             expected_remote_head,
+            effect_started=True,
         )
         if remote_after != expected_remote_head:
             raise GripActionError(
