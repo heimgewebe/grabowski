@@ -188,6 +188,11 @@ MAX_PROVIDER_EXECUTABLE_BYTES = 512 * 1024 * 1024
 MAX_AUTH_BYTES = 64 * 1024
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_DISPATCH_AUTHORIZATION_BYTES = 16 * 1024 * 1024
+MAX_PREFLIGHT_REPORT_BYTES = 16 * 1024 * 1024
+MAX_PREFLIGHT_REPORT_DIGEST_BYTES = 512
+PREFLIGHT_AUTHORIZATION_REPORT_KIND = (
+    "repobrief.agent_benchmark_preflight_dispatch_authorization"
+)
 PREFLIGHT_LEDGER_KIND = "repobrief.agent_benchmark_preflight_dispatch_ledger"
 PREFLIGHT_LEDGER_VERSION = "1.0"
 PERMISSION_PROFILE = "rab-benchmark"
@@ -1640,6 +1645,111 @@ def _assert_authorized_runtime_binding(
     return repository_map_bytes
 
 
+def _preflight_report_evidence_projection(
+    report: Mapping[str, Any],
+) -> dict[str, Any]:
+    projected = json.loads(canonical(report))
+    ledger = projected.get("dispatch_ledger")
+    if not isinstance(ledger, dict):
+        raise RunnerError("preflight report ledger is invalid")
+    ledger["authorization_sha256"] = None
+    return projected
+
+
+def _assert_preflight_report_evidence(
+    authorization: Mapping[str, Any],
+    binding: Mapping[str, Any],
+    authorization_path: Path,
+) -> None:
+    report_evidence_sha256 = authorization.get("report_evidence_sha256")
+    if (
+        not isinstance(report_evidence_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", report_evidence_sha256) is None
+    ):
+        raise RunnerError("preflight dispatch authorization report binding is invalid")
+
+    report_text = binding.get("report_out")
+    digest_text = binding.get("report_digest_out")
+    if not isinstance(report_text, str) or not isinstance(digest_text, str):
+        raise RunnerError("preflight report binding is unavailable")
+    report_path = Path(report_text)
+    digest_path = Path(digest_text)
+    if (
+        not report_path.is_absolute()
+        or not digest_path.is_absolute()
+        or digest_path != Path(str(report_path) + ".sha256")
+    ):
+        raise RunnerError("preflight report binding is invalid")
+
+    report_raw = _read_bound_regular_file(
+        report_path,
+        label="preflight report",
+        max_bytes=MAX_PREFLIGHT_REPORT_BYTES,
+    )
+    digest_raw = _read_bound_regular_file(
+        digest_path,
+        label="preflight report digest",
+        max_bytes=MAX_PREFLIGHT_REPORT_DIGEST_BYTES,
+    )
+    for candidate, label in (
+        (report_path, "preflight report"),
+        (digest_path, "preflight report digest"),
+    ):
+        try:
+            metadata = candidate.lstat()
+        except OSError as exc:
+            raise RunnerError(f"{label} disappeared") from exc
+        if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
+            raise RunnerError(f"{label} permissions are unsafe")
+
+    expected_digest = (
+        f"{sha_bytes(report_raw)}  {report_path.name}\n".encode("ascii")
+    )
+    if not hmac.compare_digest(digest_raw, expected_digest):
+        raise RunnerError("preflight report digest mismatch")
+
+    report = base._load_object_bytes(report_raw, label="preflight report")
+    ledger = report.get("dispatch_ledger")
+    requests = binding.get("requests")
+    expected_request_sha256 = (
+        {
+            condition: value.get("sha256")
+            for condition, value in requests.items()
+        }
+        if isinstance(requests, dict)
+        and set(requests) == {"baseline", "treatment"}
+        and all(isinstance(value, dict) for value in requests.values())
+        else None
+    )
+    snapshot = report.get("snapshot")
+    authorization_sha256 = base._sha256_json(authorization)
+    if (
+        report.get("kind") != PREFLIGHT_AUTHORIZATION_REPORT_KIND
+        or report.get("version") != "1.0"
+        or report.get("status") != "authorized"
+        or report.get("pair_id") != binding.get("pair_id")
+        or report.get("synthetic_fixture") is not False
+        or report.get("default_promoted") is not False
+        or expected_request_sha256 is None
+        or report.get("request_sha256") != expected_request_sha256
+        or canonical(report.get("provider")) != canonical(binding.get("provider"))
+        or not isinstance(snapshot, dict)
+        or snapshot.get("status") != "fresh"
+        or not isinstance(ledger, dict)
+        or ledger.get("authorization") != str(authorization_path)
+        or ledger.get("authorization_sha256") != authorization_sha256
+        or ledger.get("contract_sha256") != authorization.get("contract_sha256")
+        or ledger.get("retry_permitted") is not False
+    ):
+        raise RunnerError("preflight report does not prove this dispatch authorization")
+
+    actual_evidence_sha256 = base._sha256_json(
+        _preflight_report_evidence_projection(report)
+    )
+    if not hmac.compare_digest(actual_evidence_sha256, report_evidence_sha256):
+        raise RunnerError("preflight report evidence binding mismatch")
+
+
 def _load_preflight_dispatch_authorization(
     request: Mapping[str, Any],
     state_root: Path,
@@ -1697,6 +1807,8 @@ def _load_preflight_dispatch_authorization(
         raise RunnerError(
             f"preflight dispatch authorization does not bind this {condition} request"
         )
+
+    _assert_preflight_report_evidence(authorization, binding, authorization_path)
 
     repository_map_bytes: bytes | None = None
     if runtime_binding is not None:

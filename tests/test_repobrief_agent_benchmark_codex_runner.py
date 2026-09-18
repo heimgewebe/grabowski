@@ -117,15 +117,27 @@ def write_dispatch_authorization(
     pair_root = ledger_root / pair_digest
     pair_root.mkdir(mode=0o700)
     manifest = Path(value["repobrief"]["manifest"])
+    baseline = request(
+        condition="baseline",
+        commit=value["repository"]["commit"],
+    )
+    report_out = root / "preflight-report.json"
+    digest_out = Path(str(report_out) + ".sha256")
     binding = {
         "pair_id": value["pair_id"],
         "requests": {
+            "baseline": {
+                "request_id": baseline["request_id"],
+                "sha256": runner.base._sha256_json(baseline),
+            },
             "treatment": {
                 "request_id": value["request_id"],
                 "sha256": runner.base._sha256_json(value),
-            }
+            },
         },
         "state_root": str(state_root.resolve()),
+        "report_out": str(report_out.resolve()),
+        "report_digest_out": str(digest_out.resolve()),
         "manifest": file_identity(manifest),
         "mcp_command_sha256": runner.base._sha256_json(
             value["repobrief"]["mcp_command"]
@@ -135,7 +147,9 @@ def write_dispatch_authorization(
             "codex": {
                 "path": str(Path(sys.executable).resolve()),
                 "bytes": Path(sys.executable).resolve().stat().st_size,
-                "sha256": hashlib.sha256(Path(sys.executable).resolve().read_bytes()).hexdigest(),
+                "sha256": hashlib.sha256(
+                    Path(sys.executable).resolve().read_bytes()
+                ).hexdigest(),
             },
             "authentication": {
                 "mode": "chatgpt_subscription",
@@ -156,14 +170,18 @@ def write_dispatch_authorization(
     for name in runner._AUTHORIZED_RUNTIME_CODE_NAMES:
         code_path = runner._runtime_code_path(name)
         code_raw = code_path.read_bytes()
-        code_files.append({
-            "name": name, "bytes": len(code_raw),
-            "sha256": hashlib.sha256(code_raw).hexdigest(),
-        })
+        code_files.append(
+            {
+                "name": name,
+                "bytes": len(code_raw),
+                "sha256": hashlib.sha256(code_raw).hexdigest(),
+            }
+        )
     binding["code"] = {
         "files": code_files,
         "bundle_sha256": runner.base._sha256_json(code_files),
     }
+
     authorization = {
         "kind": runner.PREFLIGHT_LEDGER_KIND,
         "version": runner.PREFLIGHT_LEDGER_VERSION,
@@ -173,6 +191,57 @@ def write_dispatch_authorization(
         "retry_permitted": False,
     }
     path = pair_root / "authorization.json"
+    report = {
+        "kind": runner.PREFLIGHT_AUTHORIZATION_REPORT_KIND,
+        "version": "1.0",
+        "status": "authorized",
+        "pair_id": value["pair_id"],
+        "synthetic_fixture": False,
+        "dispatch_ledger": {
+            "root": str(pair_root),
+            "authorization": str(path),
+            "authorization_sha256": None,
+            "contract_sha256": authorization["contract_sha256"],
+            "event_count": 1,
+            "final_event_sha256": "f" * 64,
+            "condition_intents": [],
+            "provider_process_intents": 0,
+            "fixture_intents": 0,
+            "observed_costs": {},
+            "retry_permitted": False,
+        },
+        "request_sha256": {
+            "baseline": runner.base._sha256_json(baseline),
+            "treatment": runner.base._sha256_json(value),
+        },
+        "snapshot": {"status": "fresh"},
+        "source_before": {"head": value["repository"]["commit"]},
+        "source_after": {"head": value["repository"]["commit"]},
+        "timings": {
+            "snapshot_preparation_ms": 1,
+            "freshness_check_ms": 1,
+        },
+        "provider": binding["provider"],
+        "default_promoted": False,
+        "does_not_establish": [],
+    }
+    authorization["report_evidence_sha256"] = runner.base._sha256_json(
+        runner._preflight_report_evidence_projection(report)
+    )
+    report["dispatch_ledger"]["authorization_sha256"] = (
+        runner.base._sha256_json(authorization)
+    )
+
+    report_bytes = (
+        json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    report_out.write_bytes(report_bytes)
+    report_out.chmod(0o600)
+    digest_out.write_text(
+        f"{hashlib.sha256(report_bytes).hexdigest()}  {report_out.name}\n",
+        encoding="ascii",
+    )
+    digest_out.chmod(0o600)
     path.write_text(json.dumps(authorization, sort_keys=True), encoding="utf-8")
     path.chmod(0o600)
     return state_root

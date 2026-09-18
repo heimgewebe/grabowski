@@ -1695,6 +1695,22 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
             authorization_path = Path(report["dispatch_ledger"]["authorization"])
             authorization = json.loads(authorization_path.read_text(encoding="utf-8"))
             binding = authorization["binding"]
+            report_from_disk = json.loads(report_out.read_text(encoding="utf-8"))
+            self.assertRegex(
+                authorization["report_evidence_sha256"], r"^[0-9a-f]{64}$"
+            )
+            self.assertEqual(
+                authorization["report_evidence_sha256"],
+                codex_preflight.core._sha256_json(
+                    codex_preflight.core._dispatch_report_evidence_projection(
+                        report_from_disk
+                    )
+                ),
+            )
+            self.assertEqual(
+                report_from_disk["dispatch_ledger"]["authorization_sha256"],
+                codex_runner.base._sha256_json(authorization),
+            )
             self.assertEqual(
                 binding["requests"]["treatment"]["sha256"],
                 codex_runner.base._sha256_json(treatment),
@@ -1785,6 +1801,104 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
                     )
             finally:
                 environment["repository_map"].write_bytes(original_map)
+
+            report_bytes = report_out.read_bytes()
+            digest_path = Path(str(report_out) + ".sha256")
+            digest_bytes = digest_path.read_bytes()
+
+            report_out.unlink()
+            try:
+                with self.assertRaisesRegex(
+                    codex_runner.RunnerError, "preflight report is unavailable"
+                ):
+                    codex_runner._load_preflight_dispatch_authorization(
+                        baseline, state_root, runtime_binding=runtime_binding
+                    )
+            finally:
+                report_out.write_bytes(report_bytes)
+                report_out.chmod(0o600)
+
+            digest_path.unlink()
+            try:
+                with self.assertRaisesRegex(
+                    codex_runner.RunnerError,
+                    "preflight report digest is unavailable",
+                ):
+                    codex_runner._load_preflight_dispatch_authorization(
+                        baseline, state_root, runtime_binding=runtime_binding
+                    )
+            finally:
+                digest_path.write_bytes(digest_bytes)
+                digest_path.chmod(0o600)
+
+            stale_report = json.loads(report_bytes)
+            stale_report["snapshot"]["status"] = "stale"
+            stale_bytes = (
+                json.dumps(stale_report, ensure_ascii=False, indent=2, sort_keys=True)
+                + "\n"
+            ).encode("utf-8")
+            report_out.write_bytes(stale_bytes)
+            digest_path.write_text(
+                f"{hashlib.sha256(stale_bytes).hexdigest()}  {report_out.name}\n",
+                encoding="ascii",
+            )
+            try:
+                with self.assertRaisesRegex(
+                    codex_runner.RunnerError,
+                    "preflight report does not prove this dispatch authorization",
+                ):
+                    codex_runner._load_preflight_dispatch_authorization(
+                        baseline, state_root, runtime_binding=runtime_binding
+                    )
+            finally:
+                report_out.write_bytes(report_bytes)
+                digest_path.write_bytes(digest_bytes)
+
+            rebound_report = json.loads(report_bytes)
+            rebound_report["dispatch_ledger"]["authorization_sha256"] = "0" * 64
+            rebound_bytes = (
+                json.dumps(rebound_report, ensure_ascii=False, indent=2, sort_keys=True)
+                + "\n"
+            ).encode("utf-8")
+            report_out.write_bytes(rebound_bytes)
+            digest_path.write_text(
+                f"{hashlib.sha256(rebound_bytes).hexdigest()}  {report_out.name}\n",
+                encoding="ascii",
+            )
+            try:
+                with self.assertRaisesRegex(
+                    codex_runner.RunnerError,
+                    "preflight report does not prove this dispatch authorization",
+                ):
+                    codex_runner._load_preflight_dispatch_authorization(
+                        baseline, state_root, runtime_binding=runtime_binding
+                    )
+            finally:
+                report_out.write_bytes(report_bytes)
+                digest_path.write_bytes(digest_bytes)
+
+            forged_report = json.loads(report_bytes)
+            forged_report["timings"]["freshness_check_ms"] += 1
+            forged_bytes = (
+                json.dumps(forged_report, ensure_ascii=False, indent=2, sort_keys=True)
+                + "\n"
+            ).encode("utf-8")
+            report_out.write_bytes(forged_bytes)
+            digest_path.write_text(
+                f"{hashlib.sha256(forged_bytes).hexdigest()}  {report_out.name}\n",
+                encoding="ascii",
+            )
+            try:
+                with self.assertRaisesRegex(
+                    codex_runner.RunnerError,
+                    "preflight report evidence binding mismatch",
+                ):
+                    codex_runner._load_preflight_dispatch_authorization(
+                        baseline, state_root, runtime_binding=runtime_binding
+                    )
+            finally:
+                report_out.write_bytes(report_bytes)
+                digest_path.write_bytes(digest_bytes)
 
             hidden = authorization_path.with_name("authorization.hidden")
             authorization_path.rename(hidden)

@@ -820,6 +820,32 @@ def _dispatch_ledger_report_after_publication(
     return report
 
 
+def _dispatch_report_evidence_projection(
+    report: Mapping[str, Any],
+) -> dict[str, Any]:
+    projected = json.loads(_canonical_json(report))
+    ledger = projected.get("dispatch_ledger")
+    if not isinstance(ledger, dict):
+        raise PreflightError("dispatch report ledger is invalid")
+    ledger["authorization_sha256"] = None
+    return projected
+
+
+def _bind_dispatch_report_evidence(
+    publication: dict[str, Any],
+    report: dict[str, Any],
+) -> None:
+    authorization = publication.get("authorization")
+    ledger = report.get("dispatch_ledger")
+    if not isinstance(authorization, dict) or not isinstance(ledger, dict):
+        raise PreflightError("dispatch report evidence binding is invalid")
+    authorization["report_evidence_sha256"] = _sha256_json(
+        _dispatch_report_evidence_projection(report)
+    )
+    publication["authorization_sha256"] = _sha256_json(authorization)
+    ledger["authorization_sha256"] = publication["authorization_sha256"]
+
+
 def _publish_dispatch_authorization(
     ledger: dict[str, Any],
     binding: Mapping[str, Any],
@@ -1765,6 +1791,7 @@ def authorize_dispatch(
             "default_promoted": False,
             "does_not_establish": list(DOES_NOT_ESTABLISH),
         }
+        _bind_dispatch_report_evidence(publication, report)
 
         # Durable producer evidence must exist before the capability becomes
         # consumable.  A report/digest failure therefore leaves no authorization.
