@@ -2012,10 +2012,8 @@ def _manifest_artifact_paths(
     seen: set[Path] = set()
     for artifact in artifacts:
         if not isinstance(artifact, dict):
-            continue
+            raise RunnerError("RepoGround manifest artifact entry is invalid")
         raw_path = artifact.get("path")
-        if raw_path is None:
-            continue
         if not isinstance(raw_path, str) or not raw_path:
             raise RunnerError("RepoGround manifest artifact path is invalid")
         expected_bytes = artifact.get("bytes")
@@ -3602,16 +3600,16 @@ def normalize(
             result_value = item.get("result")
             output_value = result_value if result_value is not None else item.get("error")
             output_bytes = len(canonical(output_value).encode("utf-8"))
-            result_is_error = (
+            result_is_success = (
                 isinstance(result_value, dict)
-                and result_value.get("isError") is True
+                and result_value.get("isError") is False
             )
             status = (
                 "success"
                 if (
                     item.get("status") == "completed"
                     and item.get("error") is None
-                    and not result_is_error
+                    and result_is_success
                 )
                 else "failed"
             )

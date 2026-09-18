@@ -2304,34 +2304,43 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertEqual(calls[0]["status"], "success")
         self.assertEqual(normalized_answer, answer())
 
-    def test_normalize_rejects_iserror_only_treatment_call(self) -> None:
-        value = request(condition="treatment")
-        events = [json.loads(line) for line in stream(value).splitlines()]
-        command_event = next(
-            event
-            for event in events
-            if event.get("type") == "item.completed"
-            and isinstance(event.get("item"), dict)
-            and event["item"].get("type") == "command_execution"
-        )
-        command_event["item"] = {
-            "type": "mcp_tool_call",
-            "server": "repobrief",
-            "tool": "live_freshness",
-            "arguments": {"bundle_manifest": "/bundles/repo.bundle.manifest.json"},
-            "result": {
+    def test_normalize_requires_explicit_nonerror_treatment_result(self) -> None:
+        cases = (
+            {
                 "content": [{"type": "text", "text": "failed"}],
                 "structuredContent": {"status": "error"},
                 "isError": True,
             },
-            "status": "completed",
-        }
+            {},
+            "malformed-result",
+        )
+        for result in cases:
+            with self.subTest(result=result):
+                value = request(condition="treatment")
+                events = [json.loads(line) for line in stream(value).splitlines()]
+                command_event = next(
+                    event
+                    for event in events
+                    if event.get("type") == "item.completed"
+                    and isinstance(event.get("item"), dict)
+                    and event["item"].get("type") == "command_execution"
+                )
+                command_event["item"] = {
+                    "type": "mcp_tool_call",
+                    "server": "repobrief",
+                    "tool": "live_freshness",
+                    "arguments": {
+                        "bundle_manifest": "/bundles/repo.bundle.manifest.json"
+                    },
+                    "result": result,
+                    "status": "completed",
+                }
 
-        with self.assertRaisesRegex(
-            runner.RunnerError,
-            "treatment used no successful RepoBrief tool or resource",
-        ):
-            runner.normalize(value, events)
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "treatment used no successful RepoBrief tool or resource",
+                ):
+                    runner.normalize(value, events)
 
     def test_resource_freeze_rejects_pagination_and_duplicates(self) -> None:
         with self.assertRaisesRegex(runner.RunnerError, "paginated"):
@@ -2596,6 +2605,34 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             runner._revalidate_staged_repoground_manifest(binding)
             self.assertIsNone(runner.cleanup_staged_repoground_manifest(binding))
             self.assertFalse(staged.parent.exists())
+
+    def test_manifest_artifact_contract_rejects_malformed_entries(self) -> None:
+        cases = (
+            (None, "artifact entry is invalid"),
+            ({"role": "canonical_md"}, "artifact path is invalid"),
+            (
+                {
+                    "role": "canonical_md",
+                    "path": None,
+                    "bytes": 0,
+                    "sha256": "0" * 64,
+                },
+                "artifact path is invalid",
+            ),
+        )
+        for artifact, pattern in cases:
+            with self.subTest(artifact=artifact), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                manifest = root / "chosen.bundle.manifest.json"
+                manifest.write_text(
+                    json.dumps({"artifacts": [artifact]}, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(runner.RunnerError, pattern):
+                    runner._manifest_artifact_paths(
+                        manifest, manifest.read_bytes()
+                    )
+
 
     def test_staged_manifest_rejects_missing_or_nonregular_identity_artifact(self) -> None:
         for mode in ("missing", "directory", "symlink"):
