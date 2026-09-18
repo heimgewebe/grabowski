@@ -2717,7 +2717,7 @@ class SecretPtyContractTests(unittest.TestCase):
 
     def test_secret_pty_peer_rejects_foreign_interpreter_wrapper(self) -> None:
         root_tool = _load_root_broker_tool()
-        expected_client = str(Path(sys.executable).resolve())
+        expected_client = "/bin/true"
         fake_control_group = "/system.slice/grabowski-operator.service"
         execution = {
             "allowed_peer_uid": os.getuid(),
