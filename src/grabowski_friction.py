@@ -456,6 +456,11 @@ CONNECTOR_RESPONSE_LIFECYCLE_MESSAGES = {
     "MCP connection TTL reached; stopping response forwarding": "response_ttl_expired",
     "response already fulfilled or unknown request": "response_already_fulfilled_or_unknown",
 }
+CONNECTOR_RESPONSE_LIFECYCLE_LOOKBACK_MINUTES = 15
+CONNECTOR_RESPONSE_LIFECYCLE_LOOKBACK_LINES = 500
+CONNECTOR_RESPONSE_LIFECYCLE_GREP = "|".join(
+    re.escape(message) for message in CONNECTOR_RESPONSE_LIFECYCLE_MESSAGES
+)
 CONNECTOR_ERROR_MESSAGE_TERMS = {
     "received exception from stream": "stream_exception",
     "streamable_http": "stream_exception",
@@ -1071,6 +1076,135 @@ def _journal_transport_event(
     }
 
 
+
+def _journal_response_lifecycle_lookback_probe(unit: str) -> dict[str, Any]:
+    """Read only lifecycle signals over a time window so high traffic cannot evict them."""
+    name = operator._validate_unit(unit)
+    result = _run_diagnostic_command(
+        [
+            "journalctl",
+            "--user",
+            "--unit",
+            name,
+            "--no-pager",
+            "--output=json",
+            "--since",
+            f"{CONNECTOR_RESPONSE_LIFECYCLE_LOOKBACK_MINUTES} minutes ago",
+            "--grep",
+            CONNECTOR_RESPONSE_LIFECYCLE_GREP,
+            "--lines",
+            str(CONNECTOR_RESPONSE_LIFECYCLE_LOOKBACK_LINES),
+        ],
+        timeout_seconds=30,
+        max_output_bytes=CONNECTOR_DIAGNOSTIC_JOURNAL_BYTES,
+    )
+    parsed: list[dict[str, Any]] = []
+    invalid_json_records = 0
+    for line in str(result.get("stdout", "")).splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            invalid_json_records += 1
+            continue
+        if not isinstance(record, dict):
+            invalid_json_records += 1
+            continue
+        parsed.append(record)
+
+    events = [_journal_transport_event(record) for record in parsed]
+    ttl_by_request: dict[str, int | None] = {}
+    for event in events:
+        if event["response_lifecycle_signal"] != "response_ttl_expired":
+            continue
+        request_identity = event["request_identity_sha256"]
+        if not request_identity:
+            continue
+        event_microseconds = event["realtime_microseconds"]
+        current = ttl_by_request.get(request_identity)
+        if (
+            request_identity not in ttl_by_request
+            or (
+                event_microseconds is not None
+                and (current is None or event_microseconds < current)
+            )
+        ):
+            ttl_by_request[request_identity] = event_microseconds
+
+    counts: Counter[str] = Counter()
+    request_identities: set[str] = set()
+    samples: list[dict[str, Any]] = []
+    for event in events:
+        lifecycle_signal = event["response_lifecycle_signal"]
+        request_identity = event["request_identity_sha256"]
+        lifecycle_class: str | None = None
+        if lifecycle_signal == "response_ttl_expired":
+            lifecycle_class = "response_ttl_expired"
+        elif lifecycle_signal == "response_already_fulfilled_or_unknown":
+            ttl_at = ttl_by_request.get(request_identity) if request_identity else None
+            event_at = event["realtime_microseconds"]
+            paired_with_ttl = bool(
+                request_identity
+                and request_identity in ttl_by_request
+                and ttl_at is not None
+                and event_at is not None
+                and event_at >= ttl_at
+            )
+            lifecycle_class = (
+                "late_response_after_ttl"
+                if paired_with_ttl
+                else "duplicate_or_unknown_response"
+            )
+        if lifecycle_class is None:
+            continue
+        counts[lifecycle_class] += 1
+        if request_identity:
+            request_identities.add(request_identity)
+        if len(samples) < CONNECTOR_DIAGNOSTIC_SAMPLE_LIMIT:
+            samples.append(
+                {
+                    "timestamp": event["timestamp"],
+                    "invocation_id": event["invocation_id"],
+                    "component": event["component"],
+                    "classification": lifecycle_class,
+                    "request_identity_sha256": request_identity,
+                }
+            )
+
+    complete = bool(
+        result["returncode"] in {0, 1}
+        and not result["timed_out"]
+        and not result["stdout_truncated"]
+        and not result["stderr_truncated"]
+        and invalid_json_records == 0
+    )
+    signal_count = sum(counts.values())
+    return {
+        "unit": name,
+        "lookback_minutes": CONNECTOR_RESPONSE_LIFECYCLE_LOOKBACK_MINUTES,
+        "max_matching_lines": CONNECTOR_RESPONSE_LIFECYCLE_LOOKBACK_LINES,
+        "returncode": result["returncode"],
+        "timed_out": result["timed_out"],
+        "stdout_truncated": result["stdout_truncated"],
+        "stderr_truncated": result["stderr_truncated"],
+        "parsed_records": len(parsed),
+        "invalid_json_records": invalid_json_records,
+        "journal_window_complete": complete,
+        "signal_count": signal_count,
+        "classification_counts": dict(sorted(counts.items())),
+        "affected_request_identity_count": len(request_identities),
+        "paired_late_response_count": counts["late_response_after_ttl"],
+        "unpaired_response_rejection_count": counts["duplicate_or_unknown_response"],
+        "samples": samples,
+        "samples_truncated": signal_count > len(samples),
+        "does_not_establish": [
+            "current_outage",
+            "duplicate_response_proof",
+            "late_response_root_cause",
+            "connector_vendor_fix",
+        ],
+        "stderr_preview": _bounded_summary_text(result.get("stderr"), max_chars=240),
+    }
+
 def _journal_transport_probe(unit: str, max_lines: int) -> dict[str, Any]:
     name = operator._validate_unit(unit)
     result = _run_diagnostic_command(
@@ -1376,8 +1510,15 @@ def connector_transport_live_diagnostics(
         unit: _journal_transport_probe(unit, max_log_lines)
         for unit in CONNECTOR_DIAGNOSTIC_UNITS
     }
+    response_lifecycle_lookbacks = {
+        unit: _journal_response_lifecycle_lookback_probe(unit)
+        for unit in CONNECTOR_DIAGNOSTIC_UNITS
+    }
     transport_error_count = sum(
         probe["transport_error_count"] for probe in journal_probes.values()
+    )
+    lookback_signal_count = sum(
+        probe["signal_count"] for probe in response_lifecycle_lookbacks.values()
     )
     planned_lifecycle_issue_count = sum(
         probe["planned_lifecycle_issue_count"] for probe in journal_probes.values()
@@ -1386,6 +1527,18 @@ def connector_transport_live_diagnostics(
         unit: probe["transport_health_state"]
         for unit, probe in journal_probes.items()
     }
+    window_states = {
+        unit: probe["window_state"]
+        for unit, probe in journal_probes.items()
+    }
+    for unit, lookback in response_lifecycle_lookbacks.items():
+        if lookback["signal_count"] <= 0:
+            continue
+        if transport_health_states[unit] in {"healthy", "indeterminate"}:
+            transport_health_states[unit] = "degraded"
+        if window_states[unit] == "no_errors":
+            window_states[unit] = "lifecycle_errors_outside_tail_window"
+
     response_lifecycle_counts: Counter[str] = Counter()
     response_lifecycle_units: list[str] = []
     for unit, probe in journal_probes.items():
@@ -1393,20 +1546,31 @@ def connector_transport_live_diagnostics(
         response_lifecycle_counts.update(counts)
         if sum(counts.values()) > 0:
             response_lifecycle_units.append(unit)
+
+    lookback_counts: Counter[str] = Counter()
+    lookback_units: list[str] = []
+    for unit, probe in response_lifecycle_lookbacks.items():
+        lookback_counts.update(probe["classification_counts"])
+        if probe["signal_count"] > 0:
+            lookback_units.append(unit)
+
     post_error_activity_counts: Counter[str] = Counter()
     for probe in journal_probes.values():
         post_error_activity_counts.update(probe["post_error_activity_counts"])
-    window_states = {unit: probe["window_state"] for unit, probe in journal_probes.items()}
+
     if "errors_without_later_activity" in window_states.values():
         transport_window_state = "errors_without_later_activity"
     elif "errors_followed_by_activity" in window_states.values():
         transport_window_state = "errors_followed_by_activity"
+    elif "lifecycle_errors_outside_tail_window" in window_states.values():
+        transport_window_state = "lifecycle_errors_outside_tail_window"
     elif "indeterminate_truncated" in window_states.values():
         transport_window_state = "indeterminate_truncated"
     elif "indeterminate_incomplete" in window_states.values():
         transport_window_state = "indeterminate_incomplete"
     else:
         transport_window_state = "no_errors"
+
     if "unavailable_suspected" in transport_health_states.values():
         transport_health_state = "unavailable_suspected"
     elif "degraded" in transport_health_states.values():
@@ -1415,6 +1579,8 @@ def connector_transport_live_diagnostics(
         transport_health_state = "indeterminate"
     else:
         transport_health_state = "healthy"
+
+    transport_signal_observed = transport_error_count > 0 or lookback_signal_count > 0
     return {
         "schema_version": 3,
         "authority": "read_only_transport_diagnostic_receipt",
@@ -1433,12 +1599,14 @@ def connector_transport_live_diagnostics(
         "runtime_status": _runtime_status_probe(),
         "service_statuses": service_statuses,
         "journal_transport_probes": journal_probes,
-        "transport_errors_observed_in_window": transport_error_count > 0,
-        "live_transport_errors_observed": transport_error_count > 0,
+        "response_lifecycle_lookback_probes": response_lifecycle_lookbacks,
+        "transport_errors_observed_in_window": transport_signal_observed,
+        "live_transport_errors_observed": transport_signal_observed,
         "live_transport_errors_observed_semantics": (
-            "transport_error_present_in_bounded_journal_window_not_current_outage_proof"
+            "transport_error_present_in_bounded_tail_or_source_filtered_recent_lifecycle_lookback_not_current_outage_proof"
         ),
         "transport_error_count": transport_error_count,
+        "response_lifecycle_lookback_signal_count": lookback_signal_count,
         "transport_window_state": transport_window_state,
         "transport_health_state": transport_health_state,
         "transport_health_state_by_unit": transport_health_states,
@@ -1454,6 +1622,18 @@ def connector_transport_live_diagnostics(
             "classification_counts": dict(sorted(response_lifecycle_counts.items())),
             "units_with_signals": sorted(response_lifecycle_units),
             "does_not_establish": [
+                "duplicate_response_proof",
+                "late_response_root_cause",
+                "transport_reliability_proof",
+            ],
+        },
+        "response_lifecycle_lookback": {
+            "schema_version": 1,
+            "lookback_minutes": CONNECTOR_RESPONSE_LIFECYCLE_LOOKBACK_MINUTES,
+            "classification_counts": dict(sorted(lookback_counts.items())),
+            "units_with_signals": sorted(lookback_units),
+            "does_not_establish": [
+                "current_outage",
                 "duplicate_response_proof",
                 "late_response_root_cause",
                 "transport_reliability_proof",

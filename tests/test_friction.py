@@ -998,6 +998,72 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         self.assertFalse(unit_lifecycle["samples_truncated"])
         self.assertNotIn("wfr_projected/abcd", json.dumps(diagnostics, sort_keys=True))
 
+    def test_connector_transport_live_diagnostics_keeps_lifecycle_signal_outside_tail_window(self) -> None:
+        module = self._load_module()
+        module.FRICTION_LOG.parent.mkdir(parents=True, exist_ok=True)
+        module.FRICTION_LOG.write_text("", encoding="utf-8")
+
+        lifecycle_record = {
+            "__REALTIME_TIMESTAMP": "100",
+            "MESSAGE": json.dumps({
+                "level": "WARN",
+                "component": "controlplane",
+                "msg": "response already fulfilled or unknown request",
+                "cmd_request_id": "wfr_evicted/abcd",
+                "rpc_request_id": 3,
+            }),
+        }
+
+        def fake_run(argv, *, timeout_seconds=30, max_output_bytes=131_072):
+            if argv[0] == "systemctl":
+                return {
+                    "returncode": 0,
+                    "timed_out": False,
+                    "stdout": "LoadState=loaded\nActiveState=active\nSubState=running\nResult=success\nNRestarts=0\n",
+                    "stderr": "",
+                    "stdout_truncated": False,
+                    "stderr_truncated": False,
+                }
+            self.assertEqual(max_output_bytes, module.CONNECTOR_DIAGNOSTIC_JOURNAL_BYTES)
+            unit = argv[argv.index("--unit") + 1]
+            records = []
+            if "--grep" in argv and unit == "tunnel-client-grabowski.service":
+                records = [lifecycle_record]
+            return {
+                "returncode": (
+                    0
+                    if records or "--grep" not in argv
+                    else 1
+                ),
+                "timed_out": False,
+                "stdout": "".join(json.dumps(record) + "\n" for record in records),
+                "stderr": "",
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+            }
+
+        module._run_diagnostic_command = fake_run
+        diagnostics = module.connector_transport_live_diagnostics(limit=1, max_log_lines=25)
+
+        self.assertEqual(diagnostics["transport_error_count"], 0)
+        self.assertEqual(diagnostics["response_lifecycle_lookback_signal_count"], 1)
+        self.assertTrue(diagnostics["live_transport_errors_observed"])
+        self.assertTrue(diagnostics["transport_degraded"])
+        self.assertEqual(diagnostics["transport_health_state"], "degraded")
+        self.assertEqual(
+            diagnostics["transport_window_state"],
+            "lifecycle_errors_outside_tail_window",
+        )
+        self.assertEqual(
+            diagnostics["response_lifecycle_lookback"]["classification_counts"],
+            {"duplicate_or_unknown_response": 1},
+        )
+        self.assertEqual(
+            diagnostics["response_lifecycle_lookback"]["units_with_signals"],
+            ["tunnel-client-grabowski.service"],
+        )
+        self.assertNotIn("wfr_evicted/abcd", json.dumps(diagnostics, sort_keys=True))
+
     def test_connector_transport_probe_separates_completed_stop_lifecycle_issues(self) -> None:
         module = self._load_module()
         invocation = "a" * 32
