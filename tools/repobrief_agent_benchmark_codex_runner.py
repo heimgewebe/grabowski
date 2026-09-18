@@ -792,12 +792,16 @@ def _directory_fd_matches(path: Path, descriptor: int) -> None:
     if stat.S_ISLNK(linked.st_mode) or (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid) != (linked.st_dev, linked.st_ino, linked.st_mode, linked.st_uid):
         raise RunnerError("private output directory identity changed")
 
-def _write_private_dirfd(descriptor: int, name: str, data: bytes) -> None:
+def _write_private_dirfd(
+    descriptor: int, name: str, data: bytes, *, mode: int = 0o600
+) -> None:
     if Path(name).name != name or not name:
         raise RunnerError("private artifact name is unsafe")
+    if mode not in {0o600, 0o700}:
+        raise RunnerError("private artifact mode is unsafe")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
     try:
-        file_descriptor = os.open(name, flags, 0o600, dir_fd=descriptor)
+        file_descriptor = os.open(name, flags, mode, dir_fd=descriptor)
     except FileExistsError as exc:
         raise RunnerError("provider evidence artifact already exists") from exc
     write_error: BaseException | None = None
@@ -1971,7 +1975,9 @@ def _create_private_stage_directory(parent: Path, *, prefix: str) -> tuple[Path,
         os.close(parent_fd)
 
 
-def _write_private_relative_file(root_fd: int, relative: Path, data: bytes) -> None:
+def _write_private_relative_file(
+    root_fd: int, relative: Path, data: bytes, *, mode: int = 0o600
+) -> None:
     if relative.is_absolute() or not relative.parts or any(
         part in {"", ".", ".."} for part in relative.parts
     ):
@@ -1993,7 +1999,7 @@ def _write_private_relative_file(root_fd: int, relative: Path, data: bytes) -> N
                 raise RunnerError("private artifact directory permissions are unsafe")
             os.close(descriptor)
             descriptor = child
-        _write_private_dirfd(descriptor, relative.name, data)
+        _write_private_dirfd(descriptor, relative.name, data, mode=mode)
     finally:
         os.close(descriptor)
 
@@ -2396,6 +2402,108 @@ def _bind_mcp_upstream(
     return argv, bindings
 
 
+def stage_mcp_upstream(
+    state_root: Path,
+    upstream: Sequence[str],
+    manifest: Path,
+    authorized_files: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    bound_argv, source_bindings = _bind_mcp_upstream(
+        upstream, manifest, authorized_files
+    )
+    stage_root: Path | None = None
+    stage_fd: int | None = None
+    try:
+        stage_root, stage_fd = _create_private_stage_directory(
+            state_root / "repoground-mcp-upstream-runtime", prefix="upstream-"
+        )
+        staged_argv = list(bound_argv)
+        staged_bindings: list[dict[str, Any]] = []
+        for index, source_binding in enumerate(source_bindings):
+            label = "MCP executable" if index == 0 else "MCP script"
+            source = Path(source_binding["path"])
+            raw = _read_bound_regular_file(
+                source, label=label, max_bytes=MAX_PROVIDER_EXECUTABLE_BYTES
+            )
+            current = _bind_mcp_file(
+                source, label=label, executable=index == 0
+            )
+            if (
+                current["identity"] != source_binding["identity"]
+                or current["sha256"] != source_binding["sha256"]
+                or sha_bytes(raw) != source_binding["sha256"]
+            ):
+                raise RunnerError(f"{label} changed before private staging")
+            relative = Path("executable" if index == 0 else "script") / source.name
+            _write_private_relative_file(
+                stage_fd,
+                relative,
+                raw,
+                mode=0o700 if index == 0 else 0o600,
+            )
+            staged_path = stage_root / relative
+            staged = _bind_mcp_file(
+                staged_path,
+                label=f"staged {label}",
+                executable=index == 0,
+            )
+            if staged["sha256"] != source_binding["sha256"]:
+                raise RunnerError(f"staged {label} SHA mismatch")
+            staged_bindings.append(staged)
+            staged_argv[index] = str(staged_path)
+        _directory_fd_matches(stage_root, stage_fd)
+        return {
+            "argv": staged_argv,
+            "bindings": staged_bindings,
+            "runtime_dir": stage_root,
+            "runtime_identity": _private_directory_identity(os.fstat(stage_fd)),
+        }
+    except BaseException:
+        if stage_fd is not None:
+            try:
+                os.close(stage_fd)
+            except OSError:
+                pass
+            stage_fd = None
+        if stage_root is not None:
+            shutil.rmtree(stage_root, ignore_errors=True)
+        raise
+    finally:
+        if stage_fd is not None:
+            os.close(stage_fd)
+
+
+def _revalidate_staged_mcp_upstream(binding: Mapping[str, Any]) -> None:
+    bindings = binding.get("bindings")
+    if not isinstance(bindings, list) or not bindings:
+        raise RunnerError("staged MCP upstream binding is invalid")
+    for index, file_binding in enumerate(bindings):
+        label = "MCP executable" if index == 0 else "MCP script"
+        current = _bind_mcp_file(
+            Path(file_binding["path"]),
+            label=f"staged {label}",
+            executable=index == 0,
+        )
+        if (
+            current["identity"] != file_binding["identity"]
+            or current["sha256"] != file_binding["sha256"]
+        ):
+            raise RunnerError(f"staged {label} changed during execution")
+    _revalidate_private_stage_tree(binding, bindings)
+
+
+def cleanup_staged_mcp_upstream(binding: Mapping[str, Any]) -> str | None:
+    try:
+        _revalidate_staged_mcp_upstream(binding)
+        runtime_dir = Path(binding["runtime_dir"])
+        for file_binding in binding["bindings"]:
+            Path(file_binding["path"]).relative_to(runtime_dir)
+        shutil.rmtree(runtime_dir)
+    except BaseException as exc:
+        return type(exc).__name__
+    return None
+
+
 def _pin_treatment_arguments(message: dict[str, Any], manifest: Path) -> None:
     params = message.get("params")
     if not isinstance(params, dict):
@@ -2418,7 +2526,7 @@ def _pin_treatment_arguments(message: dict[str, Any], manifest: Path) -> None:
 
 def run_mcp_proxy(
     upstream: Sequence[str], manifest_text: str, manifest_sha256: str,
-    authorized_files: Sequence[Mapping[str, Any]],
+    authorized_files: Sequence[Mapping[str, Any]], runtime_root_text: str,
 ) -> int:
     if not upstream or any(not isinstance(item, str) or not item for item in upstream):
         raise RunnerError("invalid MCP upstream argv")
@@ -2433,15 +2541,21 @@ def run_mcp_proxy(
         manifest_metadata.st_dev, manifest_metadata.st_ino,
         manifest_metadata.st_size, manifest_metadata.st_mode,
     )
-    bound_upstream, upstream_bindings = _bind_mcp_upstream(
-        upstream, manifest, authorized_files
+    upstream_stage = stage_mcp_upstream(
+        Path(runtime_root_text), upstream, manifest, authorized_files
     )
+    bound_upstream = [str(item) for item in upstream_stage["argv"]]
     try:
         process = subprocess.Popen(
             bound_upstream, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env=provider_env(), shell=False,
         )
     except OSError as exc:
+        stage_cleanup_error = cleanup_staged_mcp_upstream(upstream_stage)
+        if stage_cleanup_error is not None:
+            raise RunnerError(
+                "MCP upstream could not be started and private runtime cleanup failed"
+            ) from exc
         raise RunnerError("MCP upstream could not be started") from exc
     if process.stdin is None or process.stdout is None or process.stderr is None:
         process.kill()
@@ -2449,6 +2563,11 @@ def run_mcp_proxy(
             process.wait(timeout=5)
         except subprocess.TimeoutExpired as exc:
             raise RunnerError("MCP upstream could not be reaped") from exc
+        stage_cleanup_error = cleanup_staged_mcp_upstream(upstream_stage)
+        if stage_cleanup_error is not None:
+            raise RunnerError(
+                "MCP upstream pipes unavailable and private runtime cleanup failed"
+            )
         raise RunnerError("MCP upstream pipes unavailable")
     output_lock = threading.Lock()
     state_lock = threading.Lock()
@@ -2736,9 +2855,10 @@ def run_mcp_proxy(
         stderr_thread.join(timeout=5)
         if upstream_stderr:
             sys.stderr.buffer.write(bytes(upstream_stderr)); sys.stderr.buffer.flush()
-        for index, binding in enumerate(upstream_bindings):
-            _revalidate_mcp_file(
-                binding, label="MCP executable" if index == 0 else "MCP script"
+        upstream_cleanup_error = cleanup_staged_mcp_upstream(upstream_stage)
+        if upstream_cleanup_error is not None:
+            raise RunnerError(
+                f"MCP upstream private runtime cleanup failed: {upstream_cleanup_error}"
             )
         current_manifest = _read_bound_regular_file(
             manifest, label="RepoGround manifest", max_bytes=MAX_MANIFEST_BYTES
@@ -2801,6 +2921,7 @@ def build_command(
     *, authorized_mcp_files: Sequence[Mapping[str, Any]] | None = None,
     proxy_path: Path | None = None,
     manifest_path: Path | None = None,
+    mcp_runtime_root: Path | None = None,
 ) -> list[str]:
     filesystem = (
         '{":minimal"="read",":workspace_roots"={"."="read"},'
@@ -2826,6 +2947,8 @@ def build_command(
             raise RunnerError("treatment requires a bound absolute MCP proxy path")
         if manifest_path is None or not manifest_path.is_absolute():
             raise RunnerError("treatment requires a staged absolute RepoGround manifest path")
+        if mcp_runtime_root is None or not mcp_runtime_root.is_absolute():
+            raise RunnerError("treatment requires a private absolute MCP runtime root")
         upstream = [str(item) for item in request["repobrief"]["mcp_command"]]
         binding = request["repobrief"]
         proxy_args = [
@@ -2833,6 +2956,7 @@ def build_command(
             "--codex-mcp-proxy", canonical(upstream),
             str(manifest_path), str(binding["manifest_sha256"]),
             canonical(list(authorized_mcp_files)),
+            str(mcp_runtime_root),
         ]
         command[2:2] = [
             "-c", 'mcp_servers.repobrief.command="/usr/bin/python3"',
@@ -3840,6 +3964,7 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                     authorized_mcp_files=authorized_mcp_files,
                     proxy_path=None if proxy_binding is None else Path(proxy_binding["path"]),
                     manifest_path=None if manifest_binding is None else Path(manifest_binding["path"]),
+                    mcp_runtime_root=state_path,
                 )
                 capture = run_bounded(
                     command, cwd=checkout,
@@ -3965,9 +4090,9 @@ def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     if raw and raw[0] == "--codex-mcp-proxy":
         try:
-            if len(raw) != 5:
+            if len(raw) != 6:
                 raise RunnerError(
-                    "codex MCP proxy requires upstream argv, manifest, SHA, and authorized files"
+                    "codex MCP proxy requires upstream argv, manifest, SHA, authorized files, and runtime root"
                 )
             upstream = json.loads(raw[1])
             authorized_files = json.loads(raw[4])
@@ -3975,7 +4100,9 @@ def main(argv: list[str] | None = None) -> int:
                 raise RunnerError("codex MCP proxy upstream argv must be a list")
             if not isinstance(authorized_files, list):
                 raise RunnerError("codex MCP proxy authorized files must be a list")
-            return run_mcp_proxy(upstream, raw[2], raw[3], authorized_files)
+            return run_mcp_proxy(
+                upstream, raw[2], raw[3], authorized_files, raw[5]
+            )
         except Exception as exc:
             print(f"codex MCP proxy failed: {exc}", file=sys.stderr)
             return 2

@@ -253,6 +253,8 @@ def bootstrap_program() -> str:
 
 def proxy_command(upstream: Path, root: Path) -> list[str]:
     manifest = root / "bound.bundle.manifest.json"
+    runtime_root = root / "proxy-runtime"
+    runtime_root.mkdir(mode=0o700, exist_ok=True)
     if not manifest.exists():
         manifest.write_text("{}\n", encoding="utf-8")
     digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
@@ -268,6 +270,7 @@ def proxy_command(upstream: Path, root: Path) -> list[str]:
         str(manifest),
         digest,
         json.dumps(authorized, sort_keys=True),
+        str(runtime_root),
     ]
 
 
@@ -701,6 +704,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 ],
                 proxy_path=(root / "bound-proxy.py").resolve(),
                 manifest_path=(root / "bound.bundle.manifest.json").resolve(),
+                mcp_runtime_root=(root / "state").resolve(),
             )
         baseline_joined = " ".join(baseline)
         treatment_joined = " ".join(treatment)
@@ -1741,6 +1745,52 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 with self.subTest(selector=selector), self.assertRaises(runner.RunnerError):
                     runner._pin_treatment_arguments(conflicting, manifest)
 
+    def test_staged_mcp_upstream_survives_later_source_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "state"
+            state_root.mkdir(mode=0o700)
+            executable = root / "python3"
+            executable.write_bytes(Path(sys.executable).resolve().read_bytes())
+            executable.chmod(0o755)
+            marker_path = root / "executed.txt"
+            script = root / "server.py"
+            script.write_text(
+                f"open({str(marker_path)!r}, 'w', encoding='utf-8').write('authorized')\n",
+                encoding="utf-8",
+            )
+            manifest = root / "chosen.bundle.manifest.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+            authorized = [file_identity(executable), file_identity(script)]
+
+            staged = runner.stage_mcp_upstream(
+                state_root,
+                [str(executable), str(script), "--bundle-root", str(root)],
+                manifest,
+                authorized,
+            )
+            runtime_dir = Path(staged["runtime_dir"])
+            for file_binding in staged["bindings"]:
+                Path(file_binding["path"]).relative_to(runtime_dir)
+            self.assertEqual(
+                stat.S_IMODE(Path(staged["bindings"][0]["path"]).stat().st_mode),
+                0o700,
+            )
+
+            executable.write_text("#!/bin/sh\nexit 97\n", encoding="utf-8")
+            executable.chmod(0o755)
+            script.write_text(
+                f"open({str(marker_path)!r}, 'w', encoding='utf-8').write('replaced')\n",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                staged["argv"], capture_output=True, check=False, timeout=5
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(marker_path.read_text(encoding="utf-8"), "authorized")
+            self.assertIsNone(runner.cleanup_staged_mcp_upstream(staged))
+            self.assertFalse(runtime_dir.exists())
+
     def test_mcp_absolute_interpreter_symlink_resolves_to_bound_target(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2466,6 +2516,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 request(condition="treatment"), "/opt/codex", checkout, schema, codex_home,
                 authorized_mcp_files=[], proxy_path=Path(binding["path"]),
                 manifest_path=staged_manifest.resolve(),
+                mcp_runtime_root=state_root.resolve(),
             )
             encoded = next(item for item in command if item.startswith("mcp_servers.repobrief.args="))
             proxy_args = json.loads(encoded.split("=", 1)[1])
@@ -2551,6 +2602,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 request(condition="treatment"), "/opt/codex", checkout, schema, codex_home,
                 authorized_mcp_files=[], proxy_path=(root / "bound-proxy.py").resolve(),
                 manifest_path=staged.resolve(),
+                mcp_runtime_root=state_root.resolve(),
             )
             encoded = next(item for item in command if item.startswith("mcp_servers.repobrief.args="))
             self.assertIn(str(staged), encoded)
