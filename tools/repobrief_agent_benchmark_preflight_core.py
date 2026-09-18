@@ -13,6 +13,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import platform
 import select
@@ -121,7 +122,13 @@ def _load_startup_source_module(
 MODULE_PATH = Path(__file__).with_name("repobrief_agent_benchmark_runner.py")
 CODEX_MODULE_PATH = Path(__file__).with_name("repobrief_agent_benchmark_codex_runner.py")
 CODEX_PREFLIGHT_PATH = Path(__file__).with_name("repobrief_agent_benchmark_codex_preflight.py")
+CODEX_BOOTSTRAP_PATH = Path(__file__).with_name(
+    "repobrief_agent_benchmark_source_bootstrap.py"
+)
+CODEX_BOOTSTRAP_KIND = "grabowski.python_c_source_bootstrap"
+CODEX_BOOTSTRAP_SCHEMA_VERSION = 1
 _STARTUP_CODE_IDENTITIES: dict[str, dict[str, Any]] = {}
+_STARTUP_BOOTSTRAP_IDENTITY: dict[str, Any] | None = None
 _CORE_SOURCE_RAW, _CORE_SOURCE_IDENTITY = _read_startup_source_snapshot(
     Path(__file__), label="preflight core source"
 )
@@ -198,6 +205,30 @@ def _register_startup_code_identity(identity: Mapping[str, Any]) -> None:
         _record_startup_code_identity(identity)
     except RuntimeError as exc:
         raise PreflightError(str(exc)) from exc
+
+
+def _register_startup_bootstrap_identity(identity: Mapping[str, Any]) -> None:
+    global _STARTUP_BOOTSTRAP_IDENTITY
+    expected_keys = {"schema_version", "kind", "name", "bytes", "sha256"}
+    if (
+        set(identity) != expected_keys
+        or identity.get("schema_version") != CODEX_BOOTSTRAP_SCHEMA_VERSION
+        or identity.get("kind") != CODEX_BOOTSTRAP_KIND
+        or identity.get("name") != CODEX_BOOTSTRAP_PATH.name
+        or not isinstance(identity.get("bytes"), int)
+        or isinstance(identity.get("bytes"), bool)
+        or int(identity["bytes"]) <= 0
+        or not isinstance(identity.get("sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", str(identity["sha256"])) is None
+    ):
+        raise PreflightError("Codex immutable source bootstrap identity is invalid")
+    current = dict(identity)
+    if (
+        _STARTUP_BOOTSTRAP_IDENTITY is not None
+        and _STARTUP_BOOTSTRAP_IDENTITY != current
+    ):
+        raise PreflightError("Codex immutable source bootstrap changed between loads")
+    _STARTUP_BOOTSTRAP_IDENTITY = current
 
 
 def _utc_now() -> datetime:
@@ -456,6 +487,7 @@ def _preflight_code_identity(request: Mapping[str, Any]) -> dict[str, Any]:
             Path(__file__).resolve(),
             CODEX_PREFLIGHT_PATH.resolve(),
             MODULE_PATH.resolve(),
+            CODEX_BOOTSTRAP_PATH.resolve(),
             CODEX_MODULE_PATH.resolve(),
         )
     require_startup_binding = selected is not runner
@@ -466,7 +498,11 @@ def _preflight_code_identity(request: Mapping[str, Any]) -> dict[str, Any]:
             maximum=MAX_LEDGER_ARTIFACT_BYTES,
             label=f"preflight code file {path.name}",
         )
-        startup = _STARTUP_CODE_IDENTITIES.get(str(path.resolve()))
+        startup = (
+            _STARTUP_BOOTSTRAP_IDENTITY
+            if path == CODEX_BOOTSTRAP_PATH.resolve()
+            else _STARTUP_CODE_IDENTITIES.get(str(path.resolve()))
+        )
         if startup is not None:
             if (
                 startup.get("name") != path.name

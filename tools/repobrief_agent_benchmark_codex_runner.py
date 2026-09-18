@@ -38,6 +38,11 @@ from typing import Any
 
 SOURCE_SNAPSHOT_MAX_BYTES = 16 * 1024 * 1024
 
+ENTRYPOINT_BOOTSTRAP_KIND = "grabowski.python_c_source_bootstrap"
+ENTRYPOINT_BOOTSTRAP_SCHEMA_VERSION = 1
+ENTRYPOINT_BOOTSTRAP_NAME = "repobrief_agent_benchmark_source_bootstrap.py"
+ENTRYPOINT_BOOTSTRAP_PATH = Path(__file__).with_name(ENTRYPOINT_BOOTSTRAP_NAME)
+
 
 def _read_source_snapshot(path: Path) -> tuple[bytes, dict[str, Any]]:
     requested = path.expanduser()
@@ -90,6 +95,10 @@ _CAPTURED_ENTRYPOINT_RAW = globals().get("__grabowski_captured_entrypoint_raw__"
 _CAPTURED_ENTRYPOINT_IDENTITY = globals().get(
     "__grabowski_captured_entrypoint_identity__"
 )
+_ENTRYPOINT_BOOTSTRAP_RAW = globals().get("__grabowski_entrypoint_bootstrap_raw__")
+_ENTRYPOINT_BOOTSTRAP_IDENTITY = globals().get(
+    "__grabowski_entrypoint_bootstrap_identity__"
+)
 
 
 def _validated_captured_self_source(
@@ -110,28 +119,34 @@ def _validated_captured_self_source(
     return data, expected
 
 
-def _execute_captured_entrypoint_if_needed() -> None:
-    if __name__ != "__main__" or _CAPTURED_ENTRYPOINT_ACTIVE:
-        return
-    source = Path(__file__).expanduser().resolve()
-    raw, identity = _read_source_snapshot(source)
-    raw, identity = _validated_captured_self_source(raw, identity, source)
-    namespace = {
-        "__name__": "__main__",
-        "__file__": str(source),
-        "__package__": None,
-        "__builtins__": __builtins__,
-        "__grabowski_captured_entrypoint_active__": True,
-        "__grabowski_captured_entrypoint_raw__": raw,
-        "__grabowski_captured_entrypoint_identity__": identity,
+def _validated_entrypoint_bootstrap_context(
+    raw: Any, identity: Any
+) -> tuple[bytes, dict[str, Any]]:
+    if not isinstance(raw, (bytes, bytearray)) or not isinstance(identity, dict):
+        raise RuntimeError("immutable Codex bootstrap binding is missing")
+    data = bytes(raw)
+    expected = {
+        "schema_version": ENTRYPOINT_BOOTSTRAP_SCHEMA_VERSION,
+        "kind": ENTRYPOINT_BOOTSTRAP_KIND,
+        "name": ENTRYPOINT_BOOTSTRAP_NAME,
+        "bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
     }
-    exec(compile(raw, str(source), "exec"), namespace)
-    raise RuntimeError("captured Codex runner entrypoint returned unexpectedly")
+    if identity != expected:
+        raise RuntimeError("immutable Codex bootstrap identity mismatch")
+    return data, expected
 
 
-_execute_captured_entrypoint_if_needed()
-
-if _CAPTURED_ENTRYPOINT_ACTIVE:
+if __name__ == "__main__":
+    if not _CAPTURED_ENTRYPOINT_ACTIVE:
+        raise RuntimeError(
+            "Codex runner must be started through the immutable source bootstrap"
+        )
+    _ENTRYPOINT_BOOTSTRAP_RAW, _ENTRYPOINT_BOOTSTRAP_IDENTITY = (
+        _validated_entrypoint_bootstrap_context(
+            _ENTRYPOINT_BOOTSTRAP_RAW, _ENTRYPOINT_BOOTSTRAP_IDENTITY
+        )
+    )
     _SELF_SOURCE_RAW, _SELF_SOURCE_IDENTITY = _validated_captured_self_source(
         _CAPTURED_ENTRYPOINT_RAW,
         _CAPTURED_ENTRYPOINT_IDENTITY,
@@ -139,7 +154,6 @@ if _CAPTURED_ENTRYPOINT_ACTIVE:
     )
 else:
     _SELF_SOURCE_RAW, _SELF_SOURCE_IDENTITY = _read_source_snapshot(Path(__file__))
-
 
 def _load_captured_module(name: str, path: Path) -> Any:
     raw, identity = _read_source_snapshot(path)
@@ -1363,6 +1377,7 @@ _AUTHORIZED_RUNTIME_CODE_NAMES = (
     "repobrief_agent_benchmark_preflight_core.py",
     "repobrief_agent_benchmark_codex_preflight.py",
     "repobrief_agent_benchmark_runner.py",
+    ENTRYPOINT_BOOTSTRAP_NAME,
     Path(__file__).name,
 )
 
@@ -1392,6 +1407,7 @@ def _validated_authorized_runtime_code(code: Any) -> dict[str, dict[str, Any]]:
             "__grabowski_source_identity__", _SELF_SOURCE_IDENTITY
         ),
         BASE_PATH.name: getattr(base, "__grabowski_source_identity__", None),
+        ENTRYPOINT_BOOTSTRAP_NAME: _ENTRYPOINT_BOOTSTRAP_IDENTITY,
     }
     by_name: dict[str, dict[str, Any]] = {}
     for item in files:
@@ -2624,6 +2640,34 @@ def _toml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=True)
 
 
+def _bootstrap_program_text() -> str:
+    if (
+        _ENTRYPOINT_BOOTSTRAP_RAW is not None
+        and _ENTRYPOINT_BOOTSTRAP_IDENTITY is not None
+    ):
+        raw, _identity = _validated_entrypoint_bootstrap_context(
+            _ENTRYPOINT_BOOTSTRAP_RAW, _ENTRYPOINT_BOOTSTRAP_IDENTITY
+        )
+    else:
+        raw = _read_bound_regular_file(
+            ENTRYPOINT_BOOTSTRAP_PATH,
+            label="Codex immutable source bootstrap",
+            max_bytes=SOURCE_SNAPSHOT_MAX_BYTES,
+        )
+        identity = {
+            "schema_version": ENTRYPOINT_BOOTSTRAP_SCHEMA_VERSION,
+            "kind": ENTRYPOINT_BOOTSTRAP_KIND,
+            "name": ENTRYPOINT_BOOTSTRAP_NAME,
+            "bytes": len(raw),
+            "sha256": sha_bytes(raw),
+        }
+        raw, _identity = _validated_entrypoint_bootstrap_context(raw, identity)
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RunnerError("Codex immutable source bootstrap is not UTF-8") from exc
+
+
 def build_command(
     request: Mapping[str, Any], codex: str, checkout: Path, schema: Path, codex_home: Path,
     *, authorized_mcp_files: Sequence[Mapping[str, Any]] | None = None,
@@ -2657,7 +2701,8 @@ def build_command(
         upstream = [str(item) for item in request["repobrief"]["mcp_command"]]
         binding = request["repobrief"]
         proxy_args = [
-            "-B", str(proxy_path), "--codex-mcp-proxy", canonical(upstream),
+            "-I", "-c", _bootstrap_program_text(), str(proxy_path),
+            "--codex-mcp-proxy", canonical(upstream),
             str(manifest_path), str(binding["manifest_sha256"]),
             canonical(list(authorized_mcp_files)),
         ]

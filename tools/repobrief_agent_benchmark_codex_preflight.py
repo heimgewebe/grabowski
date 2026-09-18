@@ -25,6 +25,11 @@ SOURCE_SNAPSHOT_MAX_BYTES = 16 * 1024 * 1024
 CODEX_CREDENTIAL_COMMITMENT_KIND = "grabowski.codex_credential_commitment"
 CODEX_CREDENTIAL_COMMITMENT_DOMAIN = "grabowski.codex-credential-commitment.v1"
 
+ENTRYPOINT_BOOTSTRAP_KIND = "grabowski.python_c_source_bootstrap"
+ENTRYPOINT_BOOTSTRAP_SCHEMA_VERSION = 1
+ENTRYPOINT_BOOTSTRAP_NAME = "repobrief_agent_benchmark_source_bootstrap.py"
+ENTRYPOINT_BOOTSTRAP_PATH = Path(__file__).with_name(ENTRYPOINT_BOOTSTRAP_NAME)
+
 
 def _read_source_snapshot(path: Path) -> tuple[bytes, dict[str, Any]]:
     requested = path.expanduser()
@@ -77,6 +82,10 @@ _CAPTURED_ENTRYPOINT_RAW = globals().get("__grabowski_captured_entrypoint_raw__"
 _CAPTURED_ENTRYPOINT_IDENTITY = globals().get(
     "__grabowski_captured_entrypoint_identity__"
 )
+_ENTRYPOINT_BOOTSTRAP_RAW = globals().get("__grabowski_entrypoint_bootstrap_raw__")
+_ENTRYPOINT_BOOTSTRAP_IDENTITY = globals().get(
+    "__grabowski_entrypoint_bootstrap_identity__"
+)
 
 
 def _validated_captured_self_source(
@@ -97,28 +106,34 @@ def _validated_captured_self_source(
     return data, expected
 
 
-def _execute_captured_entrypoint_if_needed() -> None:
-    if __name__ != "__main__" or _CAPTURED_ENTRYPOINT_ACTIVE:
-        return
-    source = Path(__file__).expanduser().resolve()
-    raw, identity = _read_source_snapshot(source)
-    raw, identity = _validated_captured_self_source(raw, identity, source)
-    namespace = {
-        "__name__": "__main__",
-        "__file__": str(source),
-        "__package__": None,
-        "__builtins__": __builtins__,
-        "__grabowski_captured_entrypoint_active__": True,
-        "__grabowski_captured_entrypoint_raw__": raw,
-        "__grabowski_captured_entrypoint_identity__": identity,
+def _validated_entrypoint_bootstrap_context(
+    raw: Any, identity: Any
+) -> tuple[bytes, dict[str, Any]]:
+    if not isinstance(raw, (bytes, bytearray)) or not isinstance(identity, dict):
+        raise RuntimeError("immutable Codex preflight bootstrap binding is missing")
+    data = bytes(raw)
+    expected = {
+        "schema_version": ENTRYPOINT_BOOTSTRAP_SCHEMA_VERSION,
+        "kind": ENTRYPOINT_BOOTSTRAP_KIND,
+        "name": ENTRYPOINT_BOOTSTRAP_NAME,
+        "bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
     }
-    exec(compile(raw, str(source), "exec"), namespace)
-    raise RuntimeError("captured Codex preflight entrypoint returned unexpectedly")
+    if identity != expected:
+        raise RuntimeError("immutable Codex preflight bootstrap identity mismatch")
+    return data, expected
 
 
-_execute_captured_entrypoint_if_needed()
-
-if _CAPTURED_ENTRYPOINT_ACTIVE:
+if __name__ == "__main__":
+    if not _CAPTURED_ENTRYPOINT_ACTIVE:
+        raise RuntimeError(
+            "Codex preflight must be started through the immutable source bootstrap"
+        )
+    _ENTRYPOINT_BOOTSTRAP_RAW, _ENTRYPOINT_BOOTSTRAP_IDENTITY = (
+        _validated_entrypoint_bootstrap_context(
+            _ENTRYPOINT_BOOTSTRAP_RAW, _ENTRYPOINT_BOOTSTRAP_IDENTITY
+        )
+    )
     _SELF_SOURCE_RAW, _SELF_SOURCE_IDENTITY = _validated_captured_self_source(
         _CAPTURED_ENTRYPOINT_RAW,
         _CAPTURED_ENTRYPOINT_IDENTITY,
@@ -126,7 +141,6 @@ if _CAPTURED_ENTRYPOINT_ACTIVE:
     )
 else:
     _SELF_SOURCE_RAW, _SELF_SOURCE_IDENTITY = _read_source_snapshot(Path(__file__))
-
 
 def _load(name: str, path: Path) -> Any:
     raw, identity = _read_source_snapshot(path)
@@ -154,6 +168,8 @@ codex_runner = _load("repobrief_agent_benchmark_codex_runner_for_authorization",
 core._register_startup_code_identity(core.__grabowski_source_identity__)
 core._register_startup_code_identity(_SELF_SOURCE_IDENTITY)
 core._register_startup_code_identity(codex_runner.__grabowski_source_identity__)
+if _ENTRYPOINT_BOOTSTRAP_IDENTITY is not None:
+    core._register_startup_bootstrap_identity(_ENTRYPOINT_BOOTSTRAP_IDENTITY)
 
 
 def _credential_commitment_sha256(credential_data: bytes, nonce: str) -> str:
@@ -230,6 +246,11 @@ def authorize_pair(
     max_cost_usd: Decimal,
     validator_command: list[str],
 ) -> dict[str, Any]:
+    if _ENTRYPOINT_BOOTSTRAP_IDENTITY is None:
+        raise core.PreflightError(
+            "Codex preflight authorization requires immutable source bootstrap"
+        )
+    core._register_startup_bootstrap_identity(_ENTRYPOINT_BOOTSTRAP_IDENTITY)
     provider_binding = _validated_codex_provider_binding(
         codex_command, codex_command_sha256
     )

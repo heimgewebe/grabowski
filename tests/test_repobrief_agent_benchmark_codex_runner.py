@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "tools" / "repobrief_agent_benchmark_codex_runner.py"
+BOOTSTRAP_PATH = ROOT / "tools" / "repobrief_agent_benchmark_source_bootstrap.py"
 SPEC = importlib.util.spec_from_file_location("repobrief_agent_benchmark_codex_runner", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 runner = importlib.util.module_from_spec(SPEC)
@@ -177,6 +178,10 @@ def write_dispatch_authorization(
     return state_root
 
 
+def bootstrap_program() -> str:
+    return BOOTSTRAP_PATH.read_text(encoding="utf-8")
+
+
 def proxy_command(upstream: Path, root: Path) -> list[str]:
     manifest = root / "bound.bundle.manifest.json"
     if not manifest.exists():
@@ -185,6 +190,9 @@ def proxy_command(upstream: Path, root: Path) -> list[str]:
     authorized = [file_identity(Path(sys.executable)), file_identity(upstream)]
     return [
         sys.executable,
+        "-I",
+        "-c",
+        bootstrap_program(),
         str(MODULE_PATH),
         "--codex-mcp-proxy",
         json.dumps([str(Path(sys.executable).resolve()), str(upstream), "--bundle-root", str(root)]),
@@ -341,40 +349,39 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertNotIn("CODEX_ACCESS_TOKEN", environment)
         self.assertEqual(environment["PATH"], "/usr/bin:/bin")
 
-    def test_direct_runner_executes_captured_source_before_dependencies(self) -> None:
-        source = Path(runner.__file__).resolve()
-        payload = (
-            "import hashlib\n"
-            "assert globals().get('__grabowski_captured_entrypoint_active__') is True\n"
-            "raw = globals().get('__grabowski_captured_entrypoint_raw__')\n"
-            "identity = globals().get('__grabowski_captured_entrypoint_identity__')\n"
-            "assert isinstance(raw, bytes)\n"
-            "assert identity['sha256'] == hashlib.sha256(raw).hexdigest()\n"
-            "raise SystemExit(37)\n"
-        ).encode("utf-8")
-        identity = {
-            "path": str(source),
-            "name": source.name,
-            "bytes": len(payload),
-            "sha256": hashlib.sha256(payload).hexdigest(),
-        }
-        with (
-            patch.object(runner, "__name__", "__main__"),
-            patch.object(runner, "_CAPTURED_ENTRYPOINT_ACTIVE", False),
-            patch.object(
-                runner,
-                "_read_source_snapshot",
-                return_value=(payload, identity),
-            ),
-            self.assertRaises(SystemExit) as raised,
-        ):
-            runner._execute_captured_entrypoint_if_needed()
-        self.assertEqual(raised.exception.code, 37)
+    def test_direct_runner_rejects_unbootstrapped_start(self) -> None:
+        completed = subprocess.run(
+            [sys.executable, str(MODULE_PATH), "--help"],
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(
+            b"must be started through the immutable source bootstrap",
+            completed.stderr,
+        )
 
-        source_text = source.read_text(encoding="utf-8")
-        bootstrap_call = source_text.index("\n_execute_captured_entrypoint_if_needed()\n")
-        dependency_loader = source_text.index("\ndef _load_captured_module(name: str, path: Path) -> Any:\n")
-        self.assertLess(bootstrap_call, dependency_loader)
+    def test_immutable_bootstrap_captures_runner_before_execution(self) -> None:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                bootstrap_program(),
+                str(MODULE_PATH),
+                "--help",
+            ],
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stderr.decode("utf-8", errors="replace"),
+        )
+        self.assertIn(b"Run one isolated read-only RepoBrief Codex benchmark request", completed.stdout)
 
     def test_authorized_runtime_code_must_match_executed_runner_bytes(self) -> None:
         files = []
@@ -392,6 +399,34 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         drifted["sha256"] = "0" * 64
         with (
             patch.object(runner, "_SELF_SOURCE_IDENTITY", drifted),
+            self.assertRaisesRegex(
+                runner.RunnerError, "differs from executed bytes"
+            ),
+        ):
+            runner._validated_authorized_runtime_code(code)
+
+    def test_authorized_runtime_code_must_match_executed_bootstrap_bytes(self) -> None:
+        files = []
+        for name in runner._AUTHORIZED_RUNTIME_CODE_NAMES:
+            path = runner._runtime_code_path(name)
+            raw = path.read_bytes()
+            files.append(
+                {"name": name, "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+            )
+        code = {
+            "files": files,
+            "bundle_sha256": runner.base._sha256_json(files),
+        }
+        raw = BOOTSTRAP_PATH.read_bytes()
+        identity = {
+            "schema_version": runner.ENTRYPOINT_BOOTSTRAP_SCHEMA_VERSION,
+            "kind": runner.ENTRYPOINT_BOOTSTRAP_KIND,
+            "name": runner.ENTRYPOINT_BOOTSTRAP_NAME,
+            "bytes": len(raw),
+            "sha256": "0" * 64,
+        }
+        with (
+            patch.object(runner, "_ENTRYPOINT_BOOTSTRAP_IDENTITY", identity),
             self.assertRaisesRegex(
                 runner.RunnerError, "differs from executed bytes"
             ),
@@ -2241,6 +2276,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             root = Path(temporary)
             command = [
                 sys.executable,
+                "-I",
+                "-c",
+                bootstrap_program(),
                 str(MODULE_PATH),
                 "--request-root", str(root / "requests"),
                 "--repository-map", str(root / "repository-map.json"),
@@ -2293,7 +2331,14 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertEqual(staged.name, MODULE_PATH.name)
             self.assertTrue(staged.with_name(runner.BASE_PATH.name).is_file())
             completed = subprocess.run(
-                [sys.executable, "-B", str(staged), "--help"],
+                [
+                    sys.executable,
+                    "-I",
+                    "-c",
+                    bootstrap_program(),
+                    str(staged),
+                    "--help",
+                ],
                 capture_output=True,
                 check=False,
                 timeout=5,
@@ -2346,7 +2391,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             )
             encoded = next(item for item in command if item.startswith("mcp_servers.repobrief.args="))
             proxy_args = json.loads(encoded.split("=", 1)[1])
-            self.assertEqual(proxy_args[:2], ["-B", str(binding["path"])])
+            self.assertEqual(proxy_args[:2], ["-I", "-c"])
+            self.assertEqual(proxy_args[2], bootstrap_program())
+            self.assertEqual(proxy_args[3], str(binding["path"]))
             self.assertNotIn(str(source), encoded)
             self.assertIsNone(runner.cleanup_staged_mcp_proxy(binding))
 

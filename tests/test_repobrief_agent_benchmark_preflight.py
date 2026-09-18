@@ -8,6 +8,7 @@ import json
 import os
 import signal
 import shutil
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -16,6 +17,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
+BOOTSTRAP_PATH = ROOT / "tools" / "repobrief_agent_benchmark_source_bootstrap.py"
 SUPPORT_PATH = Path(__file__).resolve().parent / "repobrief_agent_benchmark_preflight_cases.py"
 SPEC = importlib.util.spec_from_file_location(
     "repobrief_agent_benchmark_preflight_cases", SUPPORT_PATH
@@ -1602,6 +1604,19 @@ class RepoBriefAgentBenchmarkPreflightLedgerTests(unittest.TestCase):
 
 
 class CodexProductionAuthorizationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        raw = BOOTSTRAP_PATH.read_bytes()
+        identity = {
+            "schema_version": codex_preflight.ENTRYPOINT_BOOTSTRAP_SCHEMA_VERSION,
+            "kind": codex_preflight.ENTRYPOINT_BOOTSTRAP_KIND,
+            "name": codex_preflight.ENTRYPOINT_BOOTSTRAP_NAME,
+            "bytes": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
+        codex_preflight._ENTRYPOINT_BOOTSTRAP_RAW = raw
+        codex_preflight._ENTRYPOINT_BOOTSTRAP_IDENTITY = identity
+        codex_preflight.core._register_startup_bootstrap_identity(identity)
+
     @staticmethod
     def _codex_pair(environment: dict) -> tuple[str, dict, dict]:
         pair_id = f"{support.TASKSET}:{support.CASE}:r2"
@@ -1691,6 +1706,7 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
             self.assertGreaterEqual(len(binding["mcp_command_files"]), 2)
             code_files = {item["name"]: item for item in binding["code"]["files"]}
             self.assertIn(Path(codex_runner.__file__).name, code_files)
+            self.assertIn(codex_preflight.ENTRYPOINT_BOOTSTRAP_NAME, code_files)
             authentication = binding["provider"]["authentication"]
             self.assertEqual(authentication["mode"], "chatgpt_subscription")
             self.assertFalse(authentication["credential_digest_public"])
@@ -2201,40 +2217,68 @@ class McpCommandFileIdentityTests(unittest.TestCase):
                     executable_search_path=str(runtime_bin),
                 )
 
-    def test_direct_codex_preflight_executes_captured_source_before_dependencies(self) -> None:
+    def test_direct_codex_preflight_rejects_unbootstrapped_start(self) -> None:
         source = Path(codex_preflight.__file__).resolve()
-        payload = (
-            "import hashlib\n"
-            "assert globals().get('__grabowski_captured_entrypoint_active__') is True\n"
-            "raw = globals().get('__grabowski_captured_entrypoint_raw__')\n"
-            "identity = globals().get('__grabowski_captured_entrypoint_identity__')\n"
-            "assert isinstance(raw, bytes)\n"
-            "assert identity['sha256'] == hashlib.sha256(raw).hexdigest()\n"
-            "raise SystemExit(37)\n"
-        ).encode("utf-8")
-        identity = {
-            "path": str(source),
-            "name": source.name,
-            "bytes": len(payload),
-            "sha256": hashlib.sha256(payload).hexdigest(),
-        }
-        with (
-            mock.patch.object(codex_preflight, "__name__", "__main__"),
-            mock.patch.object(codex_preflight, "_CAPTURED_ENTRYPOINT_ACTIVE", False),
-            mock.patch.object(
-                codex_preflight,
-                "_read_source_snapshot",
-                return_value=(payload, identity),
-            ),
-            self.assertRaises(SystemExit) as raised,
-        ):
-            codex_preflight._execute_captured_entrypoint_if_needed()
-        self.assertEqual(raised.exception.code, 37)
+        completed = subprocess.run(
+            [sys.executable, str(source), "--help"],
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(
+            b"must be started through the immutable source bootstrap",
+            completed.stderr,
+        )
 
-        source_text = source.read_text(encoding="utf-8")
-        bootstrap_call = source_text.index("\n_execute_captured_entrypoint_if_needed()\n")
-        dependency_loader = source_text.index("\ndef _load(name: str, path: Path) -> Any:\n")
-        self.assertLess(bootstrap_call, dependency_loader)
+    def test_immutable_bootstrap_captures_codex_preflight_before_execution(self) -> None:
+        source = Path(codex_preflight.__file__).resolve()
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                BOOTSTRAP_PATH.read_text(encoding="utf-8"),
+                str(source),
+                "--help",
+            ],
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stderr.decode("utf-8", errors="replace"),
+        )
+        self.assertIn(b"usage:", completed.stdout)
+
+    def test_codex_authorization_requires_bootstrap_binding(self) -> None:
+        saved_raw = codex_preflight._ENTRYPOINT_BOOTSTRAP_RAW
+        saved_identity = codex_preflight._ENTRYPOINT_BOOTSTRAP_IDENTITY
+        try:
+            codex_preflight._ENTRYPOINT_BOOTSTRAP_RAW = None
+            codex_preflight._ENTRYPOINT_BOOTSTRAP_IDENTITY = None
+            with self.assertRaisesRegex(
+                codex_preflight.core.PreflightError,
+                "requires immutable source bootstrap",
+            ):
+                codex_preflight.authorize_pair(
+                    pair_id="unused",
+                    request_root=Path("/unused"),
+                    repository_map=Path("/unused"),
+                    state_root=Path("/unused"),
+                    transcript_root=Path("/unused"),
+                    evidence_root=Path("/unused"),
+                    report_out=None,
+                    codex_command="/unused",
+                    codex_command_sha256="0" * 64,
+                    max_cost_usd=support.Decimal("1.00"),
+                    validator_command=["/unused"],
+                )
+        finally:
+            codex_preflight._ENTRYPOINT_BOOTSTRAP_RAW = saved_raw
+            codex_preflight._ENTRYPOINT_BOOTSTRAP_IDENTITY = saved_identity
 
     def test_codex_code_identity_rejects_post_startup_source_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
