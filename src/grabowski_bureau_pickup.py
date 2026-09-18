@@ -2082,7 +2082,9 @@ def _coordination_status(
     return bureau._invoke_bureau(arguments)
 
 
-def _definitive_missing_run(payload: dict[str, Any]) -> bool:
+def _definitive_missing_run(
+    payload: dict[str, Any], *, expected_run_id: str
+) -> bool:
     if payload.get("status") == "coordinated" or payload.get("run") is not None:
         return False
     code = payload.get("code")
@@ -2091,10 +2093,13 @@ def _definitive_missing_run(payload: dict[str, Any]) -> bool:
     if code != "state-error":
         return False
     detail = payload.get("detail")
-    return (
-        isinstance(detail, str)
-        and re.fullmatch(r"unknown run BUR-RUN-[A-Za-z0-9._-]+", detail.strip()) is not None
+    if not isinstance(detail, str) or RUN_ID_RE.fullmatch(expected_run_id) is None:
+        return False
+    match = re.fullmatch(
+        r"unknown run (BUR-RUN-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{10})",
+        detail.strip(),
     )
+    return match is not None and match.group(1) == expected_run_id
 
 
 def _pickup_lease_commit_precondition(
@@ -2121,7 +2126,7 @@ def _pickup_lease_commit_precondition(
         )
         if not isinstance(payload, dict):
             raise BureauPickupError("pickup-lease-authority-readback-invalid")
-        if _definitive_missing_run(payload):
+        if _definitive_missing_run(payload, expected_run_id=intent["run_id"]):
             if allow_unknown_run:
                 return
             raise BureauPickupError("pickup-lease-authority-run-missing")
@@ -2289,7 +2294,7 @@ def _recover_after_commit(
         except Exception:
             pass
         return failure
-    if _definitive_missing_run(status):
+    if _definitive_missing_run(status, expected_run_id=intent["run_id"]):
         return {
             "status": "commit-not-applied",
             "coordination": status,
@@ -6989,7 +6994,9 @@ def _coordination_status_for_binding(
             coordination_root=binding["coordination_root"],
         ),
     )
-    if not binding["legacy_fallback_allowed"] or not _definitive_missing_run(payload):
+    if not binding["legacy_fallback_allowed"] or not _definitive_missing_run(
+        payload, expected_run_id=run_id
+    ):
         return payload, binding
     legacy_payload = _bound_bureau_call(
         binding["registry_binding"],
@@ -6999,7 +7006,7 @@ def _coordination_status_for_binding(
             coordination_root=None,
         ),
     )
-    if _definitive_missing_run(legacy_payload):
+    if _definitive_missing_run(legacy_payload, expected_run_id=run_id):
         return payload, binding
     return legacy_payload, {
         **binding,
