@@ -6648,109 +6648,172 @@ def _run_remote_head_materialize(
         )
     _check(receipt, "fast_forward", "pass", "ancestor")
 
-    pre_cas_leases = lane_lease_snapshots("lane_leases_before_cas")
-    try:
-        renewal = resources.renew_resources(
-            lane_owner,
-            resource_keys,
-            ttl_seconds=120,
-            expected_leases=pre_cas_leases,
+    with work_acquire._lane_lock(lane_id) as lane_receipt_path:
+        locked_record = work_acquire._read_state(lane_receipt_path)
+        locked_inputs = (
+            locked_record.get("inputs")
+            if isinstance(locked_record, dict)
+            else None
         )
-    except (OSError, PermissionError, RuntimeError, TypeError, ValueError) as exc:
-        _check(receipt, "lane_lease_hold", "fail", type(exc).__name__)
-        raise GripPreflightError(
-            "remote-head-materialize could not snapshot-renew the exact Work Lane leases before branch CAS"
-        ) from exc
-    renewed = renewal.get("leases")
-    renewed_keys = (
-        {
-            item.get("resource_key")
-            for item in renewed
-            if isinstance(item, dict)
-        }
-        if isinstance(renewed, list)
-        else set()
-    )
-    if (
-        renewal.get("owner_id") != lane_owner
-        or renewal.get("snapshot_guarded") is not True
-        or renewed_keys != set(resource_keys)
-    ):
-        _check(receipt, "lane_lease_hold", "fail", "renewal_receipt_mismatch")
-        raise GripActionError(
-            "remote-head-materialize Work Lane lease hold returned mismatched evidence"
+        lane_inactive = (
+            not isinstance(locked_record, dict)
+            or locked_record.get("lane_id") != lane_id
+            or locked_record.get("state") != "ready"
+            or locked_inputs != lane
+            or locked_record.get("terminal_closeout") is not None
+            or locked_record.get("terminal_closeout_pending") is not None
         )
-    _check(receipt, "lane_lease_hold", "pass", f"count={len(resource_keys)}")
+        if lane_inactive:
+            _check(receipt, "lane_active_before_cas", "fail", "lane_state_changed")
+            raise GripPreflightError(
+                "remote-head-materialize Work Lane is no longer active and unchanged before branch CAS"
+            )
+        _check(receipt, "lane_active_before_cas", "pass", "ready")
 
-    pre_orientation = _orient(repo, runner)
-    if (
-        pre_orientation["branch"] != lane_branch
-        or pre_orientation["head"] != expected_local_head
-        or pre_orientation["dirty"]
-    ):
-        raise GripPreflightError(
-            "writer checkout changed after object import"
+        pre_cas_leases = lane_lease_snapshots("lane_leases_before_cas")
+        try:
+            renewal = resources.renew_resources(
+                lane_owner,
+                resource_keys,
+                ttl_seconds=120,
+                expected_leases=pre_cas_leases,
+            )
+        except (OSError, PermissionError, RuntimeError, TypeError, ValueError) as exc:
+            _check(receipt, "lane_lease_hold", "fail", type(exc).__name__)
+            raise GripPreflightError(
+                "remote-head-materialize could not snapshot-renew the exact Work Lane leases before branch CAS"
+            ) from exc
+        renewed = renewal.get("leases")
+        renewed_keys = (
+            {
+                item.get("resource_key")
+                for item in renewed
+                if isinstance(item, dict)
+            }
+            if isinstance(renewed, list)
+            else set()
         )
-    preimage = operator_surface._git_branch_preimage(repo)
-    if (
-        preimage.get("branch") != lane_branch
-        or preimage.get("head") != expected_local_head
-        or not isinstance(preimage.get("preimage_sha256"), str)
-    ):
-        raise GripPreflightError(
-            "remote-head-materialize captured a mismatched branch preimage"
+        if (
+            renewal.get("owner_id") != lane_owner
+            or renewal.get("snapshot_guarded") is not True
+            or renewed_keys != set(resource_keys)
+        ):
+            _check(receipt, "lane_lease_hold", "fail", "renewal_receipt_mismatch")
+            raise GripActionError(
+                "remote-head-materialize Work Lane lease hold returned mismatched evidence"
+            )
+        _check(receipt, "lane_lease_hold", "pass", f"count={len(resource_keys)}")
+
+        remote_before_cas = _remote_materialization_head(
+            repo,
+            remote,
+            remote_branch,
+            receipt,
+            runner,
+            "remote_head_before_cas",
         )
-    _check(
-        receipt,
-        "local_preimage",
-        "pass",
-        str(preimage["preimage_sha256"]),
-    )
-    mutation = operator_surface.grabowski_git(
-        str(repo),
-        ["merge", "--ff-only", expected_remote_head],
-        timeout_seconds=60,
-        branch_attempt={
-            "schema_version": 1,
-            "owner_id": lane_owner,
-            "operation_id": f"remote-head-materialize:{lane_id}",
-            "attempt_id": f"head-{expected_remote_head[:24]}",
-            "branch": lane_branch,
-            "expected_preimage_sha256": preimage["preimage_sha256"],
-        },
-    )
-    branch_receipt = mutation.get("branch_mutation")
-    if (
-        int(mutation.get("returncode", 1)) != 0
-        or not isinstance(branch_receipt, dict)
-        or branch_receipt.get("status") != "completed"
-        or branch_receipt.get("post_head") != expected_remote_head
-    ):
+        if remote_before_cas != expected_remote_head:
+            raise GripPreflightError(
+                "remote branch advanced before branch CAS"
+            )
+
+        pre_orientation = _orient(repo, runner)
+        if (
+            pre_orientation["branch"] != lane_branch
+            or pre_orientation["head"] != expected_local_head
+            or pre_orientation["dirty"]
+        ):
+            raise GripPreflightError(
+                "writer checkout changed after object import"
+            )
+        preimage = operator_surface._git_branch_preimage(repo)
+        if (
+            preimage.get("branch") != lane_branch
+            or preimage.get("head") != expected_local_head
+            or not isinstance(preimage.get("preimage_sha256"), str)
+        ):
+            raise GripPreflightError(
+                "remote-head-materialize captured a mismatched branch preimage"
+            )
+        _check(
+            receipt,
+            "local_preimage",
+            "pass",
+            str(preimage["preimage_sha256"]),
+        )
+        try:
+            mutation = operator_surface.grabowski_git(
+                str(repo),
+                ["merge", "--ff-only", expected_remote_head],
+                timeout_seconds=60,
+                branch_attempt={
+                    "schema_version": 1,
+                    "owner_id": lane_owner,
+                    "operation_id": f"remote-head-materialize:{lane_id}",
+                    "attempt_id": f"head-{expected_remote_head[:24]}",
+                    "branch": lane_branch,
+                    "expected_preimage_sha256": preimage["preimage_sha256"],
+                },
+            )
+        except (OSError, PermissionError, RuntimeError, TypeError, ValueError) as exc:
+            _check(receipt, "branch_cas", "fail", type(exc).__name__)
+            return {
+                "action": "readback_required",
+                "receipt_status": "blocked",
+                "outcome_unknown": True,
+                "retry_allowed": False,
+                "lane_id": lane_id,
+                "branch": lane_branch,
+                "old_head": expected_local_head,
+                "new_head": None,
+                "branch_mutation": None,
+                "error_class": type(exc).__name__,
+                "required_readback": [
+                    f"writer:{repo}",
+                    f"remote:{remote}:refs/heads/{remote_branch}",
+                ],
+            }
+        branch_receipt = mutation.get("branch_mutation")
+        if (
+            int(mutation.get("returncode", 1)) != 0
+            or not isinstance(branch_receipt, dict)
+            or branch_receipt.get("status") != "completed"
+            or branch_receipt.get("post_head") != expected_remote_head
+        ):
+            _check(
+                receipt,
+                "branch_cas",
+                "fail",
+                str(
+                    branch_receipt.get("status")
+                    if isinstance(branch_receipt, dict)
+                    else "missing_receipt"
+                ),
+            )
+            return {
+                "action": "readback_required",
+                "receipt_status": "blocked",
+                "outcome_unknown": (
+                    isinstance(branch_receipt, dict)
+                    and branch_receipt.get("status") == "outcome_unknown"
+                ),
+                "retry_allowed": False,
+                "lane_id": lane_id,
+                "branch": lane_branch,
+                "old_head": expected_local_head,
+                "new_head": None,
+                "branch_mutation": branch_receipt,
+                "required_readback": [
+                    f"writer:{repo}",
+                    f"remote:{remote}:refs/heads/{remote_branch}",
+                ],
+            }
         _check(
             receipt,
             "branch_cas",
-            "fail",
-            str(
-                branch_receipt.get("status")
-                if isinstance(branch_receipt, dict)
-                else "missing_receipt"
-            ),
+            "pass",
+            str(branch_receipt.get("receipt_sha256", "")),
         )
-        return {
-            "action": "readback_required",
-            "receipt_status": "blocked",
-            "lane_id": lane_id,
-            "branch": lane_branch,
-            "old_head": expected_local_head,
-            "new_head": None,
-            "branch_mutation": branch_receipt,
-        }
-    _check(
-        receipt,
-        "branch_cas",
-        "pass",
-        str(branch_receipt.get("receipt_sha256", "")),
-    )
 
     final = _orient(repo, runner)
     remote_after = _remote_materialization_head(
