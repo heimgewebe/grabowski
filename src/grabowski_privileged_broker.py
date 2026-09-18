@@ -1551,7 +1551,8 @@ def _resolve_secret_pty_action(
         "timeout_seconds", "prompt_sequence", "max_secret_bytes",
         "max_output_bytes", "kill_switch_path", "legacy_kill_switch_path",
         "recovery_gate", "allowed_peer_uid", "allowed_peer_unit",
-        "allowed_peer_executable", "authority_task_id", "authority_host",
+        "allowed_peer_executable", "allowed_peer_interpreter",
+        "authority_task_id", "authority_host",
         "action_schema", "privilege_context", "required_resource_keys",
         "redaction_contract_sha256",
     }
@@ -1624,6 +1625,7 @@ def _resolve_secret_pty_action(
     peer_uid = candidate["allowed_peer_uid"]
     peer_unit = candidate["allowed_peer_unit"]
     peer_executable = candidate["allowed_peer_executable"]
+    peer_interpreter = candidate["allowed_peer_interpreter"]
     authority_task_id = candidate["authority_task_id"]
     authority_host = candidate["authority_host"]
     action_schema = candidate["action_schema"]
@@ -1639,6 +1641,9 @@ def _resolve_secret_pty_action(
         or not isinstance(peer_executable, str)
         or not Path(peer_executable).is_absolute()
         or "\x00" in peer_executable
+        or not isinstance(peer_interpreter, str)
+        or not Path(peer_interpreter).is_absolute()
+        or "\x00" in peer_interpreter
         or not isinstance(authority_task_id, str)
         or re.fullmatch(r"[-A-Za-z0-9_.:]{1,160}", authority_task_id) is None
         or not isinstance(authority_host, str)
@@ -1675,6 +1680,7 @@ def _resolve_secret_pty_action(
         "allowed_peer_uid": peer_uid,
         "allowed_peer_unit": peer_unit,
         "allowed_peer_executable": peer_executable,
+        "allowed_peer_interpreter": peer_interpreter,
         "authority_task_id": authority_task_id,
         "authority_host": authority_host,
         "action_schema": action_schema,
