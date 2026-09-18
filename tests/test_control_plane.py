@@ -2579,6 +2579,105 @@ class SecretPtyContractTests(unittest.TestCase):
         self.assertEqual(envelope["secret_fd"], 7)
         self.assertEqual(envelope["secret_sha256"], secret_sha256)
 
+    def test_secret_pty_public_result_reifies_only_allowlisted_states(self) -> None:
+        root_tool = _load_root_broker_tool()
+        completed = root_tool._secret_pty_reified_result({
+            "outcome": "COMPLETED",
+            "returncode": 0,
+            "timed_out": False,
+            "readback_required": False,
+            "prompt_count": 2,
+            "expected_prompt_count": 2,
+            "failure_reason": None,
+            "raw_marker": "raw-result-marker",
+        })
+        self.assertEqual(completed, {
+            "outcome": "COMPLETED",
+            "returncode": 0,
+            "timed_out": False,
+            "retry_safe": False,
+            "readback_required": False,
+            "prompt_count": 2,
+            "expected_prompt_count": 2,
+            "failure_reason": None,
+        })
+        self.assertNotIn("raw-result-marker", json.dumps(completed))
+
+        unclear = root_tool._secret_pty_reified_result({
+            "outcome": "UNCLEAR",
+            "returncode": 0,
+            "timed_out": False,
+            "readback_required": True,
+            "prompt_count": 99,
+            "expected_prompt_count": 99,
+            "failure_reason": "unexpected-marker",
+        })
+        self.assertEqual(unclear["outcome"], "UNCLEAR")
+        self.assertEqual(unclear["returncode"], 1)
+        self.assertTrue(unclear["readback_required"])
+        self.assertEqual(unclear["prompt_count"], 0)
+        self.assertEqual(unclear["expected_prompt_count"], 2)
+        self.assertEqual(unclear["failure_reason"], "other-failure")
+        self.assertNotIn("unexpected-marker", json.dumps(unclear))
+
+    def test_secret_pty_audit_record_keeps_only_digest_bindings(self) -> None:
+        root_tool = _load_root_broker_tool()
+        reference = self._reference()
+        execution = {
+            "mode": "secret-pty",
+            "argv": [sys.executable, "-c", "raise SystemExit(0)"],
+            "execution_marker": "raw-execution-marker",
+        }
+        session_authority = {
+            "session_id": "raw-session-marker",
+            "task_id": "GRABOWSKI-OPERATOR-SURFACE-V1-T172",
+            "host": "heim-pc",
+        }
+        secret_transport = {
+            "secret_sha256": "d" * 64,
+            "transport_sha256": "e" * 64,
+        }
+        result = {
+            "outcome": "COMPLETED",
+            "returncode": 0,
+            "timed_out": False,
+            "readback_required": False,
+            "prompt_count": 2,
+            "expected_prompt_count": 2,
+            "failure_reason": None,
+        }
+        operator_peer = {
+            "pid": 123,
+            "uid": 1000,
+            "peer_marker": "raw-peer-marker",
+        }
+        record = root_tool._secret_pty_audit_record(
+            reference=reference,
+            execution=execution,
+            session_authority=session_authority,
+            secret_transport=secret_transport,
+            result=result,
+            operator_peer=operator_peer,
+            started=time.monotonic(),
+        )
+        raw = json.dumps(record, sort_keys=True)
+        self.assertNotIn("raw-execution-marker", raw)
+        self.assertNotIn("raw-session-marker", raw)
+        self.assertNotIn("raw-peer-marker", raw)
+        self.assertNotIn("d" * 64, raw)
+        self.assertNotIn("e" * 64, raw)
+        for key in (
+            "reference_binding_sha256",
+            "execution_binding_sha256",
+            "session_authority_binding_sha256",
+            "transport_binding_sha256",
+            "peer_binding_sha256",
+        ):
+            self.assertRegex(str(record[key]), r"\A[0-9a-f]{64}\Z")
+        self.assertEqual(record["outcome"], "COMPLETED")
+        self.assertEqual(record["returncode"], 0)
+        self.assertFalse(record["readback_required"])
+
     def test_request_client_never_treats_unclear_secret_pty_as_success(self) -> None:
         request_tool = _load_privileged_request_tool()
         self.assertTrue(request_tool._response_succeeded({

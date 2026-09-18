@@ -1679,6 +1679,106 @@ def _terminate_secret_pty_child(pid: int) -> int | None:
         return None
 
 
+def _secret_pty_digest(value: object) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _secret_pty_reified_result(result: dict[str, object]) -> dict[str, object]:
+    complete = (
+        result.get("outcome") == "COMPLETED"
+        and result.get("returncode") == 0
+        and result.get("timed_out") is False
+        and result.get("readback_required") is False
+        and result.get("prompt_count") == 2
+        and result.get("expected_prompt_count") == 2
+        and result.get("failure_reason") is None
+    )
+    if complete:
+        return {
+            "outcome": "COMPLETED",
+            "returncode": 0,
+            "timed_out": False,
+            "retry_safe": False,
+            "readback_required": False,
+            "prompt_count": 2,
+            "expected_prompt_count": 2,
+            "failure_reason": None,
+        }
+
+    raw_reason = result.get("failure_reason")
+    if raw_reason == "timeout":
+        failure_reason = "timeout"
+    elif raw_reason == "peer-disconnected":
+        failure_reason = "peer-disconnected"
+    elif raw_reason == "authority-lost":
+        failure_reason = "authority-lost"
+    elif raw_reason == "output-limit":
+        failure_reason = "output-limit"
+    elif raw_reason == "secret-echo":
+        failure_reason = "secret-echo"
+    elif raw_reason == "prompt-out-of-order":
+        failure_reason = "prompt-out-of-order"
+    elif raw_reason == "prompt-repeated":
+        failure_reason = "prompt-repeated"
+    else:
+        failure_reason = "other-failure"
+
+    raw_prompt_count = result.get("prompt_count")
+    if raw_prompt_count == 2:
+        prompt_count = 2
+    elif raw_prompt_count == 1:
+        prompt_count = 1
+    else:
+        prompt_count = 0
+
+    return {
+        "outcome": "UNCLEAR",
+        "returncode": 1,
+        "timed_out": raw_reason == "timeout",
+        "retry_safe": False,
+        "readback_required": True,
+        "prompt_count": prompt_count,
+        "expected_prompt_count": 2,
+        "failure_reason": failure_reason,
+    }
+
+
+def _secret_pty_audit_record(
+    *,
+    reference: dict[str, object],
+    execution: dict[str, object],
+    session_authority: dict[str, object],
+    secret_transport: dict[str, object],
+    result: dict[str, object],
+    operator_peer: dict[str, object],
+    started: float,
+) -> dict[str, object]:
+    safe_result = _secret_pty_reified_result(result)
+    transport_binding = {
+        "secret_sha256": secret_transport.get("secret_sha256"),
+        "transport_sha256": secret_transport.get("transport_sha256"),
+    }
+    return {
+        "schema_version": 1,
+        "timestamp_unix": int(time.time()),
+        "request_id": str(reference["request_id"]),
+        "mode": "secret-pty",
+        "reference_binding_sha256": _secret_pty_digest(reference),
+        "execution_binding_sha256": _secret_pty_digest(execution),
+        "session_authority_binding_sha256": _secret_pty_digest(session_authority),
+        "transport_binding_sha256": _secret_pty_digest(transport_binding),
+        "peer_binding_sha256": _secret_pty_digest(operator_peer),
+        "duration_seconds": round(time.monotonic() - started, 3),
+        **safe_result,
+    }
+
+
 def _run_secret_pty_process(
     *,
     execution: dict[str, object],
@@ -2101,47 +2201,20 @@ def main() -> int:
         finally:
             for index in range(len(secret)):
                 secret[index] = 0
-        record = {
-            **_base_audit_record(reference, execution, pty_started),
-            **_operator_peer_audit_fields(operator_peer),
-            "secret_binding_sha256": secret_transport["secret_sha256"],
-            "secret_transport_sha256": secret_transport["transport_sha256"],
-            "session_id": session_authority["session_id"],
-            "task_id": session_authority["task_id"],
-            "host": session_authority["host"],
-            "action_schema": session_authority["action_schema"],
-            "session_authority_sha256": session_authority["authority_sha256"],
-            "resource_lease_bindings_sha256": session_authority[
-                "resource_lease_bindings_sha256"
-            ],
-            "redaction_contract_sha256": session_authority[
-                "redaction_contract_sha256"
-            ],
-            "prompt_contract_sha256": execution.get("prompt_contract_sha256"),
-            "prompt_count": result["prompt_count"],
-            "expected_prompt_count": result["expected_prompt_count"],
-            "pty_bytes_observed": result["pty_bytes_observed"],
-            "outcome": result["outcome"],
-            "returncode": result["returncode"],
-            "timed_out": result["timed_out"],
-            "retry_safe": False,
-            "readback_required": result["readback_required"],
-            "failure_reason": result["failure_reason"],
-        }
+        record = _secret_pty_audit_record(
+            reference=reference,
+            execution=execution,
+            session_authority=session_authority,
+            secret_transport=secret_transport,
+            result=result,
+            operator_peer=operator_peer,
+            started=pty_started,
+        )
         append_audit(record)
         public_result = {
             "schema_version": 1,
             "mode": "secret-pty",
-            "outcome": result["outcome"],
-            "returncode": result["returncode"],
-            "timed_out": result["timed_out"],
-            "retry_safe": False,
-            "readback_required": result["readback_required"],
-            "prompt_count": result["prompt_count"],
-            "expected_prompt_count": result["expected_prompt_count"],
-            "prompt_contract_sha256": result["prompt_contract_sha256"],
-            "pty_bytes_observed": result["pty_bytes_observed"],
-            "duration_seconds": result["duration_seconds"],
+            **_secret_pty_reified_result(result),
         }
         print(json.dumps(public_result, ensure_ascii=False, sort_keys=True))
         return 0
