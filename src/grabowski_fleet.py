@@ -250,16 +250,6 @@ def run_fleet_task_output_read(
     """
     host = fleet_host(name)
     command = operator._validate_argv(argv, cwd=HOME)
-    if len(command) < 3:
-        raise ValueError("Invalid task-output reader argv length")
-    redaction_probe = [
-        command[0],
-        command[1],
-        "<hash-bound-task-output-read-code>",
-        *command[3:],
-    ]
-    if operator._redact_argv(redaction_probe) != redaction_probe:
-        raise ValueError("task-output reader argv appears to contain secret material")
     if len(command) != 7:
         raise ValueError("Invalid task-output reader argv length")
     if command[0] != TASK_OUTPUT_READ_PYTHON or command[1] != "-c":
@@ -281,6 +271,17 @@ def run_fleet_task_output_read(
         raise ValueError("Invalid task-output reader line limit")
     if str(byte_limit) != command[6] or not 1024 <= byte_limit <= TASK_OUTPUT_MAX_READ_BYTES:
         raise ValueError("Invalid task-output reader byte limit")
+    redaction_probe = [
+        command[0],
+        command[1],
+        "<hash-bound-task-output-read-code>",
+        command[3],
+        "<validated-task-output-stream>",
+        command[5],
+        command[6],
+    ]
+    if operator._redact_argv(redaction_probe) != redaction_probe:
+        raise ValueError("task-output reader argv appears to contain secret material")
     timeout = operator._timeout(timeout_seconds)
     output_limit = operator._output_limit(max_output_bytes)
     if host["transport"] == "local":
@@ -348,14 +349,6 @@ def run_fleet_task_output_cleanup(
     code_sha256 = hashlib.sha256(command[2].encode("utf-8")).hexdigest()
     if code_sha256 != TASK_OUTPUT_CLEANUP_CODE_SHA256:
         raise PermissionError("Task-output cleanup code identity mismatch")
-    redaction_probe = [
-        command[0],
-        command[1],
-        "<hash-bound-task-output-cleanup-code>",
-        *command[3:],
-    ]
-    if operator._redact_argv(redaction_probe) != redaction_probe:
-        raise ValueError("task-output cleanup argv appears to contain secret material")
     mode = command[3]
     if mode not in {"inspect", "delete"}:
         raise ValueError("Invalid task-output cleanup mode")
@@ -385,6 +378,21 @@ def run_fleet_task_output_cleanup(
             or not 0 <= stderr_bytes <= TASK_OUTPUT_CLEANUP_MAX_STREAM_BYTES
         ):
             raise ValueError("Invalid task-output cleanup size binding")
+    redaction_probe = [
+        command[0],
+        command[1],
+        "<hash-bound-task-output-cleanup-code>",
+        command[3],
+        command[4],
+        "<validated-sha256>",
+        *(
+            ["<validated-sha256>", "<validated-sha256>", command[8], command[9]]
+            if mode == "delete"
+            else command[6:10]
+        ),
+    ]
+    if operator._redact_argv(redaction_probe) != redaction_probe:
+        raise ValueError("task-output cleanup argv appears to contain secret material")
     timeout = operator._timeout(timeout_seconds)
     output_limit = operator._output_limit(max_output_bytes)
     if host["transport"] == "local":
