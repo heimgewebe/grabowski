@@ -120,7 +120,7 @@ class TransportGripIntegrationTests(unittest.TestCase):
             for item in grips.list_grips(profile="operator")
             if item["name"] == "transport-roundtrip"
         )
-        self.assertEqual(contract["version"], "2.1")
+        self.assertEqual(contract["version"], "2.2")
         self.assertIn("exact-target-bound", contract["acceptance_ids"])
         combined = contract["summary"] + contract["recovery_path"]
         for fragment in (

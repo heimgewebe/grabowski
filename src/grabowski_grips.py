@@ -643,7 +643,7 @@ GRIP_SPECS: dict[str, GripSpec] = {
     ),
     "transport-roundtrip": GripSpec(
         name="transport-roundtrip",
-        version="2.1",
+        version="2.2",
         summary=(
             "Issue a private exact-target challenge or atomically execute its target. "
             "action=begin requires target_tool_name and target_arguments. For shared_unlabeled "
