@@ -1339,6 +1339,21 @@ def _assert_source_unchanged(before: Mapping[str, Any], after: Mapping[str, Any]
             raise PreflightError(f"source checkout changed during preflight: {field}")
 
 
+def _assert_source_matches_requested_commit(
+    observed: Mapping[str, Any], request: Mapping[str, Any]
+) -> None:
+    repository = request.get("repository")
+    expected = repository.get("commit") if isinstance(repository, Mapping) else None
+    if (
+        not isinstance(expected, str)
+        or re.fullmatch(r"[0-9a-f]{40}", expected) is None
+        or observed.get("head") != expected
+    ):
+        raise PreflightError(
+            "source checkout HEAD does not match requested repository commit"
+        )
+
+
 def prepare_snapshot(treatment: Mapping[str, Any]) -> tuple[dict[str, Any], int]:
     started = time.monotonic()
     binding = treatment.get("repobrief")
@@ -1744,6 +1759,7 @@ def authorize_dispatch(
         )
         source = runner.load_repository_root(baseline, repository_map)
         before = source_state(source)
+        _assert_source_matches_requested_commit(before, baseline)
         snapshot, snapshot_preparation_ms = prepare_snapshot(treatment)
         freshness, freshness_check_ms = probe_freshness(treatment)
         if freshness["status"] != "fresh":
@@ -1877,6 +1893,7 @@ def execute_preflight(
         )
         source = runner.load_repository_root(baseline, repository_map)
         before = source_state(source)
+        _assert_source_matches_requested_commit(before, baseline)
         snapshot, snapshot_preparation_ms = prepare_snapshot(treatment)
         freshness, freshness_check_ms = probe_freshness(treatment)
         if freshness["status"] != "fresh":

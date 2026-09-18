@@ -2597,6 +2597,57 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertIsNone(runner.cleanup_staged_repoground_manifest(binding))
             self.assertFalse(staged.parent.exists())
 
+    def test_staged_manifest_rejects_missing_or_nonregular_identity_artifact(self) -> None:
+        for mode in ("missing", "directory", "symlink"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                state_root = root / "state"
+                state_root.mkdir(mode=0o700)
+                bundle = root / "bundle"
+                bundle.mkdir()
+                artifact = bundle / "brief.md"
+                authorized = b"authorized artifact\n"
+                artifact.write_bytes(authorized)
+                manifest = bundle / "chosen.bundle.manifest.json"
+                manifest.write_text(
+                    json.dumps(
+                        {
+                            "artifacts": [
+                                {
+                                    "role": "canonical_md",
+                                    "path": "brief.md",
+                                    "bytes": len(authorized),
+                                    "sha256": hashlib.sha256(authorized).hexdigest(),
+                                }
+                            ]
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                expected = file_identity(manifest)
+
+                if mode == "missing":
+                    artifact.unlink()
+                    pattern = "bundle artifact is unavailable"
+                elif mode == "directory":
+                    artifact.unlink()
+                    artifact.mkdir()
+                    pattern = "bundle artifact must be a regular non-symlink file"
+                else:
+                    target = bundle / "other.md"
+                    target.write_bytes(authorized)
+                    artifact.unlink()
+                    artifact.symlink_to(target.name)
+                    pattern = (
+                        "manifest artifact path changes through filesystem indirection"
+                    )
+
+                with self.assertRaisesRegex(runner.RunnerError, pattern):
+                    runner.stage_repoground_manifest(state_root, expected)
+
+
     def test_staged_manifest_rejects_artifact_content_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

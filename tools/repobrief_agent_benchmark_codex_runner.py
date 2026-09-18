@@ -1588,6 +1588,45 @@ def _repository_root_from_authorized_map_bytes(
         raise RunnerError("repository map root is not a Git checkout")
     return root
 
+def _assert_all_authorized_request_files(
+    binding: Mapping[str, Any], request_root: Path
+) -> None:
+    requests = binding.get("requests")
+    if not isinstance(requests, dict) or set(requests) != {"baseline", "treatment"}:
+        raise RunnerError("preflight dispatch authorization request bindings are incomplete")
+    root = request_root.expanduser().resolve()
+    for condition in ("baseline", "treatment"):
+        expected_request = requests.get(condition)
+        expected_file = (
+            expected_request.get("file")
+            if isinstance(expected_request, dict)
+            else None
+        )
+        if (
+            not isinstance(expected_file, dict)
+            or not isinstance(expected_file.get("path"), str)
+        ):
+            raise RunnerError(
+                f"preflight dispatch authorization {condition} request file identity is missing"
+            )
+        expected_path = Path(expected_file["path"])
+        try:
+            expected_path.resolve(strict=True).relative_to(root)
+        except (OSError, ValueError) as exc:
+            raise RunnerError(
+                f"preflight dispatch authorization {condition} request file escapes request root"
+            ) from exc
+        current = _runtime_file_identity(
+            expected_path,
+            label=f"{condition} request",
+            max_bytes=base.MAX_REQUEST_BYTES,
+        )
+        if canonical(expected_file) != canonical(current):
+            raise RunnerError(
+                f"preflight dispatch authorization {condition} request file identity mismatch"
+            )
+
+
 def _assert_authorized_runtime_binding(
     binding: Mapping[str, Any],
     request: Mapping[str, Any],
@@ -1617,6 +1656,8 @@ def _assert_authorized_runtime_binding(
     if canonical(expected_map) != canonical(current_map):
         raise RunnerError("preflight dispatch authorization repository map identity mismatch")
 
+    _assert_all_authorized_request_files(binding, request_root)
+
     condition = request.get("condition")
     requests = binding.get("requests")
     expected_request = requests.get(condition) if isinstance(requests, dict) else None
@@ -1629,19 +1670,6 @@ def _assert_authorized_runtime_binding(
         raise RunnerError(
             f"preflight dispatch authorization does not bind this {condition} request"
         )
-    expected_file = expected_request.get("file")
-    if not isinstance(expected_file, dict) or not isinstance(expected_file.get("path"), str):
-        raise RunnerError("preflight dispatch authorization request file identity is missing")
-    expected_path = Path(expected_file["path"])
-    try:
-        expected_path.resolve(strict=True).relative_to(request_root.expanduser().resolve())
-    except (OSError, ValueError) as exc:
-        raise RunnerError("preflight dispatch authorization request file escapes request root") from exc
-    current_request_file = _runtime_file_identity(
-        expected_path, label=f"{condition} request", max_bytes=base.MAX_REQUEST_BYTES
-    )
-    if canonical(expected_file) != canonical(current_request_file):
-        raise RunnerError("preflight dispatch authorization request file identity mismatch")
     return repository_map_bytes
 
 
@@ -2219,18 +2247,15 @@ def stage_repoground_manifest(
             state_root / "repoground-manifest-runtime", prefix="bundle-"
         )
         artifact_bindings: list[dict[str, Any]] = []
-        absent_artifacts: list[Path] = []
         for relative, candidate, expected_bytes, expected_sha256 in artifact_paths:
             try:
                 metadata = candidate.lstat()
-            except FileNotFoundError:
-                absent_artifacts.append(stage_root / relative)
-                continue
             except OSError as exc:
                 raise RunnerError("RepoGround bundle artifact is unavailable") from exc
-            if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-                absent_artifacts.append(stage_root / relative)
-                continue
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                raise RunnerError(
+                    "RepoGround bundle artifact must be a regular non-symlink file"
+                )
             _snapshot, artifact_raw = _runtime_file_snapshot(
                 candidate,
                 label=f"RepoGround bundle artifact {relative}",
@@ -2270,7 +2295,6 @@ def stage_repoground_manifest(
         bound["runtime_dir"] = stage_root
         bound["runtime_identity"] = _private_directory_identity(os.fstat(stage_fd))
         bound["artifact_bindings"] = artifact_bindings
-        bound["absent_artifacts"] = absent_artifacts
         return bound
     except BaseException:
         if stage_fd is not None:
@@ -2304,12 +2328,6 @@ def _revalidate_staged_repoground_manifest(binding: Mapping[str, Any]) -> None:
             or current_artifact["sha256"] != artifact["sha256"]
         ):
             raise RunnerError("RepoGround bundle artifact stage changed during execution")
-    for path in binding.get("absent_artifacts", []):
-        try:
-            Path(path).lstat()
-        except FileNotFoundError:
-            continue
-        raise RunnerError("absent RepoGround bundle artifact appeared during execution")
     _revalidate_private_stage_tree(
         binding,
         (binding, *binding.get("artifact_bindings", [])),

@@ -1648,6 +1648,75 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
         environment["baseline"], environment["treatment"] = requests
         return pair_id, requests[0], requests[1]
 
+    def test_codex_authorization_rejects_source_head_different_from_requested_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = support.fixture_environment(root)
+            pair_id, _baseline, _treatment = self._codex_pair(environment)
+            state_root = root / "state"
+            codex = root / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            codex.chmod(0o755)
+            codex_sha256 = hashlib.sha256(codex.read_bytes()).hexdigest()
+            original_source_state = codex_preflight.core.source_state
+
+            def wrong_head(source: Path) -> dict:
+                observed = original_source_state(source)
+                observed["head"] = "f" * 40
+                return observed
+
+            with (
+                mock.patch.object(
+                    codex_preflight.codex_runner,
+                    "validate_executable",
+                    return_value=str(codex.resolve()),
+                ),
+                mock.patch.object(codex_preflight.codex_runner, "validate_toolchain"),
+                mock.patch.object(
+                    codex_preflight.codex_runner,
+                    "validate_chatgpt_subscription",
+                    return_value=b'{"tokens":{}}',
+                ),
+                mock.patch.object(
+                    codex_preflight.core,
+                    "source_state",
+                    side_effect=wrong_head,
+                ),
+                mock.patch.object(
+                    codex_preflight.core,
+                    "probe_freshness",
+                    side_effect=AssertionError(
+                        "freshness must not run for the wrong requested commit"
+                    ),
+                ) as freshness,
+            ):
+                with self.assertRaisesRegex(
+                    codex_preflight.core.PreflightError,
+                    "source checkout HEAD does not match requested repository commit",
+                ):
+                    codex_preflight.authorize_pair(
+                        pair_id=pair_id,
+                        request_root=environment["request_root"],
+                        repository_map=environment["repository_map"],
+                        state_root=state_root,
+                        transcript_root=root / "transcripts",
+                        evidence_root=root / "evidence",
+                        report_out=root / "preflight-report.json",
+                        codex_command=str(codex.resolve()),
+                        codex_command_sha256=codex_sha256,
+                        max_cost_usd=support.Decimal("1.00"),
+                        validator_command=codex_preflight.core._command_array(
+                            environment["validator_command"]
+                        ),
+                    )
+            freshness.assert_not_called()
+            pair_root = next((state_root / "preflight-dispatch-ledger").iterdir())
+            self.assertFalse((pair_root / "authorization.json").exists())
+            events = support.ledger_events(state_root)
+            self.assertEqual(events[-1]["event"], "preflight-failed")
+            self.assertEqual(events[-1]["payload"]["provider_process_intents"], 0)
+
+
     def test_codex_producer_ledger_is_consumable_by_exact_runner(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1780,6 +1849,28 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
             self.assertEqual(baseline_consumed["mcp_files"], [])
             self.assertIsNone(baseline_consumed["proxy_code"])
             self.assertIsNone(baseline_consumed["manifest"])
+
+            for changed_condition, launch_request in (
+                ("treatment", baseline),
+                ("baseline", treatment),
+            ):
+                request_path = Path(
+                    binding["requests"][changed_condition]["file"]["path"]
+                )
+                original_request = request_path.read_bytes()
+                request_path.write_bytes(original_request + b"\n")
+                try:
+                    with self.assertRaisesRegex(
+                        codex_runner.RunnerError,
+                        f"{changed_condition} request file identity mismatch",
+                    ):
+                        codex_runner._load_preflight_dispatch_authorization(
+                            launch_request,
+                            state_root,
+                            runtime_binding=runtime_binding,
+                        )
+                finally:
+                    request_path.write_bytes(original_request)
 
             wrong_runtime = dict(runtime_binding)
             wrong_runtime["transcript_root"] = root / "other-transcripts"
