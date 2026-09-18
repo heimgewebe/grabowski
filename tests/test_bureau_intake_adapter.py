@@ -1695,6 +1695,116 @@ class BureauIntakeAdapterTests(unittest.TestCase):
         self.assertTrue(result["leases_released"])
         self.assertTrue((directory / "publication-receipt.json").exists())
 
+    def test_publish_first_task_onboarding_binds_required_lease_metadata(
+        self,
+    ) -> None:
+        proposal_id = "5" * 64
+        self._write_proposal(proposal_id)
+        state_root = "/home/alex/.local/state/bureau"
+        keys = [f"path:{state_root}"]
+        onboarding_sha256 = "d" * 64
+        preview = {
+            "kind": "bureau_task_publication_preview",
+            "status": "ready",
+            "publication_mode": "state_store",
+            "coordination_state_root": state_root,
+            "required_resource_keys": keys,
+            "required_lease_metadata": {
+                "authority_kind": "bureau_first_task_onboarding_authority",
+                "first_task_onboarding_sha256": onboarding_sha256,
+                "operation": "state-task-publication",
+                "proposal_sha256": "c" * 64,
+                "task_id": "INIT-T001",
+            },
+        }
+
+        def invoke(arguments, **_kwargs):
+            receipt = Path(arguments[arguments.index("--receipt") + 1])
+            receipt.write_text(
+                json.dumps(
+                    {
+                        "kind": "bureau_task_publication_receipt",
+                        "status": "published",
+                        "publication_mode": "state_store",
+                        "coordination_state_root": state_root,
+                    }
+                )
+                + "\n"
+            )
+            return {
+                "kind": "bureau_task_publication_receipt",
+                "status": "published",
+                "publication_mode": "state_store",
+                "coordination_state_root": state_root,
+            }
+
+        acquired = {"expires_at_unix": 200, "bureau_contract": {}}
+        released = {"released": [{"resource_key": key} for key in keys]}
+        with (
+            mock.patch.object(
+                intake, "grabowski_bureau_task_publish_preview", return_value=preview
+            ),
+            mock.patch.object(
+                intake.resources, "acquire_resources", return_value=acquired
+            ) as acquire,
+            mock.patch.object(
+                intake.resources, "release_resources", return_value=released
+            ),
+            mock.patch.object(intake, "_invoke_bureau", side_effect=invoke),
+        ):
+            result = intake.grabowski_bureau_task_publish(
+                proposal_id, registry_root=str(self.root), lease_ttl_seconds=240
+            )
+
+        metadata = acquire.call_args.kwargs["metadata"]
+        self.assertEqual(
+            metadata["authority_kind"], "bureau_first_task_onboarding_authority"
+        )
+        self.assertEqual(
+            metadata["first_task_onboarding_sha256"], onboarding_sha256
+        )
+        self.assertEqual(metadata["task_id"], "INIT-T001")
+        self.assertEqual(metadata["operation"], "state-task-publication")
+        self.assertEqual(metadata["proposal_sha256"], "c" * 64)
+        self.assertTrue(result["leases_released"])
+
+    def test_publish_first_task_onboarding_rejects_unbound_lease_metadata(
+        self,
+    ) -> None:
+        proposal_id = "6" * 64
+        self._write_proposal(proposal_id)
+        state_root = "/home/alex/.local/state/bureau"
+        preview = {
+            "kind": "bureau_task_publication_preview",
+            "status": "ready",
+            "publication_mode": "state_store",
+            "coordination_state_root": state_root,
+            "required_resource_keys": [f"path:{state_root}"],
+            "required_lease_metadata": {
+                "authority_kind": "bureau_first_task_onboarding_authority",
+                "first_task_onboarding_sha256": "d" * 64,
+                "operation": "state-task-publication",
+                "proposal_sha256": "e" * 64,
+                "task_id": "INIT-T001",
+            },
+        }
+        with (
+            mock.patch.object(
+                intake, "grabowski_bureau_task_publish_preview", return_value=preview
+            ),
+            mock.patch.object(intake.resources, "acquire_resources") as acquire,
+            mock.patch.object(intake, "_invoke_bureau") as invoke,
+        ):
+            result = intake.grabowski_bureau_task_publish(
+                proposal_id, registry_root=str(self.root)
+            )
+
+        self.assertEqual(
+            result["code"], "publication-lease-metadata-contract-invalid"
+        )
+        acquire.assert_not_called()
+        invoke.assert_not_called()
+
     def test_publish_state_store_receipt_replay_restores_explicit_state_root(
         self,
     ) -> None:

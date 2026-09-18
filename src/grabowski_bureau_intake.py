@@ -1633,6 +1633,63 @@ def _task_publication_contract(payload: dict[str, Any]) -> tuple[str, str | None
     return mode, state_root
 
 
+def _task_publication_lease_metadata(
+    preview: dict[str, Any],
+    *,
+    publication_mode: str,
+    publishing_task_id: str,
+    proposal_sha256: str,
+) -> dict[str, Any]:
+    metadata = {
+        "kind": resources.BUREAU_TASK_PUBLICATION_AUTHORITY_KIND,
+        "authority_action_class": "task_creation_from_external_evidence",
+        "authority_capability": "bureau_mutation",
+        "task_id": publishing_task_id,
+        "operation": (
+            "registry-publication"
+            if publication_mode == "git_pr"
+            else "state-task-publication"
+        ),
+        "proposal_sha256": proposal_sha256,
+        "bureau_phase": "work",
+    }
+    required = preview.get("required_lease_metadata")
+    if required is None:
+        return metadata
+    if publication_mode != "state_store" or not isinstance(required, dict):
+        raise ValueError("publication-lease-metadata-contract-invalid")
+    expected_keys = {
+        "authority_kind",
+        "first_task_onboarding_sha256",
+        "operation",
+        "proposal_sha256",
+        "task_id",
+    }
+    if set(required) != expected_keys:
+        raise ValueError("publication-lease-metadata-contract-invalid")
+    if (
+        required.get("task_id") != publishing_task_id
+        or required.get("operation") != "state-task-publication"
+        or required.get("proposal_sha256") != proposal_sha256
+        or required.get("authority_kind")
+        != "bureau_first_task_onboarding_authority"
+    ):
+        raise ValueError("publication-lease-metadata-contract-invalid")
+    onboarding_sha256 = required.get("first_task_onboarding_sha256")
+    if (
+        not isinstance(onboarding_sha256, str)
+        or SHA256_RE.fullmatch(onboarding_sha256) is None
+    ):
+        raise ValueError("publication-lease-metadata-contract-invalid")
+    metadata.update(
+        {
+            "authority_kind": "bureau_first_task_onboarding_authority",
+            "first_task_onboarding_sha256": onboarding_sha256,
+        }
+    )
+    return metadata
+
+
 def _task_publication_apply_arguments(
     *,
     resolved_root: str,
@@ -1839,19 +1896,15 @@ def grabowski_bureau_task_publish(
         publication_mode=publication_mode,
         coordination_state_root=coordination_state_root,
     )
-    metadata = {
-        "kind": resources.BUREAU_TASK_PUBLICATION_AUTHORITY_KIND,
-        "authority_action_class": "task_creation_from_external_evidence",
-        "authority_capability": "bureau_mutation",
-        "task_id": publishing_task_id,
-        "operation": (
-            "registry-publication"
-            if publication_mode == "git_pr"
-            else "state-task-publication"
-        ),
-        "proposal_sha256": proposal_sha256,
-        "bureau_phase": "work",
-    }
+    try:
+        metadata = _task_publication_lease_metadata(
+            preview,
+            publication_mode=publication_mode,
+            publishing_task_id=publishing_task_id,
+            proposal_sha256=proposal_sha256,
+        )
+    except ValueError as exc:
+        return _adapter_failure(str(exc))
     try:
         acquired = resources.acquire_resources(
             owner_id,
