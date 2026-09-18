@@ -2126,43 +2126,41 @@ def main() -> int:
         isinstance(candidate, dict)
         and candidate.get("mode") == "secret-pty"
     )
-    execution = (
-        resolve_secret_pty_execution(config, reference)
-        if secret_pty_mode
-        else resolve_non_secret_execution(config, reference)
-    )
     operator_peer: dict[str, object] | None = None
-    if execution.get("mode") == "secret-pty":
-        operator_peer = _validate_secret_pty_peer(execution)
-    elif (
-        reference.get("action") in {
-            POWER_ACTION,
-            BLOCKADE_LIFECYCLE_ACTION,
-            ROOTBROKER_CUTOVER_ACTION,
-        }
-        or execution.get("allowed_peer_uid") is not None
-        or execution.get("allowed_peer_unit") is not None
-    ):
-        operator_peer = _validate_blockade_lifecycle_peer(execution)
-    if execution.get("mode") == "recovery-marker-publish":
-        if secret_transport is not None:
-            raise PermissionError("secret transport is not allowed for this action")
-        return _run_recovery_publication(reference, execution)
-    if execution.get("mode") == "blockade-marker-lifecycle":
-        if secret_transport is not None:
-            raise PermissionError("secret transport is not allowed for this action")
-        assert operator_peer is not None
-        return _run_blockade_lifecycle(
-            reference, execution, peer=operator_peer
-        )
-    if execution.get("mode") == "secret-pty":
+    if secret_pty_mode:
+        secret_execution = resolve_secret_pty_execution(config, reference)
+        operator_peer = _validate_secret_pty_peer(secret_execution)
+    else:
+        execution = resolve_non_secret_execution(config, reference)
+        if (
+            reference.get("action") in {
+                POWER_ACTION,
+                BLOCKADE_LIFECYCLE_ACTION,
+                ROOTBROKER_CUTOVER_ACTION,
+            }
+            or execution.get("allowed_peer_uid") is not None
+            or execution.get("allowed_peer_unit") is not None
+        ):
+            operator_peer = _validate_blockade_lifecycle_peer(execution)
+        if execution.get("mode") == "recovery-marker-publish":
+            if secret_transport is not None:
+                raise PermissionError("secret transport is not allowed for this action")
+            return _run_recovery_publication(reference, execution)
+        if execution.get("mode") == "blockade-marker-lifecycle":
+            if secret_transport is not None:
+                raise PermissionError("secret transport is not allowed for this action")
+            assert operator_peer is not None
+            return _run_blockade_lifecycle(
+                reference, execution, peer=operator_peer
+            )
+    if secret_pty_mode:
         assert operator_peer is not None
         if secret_transport is None:
             raise PermissionError("secret PTY action requires peer-bound FD transport")
         session_authority = validate_secret_pty_session_authority(
-            secret_transport.get("session_authority"), execution
+            secret_transport.get("session_authority"), secret_execution
         )
-        cwd_value = execution.get("cwd")
+        cwd_value = secret_execution.get("cwd")
         if not isinstance(cwd_value, str) or not Path(cwd_value).is_dir():
             raise ValueError("secret PTY cwd is not an existing directory")
         _claim_secret_pty_authority(reference, session_authority)
@@ -2175,27 +2173,27 @@ def main() -> int:
             "redaction_contract_sha256", "prompt_contract_sha256",
         )
         refreshed = resolve_secret_pty_execution(config, reference)
-        if any(refreshed.get(key) != execution.get(key) for key in identity_keys):
+        if any(refreshed.get(key) != secret_execution.get(key) for key in identity_keys):
             raise PermissionError("secret PTY execution contract changed before spawn")
-        first_gate = execution.get("gate")
+        first_gate = secret_execution.get("gate")
         refreshed_gate = refreshed.get("gate")
         if not isinstance(first_gate, dict) or not isinstance(refreshed_gate, dict):
             raise PermissionError("secret PTY recovery gate is unavailable")
         for key in ("recovery_marker_sha256", "recovery_marker_source_sha256"):
             if refreshed_gate.get(key) != first_gate.get(key):
                 raise PermissionError("secret PTY recovery authority changed before spawn")
-        execution = refreshed
+        secret_execution = refreshed
         session_authority = validate_secret_pty_session_authority(
-            session_authority, execution
+            session_authority, secret_execution
         )
-        refreshed_peer = _validate_secret_pty_peer(execution)
+        refreshed_peer = _validate_secret_pty_peer(secret_execution)
         if (
             refreshed_peer.get("pid") != operator_peer.get("pid")
             or refreshed_peer.get("starttime_ticks") != operator_peer.get("starttime_ticks")
         ):
             raise PermissionError("secret PTY peer identity changed before spawn")
         operator_peer = refreshed_peer
-        secret = _read_peer_bound_secret(secret_transport, operator_peer, execution)
+        secret = _read_peer_bound_secret(secret_transport, operator_peer, secret_execution)
         peer_pid = int(operator_peer["pid"])
         peer_parent = int(operator_peer["parent_pid"])
         peer_starttime = int(operator_peer["starttime_ticks"])
@@ -2210,7 +2208,7 @@ def main() -> int:
         pty_started = time.monotonic()
         try:
             result = _run_secret_pty_process(
-                execution=execution,
+                execution=secret_execution,
                 secret=secret,
                 peer_alive=peer_alive,
             )
@@ -2219,7 +2217,7 @@ def main() -> int:
                 secret[index] = 0
         record = _secret_pty_audit_record(
             reference=reference,
-            execution=execution,
+            execution=secret_execution,
             session_authority=session_authority,
             secret_transport=secret_transport,
             result=result,
