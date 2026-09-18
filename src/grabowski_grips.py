@@ -6536,7 +6536,40 @@ def _run_remote_head_materialize(
         _check(receipt, check_id, "pass", f"count={len(resource_keys)}")
         return [live[key] for key in sorted(resource_keys)]
 
-    lane_lease_snapshots("lane_leases")
+    def validate_locked_lane(
+        lane_receipt_path: Path,
+        check_id: str,
+        *,
+        effect_started: bool = False,
+    ) -> None:
+        locked_record = work_acquire._read_state(lane_receipt_path)
+        locked_inputs = (
+            locked_record.get("inputs")
+            if isinstance(locked_record, dict)
+            else None
+        )
+        lane_inactive = (
+            not isinstance(locked_record, dict)
+            or locked_record.get("lane_id") != lane_id
+            or locked_record.get("state") != "ready"
+            or locked_inputs != lane
+            or locked_record.get("terminal_closeout") is not None
+            or locked_record.get("terminal_closeout_pending") is not None
+        )
+        if lane_inactive:
+            _check(receipt, check_id, "fail", "lane_state_changed")
+            message = (
+                "remote-head-materialize Work Lane changed during "
+                "materialization validation"
+            )
+            if effect_started:
+                raise GripActionError(message)
+            raise GripPreflightError(message)
+        _check(receipt, check_id, "pass", "ready")
+
+    with work_acquire._lane_lock(lane_id) as lane_receipt_path:
+        validate_locked_lane(lane_receipt_path, "lane_active_before_import")
+        lane_lease_snapshots("lane_leases")
 
     _validate_remote_materialization_target(repo, remote, receipt, runner)
     shallow = _git_optional(repo, runner, ["rev-parse", "--is-shallow-repository"])
@@ -6589,26 +6622,7 @@ def _run_remote_head_materialize(
             )
         _check(receipt, "fast_forward", "pass", "ancestor")
         with work_acquire._lane_lock(lane_id) as lane_receipt_path:
-            locked_record = work_acquire._read_state(lane_receipt_path)
-            locked_inputs = (
-                locked_record.get("inputs")
-                if isinstance(locked_record, dict)
-                else None
-            )
-            lane_inactive = (
-                not isinstance(locked_record, dict)
-                or locked_record.get("lane_id") != lane_id
-                or locked_record.get("state") != "ready"
-                or locked_inputs != lane
-                or locked_record.get("terminal_closeout") is not None
-                or locked_record.get("terminal_closeout_pending") is not None
-            )
-            if lane_inactive:
-                _check(receipt, "lane_active_replay", "fail", "lane_state_changed")
-                raise GripPreflightError(
-                    "remote-head-materialize Work Lane changed during replay validation"
-                )
-            _check(receipt, "lane_active_replay", "pass", "ready")
+            validate_locked_lane(lane_receipt_path, "lane_active_replay")
 
             remote_after = _remote_materialization_head(
                 repo,
@@ -6723,26 +6737,11 @@ def _run_remote_head_materialize(
     _check(receipt, "fast_forward", "pass", "ancestor")
 
     with work_acquire._lane_lock(lane_id) as lane_receipt_path:
-        locked_record = work_acquire._read_state(lane_receipt_path)
-        locked_inputs = (
-            locked_record.get("inputs")
-            if isinstance(locked_record, dict)
-            else None
+        validate_locked_lane(
+            lane_receipt_path,
+            "lane_active_after_import",
+            effect_started=True,
         )
-        lane_inactive = (
-            not isinstance(locked_record, dict)
-            or locked_record.get("lane_id") != lane_id
-            or locked_record.get("state") != "ready"
-            or locked_inputs != lane
-            or locked_record.get("terminal_closeout") is not None
-            or locked_record.get("terminal_closeout_pending") is not None
-        )
-        if lane_inactive:
-            _check(receipt, "lane_active_after_import", "fail", "lane_state_changed")
-            raise GripActionError(
-                "remote-head-materialize Work Lane changed during exact-head object import"
-            )
-        _check(receipt, "lane_active_after_import", "pass", "ready")
 
         remote_after = _remote_materialization_head(
             repo,

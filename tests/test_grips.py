@@ -8398,6 +8398,7 @@ class GripFoundationTests(unittest.TestCase):
         missing_lease: bool = False,
         lease_reads: list[dict[str, dict[str, object]]] | None = None,
         locked_terminal: bool = False,
+        locked_terminal_after_initial: bool = False,
     ) -> tuple[dict[str, object], FakeRemoteMaterializeGit, types.ModuleType]:
         git, operator, lane_inputs, leases = self._remote_materialize_lane_case(
             tmp,
@@ -8436,6 +8437,12 @@ class GripFoundationTests(unittest.TestCase):
         }
         if locked_terminal:
             locked_record["terminal_closeout"] = {"state": "terminal"}
+        read_state = Mock(return_value=locked_record)
+        if locked_terminal_after_initial:
+            read_state.side_effect = [
+                locked_record,
+                {**locked_record, "terminal_closeout": {"state": "terminal"}},
+            ]
 
         with (
             patch(
@@ -8450,7 +8457,7 @@ class GripFoundationTests(unittest.TestCase):
             ),
             patch(
                 "grabowski_work_acquire._read_state",
-                return_value=locked_record,
+                read_state,
             ),
             patch.dict(sys.modules, {"grabowski_operator": operator}),
         ):
@@ -8493,6 +8500,7 @@ class GripFoundationTests(unittest.TestCase):
         }
         for check_id in (
             "lane_binding",
+            "lane_active_before_import",
             "lane_leases",
             "remote_head_before",
             "object_import",
@@ -8635,13 +8643,28 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("a" * 40, fake.head)
         operator.grabowski_git.assert_not_called()
 
-    def test_remote_head_materialize_rejects_terminal_lane_after_object_import(
+    def test_remote_head_materialize_rejects_terminal_lane_before_object_import(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             result, fake, operator = self._run_remote_materialize_case(
                 tmp,
                 locked_terminal=True,
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("Work Lane changed", result["output"]["error"])
+        self.assertFalse(any("fetch" in call for call in fake.calls))
+        self.assertEqual("a" * 40, fake.head)
+        operator.grabowski_git.assert_not_called()
+
+    def test_remote_head_materialize_rejects_terminalization_after_object_import(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, fake, operator = self._run_remote_materialize_case(
+                tmp,
+                locked_terminal_after_initial=True,
             )
 
         self.assertEqual("failed", result["receipt"]["status"])
@@ -8717,7 +8740,7 @@ class GripFoundationTests(unittest.TestCase):
             result, fake, operator = self._run_remote_materialize_case(
                 tmp,
                 fake_git=fake,
-                locked_terminal=True,
+                locked_terminal_after_initial=True,
             )
 
         self.assertEqual("blocked", result["receipt"]["status"])
