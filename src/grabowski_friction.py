@@ -1532,12 +1532,22 @@ def connector_transport_live_diagnostics(
         for unit, probe in journal_probes.items()
     }
     for unit, lookback in response_lifecycle_lookbacks.items():
-        if lookback["signal_count"] <= 0:
+        if lookback["signal_count"] > 0:
+            if transport_health_states[unit] in {"healthy", "indeterminate"}:
+                transport_health_states[unit] = "degraded"
+            if window_states[unit] == "no_errors":
+                window_states[unit] = "lifecycle_errors_outside_tail_window"
             continue
-        if transport_health_states[unit] in {"healthy", "indeterminate"}:
-            transport_health_states[unit] = "degraded"
+        if lookback["journal_window_complete"]:
+            continue
+        if transport_health_states[unit] == "healthy":
+            transport_health_states[unit] = "indeterminate"
         if window_states[unit] == "no_errors":
-            window_states[unit] = "lifecycle_errors_outside_tail_window"
+            window_states[unit] = (
+                "indeterminate_truncated"
+                if lookback["stdout_truncated"]
+                else "indeterminate_incomplete"
+            )
 
     response_lifecycle_counts: Counter[str] = Counter()
     response_lifecycle_units: list[str] = []

@@ -1064,6 +1064,44 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         )
         self.assertNotIn("wfr_evicted/abcd", json.dumps(diagnostics, sort_keys=True))
 
+    def test_connector_transport_live_diagnostics_marks_incomplete_lookback_indeterminate(self) -> None:
+        module = self._load_module()
+        module.FRICTION_LOG.parent.mkdir(parents=True, exist_ok=True)
+        module.FRICTION_LOG.write_text("", encoding="utf-8")
+
+        def fake_run(argv, *, timeout_seconds=30, max_output_bytes=131_072):
+            if argv[0] == "systemctl":
+                return {
+                    "returncode": 0,
+                    "timed_out": False,
+                    "stdout": "LoadState=loaded\nActiveState=active\nSubState=running\nResult=success\nNRestarts=0\n",
+                    "stderr": "",
+                    "stdout_truncated": False,
+                    "stderr_truncated": False,
+                }
+            self.assertEqual(max_output_bytes, module.CONNECTOR_DIAGNOSTIC_JOURNAL_BYTES)
+            is_lookback = "--grep" in argv
+            return {
+                "returncode": 1 if is_lookback else 0,
+                "timed_out": is_lookback,
+                "stdout": "",
+                "stderr": "",
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+            }
+
+        module._run_diagnostic_command = fake_run
+        diagnostics = module.connector_transport_live_diagnostics(limit=1, max_log_lines=25)
+
+        self.assertEqual(diagnostics["response_lifecycle_lookback_signal_count"], 0)
+        self.assertFalse(diagnostics["live_transport_errors_observed"])
+        self.assertFalse(diagnostics["transport_degraded"])
+        self.assertEqual(diagnostics["transport_health_state"], "indeterminate")
+        self.assertEqual(diagnostics["transport_window_state"], "indeterminate_incomplete")
+        for probe in diagnostics["response_lifecycle_lookback_probes"].values():
+            self.assertFalse(probe["journal_window_complete"])
+
+
     def test_connector_transport_probe_separates_completed_stop_lifecycle_issues(self) -> None:
         module = self._load_module()
         invocation = "a" * 32
