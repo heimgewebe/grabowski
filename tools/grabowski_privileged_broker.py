@@ -1535,6 +1535,7 @@ def _validate_secret_pty_peer(
     expected_uid = execution.get("allowed_peer_uid")
     expected_unit = execution.get("allowed_peer_unit")
     expected_executable = execution.get("allowed_peer_executable")
+    expected_interpreter = execution.get("allowed_peer_interpreter")
     if (
         isinstance(expected_uid, bool)
         or not isinstance(expected_uid, int)
@@ -1543,6 +1544,8 @@ def _validate_secret_pty_peer(
         or not expected_unit
         or not isinstance(expected_executable, str)
         or not expected_executable.startswith("/")
+        or not isinstance(expected_interpreter, str)
+        or not expected_interpreter.startswith("/")
     ):
         raise PermissionError("secret PTY peer identity is not authorized")
     observed_unit = (
@@ -1578,6 +1581,21 @@ def _validate_secret_pty_peer(
     shebang = len(argv) >= 2 and argv[1] == expected_executable
     if not direct and not shebang:
         raise PermissionError("secret PTY peer executable is unauthorized")
+    try:
+        expected_interpreter_path = Path(expected_interpreter).resolve(strict=True)
+        interpreter_metadata = expected_interpreter_path.stat()
+        observed_interpreter_path = (
+            proc_root / str(pid) / "exe"
+        ).resolve(strict=True)
+    except OSError as exc:
+        raise PermissionError("secret PTY peer interpreter is unavailable") from exc
+    if (
+        not stat.S_ISREG(interpreter_metadata.st_mode)
+        or interpreter_metadata.st_uid != 0
+        or interpreter_metadata.st_mode & 0o022
+        or observed_interpreter_path != expected_interpreter_path
+    ):
+        raise PermissionError("secret PTY peer interpreter is unauthorized")
     parent_after, starttime_after = _process_identity(pid, proc_root=proc_root)
     if parent_after != parent_pid or starttime_after != starttime_ticks:
         raise PermissionError("secret PTY peer identity changed during validation")
@@ -2054,7 +2072,8 @@ def main() -> int:
             "mode", "argv", "cwd", "timeout_seconds", "prompt_sequence",
             "max_secret_bytes", "max_output_bytes", "kill_switch_path",
             "legacy_kill_switch_path", "allowed_peer_uid", "allowed_peer_unit",
-            "allowed_peer_executable", "authority_task_id", "authority_host",
+            "allowed_peer_executable", "allowed_peer_interpreter",
+            "authority_task_id", "authority_host",
             "action_schema", "privilege_context", "required_resource_keys",
             "redaction_contract_sha256", "prompt_contract_sha256",
         )
