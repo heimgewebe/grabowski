@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import asyncio
 from contextlib import closing, contextmanager
+import base64
 import hashlib
 import inspect
 import io
@@ -275,6 +276,11 @@ class TaskTests(unittest.TestCase):
             applied_at_unix=now_unix + 1,
         )
 
+    def _staged_capture_argv(self, record: dict) -> list[str]:
+        """Stage the wrapper the way a local launch does, then build its argv."""
+        tasks._stage_task_output_capture_script("local", transport="local")
+        return tasks._task_output_capture_argv(record)
+
     def _start(
         self,
         *,
@@ -347,7 +353,14 @@ class TaskTests(unittest.TestCase):
         separator = launch.index("--")
         capture = launch[separator + 1 :]
         paths = tasks._task_output_paths(result["task"])
-        script = tasks._task_output_capture_script()
+        script = tasks._task_output_capture_script_path()
+        if selected["transport"] == "local":
+            self.assertTrue(script.is_file(), "local launch must stage the wrapper")
+            self.assertEqual(script.read_text(), tasks.TASK_OUTPUT_CAPTURE_CODE)
+        else:
+            self.assertFalse(
+                script.exists(), "a remote launch must not stage on the controller"
+            )
         self.assertEqual(
             capture[:5],
             [
@@ -359,7 +372,6 @@ class TaskTests(unittest.TestCase):
             ],
         )
         self.assertNotIn("-c", capture)
-        self.assertEqual(script.read_text(), tasks.TASK_OUTPUT_CAPTURE_CODE)
         for argument in launch:
             self.assertLess(
                 len(argument.encode("utf-8")),
@@ -381,6 +393,10 @@ class TaskTests(unittest.TestCase):
         )
 
     def test_capture_script_is_content_addressed_and_idempotent(self) -> None:
+        self.assertEqual(
+            tasks._task_output_capture_script_path(),
+            tasks._task_output_capture_script(),
+        )
         first = tasks._task_output_capture_script()
         second = tasks._task_output_capture_script()
         self.assertEqual(first, second)
@@ -434,6 +450,70 @@ class TaskTests(unittest.TestCase):
                 tasks.TASK_OUTPUT_CAPTURE_ARGUMENT_MAX_BYTES,
             )
         self.assertNotIn(tasks.TASK_OUTPUT_CAPTURE_CODE, argv)
+
+    def test_local_staging_materializes_without_dispatching(self) -> None:
+        with patch.object(tasks, "_dispatch") as dispatch:
+            staged = tasks._stage_task_output_capture_script(
+                "heim-pc", transport="local"
+            )
+        dispatch.assert_not_called()
+        self.assertEqual(staged["status"], "local")
+        self.assertEqual(staged["path"], str(tasks._task_output_capture_script_path()))
+        self.assertTrue(tasks._task_output_capture_script_path().is_file())
+
+    def test_remote_staging_ships_the_wrapper_to_the_task_host(self) -> None:
+        with patch.object(
+            tasks, "_dispatch", return_value={"returncode": 0, "stdout": "written"}
+        ) as dispatch:
+            staged = tasks._stage_task_output_capture_script(
+                "heimserver", transport="ssh"
+            )
+        self.assertEqual(staged["status"], "written")
+        host, argv = dispatch.call_args.args[0], dispatch.call_args.args[1]
+        self.assertEqual(host, "heimserver")
+        self.assertEqual(argv[0], tasks.TASK_OUTPUT_CAPTURE_PYTHON)
+        self.assertEqual(argv[1], "-c")
+        self.assertEqual(argv[2], tasks.TASK_OUTPUT_CAPTURE_STAGE_CODE)
+        self.assertEqual(argv[3], str(tasks._task_output_capture_script_path()))
+        self.assertEqual(
+            base64.b64decode(argv[4].encode("ascii")).decode("utf-8"),
+            tasks.TASK_OUTPUT_CAPTURE_CODE,
+        )
+        # The wrapper must not be written on the controller for a remote host.
+        self.assertFalse(tasks._task_output_capture_script_path().exists())
+
+    def test_remote_staging_failure_stops_the_launch(self) -> None:
+        with patch.object(
+            tasks, "_dispatch", return_value={"returncode": 1, "stdout": ""}
+        ):
+            with self.assertRaisesRegex(RuntimeError, "could not be staged"):
+                tasks._stage_task_output_capture_script("heimserver", transport="ssh")
+
+    def test_staging_bootstrap_stays_small_and_writes_the_wrapper(self) -> None:
+        self.assertLess(
+            len(tasks.TASK_OUTPUT_CAPTURE_STAGE_CODE.encode("utf-8")),
+            tasks.TASK_OUTPUT_CAPTURE_ARGUMENT_MAX_BYTES,
+        )
+        target = self.capture_script_root / "remote" / "capture-probe.py"
+        payload = base64.b64encode(
+            tasks.TASK_OUTPUT_CAPTURE_CODE.encode("utf-8")
+        ).decode("ascii")
+        argv = [
+            tasks.TASK_OUTPUT_CAPTURE_PYTHON,
+            "-c",
+            tasks.TASK_OUTPUT_CAPTURE_STAGE_CODE,
+            str(target),
+            payload,
+        ]
+        first = subprocess.run(argv, capture_output=True, text=True)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(first.stdout, "written")
+        self.assertEqual(target.read_text(), tasks.TASK_OUTPUT_CAPTURE_CODE)
+        self.assertEqual(stat.S_IMODE(target.lstat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(target.parent.lstat().st_mode), 0o700)
+        second = subprocess.run(argv, capture_output=True, text=True)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(second.stdout, "present")
 
     def test_persistent_task_and_job_defaults_are_six_hours(self) -> None:
         self.assertEqual(tasks.operator.DEFAULT_JOB_RUNTIME, 21_600)
@@ -578,7 +658,7 @@ class TaskTests(unittest.TestCase):
         with patch.object(tasks, "TASK_OUTPUT_MAX_BYTES", 4096), patch.object(
             tasks, "TASK_OUTPUT_TAIL_BYTES", 512
         ):
-            argv = tasks._task_output_capture_argv(record)
+            argv = self._staged_capture_argv(record)
             completed = subprocess.run(
                 argv,
                 cwd=self.root,
@@ -614,7 +694,7 @@ class TaskTests(unittest.TestCase):
             "argv_json": json.dumps([str(fake_rg)]),
         }
         completed = subprocess.run(
-            tasks._task_output_capture_argv(record),
+            self._staged_capture_argv(record),
             cwd=self.root,
             capture_output=True,
             text=True,
@@ -633,7 +713,7 @@ class TaskTests(unittest.TestCase):
             "argv_json": json.dumps([str(missing_rg)]),
         }
         completed = subprocess.run(
-            tasks._task_output_capture_argv(record),
+            self._staged_capture_argv(record),
             cwd=self.root,
             capture_output=True,
             text=True,
@@ -658,7 +738,7 @@ class TaskTests(unittest.TestCase):
         paths = tasks._task_output_paths(record)
         paths["directory"].mkdir(mode=0o700)
         completed = subprocess.run(
-            tasks._task_output_capture_argv(record),
+            self._staged_capture_argv(record),
             cwd=self.root,
             capture_output=True,
             text=True,
@@ -687,7 +767,7 @@ class TaskTests(unittest.TestCase):
         }
         os.chmod(self.output_root, 0o775)
         completed = subprocess.run(
-            tasks._task_output_capture_argv(record),
+            self._staged_capture_argv(record),
             cwd=self.root,
             capture_output=True,
             text=True,
