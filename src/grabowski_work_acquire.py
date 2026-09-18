@@ -203,10 +203,11 @@ def _closeout_inputs(parameters: dict[str, Any], lane_id: str) -> dict[str, Any]
         _text(parameters.get("source_kind"), "source_kind"),
         _text(parameters.get("source_id"), "source_id"),
     )
-    _text(parameters.get("repo"), "repo")
+    repo = Path(_text(parameters.get("repo"), "repo")).expanduser().resolve(strict=False)
     target = Path(_text(parameters.get("target_path"), "target_path")).expanduser()
     if not target.is_absolute():
         raise ValueError("target_path must be absolute")
+    target = target.resolve(strict=False)
     branch = _text(parameters.get("branch"), "branch")
     base_head = _text(parameters.get("base_head"), "base_head").lower()
     if SHA40_RE.fullmatch(base_head) is None:
@@ -260,8 +261,10 @@ def _closeout_inputs(parameters: dict[str, Any], lane_id: str) -> dict[str, Any]
         "source": {"kind": source_kind, "id": source_id},
         "controller": {"actor": controller_actor, "role": "controller"},
         "scoped_writer": ({"actor": writer, "role": "scoped_writer"} if writer else None),
+        "repo": str(repo),
         "base_head": base_head,
         "branch": branch,
+        "target_path": str(target),
         "purpose": purpose,
         "artifact_class": artifact_class,
         "retention_until_unix": retention,
@@ -530,6 +533,69 @@ def _ensure_terminal_closeout_audit(
     if readback != appended:
         raise RuntimeError("terminal closeout audit append readback mismatch")
     return appended
+
+
+def reconcile_terminal_closeout_audit(
+    lane_id: str,
+    *,
+    expected_receipt_sha256: str,
+    audit_fn: Callable[[dict[str, Any]], str | None],
+    audit_lookup_fn: Callable[[dict[str, Any]], str | None],
+) -> dict[str, Any]:
+    """Repair only a missing audit record for an already-persisted terminal lane.
+
+    This path does not reassess Git, leases, processes, or terminal semantics. It
+    reuses the exact stored terminal assessment and its original CAS preimage,
+    then idempotently ensures the corresponding audit transition exists.
+    """
+    _text(lane_id, "lane_id", pattern=re.compile(r"[0-9a-f]{32}\Z"))
+    _text(
+        expected_receipt_sha256,
+        "expected_receipt_sha256",
+        pattern=re.compile(r"[0-9a-f]{64}\Z"),
+    )
+    with _lane_lock(lane_id) as receipt_path:
+        record = _read_state(receipt_path)
+        if record is None or record.get("lane_id") != lane_id:
+            raise RuntimeError("work-lane receipt is missing or bound to another lane")
+        assessment = _terminal_closeout_assessment(record)
+        if assessment is None:
+            raise RuntimeError("work-lane source has no terminal closeout evidence")
+        terminal = record.get("terminal_closeout")
+        if (
+            not isinstance(terminal, dict)
+            or terminal.get("expected_receipt_sha256") != expected_receipt_sha256
+        ):
+            raise RuntimeError(
+                "work-lane terminal audit reconciliation CAS preimage changed"
+            )
+        event = _terminal_closeout_audit_event(record, assessment)
+        audit_record_sha256 = _ensure_terminal_closeout_audit(
+            record,
+            assessment,
+            audit_fn=audit_fn,
+            audit_lookup_fn=audit_lookup_fn,
+        )
+        if audit_record_sha256 is None:
+            raise RuntimeError("work-lane terminal audit reconciliation produced no audit digest")
+        return {
+            "schema_version": 1,
+            "kind": "grabowski.work_lane_terminal_audit_reconciliation",
+            "lane_id": lane_id,
+            "closeout_state": assessment["closeout_state"],
+            "assessment_sha256": assessment["assessment_sha256"],
+            "expected_receipt_sha256": expected_receipt_sha256,
+            "lane_receipt_sha256": record.get("receipt_sha256"),
+            "terminal_transition_sha256": event["terminal_transition_sha256"],
+            "terminal_closeout_audit_record_sha256": audit_record_sha256,
+            "does_not_establish": [
+                "fresh_terminal_assessment",
+                "fresh_git_state",
+                "fresh_process_state",
+                "fresh_lease_state",
+                "checkout_cleanup_authority",
+            ],
+        }
 
 
 def _converge_terminal_checkout_lifecycle(
@@ -2424,7 +2490,7 @@ def grabowski_work_acquire(
     ttl_seconds: int = 7200,
     terminal_closeout: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Acquire a work lane, or persist its evidence-bound terminal closeout."""
+    """Acquire a work lane, persist terminal closeout, or repair only its missing audit."""
     parameters = {
         "source_kind": source_kind,
         "source_id": source_id,
@@ -2447,12 +2513,37 @@ def grabowski_work_acquire(
         "ttl_seconds": ttl_seconds,
     }
     if terminal_closeout is not None:
-        if not isinstance(terminal_closeout, dict) or set(terminal_closeout) != {
+        if not isinstance(terminal_closeout, dict):
+            raise ValueError("terminal_closeout must be an object")
+        audit_only_keys = {
+            "expected_receipt_sha256",
+            "lane_id",
+            "reconcile_audit_only",
+        }
+        if set(terminal_closeout) == audit_only_keys:
+            if terminal_closeout["reconcile_audit_only"] is not True:
+                raise ValueError("reconcile_audit_only must be true")
+            lane_id = terminal_closeout["lane_id"]
+            if not isinstance(lane_id, str):
+                raise ValueError("terminal_closeout.lane_id must be a string")
+            inputs = _closeout_inputs(parameters, lane_id)
+            operator._require_operator_mutation(
+                "resource_lease", path=inputs["target_path"], repo=inputs["repo"]
+            )
+            return reconcile_terminal_closeout_audit(
+                inputs["lane_id"],
+                expected_receipt_sha256=terminal_closeout[
+                    "expected_receipt_sha256"
+                ],
+                audit_fn=operator.base._append_audit_with_digest,
+                audit_lookup_fn=_find_terminal_closeout_audit,
+            )
+        if set(terminal_closeout) != {
             "expected_receipt_sha256",
             "observation",
         }:
             raise ValueError(
-                "terminal_closeout must contain exactly expected_receipt_sha256 and observation"
+                "terminal_closeout must contain either expected_receipt_sha256 + observation or expected_receipt_sha256 + lane_id + reconcile_audit_only"
             )
         observation = terminal_closeout["observation"]
         if not isinstance(observation, dict):

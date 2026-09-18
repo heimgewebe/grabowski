@@ -643,13 +643,13 @@ GRIP_SPECS: dict[str, GripSpec] = {
     ),
     "transport-roundtrip": GripSpec(
         name="transport-roundtrip",
-        version="2.1",
+        version="2.2",
         summary=(
             "Issue a private exact-target challenge or atomically execute its target. "
-            "action=begin requires target_tool_name and target_arguments. On the MCP "
-            "surface, action=execute can use only the returned challenge when the exact "
-            "target was retained by the immediately preceding shared_unlabeled mutation "
-            "attempt; explicit unchanged target fields remain supported for compatibility. "
+            "action=begin requires target_tool_name and target_arguments. For shared_unlabeled "
+            "cross-call execution, action=execute canonically carries the returned challenge, "
+            "exact target_tool_name and exact unchanged target_arguments. Challenge-only execute "
+            "is a same-process optimization when that exact target is still retained. "
             "action=ack remains available only for a stable client-declared scope and is "
             "fail-closed for shared_unlabeled callers."
         ),
@@ -1151,12 +1151,12 @@ GRIP_RECOVERY_PATHS_BY_NAME = {
         "the lost action"
     ),
     "transport-roundtrip": (
-        "invoke the mutating MCP target normally; for shared_unlabeled callers, continue "
-        "with action=execute and the returned challenge only while the server-retained "
-        "target is fresh. Explicit action=begin plus unchanged target fields remains the "
-        "compatibility path. The server reserves, consumes and dispatches through the "
-        "normal central gate in one bounded operation. After an ambiguous target result, "
-        "read back the target before any new challenge; no transport receipt grants retry authority"
+        "invoke the mutating MCP target normally; for shared_unlabeled cross-call execution, "
+        "continue with action=execute, the returned challenge, exact target_tool_name and exact "
+        "unchanged target_arguments. Challenge-only execute is only a same-process optimization "
+        "while the server-retained target is fresh. The server reserves, consumes and dispatches "
+        "through the normal central gate in one bounded operation. After an ambiguous target "
+        "result, read back the target before any new challenge; no transport receipt grants retry authority"
     ),
 }
 # Conditional requirements cannot be expressed as static required_parameters,
@@ -1243,9 +1243,9 @@ GRIP_CONDITIONAL_PRECONDITIONS = {
     "transport-roundtrip": (
         "action=begin requires target_tool_name and target_arguments together; "
         "an unbound begin is refused fail-closed",
-        "action=execute requires challenge_receipt_sha256; the MCP wrapper may inject the "
-        "fresh server-retained exact target, otherwise target_tool_name and target_arguments "
-        "must be supplied together for compatibility",
+        "action=execute requires challenge_receipt_sha256; shared_unlabeled cross-call execution "
+        "canonically supplies target_tool_name and target_arguments together, while the MCP wrapper "
+        "may inject a fresh server-retained exact target only as a same-process optimization",
         "action=ack requires challenge_receipt_sha256 and must not carry target fields; "
         "shared_unlabeled callers are refused and must use action=execute",
     ),
@@ -10455,23 +10455,33 @@ def _saga_captain_audit_binding(
         raise GripPreflightError("Captain audit completion lacks execution result binding")
     if completion.get("execution_result_sha256") != sha256_json(execution_result):
         raise GripPreflightError("Captain audit execution result digest mismatch")
+    identity_keys = {"status", "receipt_sha256", "output_sha256"}
+    if not identity_keys.issubset(execution_result):
+        raise GripPreflightError(
+            "Captain audit reference execution result identity is incomplete"
+        )
+    result_identity = {key: execution_result[key] for key in identity_keys}
     if audit_ref is not None:
-        if set(execution_result) != {"status", "receipt_sha256", "output_sha256"}:
-            raise GripPreflightError("Captain audit reference execution result shape is not canonical")
         if execution_result.get("status") != "passed":
             raise GripPreflightError("Captain audit reference requires a passed Captain result")
         if not _is_sha256_hex(execution_result.get("receipt_sha256")) or not _is_sha256_hex(execution_result.get("output_sha256")):
             raise GripPreflightError("Captain audit reference result identity is invalid")
-        result_identity = execution_result
     else:
         assert receipt is not None
-        result_identity = {
+        receipt_identity = {
             "status": receipt["status"],
             "receipt_sha256": receipt["receipt_sha256"],
             "output_sha256": receipt["output_sha256"],
         }
-        if execution_result != result_identity:
+        if result_identity != receipt_identity:
             raise GripPreflightError("Captain audit completion differs from Captain receipt")
+
+    try:
+        provenance = grabowski_grip_orchestration._captain_merge_provenance_from_execution_result(
+            execution_result
+        )
+    except grabowski_grip_orchestration.SagaError as exc:
+        raise GripPreflightError(str(exc)) from exc
     body = {
         "schema_version": 1,
         "kind": grabowski_grip_orchestration.CAPTAIN_AUDIT_BINDING_KIND,
@@ -10487,6 +10497,8 @@ def _saga_captain_audit_binding(
         "output_sha256": result_identity["output_sha256"],
         "status": result_identity["status"],
     }
+    if provenance is not None:
+        body["merge_provenance"] = provenance
     return {**body, "binding_sha256": sha256_json(body)}
 
 
@@ -13709,6 +13721,7 @@ def _run_captain_pr_merge(
         execution_result["verification_error"] = "; ".join(verify_errors)
         return execution_result
     execution_result["verification_passed"] = True
+    execution_result["merge_completion_verified"] = True
     return execution_result
 
 

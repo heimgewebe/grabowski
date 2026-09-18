@@ -1002,9 +1002,10 @@ def _pending_challenge_next_action(scope: dict[str, str]) -> str:
     """Return an executable next step for the caller's actual scope."""
     if _is_shared_pool(scope):
         return (
-            "call grip_run for transport-roundtrip with action=execute and the exact "
-            "challenge_receipt_sha256; the server retains the exact target briefly; "
-            "do not retry the target separately"
+            "call grip_run for transport-roundtrip with action=execute, the exact "
+            "challenge_receipt_sha256, exact target_tool_name and exact unchanged "
+            "target_arguments; server-retained target injection is only a same-process "
+            "optimization; do not retry the target separately"
         )
     return (
         "call grip_run for transport-roundtrip with action=ack and the "

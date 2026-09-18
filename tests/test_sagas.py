@@ -169,15 +169,87 @@ class SagaContractTests(unittest.TestCase):
         captain_result_value: dict[str, object],
         readback_value: dict[str, object],
     ) -> dict[str, object]:
-        return sagas.settle(
-            plan_value=plan_value,
-            run_receipt_value=run_receipt_value,
-            captain_result_value=captain_result_value,
-            captain_audit_binding_value=self.audit_binding(
-                plan_value, captain_result_value
-            ),
-            readback_value=readback_value,
+        captain = copy.deepcopy(captain_result_value)
+        if plan_value["saga_kind"] != "pr-settlement":
+            return sagas.settle(
+                plan_value=plan_value,
+                run_receipt_value=run_receipt_value,
+                captain_result_value=captain,
+                captain_audit_binding_value=self.audit_binding(plan_value, captain),
+                readback_value=readback_value,
+            )
+
+        receipt = captain["receipt"]
+        assert isinstance(receipt, dict)
+        handoff = plan_value["captain_handoff"]
+        expected = plan_value["expected_identity"]
+        assert isinstance(handoff, dict)
+        assert isinstance(expected, dict)
+        intent_sha = "c" * 64
+        completion_sha = "d" * 64
+        common = {
+            "kind": "grabowski_captain_run_audit",
+            "action": handoff["action"],
+            "target_sha256": sagas.sha256_json(handoff["target"]),
+            "expected_head": expected["expected_head"],
+            "expected_base": expected["base"],
+            "expected_base_sha": expected["expected_base_sha"],
+            "actor_id": "runtime-actor:test",
+            "context_sha256": "e" * 64,
+            "request_sha256": "f" * 64,
+        }
+        intent = {
+            **common,
+            "operation": "captain-run-audit-intent",
+            "phase": "intent",
+            "record_sha256": intent_sha,
+        }
+        execution_result = {
+            "status": receipt["status"],
+            "receipt_sha256": receipt["receipt_sha256"],
+            "output_sha256": receipt["output_sha256"],
+        }
+        completion = {
+            **common,
+            "operation": "captain-run-audit-completion",
+            "phase": "completion",
+            "record_sha256": completion_sha,
+            "intent_audit_sha256": intent_sha,
+            "execution_result": execution_result,
+            "execution_result_sha256": sagas.sha256_json(execution_result),
+        }
+        captain["captain_audit"] = {
+            "status": "complete",
+            "intent": {
+                "audit_record_sha256": intent_sha,
+                "audit_chain_valid": True,
+            },
+            "completion": {
+                "audit_record_sha256": completion_sha,
+                "audit_chain_valid": True,
+            },
+        }
+        payload = (
+            json.dumps(intent, separators=(",", ":"))
+            + "\n"
+            + json.dumps(completion, separators=(",", ":"))
+            + "\n"
+        ).encode("utf-8")
+        snapshot = types.SimpleNamespace(
+            segments=(types.SimpleNamespace(captured_data=payload),)
         )
+        audit_query_module = types.SimpleNamespace(
+            capture_verified_audit_snapshot=lambda: snapshot,
+            _load_snapshot_segment=lambda segment: segment.captured_data,
+        )
+        with patch.dict(sys.modules, {"grabowski_audit_query": audit_query_module}):
+            return sagas.settle(
+                plan_value=plan_value,
+                run_receipt_value=run_receipt_value,
+                captain_result_value=captain,
+                captain_audit_binding_value=self.audit_binding(plan_value, captain),
+                readback_value=readback_value,
+            )
 
     def mechanic_result(
         self,

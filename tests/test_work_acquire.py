@@ -2436,6 +2436,81 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertEqual(replayed["terminal_closeout_audit_record_sha256"], "b" * 64)
         self.assertEqual(attempts, 2)
 
+    def test_terminal_audit_reconcile_repairs_only_missing_audit_after_receipt_write(self) -> None:
+        params = self.parameters()
+        first = work_acquire.acquire_work(
+            params,
+            acquire_resources_fn=self.acquire,
+            release_resources_fn=Mock(),
+            inspect_resource_fn=Mock(),
+            ensure_worktree_fn=Mock(
+                return_value={
+                    "result_state": "CREATED",
+                    "durable_receipt_sha256": "b" * 64,
+                    "post_state": {
+                        "target_registered": True,
+                        "target_path_exists": True,
+                    },
+                }
+            ),
+            runner=Mock(),
+        )
+        assessment = self.terminal_assessment(first["lane_id"], 200)
+        with self.assertRaisesRegex(OSError, "audit unavailable"):
+            work_acquire.persist_terminal_closeout(
+                first["lane_id"],
+                assessment,
+                expected_receipt_sha256=first["receipt_sha256"],
+                audit_fn=Mock(side_effect=OSError("audit unavailable")),
+                audit_lookup_fn=Mock(return_value=None),
+            )
+
+        stored_before = work_acquire._read_state(
+            self.state / f"{first['lane_id']}.json"
+        )
+        self.assertIsNotNone(stored_before)
+        assert stored_before is not None
+        before_sha = stored_before["receipt_sha256"]
+        events: list[dict[str, object]] = []
+
+        def append_audit(event: dict[str, object]) -> str:
+            events.append(dict(event))
+            return "c" * 64
+
+        def lookup_audit(event: dict[str, object]) -> str | None:
+            return "c" * 64 if events and events[-1] == event else None
+
+        reconciled = work_acquire.reconcile_terminal_closeout_audit(
+            first["lane_id"],
+            expected_receipt_sha256=first["receipt_sha256"],
+            audit_fn=append_audit,
+            audit_lookup_fn=lookup_audit,
+        )
+        stored_after = work_acquire._read_state(
+            self.state / f"{first['lane_id']}.json"
+        )
+        self.assertIsNotNone(stored_after)
+        assert stored_after is not None
+        self.assertEqual(before_sha, stored_after["receipt_sha256"])
+        self.assertEqual(
+            assessment["assessment_sha256"], reconciled["assessment_sha256"]
+        )
+        self.assertEqual(
+            "c" * 64, reconciled["terminal_closeout_audit_record_sha256"]
+        )
+        self.assertEqual(1, len(events))
+
+        replayed = work_acquire.reconcile_terminal_closeout_audit(
+            first["lane_id"],
+            expected_receipt_sha256=first["receipt_sha256"],
+            audit_fn=append_audit,
+            audit_lookup_fn=lookup_audit,
+        )
+        self.assertEqual(
+            "c" * 64, replayed["terminal_closeout_audit_record_sha256"]
+        )
+        self.assertEqual(1, len(events))
+
     def test_terminal_closeout_rejects_stale_receipt_preimage(self) -> None:
         lane_id = "d" * 32
         self.state.mkdir(mode=0o700)
@@ -2493,6 +2568,74 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertEqual(persist.call_args.args[1]["terminal_head_sha"], SHA)
         self.assertNotIn("terminal_head_sha", persist.call_args.kwargs)
         acquire.assert_not_called()
+
+    def test_mcp_entry_reconciles_only_missing_terminal_audit_without_reassessment(self) -> None:
+        params = self.parameters()
+        stored_inputs, receipt = self.store_lane(params)
+        lane_id = str(stored_inputs["lane_id"])
+        expected = {
+            "kind": "grabowski.work_lane_terminal_audit_reconciliation",
+            "lane_id": lane_id,
+        }
+        with (
+            patch.object(work_acquire.operator, "_require_operator_mutation"),
+            patch.object(
+                work_acquire,
+                "reconcile_terminal_closeout_audit",
+                return_value=expected,
+            ) as reconcile,
+            patch.object(
+                work_acquire.lane_closeout,
+                "assess",
+                side_effect=AssertionError("audit-only reconcile must not reassess lane state"),
+            ) as assess,
+        ):
+            result = work_acquire.grabowski_work_acquire(
+                source_kind=str(params["source_kind"]),
+                source_id=str(params["source_id"]),
+                controller_actor=str(params["controller_actor"]),
+                repo=str(params["repo"]),
+                base_head=str(params["base_head"]),
+                branch=str(params["branch"]),
+                target_path=str(params["target_path"]),
+                purpose=str(params["purpose"]),
+                retention_until_unix=int(params["retention_until_unix"]),
+                idempotency_key=str(params["idempotency_key"]),
+                scoped_writer_actor=str(params["scoped_writer_actor"]),
+                ttl_seconds=int(params["ttl_seconds"]),
+                terminal_closeout={
+                    "expected_receipt_sha256": str(receipt["receipt_sha256"]),
+                    "lane_id": lane_id,
+                    "reconcile_audit_only": True,
+                },
+            )
+        self.assertEqual(expected, result)
+        reconcile.assert_called_once_with(
+            lane_id,
+            expected_receipt_sha256=str(receipt["receipt_sha256"]),
+            audit_fn=work_acquire.operator.base._append_audit_with_digest,
+            audit_lookup_fn=work_acquire._find_terminal_closeout_audit,
+        )
+        assess.assert_not_called()
+
+    def test_audit_only_closeout_rejects_repo_and_target_drift(self) -> None:
+        params = self.parameters()
+        stored_inputs, _receipt = self.store_lane(params)
+        lane_id = str(stored_inputs["lane_id"])
+
+        drift_cases = {
+            "repo": str(self.repo.parent),
+            "target_path": str(self.target.parent / "different-worktree"),
+        }
+        for field, value in drift_cases.items():
+            with self.subTest(field=field):
+                drifted = dict(params)
+                drifted[field] = value
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "terminal closeout parameters do not match stored work lane inputs",
+                ):
+                    work_acquire._closeout_inputs(drifted, lane_id)
 
     def test_mcp_entry_reuses_stored_system_convergence_plan_on_closeout(self) -> None:
         params = self.parameters()

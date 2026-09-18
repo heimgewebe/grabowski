@@ -138,16 +138,19 @@ class AgentInstructionsTests(unittest.TestCase):
         transport = rules["transport-roundtrip-before-mutation"].lower()
         for phrase in (
             "action=execute",
-            "only challenge_receipt_sha256",
-            "exact target",
+            "challenge_receipt_sha256",
+            "exact target_tool_name",
+            "exact unchanged target_arguments",
+            "same-process optimization",
             "action=ack",
             "unchanged target once",
             "action=begin",
             "target_tool_name/target_arguments",
-            "compatibility",
             "read back ambiguous effects",
         ):
             self.assertIn(phrase, transport)
+        self.assertNotIn("only challenge_receipt_sha256", transport)
+        self.assertNotIn("remains for compatibility", transport)
         typed = rules["typed-operation-preference"].lower()
         for phrase in ("typed operations", "terminal", "git", "github"):
             self.assertIn(phrase, typed)

@@ -3112,7 +3112,113 @@ class CaptainAuditTrailTests(unittest.TestCase):
         self.assertEqual("main", material["expected_base"])
         self.assertEqual(64, len(material["target_sha256"]))
         self.assertEqual(64, len(material["context_sha256"]))
+        self.assertEqual("heimgewebe/grabowski", material["target_repo"])
+        self.assertEqual(468, material["target_pr"])
         self.assertNotIn("do-not-log", json.dumps(material, sort_keys=True))
+
+    def test_completion_material_distinguishes_captain_dispatch_from_external_merge(self) -> None:
+        merge_sha = "e" * 40
+        base_result = {
+            "status": "passed",
+            "receipt": {
+                "status": "passed",
+                "receipt_sha256": "a" * 64,
+                "output_sha256": "b" * 64,
+            },
+        }
+        dispatched = {
+            **base_result,
+            "output": {
+                "executions": [
+                {
+                    "action": "pr-merge",
+                    "execution_invoked": True,
+                    "execution_attempted": True,
+                    "command_returned": True,
+                    "merge_returncode": 0,
+                    "verification_passed": True,
+                    "remote_mutation_observed": True,
+                    "merge_completion_verified": True,
+                    "verified_pr": {"mergeCommit": {"oid": merge_sha}},
+                }
+                ],
+            },
+        }
+        material = grabowski_mcp._captain_audit_execution_result_material(
+            dispatched, action="pr-merge"
+        )
+        self.assertEqual("captain_dispatch_verified", material["provenance_mode"])
+        self.assertEqual(merge_sha, material["observed_merge_sha"])
+        self.assertTrue(material["execution_invoked"])
+        self.assertFalse(material["external_merge_observed"])
+
+        ambiguous = {
+            **base_result,
+            "output": {
+                "executions": [
+                    {
+                        "action": "pr-merge",
+                        "execution_invoked": True,
+                        "execution_attempted": True,
+                        "command_returned": True,
+                        "merge_returncode": 1,
+                        "verification_passed": True,
+                        "remote_mutation_observed": True,
+                        "merge_completion_verified": True,
+                        "verified_pr": {"mergeCommit": {"oid": merge_sha}},
+                    }
+                ]
+            },
+        }
+        material = grabowski_mcp._captain_audit_execution_result_material(
+            ambiguous, action="pr-merge"
+        )
+        self.assertEqual("unverified", material["provenance_mode"])
+        self.assertFalse(material["dispatch_succeeded"])
+
+        external = {
+            **base_result,
+            "output": {
+                "executions": [
+                {
+                    "action": "pr-merge",
+                    "execution_invoked": False,
+                    "verification_passed": True,
+                    "remote_mutation_observed": True,
+                    "merge_completion_verified": True,
+                    "verified_pr": {"mergeCommit": {"oid": merge_sha}},
+                    "external_merge_reconciliation": {
+                        "external_merge_observed": True,
+                        "dispatch_called": False,
+                    },
+                }
+                ],
+            },
+        }
+        material = grabowski_mcp._captain_audit_execution_result_material(
+            external, action="pr-merge"
+        )
+        self.assertEqual("external_merge_reconciled", material["provenance_mode"])
+        self.assertEqual(merge_sha, material["observed_merge_sha"])
+        self.assertFalse(material["execution_invoked"])
+        self.assertTrue(material["external_merge_observed"])
+
+    def test_completion_material_rejects_pr_merge_without_canonical_execution(self) -> None:
+        result = {
+            "status": "passed",
+            "receipt": {
+                "status": "passed",
+                "receipt_sha256": "a" * 64,
+                "output_sha256": "b" * 64,
+            },
+            "output": {"executions": []},
+        }
+        with self.assertRaisesRegex(
+            RuntimeError, "pr-merge audit completion lacks canonical execution evidence"
+        ):
+            grabowski_mcp._captain_audit_execution_result_material(
+                result, action="pr-merge"
+            )
 
     def test_verified_append_returns_the_exact_appended_record_digest(self) -> None:
         with (
