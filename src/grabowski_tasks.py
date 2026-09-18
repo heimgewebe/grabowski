@@ -5494,13 +5494,17 @@ def _stage_task_output_capture_script(host: str, *, transport: str) -> dict[str,
     does not exist, so the payload is staged there through a short bootstrap
     before the unit is launched. The bootstrap is an ordinary command rather
     than a unit, so its own argument size is unconstrained.
+
+    Staging uses the narrow digest-bound fleet route rather than the generic
+    one, so a host whose command allowlist omits an interpreter can still
+    launch tasks.
     """
     path = _task_output_capture_script_path()
     if transport == "local":
         _task_output_capture_script()
         return {"host": host, "transport": transport, "path": str(path), "status": "local"}
     payload = base64.b64encode(TASK_OUTPUT_CAPTURE_CODE.encode("utf-8")).decode("ascii")
-    result = _dispatch(
+    staged = fleet.run_fleet_task_capture_stage(
         host,
         [
             TASK_OUTPUT_CAPTURE_PYTHON,
@@ -5510,7 +5514,9 @@ def _stage_task_output_capture_script(host: str, *, transport: str) -> dict[str,
             payload,
         ],
         timeout_seconds=60,
+        max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
     )
+    result = staged["result"]
     if result.get("returncode") != 0:
         raise RuntimeError(
             "task output capture script could not be staged on the task host"
@@ -6170,9 +6176,26 @@ def _launch(record: dict[str, Any]) -> dict[str, Any]:
                 "privileged_broker": None,
             }
     target = fleet.fleet_host(record["host"])
-    _stage_task_output_capture_script(
-        record["host"], transport=target["transport"]
-    )
+    try:
+        _stage_task_output_capture_script(
+            record["host"], transport=target["transport"]
+        )
+    except (OSError, PermissionError, RuntimeError, ValueError) as exc:
+        # The row is already committed as launching and its leases are held.
+        # Raising here would strand it, so report the same undispatched shape
+        # the root launch path uses and let the caller release the attempt.
+        return {
+            "returncode": 1,
+            "stdout": "",
+            "stderr": _redact_reason(f"{type(exc).__name__}: {exc}"),
+            "timed_out": False,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "root_truth_observable": False,
+            "outcome_unknown": False,
+            "launch_not_dispatched": True,
+            "privileged_broker": None,
+        }
     return _dispatch(
         record["host"],
         _launch_argv(

@@ -12,6 +12,7 @@ import os
 import sqlite3
 import stat
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -296,6 +297,10 @@ class TaskTests(unittest.TestCase):
             "UV_CACHE_DIR": "/run/user/1000/grabowski-uv-cache",
         }
         with patch.object(tasks.fleet, "fleet_host", return_value=selected), patch.object(
+            tasks.fleet,
+            "run_fleet_task_capture_stage",
+            return_value={"result": {"returncode": 0, "stdout": "written"}},
+        ) as capture_stage, patch.object(
             tasks, "_dispatch", return_value=_launcher()
         ) as dispatch, patch.object(tasks.base, "_append_audit"), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
@@ -357,10 +362,12 @@ class TaskTests(unittest.TestCase):
         if selected["transport"] == "local":
             self.assertTrue(script.is_file(), "local launch must stage the wrapper")
             self.assertEqual(script.read_text(), tasks.TASK_OUTPUT_CAPTURE_CODE)
+            capture_stage.assert_not_called()
         else:
             self.assertFalse(
                 script.exists(), "a remote launch must not stage on the controller"
             )
+            self.assertEqual(capture_stage.call_count, 1)
         self.assertEqual(
             capture[:5],
             [
@@ -452,24 +459,29 @@ class TaskTests(unittest.TestCase):
         self.assertNotIn(tasks.TASK_OUTPUT_CAPTURE_CODE, argv)
 
     def test_local_staging_materializes_without_dispatching(self) -> None:
-        with patch.object(tasks, "_dispatch") as dispatch:
+        with patch.object(tasks, "_dispatch") as dispatch, patch.object(
+            tasks.fleet, "run_fleet_task_capture_stage"
+        ) as stage:
             staged = tasks._stage_task_output_capture_script(
                 "heim-pc", transport="local"
             )
         dispatch.assert_not_called()
+        stage.assert_not_called()
         self.assertEqual(staged["status"], "local")
         self.assertEqual(staged["path"], str(tasks._task_output_capture_script_path()))
         self.assertTrue(tasks._task_output_capture_script_path().is_file())
 
     def test_remote_staging_ships_the_wrapper_to_the_task_host(self) -> None:
         with patch.object(
-            tasks, "_dispatch", return_value={"returncode": 0, "stdout": "written"}
-        ) as dispatch:
+            tasks.fleet,
+            "run_fleet_task_capture_stage",
+            return_value={"result": {"returncode": 0, "stdout": "written"}},
+        ) as stage:
             staged = tasks._stage_task_output_capture_script(
                 "heimserver", transport="ssh"
             )
         self.assertEqual(staged["status"], "written")
-        host, argv = dispatch.call_args.args[0], dispatch.call_args.args[1]
+        host, argv = stage.call_args.args[0], stage.call_args.args[1]
         self.assertEqual(host, "heimserver")
         self.assertEqual(argv[0], tasks.TASK_OUTPUT_CAPTURE_PYTHON)
         self.assertEqual(argv[1], "-c")
@@ -484,7 +496,9 @@ class TaskTests(unittest.TestCase):
 
     def test_remote_staging_failure_stops_the_launch(self) -> None:
         with patch.object(
-            tasks, "_dispatch", return_value={"returncode": 1, "stdout": ""}
+            tasks.fleet,
+            "run_fleet_task_capture_stage",
+            return_value={"result": {"returncode": 1, "stdout": ""}},
         ):
             with self.assertRaisesRegex(RuntimeError, "could not be staged"):
                 tasks._stage_task_output_capture_script("heimserver", transport="ssh")
@@ -514,6 +528,84 @@ class TaskTests(unittest.TestCase):
         second = subprocess.run(argv, capture_output=True, text=True)
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(second.stdout, "present")
+
+    def test_capture_script_path_matches_the_typed_fleet_grammar(self) -> None:
+        # The fleet route derives the destination grammar independently, so a
+        # drift between the two would silently reject every remote staging.
+        with patch.object(
+            tasks,
+            "TASK_OUTPUT_CAPTURE_SCRIPT_ROOT",
+            Path(tasks.operator.STATE_DIR) / "task-capture",
+        ):
+            path = str(tasks._task_output_capture_script_path())
+        match = tasks.fleet.TASK_OUTPUT_CAPTURE_SCRIPT.fullmatch(path)
+        self.assertIsNotNone(match, path)
+        self.assertEqual(
+            match.group(1),
+            hashlib.sha256(
+                tasks.TASK_OUTPUT_CAPTURE_CODE.encode("utf-8")
+            ).hexdigest(),
+        )
+
+    def test_staging_bootstrap_hash_matches_the_typed_fleet_contract(self) -> None:
+        self.assertEqual(
+            hashlib.sha256(
+                tasks.TASK_OUTPUT_CAPTURE_STAGE_CODE.encode("utf-8")
+            ).hexdigest(),
+            tasks.fleet.TASK_OUTPUT_CAPTURE_STAGE_CODE_SHA256,
+        )
+
+    def test_capture_staging_route_binds_payload_to_its_destination(self) -> None:
+        # The narrow fleet route must reject a payload whose digest does not
+        # match the content-addressed destination it would be written to.
+        path = str(tasks._task_output_capture_script_path())
+        argv = [
+            tasks.TASK_OUTPUT_CAPTURE_PYTHON,
+            "-c",
+            tasks.TASK_OUTPUT_CAPTURE_STAGE_CODE,
+            path,
+            base64.b64encode(b"import os\n").decode("ascii"),
+        ]
+        with patch.object(
+            tasks.fleet, "fleet_host", return_value=LOCAL_HOST
+        ), patch.object(
+            tasks.fleet,
+            "TASK_OUTPUT_CAPTURE_SCRIPT",
+            re.compile(
+                re.escape(path[: path.rindex("capture-")])
+                + r"capture-([0-9a-f]{64})\.py\Z"
+            ),
+        ):
+            with self.assertRaisesRegex(PermissionError, "does not match its destination"):
+                tasks.fleet.run_fleet_task_capture_stage(
+                    "heim-pc", argv, timeout_seconds=10, max_output_bytes=4096
+                )
+
+    def test_staging_failure_reports_an_undispatched_launch(self) -> None:
+        record = {
+            "host": "heimserver",
+            "task_id": "0123456789abcdef01234567",
+            "attempt": 1,
+            "argv_json": json.dumps(["/bin/echo", "hello"]),
+            "backend": "user-systemd",
+        }
+        with patch.object(
+            tasks.fleet, "fleet_host", return_value=REMOTE_HOST
+        ), patch.object(
+            tasks, "_is_root_systemd_backend", return_value=False
+        ), patch.object(
+            tasks,
+            "_stage_task_output_capture_script",
+            side_effect=RuntimeError("capture staging failed"),
+        ), patch.object(
+            tasks, "_dispatch"
+        ) as dispatch:
+            result = tasks._launch(record)
+        dispatch.assert_not_called()
+        self.assertTrue(result["launch_not_dispatched"])
+        self.assertEqual(result["returncode"], 1)
+        self.assertFalse(result["outcome_unknown"])
+        self.assertIn("capture staging failed", result["stderr"])
 
     def test_persistent_task_and_job_defaults_are_six_hours(self) -> None:
         self.assertEqual(tasks.operator.DEFAULT_JOB_RUNTIME, 21_600)
