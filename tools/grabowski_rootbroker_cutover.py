@@ -1664,7 +1664,8 @@ def _secret_pty_action_from_repository(
         "timeout_seconds", "prompt_sequence", "max_secret_bytes",
         "max_output_bytes", "kill_switch_path", "legacy_kill_switch_path",
         "recovery_gate", "allowed_peer_uid", "allowed_peer_unit",
-        "allowed_peer_executable", "authority_task_id", "authority_host",
+        "allowed_peer_executable", "allowed_peer_interpreter",
+        "authority_task_id", "authority_host",
         "action_schema", "privilege_context", "required_resource_keys",
         "redaction_contract_sha256",
     }
@@ -1710,6 +1711,7 @@ def _secret_pty_action_from_repository(
         action.get("allowed_peer_uid") != 1000
         or action.get("allowed_peer_unit") != OPERATOR_UNIT
         or action.get("allowed_peer_executable") != str(REQUEST_CLIENT_TARGET)
+        or action.get("allowed_peer_interpreter") != "/usr/bin/python3"
     ):
         raise CutoverError("secret PTY peer binding is invalid")
     if (
@@ -2210,6 +2212,8 @@ def _operator_authority_attestation(
     if (
         secret_pty.get("allowed_peer_uid") != 1000
         or secret_pty.get("allowed_peer_unit") != OPERATOR_UNIT
+        or secret_pty.get("allowed_peer_executable") != str(REQUEST_CLIENT_TARGET)
+        or secret_pty.get("allowed_peer_interpreter") != "/usr/bin/python3"
         or secret_pty.get("authority_task_id") != "GRABOWSKI-OPERATOR-SURFACE-V1-T172"
         or secret_pty.get("authority_host") != "heim-pc"
     ):
