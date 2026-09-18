@@ -1331,7 +1331,7 @@ def _require_transport_roundtrip_for_tool(
             except (RuntimeError, TypeError, ValueError) as retain_exc:
                 raise RuntimeError(
                     "fresh intent-bound transport verification required; server-side "
-                    "target retention failed, so use the compatibility path: call "
+                    "target retention failed; use the canonical cross-call path: call "
                     "grip_run for transport-roundtrip with action=execute, "
                     f"challenge_receipt_sha256={challenge}, "
                     f"target_tool_name={tool_name_text}, and the exact unchanged "

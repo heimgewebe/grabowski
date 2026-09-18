@@ -1473,6 +1473,40 @@ class CentralTransportGateTests(unittest.TestCase):
         )
         self.assertEqual(operator._deployment_admission_active_tool_calls(), 0)
 
+    def test_shared_unlabeled_retention_failure_uses_canonical_explicit_execute(self) -> None:
+        operator = self.configured_operator()
+        context = types.SimpleNamespace()
+        challenge = "c" * 64
+        with (
+            mock.patch.object(
+                operator.grabowski_transport_roundtrip,
+                "consume_verified",
+                side_effect=roundtrip.TransportRoundtripRequired("handshake required"),
+            ),
+            mock.patch.object(
+                operator.grabowski_transport_roundtrip,
+                "begin",
+                return_value={
+                    "state": "challenge_pending",
+                    "challenge_receipt_sha256": challenge,
+                },
+            ),
+            mock.patch.object(
+                operator.base,
+                "_retain_pending_transport_target",
+                side_effect=RuntimeError("retention unavailable"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "canonical cross-call path") as raised:
+                asyncio.run(operator.mcp._tool_manager.call_tool("write", {}, context))
+        message = str(raised.exception)
+        self.assertIn(f"challenge_receipt_sha256={challenge}", message)
+        self.assertIn("target_tool_name=write", message)
+        self.assertIn("exact unchanged target_arguments JSON object", message)
+        self.assertIn("retention_error=RuntimeError", message)
+        self.assertNotIn("compatibility path", message)
+        self.assertNotIn("action=ack", message)
+
     def test_verified_mutation_consumes_receipt_and_runs(self) -> None:
         operator = self.configured_operator()
         context = types.SimpleNamespace(client_id="mcp-client-1")
