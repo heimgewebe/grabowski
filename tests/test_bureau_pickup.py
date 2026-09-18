@@ -4115,6 +4115,126 @@ class BureauPickupTests(unittest.TestCase):
         )
         release.assert_not_called()
 
+    def test_definitive_missing_run_accepts_legacy_state_error_unknown_run(self) -> None:
+        run_id = "BUR-RUN-20260918T051635Z-28a07139b0"
+        self.assertTrue(
+            pickup._definitive_missing_run(
+                {
+                    "status": "failed",
+                    "code": "state-error",
+                    "detail": f"unknown run {run_id}",
+                },
+                expected_run_id=run_id,
+            )
+        )
+
+    def test_definitive_missing_run_rejects_other_legacy_state_errors(self) -> None:
+        run_id = "BUR-RUN-20260918T051635Z-28a07139b0"
+        cases = [
+            {
+                "status": "failed",
+                "code": "state-error",
+                "detail": "database is locked",
+            },
+            {
+                "status": "failed",
+                "code": "state-error",
+                "detail": "unknown run not-a-bureau-run",
+            },
+            {
+                "status": "failed",
+                "code": "state-error",
+                "detail": "unknown run BUR-RUN-20260918T051636Z-28a07139b1",
+            },
+            {
+                "status": "failed",
+                "code": "state-error",
+                "detail": f"unknown run {run_id}",
+                "run": {"run_id": run_id},
+            },
+            {
+                "status": "coordinated",
+                "code": "state-error",
+                "detail": f"unknown run {run_id}",
+            },
+        ]
+        for payload in cases:
+            with self.subTest(payload=payload):
+                self.assertFalse(
+                    pickup._definitive_missing_run(
+                        payload, expected_run_id=run_id
+                    )
+                )
+
+    def test_lease_precondition_accepts_legacy_state_error_missing_run_before_commit(
+        self,
+    ) -> None:
+        intent = self.intent()
+        request = {
+            "registry_root": str(self.registry_root),
+            "coordination_root": str(self.coordination_root),
+        }
+        payload = {
+            "status": "failed",
+            "code": "state-error",
+            "detail": f"unknown run {intent['run_id']}",
+        }
+        with mock.patch.object(pickup, "_coordination_status", return_value=payload):
+            check = pickup._pickup_lease_commit_precondition(
+                intent,
+                request,
+                allow_unknown_run=True,
+            )
+            check()
+
+    def test_lease_precondition_rejects_other_legacy_state_error_before_commit(
+        self,
+    ) -> None:
+        intent = self.intent()
+        request = {
+            "registry_root": str(self.registry_root),
+            "coordination_root": str(self.coordination_root),
+        }
+        payload = {
+            "status": "failed",
+            "code": "state-error",
+            "detail": "database is locked",
+        }
+        with mock.patch.object(pickup, "_coordination_status", return_value=payload):
+            check = pickup._pickup_lease_commit_precondition(
+                intent,
+                request,
+                allow_unknown_run=True,
+            )
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "pickup-lease-authority-unavailable"
+            ):
+                check()
+
+    def test_lease_precondition_rejects_legacy_state_error_for_different_run_before_commit(
+        self,
+    ) -> None:
+        intent = self.intent()
+        request = {
+            "registry_root": str(self.registry_root),
+            "coordination_root": str(self.coordination_root),
+        }
+        payload = {
+            "status": "failed",
+            "code": "state-error",
+            "detail": "unknown run BUR-RUN-20260918T051636Z-28a07139b1",
+        }
+        with mock.patch.object(pickup, "_coordination_status", return_value=payload):
+            check = pickup._pickup_lease_commit_precondition(
+                intent,
+                request,
+                allow_unknown_run=True,
+            )
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "pickup-lease-authority-unavailable"
+            ):
+                check()
+
     def test_definitive_missing_run_compensates_after_commit_failure(self) -> None:
         intent = self.intent()
         key = intent["required_resource_keys"][0]
@@ -4148,6 +4268,42 @@ class BureauPickupTests(unittest.TestCase):
             raised.exception.details["result"]["status"], "commit-not-applied"
         )
         release.assert_called_once_with(intent["lease_owner_id"], [key])
+
+    def test_legacy_state_error_for_different_run_retains_leases_after_commit_failure(
+        self,
+    ) -> None:
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                side_effect=[
+                    {"status": "claim-intent", "intent": intent},
+                    {"status": "unknown", "code": "bureau-runtime-timeout"},
+                    {
+                        "status": "failed",
+                        "code": "state-error",
+                        "detail": "unknown run BUR-RUN-20260918T051636Z-28a07139b1",
+                    },
+                ],
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "acquire_resources",
+                return_value={"leases": [lease], "owner_id": intent["lease_owner_id"]},
+            ),
+            mock.patch.object(pickup.resources, "release_resources") as release,
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "claim-commit-recovery-required"
+            ) as raised:
+                pickup.grabowski_bureau_pickup_execute(self.request())
+        self.assertEqual(
+            "recovery-required", raised.exception.details["result"]["status"]
+        )
+        release.assert_not_called()
 
     def test_unknown_run_code_with_run_evidence_retains_leases(self) -> None:
         intent = self.intent()
