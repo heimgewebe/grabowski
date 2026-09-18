@@ -2083,14 +2083,17 @@ def _coordination_status(
 
 
 def _definitive_missing_run(payload: dict[str, Any]) -> bool:
+    if payload.get("status") == "coordinated" or payload.get("run") is not None:
+        return False
+    code = payload.get("code")
+    if code in {"unknown-run", "state-error-unknown-run"}:
+        return True
+    if code != "state-error":
+        return False
+    detail = payload.get("detail")
     return (
-        payload.get("status") != "coordinated"
-        and payload.get("run") is None
-        and payload.get("code")
-        in {
-            "unknown-run",
-            "state-error-unknown-run",
-        }
+        isinstance(detail, str)
+        and re.fullmatch(r"unknown run BUR-RUN-[A-Za-z0-9._-]+", detail.strip()) is not None
     )
 
 
