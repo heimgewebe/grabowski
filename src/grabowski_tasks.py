@@ -100,6 +100,11 @@ TASK_OUTPUT_DIRECTORY_PREFIX = ".grabowski-task-output"
 TASK_OUTPUT_MAX_BYTES = 8 * 1024 * 1024
 TASK_OUTPUT_TAIL_BYTES = 64 * 1024
 TASK_OUTPUT_CAPTURE_PYTHON = "/usr/bin/python3"
+TASK_OUTPUT_CAPTURE_SCRIPT_ROOT = Path(operator.STATE_DIR) / "task-capture"
+# systemd writes every transient unit back to disk and resolves specifiers when it
+# re-reads that file. A single ExecStart argument of this many bytes or more fails
+# to resolve, so the unit loads as bad-setting after the next daemon-reload.
+TASK_OUTPUT_CAPTURE_ARGUMENT_MAX_BYTES = 4096
 TASK_LOG_RATE_LIMIT_INTERVAL_SECONDS = 30
 TASK_LOG_RATE_LIMIT_BURST = 200
 TASK_OUTPUT_CAPTURE_CODE = r"""
@@ -5358,13 +5363,74 @@ def _bind_task_output_managed_from_attempt(
     return _row_raw(identifier)
 
 
+def _task_output_capture_script() -> Path:
+    """Materialize the output capture wrapper and return its path.
+
+    The wrapper must not be handed to the interpreter with ``-c``. systemd
+    serializes every transient unit back to disk, and a single ExecStart
+    argument of ``TASK_OUTPUT_CAPTURE_ARGUMENT_MAX_BYTES`` bytes or more cannot
+    be re-read from that file. The unit then loads as ``bad-setting`` after the
+    next daemon-reload, so its status can no longer be read back and its
+    remains can no longer be cleaned up. The file name carries the payload
+    digest, so a changed wrapper writes a new file instead of mutating a path
+    that a running task may still be executing.
+    """
+    payload = TASK_OUTPUT_CAPTURE_CODE.encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()
+    root = TASK_OUTPUT_CAPTURE_SCRIPT_ROOT
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    root_metadata = root.lstat()
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        raise RuntimeError("task output capture script root is not a directory")
+    if root_metadata.st_uid != os.geteuid():
+        raise PermissionError("task output capture script root has a foreign owner")
+    if stat.S_IMODE(root_metadata.st_mode) != 0o700:
+        os.chmod(root, 0o700)
+    path = root / f"capture-{digest}.py"
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if not stat.S_ISREG(metadata.st_mode):
+            raise PermissionError("task output capture script is not a regular file")
+        if metadata.st_uid != os.geteuid():
+            raise PermissionError("task output capture script has a foreign owner")
+        if stat.S_IMODE(metadata.st_mode) != 0o600:
+            os.chmod(path, 0o600)
+        if path.read_bytes() == payload:
+            return path
+    descriptor, temporary = tempfile.mkstemp(
+        dir=root, prefix=f".capture-{digest}-", suffix=".tmp"
+    )
+    try:
+        try:
+            os.fchmod(descriptor, 0o600)
+            remaining = payload
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise OSError("task output capture script write made no progress")
+                remaining = remaining[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+    return path
+
+
 def _task_output_capture_argv(record: dict[str, Any]) -> list[str]:
     command = json.loads(record["argv_json"])
     paths = _task_output_paths(record)
     return [
         TASK_OUTPUT_CAPTURE_PYTHON,
-        "-c",
-        TASK_OUTPUT_CAPTURE_CODE,
+        str(_task_output_capture_script()),
         str(paths["directory"]),
         str(TASK_OUTPUT_MAX_BYTES),
         str(TASK_OUTPUT_TAIL_BYTES),

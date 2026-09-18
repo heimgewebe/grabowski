@@ -141,6 +141,10 @@ class TaskTests(unittest.TestCase):
         self.legacy_output_root_patch = patch.object(
             tasks, "TASK_OUTPUT_LEGACY_ROOT", self.output_root
         )
+        self.capture_script_root = self.root / "task-capture"
+        self.capture_script_root_patch = patch.object(
+            tasks, "TASK_OUTPUT_CAPTURE_SCRIPT_ROOT", self.capture_script_root
+        )
         self.resource_database = self.root / "state" / "resources.sqlite3"
         self.resource_patch = patch.object(
             tasks.resources, "RESOURCE_DB", self.resource_database
@@ -184,6 +188,7 @@ class TaskTests(unittest.TestCase):
         self.outcomes_patch.start()
         self.output_root_patch.start()
         self.legacy_output_root_patch.start()
+        self.capture_script_root_patch.start()
         self.resource_patch.start()
         self.admission_patch.start()
         self.start_counter = 0
@@ -191,6 +196,7 @@ class TaskTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.admission_patch.stop()
         self.resource_patch.stop()
+        self.capture_script_root_patch.stop()
         self.legacy_output_root_patch.stop()
         self.output_root_patch.stop()
         self.outcomes_patch.stop()
@@ -341,21 +347,93 @@ class TaskTests(unittest.TestCase):
         separator = launch.index("--")
         capture = launch[separator + 1 :]
         paths = tasks._task_output_paths(result["task"])
+        script = tasks._task_output_capture_script()
         self.assertEqual(
-            capture[:6],
+            capture[:5],
             [
                 tasks.TASK_OUTPUT_CAPTURE_PYTHON,
-                "-c",
-                tasks.TASK_OUTPUT_CAPTURE_CODE,
+                str(script),
                 str(paths["directory"]),
                 str(tasks.TASK_OUTPUT_MAX_BYTES),
                 str(tasks.TASK_OUTPUT_TAIL_BYTES),
             ],
         )
+        self.assertNotIn("-c", capture)
+        self.assertEqual(script.read_text(), tasks.TASK_OUTPUT_CAPTURE_CODE)
+        for argument in launch:
+            self.assertLess(
+                len(argument.encode("utf-8")),
+                tasks.TASK_OUTPUT_CAPTURE_ARGUMENT_MAX_BYTES,
+            )
         self.assertEqual(capture[-2:], ["/bin/echo", command_argument])
         self.assertEqual(result["task"]["runtime_seconds"], 60)
         self.assertIn("--property=RuntimeMaxSec=60s", launch)
         return result
+
+    def test_capture_script_is_private_and_matches_the_wrapper(self) -> None:
+        script = tasks._task_output_capture_script()
+        self.assertTrue(script.is_file())
+        self.assertEqual(script.parent, self.capture_script_root)
+        self.assertEqual(script.read_text(), tasks.TASK_OUTPUT_CAPTURE_CODE)
+        self.assertEqual(stat.S_IMODE(script.lstat().st_mode), 0o600)
+        self.assertEqual(
+            stat.S_IMODE(self.capture_script_root.lstat().st_mode), 0o700
+        )
+
+    def test_capture_script_is_content_addressed_and_idempotent(self) -> None:
+        first = tasks._task_output_capture_script()
+        second = tasks._task_output_capture_script()
+        self.assertEqual(first, second)
+        digest = hashlib.sha256(
+            tasks.TASK_OUTPUT_CAPTURE_CODE.encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(first.name, f"capture-{digest}.py")
+        with patch.object(tasks, "TASK_OUTPUT_CAPTURE_CODE", "import sys\n"):
+            other = tasks._task_output_capture_script()
+        self.assertNotEqual(first, other)
+        self.assertEqual(other.read_text(), "import sys\n")
+        self.assertEqual(first.read_text(), tasks.TASK_OUTPUT_CAPTURE_CODE)
+
+    def test_capture_script_is_restored_when_its_content_drifts(self) -> None:
+        script = tasks._task_output_capture_script()
+        script.write_text("raise SystemExit(0)\n")
+        restored = tasks._task_output_capture_script()
+        self.assertEqual(restored, script)
+        self.assertEqual(restored.read_text(), tasks.TASK_OUTPUT_CAPTURE_CODE)
+
+    def test_capture_script_leaves_no_temporary_file_behind(self) -> None:
+        tasks._task_output_capture_script()
+        tasks._task_output_capture_script()
+        leftovers = [
+            item.name
+            for item in self.capture_script_root.iterdir()
+            if item.name.endswith(".tmp")
+        ]
+        self.assertEqual(leftovers, [])
+
+    def test_launch_argv_stays_below_the_systemd_argument_limit(self) -> None:
+        # A single ExecStart argument of 4096 bytes or more cannot be re-read
+        # from the transient unit file systemd writes, which leaves every task
+        # unit unloadable (bad-setting) after the next daemon-reload.
+        self.assertGreaterEqual(
+            len(tasks.TASK_OUTPUT_CAPTURE_CODE.encode("utf-8")),
+            tasks.TASK_OUTPUT_CAPTURE_ARGUMENT_MAX_BYTES,
+        )
+        record = {
+            "argv_json": json.dumps(["/bin/echo", "hello"]),
+            "task_id": "0123456789abcdef01234567",
+            "attempt": 1,
+            "launcher_json": json.dumps(
+                {tasks.TASK_OUTPUT_LAUNCHER_BINDING_KEY: 1}
+            ),
+        }
+        argv = tasks._task_output_capture_argv(record)
+        for argument in argv:
+            self.assertLess(
+                len(argument.encode("utf-8")),
+                tasks.TASK_OUTPUT_CAPTURE_ARGUMENT_MAX_BYTES,
+            )
+        self.assertNotIn(tasks.TASK_OUTPUT_CAPTURE_CODE, argv)
 
     def test_persistent_task_and_job_defaults_are_six_hours(self) -> None:
         self.assertEqual(tasks.operator.DEFAULT_JOB_RUNTIME, 21_600)
