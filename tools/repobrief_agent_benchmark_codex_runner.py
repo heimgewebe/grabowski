@@ -1623,7 +1623,9 @@ def _write_private_relative_file(root_fd: int, relative: Path, data: bytes) -> N
         os.close(descriptor)
 
 
-def _manifest_artifact_paths(source: Path, raw: bytes) -> list[tuple[Path, Path]]:
+def _manifest_artifact_paths(
+    source: Path, raw: bytes
+) -> list[tuple[Path, Path, int, str]]:
     document = base._load_object_bytes(raw, label="RepoGround manifest")
     artifacts = document.get("artifacts")
     if artifacts is None:
@@ -1641,6 +1643,16 @@ def _manifest_artifact_paths(source: Path, raw: bytes) -> list[tuple[Path, Path]
             continue
         if not isinstance(raw_path, str) or not raw_path:
             raise RunnerError("RepoGround manifest artifact path is invalid")
+        expected_bytes = artifact.get("bytes")
+        expected_sha256 = artifact.get("sha256")
+        if (
+            isinstance(expected_bytes, bool)
+            or not isinstance(expected_bytes, int)
+            or expected_bytes < 0
+            or not isinstance(expected_sha256, str)
+            or re.fullmatch(r"[a-f0-9]{64}", expected_sha256) is None
+        ):
+            raise RunnerError("RepoGround manifest artifact identity is invalid")
         relative = Path(raw_path)
         if (
             relative.is_absolute()
@@ -1661,7 +1673,7 @@ def _manifest_artifact_paths(source: Path, raw: bytes) -> list[tuple[Path, Path]
             )
         if relative not in seen:
             seen.add(relative)
-            result.append((relative, candidate))
+            result.append((relative, candidate, expected_bytes, expected_sha256))
     return result
 
 
@@ -1861,7 +1873,7 @@ def stage_repoground_manifest(
         )
         artifact_bindings: list[dict[str, Any]] = []
         absent_artifacts: list[Path] = []
-        for relative, candidate in artifact_paths:
+        for relative, candidate, expected_bytes, expected_sha256 in artifact_paths:
             try:
                 metadata = candidate.lstat()
             except FileNotFoundError:
@@ -1877,6 +1889,13 @@ def stage_repoground_manifest(
                 label=f"RepoGround bundle artifact {relative}",
                 max_bytes=MAX_PROVIDER_EXECUTABLE_BYTES,
             )
+            if (
+                len(artifact_raw) != expected_bytes
+                or sha_bytes(artifact_raw) != expected_sha256
+            ):
+                raise RunnerError(
+                    "RepoGround bundle artifact changed after preflight authorization"
+                )
             _write_private_relative_file(stage_fd, relative, artifact_raw)
             staged_artifact = stage_root / relative
             artifact_bound = _bind_mcp_file(
@@ -3217,6 +3236,10 @@ def normalize(
         or total_output > budgets["max_tool_output_bytes"]
     ):
         raise RunnerError("Codex tool budget exceeded")
+    if request["condition"] == "treatment" and not any(
+        call["name"] in ALLOWED_MCP for call in calls
+    ):
+        raise RunnerError("treatment used no RepoBrief tool or resource")
     if not answers:
         raise RunnerError("Codex produced no final agent message")
     try:

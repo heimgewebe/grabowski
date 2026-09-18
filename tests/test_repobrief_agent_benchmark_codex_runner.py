@@ -2060,6 +2060,40 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 with self.assertRaisesRegex(runner.RunnerError, 'Codex usage is invalid'):
                     runner.normalize(request(), events)
 
+    def test_normalize_requires_repobrief_call_for_treatment(self) -> None:
+        value = request(condition="treatment")
+        events = [json.loads(line) for line in stream(value).splitlines()]
+        with self.assertRaisesRegex(
+            runner.RunnerError, "treatment used no RepoBrief tool or resource"
+        ):
+            runner.normalize(value, events)
+
+    def test_normalize_accepts_repobrief_call_for_treatment(self) -> None:
+        value = request(condition="treatment")
+        events = [json.loads(line) for line in stream(value).splitlines()]
+        command_event = next(
+            event
+            for event in events
+            if event.get("type") == "item.completed"
+            and isinstance(event.get("item"), dict)
+            and event["item"].get("type") == "command_execution"
+        )
+        command_event["item"] = {
+            "type": "mcp_tool_call",
+            "server": "repobrief",
+            "tool": "live_freshness",
+            "arguments": {"bundle_manifest": "/bundles/repo.bundle.manifest.json"},
+            "result": {"status": "ok"},
+            "status": "completed",
+        }
+
+        _input_tokens, _output_tokens, calls, normalized_answer = runner.normalize(
+            value, events
+        )
+
+        self.assertEqual([call["name"] for call in calls], ["live_freshness"])
+        self.assertEqual(normalized_answer, answer())
+
     def test_resource_freeze_rejects_pagination_and_duplicates(self) -> None:
         with self.assertRaisesRegex(runner.RunnerError, "paginated"):
             runner._freeze_resource_result({"resources": [], "nextCursor": "more"})
@@ -2274,6 +2308,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             (bundle / "nested").mkdir(parents=True)
             artifact = bundle / "nested" / "brief.md"
             artifact.write_text("authorized artifact\n", encoding="utf-8")
+            artifact_raw = artifact.read_bytes()
             manifest = bundle / "chosen.bundle.manifest.json"
             manifest.write_text(
                 json.dumps(
@@ -2282,6 +2317,8 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                             {
                                 "role": "canonical_md",
                                 "path": "nested/brief.md",
+                                "bytes": len(artifact_raw),
+                                "sha256": hashlib.sha256(artifact_raw).hexdigest(),
                             }
                         ]
                     },
@@ -2308,6 +2345,43 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             runner._revalidate_staged_repoground_manifest(binding)
             self.assertIsNone(runner.cleanup_staged_repoground_manifest(binding))
             self.assertFalse(staged.parent.exists())
+
+    def test_staged_manifest_rejects_artifact_content_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "state"
+            state_root.mkdir(mode=0o700)
+            bundle = root / "bundle"
+            bundle.mkdir()
+            artifact = bundle / "brief.md"
+            authorized = b"authorized artifact\n"
+            artifact.write_bytes(authorized)
+            manifest = bundle / "chosen.bundle.manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "artifacts": [
+                            {
+                                "role": "canonical_md",
+                                "path": "brief.md",
+                                "bytes": len(authorized),
+                                "sha256": hashlib.sha256(authorized).hexdigest(),
+                            }
+                        ]
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            expected = file_identity(manifest)
+            artifact.write_bytes(b"replaced after preflight\n")
+
+            with self.assertRaisesRegex(
+                runner.RunnerError,
+                "bundle artifact changed after preflight authorization",
+            ):
+                runner.stage_repoground_manifest(state_root, expected)
 
     def test_preflight_authorization_rejects_legacy_projected_request_hash(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
