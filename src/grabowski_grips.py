@@ -6443,6 +6443,11 @@ def _validate_remote_materialization_target(
     return effective_urls[0]
 
 
+def _remote_materialization_pinned_target(remote_target: str) -> tuple[str, str]:
+    pinned = f"grabowski-pinned-{os.urandom(16).hex()}:"
+    return pinned, f"url.{remote_target}.insteadOf={pinned}"
+
+
 def _remote_materialization_head(
     repo: Path,
     remote: str,
@@ -6455,11 +6460,38 @@ def _remote_materialization_head(
     effect_started: bool = False,
 ) -> str:
     ref = f"refs/heads/{branch}"
-    result = _git(repo, runner, ["ls-remote", "--exit-code", remote, ref])
+    failure = GripActionError if effect_started else GripPreflightError
+    try:
+        pinned_remote, pin_config = _remote_materialization_pinned_target(remote)
+        result = _git_optional(
+            repo,
+            runner,
+            [
+                "-c",
+                pin_config,
+                "ls-remote",
+                "--exit-code",
+                pinned_remote,
+                ref,
+            ],
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        _check(receipt, check_id, "fail", f"read_error={type(exc).__name__}")
+        raise failure(
+            "remote-head-materialize could not read the advertised remote branch"
+        ) from exc
+    try:
+        returncode = int(result.get("returncode", 1)) if isinstance(result, dict) else 1
+    except (TypeError, ValueError):
+        returncode = 1
+    if not isinstance(result, dict) or returncode != 0:
+        _check(receipt, check_id, "fail", "remote_read_failed")
+        raise failure(
+            "remote-head-materialize could not read the advertised remote branch"
+        )
     lines = [
         line for line in str(result.get("stdout", "")).splitlines() if line.strip()
     ]
-    failure = GripActionError if effect_started else GripPreflightError
     if len(lines) != 1:
         _check(receipt, check_id, "fail", f"match_count={len(lines)}")
         raise failure(
@@ -6488,6 +6520,7 @@ def _run_remote_head_materialize(
     runner: CommandRunner,
 ) -> dict[str, Any]:
     import sqlite3
+    from contextlib import contextmanager
 
     import grabowski_resources as resources
     import grabowski_work_acquire as work_acquire
@@ -6640,7 +6673,24 @@ def _run_remote_head_materialize(
             raise GripPreflightError(message)
         _check(receipt, check_id, "pass", "ready")
 
-    with work_acquire._lane_lock(lane_id) as lane_receipt_path:
+    @contextmanager
+    def locked_lane(check_id: str, *, effect_started: bool = False):
+        try:
+            with work_acquire._lane_lock(lane_id) as lane_receipt_path:
+                yield lane_receipt_path
+        except (GripPreflightError, GripActionError):
+            raise
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            _check(receipt, check_id, "fail", f"lock_error={type(exc).__name__}")
+            message = (
+                "remote-head-materialize could not acquire or release the "
+                "durable Work Lane lock"
+            )
+            if effect_started:
+                raise GripActionError(message) from exc
+            raise GripPreflightError(message) from exc
+
+    with locked_lane("lane_lock_before_import") as lane_receipt_path:
         validate_locked_lane(lane_receipt_path, "lane_active_before_import")
         lane_lease_snapshots("lane_leases")
 
@@ -6696,7 +6746,7 @@ def _run_remote_head_materialize(
                 "remote-head-materialize refuses a non-fast-forward update"
             )
         _check(receipt, "fast_forward", "pass", "ancestor")
-        with work_acquire._lane_lock(lane_id) as lane_receipt_path:
+        with locked_lane("lane_lock_replay") as lane_receipt_path:
             validate_locked_lane(lane_receipt_path, "lane_active_replay")
 
             remote_after = _remote_materialization_head(
@@ -6742,10 +6792,21 @@ def _run_remote_head_materialize(
             "next_action": None,
         }
 
+    try:
+        fetch_remote, fetch_pin_config = _remote_materialization_pinned_target(
+            remote_target
+        )
+    except OSError as exc:
+        _check(receipt, "object_import", "fail", "pin_generation_failed")
+        raise GripPreflightError(
+            "remote-head-materialize could not bind the validated network target"
+        ) from exc
     fetch = _git(
         repo,
         runner,
         [
+            "-c",
+            fetch_pin_config,
             "-c",
             "protocol.ext.allow=never",
             "-c",
@@ -6761,7 +6822,7 @@ def _run_remote_head_materialize(
             "--no-prune",
             "--refmap=",
             "--upload-pack=git-upload-pack",
-            remote_target,
+            fetch_remote,
             expected_remote_head,
         ],
     )
@@ -6812,7 +6873,9 @@ def _run_remote_head_materialize(
         )
     _check(receipt, "fast_forward", "pass", "ancestor")
 
-    with work_acquire._lane_lock(lane_id) as lane_receipt_path:
+    with locked_lane(
+        "lane_lock_after_import", effect_started=True
+    ) as lane_receipt_path:
         validate_locked_lane(
             lane_receipt_path,
             "lane_active_after_import",

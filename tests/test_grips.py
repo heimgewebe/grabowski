@@ -318,6 +318,7 @@ class FakeRemoteMaterializeGit(FakeGit):
         fast_forward: bool = True,
         configured_urls: list[str] | None = None,
         effective_fetch_urls: list[str] | None = None,
+        remote_read_returncodes: list[int] | None = None,
         shallow: bool = False,
     ) -> None:
         super().__init__(
@@ -335,6 +336,7 @@ class FakeRemoteMaterializeGit(FakeGit):
         self.effective_fetch_urls = list(
             effective_fetch_urls or self.configured_urls
         )
+        self.remote_read_returncodes = list(remote_read_returncodes or [])
         self.shallow = shallow
 
     def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
@@ -359,13 +361,36 @@ class FakeRemoteMaterializeGit(FakeGit):
             if len(self.effective_fetch_urls) == 1
             else "origin"
         )
-        if argv == [
-            "ls-remote",
-            "--exit-code",
-            network_target,
-            f"refs/heads/{self.remote_branch}",
-        ]:
+        plain = list(argv)
+        command_configs: list[str] = []
+        while len(plain) >= 2 and plain[0] == "-c":
+            command_configs.append(plain[1])
+            plain = plain[2:]
+        if (
+            len(plain) == 4
+            and plain[:2] == ["ls-remote", "--exit-code"]
+            and plain[3] == f"refs/heads/{self.remote_branch}"
+        ):
+            operand = plain[2]
+            pin_config = f"url.{network_target}.insteadOf={operand}"
+            if operand != network_target and pin_config not in command_configs:
+                return {
+                    "returncode": 1,
+                    "stdout": "",
+                    "stderr": "unvalidated network target",
+                }
             self.calls.append(tuple(argv))
+            returncode = (
+                self.remote_read_returncodes.pop(0)
+                if self.remote_read_returncodes
+                else 0
+            )
+            if returncode != 0:
+                return {
+                    "returncode": returncode,
+                    "stdout": "",
+                    "stderr": "remote read failed",
+                }
             head = (
                 self.remote_heads.pop(0)
                 if self.remote_heads
@@ -376,10 +401,15 @@ class FakeRemoteMaterializeGit(FakeGit):
                 "stdout": f"{head}\trefs/heads/{self.remote_branch}\n",
                 "stderr": "",
             }
-        plain = list(argv)
-        while len(plain) >= 2 and plain[0] == "-c":
-            plain = plain[2:]
         if plain and plain[0] == "fetch":
+            operand = plain[-2]
+            pin_config = f"url.{network_target}.insteadOf={operand}"
+            if operand != network_target and pin_config not in command_configs:
+                return {
+                    "returncode": 1,
+                    "stdout": "",
+                    "stderr": "unvalidated network target",
+                }
             self.calls.append(tuple(argv))
             self.object_available = True
             return {
@@ -8404,6 +8434,7 @@ class GripFoundationTests(unittest.TestCase):
         missing_lease: bool = False,
         lease_reads: list[object] | None = None,
         read_state_reads: list[object] | None = None,
+        lane_lock_failure_after_initial: bool = False,
         locked_terminal: bool = False,
         locked_terminal_after_initial: bool = False,
     ) -> tuple[dict[str, object], FakeRemoteMaterializeGit, types.ModuleType]:
@@ -8453,6 +8484,13 @@ class GripFoundationTests(unittest.TestCase):
                 {**locked_record, "terminal_closeout": {"state": "terminal"}},
             ]
 
+        lane_lock = Mock(return_value=LaneLock())
+        if lane_lock_failure_after_initial:
+            lane_lock.side_effect = [
+                LaneLock(),
+                RuntimeError("work-lane lock is unavailable"),
+            ]
+
         with (
             patch(
                 "grabowski_work_acquire._stored_lane_inputs",
@@ -8462,7 +8500,7 @@ class GripFoundationTests(unittest.TestCase):
             patch.object(resources, "renew_resources", renew),
             patch(
                 "grabowski_work_acquire._lane_lock",
-                return_value=LaneLock(),
+                lane_lock,
             ),
             patch(
                 "grabowski_work_acquire._read_state",
@@ -8501,7 +8539,17 @@ class GripFoundationTests(unittest.TestCase):
         self.assertIn("--no-tags", fetch)
         self.assertIn("--no-recurse-submodules", fetch)
         self.assertEqual("b" * 40, fetch[-1])
-        self.assertEqual(fake.effective_fetch_urls[0], fetch[-2])
+        fetch_plain = list(fetch)
+        fetch_configs: list[str] = []
+        while len(fetch_plain) >= 2 and fetch_plain[0] == "-c":
+            fetch_configs.append(fetch_plain[1])
+            fetch_plain = fetch_plain[2:]
+        fetch_target = fetch_plain[-2]
+        self.assertTrue(fetch_target.startswith("grabowski-pinned-"))
+        self.assertIn(
+            f"url.{fake.effective_fetch_urls[0]}.insteadOf={fetch_target}",
+            fetch_configs,
+        )
         self.assertNotIn(f"refs/heads/{fake.remote_branch}", fetch)
         operator.grabowski_git.assert_not_called()
         checks = {
@@ -8611,6 +8659,22 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("a" * 40, fake.head)
         operator.grabowski_git.assert_not_called()
 
+    def test_remote_head_materialize_receipts_lane_lock_failure_after_object_import(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, fake, operator = self._run_remote_materialize_case(
+                tmp,
+                lane_lock_failure_after_initial=True,
+            )
+
+        self.assertEqual("failed", result["receipt"]["status"])
+        self.assertEqual("action", result["receipt"]["phase"])
+        self.assertIn("Work Lane lock", result["output"]["error"])
+        self.assertTrue(any("fetch" in call for call in fake.calls))
+        self.assertEqual("a" * 40, fake.head)
+        operator.grabowski_git.assert_not_called()
+
     def test_remote_head_materialize_rejects_shallow_repository_before_fetch(
         self,
     ) -> None:
@@ -8670,7 +8734,7 @@ class GripFoundationTests(unittest.TestCase):
         )
         operator.grabowski_git.assert_not_called()
 
-    def test_remote_head_materialize_pins_network_effects_to_validated_effective_url(
+    def test_remote_head_materialize_pins_each_network_process_to_validated_url(
         self,
     ) -> None:
         effective = "git@github.com:heimgewebe/grabowski.git"
@@ -8684,15 +8748,58 @@ class GripFoundationTests(unittest.TestCase):
             )
 
         self.assertEqual("passed", result["receipt"]["status"])
-        fetch = next(call for call in fake.calls if "fetch" in call)
-        self.assertEqual(effective, fetch[-2])
-        remote_reads = [
-            call
-            for call in fake.calls
-            if call[:2] == ("ls-remote", "--exit-code")
+        network_calls = [
+            call for call in fake.calls if "ls-remote" in call or "fetch" in call
         ]
-        self.assertTrue(remote_reads)
-        self.assertTrue(all(call[2] == effective for call in remote_reads))
+        self.assertTrue(network_calls)
+        operands: list[str] = []
+        for call in network_calls:
+            plain = list(call)
+            configs: list[str] = []
+            while len(plain) >= 2 and plain[0] == "-c":
+                configs.append(plain[1])
+                plain = plain[2:]
+            operand = plain[-2] if plain[0] == "fetch" else plain[2]
+            operands.append(operand)
+            self.assertTrue(operand.startswith("grabowski-pinned-"))
+            self.assertIn(f"url.{effective}.insteadOf={operand}", configs)
+        self.assertEqual(len(operands), len(set(operands)))
+        operator.grabowski_git.assert_not_called()
+
+    def test_remote_head_materialize_pin_alias_is_single_pass_in_git(self) -> None:
+        target = "git@github.com:heimgewebe/grabowski.git"
+        pinned = "grabowski-pinned-test:"
+        result = subprocess.run(
+            [
+                "git",
+                "-c",
+                f"url.{target}.insteadOf={pinned}",
+                "-c",
+                "url.git@evil.example:.insteadOf=git@github.com:",
+                "ls-remote",
+                "--get-url",
+                pinned,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+        self.assertEqual(target, result.stdout.strip())
+
+    def test_remote_head_materialize_initial_remote_read_failure_is_preflight(
+        self,
+    ) -> None:
+        fake = FakeRemoteMaterializeGit(remote_read_returncodes=[2])
+        with tempfile.TemporaryDirectory() as tmp:
+            result, fake, operator = self._run_remote_materialize_case(
+                tmp, fake_git=fake
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("preflight", result["receipt"]["phase"])
+        self.assertIn("advertised remote branch", result["output"]["error"])
+        self.assertFalse(any("fetch" in call for call in fake.calls))
         operator.grabowski_git.assert_not_called()
 
     def test_remote_head_materialize_rejects_stale_remote_binding_before_fetch(
