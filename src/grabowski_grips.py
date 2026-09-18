@@ -6414,6 +6414,7 @@ def _remote_materialization_head(
     receipt: Receipt,
     runner: CommandRunner,
     check_id: str,
+    expected_head: str,
 ) -> str:
     ref = f"refs/heads/{branch}"
     result = _git(repo, runner, ["ls-remote", "--exit-code", remote, ref])
@@ -6428,7 +6429,11 @@ def _remote_materialization_head(
     parts = lines[0].split()
     head = parts[0].lower() if parts else ""
     advertised_ref = parts[1] if len(parts) > 1 else ""
-    if re.fullmatch(r"[0-9a-f]{40}", head) is None or advertised_ref != ref:
+    if (
+        len(head) != len(expected_head)
+        or re.fullmatch(r"[0-9a-f]+", head) is None
+        or advertised_ref != ref
+    ):
         _check(receipt, check_id, "fail", "malformed_remote_readback")
         raise GripPreflightError(
             "remote-head-materialize could not bind the advertised remote head"
@@ -6453,8 +6458,12 @@ def _run_remote_head_materialize(
         raise GripPreflightError(
             "lane_id must be a 32-character lowercase hex Work Lane id"
         )
-    expected_local_head = _sha_parameter(parameters, "expected_local_head")
-    expected_remote_head = _sha_parameter(parameters, "expected_remote_head")
+    expected_local_head = _sha_parameter(parameters, "expected_local_head").lower()
+    expected_remote_head = _sha_parameter(parameters, "expected_remote_head").lower()
+    if len(expected_local_head) != len(expected_remote_head):
+        raise GripPreflightError(
+            "remote-head-materialize bound heads must use one Git object format"
+        )
     remote_branch = _short_branch_name(parameters, "remote_branch")
     if remote_branch in INTRINSIC_PROTECTED_BRANCHES:
         raise GripPreflightError(
@@ -6555,7 +6564,13 @@ def _run_remote_head_materialize(
     _check(receipt, "local_head", "pass", str(orientation["head"]))
 
     remote_before = _remote_materialization_head(
-        repo, remote, remote_branch, receipt, runner, "remote_head_before"
+        repo,
+        remote,
+        remote_branch,
+        receipt,
+        runner,
+        "remote_head_before",
+        expected_remote_head,
     )
     if remote_before != expected_remote_head:
         raise GripPreflightError(
@@ -6573,15 +6588,55 @@ def _run_remote_head_materialize(
                 "remote-head-materialize refuses a non-fast-forward update"
             )
         _check(receipt, "fast_forward", "pass", "ancestor")
-        remote_after = _remote_materialization_head(
-            repo, remote, remote_branch, receipt, runner, "remote_head_after"
-        )
-        if remote_after != expected_remote_head:
-            raise GripPreflightError(
-                "remote branch advanced during materialization readback"
+        with work_acquire._lane_lock(lane_id) as lane_receipt_path:
+            locked_record = work_acquire._read_state(lane_receipt_path)
+            locked_inputs = (
+                locked_record.get("inputs")
+                if isinstance(locked_record, dict)
+                else None
             )
+            lane_inactive = (
+                not isinstance(locked_record, dict)
+                or locked_record.get("lane_id") != lane_id
+                or locked_record.get("state") != "ready"
+                or locked_inputs != lane
+                or locked_record.get("terminal_closeout") is not None
+                or locked_record.get("terminal_closeout_pending") is not None
+            )
+            if lane_inactive:
+                _check(receipt, "lane_active_replay", "fail", "lane_state_changed")
+                raise GripPreflightError(
+                    "remote-head-materialize Work Lane changed during replay validation"
+                )
+            _check(receipt, "lane_active_replay", "pass", "ready")
+
+            remote_after = _remote_materialization_head(
+                repo,
+                remote,
+                remote_branch,
+                receipt,
+                runner,
+                "remote_head_after",
+                expected_remote_head,
+            )
+            if remote_after != expected_remote_head:
+                raise GripPreflightError(
+                    "remote branch advanced during materialization readback"
+                )
+            final = _orient(repo, runner)
+            if (
+                final["branch"] != lane_branch
+                or final["head"] != expected_remote_head
+                or final["dirty"]
+            ):
+                _check(receipt, "lane_preserved", "fail", "writer_changed")
+                raise GripPreflightError(
+                    "remote-head-materialize writer lane changed during replay validation"
+                )
+            _check(receipt, "lane_preserved", "pass", expected_remote_head)
+            lane_lease_snapshots("lane_leases_replay")
+
         _check(receipt, "object_import", "skip", "already_materialized")
-        _check(receipt, "lane_preserved", "pass", expected_remote_head)
         _check(receipt, "post_state", "pass", expected_remote_head)
         return {
             "action": "unchanged",
@@ -6648,6 +6703,7 @@ def _run_remote_head_materialize(
             receipt,
             runner,
             "remote_head_after_import",
+            expected_remote_head,
         )
         != expected_remote_head
     ):
@@ -6688,7 +6744,6 @@ def _run_remote_head_materialize(
             )
         _check(receipt, "lane_active_after_import", "pass", "ready")
 
-        lane_lease_snapshots("lane_leases_after_import", effect_started=True)
         remote_after = _remote_materialization_head(
             repo,
             remote,
@@ -6696,6 +6751,7 @@ def _run_remote_head_materialize(
             receipt,
             runner,
             "remote_head_after",
+            expected_remote_head,
         )
         if remote_after != expected_remote_head:
             raise GripActionError(
@@ -6713,6 +6769,7 @@ def _run_remote_head_materialize(
                 "remote-head-materialize writer lane changed during exact-head object import"
             )
         _check(receipt, "lane_preserved", "pass", expected_local_head)
+        lane_lease_snapshots("lane_leases_after_import", effect_started=True)
 
     _check(receipt, "post_state", "pass", expected_local_head)
     return {
