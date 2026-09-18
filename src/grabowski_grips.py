@@ -1200,7 +1200,7 @@ GRIP_CONDITIONAL_PRECONDITIONS = {
     "remote-head-materialize": (
         "lane_id must bind the supplied existing writer checkout and every lane resource lease must be live and owned by that lane",
         "the effective remote must be SSH and the repository must be non-shallow; expected_remote_head must equal the advertised remote branch before and after object import; object import writes no FETCH_HEAD, tags, prune state or remote-tracking ref",
-        "expected_local_head must be an ancestor of expected_remote_head and the writer branch moves only through grabowski_git merge --ff-only under exact branch_attempt CAS",
+        "expected_local_head must be an ancestor of expected_remote_head; the exact Work Lane lease snapshots are revalidated and snapshot-renewed immediately before branch mutation, then the writer branch moves only through grabowski_git merge --ff-only under exact branch_attempt CAS",
         "this grip never pushes, changes PR metadata, merges a PR or grants Captain authority",
     ),
     "pr-base-converge": (
@@ -6501,24 +6501,28 @@ def _run_remote_head_materialize(
         raise GripPreflightError(
             "remote-head-materialize requires the exact Work Lane resource set"
         )
-    live = resources.inspect_resources(resource_keys)
-    missing = sorted(set(resource_keys) - set(live))
-    foreign = sorted(
-        key
-        for key, value in live.items()
-        if value.get("owner_id") != lane_owner
-    )
-    if missing or foreign:
-        _check(
-            receipt,
-            "lane_leases",
-            "fail",
-            f"missing={len(missing)} foreign={len(foreign)}",
+    def lane_lease_snapshots(check_id: str) -> list[dict[str, Any]]:
+        live = resources.inspect_resources(resource_keys)
+        missing = sorted(set(resource_keys) - set(live))
+        foreign = sorted(
+            key
+            for key, value in live.items()
+            if value.get("owner_id") != lane_owner
         )
-        raise GripPreflightError(
-            "remote-head-materialize requires every Work Lane resource lease to be live and lane-owned"
-        )
-    _check(receipt, "lane_leases", "pass", f"count={len(resource_keys)}")
+        if missing or foreign:
+            _check(
+                receipt,
+                check_id,
+                "fail",
+                f"missing={len(missing)} foreign={len(foreign)}",
+            )
+            raise GripPreflightError(
+                "remote-head-materialize requires every Work Lane resource lease to be live and lane-owned"
+            )
+        _check(receipt, check_id, "pass", f"count={len(resource_keys)}")
+        return [live[key] for key in sorted(resource_keys)]
+
+    lane_lease_snapshots("lane_leases")
 
     _validate_remote_materialization_target(repo, remote, receipt, runner)
     shallow = _git_optional(repo, runner, ["rev-parse", "--is-shallow-repository"])
@@ -6643,6 +6647,40 @@ def _run_remote_head_materialize(
             "remote-head-materialize refuses a non-fast-forward update"
         )
     _check(receipt, "fast_forward", "pass", "ancestor")
+
+    pre_cas_leases = lane_lease_snapshots("lane_leases_before_cas")
+    try:
+        renewal = resources.renew_resources(
+            lane_owner,
+            resource_keys,
+            ttl_seconds=120,
+            expected_leases=pre_cas_leases,
+        )
+    except (OSError, PermissionError, RuntimeError, TypeError, ValueError) as exc:
+        _check(receipt, "lane_lease_hold", "fail", type(exc).__name__)
+        raise GripPreflightError(
+            "remote-head-materialize could not snapshot-renew the exact Work Lane leases before branch CAS"
+        ) from exc
+    renewed = renewal.get("leases")
+    renewed_keys = (
+        {
+            item.get("resource_key")
+            for item in renewed
+            if isinstance(item, dict)
+        }
+        if isinstance(renewed, list)
+        else set()
+    )
+    if (
+        renewal.get("owner_id") != lane_owner
+        or renewal.get("snapshot_guarded") is not True
+        or renewed_keys != set(resource_keys)
+    ):
+        _check(receipt, "lane_lease_hold", "fail", "renewal_receipt_mismatch")
+        raise GripActionError(
+            "remote-head-materialize Work Lane lease hold returned mismatched evidence"
+        )
+    _check(receipt, "lane_lease_hold", "pass", f"count={len(resource_keys)}")
 
     pre_orientation = _orient(repo, runner)
     if (

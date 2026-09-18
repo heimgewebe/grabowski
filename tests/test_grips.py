@@ -8402,6 +8402,8 @@ class GripFoundationTests(unittest.TestCase):
         *,
         fake_git: FakeRemoteMaterializeGit | None = None,
         missing_lease: bool = False,
+        lease_reads: list[dict[str, dict[str, object]]] | None = None,
+        renew_error: Exception | None = None,
         mutation_status: str = "completed",
     ) -> tuple[
         FakeRemoteMaterializeGit,
@@ -8433,6 +8435,8 @@ class GripFoundationTests(unittest.TestCase):
         operator = fake_remote_materialize_operator(
             git, mutation_status=mutation_status
         )
+        operator.lease_reads = list(lease_reads) if lease_reads is not None else None
+        operator.renew_error = renew_error
         return git, operator, lane_inputs, leases
 
     def _run_remote_materialize_case(
@@ -8441,12 +8445,16 @@ class GripFoundationTests(unittest.TestCase):
         *,
         fake_git: FakeRemoteMaterializeGit | None = None,
         missing_lease: bool = False,
+        lease_reads: list[dict[str, dict[str, object]]] | None = None,
+        renew_error: Exception | None = None,
         mutation_status: str = "completed",
     ) -> tuple[dict[str, object], FakeRemoteMaterializeGit, types.ModuleType]:
         git, operator, lane_inputs, leases = self._remote_materialize_lane_case(
             tmp,
             fake_git=fake_git,
             missing_lease=missing_lease,
+            lease_reads=lease_reads,
+            renew_error=renew_error,
             mutation_status=mutation_status,
         )
         params = {
@@ -8456,12 +8464,27 @@ class GripFoundationTests(unittest.TestCase):
             "expected_local_head": "a" * 40,
             "expected_remote_head": git.materialize_remote_head,
         }
+        inspect = Mock(return_value=leases)
+        if operator.lease_reads is not None:
+            inspect.side_effect = operator.lease_reads
+        renewal = {
+            "owner_id": lane_inputs["lease_owner_id"],
+            "snapshot_guarded": True,
+            "leases": list(leases.values()),
+        }
+        renew = Mock(
+            side_effect=operator.renew_error
+            if operator.renew_error is not None
+            else None,
+            return_value=renewal,
+        )
         with (
             patch(
                 "grabowski_work_acquire._stored_lane_inputs",
                 return_value=lane_inputs,
             ),
-            patch.object(resources, "inspect_resources", return_value=leases),
+            patch.object(resources, "inspect_resources", inspect),
+            patch.object(resources, "renew_resources", renew),
             patch.dict(sys.modules, {"grabowski_operator": operator}),
         ):
             result = grips.run_grip(
@@ -8600,6 +8623,36 @@ class GripFoundationTests(unittest.TestCase):
         self.assertIn(
             "advanced during exact-head object import", result["output"]["error"]
         )
+        operator.grabowski_git.assert_not_called()
+
+    def test_remote_head_materialize_rejects_lane_lease_loss_before_branch_cas(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            git, _operator, _lane_inputs, leases = self._remote_materialize_lane_case(tmp)
+            result, fake, operator = self._run_remote_materialize_case(
+                tmp,
+                fake_git=git,
+                lease_reads=[leases, {}],
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("every Work Lane resource lease", result["output"]["error"])
+        self.assertTrue(any("fetch" in call for call in fake.calls))
+        operator.grabowski_git.assert_not_called()
+
+    def test_remote_head_materialize_rejects_snapshot_renewal_conflict_before_branch_cas(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, fake, operator = self._run_remote_materialize_case(
+                tmp,
+                renew_error=RuntimeError("lease snapshot changed"),
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("snapshot-renew", result["output"]["error"])
+        self.assertTrue(any("fetch" in call for call in fake.calls))
         operator.grabowski_git.assert_not_called()
 
     def test_remote_head_materialize_replays_without_fetch_when_head_is_already_exact(
