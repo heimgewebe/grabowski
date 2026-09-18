@@ -1729,7 +1729,6 @@ def _run_secret_pty_process(
     os.set_blocking(master_fd, False)
     prompt_index = 0
     bytes_seen = 0
-    secret_echo_detected = False
     failure_reason: str | None = None
     timed_out = False
     status: int | None = None
@@ -1766,7 +1765,6 @@ def _run_secret_pty_process(
                         break
                     window.extend(chunk)
                     if bytes(secret) in window:
-                        secret_echo_detected = True
                         failure_reason = "secret-echo"
                         break
                     while prompt_index < len(prompt_bytes):
@@ -1805,7 +1803,6 @@ def _run_secret_pty_process(
     complete = (
         failure_reason is None
         and not timed_out
-        and not secret_echo_detected
         and prompt_index == len(prompt_bytes)
         and returncode == 0
     )
@@ -1819,7 +1816,6 @@ def _run_secret_pty_process(
         "expected_prompt_count": len(prompt_bytes),
         "prompt_contract_sha256": execution.get("prompt_contract_sha256"),
         "pty_bytes_observed": bytes_seen,
-        "secret_echo_detected": secret_echo_detected,
         "failure_reason": failure_reason,
         "duration_seconds": round(time.monotonic() - started, 3),
     }
@@ -2144,7 +2140,6 @@ def main() -> int:
             "prompt_count": result["prompt_count"],
             "expected_prompt_count": result["expected_prompt_count"],
             "pty_bytes_observed": result["pty_bytes_observed"],
-            "secret_echo_detected": result["secret_echo_detected"],
             "outcome": result["outcome"],
             "returncode": result["returncode"],
             "timed_out": result["timed_out"],
@@ -2153,22 +2148,21 @@ def main() -> int:
             "failure_reason": result["failure_reason"],
         }
         append_audit(record)
-        print(json.dumps({
+        public_result = {
             "schema_version": 1,
-            "request_id": reference["request_id"],
-            "action": reference["action"],
             "mode": "secret-pty",
-            "session_id": session_authority["session_id"],
-            "task_id": session_authority["task_id"],
-            "host": session_authority["host"],
-            "action_schema": session_authority["action_schema"],
-            "session_authority_sha256": session_authority["authority_sha256"],
-            "resource_lease_bindings_sha256": session_authority[
-                "resource_lease_bindings_sha256"
-            ],
-            **result,
-            "audit": _public_audit_record(record),
-        }, ensure_ascii=False, sort_keys=True))
+            "outcome": result["outcome"],
+            "returncode": result["returncode"],
+            "timed_out": result["timed_out"],
+            "retry_safe": False,
+            "readback_required": result["readback_required"],
+            "prompt_count": result["prompt_count"],
+            "expected_prompt_count": result["expected_prompt_count"],
+            "prompt_contract_sha256": result["prompt_contract_sha256"],
+            "pty_bytes_observed": result["pty_bytes_observed"],
+            "duration_seconds": result["duration_seconds"],
+        }
+        print(json.dumps(public_result, ensure_ascii=False, sort_keys=True))
         return 0
     if secret_transport is not None:
         raise PermissionError("secret transport is not allowed for this action")

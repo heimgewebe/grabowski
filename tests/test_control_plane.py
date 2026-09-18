@@ -2565,6 +2565,21 @@ class SecretPtyContractTests(unittest.TestCase):
                 now=1000,
             )
 
+    def test_request_client_accepts_canonical_secret_fd_and_sha256(self) -> None:
+        request_tool = _load_privileged_request_tool()
+        reference = self._reference()
+        secret_sha256 = "f" * 64
+        authority = self._session_authority(secret_sha256)
+        raw = request_tool._secret_transport_envelope(
+            reference,
+            "/proc/self/fd/7",
+            secret_sha256,
+            authority,
+        )
+        envelope = json.loads(raw)
+        self.assertEqual(envelope["secret_fd"], 7)
+        self.assertEqual(envelope["secret_sha256"], secret_sha256)
+
     def test_request_client_never_treats_unclear_secret_pty_as_success(self) -> None:
         request_tool = _load_privileged_request_tool()
         self.assertTrue(request_tool._response_succeeded({
@@ -2811,7 +2826,8 @@ class SecretPtyContractTests(unittest.TestCase):
         self.assertEqual(result["outcome"], "COMPLETED")
         self.assertEqual(result["returncode"], 0)
         self.assertEqual(result["prompt_count"], 2)
-        self.assertFalse(result["secret_echo_detected"])
+        self.assertIsNone(result["failure_reason"])
+        self.assertNotIn("secret_echo_detected", result)
         self.assertNotIn(bytes(secret).decode(), json.dumps(result))
 
     def test_secret_pty_echo_is_detected_without_returning_secret(self) -> None:
@@ -2825,7 +2841,8 @@ class SecretPtyContractTests(unittest.TestCase):
             execution=execution, secret=secret, peer_alive=lambda: True
         )
         self.assertEqual(result["outcome"], "UNCLEAR")
-        self.assertTrue(result["secret_echo_detected"])
+        self.assertEqual(result["failure_reason"], "secret-echo")
+        self.assertNotIn("secret_echo_detected", result)
         self.assertTrue(result["readback_required"])
         self.assertFalse(result["retry_safe"])
         self.assertNotIn(bytes(secret).decode(), json.dumps(result))

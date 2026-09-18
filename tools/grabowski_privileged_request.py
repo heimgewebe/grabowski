@@ -16,8 +16,8 @@ import sys
 
 DEFAULT_SOCKET = Path("/run/grabowski/privileged-broker.sock")
 MAX_BYTES = 512 * 1024
-SHA256_RE = re.compile(r"[0-9a-f]{64}\\Z")
-SECRET_FD_PATH_RE = re.compile(r"/proc/self/fd/([0-9]+)\\Z")
+SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+SECRET_FD_PATH_RE = re.compile(r"/proc/self/fd/([0-9]+)\Z")
 
 
 def _canonical_sha256(value: object) -> str:
