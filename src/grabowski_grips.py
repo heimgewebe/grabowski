@@ -930,9 +930,9 @@ GRIP_SPECS: dict[str, GripSpec] = {
         name="remote-head-materialize",
         version="1.0",
         summary=(
-            "Materialize one exact remote branch head into an existing clean "
-            "Grabowski-owned writer lane without replacing the lane or mutating "
-            "remote-tracking refs."
+            "Import one exact remote branch head into local Git object storage "
+            "for an existing clean Grabowski-owned writer lane while preserving "
+            "that lane branch and worktree."
         ),
         effect=MUTATING,
         required_parameters=(
@@ -945,12 +945,11 @@ GRIP_SPECS: dict[str, GripSpec] = {
         acceptance_ids=(
             "lane-binding-exact",
             "lane-leases-live",
-            "local-preimage-exact",
             "remote-head-exact",
             "object-import-ref-isolated",
-            "fast-forward-only",
-            "branch-cas-bound",
-            "post-state-readback",
+            "fast-forward-ancestry",
+            "lane-preserved",
+            "successor-handoff-explicit",
         ),
         runner="remote_head_materialize",
         operation_effect_class="worktree_admin",
@@ -1108,7 +1107,7 @@ GRIP_SURFACE_TARGETS = {
     "operator-obligation-close": "one create-only operator obligation terminal record",
     "operator-obligation-resolve": "one create-only historical operator obligation resolution",
     "branch-publish": "git branch publication",
-    "remote-head-materialize": "one exact remote branch head into one existing Grabowski-owned writer lane",
+    "remote-head-materialize": "one exact remote branch head imported for one existing Grabowski-owned writer lane without moving that lane",
     "pr-base-converge": "one exact open same-repository GitHub pull request head branch",
     "pr-create-or-update": "GitHub pull request metadata",
     "candidate-integration-ready": "one closed verified Agent Workspace through controller custody to an exact ready PR",
@@ -1120,7 +1119,8 @@ GRIP_SURFACE_RECOVERY_PATHS = {
 }
 GRIP_RECOVERY_PATHS_BY_NAME = {
     "remote-head-materialize": (
-        "read back the exact writer lane, live lane leases and exact remote branch head before retry; never infer retry authority from an imported object"
+        "read back the exact writer lane, imported object and exact remote branch head before retry; "
+        "never infer authority to advance the existing lane from an imported object; use work-acquire for a successor lane"
     ),
     "pr-base-converge": (
         "read back the same PR number, exact base SHA and current head before any retry; "
@@ -1199,9 +1199,9 @@ GRIP_RECOVERY_PATHS_BY_NAME = {
 GRIP_CONDITIONAL_PRECONDITIONS = {
     "remote-head-materialize": (
         "lane_id must bind the supplied existing writer checkout and every lane resource lease must be live and owned by that lane",
-        "the effective remote must be SSH and the repository must be non-shallow; expected_remote_head must equal the advertised remote branch before and after object import; object import writes no FETCH_HEAD, tags, prune state or remote-tracking ref",
-        "expected_local_head must be an ancestor of expected_remote_head; the exact Work Lane lease snapshots are revalidated and snapshot-renewed immediately before branch mutation, then the writer branch moves only through grabowski_git merge --ff-only under exact branch_attempt CAS",
-        "this grip never pushes, changes PR metadata, merges a PR or grants Captain authority",
+        "the effective remote must be SSH and the repository must be non-shallow; expected_remote_head must equal the advertised remote branch before, during and after object import; object import writes no FETCH_HEAD, tags, prune state or remote-tracking ref",
+        "expected_local_head must be an ancestor of expected_remote_head; after import the durable lane and live leases are revalidated under the lane lock and the existing branch/worktree must still be clean at expected_local_head",
+        "a differing remote head is handed off explicitly for successor work-acquire; this grip never moves the existing lane branch, pushes, changes PR metadata, merges a PR or grants Captain authority",
     ),
     "pr-base-converge": (
         "the PR must still be OPEN, same-repository, on the requested base branch and exact expected head before dispatch; expected_base_sha must match a fresh live base-ref read",
@@ -6443,7 +6443,6 @@ def _run_remote_head_materialize(
     receipt: Receipt,
     runner: CommandRunner,
 ) -> dict[str, Any]:
-    import grabowski_operator as operator_surface
     import grabowski_resources as resources
     import grabowski_work_acquire as work_acquire
 
@@ -6501,7 +6500,9 @@ def _run_remote_head_materialize(
         raise GripPreflightError(
             "remote-head-materialize requires the exact Work Lane resource set"
         )
-    def lane_lease_snapshots(check_id: str) -> list[dict[str, Any]]:
+    def lane_lease_snapshots(
+        check_id: str, *, effect_started: bool = False
+    ) -> list[dict[str, Any]]:
         live = resources.inspect_resources(resource_keys)
         missing = sorted(set(resource_keys) - set(live))
         foreign = sorted(
@@ -6516,9 +6517,13 @@ def _run_remote_head_materialize(
                 "fail",
                 f"missing={len(missing)} foreign={len(foreign)}",
             )
-            raise GripPreflightError(
-                "remote-head-materialize requires every Work Lane resource lease to be live and lane-owned"
+            message = (
+                "remote-head-materialize requires every Work Lane resource lease "
+                "to be live and lane-owned"
             )
+            if effect_started:
+                raise GripActionError(message)
+            raise GripPreflightError(message)
         _check(receipt, check_id, "pass", f"count={len(resource_keys)}")
         return [live[key] for key in sorted(resource_keys)]
 
@@ -6576,7 +6581,7 @@ def _run_remote_head_materialize(
                 "remote branch advanced during materialization readback"
             )
         _check(receipt, "object_import", "skip", "already_materialized")
-        _check(receipt, "branch_cas", "skip", "already_materialized")
+        _check(receipt, "lane_preserved", "pass", expected_remote_head)
         _check(receipt, "post_state", "pass", expected_remote_head)
         return {
             "action": "unchanged",
@@ -6588,6 +6593,9 @@ def _run_remote_head_materialize(
             "remote_branch": remote_branch,
             "old_head": expected_remote_head,
             "new_head": expected_remote_head,
+            "imported_head": expected_remote_head,
+            "lane_preserved": True,
+            "next_action": None,
         }
 
     fetch = _git(
@@ -6643,7 +6651,7 @@ def _run_remote_head_materialize(
         )
         != expected_remote_head
     ):
-        raise GripPreflightError(
+        raise GripActionError(
             "remote branch advanced during exact-head object import"
         )
     ancestry = _git_optional(
@@ -6653,7 +6661,7 @@ def _run_remote_head_materialize(
     )
     if int(ancestry.get("returncode", 1)) != 0:
         _check(receipt, "fast_forward", "fail", "not_ancestor")
-        raise GripPreflightError(
+        raise GripActionError(
             "remote-head-materialize refuses a non-fast-forward update"
         )
     _check(receipt, "fast_forward", "pass", "ancestor")
@@ -6674,174 +6682,41 @@ def _run_remote_head_materialize(
             or locked_record.get("terminal_closeout_pending") is not None
         )
         if lane_inactive:
-            _check(receipt, "lane_active_before_cas", "fail", "lane_state_changed")
-            raise GripPreflightError(
-                "remote-head-materialize Work Lane is no longer active and unchanged before branch CAS"
-            )
-        _check(receipt, "lane_active_before_cas", "pass", "ready")
-
-        pre_cas_leases = lane_lease_snapshots("lane_leases_before_cas")
-        try:
-            renewal = resources.renew_resources(
-                lane_owner,
-                resource_keys,
-                ttl_seconds=120,
-                expected_leases=pre_cas_leases,
-            )
-        except (OSError, PermissionError, RuntimeError, TypeError, ValueError) as exc:
-            _check(receipt, "lane_lease_hold", "fail", type(exc).__name__)
-            raise GripPreflightError(
-                "remote-head-materialize could not snapshot-renew the exact Work Lane leases before branch CAS"
-            ) from exc
-        renewed = renewal.get("leases")
-        renewed_keys = (
-            {
-                item.get("resource_key")
-                for item in renewed
-                if isinstance(item, dict)
-            }
-            if isinstance(renewed, list)
-            else set()
-        )
-        if (
-            renewal.get("owner_id") != lane_owner
-            or renewal.get("snapshot_guarded") is not True
-            or renewed_keys != set(resource_keys)
-        ):
-            _check(receipt, "lane_lease_hold", "fail", "renewal_receipt_mismatch")
+            _check(receipt, "lane_active_after_import", "fail", "lane_state_changed")
             raise GripActionError(
-                "remote-head-materialize Work Lane lease hold returned mismatched evidence"
+                "remote-head-materialize Work Lane changed during exact-head object import"
             )
-        _check(receipt, "lane_lease_hold", "pass", f"count={len(resource_keys)}")
+        _check(receipt, "lane_active_after_import", "pass", "ready")
 
-        remote_before_cas = _remote_materialization_head(
+        lane_lease_snapshots("lane_leases_after_import", effect_started=True)
+        remote_after = _remote_materialization_head(
             repo,
             remote,
             remote_branch,
             receipt,
             runner,
-            "remote_head_before_cas",
+            "remote_head_after",
         )
-        if remote_before_cas != expected_remote_head:
-            raise GripPreflightError(
-                "remote branch advanced before branch CAS"
+        if remote_after != expected_remote_head:
+            raise GripActionError(
+                "remote branch advanced after exact-head object import"
             )
 
-        pre_orientation = _orient(repo, runner)
+        final = _orient(repo, runner)
         if (
-            pre_orientation["branch"] != lane_branch
-            or pre_orientation["head"] != expected_local_head
-            or pre_orientation["dirty"]
+            final["branch"] != lane_branch
+            or final["head"] != expected_local_head
+            or final["dirty"]
         ):
-            raise GripPreflightError(
-                "writer checkout changed after object import"
+            _check(receipt, "lane_preserved", "fail", "writer_changed")
+            raise GripActionError(
+                "remote-head-materialize writer lane changed during exact-head object import"
             )
-        preimage = operator_surface._git_branch_preimage(repo)
-        if (
-            preimage.get("branch") != lane_branch
-            or preimage.get("head") != expected_local_head
-            or not isinstance(preimage.get("preimage_sha256"), str)
-        ):
-            raise GripPreflightError(
-                "remote-head-materialize captured a mismatched branch preimage"
-            )
-        _check(
-            receipt,
-            "local_preimage",
-            "pass",
-            str(preimage["preimage_sha256"]),
-        )
-        try:
-            mutation = operator_surface.grabowski_git(
-                str(repo),
-                ["merge", "--ff-only", expected_remote_head],
-                timeout_seconds=60,
-                branch_attempt={
-                    "schema_version": 1,
-                    "owner_id": lane_owner,
-                    "operation_id": f"remote-head-materialize:{lane_id}",
-                    "attempt_id": f"head-{expected_remote_head[:24]}",
-                    "branch": lane_branch,
-                    "expected_preimage_sha256": preimage["preimage_sha256"],
-                },
-            )
-        except (OSError, PermissionError, RuntimeError, TypeError, ValueError) as exc:
-            _check(receipt, "branch_cas", "fail", type(exc).__name__)
-            return {
-                "action": "readback_required",
-                "receipt_status": "blocked",
-                "outcome_unknown": True,
-                "retry_allowed": False,
-                "lane_id": lane_id,
-                "branch": lane_branch,
-                "old_head": expected_local_head,
-                "new_head": None,
-                "branch_mutation": None,
-                "error_class": type(exc).__name__,
-                "required_readback": [
-                    f"writer:{repo}",
-                    f"remote:{remote}:refs/heads/{remote_branch}",
-                ],
-            }
-        branch_receipt = mutation.get("branch_mutation")
-        if (
-            int(mutation.get("returncode", 1)) != 0
-            or not isinstance(branch_receipt, dict)
-            or branch_receipt.get("status") != "completed"
-            or branch_receipt.get("post_head") != expected_remote_head
-        ):
-            _check(
-                receipt,
-                "branch_cas",
-                "fail",
-                str(
-                    branch_receipt.get("status")
-                    if isinstance(branch_receipt, dict)
-                    else "missing_receipt"
-                ),
-            )
-            return {
-                "action": "readback_required",
-                "receipt_status": "blocked",
-                "outcome_unknown": (
-                    isinstance(branch_receipt, dict)
-                    and branch_receipt.get("status") == "outcome_unknown"
-                ),
-                "retry_allowed": False,
-                "lane_id": lane_id,
-                "branch": lane_branch,
-                "old_head": expected_local_head,
-                "new_head": None,
-                "branch_mutation": branch_receipt,
-                "required_readback": [
-                    f"writer:{repo}",
-                    f"remote:{remote}:refs/heads/{remote_branch}",
-                ],
-            }
-        _check(
-            receipt,
-            "branch_cas",
-            "pass",
-            str(branch_receipt.get("receipt_sha256", "")),
-        )
+        _check(receipt, "lane_preserved", "pass", expected_local_head)
 
-    final = _orient(repo, runner)
-    remote_after = _remote_materialization_head(
-        repo, remote, remote_branch, receipt, runner, "remote_head_after"
-    )
-    if (
-        final["branch"] != lane_branch
-        or final["head"] != expected_remote_head
-        or final["dirty"]
-        or remote_after != expected_remote_head
-    ):
-        _check(receipt, "post_state", "fail", "readback_mismatch")
-        raise GripActionError(
-            "remote-head-materialize final writer/remote readback mismatched"
-        )
-    _check(receipt, "post_state", "pass", expected_remote_head)
+    _check(receipt, "post_state", "pass", expected_local_head)
     return {
-        "action": "fast_forwarded",
+        "action": "object_imported",
         "idempotent_replay": False,
         "lane_id": lane_id,
         "lane_owner_id": lane_owner,
@@ -6849,8 +6724,14 @@ def _run_remote_head_materialize(
         "remote": remote,
         "remote_branch": remote_branch,
         "old_head": expected_local_head,
-        "new_head": expected_remote_head,
-        "branch_mutation": branch_receipt,
+        "new_head": expected_local_head,
+        "imported_head": expected_remote_head,
+        "lane_preserved": True,
+        "next_action": "acquire_successor_lane_at_imported_head",
+        "does_not_establish": [
+            "successor Work Lane acquisition",
+            "existing writer branch advancement",
+        ],
     }
 
 
