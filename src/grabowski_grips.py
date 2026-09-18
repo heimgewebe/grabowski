@@ -6557,6 +6557,17 @@ def _run_remote_head_materialize(
             "remote-head-materialize expected_remote_head is stale"
         )
     if orientation["head"] == expected_remote_head:
+        ancestry = _git_optional(
+            repo,
+            runner,
+            ["merge-base", "--is-ancestor", expected_local_head, expected_remote_head],
+        )
+        if int(ancestry.get("returncode", 1)) != 0:
+            _check(receipt, "fast_forward", "fail", "not_ancestor")
+            raise GripPreflightError(
+                "remote-head-materialize refuses a non-fast-forward update"
+            )
+        _check(receipt, "fast_forward", "pass", "ancestor")
         remote_after = _remote_materialization_head(
             repo, remote, remote_branch, receipt, runner, "remote_head_after"
         )
@@ -6565,7 +6576,6 @@ def _run_remote_head_materialize(
                 "remote branch advanced during materialization readback"
             )
         _check(receipt, "object_import", "skip", "already_materialized")
-        _check(receipt, "fast_forward", "skip", "already_materialized")
         _check(receipt, "branch_cas", "skip", "already_materialized")
         _check(receipt, "post_state", "pass", expected_remote_head)
         return {
