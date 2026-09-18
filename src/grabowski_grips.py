@@ -6353,7 +6353,7 @@ def _validate_remote_materialization_target(
     remote: str,
     receipt: Receipt,
     runner: CommandRunner,
-) -> None:
+) -> str:
     configured = _git_optional(
         repo, runner, ["config", "--get-all", f"remote.{remote}.url"]
     )
@@ -6405,6 +6405,7 @@ def _validate_remote_materialization_target(
         if configured_urls[0] != effective_urls[0]
         else "single_network_target",
     )
+    return effective_urls[0]
 
 
 def _remote_materialization_head(
@@ -6448,6 +6449,8 @@ def _run_remote_head_materialize(
     receipt: Receipt,
     runner: CommandRunner,
 ) -> dict[str, Any]:
+    import sqlite3
+
     import grabowski_resources as resources
     import grabowski_work_acquire as work_acquire
 
@@ -6512,7 +6515,33 @@ def _run_remote_head_materialize(
     def lane_lease_snapshots(
         check_id: str, *, effect_started: bool = False
     ) -> list[dict[str, Any]]:
-        live = resources.inspect_resources(resource_keys)
+        message = (
+            "remote-head-materialize requires every Work Lane resource lease "
+            "to be live, lane-owned and readable"
+        )
+        try:
+            live = resources.inspect_resources(resource_keys)
+        except (
+            OSError,
+            PermissionError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+            sqlite3.Error,
+        ) as exc:
+            _check(receipt, check_id, "fail", type(exc).__name__)
+            if effect_started:
+                raise GripActionError(message) from exc
+            raise GripPreflightError(message) from exc
+        if (
+            not isinstance(live, dict)
+            or not all(isinstance(key, str) for key in live)
+            or not all(isinstance(value, dict) for value in live.values())
+        ):
+            _check(receipt, check_id, "fail", "invalid_resource_snapshot")
+            if effect_started:
+                raise GripActionError(message)
+            raise GripPreflightError(message)
         missing = sorted(set(resource_keys) - set(live))
         foreign = sorted(
             key
@@ -6525,10 +6554,6 @@ def _run_remote_head_materialize(
                 check_id,
                 "fail",
                 f"missing={len(missing)} foreign={len(foreign)}",
-            )
-            message = (
-                "remote-head-materialize requires every Work Lane resource lease "
-                "to be live and lane-owned"
             )
             if effect_started:
                 raise GripActionError(message)
@@ -6571,7 +6596,9 @@ def _run_remote_head_materialize(
         validate_locked_lane(lane_receipt_path, "lane_active_before_import")
         lane_lease_snapshots("lane_leases")
 
-    _validate_remote_materialization_target(repo, remote, receipt, runner)
+    remote_target = _validate_remote_materialization_target(
+        repo, remote, receipt, runner
+    )
     shallow = _git_optional(repo, runner, ["rev-parse", "--is-shallow-repository"])
     if (
         int(shallow.get("returncode", 1)) != 0
@@ -6598,7 +6625,7 @@ def _run_remote_head_materialize(
 
     remote_before = _remote_materialization_head(
         repo,
-        remote,
+        remote_target,
         remote_branch,
         receipt,
         runner,
@@ -6626,7 +6653,7 @@ def _run_remote_head_materialize(
 
             remote_after = _remote_materialization_head(
                 repo,
-                remote,
+                remote_target,
                 remote_branch,
                 receipt,
                 runner,
@@ -6686,7 +6713,7 @@ def _run_remote_head_materialize(
             "--no-prune",
             "--refmap=",
             "--upload-pack=git-upload-pack",
-            remote,
+            remote_target,
             expected_remote_head,
         ],
     )
@@ -6712,7 +6739,7 @@ def _run_remote_head_materialize(
     if (
         _remote_materialization_head(
             repo,
-            remote,
+            remote_target,
             remote_branch,
             receipt,
             runner,
@@ -6745,7 +6772,7 @@ def _run_remote_head_materialize(
 
         remote_after = _remote_materialization_head(
             repo,
-            remote,
+            remote_target,
             remote_branch,
             receipt,
             runner,

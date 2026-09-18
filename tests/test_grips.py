@@ -6,6 +6,7 @@ from pathlib import Path
 import hashlib
 import inspect
 import json
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -353,10 +354,15 @@ class FakeRemoteMaterializeGit(FakeGit):
                 "stdout": "\n".join(self.effective_fetch_urls),
                 "stderr": "",
             }
+        network_target = (
+            self.effective_fetch_urls[0]
+            if len(self.effective_fetch_urls) == 1
+            else "origin"
+        )
         if argv == [
             "ls-remote",
             "--exit-code",
-            "origin",
+            network_target,
             f"refs/heads/{self.remote_branch}",
         ]:
             self.calls.append(tuple(argv))
@@ -8358,7 +8364,7 @@ class GripFoundationTests(unittest.TestCase):
         *,
         fake_git: FakeRemoteMaterializeGit | None = None,
         missing_lease: bool = False,
-        lease_reads: list[dict[str, dict[str, object]]] | None = None,
+        lease_reads: list[object] | None = None,
     ) -> tuple[
         FakeRemoteMaterializeGit,
         types.ModuleType,
@@ -8396,7 +8402,7 @@ class GripFoundationTests(unittest.TestCase):
         *,
         fake_git: FakeRemoteMaterializeGit | None = None,
         missing_lease: bool = False,
-        lease_reads: list[dict[str, dict[str, object]]] | None = None,
+        lease_reads: list[object] | None = None,
         locked_terminal: bool = False,
         locked_terminal_after_initial: bool = False,
     ) -> tuple[dict[str, object], FakeRemoteMaterializeGit, types.ModuleType]:
@@ -8492,6 +8498,7 @@ class GripFoundationTests(unittest.TestCase):
         self.assertIn("--no-tags", fetch)
         self.assertIn("--no-recurse-submodules", fetch)
         self.assertEqual("b" * 40, fetch[-1])
+        self.assertEqual(fake.effective_fetch_urls[0], fetch[-2])
         self.assertNotIn(f"refs/heads/{fake.remote_branch}", fetch)
         operator.grabowski_git.assert_not_called()
         checks = {
@@ -8527,6 +8534,54 @@ class GripFoundationTests(unittest.TestCase):
         self.assertFalse(any("fetch" in call for call in fake.calls))
         operator.grabowski_git.assert_not_called()
 
+    def test_remote_head_materialize_receipts_lease_read_failure_before_network_effect(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, fake, operator = self._run_remote_materialize_case(
+                tmp,
+                lease_reads=[RuntimeError("resource store unavailable")],
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("readable", result["output"]["error"])
+        self.assertFalse(any("fetch" in call for call in fake.calls))
+        operator.grabowski_git.assert_not_called()
+
+    def test_remote_head_materialize_receipts_lease_read_failure_after_object_import(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            git, _operator, _lane_inputs, leases = self._remote_materialize_lane_case(tmp)
+            result, fake, operator = self._run_remote_materialize_case(
+                tmp,
+                fake_git=git,
+                lease_reads=[leases, sqlite3.OperationalError("resource store unavailable")],
+            )
+
+        self.assertEqual("failed", result["receipt"]["status"])
+        self.assertIn("readable", result["output"]["error"])
+        self.assertTrue(any("fetch" in call for call in fake.calls))
+        self.assertEqual("a" * 40, fake.head)
+        operator.grabowski_git.assert_not_called()
+
+    def test_remote_head_materialize_receipts_invalid_lease_snapshot_after_object_import(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            git, _operator, _lane_inputs, leases = self._remote_materialize_lane_case(tmp)
+            result, fake, operator = self._run_remote_materialize_case(
+                tmp,
+                fake_git=git,
+                lease_reads=[leases, {"broken": "not-a-lease"}],
+            )
+
+        self.assertEqual("failed", result["receipt"]["status"])
+        self.assertIn("readable", result["output"]["error"])
+        self.assertTrue(any("fetch" in call for call in fake.calls))
+        self.assertEqual("a" * 40, fake.head)
+        operator.grabowski_git.assert_not_called()
+
     def test_remote_head_materialize_rejects_shallow_repository_before_fetch(
         self,
     ) -> None:
@@ -8556,6 +8611,31 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("blocked", result["receipt"]["status"])
         self.assertIn("effective SSH remote", result["output"]["error"])
         self.assertFalse(any("fetch" in call for call in fake.calls))
+        operator.grabowski_git.assert_not_called()
+
+    def test_remote_head_materialize_pins_network_effects_to_validated_effective_url(
+        self,
+    ) -> None:
+        effective = "git@github.com:heimgewebe/grabowski.git"
+        fake = FakeRemoteMaterializeGit(
+            configured_urls=["https://github.com/heimgewebe/grabowski.git"],
+            effective_fetch_urls=[effective],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            result, fake, operator = self._run_remote_materialize_case(
+                tmp, fake_git=fake
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        fetch = next(call for call in fake.calls if "fetch" in call)
+        self.assertEqual(effective, fetch[-2])
+        remote_reads = [
+            call
+            for call in fake.calls
+            if call[:2] == ("ls-remote", "--exit-code")
+        ]
+        self.assertTrue(remote_reads)
+        self.assertTrue(all(call[2] == effective for call in remote_reads))
         operator.grabowski_git.assert_not_called()
 
     def test_remote_head_materialize_rejects_stale_remote_binding_before_fetch(
