@@ -1691,6 +1691,29 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
             self.assertGreaterEqual(len(binding["mcp_command_files"]), 2)
             code_files = {item["name"]: item for item in binding["code"]["files"]}
             self.assertIn(Path(codex_runner.__file__).name, code_files)
+            authentication = binding["provider"]["authentication"]
+            self.assertEqual(authentication["mode"], "chatgpt_subscription")
+            self.assertFalse(authentication["credential_digest_public"])
+            self.assertEqual(
+                authentication["credential_bytes"], len(b'{"tokens":{}}')
+            )
+            commitment = authentication["commitment"]
+            self.assertEqual(
+                commitment["kind"],
+                codex_preflight.CODEX_CREDENTIAL_COMMITMENT_KIND,
+            )
+            self.assertRegex(commitment["nonce"], r"^[0-9a-f]{32}$")
+            self.assertRegex(commitment["commitment_sha256"], r"^[0-9a-f]{64}$")
+            self.assertEqual(
+                commitment["commitment_sha256"],
+                codex_preflight._credential_commitment_sha256(
+                    b'{"tokens":{}}', commitment["nonce"]
+                ),
+            )
+            self.assertNotIn(
+                hashlib.sha256(b'{"tokens":{}}').hexdigest(),
+                json.dumps(authentication, sort_keys=True),
+            )
 
             runtime_binding = {
                 "request_root": environment["request_root"],

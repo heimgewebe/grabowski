@@ -135,7 +135,20 @@ def write_dispatch_authorization(
                 "path": str(Path(sys.executable).resolve()),
                 "bytes": Path(sys.executable).resolve().stat().st_size,
                 "sha256": hashlib.sha256(Path(sys.executable).resolve().read_bytes()).hexdigest(),
-            }
+            },
+            "authentication": {
+                "mode": "chatgpt_subscription",
+                "credential_digest_public": False,
+                "credential_bytes": len(b"opaque-chatgpt-auth"),
+                "commitment": {
+                    "schema_version": 1,
+                    "kind": runner.CODEX_CREDENTIAL_COMMITMENT_KIND,
+                    "nonce": "ab" * 16,
+                    "commitment_sha256": runner._credential_commitment_sha256(
+                        b"opaque-chatgpt-auth", "ab" * 16
+                    ),
+                },
+            },
         },
     }
     code_files = []
@@ -327,6 +340,85 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertNotIn("ANTHROPIC_API_KEY", environment)
         self.assertNotIn("CODEX_ACCESS_TOKEN", environment)
         self.assertEqual(environment["PATH"], "/usr/bin:/bin")
+
+    def test_direct_runner_executes_captured_source_before_dependencies(self) -> None:
+        source = Path(runner.__file__).resolve()
+        payload = (
+            "import hashlib\n"
+            "assert globals().get('__grabowski_captured_entrypoint_active__') is True\n"
+            "raw = globals().get('__grabowski_captured_entrypoint_raw__')\n"
+            "identity = globals().get('__grabowski_captured_entrypoint_identity__')\n"
+            "assert isinstance(raw, bytes)\n"
+            "assert identity['sha256'] == hashlib.sha256(raw).hexdigest()\n"
+            "raise SystemExit(37)\n"
+        ).encode("utf-8")
+        identity = {
+            "path": str(source),
+            "name": source.name,
+            "bytes": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+        with (
+            patch.object(runner, "__name__", "__main__"),
+            patch.object(runner, "_CAPTURED_ENTRYPOINT_ACTIVE", False),
+            patch.object(
+                runner,
+                "_read_source_snapshot",
+                return_value=(payload, identity),
+            ),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            runner._execute_captured_entrypoint_if_needed()
+        self.assertEqual(raised.exception.code, 37)
+
+        source_text = source.read_text(encoding="utf-8")
+        bootstrap_call = source_text.index("\n_execute_captured_entrypoint_if_needed()\n")
+        dependency_loader = source_text.index("\ndef _load_captured_module(name: str, path: Path) -> Any:\n")
+        self.assertLess(bootstrap_call, dependency_loader)
+
+    def test_authorized_runtime_code_must_match_executed_runner_bytes(self) -> None:
+        files = []
+        for name in runner._AUTHORIZED_RUNTIME_CODE_NAMES:
+            path = runner._runtime_code_path(name)
+            raw = path.read_bytes()
+            files.append(
+                {"name": name, "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+            )
+        code = {
+            "files": files,
+            "bundle_sha256": runner.base._sha256_json(files),
+        }
+        drifted = dict(runner._SELF_SOURCE_IDENTITY)
+        drifted["sha256"] = "0" * 64
+        with (
+            patch.object(runner, "_SELF_SOURCE_IDENTITY", drifted),
+            self.assertRaisesRegex(
+                runner.RunnerError, "differs from executed bytes"
+            ),
+        ):
+            runner._validated_authorized_runtime_code(code)
+
+    def test_chatgpt_credential_commitment_rejects_same_length_drift(self) -> None:
+        nonce = "ab" * 16
+        authorized = b"credential-A"
+        expected = {
+            "mode": "chatgpt_subscription",
+            "credential_digest_public": False,
+            "credential_bytes": len(authorized),
+            "commitment": {
+                "schema_version": 1,
+                "kind": runner.CODEX_CREDENTIAL_COMMITMENT_KIND,
+                "nonce": nonce,
+                "commitment_sha256": runner._credential_commitment_sha256(
+                    authorized, nonce
+                ),
+            },
+        }
+        runner._assert_authorized_chatgpt_auth(authorized, expected)
+        with self.assertRaisesRegex(
+            runner.RunnerError, "does not match preflight authorization"
+        ):
+            runner._assert_authorized_chatgpt_auth(b"credential-B", expected)
 
     def test_chatgpt_subscription_gate_rejects_other_login_modes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1974,6 +2066,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     result, tool_name=tool_name, expected_manifest=manifest
                 )
                 self.assertEqual(validated["structuredContent"], payload)
+                self.assertEqual(
+                    validated["content"],
+                    [{"type": "text", "text": runner.canonical(payload)}],
+                )
 
         nested_drifts = {
             "ask_context": "context_pack",
@@ -2001,11 +2097,16 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             },
             "isError": True,
         }
+        validated_error = runner._validated_treatment_tool_result(
+            error, tool_name="ask_context", expected_manifest=manifest
+        )
         self.assertEqual(
-            runner._validated_treatment_tool_result(
-                error, tool_name="ask_context", expected_manifest=manifest
-            )["structuredContent"],
+            validated_error["structuredContent"],
             error["structuredContent"],
+        )
+        self.assertEqual(
+            validated_error["content"],
+            [{"type": "text", "text": runner.canonical(error["structuredContent"])}],
         )
 
     def test_mcp_proxy_tracks_and_forwards_treatment_tool_responses(self) -> None:
@@ -2045,7 +2146,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0, completed.stderr.decode())
             responses = {item["id"]: item for item in map(json.loads, completed.stdout.decode().splitlines())}
-            self.assertEqual(responses[2]["result"]["content"][0]["text"], "ok")
+            self.assertEqual(
+                responses[2]["result"]["content"][0]["text"],
+                runner.canonical(responses[2]["result"]["structuredContent"]),
+            )
+            self.assertNotEqual(responses[2]["result"]["content"][0]["text"], "ok")
             arguments = json.loads(seen.read_text(encoding="utf-8"))
             self.assertEqual(arguments["bundle_manifest"], str(root / "bound.bundle.manifest.json"))
             self.assertIsNone(arguments["repo"])
@@ -2064,7 +2169,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         value = request(condition="treatment")
         events = [json.loads(line) for line in stream(value).splitlines()]
         with self.assertRaisesRegex(
-            runner.RunnerError, "treatment used no RepoBrief tool or resource"
+            runner.RunnerError, "treatment used no successful RepoBrief tool or resource"
         ):
             runner.normalize(value, events)
 
@@ -2083,7 +2188,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             "server": "repobrief",
             "tool": "live_freshness",
             "arguments": {"bundle_manifest": "/bundles/repo.bundle.manifest.json"},
-            "result": {"status": "ok"},
+            "result": {"isError": False, "status": "ok"},
             "status": "completed",
         }
 
@@ -2092,7 +2197,37 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         )
 
         self.assertEqual([call["name"] for call in calls], ["live_freshness"])
+        self.assertEqual(calls[0]["status"], "success")
         self.assertEqual(normalized_answer, answer())
+
+    def test_normalize_rejects_iserror_only_treatment_call(self) -> None:
+        value = request(condition="treatment")
+        events = [json.loads(line) for line in stream(value).splitlines()]
+        command_event = next(
+            event
+            for event in events
+            if event.get("type") == "item.completed"
+            and isinstance(event.get("item"), dict)
+            and event["item"].get("type") == "command_execution"
+        )
+        command_event["item"] = {
+            "type": "mcp_tool_call",
+            "server": "repobrief",
+            "tool": "live_freshness",
+            "arguments": {"bundle_manifest": "/bundles/repo.bundle.manifest.json"},
+            "result": {
+                "content": [{"type": "text", "text": "failed"}],
+                "structuredContent": {"status": "error"},
+                "isError": True,
+            },
+            "status": "completed",
+        }
+
+        with self.assertRaisesRegex(
+            runner.RunnerError,
+            "treatment used no successful RepoBrief tool or resource",
+        ):
+            runner.normalize(value, events)
 
     def test_resource_freeze_rejects_pagination_and_duplicates(self) -> None:
         with self.assertRaisesRegex(runner.RunnerError, "paginated"):

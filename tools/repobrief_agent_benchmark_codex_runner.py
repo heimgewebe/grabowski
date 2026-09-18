@@ -16,6 +16,7 @@ import argparse
 import ctypes
 from datetime import datetime, timezone
 import hashlib
+import hmac
 import importlib.util
 import json
 import os
@@ -35,12 +36,132 @@ import time
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+SOURCE_SNAPSHOT_MAX_BYTES = 16 * 1024 * 1024
+
+
+def _read_source_snapshot(path: Path) -> tuple[bytes, dict[str, Any]]:
+    requested = path.expanduser()
+    before = requested.lstat()
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise RuntimeError(f"cannot safely load {path.name}")
+    if before.st_size <= 0 or before.st_size > SOURCE_SNAPSHOT_MAX_BYTES:
+        raise RuntimeError(f"cannot safely load {path.name}")
+    descriptor = os.open(
+        requested, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino, opened.st_size) != (
+            before.st_dev, before.st_ino, before.st_size
+        ):
+            raise RuntimeError(f"{path.name} changed before load")
+        data = bytearray()
+        while len(data) <= SOURCE_SNAPSHOT_MAX_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(1024 * 1024, SOURCE_SNAPSHOT_MAX_BYTES + 1 - len(data)),
+            )
+            if not chunk:
+                break
+            data.extend(chunk)
+    finally:
+        os.close(descriptor)
+    after = requested.lstat()
+    if (
+        len(data) != opened.st_size
+        or len(data) > SOURCE_SNAPSHOT_MAX_BYTES
+        or (after.st_dev, after.st_ino, after.st_size)
+        != (opened.st_dev, opened.st_ino, opened.st_size)
+    ):
+        raise RuntimeError(f"{path.name} changed during load")
+    resolved = requested.resolve()
+    return bytes(data), {
+        "path": str(resolved),
+        "name": resolved.name,
+        "bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+
+
+_CAPTURED_ENTRYPOINT_ACTIVE = (
+    globals().get("__grabowski_captured_entrypoint_active__") is True
+)
+_CAPTURED_ENTRYPOINT_RAW = globals().get("__grabowski_captured_entrypoint_raw__")
+_CAPTURED_ENTRYPOINT_IDENTITY = globals().get(
+    "__grabowski_captured_entrypoint_identity__"
+)
+
+
+def _validated_captured_self_source(
+    raw: Any, identity: Any, source: Path
+) -> tuple[bytes, dict[str, Any]]:
+    if not isinstance(raw, (bytes, bytearray)) or not isinstance(identity, dict):
+        raise RuntimeError("captured Codex runner source binding is invalid")
+    data = bytes(raw)
+    resolved = source.expanduser().resolve()
+    expected = {
+        "path": str(resolved),
+        "name": resolved.name,
+        "bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+    if identity != expected:
+        raise RuntimeError("captured Codex runner source identity mismatch")
+    return data, expected
+
+
+def _execute_captured_entrypoint_if_needed() -> None:
+    if __name__ != "__main__" or _CAPTURED_ENTRYPOINT_ACTIVE:
+        return
+    source = Path(__file__).expanduser().resolve()
+    raw, identity = _read_source_snapshot(source)
+    raw, identity = _validated_captured_self_source(raw, identity, source)
+    namespace = {
+        "__name__": "__main__",
+        "__file__": str(source),
+        "__package__": None,
+        "__builtins__": __builtins__,
+        "__grabowski_captured_entrypoint_active__": True,
+        "__grabowski_captured_entrypoint_raw__": raw,
+        "__grabowski_captured_entrypoint_identity__": identity,
+    }
+    exec(compile(raw, str(source), "exec"), namespace)
+    raise RuntimeError("captured Codex runner entrypoint returned unexpectedly")
+
+
+_execute_captured_entrypoint_if_needed()
+
+if _CAPTURED_ENTRYPOINT_ACTIVE:
+    _SELF_SOURCE_RAW, _SELF_SOURCE_IDENTITY = _validated_captured_self_source(
+        _CAPTURED_ENTRYPOINT_RAW,
+        _CAPTURED_ENTRYPOINT_IDENTITY,
+        Path(__file__),
+    )
+else:
+    _SELF_SOURCE_RAW, _SELF_SOURCE_IDENTITY = _read_source_snapshot(Path(__file__))
+
+
+def _load_captured_module(name: str, path: Path) -> Any:
+    raw, identity = _read_source_snapshot(path)
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {path.name}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        exec(compile(raw, str(path), "exec"), module.__dict__)
+        _after_raw, after_identity = _read_source_snapshot(path)
+        if after_identity != identity:
+            raise RuntimeError(f"{path.name} changed while being loaded")
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    module.__grabowski_source_identity__ = dict(identity)
+    return module
+
+
 BASE_PATH = Path(__file__).with_name("repobrief_agent_benchmark_runner.py")
-_spec = importlib.util.spec_from_file_location("repobrief_agent_benchmark_base", BASE_PATH)
-if _spec is None or _spec.loader is None:
-    raise RuntimeError("cannot load RepoBrief benchmark base helpers")
-base = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(base)
+base = _load_captured_module("repobrief_agent_benchmark_base", BASE_PATH)
 
 PROVIDER = "openai-codex-cli"
 MODEL = "gpt-5.3-codex-spark"
@@ -57,6 +178,8 @@ PREFLIGHT_LEDGER_KIND = "repobrief.agent_benchmark_preflight_dispatch_ledger"
 PREFLIGHT_LEDGER_VERSION = "1.0"
 PERMISSION_PROFILE = "rab-benchmark"
 CHATGPT_LOGIN_LINE = "Logged in using ChatGPT"
+CODEX_CREDENTIAL_COMMITMENT_KIND = "grabowski.codex_credential_commitment"
+CODEX_CREDENTIAL_COMMITMENT_DOMAIN = "grabowski.codex-credential-commitment.v1"
 ALLOWED_MCP = {"ask_context", "grounding_verify", "live_freshness", "repobrief_resource_read"}
 UPSTREAM_MCP = {"ask_context", "grounding_verify", "live_freshness"}
 REPOGROUND_MCP_SCHEMA_CONTRACT_COMMIT = "9c24c2887b4b5724686a5051e5feb8aa54783019"
@@ -198,6 +321,62 @@ def canonical(value: Any) -> str:
 
 def sha_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _credential_commitment_sha256(credential_data: bytes, nonce: str) -> str:
+    credential_sha256 = sha_bytes(credential_data)
+    payload = canonical(
+        {
+            "domain": CODEX_CREDENTIAL_COMMITMENT_DOMAIN,
+            "nonce": nonce,
+            "credential_sha256": credential_sha256,
+        }
+    ).encode("utf-8")
+    return sha_bytes(payload)
+
+
+def _validated_authorized_authentication(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "mode", "credential_digest_public", "credential_bytes", "commitment"
+    }:
+        raise RunnerError("preflight dispatch authorization authentication is invalid")
+    commitment = value.get("commitment")
+    if (
+        value.get("mode") != "chatgpt_subscription"
+        or value.get("credential_digest_public") is not False
+        or not isinstance(value.get("credential_bytes"), int)
+        or isinstance(value.get("credential_bytes"), bool)
+        or value.get("credential_bytes") <= 0
+        or not isinstance(commitment, dict)
+        or set(commitment) != {
+            "schema_version", "kind", "nonce", "commitment_sha256"
+        }
+        or commitment.get("schema_version") != 1
+        or commitment.get("kind") != CODEX_CREDENTIAL_COMMITMENT_KIND
+        or not isinstance(commitment.get("nonce"), str)
+        or re.fullmatch(r"[0-9a-f]{32}", commitment["nonce"]) is None
+        or not isinstance(commitment.get("commitment_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", commitment["commitment_sha256"]) is None
+    ):
+        raise RunnerError("preflight dispatch authorization authentication is invalid")
+    return json.loads(json.dumps(value))
+
+
+def _assert_authorized_chatgpt_auth(
+    auth_data: bytes, expected: Mapping[str, Any]
+) -> None:
+    if len(auth_data) != expected.get("credential_bytes"):
+        raise RunnerError("ChatGPT credential does not match preflight authorization")
+    commitment = expected.get("commitment")
+    if not isinstance(commitment, Mapping):
+        raise RunnerError("ChatGPT credential authorization is unavailable")
+    nonce = commitment.get("nonce")
+    expected_digest = commitment.get("commitment_sha256")
+    if not isinstance(nonce, str) or not isinstance(expected_digest, str):
+        raise RunnerError("ChatGPT credential authorization is unavailable")
+    actual = _credential_commitment_sha256(auth_data, nonce)
+    if not hmac.compare_digest(actual, expected_digest):
+        raise RunnerError("ChatGPT credential does not match preflight authorization")
 
 
 def _valid_jsonrpc_request_id(value: Any) -> bool:
@@ -1045,13 +1224,17 @@ def _validated_treatment_tool_result(
     is_error = value.get("isError")
     if not isinstance(is_error, bool):
         raise RunnerError("RepoGround treatment tool result is malformed")
-    value["structuredContent"] = _validated_treatment_structured_payload(
+    structured = _validated_treatment_structured_payload(
         value.get("structuredContent"),
         tool_name=tool_name,
         expected_manifest=expected_manifest,
         is_error=is_error,
     )
-    return json.loads(json.dumps(value))
+    return {
+        "content": [{"type": "text", "text": canonical(structured)}],
+        "structuredContent": structured,
+        "isError": is_error,
+    }
 
 
 def _proxy_error(identifier: Any, message: str) -> dict[str, Any]:
@@ -1204,6 +1387,12 @@ def _validated_authorized_runtime_code(code: Any) -> dict[str, dict[str, Any]]:
         or bundle_sha256 != base._sha256_json(files)
     ):
         raise RunnerError("preflight dispatch authorization code identity is invalid")
+    executed_identities = {
+        Path(__file__).name: globals().get(
+            "__grabowski_source_identity__", _SELF_SOURCE_IDENTITY
+        ),
+        BASE_PATH.name: getattr(base, "__grabowski_source_identity__", None),
+    }
     by_name: dict[str, dict[str, Any]] = {}
     for item in files:
         if not isinstance(item, dict):
@@ -1222,6 +1411,25 @@ def _validated_authorized_runtime_code(code: Any) -> dict[str, dict[str, Any]]:
             or re.fullmatch(r"[0-9a-f]{64}", digest) is None
         ):
             raise RunnerError("preflight dispatch authorization code identity is invalid")
+        executed = executed_identities.get(name)
+        if executed is not None:
+            executed_projection = (
+                {
+                    "name": executed.get("name"),
+                    "bytes": executed.get("bytes"),
+                    "sha256": executed.get("sha256"),
+                }
+                if isinstance(executed, dict)
+                else None
+            )
+            if executed_projection != {
+                "name": name,
+                "bytes": size,
+                "sha256": digest,
+            }:
+                raise RunnerError(
+                    f"authorized runtime code differs from executed bytes: {name}"
+                )
         path = _runtime_code_path(name)
         current = _read_bound_regular_file(
             path, label=f"authorized runtime code {name}",
@@ -1235,8 +1443,13 @@ def _validated_authorized_runtime_code(code: Any) -> dict[str, dict[str, Any]]:
     return by_name
 
 
-def _validated_authorized_codex_provider(provider: Any) -> dict[str, Any]:
+def _validated_authorized_codex_provider(
+    provider: Any,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     codex = provider.get("codex") if isinstance(provider, dict) else None
+    authentication = (
+        provider.get("authentication") if isinstance(provider, dict) else None
+    )
     if not isinstance(codex, dict):
         raise RunnerError("preflight dispatch authorization Codex identity is missing")
     path = codex.get("path")
@@ -1252,7 +1465,10 @@ def _validated_authorized_codex_provider(provider: Any) -> dict[str, Any]:
         or re.fullmatch(r"[0-9a-f]{64}", digest) is None
     ):
         raise RunnerError("preflight dispatch authorization Codex identity is invalid")
-    return {"path": path, "bytes": size, "sha256": digest}
+    return (
+        {"path": path, "bytes": size, "sha256": digest},
+        _validated_authorized_authentication(authentication),
+    )
 
 
 def _assert_authorized_codex_executable(
@@ -1484,13 +1700,16 @@ def _load_preflight_dispatch_authorization(
         )
 
     code_files = _validated_authorized_runtime_code(binding.get("code"))
-    provider_codex = _validated_authorized_codex_provider(binding.get("provider"))
+    provider_codex, provider_authentication = _validated_authorized_codex_provider(
+        binding.get("provider")
+    )
     result: dict[str, Any] = {
         "mcp_files": [],
         "proxy_code": None,
         "proxy_base_code": None,
         "manifest": None,
         "provider_codex": provider_codex,
+        "provider_authentication": provider_authentication,
         "code_files": [dict(code_files[name]) for name in _AUTHORIZED_RUNTIME_CODE_NAMES],
         "binding": dict(binding),
         "repository_map_bytes": repository_map_bytes,
@@ -3205,11 +3424,20 @@ def normalize(
                 raise RunnerError("unapproved Codex MCP tool call")
             name = str(item["tool"])
             input_bytes = len(canonical(item.get("arguments")).encode("utf-8"))
-            output_value = item.get("result") if item.get("result") is not None else item.get("error")
+            result_value = item.get("result")
+            output_value = result_value if result_value is not None else item.get("error")
             output_bytes = len(canonical(output_value).encode("utf-8"))
+            result_is_error = (
+                isinstance(result_value, dict)
+                and result_value.get("isError") is True
+            )
             status = (
                 "success"
-                if item.get("status") == "completed" and item.get("error") is None
+                if (
+                    item.get("status") == "completed"
+                    and item.get("error") is None
+                    and not result_is_error
+                )
                 else "failed"
             )
         elif item_type in {"file_change", "web_search", "collab_tool_call", "error"}:
@@ -3237,9 +3465,10 @@ def normalize(
     ):
         raise RunnerError("Codex tool budget exceeded")
     if request["condition"] == "treatment" and not any(
-        call["name"] in ALLOWED_MCP for call in calls
+        call["name"] in ALLOWED_MCP and call["status"] == "success"
+        for call in calls
     ):
-        raise RunnerError("treatment used no RepoBrief tool or resource")
+        raise RunnerError("treatment used no successful RepoBrief tool or resource")
     if not answers:
         raise RunnerError("Codex produced no final agent message")
     try:
@@ -3366,6 +3595,9 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
         )
         validate_toolchain(codex)
         auth_data = validate_chatgpt_subscription(codex)
+        _assert_authorized_chatgpt_auth(
+            auth_data, dispatch_authorization["provider_authentication"]
+        )
         if request["condition"] == "treatment":
             authorized_mcp_files = list(dispatch_authorization["mcp_files"])
             proxy_code = dispatch_authorization["proxy_code"]

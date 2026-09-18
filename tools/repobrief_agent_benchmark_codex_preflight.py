@@ -15,12 +15,15 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import secrets
 import stat
 import sys
 from typing import Any
 
 
 SOURCE_SNAPSHOT_MAX_BYTES = 16 * 1024 * 1024
+CODEX_CREDENTIAL_COMMITMENT_KIND = "grabowski.codex_credential_commitment"
+CODEX_CREDENTIAL_COMMITMENT_DOMAIN = "grabowski.codex-credential-commitment.v1"
 
 
 def _read_source_snapshot(path: Path) -> tuple[bytes, dict[str, Any]]:
@@ -153,6 +156,33 @@ core._register_startup_code_identity(_SELF_SOURCE_IDENTITY)
 core._register_startup_code_identity(codex_runner.__grabowski_source_identity__)
 
 
+def _credential_commitment_sha256(credential_data: bytes, nonce: str) -> str:
+    credential_sha256 = hashlib.sha256(credential_data).hexdigest()
+    payload = json.dumps(
+        {
+            "domain": CODEX_CREDENTIAL_COMMITMENT_DOMAIN,
+            "nonce": nonce,
+            "credential_sha256": credential_sha256,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _codex_credential_commitment(credential_data: bytes) -> dict[str, Any]:
+    nonce = secrets.token_hex(16)
+    return {
+        "schema_version": 1,
+        "kind": CODEX_CREDENTIAL_COMMITMENT_KIND,
+        "nonce": nonce,
+        "commitment_sha256": _credential_commitment_sha256(
+            credential_data, nonce
+        ),
+    }
+
+
 def _validated_codex_provider_binding(
     codex_command: str, codex_command_sha256: str
 ) -> dict[str, Any]:
@@ -181,6 +211,7 @@ def _validated_codex_provider_binding(
             "mode": "chatgpt_subscription",
             "credential_digest_public": False,
             "credential_bytes": len(auth_data),
+            "commitment": _codex_credential_commitment(auth_data),
         },
     }
 
