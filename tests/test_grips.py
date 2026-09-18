@@ -319,6 +319,7 @@ class FakeRemoteMaterializeGit(FakeGit):
         configured_urls: list[str] | None = None,
         effective_fetch_urls: list[str] | None = None,
         remote_read_returncodes: list[int] | None = None,
+        orientation_failure_at_call: int | None = None,
         shallow: bool = False,
     ) -> None:
         super().__init__(
@@ -337,9 +338,20 @@ class FakeRemoteMaterializeGit(FakeGit):
             effective_fetch_urls or self.configured_urls
         )
         self.remote_read_returncodes = list(remote_read_returncodes or [])
+        self.orientation_failure_at_call = orientation_failure_at_call
+        self.orientation_call_count = 0
         self.shallow = shallow
 
     def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
+        if argv == ["rev-parse", "--show-toplevel"]:
+            self.orientation_call_count += 1
+            if self.orientation_call_count == self.orientation_failure_at_call:
+                self.calls.append(tuple(argv))
+                return {
+                    "returncode": 128,
+                    "stdout": "",
+                    "stderr": "writer checkout unavailable",
+                }
         if argv == ["rev-parse", "--is-shallow-repository"]:
             self.calls.append(tuple(argv))
             return {
@@ -430,6 +442,7 @@ class FakeRemoteMaterializeGit(FakeGit):
                 "stderr": "",
             }
         if argv == [
+            "--no-replace-objects",
             "merge-base",
             "--is-ancestor",
             "a" * len(self.materialize_remote_head),
@@ -8689,6 +8702,36 @@ class GripFoundationTests(unittest.TestCase):
         self.assertFalse(any("fetch" in call for call in fake.calls))
         operator.grabowski_git.assert_not_called()
 
+    def test_remote_head_materialize_classifies_pre_import_orientation_failure_as_preflight(
+        self,
+    ) -> None:
+        fake = FakeRemoteMaterializeGit(orientation_failure_at_call=1)
+        with tempfile.TemporaryDirectory() as tmp:
+            result, fake, operator = self._run_remote_materialize_case(
+                tmp, fake_git=fake
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("preflight", result["receipt"]["phase"])
+        self.assertIn("inspect the writer checkout", result["output"]["error"])
+        self.assertFalse(any("fetch" in call for call in fake.calls))
+        operator.grabowski_git.assert_not_called()
+
+    def test_remote_head_materialize_classifies_post_import_orientation_failure_as_action(
+        self,
+    ) -> None:
+        fake = FakeRemoteMaterializeGit(orientation_failure_at_call=2)
+        with tempfile.TemporaryDirectory() as tmp:
+            result, fake, operator = self._run_remote_materialize_case(
+                tmp, fake_git=fake
+            )
+
+        self.assertEqual("failed", result["receipt"]["status"])
+        self.assertEqual("action", result["receipt"]["phase"])
+        self.assertIn("inspect the writer checkout", result["output"]["error"])
+        self.assertTrue(any("fetch" in call for call in fake.calls))
+        operator.grabowski_git.assert_not_called()
+
     def test_remote_head_materialize_requires_effective_ssh_remote(
         self,
     ) -> None:
@@ -8950,6 +8993,16 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("passed", result["receipt"]["status"])
         self.assertEqual("object_imported", result["output"]["action"])
         self.assertEqual("a" * 40, fake.head)
+        self.assertIn(
+            (
+                "--no-replace-objects",
+                "merge-base",
+                "--is-ancestor",
+                "a" * 40,
+                "b" * 40,
+            ),
+            fake.calls,
+        )
         operator.grabowski_git.assert_not_called()
 
     def test_remote_head_materialize_replay_rejects_non_ancestor_local_preimage(
@@ -8979,6 +9032,16 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("unchanged", result["output"]["action"])
         self.assertTrue(result["output"]["idempotent_replay"])
         self.assertFalse(any("fetch" in call for call in fake.calls))
+        self.assertIn(
+            (
+                "--no-replace-objects",
+                "merge-base",
+                "--is-ancestor",
+                "a" * 40,
+                "b" * 40,
+            ),
+            fake.calls,
+        )
         operator.grabowski_git.assert_not_called()
 
     def test_remote_head_materialize_accepts_sha256_object_ids(self) -> None:

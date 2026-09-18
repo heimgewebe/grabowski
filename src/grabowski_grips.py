@@ -6690,6 +6690,26 @@ def _run_remote_head_materialize(
                 raise GripActionError(message) from exc
             raise GripPreflightError(message) from exc
 
+    def read_orientation(
+        check_id: str, *, effect_started: bool = False
+    ) -> dict[str, Any]:
+        message = "remote-head-materialize could not inspect the writer checkout"
+        try:
+            return _orient(repo, runner)
+        except (
+            GripPreflightError,
+            GripActionError,
+            KeyError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            _check(receipt, check_id, "fail", type(exc).__name__)
+            if effect_started:
+                raise GripActionError(message) from exc
+            raise GripPreflightError(message) from exc
+
     with locked_lane("lane_lock_before_import") as lane_receipt_path:
         validate_locked_lane(lane_receipt_path, "lane_active_before_import")
         lane_lease_snapshots("lane_leases")
@@ -6707,7 +6727,7 @@ def _run_remote_head_materialize(
             "remote-head-materialize requires a non-shallow repository"
         )
     _check(receipt, "non_shallow_repository", "pass", "false")
-    orientation = _orient(repo, runner)
+    orientation = read_orientation("writer_checkout_read")
     if orientation["branch"] != lane_branch or orientation["dirty"]:
         _check(receipt, "writer_checkout", "fail", "branch_or_cleanliness_mismatch")
         raise GripPreflightError(
@@ -6734,11 +6754,18 @@ def _run_remote_head_materialize(
         raise GripPreflightError(
             "remote-head-materialize expected_remote_head is stale"
         )
+    ancestry_args = [
+        "--no-replace-objects",
+        "merge-base",
+        "--is-ancestor",
+        expected_local_head,
+        expected_remote_head,
+    ]
     if orientation["head"] == expected_remote_head:
         ancestry = _git_optional(
             repo,
             runner,
-            ["merge-base", "--is-ancestor", expected_local_head, expected_remote_head],
+            ancestry_args,
         )
         if int(ancestry.get("returncode", 1)) != 0:
             _check(receipt, "fast_forward", "fail", "not_ancestor")
@@ -6762,7 +6789,7 @@ def _run_remote_head_materialize(
                 raise GripPreflightError(
                     "remote branch advanced during materialization readback"
                 )
-            final = _orient(repo, runner)
+            final = read_orientation("lane_preserved_replay_read")
             if (
                 final["branch"] != lane_branch
                 or final["head"] != expected_remote_head
@@ -6864,7 +6891,7 @@ def _run_remote_head_materialize(
     ancestry = _git_optional(
         repo,
         runner,
-        ["merge-base", "--is-ancestor", expected_local_head, expected_remote_head],
+        ancestry_args,
     )
     if int(ancestry.get("returncode", 1)) != 0:
         _check(receipt, "fast_forward", "fail", "not_ancestor")
@@ -6897,7 +6924,9 @@ def _run_remote_head_materialize(
                 "remote branch advanced after exact-head object import"
             )
 
-        final = _orient(repo, runner)
+        final = read_orientation(
+            "lane_preserved_after_import_read", effect_started=True
+        )
         if (
             final["branch"] != lane_branch
             or final["head"] != expected_local_head
