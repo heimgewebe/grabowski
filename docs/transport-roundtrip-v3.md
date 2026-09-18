@@ -22,11 +22,11 @@ Damit benötigt der normale Owner-Pfad genau **einen** Agentenaufruf. Die Reques
 
 Wenn eine Anfrage nicht über den signierten Ingress kommt, bleibt der Roundtrip während der Migration fail-closed erhalten. Für `shared_unlabeled` gilt genau dieser Normalablauf:
 
-1. Der Client ruft das exakte mutierende Ziel einmal normal auf; der Aufruf erzeugt vor jeder Produktwirkung eine Challenge, und der Server hält eine kanonische Kopie von Werkzeug und Argumenten kurzzeitig privat zurück.
-2. Der Client ruft `grip_run(name="transport-roundtrip", action="execute", challenge_receipt_sha256=...)` ohne Zielwerkzeug und Zielargumente auf.
-3. `execute` beansprucht nur das serverseitig zurückgehaltene Ziel, reserviert und verbraucht die Challenge und dispatcht das Ziel im selben In-Prozess-Kontext.
+1. Der Client ruft das exakte mutierende Ziel einmal normal auf; der Aufruf erzeugt vor jeder Produktwirkung eine Challenge. Der Server darf Werkzeug und Argumente zusätzlich kurzzeitig im Prozess halten, aber diese Retention ist keine Cross-call-Garantie.
+2. Der Client ruft `grip_run(name="transport-roundtrip", action="execute", challenge_receipt_sha256=..., target_tool_name=..., target_arguments=...)` mit demselben exakten Zielwerkzeug und den unveränderten Zielargumenten auf.
+3. `execute` prüft das erneut übergebene Ziel gegen die dauerhaft in der Challenge gebundene Werkzeug-/Argumentdigest-Identität, reserviert und verbraucht die Challenge und dispatcht das Ziel im selben In-Prozess-Kontext. Vorhandene passende Retention darf zusätzlich als Same-Process-Konsistenzprüfung verwendet werden, ist für den kanonischen Cross-call-Pfad aber nicht erforderlich.
 
-Eine abgelaufene oder fehlende Retention wird nur dann als wirkungsfrei eingestuft, wenn die noch pending Challenge atomar storniert werden konnte. Andernfalls bleibt der Ausgang mehrdeutig und verlangt zielspezifischen Readback. Der explizite `begin`/`execute`-Pfad mit unveränderten Zielfeldern bleibt nur als Kompatibilitätsweg erhalten. Ein stabiler, servervalidierter Connector-Scope kann weiterhin `begin`/`ack` verwenden. Client-deklarierte Metadaten wie `_meta.client_id` bleiben ohne Autorität, und ein separater bestätigter Token wird nie an den gemeinsamen Pool ausgegeben.
+Challenge-only `action=execute` bleibt nur eine opportunistische Same-Process-Optimierung, solange das exakte Target noch im selben Prozess gehalten wird. Clients dürfen sich darauf über getrennte Connector-Calls, Prozesswechsel, Deploys, Restarts oder Retention-Eviction hinweg nicht verlassen. Fehlt diese Retention bei einem Challenge-only-Versuch, gilt der Vorgang nur dann als wirkungsfrei, wenn die noch pending Challenge atomar storniert werden konnte; andernfalls bleibt der Ausgang mehrdeutig und verlangt zielspezifischen Readback. Ein stabiler, servervalidierter Connector-Scope kann weiterhin `begin`/`ack` verwenden. Client-deklarierte Metadaten wie `_meta.client_id` bleiben ohne Autorität, und ein separater bestätigter Token wird nie an den gemeinsamen Pool ausgegeben.
 
 ## Zustands- und Sicherheitsvertrag
 

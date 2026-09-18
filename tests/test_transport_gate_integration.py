@@ -425,6 +425,136 @@ class TransportGripIntegrationTests(unittest.TestCase):
                 challenge, client_scope=SHARED_SCOPE, runtime_binding=BINDING
             )
 
+    def test_mcp_explicit_cross_call_uses_durable_challenge_once_without_retention(self) -> None:
+        target_arguments = {"request": {"action": "pickup_next", "owner_id": "operator"}}
+        wrong_arguments = {"request": {"action": "pickup_next", "owner_id": "other"}}
+        effects: list[dict[str, object]] = []
+
+        def configured_module():
+            base = _load_grabowski_mcp()
+
+            async def call_tool(name, arguments, _ctx):
+                consumed = roundtrip.consume_verified(
+                    client_scope=SHARED_SCOPE,
+                    runtime_binding=BINDING,
+                    tool_name=name,
+                    arguments_sha256=roundtrip.canonical_arguments_sha256(arguments),
+                )
+                effects.append(dict(arguments))
+                return {"state": consumed["state"], "effect_count": len(effects)}
+
+            base.mcp._tool_manager = types.SimpleNamespace(
+                get_tool=lambda _name: types.SimpleNamespace(
+                    annotations=types.SimpleNamespace(readOnlyHint=False)
+                ),
+                call_tool=call_tool,
+            )
+            return base
+
+        def invoke(base, parameters, now):
+            with (
+                mock.patch.object(roundtrip.time, "time", return_value=now),
+                mock.patch.object(base, "_require_capability"),
+                mock.patch.object(base, "_require_mutations_enabled"),
+                mock.patch.object(
+                    base, "_transport_roundtrip_client_scope", return_value=SHARED_SCOPE
+                ),
+                mock.patch.object(
+                    base, "_transport_roundtrip_runtime_binding", return_value=BINDING
+                ),
+            ):
+                return asyncio.run(
+                    base._grip_run_mcp(
+                        "transport-roundtrip",
+                        parameters,
+                        allow_mutation=False,
+                    )
+                )
+
+        begin_module = configured_module()
+        begun = invoke(
+            begin_module,
+            {
+                "action": "begin",
+                "target_tool_name": "write",
+                "target_arguments": target_arguments,
+            },
+            100,
+        )
+        self.assertEqual(begun["status"], "passed")
+        challenge = begun["output"]["challenge_receipt_sha256"]
+
+        wrong_module = configured_module()
+        self.assertEqual(wrong_module._RETAINED_TRANSPORT_TARGETS, {})
+        wrong = invoke(
+            wrong_module,
+            {
+                "action": "execute",
+                "challenge_receipt_sha256": challenge,
+                "target_tool_name": "write",
+                "target_arguments": wrong_arguments,
+            },
+            101,
+        )
+        self.assertEqual(wrong["status"], "blocked")
+        self.assertEqual(effects, [])
+
+        execute_module = configured_module()
+        executed = invoke(
+            execute_module,
+            {
+                "action": "execute",
+                "challenge_receipt_sha256": challenge,
+                "target_tool_name": "write",
+                "target_arguments": target_arguments,
+            },
+            102,
+        )
+        self.assertEqual(executed["status"], "passed")
+        self.assertEqual(executed["output"]["state"], "executed")
+        self.assertEqual(executed["output"]["target_result"]["effect_count"], 1)
+        self.assertEqual(effects, [target_arguments])
+
+        replay_module = configured_module()
+        replay = invoke(
+            replay_module,
+            {
+                "action": "execute",
+                "challenge_receipt_sha256": challenge,
+                "target_tool_name": "write",
+                "target_arguments": target_arguments,
+            },
+            103,
+        )
+        self.assertEqual(replay["status"], "blocked")
+        self.assertEqual(effects, [target_arguments])
+
+        expiry_arguments = {"request": {"action": "pickup_next", "owner_id": "expiry"}}
+        expiry_begin_module = configured_module()
+        expiry_begin = invoke(
+            expiry_begin_module,
+            {
+                "action": "begin",
+                "target_tool_name": "write",
+                "target_arguments": expiry_arguments,
+            },
+            200,
+        )
+        expiry_challenge = expiry_begin["output"]["challenge_receipt_sha256"]
+        expired_module = configured_module()
+        expired = invoke(
+            expired_module,
+            {
+                "action": "execute",
+                "challenge_receipt_sha256": expiry_challenge,
+                "target_tool_name": "write",
+                "target_arguments": expiry_arguments,
+            },
+            200 + roundtrip.CHALLENGE_TTL_SECONDS + 1,
+        )
+        self.assertEqual(expired["status"], "blocked")
+        self.assertEqual(effects, [target_arguments])
+
     def test_mcp_execute_without_retained_target_requires_readback_when_unused_cannot_be_proven(self) -> None:
         base = _load_grabowski_mcp()
         challenge = "f" * 64
