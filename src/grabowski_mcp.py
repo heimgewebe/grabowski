@@ -101,7 +101,7 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "transport-roundtrip-before-mutation",
-        "Invoke mutations normally. On fresh shared_unlabeled challenge, use grip_run transport-roundtrip action=execute with only challenge_receipt_sha256; server retains and binds the exact target. Stable scope may action=ack then invoke unchanged target once. action=begin with target_tool_name/target_arguments remains for compatibility. Read back ambiguous effects before retry.",
+        "Invoke mutations normally. For fresh shared_unlabeled challenge, call grip_run transport-roundtrip action=execute with challenge_receipt_sha256, exact target_tool_name, exact unchanged target_arguments; retention is a same-process optimization. Stable scope may action=ack then invoke unchanged target once. action=begin requires exact target_tool_name/target_arguments. Read back ambiguous effects before retry.",
     ),
     (
         "typed-operation-preference",
