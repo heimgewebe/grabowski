@@ -1340,10 +1340,12 @@ def _require_transport_roundtrip_for_tool(
                 ) from retain_exc
             raise RuntimeError(
                 "fresh intent-bound transport verification required; call grip_run "
-                "for transport-roundtrip with action=execute and "
-                f"challenge_receipt_sha256={challenge}; the exact target is retained "
-                "server-side for this challenge, so do not include target_tool_name or "
-                "target_arguments and do not retry the original target separately"
+                "for transport-roundtrip with action=execute, "
+                f"challenge_receipt_sha256={challenge}, "
+                f"target_tool_name={tool_name_text}, and the exact unchanged "
+                "target_arguments JSON object from the original target call; server-side "
+                "target retention is only an in-process optimization and may be absent on "
+                "the next connector call; do not retry the original target separately"
             ) from exc
         raise RuntimeError(
             "fresh intent-bound transport verification required; call grip_run "

@@ -123,15 +123,23 @@ class TransportGripIntegrationTests(unittest.TestCase):
         self.assertEqual(contract["version"], "2.1")
         self.assertIn("exact-target-bound", contract["acceptance_ids"])
         combined = contract["summary"] + contract["recovery_path"]
-        for fragment in ("server-retained", "compatibility", "action=execute"):
+        for fragment in (
+            "cross-call execution",
+            "same-process optimization",
+            "exact unchanged target_arguments",
+            "action=execute",
+        ):
             self.assertIn(fragment, combined)
+        self.assertNotIn("supported for compatibility", combined)
         preconditions = " | ".join(contract["preconditions"])
         self.assertIn(
             "action=begin requires target_tool_name and target_arguments together",
             preconditions,
         )
         self.assertIn("action=execute requires challenge_receipt_sha256", preconditions)
-        self.assertIn("MCP wrapper may inject", preconditions)
+        self.assertIn("cross-call execution canonically supplies", preconditions)
+        self.assertIn("same-process optimization", preconditions)
+        self.assertIn("MCP wrapper", preconditions)
         self.assertIn("shared_unlabeled callers are refused", preconditions)
         self.assertEqual(contract["required_parameters"], ["action"])
 
@@ -364,6 +372,54 @@ class TransportGripIntegrationTests(unittest.TestCase):
             observed[0]["target_tool_name"], "grabowski_bureau_pickup_execute"
         )
         self.assertEqual(observed[0]["target_arguments"], expected_arguments)
+        with self.assertRaisesRegex(RuntimeError, "missing or expired"):
+            base._claim_pending_transport_target(
+                challenge, client_scope=SHARED_SCOPE, runtime_binding=BINDING
+            )
+
+    def test_mcp_execute_explicit_target_survives_missing_retained_target(self) -> None:
+        base = _load_grabowski_mcp()
+        challenge = "b" * 64
+        arguments = {"request": {"action": "pickup_next"}}
+        caller_parameters = {
+            "action": "execute",
+            "challenge_receipt_sha256": challenge,
+            "target_tool_name": "grabowski_bureau_pickup_execute",
+            "target_arguments": arguments,
+        }
+        observed: list[dict[str, object]] = []
+
+        def fake_core(name, parameters, profile, allow_mutation, ctx, **_kwargs):
+            observed.append(dict(parameters))
+            return {"status": "passed", "name": name}
+
+        with (
+            mock.patch.object(base, "_require_capability"),
+            mock.patch.object(
+                base, "_transport_roundtrip_client_scope", return_value=SHARED_SCOPE
+            ),
+            mock.patch.object(
+                base, "_transport_roundtrip_runtime_binding", return_value=BINDING
+            ),
+            mock.patch.object(base, "_grip_run_core", side_effect=fake_core),
+        ):
+            result = asyncio.run(
+                base._grip_run_mcp(
+                    "transport-roundtrip",
+                    caller_parameters,
+                    allow_mutation=False,
+                )
+            )
+
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(
+            observed[0]["target_tool_name"], "grabowski_bureau_pickup_execute"
+        )
+        self.assertEqual(observed[0]["target_arguments"], arguments)
+        self.assertEqual(
+            observed[0]["challenge_receipt_sha256"], challenge
+        )
         with self.assertRaisesRegex(RuntimeError, "missing or expired"):
             base._claim_pending_transport_target(
                 challenge, client_scope=SHARED_SCOPE, runtime_binding=BINDING
@@ -1394,10 +1450,11 @@ class CentralTransportGateTests(unittest.TestCase):
                 asyncio.run(operator.mcp._tool_manager.call_tool("write", {}, context))
         message = str(raised.exception)
         self.assertIn(f"challenge_receipt_sha256={challenge}", message)
-        self.assertIn("exact target is retained server-side", message)
-        self.assertIn("do not include target_tool_name or target_arguments", message)
+        self.assertIn("target_tool_name=write", message)
+        self.assertIn("exact unchanged target_arguments JSON object", message)
+        self.assertIn("only an in-process optimization", message)
         self.assertIn("do not retry the original target separately", message)
-        self.assertNotIn("target_tool_name=write", message)
+        self.assertNotIn("do not include target_tool_name or target_arguments", message)
         self.assertNotIn("action=ack", message)
         digest = roundtrip.canonical_arguments_sha256({})
         consume_verified.assert_called_once_with(
