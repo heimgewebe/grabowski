@@ -305,6 +305,163 @@ class FakeGit:
         return {"returncode": 1, "stdout": "", "stderr": f"unexpected command: {argv}"}
 
 
+class FakeRemoteMaterializeGit(FakeGit):
+    def __init__(
+        self,
+        *,
+        branch: str = "writer",
+        head: str = "a" * 40,
+        remote_branch: str = "fix/pr-head",
+        remote_head: str = "b" * 40,
+        remote_heads: list[str] | None = None,
+        fast_forward: bool = True,
+        configured_urls: list[str] | None = None,
+        effective_fetch_urls: list[str] | None = None,
+        shallow: bool = False,
+    ) -> None:
+        super().__init__(
+            branch=branch,
+            head=head,
+            upstream=f"origin/{branch}",
+            remote_head=remote_head,
+            configured_urls=configured_urls,
+        )
+        self.remote_branch = remote_branch
+        self.materialize_remote_head = remote_head
+        self.remote_heads = list(remote_heads or [])
+        self.fast_forward = fast_forward
+        self.object_available = head == remote_head
+        self.effective_fetch_urls = list(
+            effective_fetch_urls or self.configured_urls
+        )
+        self.shallow = shallow
+
+    def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
+        if argv == ["rev-parse", "--is-shallow-repository"]:
+            self.calls.append(tuple(argv))
+            return {
+                "returncode": 0,
+                "stdout": "true" if self.shallow else "false",
+                "stderr": "",
+            }
+        if argv == ["remote", "get-url", "--all", "origin"]:
+            self.calls.append(tuple(argv))
+            if not self.effective_fetch_urls:
+                return {"returncode": 2, "stdout": "", "stderr": "no such remote"}
+            return {
+                "returncode": 0,
+                "stdout": "\n".join(self.effective_fetch_urls),
+                "stderr": "",
+            }
+        if argv == [
+            "ls-remote",
+            "--exit-code",
+            "origin",
+            f"refs/heads/{self.remote_branch}",
+        ]:
+            self.calls.append(tuple(argv))
+            head = (
+                self.remote_heads.pop(0)
+                if self.remote_heads
+                else self.materialize_remote_head
+            )
+            return {
+                "returncode": 0,
+                "stdout": f"{head}\trefs/heads/{self.remote_branch}\n",
+                "stderr": "",
+            }
+        plain = list(argv)
+        while len(plain) >= 2 and plain[0] == "-c":
+            plain = plain[2:]
+        if plain and plain[0] == "fetch":
+            self.calls.append(tuple(argv))
+            self.object_available = True
+            return {
+                "returncode": 0,
+                "stdout": "",
+                "stderr": "",
+                "argv_sha256": "f" * 64,
+            }
+        if argv == [
+            "rev-parse",
+            "--verify",
+            f"{self.materialize_remote_head}^{{commit}}",
+        ]:
+            self.calls.append(tuple(argv))
+            return {
+                "returncode": 0 if self.object_available else 1,
+                "stdout": self.materialize_remote_head if self.object_available else "",
+                "stderr": "",
+            }
+        if argv == [
+            "merge-base",
+            "--is-ancestor",
+            "a" * 40,
+            self.materialize_remote_head,
+        ]:
+            self.calls.append(tuple(argv))
+            return {
+                "returncode": 0 if self.fast_forward else 1,
+                "stdout": "",
+                "stderr": "",
+            }
+        return super().__call__(repo, argv)
+
+
+def fake_remote_materialize_operator(
+    fake_git: FakeRemoteMaterializeGit,
+    *,
+    mutation_status: str = "completed",
+) -> types.ModuleType:
+    module = types.ModuleType("grabowski_operator")
+    module._git_branch_preimage = Mock(
+        side_effect=lambda _repo: {
+            "branch": fake_git.branch,
+            "head": fake_git.head,
+            "preimage_sha256": "e" * 64,
+        }
+    )
+
+    def mutate(
+        repo: str,
+        arguments: list[str],
+        timeout_seconds: int = 60,
+        branch_attempt: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        del repo, timeout_seconds
+        assert arguments == [
+            "merge",
+            "--ff-only",
+            fake_git.materialize_remote_head,
+        ]
+        assert branch_attempt is not None
+        if mutation_status == "completed":
+            fake_git.head = fake_git.materialize_remote_head
+            return {
+                "returncode": 0,
+                "timed_out": False,
+                "branch_mutation": {
+                    "status": "completed",
+                    "post_head": fake_git.materialize_remote_head,
+                    "preimage_sha256": branch_attempt["expected_preimage_sha256"],
+                    "postimage_sha256": "d" * 64,
+                    "receipt_sha256": "c" * 64,
+                },
+            }
+        return {
+            "returncode": 1,
+            "timed_out": False,
+            "branch_mutation": {
+                "status": mutation_status,
+                "post_head": fake_git.head,
+                "receipt_sha256": "c" * 64,
+            },
+        }
+
+    module.grabowski_git = Mock(side_effect=mutate)
+    return module
+
+
 class FakeGh:
     def __init__(
         self,
@@ -1306,6 +1463,7 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual(
             {
                 "branch-publish",
+                "remote-head-materialize",
                 "candidate-integration-ready",
                 "agent-execution-happy-path",
                 "bureau-pickup-execute",
@@ -8236,6 +8394,281 @@ class GripFoundationTests(unittest.TestCase):
         self.assertIn("caller-selected", result["output"]["error"])
         self.assertEqual([], case["events"])
         case["workspace"].grabowski_agent_workspace_adopt.assert_not_called()
+
+
+    def _remote_materialize_lane_case(
+        self,
+        tmp: str,
+        *,
+        fake_git: FakeRemoteMaterializeGit | None = None,
+        missing_lease: bool = False,
+        lease_reads: list[dict[str, dict[str, object]]] | None = None,
+        renew_error: Exception | None = None,
+        mutation_status: str = "completed",
+    ) -> tuple[
+        FakeRemoteMaterializeGit,
+        types.ModuleType,
+        dict[str, object],
+        dict[str, dict[str, object]],
+    ]:
+        lane_id = "1" * 32
+        owner = f"lane:{lane_id}"
+        git = fake_git or FakeRemoteMaterializeGit()
+        resource_keys = [
+            f"path:{tmp}",
+            "path:/scope/src.py",
+            "repo:/scope:branch:writer",
+        ]
+        lane_inputs: dict[str, object] = {
+            "lane_id": lane_id,
+            "lease_owner_id": owner,
+            "target_path": tmp,
+            "branch": git.branch,
+            "resource_keys": resource_keys,
+        }
+        leases = {
+            key: {"resource_key": key, "owner_id": owner}
+            for key in resource_keys
+        }
+        if missing_lease:
+            leases.pop(resource_keys[-1])
+        operator = fake_remote_materialize_operator(
+            git, mutation_status=mutation_status
+        )
+        operator.lease_reads = list(lease_reads) if lease_reads is not None else None
+        operator.renew_error = renew_error
+        return git, operator, lane_inputs, leases
+
+    def _run_remote_materialize_case(
+        self,
+        tmp: str,
+        *,
+        fake_git: FakeRemoteMaterializeGit | None = None,
+        missing_lease: bool = False,
+        lease_reads: list[dict[str, dict[str, object]]] | None = None,
+        renew_error: Exception | None = None,
+        mutation_status: str = "completed",
+    ) -> tuple[dict[str, object], FakeRemoteMaterializeGit, types.ModuleType]:
+        git, operator, lane_inputs, leases = self._remote_materialize_lane_case(
+            tmp,
+            fake_git=fake_git,
+            missing_lease=missing_lease,
+            lease_reads=lease_reads,
+            renew_error=renew_error,
+            mutation_status=mutation_status,
+        )
+        params = {
+            "repo": tmp,
+            "lane_id": "1" * 32,
+            "remote_branch": git.remote_branch,
+            "expected_local_head": "a" * 40,
+            "expected_remote_head": git.materialize_remote_head,
+        }
+        inspect = Mock(return_value=leases)
+        if operator.lease_reads is not None:
+            inspect.side_effect = operator.lease_reads
+        renewal = {
+            "owner_id": lane_inputs["lease_owner_id"],
+            "snapshot_guarded": True,
+            "leases": list(leases.values()),
+        }
+        renew = Mock(
+            side_effect=operator.renew_error
+            if operator.renew_error is not None
+            else None,
+            return_value=renewal,
+        )
+        with (
+            patch(
+                "grabowski_work_acquire._stored_lane_inputs",
+                return_value=lane_inputs,
+            ),
+            patch.object(resources, "inspect_resources", inspect),
+            patch.object(resources, "renew_resources", renew),
+            patch.dict(sys.modules, {"grabowski_operator": operator}),
+        ):
+            result = grips.run_grip(
+                "remote-head-materialize",
+                params,
+                allow_mutation=True,
+                command_runner=git,
+            )
+        return result, git, operator
+
+    def test_remote_head_materialize_fast_forwards_exact_lane_via_branch_cas(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, fake, operator = self._run_remote_materialize_case(tmp)
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("fast_forwarded", result["output"]["action"])
+        self.assertEqual("a" * 40, result["output"]["old_head"])
+        self.assertEqual("b" * 40, result["output"]["new_head"])
+        fetch = next(call for call in fake.calls if "fetch" in call)
+        self.assertIn("--no-write-fetch-head", fetch)
+        self.assertIn("--refmap=", fetch)
+        self.assertIn("--no-tags", fetch)
+        self.assertIn("--no-recurse-submodules", fetch)
+        self.assertEqual("b" * 40, fetch[-1])
+        self.assertNotIn(f"refs/heads/{fake.remote_branch}", fetch)
+        mutation = operator.grabowski_git.call_args
+        self.assertEqual(["merge", "--ff-only", "b" * 40], mutation.args[1])
+        attempt = mutation.kwargs["branch_attempt"]
+        self.assertEqual("lane:" + "1" * 32, attempt["owner_id"])
+        self.assertEqual("writer", attempt["branch"])
+        self.assertEqual("e" * 64, attempt["expected_preimage_sha256"])
+        checks = {
+            item["id"]: item["status"]
+            for item in result["receipt"]["checks"]
+        }
+        for check_id in (
+            "lane_binding",
+            "lane_leases",
+            "remote_head_before",
+            "object_import",
+            "fast_forward",
+            "local_preimage",
+            "branch_cas",
+            "post_state",
+        ):
+            self.assertEqual("pass", checks[check_id])
+
+    def test_remote_head_materialize_rejects_missing_lane_lease_before_network_effect(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, fake, operator = self._run_remote_materialize_case(
+                tmp, missing_lease=True
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("every Work Lane resource lease", result["output"]["error"])
+        self.assertFalse(any("fetch" in call for call in fake.calls))
+        operator.grabowski_git.assert_not_called()
+
+    def test_remote_head_materialize_rejects_shallow_repository_before_fetch(
+        self,
+    ) -> None:
+        fake = FakeRemoteMaterializeGit(shallow=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            result, fake, operator = self._run_remote_materialize_case(
+                tmp, fake_git=fake
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("non-shallow repository", result["output"]["error"])
+        self.assertFalse(any("fetch" in call for call in fake.calls))
+        operator.grabowski_git.assert_not_called()
+
+    def test_remote_head_materialize_requires_effective_ssh_remote(
+        self,
+    ) -> None:
+        fake = FakeRemoteMaterializeGit(
+            configured_urls=["https://github.com/heimgewebe/grabowski.git"],
+            effective_fetch_urls=["https://github.com/heimgewebe/grabowski.git"],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            result, fake, operator = self._run_remote_materialize_case(
+                tmp, fake_git=fake
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("effective SSH remote", result["output"]["error"])
+        self.assertFalse(any("fetch" in call for call in fake.calls))
+        operator.grabowski_git.assert_not_called()
+
+    def test_remote_head_materialize_rejects_stale_remote_binding_before_fetch(
+        self,
+    ) -> None:
+        fake = FakeRemoteMaterializeGit(
+            remote_head="b" * 40, remote_heads=["c" * 40]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            result, fake, operator = self._run_remote_materialize_case(
+                tmp, fake_git=fake
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("expected_remote_head", result["output"]["error"])
+        self.assertFalse(any("fetch" in call for call in fake.calls))
+        operator.grabowski_git.assert_not_called()
+
+    def test_remote_head_materialize_rejects_non_fast_forward_after_object_import(
+        self,
+    ) -> None:
+        fake = FakeRemoteMaterializeGit(fast_forward=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            result, fake, operator = self._run_remote_materialize_case(
+                tmp, fake_git=fake
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("non-fast-forward", result["output"]["error"])
+        self.assertTrue(any("fetch" in call for call in fake.calls))
+        operator.grabowski_git.assert_not_called()
+
+    def test_remote_head_materialize_rejects_remote_drift_after_object_import(
+        self,
+    ) -> None:
+        fake = FakeRemoteMaterializeGit(
+            remote_heads=["b" * 40, "c" * 40]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            result, fake, operator = self._run_remote_materialize_case(
+                tmp, fake_git=fake
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn(
+            "advanced during exact-head object import", result["output"]["error"]
+        )
+        operator.grabowski_git.assert_not_called()
+
+    def test_remote_head_materialize_rejects_lane_lease_loss_before_branch_cas(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            git, _operator, _lane_inputs, leases = self._remote_materialize_lane_case(tmp)
+            result, fake, operator = self._run_remote_materialize_case(
+                tmp,
+                fake_git=git,
+                lease_reads=[leases, {}],
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("every Work Lane resource lease", result["output"]["error"])
+        self.assertTrue(any("fetch" in call for call in fake.calls))
+        operator.grabowski_git.assert_not_called()
+
+    def test_remote_head_materialize_rejects_snapshot_renewal_conflict_before_branch_cas(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, fake, operator = self._run_remote_materialize_case(
+                tmp,
+                renew_error=RuntimeError("lease snapshot changed"),
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("snapshot-renew", result["output"]["error"])
+        self.assertTrue(any("fetch" in call for call in fake.calls))
+        operator.grabowski_git.assert_not_called()
+
+    def test_remote_head_materialize_replays_without_fetch_when_head_is_already_exact(
+        self,
+    ) -> None:
+        fake = FakeRemoteMaterializeGit(head="b" * 40)
+        with tempfile.TemporaryDirectory() as tmp:
+            result, fake, operator = self._run_remote_materialize_case(
+                tmp, fake_git=fake
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("unchanged", result["output"]["action"])
+        self.assertTrue(result["output"]["idempotent_replay"])
+        self.assertFalse(any("fetch" in call for call in fake.calls))
+        operator.grabowski_git.assert_not_called()
 
     def test_branch_publish_requires_allow_mutation(self) -> None:
         result = grips.run_grip(
