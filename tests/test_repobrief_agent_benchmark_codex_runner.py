@@ -2686,6 +2686,46 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     )
 
 
+    def test_manifest_artifact_contract_rejects_conflicting_duplicate_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            artifact = root / "brief.md"
+            artifact.write_text("authorized artifact\n", encoding="utf-8")
+            artifact_raw = artifact.read_bytes()
+            identity = {
+                "role": "canonical_md",
+                "path": "brief.md",
+                "bytes": len(artifact_raw),
+                "sha256": hashlib.sha256(artifact_raw).hexdigest(),
+            }
+            manifest = root / "chosen.bundle.manifest.json"
+
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "artifacts": [
+                            identity,
+                            {**identity, "sha256": "0" * 64},
+                        ]
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(runner.RunnerError, "conflicting identities"):
+                runner._manifest_artifact_paths(manifest, manifest.read_bytes())
+
+            manifest.write_text(
+                json.dumps({"artifacts": [identity, dict(identity)]}, sort_keys=True)
+                + "\n",
+                encoding="utf-8",
+            )
+            paths = runner._manifest_artifact_paths(manifest, manifest.read_bytes())
+            self.assertEqual(len(paths), 1)
+            self.assertEqual(paths[0][0], Path("brief.md"))
+
+
     def test_staged_manifest_rejects_missing_or_nonregular_identity_artifact(self) -> None:
         for mode in ("missing", "directory", "symlink"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:

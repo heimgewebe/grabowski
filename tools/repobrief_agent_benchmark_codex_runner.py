@@ -2014,8 +2014,8 @@ def _manifest_artifact_paths(
     if not isinstance(artifacts, list):
         raise RunnerError("RepoGround manifest artifacts contract is invalid")
     root = source.parent.resolve(strict=True)
-    result: list[tuple[Path, Path]] = []
-    seen: set[Path] = set()
+    result: list[tuple[Path, Path, int, str]] = []
+    seen: dict[Path, tuple[int, str]] = {}
     for artifact in artifacts:
         if not isinstance(artifact, dict):
             raise RunnerError("RepoGround manifest artifact entry is invalid")
@@ -2050,9 +2050,16 @@ def _manifest_artifact_paths(
             raise RunnerError(
                 "RepoGround manifest artifact path changes through filesystem indirection"
             )
-        if relative not in seen:
-            seen.add(relative)
-            result.append((relative, candidate, expected_bytes, expected_sha256))
+        identity = (expected_bytes, expected_sha256)
+        previous_identity = seen.get(relative)
+        if previous_identity is not None:
+            if previous_identity != identity:
+                raise RunnerError(
+                    "RepoGround manifest artifact path has conflicting identities"
+                )
+            continue
+        seen[relative] = identity
+        result.append((relative, candidate, expected_bytes, expected_sha256))
     return result
 
 
