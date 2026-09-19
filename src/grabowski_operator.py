@@ -2426,7 +2426,7 @@ def _redact_argv(argv: list[str]) -> list[str]:
                 )
             redacted.append(_redact(redacted_item))
             continue
-        if item.startswith("-") and _sensitive_argv_name(item):
+        if "=" not in item and item.startswith("-") and _sensitive_argv_name(item):
             redacted.append(item)
             hide_next = True
             continue
@@ -2447,7 +2447,7 @@ def _argv_secret_values(argv: list[str]) -> list[str]:
         if inline_secrets:
             values.extend(value for _start, _end, value in inline_secrets)
             continue
-        if item.startswith("-") and _sensitive_argv_name(item):
+        if "=" not in item and item.startswith("-") and _sensitive_argv_name(item):
             hide_next = True
     return values
 

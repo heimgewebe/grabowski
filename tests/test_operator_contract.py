@@ -3141,6 +3141,7 @@ class OperatorContractTests(unittest.TestCase):
             "stdout.log",
             "25",
             "--output=/tmp/t203-secret-worktree/result",
+            "after-output",
         ]
         self.assertEqual(operator._redact_argv(argv), argv)
         self.assertEqual(operator._argv_secret_values(argv), [])
