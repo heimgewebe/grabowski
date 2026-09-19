@@ -28,6 +28,7 @@ import grabowski_client_snapshot as client_snapshot
 import grabowski_connector_contract as connector_contract
 import grabowski_mcp as base
 import grabowski_midcutover_resume as midcutover
+import grabowski_job_origin as job_origin
 import grabowski_deployment_observer as deployment_observer
 import grabowski_operator_core as operator
 import grabowski_privileged as privileged
@@ -1068,6 +1069,91 @@ def _deploy_command_fields(command: Any) -> dict[str, str] | None:
     }
 
 
+def _recover_legacy_redacted_deploy_command(
+    entry: Path,
+    metadata: dict[str, Any],
+    command: list[str],
+) -> dict[str, Any] | None:
+    """Recover only the historical deploy argv shape corrupted by argv redaction.
+
+    Before the path-sensitive argv fix, positional repository paths containing
+    the word secret caused the preceding --repo and --canonical-repo option
+    names to be persisted as <REDACTED>. The original raw argv hash,
+    server-owned job origin, finalization contract and deployment-observer
+    contract survived. Reconstruct exactly those two missing option names and
+    accept the result only when the reconstructed argv hashes to the stored raw
+    command identity and every server-owned binding agrees.
+
+    This is deliberately not a generic malformed-metadata escape hatch.
+    """
+    if (
+        len(command) != 14
+        or command[2] != "<REDACTED>"
+        or command[4] != "<REDACTED>"
+        or any(
+            item == "<REDACTED>"
+            for index, item in enumerate(command)
+            if index not in {2, 4}
+        )
+    ):
+        return None
+
+    recovered = list(command)
+    recovered[2] = "--repo"
+    recovered[4] = "--canonical-repo"
+    fields = _deploy_command_fields(recovered)
+    if fields is None:
+        return None
+
+    argv_sha256 = metadata.get("argv_sha256")
+    if (
+        not isinstance(argv_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", argv_sha256) is None
+        or _deploy_command_sha256(recovered) != argv_sha256
+    ):
+        return None
+
+    try:
+        origin = job_origin.validate_origin(
+            metadata.get("origin"),
+            metadata.get("origin_sha256"),
+            expected_unit=entry.name,
+        )
+    except ValueError:
+        return None
+    if any(
+        metadata.get(key) != origin.get(key)
+        for key in ("unit", "job_id", "owner", "argv_sha256", "scope")
+    ):
+        return None
+    if (
+        origin.get("invoker_tool") != "grabowski_runtime_deploy_schedule"
+        or origin.get("argv_sha256") != argv_sha256
+    ):
+        return None
+
+    finalization = metadata.get("finalization_contract")
+    observer = metadata.get("deployment_observer_contract")
+    if (
+        not isinstance(finalization, dict)
+        or finalization.get("kind") != "grabowski_runtime_deploy_finalization"
+        or finalization.get("unit") != entry.name
+        or finalization.get("job_id") != metadata.get("job_id")
+        or finalization.get("argv_sha256") != argv_sha256
+        or finalization.get("expected_head") != fields["expected_head"]
+        or not isinstance(observer, dict)
+        or observer.get("unit") != entry.name
+        or observer.get("argv_sha256") != argv_sha256
+        or observer.get("origin_sha256") != metadata.get("origin_sha256")
+        or observer.get("expected_head") != fields["expected_head"]
+        or observer.get("source_identity_sha256")
+        != fields["source_identity_sha256"]
+        or metadata.get("cwd") != fields["repository"]
+    ):
+        return None
+    return {"argv": recovered, "fields": fields}
+
+
 def _deploy_identity(command: Any) -> tuple[str, ...] | None:
     fields = _deploy_command_fields(command)
     if fields is None:
@@ -1537,6 +1623,15 @@ def _classify_indexed_job(entry: Path) -> dict[str, Any]:
     ):
         raise IndexedRuntimeJobConflict(f"durable job argv is malformed: {entry.name}")
     deploy_fields = _deploy_command_fields(candidate_command)
+    legacy_redacted_argv_recovered = False
+    if deploy_fields is None:
+        recovered = _recover_legacy_redacted_deploy_command(
+            entry, metadata, candidate_command
+        )
+        if recovered is not None:
+            candidate_command = recovered["argv"]
+            deploy_fields = recovered["fields"]
+            legacy_redacted_argv_recovered = True
     resume_fields = (
         _midcutover_resume_command_fields(candidate_command)
         if deploy_fields is None
@@ -1590,12 +1685,20 @@ def _classify_indexed_job(entry: Path) -> dict[str, Any]:
     )
     runtime_proven_terminal = bool(
         deploy_fields is not None
-        and _missing_finalization_deploy_is_runtime_proven(status, deploy_fields)
+        and _missing_finalization_deploy_is_runtime_proven(
+            status,
+            deploy_fields,
+            legacy_redacted_argv_recovered=legacy_redacted_argv_recovered,
+        )
     )
     noeffect_proven_terminal = bool(
         deploy_fields is not None
         and not runtime_proven_terminal
-        and _missing_finalization_deploy_is_noeffect_proven(status, deploy_fields)
+        and _missing_finalization_deploy_is_noeffect_proven(
+            status,
+            deploy_fields,
+            legacy_redacted_argv_recovered=legacy_redacted_argv_recovered,
+        )
     )
     return {
         "unit": entry.name,
@@ -1609,6 +1712,7 @@ def _classify_indexed_job(entry: Path) -> dict[str, Any]:
         "readback_required": readback_required,
         "runtime_proven_terminal": runtime_proven_terminal,
         "noeffect_proven_terminal": noeffect_proven_terminal,
+        "legacy_redacted_argv_recovered": legacy_redacted_argv_recovered,
         "terminal": (
             final_status in TERMINAL_JOB_STATUSES and not readback_required
         ) or runtime_proven_terminal or noeffect_proven_terminal,
@@ -1832,11 +1936,28 @@ def _sidecars_match_deploy_head(command_fields: dict[str, Any]) -> bool:
         return False
 
 
+def _deploy_finalization_unavailable_for_proof(
+    finalization: Any,
+    *,
+    legacy_redacted_argv_recovered: bool,
+) -> bool:
+    if not isinstance(finalization, dict) or finalization.get("valid") is True:
+        return False
+    if finalization.get("state") in {"missing_receipt", "not_configured"}:
+        return True
+    return bool(
+        legacy_redacted_argv_recovered
+        and finalization.get("state") == "invalid_contract"
+        and finalization.get("reason") == "metadata_argv_binding_invalid"
+    )
+
+
 def _missing_finalization_deploy_is_runtime_proven(
     status: dict[str, Any],
     command_fields: dict[str, Any],
     *,
     runtime_proof_cache: dict[tuple[str, str, str], bool] | None = None,
+    legacy_redacted_argv_recovered: bool = False,
 ) -> bool:
     """Treat an exited deploy as terminal only when its active release proves the head.
 
@@ -1849,11 +1970,10 @@ def _missing_finalization_deploy_is_runtime_proven(
     if status.get("final_status") in TERMINAL_JOB_STATUSES | REUSABLE_JOB_STATUSES:
         return False
     finalization = status.get("finalization_receipt")
-    if not isinstance(finalization, dict):
-        return False
-    if finalization.get("state") not in {"missing_receipt", "not_configured"}:
-        return False
-    if finalization.get("valid") is True:
+    if not _deploy_finalization_unavailable_for_proof(
+        finalization,
+        legacy_redacted_argv_recovered=legacy_redacted_argv_recovered,
+    ):
         return False
     properties = status.get("properties")
     if not isinstance(properties, dict):
@@ -2010,6 +2130,8 @@ def _active_runtime_process_matches_stable_pointer(deployment: dict[str, Any]) -
 def _missing_finalization_deploy_is_noeffect_proven(
     status: dict[str, Any],
     command_fields: dict[str, Any],
+    *,
+    legacy_redacted_argv_recovered: bool = False,
 ) -> bool:
     """Prove an interrupted deploy no longer owns an unresolved cutover.
 
@@ -2023,11 +2145,10 @@ def _missing_finalization_deploy_is_noeffect_proven(
     if status.get("final_status") in TERMINAL_JOB_STATUSES | REUSABLE_JOB_STATUSES:
         return False
     finalization = status.get("finalization_receipt")
-    if not isinstance(finalization, dict):
-        return False
-    if finalization.get("state") not in {"missing_receipt", "not_configured"}:
-        return False
-    if finalization.get("valid") is True:
+    if not _deploy_finalization_unavailable_for_proof(
+        finalization,
+        legacy_redacted_argv_recovered=legacy_redacted_argv_recovered,
+    ):
         return False
     properties = status.get("properties")
     if not isinstance(properties, dict):
