@@ -56,23 +56,32 @@ def _read_source_snapshot(path: Path) -> tuple[bytes, dict[str, Any]]:
             if not chunk:
                 break
             data.extend(chunk)
+        after_descriptor = os.fstat(descriptor)
+        try:
+            descriptor_path = os.readlink(f"/proc/self/fd/{descriptor}")
+        except OSError as exc:
+            raise RuntimeError(f"{path.name} opened path cannot be bound") from exc
+        if not os.path.isabs(descriptor_path) or descriptor_path.endswith(" (deleted)"):
+            raise RuntimeError(f"{path.name} opened path is unavailable")
+        after = requested.lstat()
+        if (
+            len(data) != opened.st_size
+            or len(data) > SOURCE_SNAPSHOT_MAX_BYTES
+            or (after_descriptor.st_dev, after_descriptor.st_ino, after_descriptor.st_size)
+            != (opened.st_dev, opened.st_ino, opened.st_size)
+            or (after.st_dev, after.st_ino, after.st_size)
+            != (opened.st_dev, opened.st_ino, opened.st_size)
+        ):
+            raise RuntimeError(f"{path.name} changed during load")
+        resolved = Path(descriptor_path)
+        return bytes(data), {
+            "path": str(resolved),
+            "name": resolved.name,
+            "bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
     finally:
         os.close(descriptor)
-    after = requested.lstat()
-    if (
-        len(data) != opened.st_size
-        or len(data) > SOURCE_SNAPSHOT_MAX_BYTES
-        or (after.st_dev, after.st_ino, after.st_size)
-        != (opened.st_dev, opened.st_ino, opened.st_size)
-    ):
-        raise RuntimeError(f"{path.name} changed during load")
-    resolved = requested.resolve()
-    return bytes(data), {
-        "path": str(resolved),
-        "name": resolved.name,
-        "bytes": len(data),
-        "sha256": hashlib.sha256(data).hexdigest(),
-    }
 
 
 _CAPTURED_ENTRYPOINT_ACTIVE = (

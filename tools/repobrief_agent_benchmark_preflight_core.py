@@ -58,27 +58,36 @@ def _read_startup_source_snapshot(path: Path, *, label: str) -> tuple[bytes, dic
             if not chunk:
                 break
             data.extend(chunk)
+        after_descriptor = os.fstat(descriptor)
+        try:
+            descriptor_path = os.readlink(f"/proc/self/fd/{descriptor}")
+        except OSError as exc:
+            raise RuntimeError(f"{label} opened path cannot be bound") from exc
+        if not os.path.isabs(descriptor_path) or descriptor_path.endswith(" (deleted)"):
+            raise RuntimeError(f"{label} opened path is unavailable")
+        try:
+            after = requested.lstat()
+        except OSError as exc:
+            raise RuntimeError(f"{label} disappeared during load") from exc
+        if (
+            len(data) != opened.st_size
+            or len(data) > SOURCE_SNAPSHOT_MAX_BYTES
+            or (after_descriptor.st_dev, after_descriptor.st_ino, after_descriptor.st_size)
+            != (opened.st_dev, opened.st_ino, opened.st_size)
+            or (after.st_dev, after.st_ino, after.st_size)
+            != (opened.st_dev, opened.st_ino, opened.st_size)
+        ):
+            raise RuntimeError(f"{label} changed during load")
+        resolved = Path(descriptor_path)
+        identity = {
+            "path": str(resolved),
+            "name": resolved.name,
+            "bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+        return bytes(data), identity
     finally:
         os.close(descriptor)
-    try:
-        after = requested.lstat()
-    except OSError as exc:
-        raise RuntimeError(f"{label} disappeared during load") from exc
-    if (
-        len(data) != opened.st_size
-        or len(data) > SOURCE_SNAPSHOT_MAX_BYTES
-        or (after.st_dev, after.st_ino, after.st_size)
-        != (opened.st_dev, opened.st_ino, opened.st_size)
-    ):
-        raise RuntimeError(f"{label} changed during load")
-    resolved = requested.resolve()
-    identity = {
-        "path": str(resolved),
-        "name": resolved.name,
-        "bytes": len(data),
-        "sha256": hashlib.sha256(data).hexdigest(),
-    }
-    return bytes(data), identity
 
 
 def _record_startup_code_identity(identity: Mapping[str, Any]) -> None:
@@ -356,7 +365,7 @@ def _file_identity(
         raise PreflightError(f"{label} is empty or oversized")
     if require_private and metadata.st_mode & 0o077:
         raise PreflightError(f"{label} must not be group- or world-accessible")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(requested, flags)
     except OSError as exc:
@@ -380,25 +389,35 @@ def _file_identity(
             if count > maximum:
                 raise PreflightError(f"{label} is oversized")
             digest.update(chunk)
+        final_descriptor = os.fstat(descriptor)
+        try:
+            descriptor_path = os.readlink(f"/proc/self/fd/{descriptor}")
+        except OSError as exc:
+            raise PreflightError(f"{label} opened path cannot be bound") from exc
+        if not os.path.isabs(descriptor_path) or descriptor_path.endswith(" (deleted)"):
+            raise PreflightError(f"{label} opened path is unavailable")
+        try:
+            final = requested.lstat()
+        except OSError as exc:
+            raise PreflightError(f"{label} disappeared during validation") from exc
+        if (
+            final_descriptor.st_dev != current.st_dev
+            or final_descriptor.st_ino != current.st_ino
+            or final_descriptor.st_size != current.st_size
+            or final.st_dev != current.st_dev
+            or final.st_ino != current.st_ino
+            or final.st_size != current.st_size
+            or count != current.st_size
+        ):
+            raise PreflightError(f"{label} changed during validation")
+        return {
+            "path": descriptor_path,
+            "bytes": count,
+            "sha256": digest.hexdigest(),
+            "mode": oct(current.st_mode & 0o777),
+        }
     finally:
         os.close(descriptor)
-    try:
-        final = requested.lstat()
-    except OSError as exc:
-        raise PreflightError(f"{label} disappeared during validation") from exc
-    if (
-        final.st_dev != metadata.st_dev
-        or final.st_ino != metadata.st_ino
-        or final.st_size != metadata.st_size
-        or count != metadata.st_size
-    ):
-        raise PreflightError(f"{label} changed during validation")
-    return {
-        "path": str(requested.resolve()),
-        "bytes": count,
-        "sha256": digest.hexdigest(),
-        "mode": oct(metadata.st_mode & 0o777),
-    }
 
 
 def _command_file_identities(

@@ -2511,5 +2511,44 @@ class McpCommandFileIdentityTests(unittest.TestCase):
                 codex_preflight.core._STARTUP_CODE_IDENTITIES.pop(key, None)
 
 
+    def test_codex_preflight_source_snapshot_identity_comes_from_open_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "codex-preflight.py"
+            target.write_bytes(b"VALUE = 1\n")
+            attacker = Path(temporary) / "attacker.py"
+            with mock.patch.object(Path, "resolve", return_value=attacker):
+                raw, identity = codex_preflight._read_source_snapshot(target)
+        self.assertEqual(raw, b"VALUE = 1\n")
+        self.assertEqual(identity["path"], str(target))
+        self.assertEqual(identity["name"], target.name)
+
+    def test_preflight_core_startup_snapshot_identity_comes_from_open_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "preflight-core.py"
+            target.write_bytes(b"VALUE = 2\n")
+            attacker = Path(temporary) / "attacker.py"
+            with mock.patch.object(Path, "resolve", return_value=attacker):
+                raw, identity = codex_preflight.core._read_startup_source_snapshot(
+                    target, label="test startup source"
+                )
+        self.assertEqual(raw, b"VALUE = 2\n")
+        self.assertEqual(identity["path"], str(target))
+        self.assertEqual(identity["name"], target.name)
+
+    def test_preflight_core_file_identity_comes_from_open_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "repository-map.json"
+            target.write_bytes(b"{}\n")
+            attacker = Path(temporary) / "attacker.json"
+            with mock.patch.object(Path, "resolve", return_value=attacker):
+                identity = codex_preflight.core._file_identity(
+                    target,
+                    maximum=1024,
+                    label="test repository map",
+                )
+        self.assertEqual(identity["path"], str(target))
+        self.assertEqual(identity["sha256"], hashlib.sha256(b"{}\n").hexdigest())
+
+
 if __name__ == "__main__":
     unittest.main()

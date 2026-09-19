@@ -3062,5 +3062,32 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
 
 
 
+    def test_source_snapshot_path_identity_comes_from_open_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "base-runner.py"
+            target.write_bytes(b"VALUE = 3\n")
+            attacker = Path(directory) / "attacker.py"
+            with patch.object(Path, "resolve", return_value=attacker):
+                raw, identity = runner._read_source_snapshot(target)
+        self.assertEqual(raw, b"VALUE = 3\n")
+        self.assertEqual(identity["path"], str(target))
+        self.assertEqual(identity["name"], target.name)
+
+    def test_runtime_file_snapshot_path_identity_comes_from_open_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "manifest.json"
+            target.write_bytes(b"{}\n")
+            attacker = Path(directory) / "attacker.json"
+            with patch.object(Path, "resolve", return_value=attacker):
+                identity, raw = runner._runtime_file_snapshot(
+                    target,
+                    label="test runtime file",
+                    max_bytes=1024,
+                )
+        self.assertEqual(raw, b"{}\n")
+        self.assertEqual(identity["path"], str(target))
+        self.assertEqual(identity["sha256"], hashlib.sha256(raw).hexdigest())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -70,23 +70,32 @@ def _read_source_snapshot(path: Path) -> tuple[bytes, dict[str, Any]]:
             if not chunk:
                 break
             data.extend(chunk)
+        after_descriptor = os.fstat(descriptor)
+        try:
+            descriptor_path = os.readlink(f"/proc/self/fd/{descriptor}")
+        except OSError as exc:
+            raise RuntimeError(f"{path.name} opened path cannot be bound") from exc
+        if not os.path.isabs(descriptor_path) or descriptor_path.endswith(" (deleted)"):
+            raise RuntimeError(f"{path.name} opened path is unavailable")
+        after = requested.lstat()
+        if (
+            len(data) != opened.st_size
+            or len(data) > SOURCE_SNAPSHOT_MAX_BYTES
+            or (after_descriptor.st_dev, after_descriptor.st_ino, after_descriptor.st_size)
+            != (opened.st_dev, opened.st_ino, opened.st_size)
+            or (after.st_dev, after.st_ino, after.st_size)
+            != (opened.st_dev, opened.st_ino, opened.st_size)
+        ):
+            raise RuntimeError(f"{path.name} changed during load")
+        resolved = Path(descriptor_path)
+        return bytes(data), {
+            "path": str(resolved),
+            "name": resolved.name,
+            "bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
     finally:
         os.close(descriptor)
-    after = requested.lstat()
-    if (
-        len(data) != opened.st_size
-        or len(data) > SOURCE_SNAPSHOT_MAX_BYTES
-        or (after.st_dev, after.st_ino, after.st_size)
-        != (opened.st_dev, opened.st_ino, opened.st_size)
-    ):
-        raise RuntimeError(f"{path.name} changed during load")
-    resolved = requested.resolve()
-    return bytes(data), {
-        "path": str(resolved),
-        "name": resolved.name,
-        "bytes": len(data),
-        "sha256": hashlib.sha256(data).hexdigest(),
-    }
 
 
 _CAPTURED_ENTRYPOINT_ACTIVE = (
@@ -1547,30 +1556,46 @@ def _runtime_file_snapshot(
             if not chunk:
                 break
             data.extend(chunk)
+        after_descriptor = os.fstat(descriptor)
+        try:
+            descriptor_path = os.readlink(f"/proc/self/fd/{descriptor}")
+        except OSError as exc:
+            raise RunnerError(f"{label} opened path cannot be bound") from exc
+        if not os.path.isabs(descriptor_path) or descriptor_path.endswith(" (deleted)"):
+            raise RunnerError(f"{label} opened path is unavailable")
+        try:
+            after = requested.lstat()
+        except OSError as exc:
+            raise RunnerError(f"{label} disappeared during validation") from exc
+        initial_identity = (linked.st_dev, linked.st_ino, linked.st_size, linked.st_mode)
+        opened_identity = (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mode)
+        after_descriptor_identity = (
+            after_descriptor.st_dev,
+            after_descriptor.st_ino,
+            after_descriptor.st_size,
+            after_descriptor.st_mode,
+        )
+        after_identity = (after.st_dev, after.st_ino, after.st_size, after.st_mode)
+        if (
+            initial_identity != opened_identity
+            or opened_identity != after_descriptor_identity
+            or opened_identity != after_identity
+        ):
+            raise RunnerError(f"{label} changed during validation")
+        if len(data) != opened.st_size or len(data) > max_bytes:
+            raise RunnerError(f"{label} changed or exceeds its bound")
+        raw = bytes(data)
+        return (
+            {
+                "path": descriptor_path,
+                "bytes": len(raw),
+                "sha256": sha_bytes(raw),
+                "mode": oct(opened.st_mode & 0o777),
+            },
+            raw,
+        )
     finally:
         os.close(descriptor)
-    try:
-        after = requested.lstat()
-        resolved = requested.resolve(strict=True)
-    except OSError as exc:
-        raise RunnerError(f"{label} disappeared during validation") from exc
-    initial_identity = (linked.st_dev, linked.st_ino, linked.st_size, linked.st_mode)
-    opened_identity = (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mode)
-    after_identity = (after.st_dev, after.st_ino, after.st_size, after.st_mode)
-    if initial_identity != opened_identity or opened_identity != after_identity:
-        raise RunnerError(f"{label} changed during validation")
-    if len(data) != opened.st_size or len(data) > max_bytes:
-        raise RunnerError(f"{label} changed or exceeds its bound")
-    raw = bytes(data)
-    return (
-        {
-            "path": str(resolved),
-            "bytes": len(raw),
-            "sha256": sha_bytes(raw),
-            "mode": oct(opened.st_mode & 0o777),
-        },
-        raw,
-    )
 
 
 def _runtime_file_identity(path: Path, *, label: str, max_bytes: int) -> dict[str, Any]:
