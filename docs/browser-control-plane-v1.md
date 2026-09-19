@@ -116,6 +116,41 @@ späterer Worker kann dasselbe Profil nach erneutem exklusivem
 `browser-profile:<pfad>`-Lease verwenden. Für benannte Operatorprofile gilt ohne
 explizite Runtime ein weiterhin begrenzter Default von sechs Stunden.
 
+### Live-Policy-Aktivierung
+
+Der Runtime-Deploy ändert die produktive `~/.config/grabowski/access.json` absichtlich
+nicht. Die Umstellung bestehender Trusted-Owner-Installationen auf den dedizierten
+Managed-Browser-Root erfolgt daher separat und fail-closed über den vorhandenen
+Policy-Upgrader. Die Browserroot-Konvergenz ist ausdrücklich opt-in; der normale
+Access-Profile-Upgradepfad behält sein bisheriges Verhalten.
+
+Zuerst nur lesen und die erwartete Änderung samt `before_sha256` und
+`template_sha256` prüfen:
+
+```bash
+python tools/upgrade_access_profiles.py ~/.config/grabowski/access.json \
+  --converge-browser-profile-roots
+```
+
+Erst danach darf genau derselbe Policy- und Template-Snapshot atomar angewendet
+werden:
+
+```bash
+python tools/upgrade_access_profiles.py ~/.config/grabowski/access.json \
+  --expected-sha256 <before_sha256> \
+  --expected-template-sha256 <template_sha256> \
+  --converge-browser-profile-roots \
+  --apply
+```
+
+Diese Migration ersetzt ausschließlich die Top-Level- und Trusted-Owner-
+`browser_profile_roots` durch die im versionierten Trusted-Owner-Template identische
+Rootliste. Sie verändert keine übrige Trusted-Owner-Autorität, verlangt identische
+Top-Level-/Profil-Roots im Template, hält die Policy als private reguläre `0600`-Datei
+und bricht bei Identitäts- oder Hashdrift vor dem atomaren Replace ab. Ein Runtime-
+Deploy und diese Policy-Migration sind daher zwei getrennte, jeweils belegpflichtige
+Effekte.
+
 Der Workerstatus prüft bei laufenden CDP-Workern zusätzlich die lokale Target-Ebene.
 Ein laufender systemd-Prozess ohne genau ein steuerbares CDP-Seitentarget wird als
 `target_unavailable` und handlungsbedürftig projiziert. Das autorisiert keinen
