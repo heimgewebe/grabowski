@@ -2900,7 +2900,9 @@ class SecretPtyContractTests(unittest.TestCase):
 
     def test_secret_pty_peer_rejects_foreign_interpreter_wrapper(self) -> None:
         root_tool = _load_root_broker_tool()
-        expected_client = str(Path(sys.executable).resolve())
+        # Use a stable root-controlled executable so this regression reaches the
+        # interpreter-identity guard on both local hosts and GitHub runners.
+        expected_client = "/bin/true"
         fake_control_group = "/system.slice/grabowski-operator.service"
         execution = {
             "allowed_peer_uid": os.getuid(),
