@@ -88,6 +88,14 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
             "allowed_peer_uid": 1000,
             "allowed_peer_unit": dual.OPERATOR_SERVICE,
         }
+        secret_pty = {
+            "enabled": True,
+            "mode": "secret-pty",
+            "allowed_peer_uid": 1000,
+            "allowed_peer_unit": dual.OPERATOR_SERVICE,
+            "authority_task_id": "GRABOWSKI-OPERATOR-SURFACE-V1-T172",
+            "authority_host": "heim-pc",
+        }
         platform_connector_capture = {
             "enabled": True,
             "mode": "template",
@@ -106,6 +114,7 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
                 "operator_blockade_marker_lifecycle": lifecycle,
                 dual.OPERATOR_SERVICE_CONTROL_ACTION: service_control,
                 dual.ROOTBROKER_CUTOVER_ACTION: rootbroker_cutover,
+                dual.SECRET_PTY_ACTION: secret_pty,
                 dual.PLATFORM_CONNECTOR_CAPTURE_ACTION: platform_connector_capture,
             },
         }
@@ -132,6 +141,9 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
         artifact_sha256 = {
             "broker_module": __import__("hashlib").sha256(
                 blobs[Path("src/grabowski_privileged_broker.py")]
+            ).hexdigest(),
+            "secret_pty_module": __import__("hashlib").sha256(
+                blobs[Path("src/grabowski_secret_pty.py")]
             ).hexdigest(),
             "broker_wrapper": __import__("hashlib").sha256(
                 blobs[Path("tools/grabowski_privileged_broker.py")]
@@ -164,6 +176,7 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
                 dual.ROOTBROKER_CUTOVER_ACTION: dual._canonical_line_sha256(
                     rootbroker_cutover
                 ),
+                dual.SECRET_PTY_ACTION: dual._canonical_line_sha256(secret_pty),
                 dual.PLATFORM_CONNECTOR_CAPTURE_ACTION: dual._canonical_line_sha256(
                     platform_connector_capture
                 ),

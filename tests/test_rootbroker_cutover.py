@@ -811,6 +811,14 @@ class RootbrokerCutoverTests(unittest.TestCase):
         self.assertEqual(artifact.mode, 0o644)
         self.assertTrue(artifact.python_source)
 
+    def test_cutover_artifacts_include_secret_pty_root_module(self) -> None:
+        artifacts = {artifact.target: artifact for artifact in cutover.ARTIFACTS}
+
+        artifact = artifacts[cutover.SECRET_PTY_MODULE_TARGET]
+        self.assertEqual(artifact.source_relative, "src/grabowski_secret_pty.py")
+        self.assertEqual(artifact.mode, 0o644)
+        self.assertTrue(artifact.python_source)
+
     def test_cutover_artifacts_include_runtime_bootstrap_recovery_helper(self) -> None:
         artifacts = {artifact.target: artifact for artifact in cutover.ARTIFACTS}
 
@@ -843,6 +851,7 @@ class RootbrokerCutoverTests(unittest.TestCase):
         source_artifacts = {}
         for label, target in {
             "broker_module": cutover.BROKER_MODULE_TARGET,
+            "secret_pty_module": cutover.SECRET_PTY_MODULE_TARGET,
             "broker_wrapper": cutover.BROKER_WRAPPER_TARGET,
             "platform_connector_capture": cutover.PLATFORM_CONNECTOR_CAPTURE_TARGET,
             "cutover_helper": cutover.CUTOVER_HELPER_TARGET,
@@ -911,6 +920,7 @@ class RootbrokerCutoverTests(unittest.TestCase):
         source_artifacts = {}
         for target in (
             cutover.BROKER_MODULE_TARGET,
+            cutover.SECRET_PTY_MODULE_TARGET,
             cutover.BROKER_WRAPPER_TARGET,
             cutover.PLATFORM_CONNECTOR_CAPTURE_TARGET,
             cutover.CUTOVER_HELPER_TARGET,

@@ -19,6 +19,25 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
+
+_BROKER_LIB_SPEC = importlib.util.spec_from_file_location(
+    "grabowski_privileged_broker", SRC / "grabowski_privileged_broker.py"
+)
+if _BROKER_LIB_SPEC is None or _BROKER_LIB_SPEC.loader is None:
+    raise RuntimeError("privileged broker source module could not be loaded")
+_broker_lib = importlib.util.module_from_spec(_BROKER_LIB_SPEC)
+sys.modules[_BROKER_LIB_SPEC.name] = _broker_lib
+_BROKER_LIB_SPEC.loader.exec_module(_broker_lib)
+
+_SECRET_PTY_SPEC = importlib.util.spec_from_file_location(
+    "grabowski_secret_pty", SRC / "grabowski_secret_pty.py"
+)
+if _SECRET_PTY_SPEC is None or _SECRET_PTY_SPEC.loader is None:
+    raise RuntimeError("secret PTY source module could not be loaded")
+_secret_pty_lib = importlib.util.module_from_spec(_SECRET_PTY_SPEC)
+sys.modules[_SECRET_PTY_SPEC.name] = _secret_pty_lib
+_SECRET_PTY_SPEC.loader.exec_module(_secret_pty_lib)
+
 MODULE_PATH = ROOT / "tools" / "grabowski_privileged_broker.py"
 SPEC = importlib.util.spec_from_file_location(
     "grabowski_privileged_broker_peer_test", MODULE_PATH

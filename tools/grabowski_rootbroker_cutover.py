@@ -27,6 +27,7 @@ BLOCKADE_STORE_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_blockade
 BLOCKADE_AUTHORITY_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_blockade_authority.py")
 COMMAND_IDENTITY_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_command_identity.py")
 BROKER_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_privileged_broker.py")
+SECRET_PTY_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_secret_pty.py")
 BROKER_WRAPPER_TARGET = Path("/usr/local/libexec/grabowski-privileged-broker")
 PROCESS_OBSERVER_TARGET = Path("/usr/local/libexec/grabowski-process-reference-observer")
 PLATFORM_CONNECTOR_CAPTURE_TARGET = Path(
@@ -178,6 +179,12 @@ ARTIFACTS = (
     Artifact(
         "src/grabowski_privileged_broker.py",
         BROKER_MODULE_TARGET,
+        0o644,
+        True,
+    ),
+    Artifact(
+        "src/grabowski_secret_pty.py",
+        SECRET_PTY_MODULE_TARGET,
         0o644,
         True,
     ),
@@ -2154,6 +2161,7 @@ def _operator_authority_attestation(
 ) -> dict[str, Any]:
     required_artifacts = {
         "broker_module": BROKER_MODULE_TARGET,
+        "secret_pty_module": SECRET_PTY_MODULE_TARGET,
         "broker_wrapper": BROKER_WRAPPER_TARGET,
         "platform_connector_capture": PLATFORM_CONNECTOR_CAPTURE_TARGET,
         "cutover_helper": CUTOVER_HELPER_TARGET,
