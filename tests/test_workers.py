@@ -1452,6 +1452,78 @@ globalThis.fetch = async () => ({
         self.assertEqual(Path(worker["profile_path"]).stat().st_mode & 0o777, 0o700)
         self.assertEqual(worker["control_plane"]["profile"]["scope_kind"], "managed-operator-profile")
 
+    def test_active_managed_profile_blocks_raw_persistent_descendant(self) -> None:
+        managed_root = self.root / "managed-browser-profiles"
+        with patch.object(
+            workers.base, "OPERATOR_BROWSER_PROFILE_ROOT", managed_root
+        ), patch.object(
+            workers.base, "_load_policy", return_value={}
+        ), patch.object(
+            workers.base, "_profile_values", return_value=[str(managed_root)]
+        ), patch.object(
+            workers, "_executable", return_value=self.binary.resolve()
+        ), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            active = workers.browser_start(
+                str(self.binary),
+                port=9250,
+                operator_profile="provider-operator",
+                runtime_seconds=60,
+            )["worker"]
+            active_profile = Path(active["profile_path"])
+            descendant = active_profile / "nested-raw-profile"
+            with self.assertRaisesRegex(
+                PermissionError,
+                "raw persistent_profile may not overlap.*use operator_profile",
+            ):
+                workers.browser_start(
+                    str(self.binary),
+                    port=9251,
+                    persistent_profile=str(descendant),
+                    runtime_seconds=60,
+                )
+        self.assertFalse(descendant.exists())
+        self.assertIsNone(workers.resources.inspect_resource("port:9251"))
+        self.assertIsNone(
+            workers.resources.inspect_resource(f"browser-profile:{descendant}")
+        )
+
+    def test_active_managed_profile_blocks_raw_persistent_parent(self) -> None:
+        managed_root = self.root / "managed-browser-profiles"
+        with patch.object(
+            workers.base, "OPERATOR_BROWSER_PROFILE_ROOT", managed_root
+        ), patch.object(
+            workers.base, "_load_policy", return_value={}
+        ), patch.object(
+            workers.base, "_profile_values", return_value=[str(managed_root)]
+        ), patch.object(
+            workers, "_executable", return_value=self.binary.resolve()
+        ), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            active = workers.browser_start(
+                str(self.binary),
+                port=9252,
+                operator_profile="provider-operator",
+                runtime_seconds=60,
+            )["worker"]
+            self.assertEqual(Path(active["profile_path"]).parent, managed_root)
+            with self.assertRaisesRegex(
+                PermissionError,
+                "raw persistent_profile may not overlap.*use operator_profile",
+            ):
+                workers.browser_start(
+                    str(self.binary),
+                    port=9253,
+                    persistent_profile=str(managed_root),
+                    runtime_seconds=60,
+                )
+        self.assertIsNone(workers.resources.inspect_resource("port:9253"))
+        self.assertIsNone(
+            workers.resources.inspect_resource(f"browser-profile:{managed_root}")
+        )
+
     def test_named_operator_profile_rejects_unconfigured_managed_root(self) -> None:
         managed_root = self.root / "managed-browser-profiles"
         another_root = self.root / "another-root"

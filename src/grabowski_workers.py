@@ -292,12 +292,36 @@ def _operator_browser_profile_path(name: str) -> Path:
     return root / name
 
 
-def _browser_profile(worker_id: str, persistent_profile: str | None) -> tuple[Path, bool]:
+def _browser_profile_overlaps_managed_root(candidate: Path) -> bool:
+    managed_root = _normalized_browser_profile_candidate(
+        base.OPERATOR_BROWSER_PROFILE_ROOT
+    )
+    return (
+        candidate == managed_root
+        or managed_root in candidate.parents
+        or candidate in managed_root.parents
+    )
+
+
+def _browser_profile(
+    worker_id: str,
+    persistent_profile: str | None,
+    *,
+    allow_managed_operator_profile: bool = False,
+) -> tuple[Path, bool]:
     if persistent_profile is None:
         profile = WORKER_STATE / "profiles" / worker_id
         profile.mkdir(parents=True, exist_ok=False, mode=0o700)
         return profile, True
     candidate = _normalized_browser_profile_candidate(persistent_profile)
+    if (
+        not allow_managed_operator_profile
+        and _browser_profile_overlaps_managed_root(candidate)
+    ):
+        raise PermissionError(
+            "raw persistent_profile may not overlap the managed operator browser "
+            "profile root; use operator_profile"
+        )
     _reject_browser_profile_symlink_components(candidate, allow_missing_leaf=True)
     if candidate.exists():
         if not candidate.is_dir():
@@ -5900,9 +5924,14 @@ def _browser_start_cdp_worker(
     extra: list[str],
     persistent_profile: str | None,
     runtime: int,
+    managed_operator_profile: bool = False,
 ) -> dict[str, Any]:
     worker_id = uuid.uuid4().hex[:20]
-    profile, ephemeral = _browser_profile(worker_id, persistent_profile)
+    profile, ephemeral = _browser_profile(
+        worker_id,
+        persistent_profile,
+        allow_managed_operator_profile=managed_operator_profile,
+    )
     argv = _browser_adapter_launch_argv(
         adapter,
         executable=binary,
@@ -6040,6 +6069,7 @@ def browser_start(
         raise ValueError(
             "persistent_profile and operator_profile are mutually exclusive"
         )
+    managed_operator_profile = operator_profile is not None
     if operator_profile is not None:
         persistent_profile = str(_operator_browser_profile_path(operator_profile))
     if runtime_seconds is None:
@@ -6065,6 +6095,7 @@ def browser_start(
             port=port,
             extra=extra,
             persistent_profile=persistent_profile,
+            managed_operator_profile=managed_operator_profile,
             runtime=runtime,
         )
 
