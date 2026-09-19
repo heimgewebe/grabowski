@@ -659,6 +659,7 @@ GRIP_SPECS: dict[str, GripSpec] = {
             "secret-output-redacted",
             "temporary-authority-cleaned",
             "host-lease-released",
+            "retry-locked",
         ),
         runner="secret_pty_getpass_probe",
         operation_effect_class="privileged_execution",
@@ -4241,9 +4242,10 @@ def _run_secret_pty_getpass_probe(
         and broker.get("outcome") == "COMPLETED"
         and broker.get("returncode") == 0
         and broker.get("timed_out") is False
+        and broker.get("retry_safe") is False
         and broker.get("readback_required") is False
         and broker.get("prompt_count") == broker.get("expected_prompt_count") == 2
-        and broker.get("failure_reason") is None
+        and broker.get("failure_reason_present") is False
         and output.get("broker_client_returncode") == 0
         and output.get("broker_client_timed_out") is False
     )
@@ -4251,6 +4253,11 @@ def _run_secret_pty_getpass_probe(
     redacted = output.get("secret_output_redacted") is True
     temporary_clean = output.get("temporary_authority_cleaned") is True
     lease_released = output.get("host_lease_released") is True
+    retry_locked = (
+        output.get("retry_safe") is False
+        and isinstance(broker, dict)
+        and broker.get("retry_safe") is False
+    )
     contract_sha = output.get("action_contract_sha256")
 
     _check(receipt, "broker-contract-bound",
@@ -4271,14 +4278,26 @@ def _run_secret_pty_getpass_probe(
     _check(receipt, "host-lease-released",
            "pass" if lease_released else "fail",
            str(output.get("lease_owner_id") or "missing"))
-    if not all((broker_ok, lease_bound, redacted, temporary_clean, lease_released)):
+    _check(receipt, "retry-locked",
+           "pass" if retry_locked else "fail",
+           "retry_safe=false" if retry_locked else "retry contract violated")
+    if not all((
+        broker_ok,
+        lease_bound,
+        redacted,
+        temporary_clean,
+        lease_released,
+        retry_locked,
+    )):
         return {
             "receipt_status": "failed",
             "error": "secret PTY probe violated its fail-closed completion or cleanup contract",
-            **output,
+            "retry_safe": False,
+            "secret_output_redacted": redacted,
+            "temporary_authority_cleaned": temporary_clean,
+            "host_lease_released": lease_released,
         }
     return output
-
 
 def _run_transport_roundtrip(
     spec: GripSpec,

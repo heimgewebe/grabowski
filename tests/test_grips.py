@@ -10243,7 +10243,7 @@ class SecretPtyGripTests(unittest.TestCase):
                 "readback_required": False,
                 "prompt_count": 2,
                 "expected_prompt_count": 2,
-                "failure_reason": None,
+                "failure_reason_present": False,
             },
         }
 
@@ -10290,6 +10290,7 @@ class SecretPtyGripTests(unittest.TestCase):
             "secret-output-redacted",
             "temporary-authority-cleaned",
             "host-lease-released",
+            "retry-locked",
         ):
             self.assertEqual("pass", checks[check_id])
 
@@ -10300,7 +10301,7 @@ class SecretPtyGripTests(unittest.TestCase):
             "outcome": "UNCLEAR",
             "returncode": 1,
             "readback_required": True,
-            "failure_reason": "prompt-repeated",
+            "failure_reason_present": True,
         }
         result = grips.run_grip(
             "secret-pty-getpass-probe",
@@ -10313,7 +10314,7 @@ class SecretPtyGripTests(unittest.TestCase):
         )
         self.assertEqual("failed", result["status"])
         self.assertFalse(result["output"]["retry_safe"])
-        self.assertTrue(result["output"]["broker"]["readback_required"])
+        self.assertNotIn("broker", result["output"])
 
     def test_secret_pty_grip_fails_closed_on_broker_client_failure(self) -> None:
         output = self._success_output()
@@ -10333,6 +10334,27 @@ class SecretPtyGripTests(unittest.TestCase):
             result["output"]["error"],
         )
         self.assertFalse(result["output"]["retry_safe"])
+
+    def test_secret_pty_grip_fails_closed_when_retry_is_not_locked(self) -> None:
+        output = self._success_output()
+        output["retry_safe"] = True
+        result = grips.run_grip(
+            "secret-pty-getpass-probe",
+            {
+                "source_path": "/private/value",
+                "expected_source_sha256": "a" * 64,
+            },
+            allow_mutation=True,
+            secret_pty_dispatcher=lambda _request: output,
+        )
+        self.assertEqual("failed", result["status"])
+        checks = {
+            item["id"]: item["status"]
+            for item in result["receipt"]["checks"]
+        }
+        self.assertEqual("fail", checks["retry-locked"])
+        self.assertFalse(result["output"]["retry_safe"])
+        self.assertNotIn("broker", result["output"])
 
     def test_secret_pty_grip_rejects_caller_authority_fields(self) -> None:
         result = grips.run_grip(
