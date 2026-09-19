@@ -16330,6 +16330,74 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             execution["merge_lease_guard"]["errors"],
         )
 
+    def test_atomic_merge_guard_reads_trusted_blocker_from_second_review_page(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        review_evidence = parameters["review_evidence"]
+        assert isinstance(review_evidence, dict)
+        review_evidence["external_review_required"] = False
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        codex_review = {
+            "id": 202,
+            "state": "COMMENTED",
+            "body": "reviewed",
+            "submitted_at": "2026-07-26T08:01:00Z",
+            "html_url": "https://github.com/heimgewebe/grabowski/pull/96#pullrequestreview-202",
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "commit_id": CAPTAIN_HEAD,
+        }
+        stale_blocker = {
+            "id": 404,
+            "state": "CHANGES_REQUESTED",
+            "body": "structured blocker on older history page",
+            "submitted_at": "2026-07-26T07:59:00Z",
+            "html_url": "https://github.com/heimgewebe/grabowski/pull/96#pullrequestreview-404",
+            "user": {"login": "claude-code[bot]"},
+            "commit_id": "c" * 40,
+        }
+        state = captain_codex_live_state(
+            view,
+            review_pages=[[codex_review], [stale_blocker]],
+            threads=[],
+        )
+        gh = FakeGh(view=view, diff_text=CAPTAIN_DIFF_TEXT, codex_state=state)
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        execution = result["output"]["executions"][0]
+        self.assertFalse(execution["verification_passed"])
+        guard_errors = execution["merge_lease_guard"]["errors"]
+        self.assertIn(
+            "merge_guard_review_findings_changes_requested_present",
+            guard_errors,
+        )
+        self.assertNotIn(
+            "merge_guard_review_findings_reviews_truncated",
+            guard_errors,
+        )
+        self.assertNotIn(
+            "merge_guard_codex_finding_reviews_truncated",
+            guard_errors,
+        )
+
+
     def test_atomic_merge_guard_allows_superseded_trusted_changes_requested(self) -> None:
         parameters = authorized_captain_run_parameters()
         review_evidence = parameters["review_evidence"]

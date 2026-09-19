@@ -1563,6 +1563,72 @@ class CodexReviewSettlementTests(unittest.TestCase):
         self.assertFalse(result["review_performed"])
         self.assertFalse(result["settled"])
 
+    def test_collect_reviews_paginates_older_windows(self) -> None:
+        initial = connection(
+            [{"databaseId": 200}],
+            hasPreviousPage=True,
+            startCursor="review-cursor-new",
+        )
+        payload = {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviews": connection(
+                            [{"databaseId": 100}],
+                            hasPreviousPage=False,
+                            startCursor="review-cursor-old",
+                        )
+                    }
+                }
+            }
+        }
+        with mock.patch.object(
+            settlement, "_run_json", return_value=payload
+        ) as run_json:
+            result = settlement._collect_reviews(
+                ROOT, "heimgewebe", "grabowski", PR, initial
+            )
+        self.assertEqual(
+            [item["databaseId"] for item in result["nodes"]], [100, 200]
+        )
+        self.assertEqual(
+            result["pageInfo"], {"hasPreviousPage": False, "pages_loaded": 2}
+        )
+        self.assertIn("before=review-cursor-new", run_json.call_args.args[1])
+
+    def test_collect_reviews_fails_closed_at_page_bound(self) -> None:
+        initial = connection(
+            [{"databaseId": 300}],
+            hasPreviousPage=True,
+            startCursor="review-cursor-3",
+        )
+        payload = {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviews": connection(
+                            [{"databaseId": 200}],
+                            hasPreviousPage=True,
+                            startCursor="review-cursor-2",
+                        )
+                    }
+                }
+            }
+        }
+        with mock.patch.object(
+            settlement, "MAX_REVIEW_PAGES", 2
+        ), mock.patch.object(
+            settlement, "MAX_REVIEW_ITEMS", 200
+        ), mock.patch.object(
+            settlement, "_run_json", return_value=payload
+        ):
+            with self.assertRaisesRegex(
+                settlement.SettlementError, "bounded 200-item history"
+            ):
+                settlement._collect_reviews(
+                    ROOT, "heimgewebe", "grabowski", PR, initial
+                )
+
     def test_collect_comments_paginates_older_windows(self) -> None:
         initial = connection([{"databaseId": 200}], hasPreviousPage=True, startCursor="cursor-new")
         payload = {"data": {"repository": {"pullRequest": {"comments": connection([{"databaseId": 100}], hasPreviousPage=False, startCursor="cursor-old")}}}}
