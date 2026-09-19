@@ -251,8 +251,25 @@ def runner_for(evidence: dict, live: dict) -> merge_guard.CaptainMergeGuardRunne
         errors.append(f"unexpected_page_label:{label}")
         return None
 
+    def bounded_pages(
+        self,
+        args,
+        *,
+        label,
+        observations,
+        errors,
+        max_pages=1,
+        max_items=100,
+    ):
+        observations.append({"label": label, "command": ["gh", *args]})
+        if label in {"reviews", "finding_reviews"}:
+            return deepcopy(live["reviews"])
+        errors.append(f"unexpected_bounded_page_label:{label}")
+        return None
+
     runner._codex_api_json = MethodType(api_json, runner)
     runner._codex_single_page = MethodType(single_page, runner)
+    runner._codex_bounded_pages = MethodType(bounded_pages, runner)
     return runner
 
 
