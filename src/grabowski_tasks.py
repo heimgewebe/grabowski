@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
@@ -100,6 +101,11 @@ TASK_OUTPUT_DIRECTORY_PREFIX = ".grabowski-task-output"
 TASK_OUTPUT_MAX_BYTES = 8 * 1024 * 1024
 TASK_OUTPUT_TAIL_BYTES = 64 * 1024
 TASK_OUTPUT_CAPTURE_PYTHON = "/usr/bin/python3"
+TASK_OUTPUT_CAPTURE_SCRIPT_ROOT = Path(operator.STATE_DIR) / "task-capture"
+# systemd writes every transient unit back to disk and resolves specifiers when it
+# re-reads that file. A single ExecStart argument of this many bytes or more fails
+# to resolve, so the unit loads as bad-setting after the next daemon-reload.
+TASK_OUTPUT_CAPTURE_ARGUMENT_MAX_BYTES = 4096
 TASK_LOG_RATE_LIMIT_INTERVAL_SECONDS = 30
 TASK_LOG_RATE_LIMIT_BURST = 200
 TASK_OUTPUT_CAPTURE_CODE = r"""
@@ -289,6 +295,61 @@ if returncode < 0:
 if returncode == 1 and command and os.path.basename(command[0]) == "rg":
     returncode = 0
 raise SystemExit(returncode)
+""".strip()
+TASK_OUTPUT_CAPTURE_STAGE_CODE = r"""
+import base64
+import os
+import stat
+import sys
+import tempfile
+
+path = sys.argv[1]
+payload = base64.b64decode(sys.argv[2].encode("ascii"))
+directory = os.path.dirname(path)
+if not os.path.isabs(path) or os.path.normpath(path) != path or not directory:
+    raise SystemExit(125)
+os.makedirs(directory, 0o700, exist_ok=True)
+directory_metadata = os.lstat(directory)
+if not stat.S_ISDIR(directory_metadata.st_mode):
+    raise SystemExit(126)
+if directory_metadata.st_uid != os.geteuid():
+    raise SystemExit(126)
+if stat.S_IMODE(directory_metadata.st_mode) != 0o700:
+    os.chmod(directory, 0o700)
+try:
+    metadata = os.lstat(path)
+except FileNotFoundError:
+    metadata = None
+if metadata is not None:
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
+        raise SystemExit(126)
+    if stat.S_IMODE(metadata.st_mode) != 0o600:
+        os.chmod(path, 0o600)
+    with open(path, "rb") as handle:
+        if handle.read() == payload:
+            sys.stdout.write("present")
+            raise SystemExit(0)
+descriptor, temporary = tempfile.mkstemp(dir=directory, prefix=".capture-", suffix=".tmp")
+try:
+    try:
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("capture script write made no progress")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.replace(temporary, path)
+except BaseException:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
+sys.stdout.write("written")
 """.strip()
 TASK_OUTPUT_REMOTE_READ_CODE = r"""
 import os
@@ -5358,13 +5419,122 @@ def _bind_task_output_managed_from_attempt(
     return _row_raw(identifier)
 
 
+def _task_output_capture_script_path() -> Path:
+    """Return the wrapper path without touching the filesystem."""
+    digest = hashlib.sha256(TASK_OUTPUT_CAPTURE_CODE.encode("utf-8")).hexdigest()
+    return TASK_OUTPUT_CAPTURE_SCRIPT_ROOT / f"capture-{digest}.py"
+
+
+def _task_output_capture_script() -> Path:
+    """Materialize the output capture wrapper on this host and return its path.
+
+    The wrapper must not be handed to the interpreter with ``-c``. systemd
+    serializes every transient unit back to disk, and a single ExecStart
+    argument of ``TASK_OUTPUT_CAPTURE_ARGUMENT_MAX_BYTES`` bytes or more cannot
+    be re-read from that file. The unit then loads as ``bad-setting`` after the
+    next daemon-reload, so its status can no longer be read back and its
+    remains can no longer be cleaned up. The file name carries the payload
+    digest, so a changed wrapper writes a new file instead of mutating a path
+    that a running task may still be executing.
+    """
+    payload = TASK_OUTPUT_CAPTURE_CODE.encode("utf-8")
+    path = _task_output_capture_script_path()
+    root = path.parent
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    root_metadata = root.lstat()
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        raise RuntimeError("task output capture script root is not a directory")
+    if root_metadata.st_uid != os.geteuid():
+        raise PermissionError("task output capture script root has a foreign owner")
+    if stat.S_IMODE(root_metadata.st_mode) != 0o700:
+        os.chmod(root, 0o700)
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if not stat.S_ISREG(metadata.st_mode):
+            raise PermissionError("task output capture script is not a regular file")
+        if metadata.st_uid != os.geteuid():
+            raise PermissionError("task output capture script has a foreign owner")
+        if stat.S_IMODE(metadata.st_mode) != 0o600:
+            os.chmod(path, 0o600)
+        if path.read_bytes() == payload:
+            return path
+    descriptor, temporary = tempfile.mkstemp(
+        dir=root, prefix=".capture-", suffix=".tmp"
+    )
+    try:
+        try:
+            os.fchmod(descriptor, 0o600)
+            remaining = payload
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise OSError("task output capture script write made no progress")
+                remaining = remaining[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+    return path
+
+
+def _stage_task_output_capture_script(host: str, *, transport: str) -> dict[str, Any]:
+    """Make sure the wrapper exists on the host that will run the task.
+
+    A local target is written directly. Any other transport executes the task
+    unit on a different machine, where the controller's copy of the wrapper
+    does not exist, so the payload is staged there through a short bootstrap
+    before the unit is launched. The bootstrap is an ordinary command rather
+    than a unit, so its own argument size is unconstrained.
+
+    Staging uses the narrow digest-bound fleet route rather than the generic
+    one, so a host whose command allowlist omits an interpreter can still
+    launch tasks.
+    """
+    path = _task_output_capture_script_path()
+    if transport == "local":
+        _task_output_capture_script()
+        return {"host": host, "transport": transport, "path": str(path), "status": "local"}
+    payload = base64.b64encode(TASK_OUTPUT_CAPTURE_CODE.encode("utf-8")).decode("ascii")
+    staged = fleet.run_fleet_task_capture_stage(
+        host,
+        [
+            TASK_OUTPUT_CAPTURE_PYTHON,
+            "-c",
+            TASK_OUTPUT_CAPTURE_STAGE_CODE,
+            str(path),
+            payload,
+        ],
+        timeout_seconds=60,
+        max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
+    )
+    result = staged["result"]
+    if result.get("returncode") != 0:
+        raise RuntimeError(
+            "task output capture script could not be staged on the task host"
+        )
+    return {
+        "host": host,
+        "transport": transport,
+        "path": str(path),
+        "status": str(result.get("stdout", "")).strip() or "staged",
+    }
+
+
 def _task_output_capture_argv(record: dict[str, Any]) -> list[str]:
     command = json.loads(record["argv_json"])
     paths = _task_output_paths(record)
     return [
         TASK_OUTPUT_CAPTURE_PYTHON,
-        "-c",
-        TASK_OUTPUT_CAPTURE_CODE,
+        str(_task_output_capture_script_path()),
         str(paths["directory"]),
         str(TASK_OUTPUT_MAX_BYTES),
         str(TASK_OUTPUT_TAIL_BYTES),
@@ -6006,6 +6176,26 @@ def _launch(record: dict[str, Any]) -> dict[str, Any]:
                 "privileged_broker": None,
             }
     target = fleet.fleet_host(record["host"])
+    try:
+        _stage_task_output_capture_script(
+            record["host"], transport=target["transport"]
+        )
+    except (OSError, PermissionError, RuntimeError, ValueError) as exc:
+        # The row is already committed as launching and its leases are held.
+        # Raising here would strand it, so report the same undispatched shape
+        # the root launch path uses and let the caller release the attempt.
+        return {
+            "returncode": 1,
+            "stdout": "",
+            "stderr": _redact_reason(f"{type(exc).__name__}: {exc}"),
+            "timed_out": False,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "root_truth_observable": False,
+            "outcome_unknown": False,
+            "launch_not_dispatched": True,
+            "privileged_broker": None,
+        }
     return _dispatch(
         record["host"],
         _launch_argv(

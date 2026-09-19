@@ -684,6 +684,122 @@ class ProfileTopologyTests(unittest.TestCase):
             self.topology(payload)
 
 
+class TunnelIdentityTests(unittest.TestCase):
+    def _client(self, home: Path, name: str) -> Path:
+        path = home / ".local/bin" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_bytes(b"tunnel-client-fixture")
+            path.chmod(0o755)
+        return path
+
+    def _verify(
+        self,
+        home: Path,
+        *,
+        process_name: str,
+        process_args: list[str] | None = None,
+        unit_args: list[str] | None = None,
+    ) -> dict:
+        stable = self._client(home, "tunnel-client")
+        process_path = self._client(home, process_name)
+        observed = process_args or [
+            str(process_path),
+            "run",
+            "--profile",
+            core.PROFILE_NAME,
+        ]
+        unit = unit_args or [
+            str(stable),
+            "run",
+            "--profile",
+            core.PROFILE_NAME,
+        ]
+        with (
+            mock.patch.object(core, "HOME", home),
+            mock.patch.object(dual, "tunnel_unit_argv", return_value=unit),
+            mock.patch.object(dual, "_service_main_pid", return_value=456),
+            mock.patch.object(core, "process_argv", return_value=observed),
+            mock.patch.object(core, "process_exe", return_value=process_path),
+        ):
+            return dual.verify_tunnel_process()
+
+    def test_tunnel_process_accepts_exact_stable_launcher(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            result = self._verify(home, process_name="tunnel-client")
+        self.assertEqual(result["pid"], 456)
+
+    def test_tunnel_process_accepts_safe_versioned_reexec_from_stable_unit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            result = self._verify(home, process_name="tunnel-client-v0.0.14")
+        self.assertEqual(Path(result["exe"]).name, "tunnel-client-v0.0.14")
+
+    def test_tunnel_process_rejects_arbitrary_reexec_name(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            with self.assertRaises(core.DeployError):
+                self._verify(home, process_name="tunnel-client-malicious")
+
+    def test_tunnel_process_rejects_versioned_reexec_with_wrong_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            process = self._client(home, "tunnel-client-v0.0.14")
+            with self.assertRaises(core.DeployError):
+                self._verify(
+                    home,
+                    process_name=process.name,
+                    process_args=[
+                        str(process),
+                        "run",
+                        "--profile",
+                        "other-profile",
+                    ],
+                )
+
+    def test_tunnel_process_accepts_safe_versioned_systemd_execstart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            versioned = self._client(home, "tunnel-client-v0.0.14")
+            result = self._verify(
+                home,
+                process_name=versioned.name,
+                unit_args=[
+                    str(versioned),
+                    "run",
+                    "--profile",
+                    core.PROFILE_NAME,
+                ],
+            )
+        self.assertEqual(Path(result["exe"]).name, versioned.name)
+
+    def test_tunnel_process_rejects_drift_from_versioned_systemd_execstart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            unit_version = self._client(home, "tunnel-client-v0.0.14")
+            process_version = self._client(home, "tunnel-client-v0.0.15")
+            with self.assertRaises(core.DeployError):
+                self._verify(
+                    home,
+                    process_name=process_version.name,
+                    unit_args=[
+                        str(unit_version),
+                        "run",
+                        "--profile",
+                        core.PROFILE_NAME,
+                    ],
+                )
+
+    def test_tunnel_process_rejects_group_writable_versioned_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            versioned = self._client(home, "tunnel-client-v0.0.14")
+            versioned.chmod(0o775)
+            with self.assertRaises(core.DeployError):
+                self._verify(home, process_name=versioned.name)
+
+
 class OperatorIdentityTests(unittest.TestCase):
     def test_expected_operator_argv_is_exact(self) -> None:
         self.assertEqual(
