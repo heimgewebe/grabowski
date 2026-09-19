@@ -1065,6 +1065,114 @@ class OperatorSignedTransportTests(unittest.TestCase):
             )
         )
 
+    def test_captain_preflight_exact_read_only_shape_is_transport_exempt(self) -> None:
+        arguments = {
+            "name": "captain-preflight",
+            "profile": "captain",
+            "parameters": {"actions": []},
+            "allow_mutation": False,
+        }
+        self.assertTrue(
+            operator._transport_roundtrip_exempt_call("grip_run", arguments)
+        )
+        without_explicit_default = dict(arguments)
+        without_explicit_default.pop("allow_mutation")
+        self.assertTrue(
+            operator._transport_roundtrip_exempt_call(
+                "grip_run", without_explicit_default
+            )
+        )
+
+        tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=False))
+        with mock.patch.object(
+            base,
+            "_transport_signed_one_call_evidence",
+            side_effect=AssertionError(
+                "read-only Captain preflight must not consume signed replay state"
+            ),
+        ):
+            self.assertIsNone(
+                operator._require_transport_roundtrip_for_tool(
+                    tool_name="grip_run",
+                    arguments=arguments,
+                    context=None,
+                    tool=tool,
+                )
+            )
+            self.assertIsNone(
+                operator._require_transport_roundtrip_for_tool(
+                    tool_name="grip_run",
+                    arguments=arguments,
+                    context=None,
+                    tool=tool,
+                )
+            )
+
+    def test_captain_preflight_transport_exemption_fails_closed_on_shape_or_spec_drift(
+        self,
+    ) -> None:
+        base_arguments = {
+            "name": "captain-preflight",
+            "profile": "captain",
+            "parameters": {"actions": []},
+            "allow_mutation": False,
+        }
+        unsafe = [
+            {**base_arguments, "profile": "operator"},
+            {**base_arguments, "allow_mutation": True},
+            {**base_arguments, "name": "captain-run"},
+            {
+                "name": "repo-orient",
+                "profile": "operator",
+                "parameters": {"repo": "/tmp/repo"},
+                "allow_mutation": False,
+            },
+            {
+                "name": "captain-preflight",
+                "parameters": {"actions": []},
+                "allow_mutation": False,
+            },
+        ]
+        for arguments in unsafe:
+            with self.subTest(arguments=arguments):
+                self.assertFalse(
+                    operator._transport_roundtrip_exempt_call(
+                        "grip_run", arguments
+                    )
+                )
+
+        spec = operator.grabowski_grips.GRIP_SPECS["captain-preflight"]
+        drifts = [
+            SimpleNamespace(
+                effect=operator.grabowski_grips.MUTATING,
+                runner=spec.runner,
+                uses_github=spec.uses_github,
+            ),
+            SimpleNamespace(
+                effect=spec.effect,
+                runner="captain_run",
+                uses_github=spec.uses_github,
+            ),
+            SimpleNamespace(
+                effect=spec.effect,
+                runner=spec.runner,
+                uses_github=True,
+            ),
+        ]
+        for drift in drifts:
+            with (
+                self.subTest(drift=drift),
+                mock.patch.dict(
+                    operator.grabowski_grips.GRIP_SPECS,
+                    {"captain-preflight": drift},
+                ),
+            ):
+                self.assertFalse(
+                    operator._transport_roundtrip_exempt_call(
+                        "grip_run", base_arguments
+                    )
+                )
+
     def test_trusted_github_cli_pin_rejects_unsafe_metadata(self) -> None:
         trusted_file = SimpleNamespace(
             st_mode=operator.stat.S_IFREG | 0o755, st_uid=0
