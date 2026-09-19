@@ -637,6 +637,86 @@ def _read_chatgpt_auth_file(home: Path) -> bytes:
     return data
 
 
+def _read_bound_regular_file_at(
+    directory_fd: int,
+    name: str,
+    *,
+    label: str,
+    max_bytes: int,
+) -> bytes:
+    if (
+        not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\x00" in name
+    ):
+        raise RunnerError(f"{label} relative name is invalid")
+    try:
+        linked = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise RunnerError(f"{label} is unavailable") from exc
+    if stat.S_ISLNK(linked.st_mode) or not stat.S_ISREG(linked.st_mode):
+        raise RunnerError(f"{label} must be a regular non-symlink file")
+    if linked.st_size < 0 or linked.st_size > max_bytes:
+        raise RunnerError(f"{label} size is invalid")
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(name, flags, dir_fd=directory_fd)
+    except OSError as exc:
+        raise RunnerError(f"{label} could not be opened safely") from exc
+    try:
+        opened = os.fstat(descriptor)
+        data = bytearray()
+        while len(data) <= max_bytes:
+            chunk = os.read(
+                descriptor,
+                min(1024 * 1024, max_bytes + 1 - len(data)),
+            )
+            if not chunk:
+                break
+            data.extend(chunk)
+        final_descriptor = os.fstat(descriptor)
+        try:
+            final = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise RunnerError(f"{label} disappeared during validation") from exc
+        initial_identity = (
+            linked.st_dev,
+            linked.st_ino,
+            linked.st_size,
+            linked.st_mode,
+        )
+        opened_identity = (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_mode,
+        )
+        final_descriptor_identity = (
+            final_descriptor.st_dev,
+            final_descriptor.st_ino,
+            final_descriptor.st_size,
+            final_descriptor.st_mode,
+        )
+        final_identity = (
+            final.st_dev,
+            final.st_ino,
+            final.st_size,
+            final.st_mode,
+        )
+        if (
+            initial_identity != opened_identity
+            or opened_identity != final_descriptor_identity
+            or opened_identity != final_identity
+        ):
+            raise RunnerError(f"{label} changed during validation")
+        if len(data) != opened.st_size or len(data) > max_bytes:
+            raise RunnerError(f"{label} changed or exceeds its bound")
+        return bytes(data)
+    finally:
+        os.close(descriptor)
+
+
 def _read_bound_regular_file(path: Path, *, label: str, max_bytes: int) -> bytes:
     if not path.is_absolute():
         raise RunnerError(f"{label} path must be absolute")
@@ -2080,8 +2160,9 @@ def _record_preflight_dispatch_intent(
             raise RunnerError("preflight dispatch intent lock is unsafe")
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         _directory_fd_matches(pair_path, pair_fd)
-        current_raw = _read_bound_regular_file(
-            pair_root / "authorization.json",
+        current_raw = _read_bound_regular_file_at(
+            pair_fd,
+            "authorization.json",
             label="preflight dispatch authorization",
             max_bytes=MAX_DISPATCH_AUTHORIZATION_BYTES,
         )
@@ -3709,27 +3790,29 @@ def run_bounded(
         # normal bounded-capture path. Once Popen returned, no catchable failure
         # may leave the provider process or adopted descendants alive.
         emergency_errors = [f"capture_unhandled:{type(exc).__name__}"]
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except BaseException as cleanup_exc:
-            emergency_errors.append(
-                f"emergency_process_group_kill_failed:{type(cleanup_exc).__name__}"
-            )
+        process_started = process is not None
+        if process_started:
             try:
-                if process.poll() is None:
-                    process.kill()
-            except BaseException as kill_exc:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except BaseException as cleanup_exc:
                 emergency_errors.append(
-                    f"emergency_process_kill_failed:{type(kill_exc).__name__}"
+                    f"emergency_process_group_kill_failed:{type(cleanup_exc).__name__}"
                 )
-        try:
-            process.wait(timeout=5)
-        except BaseException as cleanup_exc:
-            emergency_errors.append(
-                f"emergency_process_reap_failed:{type(cleanup_exc).__name__}"
-            )
+                try:
+                    if process.poll() is None:
+                        process.kill()
+                except BaseException as kill_exc:
+                    emergency_errors.append(
+                        f"emergency_process_kill_failed:{type(kill_exc).__name__}"
+                    )
+            try:
+                process.wait(timeout=5)
+            except BaseException as cleanup_exc:
+                emergency_errors.append(
+                    f"emergency_process_reap_failed:{type(cleanup_exc).__name__}"
+                )
         try:
             adopted = _direct_child_pids() - baseline_children
         except BaseException as cleanup_exc:
@@ -3755,16 +3838,17 @@ def run_bounded(
                 emergency_errors.append(
                     f"emergency_child_reap_failed:{type(cleanup_exc).__name__}"
                 )
-        for stream in (process.stdin, process.stdout, process.stderr):
-            if stream is None or stream.closed:
-                continue
-            try:
-                stream.close()
-            except BaseException as cleanup_exc:
-                emergency_errors.append(
-                    f"emergency_stream_cleanup_failed:{type(cleanup_exc).__name__}"
-                )
-        if not isinstance(exc, Exception):
+        if process_started:
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is None or stream.closed:
+                    continue
+                try:
+                    stream.close()
+                except BaseException as cleanup_exc:
+                    emergency_errors.append(
+                        f"emergency_stream_cleanup_failed:{type(cleanup_exc).__name__}"
+                    )
+        if not process_started or not isinstance(exc, Exception):
             raise
 
         existing_buffers = locals().get("buffers")

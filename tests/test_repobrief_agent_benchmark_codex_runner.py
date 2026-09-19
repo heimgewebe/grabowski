@@ -1276,6 +1276,24 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertIn("process", observed)
         self.assertIsNotNone(observed["process"].poll())
 
+    def test_run_bounded_popen_failure_preserves_original_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch.object(
+                runner.subprocess,
+                "Popen",
+                side_effect=OSError("simulated spawn failure"),
+            ):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "Codex process could not be started"
+                ):
+                    runner.run_bounded(
+                        ["missing-provider"],
+                        cwd=root,
+                        timeout_seconds=30,
+                        stdin_data=b"",
+                    )
+
     def test_direct_child_pids_falls_back_when_task_children_file_is_missing(self) -> None:
         child = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(30)"],
@@ -2928,6 +2946,43 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     treatment, state_root, authorization
                 )
 
+
+    def test_dispatch_intent_reads_authorization_through_bound_pair_fd(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            treatment = request(condition="treatment")
+            manifest = root / "bundle.manifest.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+            treatment["repobrief"]["manifest"] = str(manifest)
+            treatment["repobrief"]["manifest_sha256"] = hashlib.sha256(
+                manifest.read_bytes()
+            ).hexdigest()
+            baseline = request(
+                condition="baseline",
+                commit=treatment["repository"]["commit"],
+            )
+            state_root = write_dispatch_authorization(root, treatment, [])
+            authorization = runner._load_preflight_dispatch_authorization(
+                baseline, state_root
+            )["authorization"]
+            absolute_reader = runner._read_bound_regular_file
+
+            def reject_authorization_absolute_read(path, *, label, max_bytes):
+                if label == "preflight dispatch authorization":
+                    raise AssertionError(
+                        "dispatch intent must use pair_fd-bound authorization read"
+                    )
+                return absolute_reader(path, label=label, max_bytes=max_bytes)
+
+            with patch.object(
+                runner,
+                "_read_bound_regular_file",
+                side_effect=reject_authorization_absolute_read,
+            ):
+                event_sha256 = runner._record_preflight_dispatch_intent(
+                    baseline, state_root, authorization
+                )
+            self.assertEqual(len(event_sha256), 64)
 
     def test_manifest_artifact_contract_rejects_manifest_self_reference(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

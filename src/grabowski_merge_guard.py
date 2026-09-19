@@ -3653,6 +3653,12 @@ class CaptainMergeGuardRunner:
         if any(field.startswith("page=") for field in query_fields):
             errors.append(f"merge_guard_codex_{label}_pages_invalid")
             return None
+        per_page_fields = [
+            field for field in query_fields if field.startswith("per_page=")
+        ]
+        if per_page_fields != ["per_page=100"]:
+            errors.append(f"merge_guard_codex_{label}_pages_invalid")
+            return None
 
         flattened: list[dict[str, Any]] = []
         # Fetch at most the allowed pages plus one bounded sentinel page. The

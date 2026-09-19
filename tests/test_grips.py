@@ -16585,6 +16585,45 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             any("--paginate" in call or "--slurp" in call for call in review_calls)
         )
 
+    def test_codex_bounded_pages_requires_exact_page_size_contract(self) -> None:
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        for endpoint in (
+            "repos/heimgewebe/grabowski/pulls/96/reviews",
+            "repos/heimgewebe/grabowski/pulls/96/reviews?per_page=30",
+            "repos/heimgewebe/grabowski/pulls/96/reviews?per_page=100&per_page=100",
+        ):
+            with self.subTest(endpoint=endpoint):
+                gh = FakeGh(view=view)
+                runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
+                runner.repo_path = Path.cwd()
+                runner.github_runner = gh
+                observations: list[dict[str, object]] = []
+                errors: list[str] = []
+                items = runner._codex_bounded_pages(
+                    ["api", "--paginate", "--slurp", endpoint],
+                    label="reviews",
+                    observations=observations,
+                    errors=errors,
+                    max_pages=10,
+                    max_items=1000,
+                )
+                self.assertIsNone(items)
+                self.assertEqual(
+                    ["merge_guard_codex_reviews_pages_invalid"],
+                    errors,
+                )
+                self.assertEqual([], observations)
+
     def test_atomic_merge_guard_reads_trusted_blocker_from_second_review_page(self) -> None:
         parameters = authorized_captain_run_parameters()
         review_evidence = parameters["review_evidence"]
