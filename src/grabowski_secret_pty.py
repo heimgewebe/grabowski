@@ -405,7 +405,8 @@ def run_secret_transport_request(
         "mode", "argv", "cwd", "timeout_seconds", "prompt_sequence",
         "max_secret_bytes", "max_output_bytes", "kill_switch_path",
         "legacy_kill_switch_path", "allowed_peer_uid", "allowed_peer_unit",
-        "allowed_peer_executable", "authority_task_id", "authority_host",
+        "allowed_peer_executable", "allowed_peer_interpreter",
+        "authority_task_id", "authority_host",
         "action_schema", "privilege_context", "required_resource_keys",
         "redaction_contract_sha256", "prompt_contract_sha256",
     )

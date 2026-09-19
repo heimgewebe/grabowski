@@ -1551,7 +1551,8 @@ def _resolve_secret_pty_action(
         "timeout_seconds", "prompt_sequence", "max_secret_bytes",
         "max_output_bytes", "kill_switch_path", "legacy_kill_switch_path",
         "recovery_gate", "allowed_peer_uid", "allowed_peer_unit",
-        "allowed_peer_executable", "authority_task_id", "authority_host",
+        "allowed_peer_executable", "allowed_peer_interpreter",
+        "authority_task_id", "authority_host",
         "action_schema", "privilege_context", "required_resource_keys",
         "redaction_contract_sha256",
     }
@@ -1624,6 +1625,7 @@ def _resolve_secret_pty_action(
     peer_uid = candidate["allowed_peer_uid"]
     peer_unit = candidate["allowed_peer_unit"]
     peer_executable = candidate["allowed_peer_executable"]
+    peer_interpreter = candidate["allowed_peer_interpreter"]
     authority_task_id = candidate["authority_task_id"]
     authority_host = candidate["authority_host"]
     action_schema = candidate["action_schema"]
@@ -1639,6 +1641,9 @@ def _resolve_secret_pty_action(
         or not isinstance(peer_executable, str)
         or not Path(peer_executable).is_absolute()
         or "\x00" in peer_executable
+        or not isinstance(peer_interpreter, str)
+        or not Path(peer_interpreter).is_absolute()
+        or "\x00" in peer_interpreter
         or not isinstance(authority_task_id, str)
         or re.fullmatch(r"[-A-Za-z0-9_.:]{1,160}", authority_task_id) is None
         or not isinstance(authority_host, str)
@@ -1675,6 +1680,7 @@ def _resolve_secret_pty_action(
         "allowed_peer_uid": peer_uid,
         "allowed_peer_unit": peer_unit,
         "allowed_peer_executable": peer_executable,
+        "allowed_peer_interpreter": peer_interpreter,
         "authority_task_id": authority_task_id,
         "authority_host": authority_host,
         "action_schema": action_schema,
@@ -1723,17 +1729,22 @@ def validate_secret_pty_session_authority(
     leases = session_authority.get("resource_leases")
     if not isinstance(leases, list):
         raise PermissionError("secret PTY session lease binding is unavailable")
-    lease_keys = {
+    lease_key_list = [
         lease.get("resource_key")
         for lease in leases
         if isinstance(lease, dict)
-    }
+    ]
+    lease_keys = set(lease_key_list)
     required_keys = execution.get("required_resource_keys")
     if (
-        not isinstance(required_keys, list)
-        or not set(required_keys).issubset(lease_keys)
+        len(lease_key_list) != len(leases)
+        or len(lease_keys) != len(lease_key_list)
+        or not isinstance(required_keys, list)
+        or set(required_keys) != lease_keys
     ):
-        raise PermissionError("secret PTY required resource lease is missing")
+        raise PermissionError(
+            "secret PTY resource lease set differs from root-owned action contract"
+        )
     return dict(session_authority)
 
 

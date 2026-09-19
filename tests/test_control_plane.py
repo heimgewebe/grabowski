@@ -2512,6 +2512,7 @@ class SecretPtyContractTests(unittest.TestCase):
                     "allowed_peer_uid": os.getuid(),
                     "allowed_peer_unit": "grabowski-operator.service",
                     "allowed_peer_executable": "/usr/local/bin/grabowski-privileged-request",
+                    "allowed_peer_interpreter": sys.executable,
                     "authority_task_id": "GRABOWSKI-OPERATOR-SURFACE-V1-T172",
                     "authority_host": "heim-pc",
                     "action_schema": "grabowski.secret-pty.getpass.v1",
@@ -2833,6 +2834,25 @@ class SecretPtyContractTests(unittest.TestCase):
             privileged_broker.validate_secret_pty_session_authority(
                 mismatched, execution
             )
+        extra = self._session_authority("e" * 64)
+        extra_lease = dict(extra["resource_leases"][0])
+        extra_lease["resource_key"] = "component:unrelated"
+        extra["resource_leases"] = [
+            *extra["resource_leases"],
+            extra_lease,
+        ]
+        extra["resource_lease_bindings_sha256"] = (
+            privileged_broker.canonical_sha256(extra["resource_leases"])
+        )
+        unsigned = dict(extra)
+        unsigned.pop("authority_sha256")
+        extra["authority_sha256"] = privileged_broker.canonical_sha256(unsigned)
+        with self.assertRaisesRegex(
+            PermissionError, "lease set differs"
+        ):
+            privileged_broker.validate_secret_pty_session_authority(
+                extra, execution
+            )
         unsafe = self._secret_pty_config()
         unsafe["actions"]["operator_secret_pty_getpass_probe"]["argv"] = [
             "/bin/sh", "-c", "true"
@@ -2876,6 +2896,47 @@ class SecretPtyContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "max_output_bytes"):
                 privileged_broker.resolve_secret_pty_execution(
                     oversized, reference
+                )
+
+    def test_secret_pty_peer_rejects_foreign_interpreter_wrapper(self) -> None:
+        root_tool = _load_root_broker_tool()
+        # Use a stable root-controlled executable so this regression reaches the
+        # interpreter-identity guard on both local hosts and GitHub runners.
+        expected_client = "/bin/true"
+        fake_control_group = "/system.slice/grabowski-operator.service"
+        execution = {
+            "allowed_peer_uid": os.getuid(),
+            "allowed_peer_unit": "grabowski-operator.service",
+            "allowed_peer_executable": expected_client,
+            "allowed_peer_interpreter": "/bin/true",
+        }
+        with patch.object(
+            root_tool,
+            "_socket_peer_credentials",
+            return_value=(os.getpid(), os.getuid(), os.getgid()),
+        ), patch.object(
+            root_tool,
+            "_unified_cgroup_path",
+            return_value=fake_control_group,
+        ), patch.object(
+            root_tool,
+            "_validate_system_cgroup_authority",
+        ), patch.object(
+            root_tool,
+            "_process_identity",
+            return_value=(4242, 777),
+        ), patch.object(
+            root_tool,
+            "_process_cmdline",
+            return_value=("/tmp/foreign-wrapper", expected_client),
+        ):
+            with self.assertRaisesRegex(PermissionError, "interpreter"):
+                root_tool._validate_secret_pty_peer(
+                    execution,
+                    unit_identity={
+                        "main_pid": 4242,
+                        "control_group": fake_control_group,
+                    },
                 )
 
     def test_peer_bound_secret_reads_only_exact_hash_bound_descriptor(self) -> None:

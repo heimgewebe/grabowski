@@ -809,18 +809,20 @@ def reconcile(
             attempt["classification"] = "binding_drift"
             attempts.append(attempt)
             continue
+        diff_binding_drift = False
         if binding["diff_sha256"] not in accepted_diff_sha256s:
             if defer_diff_identity:
                 attempt["diff_identity_deferred"] = True
             else:
-                errors.append(f"decision_review_diff_sha256_drift:{directory.name}")
-                attempt["classification"] = "binding_drift"
-                attempts.append(attempt)
-                continue
+                diff_binding_drift = True
         if _proven_not_started(metadata):
             attempt["terminal"] = True
             attempt["terminal_status"] = "launch_failed"
-            attempt["classification"] = "infrastructure_error"
+            if diff_binding_drift:
+                errors.append(f"decision_review_diff_sha256_drift:{directory.name}")
+                attempt["classification"] = "binding_drift"
+            else:
+                attempt["classification"] = "infrastructure_error"
             attempts.append(attempt)
             continue
         try:
@@ -848,6 +850,14 @@ def reconcile(
         try:
             role_evidence = _validated_review_role_evidence(metadata, binding, provenance)
         except FileNotFoundError as exc:
+            # A drifted diff binding is repairable only when a valid provenance-
+            # bound role receipt proves that no semantic review result exists.
+            # Missing role evidence cannot establish that narrow condition.
+            if diff_binding_drift:
+                errors.append(f"decision_review_diff_sha256_drift:{directory.name}")
+                attempt["classification"] = "binding_drift"
+                attempts.append(attempt)
+                continue
             # A non-success terminal provenance-bound reviewer whose role
             # receipt was never created has no semantic review result. Treat
             # only the known pre-result termination states like the existing
@@ -888,6 +898,26 @@ def reconcile(
                 attempt["classification"] = "invalid_result"
                 attempts.append(attempt)
                 continue
+        if result is not None:
+            attempt["result_sha256"] = sha256_json(result)
+            attempt["verdict"] = result["verdict"]
+            attempt["material_findings"] = result["material_findings"]
+        if diff_binding_drift:
+            # Never accept a semantic PASS/REJECT for an unproven diff identity.
+            # A terminal failed reviewer with no formal semantic result is
+            # different: it established no review decision at all, so it may be
+            # superseded by a later exact-bound PASS in the same slot.
+            if (
+                result is None
+                and attempt["terminal_status"] in _PRE_RESULT_INFRASTRUCTURE_STATUSES
+            ):
+                attempt["classification"] = "infrastructure_error"
+                attempts.append(attempt)
+                continue
+            errors.append(f"decision_review_diff_sha256_drift:{directory.name}")
+            attempt["classification"] = "binding_drift"
+            attempts.append(attempt)
+            continue
         if result is None:
             # A terminal reviewer that produced no decision marker did not
             # establish a semantic review outcome. Treat that attempt as
@@ -897,9 +927,6 @@ def reconcile(
             attempt["classification"] = "infrastructure_error"
             attempts.append(attempt)
             continue
-        attempt["result_sha256"] = sha256_json(result)
-        attempt["verdict"] = result["verdict"]
-        attempt["material_findings"] = result["material_findings"]
         if result["verdict"] == "REJECT_THIS_REVISION":
             attempt["classification"] = "material_reject"
             errors.append(f"decision_review_material_reject:{binding['slot']}:{directory.name}")
