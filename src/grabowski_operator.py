@@ -2381,6 +2381,17 @@ def _argv_hash(argv: list[str]) -> str:
     return _json_sha256(argv)
 
 
+def _sensitive_argv_key(item: str) -> str | None:
+    # Only named options and assignment-like argv items may declare that the
+    # following/value portion is secret. Positional values and paths still pass
+    # through literal-pattern redaction, but lexical path components such as
+    # "secret-worktree" must not turn the next argv item into a secret.
+    if "=" not in item and not item.startswith("-"):
+        return None
+    key = item.split("=", 1)[0].lstrip("-").replace("-", "_").upper()
+    return key if any(part in key for part in SENSITIVE_ENV_PARTS) else None
+
+
 def _redact_argv(argv: list[str]) -> list[str]:
     redacted: list[str] = []
     hide_next = False
@@ -2390,8 +2401,7 @@ def _redact_argv(argv: list[str]) -> list[str]:
             hide_next = False
             continue
 
-        key = item.split("=", 1)[0].lstrip("-").replace("-", "_").upper()
-        if any(part in key for part in SENSITIVE_ENV_PARTS):
+        if _sensitive_argv_key(item) is not None:
             if "=" in item:
                 redacted.append(f"{item.split('=', 1)[0]}=<REDACTED>")
             else:
@@ -2411,8 +2421,7 @@ def _argv_secret_values(argv: list[str]) -> list[str]:
             hide_next = False
             continue
 
-        key = item.split("=", 1)[0].lstrip("-").replace("-", "_").upper()
-        if not any(part in key for part in SENSITIVE_ENV_PARTS):
+        if _sensitive_argv_key(item) is None:
             continue
         if "=" in item:
             values.append(item.split("=", 1)[1])
