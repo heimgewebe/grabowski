@@ -474,6 +474,81 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
             )
         )
 
+    def test_failed_generic_diff_drift_without_result_can_be_superseded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp)
+            make_job(
+                jobs,
+                suffix="a00000000047",
+                slot="independent-reviewer",
+                terminal_status="failed",
+                review_result=None,
+                diff_sha256=ALIAS_DIFF,
+                created_at_unix=1_787_000_100,
+            )
+            make_job(
+                jobs,
+                suffix="a00000000048",
+                slot="independent-reviewer",
+                terminal_status="succeeded",
+                review_result=None,
+                review_role=True,
+                created_at_unix=1_787_000_200,
+            )
+            reconciled = self.reconcile(jobs)
+        self.assertEqual(reconciled["status"], "settled")
+        self.assertEqual(reconciled["errors"], [])
+        slot = reconciled["slots"][0]
+        self.assertEqual(slot["infrastructure_error_count"], 1)
+        self.assertEqual(slot["independent_pass_count"], 1)
+
+    def test_failed_provenance_bound_diff_drift_without_result_can_be_superseded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp)
+            failed = make_job(
+                jobs,
+                suffix="a00000000045",
+                slot="independent-reviewer",
+                terminal_status="failed",
+                review_result=None,
+                diff_sha256=ALIAS_DIFF,
+                review_role=True,
+                created_at_unix=1_787_000_100,
+            )
+            role_receipt_path = failed / "review-role-receipt.json"
+            role_receipt = json.loads(role_receipt_path.read_text(encoding="utf-8"))
+            role_receipt.update(
+                {
+                    "returncode": 126,
+                    "verdict": "INVALID",
+                    "findings": [],
+                    "failure_classification": "invalid_review_output",
+                }
+            )
+            role_receipt["receipt_sha256"] = reviews._agent_role_receipt_sha256(
+                role_receipt
+            )
+            write_private(role_receipt_path, json.dumps(role_receipt))
+            make_job(
+                jobs,
+                suffix="a00000000046",
+                slot="independent-reviewer",
+                terminal_status="succeeded",
+                review_result=None,
+                review_role=True,
+                created_at_unix=1_787_000_200,
+            )
+            reconciled = self.reconcile(jobs)
+        self.assertEqual(reconciled["status"], "settled")
+        self.assertEqual(reconciled["errors"], [])
+        slot = reconciled["slots"][0]
+        self.assertEqual(slot["infrastructure_error_count"], 1)
+        self.assertEqual(slot["independent_pass_count"], 1)
+        self.assertEqual(
+            {item["classification"] for item in reconciled["attempts"]},
+            {"infrastructure_error", "pass"},
+        )
+
     def test_explicit_equivalent_diff_alias_settles(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             jobs = Path(tmp)
