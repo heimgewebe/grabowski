@@ -65,6 +65,43 @@
       "require_root_owned_destination": true,
       "legacy_kill_switch_path": "/home/alex/.local/state/grabowski/operator-kill-switch"
     },
+    "operator_secret_pty_getpass_probe": {
+      "enabled": true,
+      "mode": "secret-pty",
+      "target_pattern": "probe",
+      "argv": [
+        "/usr/bin/python3",
+        "-c",
+        "import getpass; a=getpass.getpass('LUKS passphrase: '); b=getpass.getpass('Repeat LUKS passphrase: '); raise SystemExit(0 if a and a == b else 3)"
+      ],
+      "cwd": "/",
+      "timeout_seconds": 30,
+      "prompt_sequence": [
+        "LUKS passphrase: ",
+        "Repeat LUKS passphrase: "
+      ],
+      "max_secret_bytes": 4096,
+      "max_output_bytes": 262144,
+      "kill_switch_path": "/var/lib/grabowski/operator-blockade/operator-kill-switch",
+      "legacy_kill_switch_path": "/home/alex/.local/state/grabowski/operator-kill-switch",
+      "recovery_gate": {
+        "recovery_marker_path": "/var/lib/grabowski/power-worker-recovery-gate.json",
+        "max_recovery_age_seconds": 86400,
+        "require_root_owned_gate_files": true,
+        "configured_target": "local-backup-disk:UUID=9b626294-7913-4be0-88fa-96b314e96ee5/restic/heim-pc"
+      },
+      "allowed_peer_unit": "grabowski-operator.service",
+      "allowed_peer_uid": 1000,
+      "allowed_peer_executable": "/usr/local/bin/grabowski-privileged-request",
+      "authority_task_id": "GRABOWSKI-OPERATOR-SURFACE-V1-T172",
+      "authority_host": "heim-pc",
+      "action_schema": "grabowski.secret-pty.getpass.v1",
+      "privilege_context": "root",
+      "required_resource_keys": [
+        "host:heim-pc"
+      ],
+      "redaction_contract_sha256": "59534d36a9b51064f09c6d1509440a36ea92b47e39be3d9ba442c889589852bd"
+    },
     "operator_power_argv": {
       "enabled": true,
       "mode": "argv-json",

@@ -21,6 +21,7 @@ MAX_ARGV_ITEMS = 128
 MAX_ARG_BYTES = 32 * 1024
 MAX_TARGET_BYTES = 48 * 1024
 MAX_GATE_MARKER_BYTES = 64 * 1024
+SECRET_PTY_MAX_OUTPUT_BYTES = 512 * 1024
 MAX_RECOVERY_AGE_SECONDS = 7 * 24 * 3600
 RECOVERY_LOCK_TIMEOUT_SECONDS = 2.0
 RECOVERY_LOCK_POLL_SECONDS = 0.02
@@ -129,6 +130,176 @@ def parse_reference(data: bytes, *, now: int | None = None) -> dict[str, Any]:
     if expires <= created or expires - created > MAX_TTL_SECONDS:
         raise ValueError("privileged reference TTL is invalid")
     return value
+
+
+def _parse_secret_pty_session_authority(
+    value: Any,
+    *,
+    reference: dict[str, Any],
+    now: int,
+) -> dict[str, Any]:
+    required = {
+        "schema_version", "kind", "task_id", "host", "session_id",
+        "action", "action_schema", "privilege_context", "lease_owner_id",
+        "resource_leases", "resource_lease_bindings_sha256",
+        "created_at_unix", "expires_at_unix", "timeout_seconds",
+        "input_max_bytes", "output_max_bytes", "source_sha256",
+        "argv_sha256", "redaction_contract_sha256", "authority_sha256",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise ValueError("secret PTY session authority is invalid")
+    if value["schema_version"] != 1 or value["kind"] != "grabowski_secret_pty_session_authority":
+        raise ValueError("secret PTY session authority version is invalid")
+    unsigned = dict(value)
+    authority_hash = unsigned.pop("authority_sha256")
+    if not isinstance(authority_hash, str) or canonical_sha256(unsigned) != authority_hash:
+        raise ValueError("secret PTY session authority hash is invalid")
+    task_id = value["task_id"]
+    host = value["host"]
+    session_id = value["session_id"]
+    action = value["action"]
+    action_schema = value["action_schema"]
+    privilege_context = value["privilege_context"]
+    lease_owner = value["lease_owner_id"]
+    if (
+        not isinstance(task_id, str)
+        or re.fullmatch(r"[-A-Za-z0-9_.:]{1,160}", task_id) is None
+        or not isinstance(host, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,254}", host) is None
+        or not isinstance(session_id, str)
+        or re.fullmatch(r"[0-9a-f]{32}", session_id) is None
+        or not isinstance(action, str)
+        or action != reference["action"]
+        or not isinstance(action_schema, str)
+        or re.fullmatch(r"[-A-Za-z0-9_.:]{1,96}", action_schema) is None
+        or not isinstance(privilege_context, str)
+        or re.fullmatch(r"[-A-Za-z0-9_.:]{1,96}", privilege_context) is None
+        or lease_owner != f"task:{task_id}"
+    ):
+        raise PermissionError("secret PTY session identity is not authorized")
+    created = value["created_at_unix"]
+    expires = value["expires_at_unix"]
+    timeout = value["timeout_seconds"]
+    input_max = value["input_max_bytes"]
+    output_max = value["output_max_bytes"]
+    if (
+        isinstance(created, bool) or not isinstance(created, int)
+        or isinstance(expires, bool) or not isinstance(expires, int)
+        or created > now + 5 or expires <= now or expires <= created
+        or expires - created > 3600
+        or isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 3600
+        or isinstance(input_max, bool) or not isinstance(input_max, int) or not 1 <= input_max <= 64 * 1024
+        or isinstance(output_max, bool) or not isinstance(output_max, int) or not 1 <= output_max <= 2_000_000
+    ):
+        raise PermissionError("secret PTY session bounds are invalid")
+    leases = value["resource_leases"]
+    if not isinstance(leases, list) or not 1 <= len(leases) <= 32:
+        raise PermissionError("secret PTY resource lease binding is empty or too large")
+    normalized: list[dict[str, Any]] = []
+    for lease in leases:
+        required_lease = {
+            "resource_key", "owner_id", "acquired_at_unix", "updated_at_unix",
+            "expires_at_unix", "metadata_sha256",
+        }
+        if not isinstance(lease, dict) or set(lease) != required_lease:
+            raise PermissionError("secret PTY resource lease binding is invalid")
+        if (
+            not isinstance(lease["resource_key"], str)
+            or not lease["resource_key"]
+            or lease["owner_id"] != lease_owner
+            or isinstance(lease["acquired_at_unix"], bool)
+            or not isinstance(lease["acquired_at_unix"], int)
+            or isinstance(lease["updated_at_unix"], bool)
+            or not isinstance(lease["updated_at_unix"], int)
+            or isinstance(lease["expires_at_unix"], bool)
+            or not isinstance(lease["expires_at_unix"], int)
+            or lease["expires_at_unix"] < expires
+            or not isinstance(lease["metadata_sha256"], str)
+            or SHA256_RE.fullmatch(lease["metadata_sha256"]) is None
+        ):
+            raise PermissionError("secret PTY resource lease binding is invalid")
+        normalized.append(dict(lease))
+    if len({item["resource_key"] for item in normalized}) != len(normalized):
+        raise PermissionError("secret PTY resource lease keys are not unique")
+    if f"host:{host}" not in {item["resource_key"] for item in normalized}:
+        raise PermissionError("secret PTY session is not bound to its host lease")
+    binding_hash = value["resource_lease_bindings_sha256"]
+    if not isinstance(binding_hash, str) or canonical_sha256(normalized) != binding_hash:
+        raise PermissionError("secret PTY resource lease binding hash is invalid")
+    for digest_key in ("source_sha256", "argv_sha256", "redaction_contract_sha256"):
+        digest = value[digest_key]
+        if not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None:
+            raise ValueError(f"secret PTY {digest_key} is invalid")
+    return dict(value)
+
+
+def parse_transport_request(
+    data: bytes,
+    *,
+    now: int | None = None,
+    reference_parser=None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Parse one broker request and preserve legacy reference-only clients.
+
+    Secret material is never serialized into this envelope.  The transport
+    carries only an inherited descriptor number plus the expected SHA-256;
+    the root broker later binds that descriptor to the immediate SO_PEERCRED
+    peer before reading any bytes.
+    """
+    if len(data) > MAX_INPUT_BYTES:
+        raise ValueError("privileged request exceeds input limit")
+    parser = parse_reference if reference_parser is None else reference_parser
+    value = json.loads(data.decode("utf-8"))
+    if not isinstance(value, dict) or value.get("kind") != "grabowski_privileged_transport":
+        return parser(data, now=now), None
+    required = {
+        "schema_version", "kind", "reference", "secret_fd",
+        "secret_sha256", "session_authority", "transport_sha256",
+    }
+    if set(value) != required or value["schema_version"] != 1:
+        raise ValueError("privileged transport envelope is invalid")
+    unsigned = dict(value)
+    transport_hash = unsigned.pop("transport_sha256")
+    if (
+        not isinstance(transport_hash, str)
+        or canonical_sha256(unsigned) != transport_hash
+    ):
+        raise ValueError("privileged transport hash is invalid")
+    nested = value["reference"]
+    if not isinstance(nested, dict):
+        raise ValueError("privileged transport reference is invalid")
+    reference = parser(
+        json.dumps(
+            nested,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8"),
+        now=now,
+    )
+    secret_fd = value["secret_fd"]
+    if (
+        isinstance(secret_fd, bool)
+        or not isinstance(secret_fd, int)
+        or not 3 <= secret_fd <= 1_048_576
+    ):
+        raise ValueError("privileged transport secret_fd is invalid")
+    secret_sha256 = value["secret_sha256"]
+    if not isinstance(secret_sha256, str) or SHA256_RE.fullmatch(secret_sha256) is None:
+        raise ValueError("privileged transport secret_sha256 is invalid")
+    current = int(time.time()) if now is None else now
+    session_authority = _parse_secret_pty_session_authority(
+        value["session_authority"], reference=reference, now=current
+    )
+    if session_authority["source_sha256"] != secret_sha256:
+        raise PermissionError("secret PTY source hash does not match transport binding")
+    return reference, {
+        "kind": "peer-fd-v1",
+        "secret_fd": secret_fd,
+        "secret_sha256": secret_sha256,
+        "session_authority": session_authority,
+        "transport_sha256": transport_hash,
+    }
 
 
 ROOTBROKER_CUTOVER_ACTION = "operator_rootbroker_cutover"
@@ -1353,6 +1524,219 @@ def _resolve_root_task_systemd_action(
     return execution
 
 
+def _validate_secret_pty_prompts(value: Any) -> list[str]:
+    if not isinstance(value, list) or not 1 <= len(value) <= 8:
+        raise ValueError("secret PTY prompt sequence is invalid")
+    prompts: list[str] = []
+    for prompt in value:
+        if (
+            not isinstance(prompt, str)
+            or not prompt
+            or len(prompt.encode("utf-8")) > 512
+            or any(ord(character) < 32 or ord(character) == 127 for character in prompt)
+        ):
+            raise ValueError("secret PTY prompt sequence is invalid")
+        prompts.append(prompt)
+    if len(set(prompts)) != len(prompts):
+        raise ValueError("secret PTY prompts must be unique")
+    return prompts
+
+
+def _resolve_secret_pty_action(
+    candidate: dict[str, Any],
+    reference: dict[str, Any],
+) -> dict[str, Any]:
+    required = {
+        "enabled", "mode", "target_pattern", "argv", "cwd",
+        "timeout_seconds", "prompt_sequence", "max_secret_bytes",
+        "max_output_bytes", "kill_switch_path", "legacy_kill_switch_path",
+        "recovery_gate", "allowed_peer_uid", "allowed_peer_unit",
+        "allowed_peer_executable", "authority_task_id", "authority_host",
+        "action_schema", "privilege_context", "required_resource_keys",
+        "redaction_contract_sha256",
+    }
+    if (
+        not isinstance(candidate, dict)
+        or set(candidate) != required
+        or candidate.get("enabled") is not True
+        or candidate.get("mode") != "secret-pty"
+    ):
+        raise PermissionError("secret PTY action is disabled or malformed")
+    pattern = candidate["target_pattern"]
+    if not isinstance(pattern, str) or len(pattern) > 500:
+        raise ValueError("secret PTY target pattern is invalid")
+    if re.fullmatch(pattern, reference["target"]) is None:
+        raise PermissionError("secret PTY target does not match its contract")
+    template = candidate["argv"]
+    if (
+        not isinstance(template, list)
+        or not template
+        or len(template) > MAX_ARGV_ITEMS
+        or not all(isinstance(token, str) and token and "\x00" not in token for token in template)
+    ):
+        raise ValueError("secret PTY argv template is invalid")
+    if any(
+        ("{" in token or "}" in token) and token != "{target}"
+        for token in template
+    ):
+        raise ValueError("secret PTY argv contains an unknown placeholder")
+    argv = [reference["target"] if token == "{target}" else token for token in template]
+    if not Path(argv[0]).is_absolute() or argv[0] in SHELL_EXECUTABLES:
+        raise ValueError("secret PTY executable must be an absolute non-shell path")
+    if sum(len(token.encode("utf-8")) for token in argv) > MAX_ARG_BYTES:
+        raise ValueError("secret PTY argv exceeds size limit")
+    cwd = candidate["cwd"]
+    if (
+        not isinstance(cwd, str)
+        or not cwd.startswith("/")
+        or "\x00" in cwd
+        or os.path.normpath(cwd) != cwd
+    ):
+        raise ValueError("secret PTY cwd is invalid")
+    timeout = candidate["timeout_seconds"]
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 3600:
+        raise ValueError("secret PTY timeout is invalid")
+    max_secret_bytes = candidate["max_secret_bytes"]
+    if (
+        isinstance(max_secret_bytes, bool)
+        or not isinstance(max_secret_bytes, int)
+        or not 1 <= max_secret_bytes <= 64 * 1024
+    ):
+        raise ValueError("secret PTY max_secret_bytes is invalid")
+    max_output_bytes = candidate["max_output_bytes"]
+    if (
+        isinstance(max_output_bytes, bool)
+        or not isinstance(max_output_bytes, int)
+        or not 1 <= max_output_bytes <= SECRET_PTY_MAX_OUTPUT_BYTES
+    ):
+        raise ValueError("secret PTY max_output_bytes is invalid")
+    prompts = _validate_secret_pty_prompts(candidate["prompt_sequence"])
+    kill_switch = _validate_gate_path(
+        candidate["kill_switch_path"], label="secret PTY kill_switch_path"
+    )
+    legacy_switch = _validate_gate_path(
+        candidate["legacy_kill_switch_path"],
+        label="secret PTY legacy_kill_switch_path",
+    )
+    _require_kill_switch_clear(kill_switch)
+    _require_kill_switch_clear(legacy_switch)
+    recovery = _validate_recovery_gate(candidate["recovery_gate"])
+    peer_uid = candidate["allowed_peer_uid"]
+    peer_unit = candidate["allowed_peer_unit"]
+    peer_executable = candidate["allowed_peer_executable"]
+    authority_task_id = candidate["authority_task_id"]
+    authority_host = candidate["authority_host"]
+    action_schema = candidate["action_schema"]
+    privilege_context = candidate["privilege_context"]
+    required_resource_keys = candidate["required_resource_keys"]
+    redaction_contract_sha256 = candidate["redaction_contract_sha256"]
+    if (
+        isinstance(peer_uid, bool)
+        or not isinstance(peer_uid, int)
+        or peer_uid < 0
+        or not isinstance(peer_unit, str)
+        or not peer_unit
+        or not isinstance(peer_executable, str)
+        or not Path(peer_executable).is_absolute()
+        or "\x00" in peer_executable
+        or not isinstance(authority_task_id, str)
+        or re.fullmatch(r"[-A-Za-z0-9_.:]{1,160}", authority_task_id) is None
+        or not isinstance(authority_host, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,254}", authority_host) is None
+        or not isinstance(action_schema, str)
+        or re.fullmatch(r"[-A-Za-z0-9_.:]{1,96}", action_schema) is None
+        or not isinstance(privilege_context, str)
+        or re.fullmatch(r"[-A-Za-z0-9_.:]{1,96}", privilege_context) is None
+        or not isinstance(required_resource_keys, list)
+        or not required_resource_keys
+        or len(required_resource_keys) > 16
+        or not all(isinstance(item, str) and item for item in required_resource_keys)
+        or len(set(required_resource_keys)) != len(required_resource_keys)
+        or f"host:{authority_host}" not in required_resource_keys
+        or not isinstance(redaction_contract_sha256, str)
+        or SHA256_RE.fullmatch(redaction_contract_sha256) is None
+    ):
+        raise PermissionError("secret PTY authority contract is malformed")
+    gate = {
+        **recovery,
+        "kill_switch_path": str(kill_switch),
+        "legacy_kill_switch_path": str(legacy_switch),
+    }
+    return {
+        "mode": "secret-pty",
+        "argv": argv,
+        "cwd": cwd,
+        "timeout_seconds": timeout,
+        "prompt_sequence": prompts,
+        "max_secret_bytes": max_secret_bytes,
+        "max_output_bytes": max_output_bytes,
+        "kill_switch_path": str(kill_switch),
+        "legacy_kill_switch_path": str(legacy_switch),
+        "allowed_peer_uid": peer_uid,
+        "allowed_peer_unit": peer_unit,
+        "allowed_peer_executable": peer_executable,
+        "authority_task_id": authority_task_id,
+        "authority_host": authority_host,
+        "action_schema": action_schema,
+        "privilege_context": privilege_context,
+        "required_resource_keys": sorted(required_resource_keys),
+        "redaction_contract_sha256": redaction_contract_sha256,
+        "gate": gate,
+        "prompt_contract_sha256": canonical_sha256(prompts),
+    }
+
+
+def validate_secret_pty_session_authority(
+    session_authority: Any,
+    execution: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(session_authority, dict):
+        raise PermissionError("secret PTY session authority is unavailable")
+    exact = {
+        "task_id": execution.get("authority_task_id"),
+        "host": execution.get("authority_host"),
+        "action_schema": execution.get("action_schema"),
+        "privilege_context": execution.get("privilege_context"),
+        "argv_sha256": canonical_sha256(execution.get("argv")),
+        "redaction_contract_sha256": execution.get("redaction_contract_sha256"),
+    }
+    mismatched = {
+        key: {"expected": expected, "observed": session_authority.get(key)}
+        for key, expected in exact.items()
+        if session_authority.get(key) != expected
+    }
+    if mismatched:
+        raise PermissionError("secret PTY session authority differs from root-owned action contract")
+    timeout = session_authority.get("timeout_seconds")
+    input_max = session_authority.get("input_max_bytes")
+    output_max = session_authority.get("output_max_bytes")
+    if (
+        timeout != execution.get("timeout_seconds")
+        or isinstance(input_max, bool)
+        or not isinstance(input_max, int)
+        or input_max > int(execution["max_secret_bytes"])
+        or isinstance(output_max, bool)
+        or not isinstance(output_max, int)
+        or output_max > int(execution["max_output_bytes"])
+    ):
+        raise PermissionError("secret PTY session bounds exceed root-owned action contract")
+    leases = session_authority.get("resource_leases")
+    if not isinstance(leases, list):
+        raise PermissionError("secret PTY session lease binding is unavailable")
+    lease_keys = {
+        lease.get("resource_key")
+        for lease in leases
+        if isinstance(lease, dict)
+    }
+    required_keys = execution.get("required_resource_keys")
+    if (
+        not isinstance(required_keys, list)
+        or not set(required_keys).issubset(lease_keys)
+    ):
+        raise PermissionError("secret PTY required resource lease is missing")
+    return dict(session_authority)
+
+
 def _resolve_power_argv_action(
     candidate: dict[str, Any],
     reference: dict[str, Any],
@@ -1463,11 +1847,54 @@ def _resolve_power_argv_action(
     return execution
 
 
-def resolve_execution(config: dict[str, Any], reference: dict[str, Any]) -> dict[str, Any]:
-    candidate = config["actions"].get(reference["action"])
+def _configured_action(
+    config: dict[str, Any], reference: dict[str, Any]
+) -> dict[str, Any]:
+    actions = config.get("actions")
+    candidate = (
+        actions.get(reference["action"])
+        if isinstance(actions, dict)
+        else None
+    )
+    if not isinstance(candidate, dict):
+        raise PermissionError("privileged action is not configured")
+    return candidate
+
+
+def resolve_secret_pty_execution(
+    config: dict[str, Any], reference: dict[str, Any]
+) -> dict[str, Any]:
+    """Resolve only the secret-bearing PTY mode.
+
+    Keeping this path separate prevents non-secret broker response and audit
+    sinks from inheriting a secret-tainted dispatcher return value.
+    """
+    actions = config.get("actions")
+    candidate = (
+        actions.get(reference["action"])
+        if isinstance(actions, dict)
+        else None
+    )
+    if not isinstance(candidate, dict) or candidate.get("mode") != "secret-pty":
+        raise PermissionError("privileged action is not a secret PTY action")
+    return _resolve_secret_pty_action(candidate, reference)
+
+
+def resolve_regular_execution(
+    config: dict[str, Any], reference: dict[str, Any]
+) -> dict[str, Any]:
+    """Resolve only modes whose execution object is safe for normal output paths."""
+    actions = config.get("actions")
+    candidate = (
+        actions.get(reference["action"])
+        if isinstance(actions, dict)
+        else None
+    )
     if not isinstance(candidate, dict):
         raise PermissionError("privileged action is not configured")
     mode = candidate.get("mode", "template")
+    if mode == "secret-pty":
+        raise PermissionError("secret PTY action requires the dedicated resolver")
     if mode == "template":
         return _resolve_template_action(candidate, reference)
     if mode == "argv-json":
@@ -1483,6 +1910,14 @@ def resolve_execution(config: dict[str, Any], reference: dict[str, Any]) -> dict
     if mode == "root-task-systemd":
         return _resolve_root_task_systemd_action(candidate, reference)
     raise PermissionError("privileged action mode is disabled or malformed")
+
+
+def resolve_execution(config: dict[str, Any], reference: dict[str, Any]) -> dict[str, Any]:
+    """Compatibility dispatcher; root output paths should use the split resolvers."""
+    candidate = _configured_action(config, reference)
+    if candidate.get("mode", "template") == "secret-pty":
+        return resolve_secret_pty_execution(config, reference)
+    return resolve_regular_execution(config, reference)
 
 
 def resolve_action(config: dict[str, Any], reference: dict[str, Any]) -> tuple[list[str], int]:

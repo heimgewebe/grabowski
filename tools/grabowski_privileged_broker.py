@@ -30,7 +30,17 @@ from grabowski_privileged_broker import (
     parse_reference,
     publish_recovery_marker,
     resolve_execution,
+    resolve_regular_execution,
     _require_kill_switch_clear,
+)
+
+from grabowski_secret_pty import (
+    _claim_secret_pty_authority,
+    _read_peer_bound_secret,
+    _run_secret_pty_process,
+    _secret_pty_audit_record,
+    _secret_pty_reified_result,
+    run_secret_transport_request,
 )
 
 CONFIG = Path("/etc/grabowski/privileged-actions.json")
@@ -47,6 +57,8 @@ PACKAGE_UPDATE_APPLY_CONSUMED_ROOT = STATE / "package-update-apply-consumed"
 PACKAGE_OUTPUT_EVIDENCE_MAX_AGE_SECONDS = 3600
 MAX_OUTPUT_EVIDENCE_FILES = 4096
 MAX_OUTPUT_BYTES = 250_000
+SECRET_PTY_MAX_TRANSCRIPT_BYTES = 512 * 1024
+SECRET_PTY_TERMINATE_GRACE_SECONDS = 2.0
 POWER_ACTION = "operator_power_argv"
 BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
 ROOTBROKER_CUTOVER_ACTION = "operator_rootbroker_cutover"
@@ -1517,6 +1529,76 @@ def _assert_local_backup_smart_pre_spawn(
         raise PermissionError(f"{label} By-ID identity changed before spawn")
 
 
+def _validate_secret_pty_peer(
+    execution: dict[str, object],
+    *,
+    descriptor: int = 0,
+    proc_root: Path = Path("/proc"),
+    cgroup_root: Path = CGROUP_ROOT,
+    unit_identity: dict[str, object] | None = None,
+) -> dict[str, object]:
+    pid, uid, gid = _socket_peer_credentials(descriptor)
+    expected_uid = execution.get("allowed_peer_uid")
+    expected_unit = execution.get("allowed_peer_unit")
+    expected_executable = execution.get("allowed_peer_executable")
+    if (
+        isinstance(expected_uid, bool)
+        or not isinstance(expected_uid, int)
+        or uid != expected_uid
+        or not isinstance(expected_unit, str)
+        or not expected_unit
+        or not isinstance(expected_executable, str)
+        or not expected_executable.startswith("/")
+    ):
+        raise PermissionError("secret PTY peer identity is not authorized")
+    observed_unit = (
+        _operator_system_unit_identity(expected_uid, expected_unit)
+        if unit_identity is None
+        else dict(unit_identity)
+    )
+    main_pid = observed_unit.get("main_pid")
+    control_group = observed_unit.get("control_group")
+    if not isinstance(main_pid, int) or main_pid <= 1 or not isinstance(control_group, str):
+        raise PermissionError("secret PTY operator unit identity is invalid")
+    unified_path = _unified_cgroup_path(pid, proc_root=proc_root)
+    if unified_path != control_group or not unified_path.endswith("/" + expected_unit):
+        raise PermissionError("secret PTY peer is outside the operator service")
+    _validate_system_cgroup_authority(unified_path, cgroup_root=cgroup_root)
+    parent_pid, starttime_ticks = _process_identity(pid, proc_root=proc_root)
+    if parent_pid != main_pid:
+        raise PermissionError("secret PTY peer is not a direct operator child")
+    argv = _process_cmdline(pid, proc_root=proc_root)
+    expected_path = Path(expected_executable)
+    try:
+        metadata = expected_path.lstat()
+    except OSError as exc:
+        raise PermissionError("secret PTY peer executable is unavailable") from exc
+    if (
+        expected_path.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_mode & 0o022
+    ):
+        raise PermissionError("secret PTY peer executable is not root-controlled")
+    direct = argv[0] == expected_executable
+    shebang = len(argv) >= 2 and argv[1] == expected_executable
+    if not direct and not shebang:
+        raise PermissionError("secret PTY peer executable is unauthorized")
+    parent_after, starttime_after = _process_identity(pid, proc_root=proc_root)
+    if parent_after != parent_pid or starttime_after != starttime_ticks:
+        raise PermissionError("secret PTY peer identity changed during validation")
+    return {
+        "pid": pid,
+        "uid": uid,
+        "gid": gid,
+        "parent_pid": parent_pid,
+        "starttime_ticks": starttime_ticks,
+        "cgroup": unified_path,
+        "unit": expected_unit,
+        "executable": expected_executable,
+    }
+
+
 def _require_execution_kill_switch_clear(execution: dict[str, object]) -> None:
     kill_switch_value = execution.get("kill_switch_path")
     legacy_switch_value = execution.get("legacy_kill_switch_path")
@@ -1720,14 +1802,32 @@ def _execute_broker_command(
         "package_apply_consumption": package_consumption,
     }
 
-def main() -> int:
-    if os.geteuid() != 0:
-        raise PermissionError("privileged broker must run as root")
-    data = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
+def _request_uses_secret_transport(data: bytes) -> bool:
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(value, dict)
+        and value.get("kind") == "grabowski_privileged_transport"
+    )
+
+
+def _run_secret_transport_request(data: bytes) -> int:
+    return run_secret_transport_request(
+        data,
+        config_path=CONFIG,
+        state=STATE,
+        validate_peer=_validate_secret_pty_peer,
+        append_audit=append_audit,
+    )
+
+
+def _run_non_secret_reference_request(data: bytes) -> int:
     reference = parse_reference(data)
     config = load_root_config(CONFIG)
-    execution = resolve_execution(config, reference)
     operator_peer: dict[str, object] | None = None
+    execution = resolve_regular_execution(config, reference)
     if (
         reference.get("action") in {
             POWER_ACTION,
@@ -1752,7 +1852,7 @@ def main() -> int:
         raise ValueError("privileged cwd is not an existing directory")
     claim_once(STATE / "used", str(reference["request_id"]))
     if reference.get("action") == POWER_ACTION:
-        refreshed_execution = resolve_execution(config, reference)
+        refreshed_execution = resolve_regular_execution(config, reference)
         stable_fields = (
             "mode", "argv", "cwd", "timeout_seconds",
             "allowed_peer_uid", "allowed_peer_unit",
@@ -1766,7 +1866,7 @@ def main() -> int:
         cwd = execution.get("cwd")
         if cwd is not None and not Path(str(cwd)).is_dir():
             raise ValueError("privileged cwd changed before final gate")
-        final_execution = resolve_execution(config, reference)
+        final_execution = resolve_regular_execution(config, reference)
         if any(final_execution.get(key) != execution.get(key) for key in stable_fields):
             raise PermissionError("power execution contract changed at final gate")
         execution = final_execution
@@ -1801,6 +1901,17 @@ def main() -> int:
     # The socket client returns non-zero for non-zero action returncodes. The
     # broker process itself exits successfully after a structured response so a
     # handled request failure does not leave a failed transient systemd unit.
+    return 0
+
+
+
+def main() -> int:
+    if os.geteuid() != 0:
+        raise PermissionError("privileged broker must run as root")
+    data = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
+    if _request_uses_secret_transport(data):
+        return _run_secret_transport_request(data)
+    _run_non_secret_reference_request(data)
     return 0
 
 
