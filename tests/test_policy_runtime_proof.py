@@ -22,6 +22,10 @@ class PolicyRuntimeProofTests(unittest.TestCase):
             policy["profiles"]["trusted-owner"]["browser_profile_roots"],
             [managed_root],
         )
+        self.assertNotIn(
+            "browser_profile_read",
+            policy["profiles"]["trusted-owner"]["capabilities"],
+        )
         validate_access_policy.validate_policy(policy_path)
 
         with tempfile.TemporaryDirectory() as directory:
@@ -52,6 +56,19 @@ class PolicyRuntimeProofTests(unittest.TestCase):
                         SystemExit, "desktop browser profiles stay outside operator authority"
                     ):
                         validate_access_policy.validate_policy(copied)
+
+            candidate = json.loads(json.dumps(policy))
+            candidate["profiles"]["trusted-owner"]["capabilities"].append(
+                "browser_profile_read"
+            )
+            copied.write_text(
+                json.dumps(candidate, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                SystemExit, "must not grant browser_profile_read"
+            ):
+                validate_access_policy.validate_policy(copied)
 
     def test_home_wide_policy_retains_legacy_browser_profile_contract(self) -> None:
         path = ROOT / "config" / "access.home-wide-operator.example.json"

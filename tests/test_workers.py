@@ -1535,6 +1535,38 @@ globalThis.fetch = async () => ({
                 workers._operator_browser_profile_path("provider-operator")
         self.assertFalse(managed_root.exists())
 
+    def test_named_operator_profile_rejects_missing_or_malformed_roots_cleanly(self) -> None:
+        managed_root = self.root / "managed-browser-profiles"
+        for configured in (None, "not-a-list", [None]):
+            with self.subTest(configured=configured), patch.object(
+                workers.base, "OPERATOR_BROWSER_PROFILE_ROOT", managed_root
+            ), patch.object(
+                workers.base, "_load_policy", return_value={}
+            ), patch.object(
+                workers.base, "_profile_values", return_value=configured
+            ):
+                with self.assertRaisesRegex(PermissionError, "explicitly configured"):
+                    workers._operator_browser_profile_path("provider-operator")
+        self.assertFalse(managed_root.exists())
+
+    def test_operator_profile_rejects_bidi_before_managed_root_creation(self) -> None:
+        managed_root = self.root / "managed-browser-profiles"
+        with patch.object(
+            workers.base, "OPERATOR_BROWSER_PROFILE_ROOT", managed_root
+        ), patch.object(
+            workers.base, "_load_policy", return_value={}
+        ), patch.object(
+            workers.base, "_profile_values", return_value=[str(managed_root)]
+        ):
+            with self.assertRaisesRegex(ValueError, "does not support operator_profile"):
+                workers.browser_start(
+                    str(self.binary),
+                    port=9254,
+                    operator_profile="provider-operator",
+                    chromedriver_executable="/does/not/exist",
+                )
+        self.assertFalse(managed_root.exists())
+
     def test_persistent_profile_outside_allowed_root_remains_blocked(self) -> None:
         allowed_root = self.root / "allowed-browser-profiles"
         allowed_root.mkdir()
@@ -1602,6 +1634,77 @@ globalThis.fetch = async () => ({
         self.assertEqual(status["state"], "completed")
         self.assertTrue(profile.is_dir())
         self.assertEqual(marker.read_text(encoding="utf-8"), "survives-timeout")
+
+    def test_browser_cdp_target_health_validates_real_target_payloads(self) -> None:
+        port = 9255
+        record = {
+            "kind": "browser",
+            "executable": str(self.binary),
+            "port": port,
+            "argv_json": "[]",
+        }
+
+        def probe(payload: bytes, *, status: int = 200) -> dict[str, object]:
+            response = Mock()
+            response.status = status
+            response.read.return_value = payload
+            connection = Mock()
+            connection.getresponse.return_value = response
+            with patch.object(
+                workers.http.client, "HTTPConnection", return_value=connection
+            ) as constructor:
+                outcome = workers._browser_cdp_target_health(record)
+            constructor.assert_called_once_with(
+                "127.0.0.1",
+                port,
+                timeout=workers.BROWSER_TARGET_HEALTH_TIMEOUT_SECONDS,
+            )
+            connection.request.assert_called_once_with("GET", "/json/list")
+            connection.close.assert_called_once_with()
+            return outcome
+
+        page_one = {
+            "type": "page",
+            "webSocketDebuggerUrl": f"ws://127.0.0.1:{port}/devtools/page/one",
+        }
+        page_two = {
+            "type": "page",
+            "webSocketDebuggerUrl": f"ws://localhost:{port}/devtools/page/two",
+        }
+
+        cases = (
+            ("zero-pages", json.dumps([]).encode(), 200, "target_unavailable"),
+            ("one-page", json.dumps([page_one]).encode(), 200, "ready"),
+            ("two-pages", json.dumps([page_one, page_two]).encode(), 200, "ready"),
+            ("non-list", json.dumps({"targets": [page_one]}).encode(), 200, "target_unavailable"),
+            ("invalid-json", b"{", 200, "target_unavailable"),
+            (
+                "oversized",
+                b"x" * (workers.BROWSER_TARGET_HEALTH_MAX_BYTES + 1),
+                200,
+                "target_unavailable",
+            ),
+            ("bad-status", json.dumps([page_one]).encode(), 503, "target_unavailable"),
+            (
+                "wrong-port",
+                json.dumps(
+                    [
+                        {
+                            "type": "page",
+                            "webSocketDebuggerUrl": "ws://127.0.0.1:9999/devtools/page/other",
+                        }
+                    ]
+                ).encode(),
+                200,
+                "target_unavailable",
+            ),
+        )
+        for label, payload, status, expected_state in cases:
+            with self.subTest(case=label):
+                self.assertEqual(
+                    probe(payload, status=status),
+                    {"state": expected_state},
+                )
 
     def test_running_worker_without_cdp_target_is_attention_and_recoverable(self) -> None:
         with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(

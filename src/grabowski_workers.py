@@ -267,9 +267,15 @@ def _operator_browser_profile_path(name: str) -> Path:
         )
     root = _normalized_browser_profile_candidate(base.OPERATOR_BROWSER_PROFILE_ROOT)
     policy = base._load_policy()
+    try:
+        root_values = base._browser_profile_root_values(policy)
+    except RuntimeError as exc:
+        raise PermissionError(
+            "managed operator browser profile root is not explicitly configured"
+        ) from exc
     configured_roots = {
         _normalized_browser_profile_candidate(base._policy_path(value))
-        for value in base._profile_values(policy, "browser_profile_roots")
+        for value in root_values
     }
     if root not in configured_roots:
         raise PermissionError(
@@ -630,7 +636,7 @@ def _browser_cdp_target_health(record: dict[str, Any]) -> dict[str, Any]:
                 and endpoint.port == port
             ):
                 matches += 1
-        return {"state": "ready" if matches == 1 else "target_unavailable"}
+        return {"state": "ready" if matches >= 1 else "target_unavailable"}
     except (OSError, ValueError, json.JSONDecodeError, UnicodeDecodeError):
         return {"state": "target_unavailable"}
     finally:
@@ -6068,6 +6074,11 @@ def browser_start(
     if persistent_profile is not None and operator_profile is not None:
         raise ValueError(
             "persistent_profile and operator_profile are mutually exclusive"
+        )
+    if operator_profile is not None and chromedriver_executable is not None:
+        raise ValueError(
+            "qualified BiDi fallback does not support operator_profile; "
+            "use an ephemeral primary and standby"
         )
     managed_operator_profile = operator_profile is not None
     if operator_profile is not None:

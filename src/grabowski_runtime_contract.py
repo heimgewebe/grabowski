@@ -386,7 +386,7 @@ def _validate_browser_operator_default(value: Any) -> None:
             "lifecycle",
             *(("semantic_gateway",) if schema_version >= 2 else ()),
         ),
-        optional=("human_browser_default", "future_adapter", "evidence_anchor", "control_health"),
+        optional=("human_browser_default", "future_adapter", "evidence_anchor"),
     )
     _require_text(contract["authority"], label=f"{label}.authority", maximum=200)
     _require_text(contract["decision_rule"], label=f"{label}.decision_rule", maximum=1024)
@@ -600,13 +600,6 @@ def _validate_browser_operator_default(value: Any) -> None:
             "persistent_profile_policy",
             "exclusive_profile_lease",
         ),
-        optional=(
-            "named_operator_profile_parameter",
-            "managed_persistent_root",
-            "named_operator_default_runtime_seconds",
-            "managed_operator_profiles_opaque_to_profile_read",
-            "process_lifetime_separate_from_profile_lifetime",
-        ),
     )
     profile_default = _require_text(
         profile["default"], label=f"{profile_label}.default", maximum=64
@@ -622,58 +615,11 @@ def _validate_browser_operator_default(value: Any) -> None:
         label=f"{profile_label}.exclusive_profile_lease",
     ) is not True:
         _fail(f"{profile_label}.exclusive_profile_lease must be true")
-    persistent_policy = _require_text(
+    _require_text(
         profile["persistent_profile_policy"],
         label=f"{profile_label}.persistent_profile_policy",
         maximum=200,
     )
-    if "named_operator_profile_parameter" in profile:
-        if profile["named_operator_profile_parameter"] != "operator_profile":
-            _fail(f"{profile_label}.named_operator_profile_parameter must be 'operator_profile'")
-        managed_root = _require_text(
-            profile["managed_persistent_root"],
-            label=f"{profile_label}.managed_persistent_root",
-        )
-        if managed_root != "${HOME}/.local/state/grabowski/browser-profiles":
-            _fail(f"{profile_label}.managed_persistent_root must use the dedicated Grabowski root")
-        runtime = profile["named_operator_default_runtime_seconds"]
-        if not isinstance(runtime, int) or isinstance(runtime, bool) or not 3600 <= runtime <= 86400:
-            _fail(f"{profile_label}.named_operator_default_runtime_seconds must be between 3600 and 86400")
-        for key in (
-            "managed_operator_profiles_opaque_to_profile_read",
-            "process_lifetime_separate_from_profile_lifetime",
-        ):
-            if _require_bool(profile[key], label=f"{profile_label}.{key}") is not True:
-                _fail(f"{profile_label}.{key} must be true")
-        if persistent_policy != "explicit-configured-root-only":
-            _fail(f"{profile_label}.persistent_profile_policy must be explicit-configured-root-only")
-
-    if "control_health" in contract:
-        health_label = f"{label}.control_health"
-        health = _require_mapping(contract["control_health"], label=health_label)
-        _require_exact_keys(
-            health,
-            label=health_label,
-            required=(
-                "process_state_authority",
-                "target_state_authority",
-                "target_unavailable_is_distinct_from_process_running",
-                "target_unavailable_recovery",
-                "automatic_unbounded_restart",
-            ),
-        )
-        for key in ("process_state_authority", "target_state_authority", "target_unavailable_recovery"):
-            _require_text(health[key], label=f"{health_label}.{key}", maximum=200)
-        if _require_bool(
-            health["target_unavailable_is_distinct_from_process_running"],
-            label=f"{health_label}.target_unavailable_is_distinct_from_process_running",
-        ) is not True:
-            _fail(f"{health_label}.target_unavailable_is_distinct_from_process_running must be true")
-        if _require_bool(
-            health["automatic_unbounded_restart"],
-            label=f"{health_label}.automatic_unbounded_restart",
-        ) is not False:
-            _fail(f"{health_label}.automatic_unbounded_restart must be false")
 
     lifecycle_label = f"{label}.lifecycle"
     lifecycle = _require_list(contract["lifecycle"], label=lifecycle_label, maximum=64)

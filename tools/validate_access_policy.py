@@ -307,6 +307,14 @@ def validate_policy(path: Path) -> None:
             )
         require_home_wide_typed_roots(path, f"profile {name}", profile)
         capabilities = set(profile["capabilities"])
+        if (
+            path.name == "access.trusted-owner.example.json"
+            and "browser_profile_read" in capabilities
+        ):
+            raise SystemExit(
+                f"{path}: managed operator browser profiles are opaque; "
+                f"profile {name} must not grant browser_profile_read"
+            )
         if name == "failover-mutate":
             if profile.get("trusted_owner") is not False:
                 raise SystemExit(

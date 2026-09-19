@@ -116,6 +116,12 @@ späterer Worker kann dasselbe Profil nach erneutem exklusivem
 `browser-profile:<pfad>`-Lease verwenden. Für benannte Operatorprofile gilt ohne
 explizite Runtime ein weiterhin begrenzter Default von sechs Stunden.
 
+Benannte `operator_profile`-Sessions verwenden ausschließlich den kanonischen
+CDP-Pfad. Der startup-only WebDriver-BiDi-Fallback ist absichtlich nur für eine
+ephemere Primary-/Standby-Kombination zulässig; die Kombination aus
+`operator_profile` und `chromedriver_executable` wird vor Profilerstellung
+fail-closed abgewiesen.
+
 ### Live-Policy-Aktivierung
 
 Der Runtime-Deploy ändert die produktive `~/.config/grabowski/access.json` absichtlich
@@ -152,8 +158,10 @@ Deploy und diese Policy-Migration sind daher zwei getrennte, jeweils belegpflich
 Effekte.
 
 Der Workerstatus prüft bei laufenden CDP-Workern zusätzlich die lokale Target-Ebene.
-Ein laufender systemd-Prozess ohne genau ein steuerbares CDP-Seitentarget wird als
-`target_unavailable` und handlungsbedürftig projiziert. Das autorisiert keinen
+Ein laufender systemd-Prozess ohne mindestens ein steuerbares, zum lokalen
+Worker-Port gehörendes CDP-Seitentarget wird als `target_unavailable` und
+handlungsbedürftig projiziert. Mehrere gesunde Tabs oder Popups bleiben dagegen
+steuerbar und lösen keinen künstlichen Restart aus. Das autorisiert keinen
 unkontrollierten Retry: der Worker wird kontrolliert beendet und neu gestartet; nur
 bei persistentem Profil darf derselbe Profilzustand wiederverwendet werden.
 
