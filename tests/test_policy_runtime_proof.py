@@ -5,12 +5,64 @@ import unittest
 from unittest.mock import patch
 
 from test_operator_v2_runtime import grabowski_mcp
+from tools import validate_access_policy
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class PolicyRuntimeProofTests(unittest.TestCase):
+
+    def test_trusted_owner_policy_keeps_desktop_browser_profiles_outside_authority(self) -> None:
+        policy_path = ROOT / "config" / "access.trusted-owner.example.json"
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        managed_root = "${HOME}/.local/state/grabowski/browser-profiles"
+        self.assertEqual(policy["browser_profile_roots"], [managed_root])
+        self.assertEqual(
+            policy["profiles"]["trusted-owner"]["browser_profile_roots"],
+            [managed_root],
+        )
+        validate_access_policy.validate_policy(policy_path)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            copied = root / "access.trusted-owner.example.json"
+            for label, mutate in (
+                (
+                    "top-level",
+                    lambda document: document["browser_profile_roots"].append(
+                        "${HOME}/.config/google-chrome"
+                    ),
+                ),
+                (
+                    "profile",
+                    lambda document: document["profiles"]["maintain"][
+                        "browser_profile_roots"
+                    ].append("${HOME}/.config/google-chrome"),
+                ),
+            ):
+                with self.subTest(scope=label):
+                    candidate = json.loads(json.dumps(policy))
+                    mutate(candidate)
+                    copied.write_text(
+                        json.dumps(candidate, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(
+                        SystemExit, "desktop browser profiles stay outside operator authority"
+                    ):
+                        validate_access_policy.validate_policy(copied)
+
+    def test_home_wide_policy_retains_legacy_browser_profile_contract(self) -> None:
+        path = ROOT / "config" / "access.home-wide-operator.example.json"
+        policy = json.loads(path.read_text(encoding="utf-8"))
+        self.assertIn("${HOME}/.config/google-chrome", policy["browser_profile_roots"])
+        self.assertNotIn(
+            "${HOME}/.local/state/grabowski/browser-profiles",
+            policy["browser_profile_roots"],
+        )
+        validate_access_policy.validate_policy(path)
+
     def test_observe_profile_blocks_generic_tools_under_typed_roots(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
