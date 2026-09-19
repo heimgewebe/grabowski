@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import json
 import os
@@ -57,6 +58,16 @@ TASK_OUTPUT_CLEANUP_CODE_SHA256 = (
     "6001b35604486ad1976ccb3b3efac6115ee02e5175c56138ef3cbbdaee2e294b"
 )
 TASK_OUTPUT_CLEANUP_MAX_STREAM_BYTES = 8 * 1024 * 1024
+TASK_OUTPUT_CAPTURE_STAGE_OBSERVER = "task-output-capture-stage-v1"
+TASK_OUTPUT_CAPTURE_STAGE_CODE_SHA256 = (
+    "92452ed0bb0ebd98cf5723c3dd92515c446bbe0e2e0dcec78aac6bcf9a85cd7a"
+)
+TASK_OUTPUT_CAPTURE_SCRIPT = re.compile(
+    re.escape(str(HOME))
+    + r"/\.local/state/grabowski/task-capture/capture-([0-9a-f]{64})\.py\Z"
+)
+TASK_OUTPUT_CAPTURE_PAYLOAD = re.compile(r"[A-Za-z0-9+/]+={0,2}\Z")
+TASK_OUTPUT_CAPTURE_MAX_PAYLOAD_BYTES = 256 * 1024
 
 
 class FleetCommandDenied(PermissionError):
@@ -323,6 +334,101 @@ def run_fleet_task_output_read(
         "task_id": directory_match.group(1),
         "attempt": int(directory_match.group(2)),
         "stream": command[4],
+        "result": result,
+    }
+
+
+def run_fleet_task_capture_stage(
+    name: str,
+    argv: list[str],
+    *,
+    timeout_seconds: int,
+    max_output_bytes: int,
+) -> dict[str, Any]:
+    """Run the narrow digest-bound task-output capture stager.
+
+    Like the task-output reader this deliberately bypasses the generic
+    production executable allowlist, but only after binding the exact embedded
+    Python program by SHA-256 and binding the staged payload to the
+    content-addressed destination it is written to. It therefore does not
+    authorize arbitrary Python execution through ``grabowski_fleet_run``, and a
+    host whose allowlist omits an interpreter can still launch tasks.
+    """
+    host = fleet_host(name)
+    command = operator._validate_argv(argv, cwd=HOME)
+    if len(command) != 5:
+        raise ValueError("Invalid capture stager argv length")
+    if command[0] != TASK_OUTPUT_READ_PYTHON or command[1] != "-c":
+        raise ValueError("Invalid capture stager executable")
+    code_sha256 = hashlib.sha256(command[2].encode("utf-8")).hexdigest()
+    if code_sha256 != TASK_OUTPUT_CAPTURE_STAGE_CODE_SHA256:
+        raise PermissionError("Capture stager code identity mismatch")
+    script_match = TASK_OUTPUT_CAPTURE_SCRIPT.fullmatch(command[3])
+    if script_match is None:
+        raise ValueError("Invalid capture script destination")
+    payload = command[4]
+    if TASK_OUTPUT_CAPTURE_PAYLOAD.fullmatch(payload) is None:
+        raise ValueError("Invalid capture payload encoding")
+    if len(payload) > TASK_OUTPUT_CAPTURE_MAX_PAYLOAD_BYTES:
+        raise ValueError("Capture payload exceeds the bounded maximum")
+    try:
+        decoded = base64.b64decode(payload.encode("ascii"), validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("Invalid capture payload encoding") from exc
+    if not decoded or len(decoded) > TASK_OUTPUT_CAPTURE_MAX_PAYLOAD_BYTES:
+        raise ValueError("Capture payload exceeds the bounded maximum")
+    payload_sha256 = hashlib.sha256(decoded).hexdigest()
+    if payload_sha256 != script_match.group(1):
+        raise PermissionError("Capture payload does not match its destination digest")
+    redaction_probe = [
+        command[0],
+        command[1],
+        "<hash-bound-capture-stage-code>",
+        command[3],
+        "<digest-bound-capture-payload>",
+    ]
+    if operator._redact_argv(redaction_probe) != redaction_probe:
+        raise ValueError("capture stager argv appears to contain secret material")
+    timeout = operator._timeout(timeout_seconds)
+    output_limit = operator._output_limit(max_output_bytes)
+    if host["transport"] == "local":
+        result = operator._run(
+            command,
+            cwd=HOME,
+            timeout_seconds=timeout,
+            max_output_bytes=output_limit,
+        )
+    else:
+        ssh = shutil.which("ssh")
+        if not ssh:
+            raise RuntimeError("OpenSSH client is not installed")
+        remote_command = _ssh_remote_command(host, command)
+        result = operator._run(
+            [
+                ssh,
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ClearAllForwardings=yes",
+                "-o",
+                f"ConnectTimeout={host['connect_timeout_seconds']}",
+                "--",
+                host["target"],
+                remote_command,
+            ],
+            cwd=HOME,
+            timeout_seconds=timeout,
+            max_output_bytes=output_limit,
+        )
+    return {
+        "host": name,
+        "transport": host["transport"],
+        "roles": host["roles"],
+        "remote_argv": command,
+        "observer": TASK_OUTPUT_CAPTURE_STAGE_OBSERVER,
+        "stage_code_sha256": code_sha256,
+        "capture_code_sha256": payload_sha256,
+        "script_path": command[3],
         "result": result,
     }
 
