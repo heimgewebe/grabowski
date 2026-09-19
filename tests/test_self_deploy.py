@@ -6253,6 +6253,185 @@ class BootstrapIndexRunnerRecognitionTests(unittest.TestCase):
         self.assertEqual(written["units"], [])
 
 
+class LegacyRedactedDeployIndexTests(unittest.TestCase):
+    """Historical redacted deploy argv may be recovered only from exact bindings."""
+
+    UNIT = "grabowski-job-3866568bdda9"
+    ARGV = [
+        "/usr/bin/python3",
+        "/home/alex/repos/t172-secret-worktree/tools/run_scheduled_deploy.py",
+        "--repo",
+        "/home/alex/repos/t172-secret-worktree",
+        "--canonical-repo",
+        "/home/alex/repos/grabowski",
+        "--source-kind",
+        "detached-worktree",
+        "--source-identity-sha256",
+        "ab" * 32,
+        "--expected-head",
+        "a" * 40,
+        "--delay-seconds",
+        "5",
+    ]
+
+    def _metadata(self) -> dict:
+        argv_sha256 = SELF_DEPLOY._deploy_command_sha256(self.ARGV)
+        return {
+            "unit": self.UNIT,
+            "job_id": self.UNIT.removeprefix("grabowski-job-"),
+            "argv": [
+                *self.ARGV[:2],
+                "<REDACTED>",
+                self.ARGV[3],
+                "<REDACTED>",
+                *self.ARGV[5:],
+            ],
+            "argv_sha256": argv_sha256,
+            "cwd": self.ARGV[3],
+            "origin_sha256": "cd" * 32,
+            "owner": "uid:1000",
+            "scope": {"argv_sha256": argv_sha256, "cwd": self.ARGV[3]},
+            "origin": {"placeholder": True},
+            "finalization_contract": {
+                "kind": "grabowski_runtime_deploy_finalization",
+                "unit": self.UNIT,
+                "job_id": self.UNIT.removeprefix("grabowski-job-"),
+                "argv_sha256": argv_sha256,
+                "expected_head": "a" * 40,
+            },
+            "deployment_observer_contract": {
+                "unit": self.UNIT,
+                "argv_sha256": argv_sha256,
+                "origin_sha256": "cd" * 32,
+                "expected_head": "a" * 40,
+                "source_identity_sha256": "ab" * 32,
+            },
+        }
+
+    def _origin(self, metadata: dict) -> dict:
+        return {
+            "unit": metadata["unit"],
+            "job_id": metadata["job_id"],
+            "owner": metadata.get("owner"),
+            "argv_sha256": metadata["argv_sha256"],
+            "scope": metadata.get("scope"),
+            "invoker_tool": "grabowski_runtime_deploy_schedule",
+        }
+
+    def test_recovers_only_hash_bound_server_deploy_shape(self) -> None:
+        metadata = self._metadata()
+        with mock.patch.object(
+            SELF_DEPLOY.job_origin,
+            "validate_origin",
+            return_value=self._origin(metadata),
+        ):
+            recovered = SELF_DEPLOY._recover_legacy_redacted_deploy_command(
+                Path("/jobs") / self.UNIT,
+                metadata,
+                metadata["argv"],
+            )
+        self.assertIsNotNone(recovered)
+        assert recovered is not None
+        self.assertEqual(self.ARGV, recovered["argv"])
+        self.assertEqual("detached-worktree", recovered["fields"]["source_kind"])
+
+    def test_rejects_redacted_shape_when_raw_argv_hash_does_not_match(self) -> None:
+        metadata = self._metadata()
+        metadata["argv_sha256"] = "ef" * 32
+        metadata["finalization_contract"]["argv_sha256"] = "ef" * 32
+        metadata["deployment_observer_contract"]["argv_sha256"] = "ef" * 32
+        with mock.patch.object(
+            SELF_DEPLOY.job_origin,
+            "validate_origin",
+            return_value=self._origin(metadata),
+        ):
+            recovered = SELF_DEPLOY._recover_legacy_redacted_deploy_command(
+                Path("/jobs") / self.UNIT,
+                metadata,
+                metadata["argv"],
+            )
+        self.assertIsNone(recovered)
+
+    def test_invalid_finalization_contract_is_admissible_only_after_legacy_recovery(self) -> None:
+        finalization = {
+            "valid": False,
+            "state": "invalid_contract",
+            "reason": "metadata_argv_binding_invalid",
+        }
+        self.assertFalse(
+            SELF_DEPLOY._deploy_finalization_unavailable_for_proof(
+                finalization,
+                legacy_redacted_argv_recovered=False,
+            )
+        )
+        self.assertTrue(
+            SELF_DEPLOY._deploy_finalization_unavailable_for_proof(
+                finalization,
+                legacy_redacted_argv_recovered=True,
+            )
+        )
+        self.assertFalse(
+            SELF_DEPLOY._deploy_finalization_unavailable_for_proof(
+                {**finalization, "reason": "other"},
+                legacy_redacted_argv_recovered=True,
+            )
+        )
+
+    def test_classifier_marks_hash_bound_legacy_noeffect_job_terminal(self) -> None:
+        metadata = self._metadata()
+        status = {
+            "final_status": "missing_finalization_evidence",
+            "finalization_receipt": {
+                "valid": False,
+                "state": "invalid_contract",
+                "reason": "metadata_argv_binding_invalid",
+            },
+            "properties": {
+                "ActiveState": "inactive",
+                "SubState": "dead",
+                "Result": "success",
+                "ExecMainStatus": "0",
+            },
+        }
+
+        def noeffect(_status, _fields, *, legacy_redacted_argv_recovered=False):
+            return legacy_redacted_argv_recovered
+
+        with (
+            mock.patch.object(
+                SELF_DEPLOY.operator, "_read_job_metadata", return_value=metadata
+            ),
+            mock.patch.object(
+                SELF_DEPLOY.job_origin,
+                "validate_origin",
+                return_value=self._origin(metadata),
+            ),
+            mock.patch.object(
+                SELF_DEPLOY.operator, "grabowski_job_status", return_value=status
+            ),
+            mock.patch.object(
+                SELF_DEPLOY,
+                "_missing_finalization_deploy_is_runtime_proven",
+                return_value=False,
+            ),
+            mock.patch.object(
+                SELF_DEPLOY,
+                "_missing_finalization_deploy_is_noeffect_proven",
+                side_effect=noeffect,
+            ),
+            mock.patch.object(Path, "is_symlink", return_value=False),
+            mock.patch.object(Path, "is_dir", return_value=True),
+        ):
+            classified = SELF_DEPLOY._classify_indexed_job(
+                Path("/jobs") / self.UNIT
+            )
+
+        self.assertTrue(classified["legacy_redacted_argv_recovered"])
+        self.assertTrue(classified["noeffect_proven_terminal"])
+        self.assertTrue(classified["terminal"])
+        self.assertFalse(classified["reusable"])
+
+
 class ReadbackRequiredAndAmbiguityTests(unittest.TestCase):
     """Two ways a job can look finished without being safe to move past."""
 
