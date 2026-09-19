@@ -72,6 +72,7 @@ TUNNEL_CLIENT_VERSION_RE = re.compile(r"^tunnel-client-v[0-9]+\.[0-9]+\.[0-9]+$"
 OPERATOR_SERVICE = "grabowski-operator.service"
 OPERATOR_SERVICE_CONTROL_ACTION = "operator_system_service_control"
 ROOTBROKER_CUTOVER_ACTION = "operator_rootbroker_cutover"
+SECRET_PTY_ACTION = "operator_secret_pty_getpass_probe"
 PLATFORM_CONNECTOR_CAPTURE_ACTION = "platform_connector_capture"
 LOCAL_BACKUP_NTFS_CHECK_ACTION = "local_backup_ntfs_check"
 LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION = "local_backup_ntfs_clear_dirty"
@@ -4893,6 +4894,7 @@ def require_operator_authority_anchored(
 
     relative_artifacts = {
         "broker_module": Path("src/grabowski_privileged_broker.py"),
+        "secret_pty_module": Path("src/grabowski_secret_pty.py"),
         "broker_wrapper": Path("tools/grabowski_privileged_broker.py"),
         "platform_connector_capture": Path("tools/grabowski_platform_connector_capture.py"),
         "cutover_helper": Path("tools/grabowski_rootbroker_cutover.py"),
@@ -4935,6 +4937,7 @@ def require_operator_authority_anchored(
     lifecycle = actions.get("operator_blockade_marker_lifecycle")
     service_control = actions.get(OPERATOR_SERVICE_CONTROL_ACTION)
     rootbroker_cutover = actions.get(ROOTBROKER_CUTOVER_ACTION)
+    secret_pty = actions.get(SECRET_PTY_ACTION)
     platform_connector_capture = actions.get(PLATFORM_CONNECTOR_CAPTURE_ACTION)
     backup_storage = {
         name: actions.get(name) for name in LOCAL_BACKUP_STORAGE_ACTIONS
@@ -4942,7 +4945,11 @@ def require_operator_authority_anchored(
     if not all(
         isinstance(item, dict)
         for item in (
-            lifecycle, service_control, rootbroker_cutover, platform_connector_capture
+            lifecycle,
+            service_control,
+            rootbroker_cutover,
+            secret_pty,
+            platform_connector_capture,
         )
     ):
         core.fail(
@@ -4965,6 +4972,7 @@ def require_operator_authority_anchored(
     assert isinstance(lifecycle, dict)
     assert isinstance(service_control, dict)
     assert isinstance(rootbroker_cutover, dict)
+    assert isinstance(secret_pty, dict)
     assert isinstance(platform_connector_capture, dict)
     expected_peer = {
         "allowed_peer_uid": lifecycle.get("allowed_peer_uid"),
@@ -4979,6 +4987,7 @@ def require_operator_authority_anchored(
         "operator_blockade_marker_lifecycle": lifecycle,
         OPERATOR_SERVICE_CONTROL_ACTION: service_control,
         ROOTBROKER_CUTOVER_ACTION: rootbroker_cutover,
+        SECRET_PTY_ACTION: secret_pty,
         PLATFORM_CONNECTOR_CAPTURE_ACTION: platform_connector_capture,
     }
     expected_action_contracts.update(

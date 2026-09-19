@@ -2534,6 +2534,186 @@ class WatchdogPolicyTests(unittest.TestCase):
             emit.call_args.args[0],
         )
 
+    def test_dependency_recovery_opens_fresh_restart_episode_after_prior_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args = watchdog.normalize_args(
+                watchdog.parser().parse_args(
+                    [
+                        "--component",
+                        "tunnel",
+                        "--state-dir",
+                        tmp,
+                        "--failure-threshold",
+                        "1",
+                        "--startup-grace",
+                        "0",
+                        "--recovery-timeout",
+                        "5",
+                    ]
+                )
+            )
+            state_path = Path(tmp) / "tunnel-watchdog-state.json"
+            watchdog.save_state(
+                state_path,
+                watchdog.WatchdogState(
+                    consecutive_failures=5,
+                    restart_generation=308,
+                    recovery_episode_restart_attempted=True,
+                    recovery_episode_started_at_unix=900,
+                    recovery_phase="degraded",
+                    recovery_episode_reason="tunnel-identity-mismatch",
+                    readiness_dependency_unavailable_boot_id=BOOT_ID,
+                    readiness_dependency_unavailable_pid=321,
+                    readiness_dependency_unavailable_start_ticks=77,
+                ),
+            )
+            initial = watchdog.ProbeResult(
+                "indeterminate",
+                ("readiness-failed",),
+                pid=321,
+                age_seconds=120.0,
+                start_ticks=77,
+                boot_id=BOOT_ID,
+            )
+            recovered = watchdog.ProbeResult(
+                "healthy",
+                pid=322,
+                age_seconds=1.0,
+                start_ticks=88,
+                boot_id=BOOT_ID,
+            )
+            with (
+                patch.object(
+                    watchdog,
+                    "probe_component",
+                    side_effect=[initial, recovered],
+                ),
+                patch.object(watchdog, "mcp_http_probe", return_value=None),
+                patch.object(
+                    watchdog,
+                    "tunnel_service_process_identity",
+                    return_value=(
+                        watchdog.TunnelProcessIdentity(
+                            BOOT_ID, 321, 77, 120.0
+                        ),
+                        None,
+                    ),
+                ),
+                patch.object(watchdog, "restart_service") as restart,
+                patch.object(
+                    watchdog,
+                    "_emit_connector_snapshot_refresh",
+                    return_value={"state": "renewed"},
+                ),
+                patch.object(watchdog, "emit"),
+                patch.object(watchdog.time, "sleep"),
+                patch.object(
+                    watchdog.time,
+                    "monotonic",
+                    side_effect=itertools.chain(
+                        [0.0, 0.0], itertools.repeat(1.0)
+                    ),
+                ),
+                patch.object(
+                    watchdog.time,
+                    "time",
+                    side_effect=itertools.repeat(1000.0),
+                ),
+                patch.object(watchdog.random, "random", return_value=0.0),
+            ):
+                self.assertEqual(0, watchdog.run_watchdog(args))
+
+            restart.assert_called_once_with(
+                "tunnel-client-grabowski.service"
+            )
+            final_state = watchdog.load_state(state_path)
+            self.assertEqual("idle", final_state.recovery_phase)
+            self.assertFalse(final_state.recovery_episode_restart_attempted)
+            self.assertIsNone(
+                final_state.readiness_dependency_unavailable_pid
+            )
+
+    def test_failed_dependency_recovery_restart_consumes_restart_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args = watchdog.normalize_args(
+                watchdog.parser().parse_args(
+                    [
+                        "--component",
+                        "tunnel",
+                        "--state-dir",
+                        tmp,
+                        "--failure-threshold",
+                        "1",
+                        "--startup-grace",
+                        "0",
+                    ]
+                )
+            )
+            state_path = Path(tmp) / "tunnel-watchdog-state.json"
+            watchdog.save_state(
+                state_path,
+                watchdog.WatchdogState(
+                    consecutive_failures=5,
+                    restart_generation=308,
+                    recovery_episode_restart_attempted=True,
+                    recovery_episode_started_at_unix=900,
+                    recovery_phase="degraded",
+                    recovery_episode_reason="tunnel-identity-mismatch",
+                    readiness_dependency_unavailable_boot_id=BOOT_ID,
+                    readiness_dependency_unavailable_pid=321,
+                    readiness_dependency_unavailable_start_ticks=77,
+                ),
+            )
+            initial = watchdog.ProbeResult(
+                "indeterminate",
+                ("readiness-failed",),
+                pid=321,
+                age_seconds=120.0,
+                start_ticks=77,
+                boot_id=BOOT_ID,
+            )
+            with (
+                patch.object(watchdog, "probe_component", return_value=initial),
+                patch.object(watchdog, "mcp_http_probe", return_value=None),
+                patch.object(
+                    watchdog,
+                    "tunnel_service_process_identity",
+                    return_value=(
+                        watchdog.TunnelProcessIdentity(
+                            BOOT_ID, 321, 77, 120.0
+                        ),
+                        None,
+                    ),
+                ),
+                patch.object(
+                    watchdog,
+                    "restart_service",
+                    side_effect=watchdog.WatchdogError(
+                        "service-restart-failed"
+                    ),
+                ),
+                patch.object(watchdog, "emit"),
+                patch.object(
+                    watchdog.time,
+                    "time",
+                    side_effect=itertools.repeat(1000.0),
+                ),
+                patch.object(watchdog.random, "random", return_value=0.0),
+            ):
+                self.assertEqual(4, watchdog.run_watchdog(args))
+
+            failed_state = watchdog.load_state(state_path)
+            self.assertTrue(failed_state.recovery_episode_restart_attempted)
+            self.assertIsNone(
+                failed_state.readiness_dependency_unavailable_boot_id
+            )
+            self.assertIsNone(
+                failed_state.readiness_dependency_unavailable_pid
+            )
+            self.assertIsNone(
+                failed_state.readiness_dependency_unavailable_start_ticks
+            )
+
     def test_restart_service_queues_nonblocking_restart(self) -> None:
         with patch.object(watchdog.subprocess, "run") as run:
             watchdog.restart_service("grabowski-operator.service")
