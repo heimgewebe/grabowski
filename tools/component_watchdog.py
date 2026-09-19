@@ -2496,6 +2496,31 @@ def run_watchdog(args: argparse.Namespace) -> int:
                 return 1
 
             decision_now = int(time.time())
+            dependency_recovery_restart = (
+                args.component == "tunnel"
+                and probe.reasons
+                == ("readiness-stale-after-dependency-recovered",)
+                and state.readiness_dependency_unavailable_boot_id is not None
+                and state.readiness_dependency_unavailable_pid == probe.pid
+                and state.readiness_dependency_unavailable_start_ticks
+                == probe.start_ticks
+            )
+            if (
+                dependency_recovery_restart
+                and state.recovery_episode_restart_attempted
+            ):
+                # A persisted MCP-dependency outage followed by stale readiness
+                # is a new bounded recovery episode. A restart already spent on
+                # an older tunnel failure must not permanently suppress the one
+                # restart allowed to clear this process-bound stale readiness.
+                # Restart budget/backoff state is intentionally preserved.
+                state = replace(
+                    state,
+                    recovery_episode_restart_attempted=False,
+                    recovery_episode_started_at_unix=0,
+                    recovery_phase="idle",
+                    recovery_episode_reason="",
+                )
             if (
                 args.component == "tunnel"
                 and state.recovery_episode_restart_attempted
@@ -2543,6 +2568,17 @@ def run_watchdog(args: argparse.Namespace) -> int:
                     restart_attempted=True if action == "restart" else None,
                     reason=_recovery_reason(probe),
                 )
+                if action == "restart" and dependency_recovery_restart:
+                    # The persisted dependency-recovery evidence authorizes
+                    # exactly this restart attempt. Consume it before the
+                    # service action so a failed/no-op restart cannot reopen
+                    # the same allowance on the next watchdog cycle.
+                    next_state = replace(
+                        next_state,
+                        readiness_dependency_unavailable_boot_id=None,
+                        readiness_dependency_unavailable_pid=None,
+                        readiness_dependency_unavailable_start_ticks=None,
+                    )
             save_state(state_path, next_state)
             if action == "observe":
                 emit(

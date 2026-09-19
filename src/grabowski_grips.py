@@ -926,6 +926,35 @@ GRIP_SPECS: dict[str, GripSpec] = {
         operation_effect_class="network_control",
         operation_class="forrest-server-exit",
     ),
+    "remote-head-materialize": GripSpec(
+        name="remote-head-materialize",
+        version="1.0",
+        summary=(
+            "Import one exact remote branch head into local Git object storage "
+            "for an existing clean Grabowski-owned writer lane while preserving "
+            "that lane branch and worktree."
+        ),
+        effect=MUTATING,
+        required_parameters=(
+            "repo",
+            "lane_id",
+            "remote_branch",
+            "expected_local_head",
+            "expected_remote_head",
+        ),
+        acceptance_ids=(
+            "lane-binding-exact",
+            "lane-leases-live",
+            "remote-head-exact",
+            "object-import-ref-isolated",
+            "fast-forward-ancestry",
+            "lane-preserved",
+            "successor-handoff-explicit",
+        ),
+        runner="remote_head_materialize",
+        operation_effect_class="worktree_admin",
+        operation_class="remote-head-materialize",
+    ),
     "pr-base-converge": GripSpec(
         name="pr-base-converge",
         version="1.2",
@@ -1019,6 +1048,7 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
         "operator-obligation-close",
         "operator-obligation-resolve",
         "branch-publish",
+        "remote-head-materialize",
         "pr-base-converge",
         "pr-create-or-update",
         "candidate-integration-ready",
@@ -1077,6 +1107,7 @@ GRIP_SURFACE_TARGETS = {
     "operator-obligation-close": "one create-only operator obligation terminal record",
     "operator-obligation-resolve": "one create-only historical operator obligation resolution",
     "branch-publish": "git branch publication",
+    "remote-head-materialize": "one exact remote branch head imported for one existing Grabowski-owned writer lane without moving that lane",
     "pr-base-converge": "one exact open same-repository GitHub pull request head branch",
     "pr-create-or-update": "GitHub pull request metadata",
     "candidate-integration-ready": "one closed verified Agent Workspace through controller custody to an exact ready PR",
@@ -1087,6 +1118,10 @@ GRIP_SURFACE_RECOVERY_PATHS = {
     MUTATING: "inspect the emitted receipt, verify target/scope, then use git/GitHub rollback or retry from the recorded head",
 }
 GRIP_RECOVERY_PATHS_BY_NAME = {
+    "remote-head-materialize": (
+        "read back the exact writer lane, imported object and exact remote branch head before retry; "
+        "never infer authority to advance the existing lane from an imported object; use work-acquire for a successor lane"
+    ),
     "pr-base-converge": (
         "read back the same PR number, exact base SHA and current head before any retry; "
         "the exact-base merge plus exact-old-head Git CAS reconciles every non-successful push through remote-ref readback, and an outcome_unknown result must never be replayed or converted into a successor PR without fresh authoritative readback"
@@ -1162,6 +1197,12 @@ GRIP_RECOVERY_PATHS_BY_NAME = {
 # Conditional requirements cannot be expressed as static required_parameters,
 # so the published contract carries them explicitly per action.
 GRIP_CONDITIONAL_PRECONDITIONS = {
+    "remote-head-materialize": (
+        "lane_id must bind the supplied existing writer checkout and every lane resource lease must be live and owned by that lane",
+        "the effective remote must be SSH and the repository must be non-shallow; expected_remote_head must equal the advertised remote branch before, during and after object import; object import writes no FETCH_HEAD, tags, prune state or remote-tracking ref",
+        "expected_local_head must be an ancestor of expected_remote_head; after import the durable lane and live leases are revalidated under the lane lock and the existing branch/worktree must still be clean at expected_local_head",
+        "a differing remote head is handed off explicitly for successor work-acquire; this grip never moves the existing lane branch, pushes, changes PR metadata, merges a PR or grants Captain authority",
+    ),
     "pr-base-converge": (
         "the PR must still be OPEN, same-repository, on the requested base branch and exact expected head before dispatch; expected_base_sha must match a fresh live base-ref read",
         "the head branch must not be main/master; existing review, saga and Captain evidence is intentionally invalidated by any resulting head change and must be renewed",
@@ -1266,6 +1307,7 @@ MECHANIC_NORMAL_GRIPS = frozenset(
         "pr-check-readiness",
         "post-merge-sync",
         "branch-publish",
+        "remote-head-materialize",
         "pr-base-converge",
         "pr-create-or-update",
     }
@@ -1565,6 +1607,7 @@ def _default_command_runner(repo: Path, argv: list[str]) -> dict[str, Any]:
         {
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_GRAFT_FILE": os.devnull,
             "GIT_CONFIG_COUNT": str(len(command_config)),
             "GIT_PAGER": "cat",
             "PAGER": "cat",
@@ -6303,6 +6346,619 @@ def _open_pr_from_stdout(value: Any) -> dict[str, Any] | None:
     if not isinstance(item, dict):
         raise GripActionError("unexpected PR lookup item")
     return item
+
+
+
+def _validate_remote_materialization_target(
+    repo: Path,
+    remote: str,
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> str:
+    configured = _git_optional(
+        repo, runner, ["config", "--get-all", f"remote.{remote}.url"]
+    )
+    configured_urls = (
+        str(configured.get("stdout", "")).splitlines()
+        if int(configured.get("returncode", 1)) == 0
+        else []
+    )
+    effective = _git_optional(repo, runner, ["remote", "get-url", "--all", remote])
+    effective_urls = (
+        str(effective.get("stdout", "")).splitlines()
+        if int(effective.get("returncode", 1)) == 0
+        else []
+    )
+    if len(configured_urls) != 1 or len(effective_urls) != 1:
+        _check(receipt, "fetch_remote_target", "fail", "remote_url_count_not_one")
+        raise GripPreflightError(
+            "remote-head-materialize requires exactly one configured and effective remote URL"
+        )
+    rewrite_config = _git_optional(
+        repo,
+        runner,
+        ["config", "--get-regexp", r"^url\..*\.insteadof$"],
+    )
+    rewrite_returncode = int(rewrite_config.get("returncode", 1))
+    if rewrite_returncode not in {0, 1}:
+        _check(receipt, "fetch_remote_target", "fail", "url_rewrite_query_failed")
+        raise GripPreflightError(
+            "remote-head-materialize could not verify URL rewrite configuration"
+        )
+    effective_url = effective_urls[0]
+    if rewrite_returncode == 0:
+        for line in str(rewrite_config.get("stdout", "")).splitlines():
+            parts = line.split(maxsplit=1)
+            if len(parts) != 2 or not parts[1]:
+                _check(
+                    receipt,
+                    "fetch_remote_target",
+                    "fail",
+                    "malformed_url_rewrite_configuration",
+                )
+                raise GripPreflightError(
+                    "remote-head-materialize found malformed URL rewrite configuration"
+                )
+            if effective_url.startswith(parts[1]):
+                _check(
+                    receipt,
+                    "fetch_remote_target",
+                    "fail",
+                    "chained_url_rewrite",
+                )
+                raise GripPreflightError(
+                    "remote-head-materialize refuses a chained URL rewrite of the validated network target"
+                )
+    configured_identity = _remote_target_identity(configured_urls[0])
+    effective_identity = _remote_target_identity(effective_urls[0])
+    if configured_identity is None or effective_identity is None:
+        _check(receipt, "fetch_remote_target", "fail", "unsupported_network_target")
+        raise GripPreflightError(
+            "remote-head-materialize requires one supported network remote target"
+        )
+    if not effective_identity[3]:
+        _check(receipt, "fetch_remote_target", "fail", "effective_target_not_ssh")
+        raise GripPreflightError(
+            "remote-head-materialize requires one effective SSH remote target"
+        )
+    same_repository = effective_identity[:2] == configured_identity[:2]
+    if configured_identity[3] and effective_identity[3]:
+        same_user = effective_identity[2] == configured_identity[2]
+    elif effective_identity[3]:
+        same_user = effective_identity[2] in {"", "git"}
+    else:
+        same_user = True
+    if not same_repository or not same_user:
+        _check(receipt, "fetch_remote_target", "fail", "url_rewrite_changed_identity")
+        raise GripPreflightError(
+            "remote-head-materialize refuses URL rewriting that changes remote identity"
+        )
+    _check(
+        receipt,
+        "fetch_remote_target",
+        "pass",
+        "identity_preserving_rewrite"
+        if configured_urls[0] != effective_urls[0]
+        else "single_network_target",
+    )
+    return effective_urls[0]
+
+
+def _remote_materialization_pinned_target(remote_target: str) -> tuple[str, str]:
+    pinned = f"grabowski-pinned-{os.urandom(16).hex()}:"
+    return pinned, f"url.{remote_target}.insteadOf={pinned}"
+
+
+def _remote_materialization_head(
+    repo: Path,
+    remote: str,
+    branch: str,
+    receipt: Receipt,
+    runner: CommandRunner,
+    check_id: str,
+    expected_head: str,
+    *,
+    effect_started: bool = False,
+) -> str:
+    ref = f"refs/heads/{branch}"
+    failure = GripActionError if effect_started else GripPreflightError
+    try:
+        pinned_remote, pin_config = _remote_materialization_pinned_target(remote)
+        result = _git_optional(
+            repo,
+            runner,
+            [
+                "-c",
+                pin_config,
+                "ls-remote",
+                "--exit-code",
+                pinned_remote,
+                ref,
+            ],
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        _check(receipt, check_id, "fail", f"read_error={type(exc).__name__}")
+        raise failure(
+            "remote-head-materialize could not read the advertised remote branch"
+        ) from exc
+    try:
+        returncode = int(result.get("returncode", 1)) if isinstance(result, dict) else 1
+    except (TypeError, ValueError):
+        returncode = 1
+    if not isinstance(result, dict) or returncode != 0:
+        _check(receipt, check_id, "fail", "remote_read_failed")
+        raise failure(
+            "remote-head-materialize could not read the advertised remote branch"
+        )
+    lines = [
+        line for line in str(result.get("stdout", "")).splitlines() if line.strip()
+    ]
+    if len(lines) != 1:
+        _check(receipt, check_id, "fail", f"match_count={len(lines)}")
+        raise failure(
+            "remote-head-materialize requires exactly one advertised remote branch"
+        )
+    parts = lines[0].split()
+    head = parts[0].lower() if parts else ""
+    advertised_ref = parts[1] if len(parts) > 1 else ""
+    if (
+        len(head) != len(expected_head)
+        or re.fullmatch(r"[0-9a-f]+", head) is None
+        or advertised_ref != ref
+    ):
+        _check(receipt, check_id, "fail", "malformed_remote_readback")
+        raise failure(
+            "remote-head-materialize could not bind the advertised remote head"
+        )
+    _check(receipt, check_id, "pass", head)
+    return head
+
+
+def _run_remote_head_materialize(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    import sqlite3
+    from contextlib import contextmanager
+
+    import grabowski_resources as resources
+    import grabowski_work_acquire as work_acquire
+
+    del spec
+    repo = _repo_path(parameters)
+    lane_id = _string_parameter(parameters, "lane_id")
+    if re.fullmatch(r"[0-9a-f]{32}", lane_id) is None:
+        raise GripPreflightError(
+            "lane_id must be a 32-character lowercase hex Work Lane id"
+        )
+    expected_local_head = _sha_parameter(parameters, "expected_local_head").lower()
+    expected_remote_head = _sha_parameter(parameters, "expected_remote_head").lower()
+    if len(expected_local_head) != len(expected_remote_head):
+        raise GripPreflightError(
+            "remote-head-materialize bound heads must use one Git object format"
+        )
+    remote_branch = _short_branch_name(parameters, "remote_branch")
+    if remote_branch in INTRINSIC_PROTECTED_BRANCHES:
+        raise GripPreflightError(
+            "remote-head-materialize refuses protected remote branches"
+        )
+    remote = parameters.get("remote", "origin")
+    if (
+        not isinstance(remote, str)
+        or remote in {"", ".", ".."}
+        or REMOTE_NAME_RE.fullmatch(remote) is None
+    ):
+        raise GripPreflightError("remote must be one configured remote name")
+
+    try:
+        lane = work_acquire._stored_lane_inputs(lane_id)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        _check(receipt, "lane_binding", "fail", type(exc).__name__)
+        raise GripPreflightError(
+            "remote-head-materialize could not verify the durable Work Lane"
+        ) from exc
+    lane_path = Path(str(lane.get("target_path", ""))).expanduser().resolve(
+        strict=False
+    )
+    lane_branch = str(lane.get("branch", ""))
+    lane_owner = str(lane.get("lease_owner_id", ""))
+    if (
+        lane_path != repo
+        or not lane_branch
+        or lane_owner != f"lane:{lane_id}"
+    ):
+        _check(receipt, "lane_binding", "fail", "lane_identity_mismatch")
+        raise GripPreflightError(
+            "remote-head-materialize target does not match the Work Lane"
+        )
+    _check(receipt, "lane_binding", "pass", f"{lane_id}:{lane_branch}")
+
+    resource_keys = lane.get("resource_keys")
+    if (
+        not isinstance(resource_keys, list)
+        or not resource_keys
+        or not all(isinstance(item, str) and item for item in resource_keys)
+    ):
+        raise GripPreflightError(
+            "remote-head-materialize requires the exact Work Lane resource set"
+        )
+    def lane_lease_snapshots(
+        check_id: str, *, effect_started: bool = False
+    ) -> list[dict[str, Any]]:
+        message = (
+            "remote-head-materialize requires every Work Lane resource lease "
+            "to be live, lane-owned and readable"
+        )
+        try:
+            live = resources.inspect_resources(resource_keys)
+        except (
+            OSError,
+            PermissionError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+            sqlite3.Error,
+        ) as exc:
+            _check(receipt, check_id, "fail", type(exc).__name__)
+            if effect_started:
+                raise GripActionError(message) from exc
+            raise GripPreflightError(message) from exc
+        if (
+            not isinstance(live, dict)
+            or not all(isinstance(key, str) for key in live)
+            or not all(isinstance(value, dict) for value in live.values())
+        ):
+            _check(receipt, check_id, "fail", "invalid_resource_snapshot")
+            if effect_started:
+                raise GripActionError(message)
+            raise GripPreflightError(message)
+        missing = sorted(set(resource_keys) - set(live))
+        foreign = sorted(
+            key
+            for key, value in live.items()
+            if value.get("owner_id") != lane_owner
+        )
+        if missing or foreign:
+            _check(
+                receipt,
+                check_id,
+                "fail",
+                f"missing={len(missing)} foreign={len(foreign)}",
+            )
+            if effect_started:
+                raise GripActionError(message)
+            raise GripPreflightError(message)
+        _check(receipt, check_id, "pass", f"count={len(resource_keys)}")
+        return [live[key] for key in sorted(resource_keys)]
+
+    def validate_locked_lane(
+        lane_receipt_path: Path,
+        check_id: str,
+        *,
+        effect_started: bool = False,
+    ) -> None:
+        try:
+            locked_record = work_acquire._read_state(lane_receipt_path)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            _check(receipt, check_id, "fail", f"read_error={type(exc).__name__}")
+            message = (
+                "remote-head-materialize could not verify the durable Work Lane "
+                "during locked materialization validation"
+            )
+            if effect_started:
+                raise GripActionError(message) from exc
+            raise GripPreflightError(message) from exc
+        locked_inputs = (
+            locked_record.get("inputs")
+            if isinstance(locked_record, dict)
+            else None
+        )
+        lane_inactive = (
+            not isinstance(locked_record, dict)
+            or locked_record.get("lane_id") != lane_id
+            or locked_record.get("state") != "ready"
+            or locked_inputs != lane
+            or locked_record.get("terminal_closeout") is not None
+            or locked_record.get("terminal_closeout_pending") is not None
+        )
+        if lane_inactive:
+            _check(receipt, check_id, "fail", "lane_state_changed")
+            message = (
+                "remote-head-materialize Work Lane changed during "
+                "materialization validation"
+            )
+            if effect_started:
+                raise GripActionError(message)
+            raise GripPreflightError(message)
+        _check(receipt, check_id, "pass", "ready")
+
+    @contextmanager
+    def locked_lane(check_id: str, *, effect_started: bool = False):
+        try:
+            with work_acquire._lane_lock(lane_id) as lane_receipt_path:
+                yield lane_receipt_path
+        except (GripPreflightError, GripActionError):
+            raise
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            _check(receipt, check_id, "fail", f"lock_error={type(exc).__name__}")
+            message = (
+                "remote-head-materialize could not acquire or release the "
+                "durable Work Lane lock"
+            )
+            if effect_started:
+                raise GripActionError(message) from exc
+            raise GripPreflightError(message) from exc
+
+    def read_orientation(
+        check_id: str, *, effect_started: bool = False
+    ) -> dict[str, Any]:
+        message = "remote-head-materialize could not inspect the writer checkout"
+        try:
+            return _orient(repo, runner)
+        except (
+            GripPreflightError,
+            GripActionError,
+            KeyError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            _check(receipt, check_id, "fail", type(exc).__name__)
+            if effect_started:
+                raise GripActionError(message) from exc
+            raise GripPreflightError(message) from exc
+
+    with locked_lane("lane_lock_before_import") as lane_receipt_path:
+        validate_locked_lane(lane_receipt_path, "lane_active_before_import")
+        lane_lease_snapshots("lane_leases")
+
+    remote_target = _validate_remote_materialization_target(
+        repo, remote, receipt, runner
+    )
+    shallow = _git_optional(repo, runner, ["rev-parse", "--is-shallow-repository"])
+    if (
+        int(shallow.get("returncode", 1)) != 0
+        or str(shallow.get("stdout", "")).strip() != "false"
+    ):
+        _check(receipt, "non_shallow_repository", "fail", "shallow_or_unknown")
+        raise GripPreflightError(
+            "remote-head-materialize requires a non-shallow repository"
+        )
+    _check(receipt, "non_shallow_repository", "pass", "false")
+    orientation = read_orientation("writer_checkout_read")
+    if orientation["branch"] != lane_branch or orientation["dirty"]:
+        _check(receipt, "writer_checkout", "fail", "branch_or_cleanliness_mismatch")
+        raise GripPreflightError(
+            "remote-head-materialize requires the clean attached Work Lane branch"
+        )
+    if orientation["head"] not in {expected_local_head, expected_remote_head}:
+        _check(receipt, "local_head", "fail", str(orientation["head"]))
+        raise GripPreflightError(
+            "remote-head-materialize local head does not match a bound head"
+        )
+    _check(receipt, "writer_checkout", "pass", lane_branch)
+    _check(receipt, "local_head", "pass", str(orientation["head"]))
+
+    remote_before = _remote_materialization_head(
+        repo,
+        remote_target,
+        remote_branch,
+        receipt,
+        runner,
+        "remote_head_before",
+        expected_remote_head,
+    )
+    if remote_before != expected_remote_head:
+        raise GripPreflightError(
+            "remote-head-materialize expected_remote_head is stale"
+        )
+    ancestry_args = [
+        "--no-replace-objects",
+        "merge-base",
+        "--is-ancestor",
+        expected_local_head,
+        expected_remote_head,
+    ]
+    if orientation["head"] == expected_remote_head:
+        ancestry = _git_optional(
+            repo,
+            runner,
+            ancestry_args,
+        )
+        if int(ancestry.get("returncode", 1)) != 0:
+            _check(receipt, "fast_forward", "fail", "not_ancestor")
+            raise GripPreflightError(
+                "remote-head-materialize refuses a non-fast-forward update"
+            )
+        _check(receipt, "fast_forward", "pass", "ancestor")
+        with locked_lane("lane_lock_replay") as lane_receipt_path:
+            validate_locked_lane(lane_receipt_path, "lane_active_replay")
+
+            remote_after = _remote_materialization_head(
+                repo,
+                remote_target,
+                remote_branch,
+                receipt,
+                runner,
+                "remote_head_after",
+                expected_remote_head,
+            )
+            if remote_after != expected_remote_head:
+                raise GripPreflightError(
+                    "remote branch advanced during materialization readback"
+                )
+            final = read_orientation("lane_preserved_replay_read")
+            if (
+                final["branch"] != lane_branch
+                or final["head"] != expected_remote_head
+                or final["dirty"]
+            ):
+                _check(receipt, "lane_preserved", "fail", "writer_changed")
+                raise GripPreflightError(
+                    "remote-head-materialize writer lane changed during replay validation"
+                )
+            _check(receipt, "lane_preserved", "pass", expected_remote_head)
+            lane_lease_snapshots("lane_leases_replay")
+
+        _check(receipt, "object_import", "skip", "already_materialized")
+        _check(receipt, "post_state", "pass", expected_remote_head)
+        return {
+            "action": "unchanged",
+            "idempotent_replay": True,
+            "lane_id": lane_id,
+            "lane_owner_id": lane_owner,
+            "branch": lane_branch,
+            "remote": remote,
+            "remote_branch": remote_branch,
+            "old_head": expected_remote_head,
+            "new_head": expected_remote_head,
+            "imported_head": expected_remote_head,
+            "lane_preserved": True,
+            "next_action": None,
+        }
+
+    try:
+        fetch_remote, fetch_pin_config = _remote_materialization_pinned_target(
+            remote_target
+        )
+    except OSError as exc:
+        _check(receipt, "object_import", "fail", "pin_generation_failed")
+        raise GripPreflightError(
+            "remote-head-materialize could not bind the validated network target"
+        ) from exc
+    fetch = _git(
+        repo,
+        runner,
+        [
+            "-c",
+            fetch_pin_config,
+            "-c",
+            "protocol.ext.allow=never",
+            "-c",
+            "fetch.writeCommitGraph=false",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=false",
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--no-recurse-submodules",
+            "--no-prune",
+            "--refmap=",
+            "--upload-pack=git-upload-pack",
+            fetch_remote,
+            expected_remote_head,
+        ],
+    )
+    _check(
+        receipt,
+        "object_import",
+        "pass",
+        str(fetch.get("argv_sha256") or "exact_remote_head"),
+    )
+    commit = _git_optional(
+        repo,
+        runner,
+        ["rev-parse", "--verify", f"{expected_remote_head}^{{commit}}"],
+    )
+    if (
+        int(commit.get("returncode", 1)) != 0
+        or str(commit.get("stdout", "")).strip().lower()
+        != expected_remote_head
+    ):
+        raise GripActionError(
+            "remote-head-materialize exact remote commit was not materialized"
+        )
+    if (
+        _remote_materialization_head(
+            repo,
+            remote_target,
+            remote_branch,
+            receipt,
+            runner,
+            "remote_head_after_import",
+            expected_remote_head,
+            effect_started=True,
+        )
+        != expected_remote_head
+    ):
+        raise GripActionError(
+            "remote branch advanced during exact-head object import"
+        )
+    ancestry = _git_optional(
+        repo,
+        runner,
+        ancestry_args,
+    )
+    if int(ancestry.get("returncode", 1)) != 0:
+        _check(receipt, "fast_forward", "fail", "not_ancestor")
+        raise GripActionError(
+            "remote-head-materialize refuses a non-fast-forward update"
+        )
+    _check(receipt, "fast_forward", "pass", "ancestor")
+
+    with locked_lane(
+        "lane_lock_after_import", effect_started=True
+    ) as lane_receipt_path:
+        validate_locked_lane(
+            lane_receipt_path,
+            "lane_active_after_import",
+            effect_started=True,
+        )
+
+        remote_after = _remote_materialization_head(
+            repo,
+            remote_target,
+            remote_branch,
+            receipt,
+            runner,
+            "remote_head_after",
+            expected_remote_head,
+            effect_started=True,
+        )
+        if remote_after != expected_remote_head:
+            raise GripActionError(
+                "remote branch advanced after exact-head object import"
+            )
+
+        final = read_orientation(
+            "lane_preserved_after_import_read", effect_started=True
+        )
+        if (
+            final["branch"] != lane_branch
+            or final["head"] != expected_local_head
+            or final["dirty"]
+        ):
+            _check(receipt, "lane_preserved", "fail", "writer_changed")
+            raise GripActionError(
+                "remote-head-materialize writer lane changed during exact-head object import"
+            )
+        _check(receipt, "lane_preserved", "pass", expected_local_head)
+        lane_lease_snapshots("lane_leases_after_import", effect_started=True)
+
+    _check(receipt, "post_state", "pass", expected_local_head)
+    return {
+        "action": "object_imported",
+        "idempotent_replay": False,
+        "lane_id": lane_id,
+        "lane_owner_id": lane_owner,
+        "branch": lane_branch,
+        "remote": remote,
+        "remote_branch": remote_branch,
+        "old_head": expected_local_head,
+        "new_head": expected_local_head,
+        "imported_head": expected_remote_head,
+        "lane_preserved": True,
+        "next_action": "acquire_successor_lane_at_imported_head",
+        "does_not_establish": [
+            "successor Work Lane acquisition",
+            "existing writer branch advancement",
+        ],
+    }
 
 
 def _run_pr_base_converge(
@@ -15211,6 +15867,7 @@ _RUNNERS = {
     "captain_preflight": _run_captain_preflight,
     "captain_run": _run_captain_run,
     "branch_publish": _run_branch_publish,
+    "remote_head_materialize": _run_remote_head_materialize,
     "pr_base_converge": _run_pr_base_converge,
     "pr_create_or_update": _run_pr_create_or_update,
     "candidate_integration_ready": _run_candidate_integration_ready,
