@@ -68,6 +68,7 @@ class WatchdogHostAssetProjection:
 
 
 TUNNEL_SERVICE = "tunnel-client-grabowski.service"
+TUNNEL_CLIENT_VERSION_RE = re.compile(r"^tunnel-client-v[0-9]+\.[0-9]+\.[0-9]+$")
 OPERATOR_SERVICE = "grabowski-operator.service"
 OPERATOR_SERVICE_CONTROL_ACTION = "operator_system_service_control"
 ROOTBROKER_CUTOVER_ACTION = "operator_rootbroker_cutover"
@@ -2788,23 +2789,102 @@ def _service_main_pid(unit: str) -> int:
     return observation.main_pid
 
 
+def _expected_tunnel_client_argv(executable: Path) -> set[tuple[str, ...]]:
+    return {
+        (
+            str(executable),
+            "run",
+            "--profile",
+            core.PROFILE_NAME,
+        ),
+        (
+            str(executable),
+            "run",
+            f"--profile={core.PROFILE_NAME}",
+        ),
+    }
+
+
+def tunnel_unit_argv() -> list[str]:
+    result = core.run(
+        [
+            "systemctl",
+            "--user",
+            "show",
+            TUNNEL_SERVICE,
+            "--no-pager",
+            "--property=ExecStart",
+        ],
+        capture=True,
+        check=False,
+        timeout=core.TIMEOUTS["systemd_query"],
+    )
+    if result.returncode != 0:
+        core.fail("Tunnel-Service ExecStart konnte nicht gelesen werden")
+    lines = [line for line in result.stdout.splitlines() if line.startswith("ExecStart=")]
+    if len(lines) != 1:
+        core.fail("Tunnel-Service liefert keinen eindeutigen ExecStart")
+    return _parse_systemd_execstart(
+        lines[0].removeprefix("ExecStart="),
+        label="Tunnel-Service",
+    )
+
+
+def _verified_tunnel_client_path(path: Path) -> Path:
+    stable_path = core.HOME / ".local/bin/tunnel-client"
+    if path != stable_path and (
+        path.parent != stable_path.parent
+        or TUNNEL_CLIENT_VERSION_RE.fullmatch(path.name) is None
+    ):
+        core.fail("Tunnel-Service verwendet keinen gebundenen Tunnel-Client")
+    try:
+        linked = path.lstat()
+    except OSError:
+        core.fail("Tunnel-Client ist nicht sicher lesbar")
+    if (
+        statmod.S_ISLNK(linked.st_mode)
+        or not statmod.S_ISREG(linked.st_mode)
+        or linked.st_uid != os.geteuid()
+        or statmod.S_IMODE(linked.st_mode) & 0o022
+        or not statmod.S_IMODE(linked.st_mode) & statmod.S_IXUSR
+    ):
+        core.fail("Tunnel-Client ist keine sichere eigentümerkontrollierte Datei")
+    return path
+
+
+def _verified_tunnel_process_executable(pid: int, argv: list[str]) -> Path:
+    if not argv:
+        core.fail("Tunnel-Service verwendet nicht exakt den erwarteten Client")
+    observed_path = _verified_tunnel_client_path(Path(argv[0]))
+    executable = core.process_exe(pid)
+    if executable is None or executable.resolve() != observed_path.resolve():
+        core.fail("Tunnel-Service Prozesspfad stimmt nicht mit /proc/<pid>/exe überein")
+    return executable
+
+
 def verify_tunnel_process() -> dict[str, Any]:
+    stable_path = core.HOME / ".local/bin/tunnel-client"
+    unit_argv = tunnel_unit_argv()
+    if not unit_argv:
+        core.fail("Tunnel-Service ExecStart ist leer")
+    unit_path = _verified_tunnel_client_path(Path(unit_argv[0]))
+    if tuple(unit_argv) not in _expected_tunnel_client_argv(unit_path):
+        core.fail("Tunnel-Service ExecStart verwendet nicht exakt das erwartete Profil")
+
     pid = _service_main_pid(TUNNEL_SERVICE)
     argv = core.process_argv(pid)
-    expected_a = [
-        str(core.HOME / ".local/bin/tunnel-client"),
-        "run",
-        "--profile",
-        core.PROFILE_NAME,
-    ]
-    expected_b = [
-        str(core.HOME / ".local/bin/tunnel-client"),
-        "run",
-        f"--profile={core.PROFILE_NAME}",
-    ]
-    if tuple(argv) not in {tuple(expected_a), tuple(expected_b)}:
-        core.fail("Tunnel-Service verwendet nicht exakt den erwarteten Client")
-    return {"pid": pid, "argv": core.redact_argv(argv)}
+    observed_path = Path(argv[0]) if argv else stable_path
+    if tuple(argv) not in _expected_tunnel_client_argv(observed_path):
+        core.fail("Tunnel-Service verwendet nicht exakt das erwartete Profil")
+    executable = _verified_tunnel_process_executable(pid, argv)
+    if unit_path != stable_path and observed_path != unit_path:
+        core.fail("Tunnel-Service Prozess weicht vom versionierten ExecStart ab")
+    return {
+        "pid": pid,
+        "exe": str(executable),
+        "argv": core.redact_argv(argv),
+        "unit_argv": core.redact_argv(unit_argv),
+    }
 
 
 def expected_operator_argv(
@@ -2819,16 +2899,20 @@ def expected_operator_argv(
     ]
 
 
-def _parse_systemd_execstart(value: str) -> list[str]:
+def _parse_systemd_execstart(
+    value: str,
+    *,
+    label: str = "Operator-Service",
+) -> list[str]:
     matches = re.findall(r"argv\[\]=(.*?)\s;\signore_errors=", value)
     if len(matches) != 1:
-        core.fail("Operator-Service besitzt keinen eindeutigen ExecStart")
+        core.fail(f"{label} besitzt keinen eindeutigen ExecStart")
     try:
         argv = shlex.split(matches[0])
     except ValueError:
-        core.fail("Operator-Service ExecStart ist nicht strukturiert parsebar")
+        core.fail(f"{label} ExecStart ist nicht strukturiert parsebar")
     if not argv:
-        core.fail("Operator-Service ExecStart ist leer")
+        core.fail(f"{label} ExecStart ist leer")
     return argv
 
 
