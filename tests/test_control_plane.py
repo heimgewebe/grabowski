@@ -2954,6 +2954,34 @@ class SecretPtyContractTests(unittest.TestCase):
         self.assertNotIn("secret_echo_detected", result)
         self.assertNotIn(bytes(secret).decode(), json.dumps(result))
 
+    def test_secret_pty_duplicate_prompt_contract_fails_before_spawn(self) -> None:
+        root_tool = _load_root_broker_tool()
+        secret = bytearray(os.urandom(24).hex().encode())
+        execution = self._pty_execution(
+            "raise SystemExit(0)",
+            ["LUKS passphrase: ", "LUKS passphrase: "],
+        )
+        with self.assertRaisesRegex(PermissionError, "prompt contract"):
+            root_tool._run_secret_pty_process(
+                execution=execution, secret=secret, peer_alive=lambda: True
+            )
+
+    def test_secret_pty_echo_detection_survives_prompt_window_trimming(self) -> None:
+        root_tool = _load_root_broker_tool()
+        secret = bytearray(os.urandom(64).hex().encode())
+        execution = self._pty_execution(
+            "import sys; sys.stdout.write('x' * 70000); sys.stdout.flush(); "
+            "input('LUKS passphrase: ')",
+            ["LUKS passphrase: "],
+        )
+        result = root_tool._run_secret_pty_process(
+            execution=execution, secret=secret, peer_alive=lambda: True
+        )
+        self.assertEqual(result["outcome"], "UNCLEAR")
+        self.assertEqual(result["failure_reason"], "secret-echo")
+        self.assertTrue(result["readback_required"])
+        self.assertNotIn(bytes(secret).decode(), json.dumps(result))
+
     def test_secret_pty_echo_is_detected_without_returning_secret(self) -> None:
         root_tool = _load_root_broker_tool()
         secret = bytearray(os.urandom(24).hex().encode())

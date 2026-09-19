@@ -264,6 +264,10 @@ def _run_secret_pty_process(
     ):
         raise PermissionError("secret PTY output bound is invalid")
     prompt_bytes = [item.encode("utf-8") for item in prompts]
+    if not prompt_bytes or len(set(prompt_bytes)) != len(prompt_bytes):
+        raise PermissionError("secret PTY prompt contract is invalid")
+    if not secret:
+        raise PermissionError("secret PTY secret is empty")
     started = time.monotonic()
     pid, master_fd = pty.fork()
     if pid == 0:
@@ -279,6 +283,8 @@ def _run_secret_pty_process(
     timed_out = False
     status: int | None = None
     window = bytearray()
+    echo_tail = bytearray()
+    echo_tail_limit = max(0, len(secret) - 1)
     try:
         while status is None:
             if time.monotonic() - started >= timeout:
@@ -309,10 +315,15 @@ def _run_secret_pty_process(
                     if bytes_seen > output_limit:
                         failure_reason = "output-limit"
                         break
-                    window.extend(chunk)
-                    if bytes(secret) in window:
+                    echo_tail.extend(chunk)
+                    if secret in echo_tail:
                         failure_reason = "secret-echo"
                         break
+                    if echo_tail_limit == 0:
+                        echo_tail.clear()
+                    elif len(echo_tail) > echo_tail_limit:
+                        del echo_tail[: len(echo_tail) - echo_tail_limit]
+                    window.extend(chunk)
                     while prompt_index < len(prompt_bytes):
                         positions = [
                             (index, window.find(prompt))
