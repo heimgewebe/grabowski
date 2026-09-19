@@ -3145,6 +3145,16 @@ class OperatorContractTests(unittest.TestCase):
         self.assertEqual(operator._redact_argv(argv), argv)
         self.assertEqual(operator._argv_secret_values(argv), [])
 
+    def test_argv_redaction_does_not_treat_path_text_before_unrelated_equals_as_sensitive(self) -> None:
+        operator = _load_operator_module()
+        argv = [
+            "/tmp/t203-secret-worktree/cache=123456789",
+            "https://example.invalid/secret-worktree/download?version=123456789",
+            "stdout.log",
+        ]
+        self.assertEqual(operator._redact_argv(argv), argv)
+        self.assertEqual(operator._argv_secret_values(argv), [])
+
     def test_argv_redaction_preserves_sensitive_option_and_assignment_contract(self) -> None:
         operator = _load_operator_module()
         token = "plain-secret-value-12345"
@@ -3172,13 +3182,19 @@ class OperatorContractTests(unittest.TestCase):
             [token, password, env_secret],
         )
 
-    def test_argv_redaction_preserves_equals_form_detection_outside_options(self) -> None:
+    def test_argv_redaction_preserves_sensitive_query_parameters(self) -> None:
         operator = _load_operator_module()
         query_secret = "query-secret-value-45678"
-        query = f"https://example.invalid/path?secret={query_secret}"
+        query = (
+            "https://example.invalid/path?version=1"
+            f"&secret={query_secret}&mode=raw"
+        )
         self.assertEqual(
             operator._redact_argv([query]),
-            ["https://example.invalid/path?secret=<REDACTED>"],
+            [
+                "https://example.invalid/path?version=1"
+                "&secret=<REDACTED>&mode=raw"
+            ],
         )
         self.assertEqual(operator._argv_secret_values([query]), [query_secret])
 
