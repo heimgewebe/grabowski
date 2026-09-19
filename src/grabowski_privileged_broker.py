@@ -1729,17 +1729,22 @@ def validate_secret_pty_session_authority(
     leases = session_authority.get("resource_leases")
     if not isinstance(leases, list):
         raise PermissionError("secret PTY session lease binding is unavailable")
-    lease_keys = {
+    lease_key_list = [
         lease.get("resource_key")
         for lease in leases
         if isinstance(lease, dict)
-    }
+    ]
+    lease_keys = set(lease_key_list)
     required_keys = execution.get("required_resource_keys")
     if (
-        not isinstance(required_keys, list)
-        or not set(required_keys).issubset(lease_keys)
+        len(lease_key_list) != len(leases)
+        or len(lease_keys) != len(lease_key_list)
+        or not isinstance(required_keys, list)
+        or set(required_keys) != lease_keys
     ):
-        raise PermissionError("secret PTY required resource lease is missing")
+        raise PermissionError(
+            "secret PTY resource lease set differs from root-owned action contract"
+        )
     return dict(session_authority)
 
 

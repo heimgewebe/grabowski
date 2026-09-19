@@ -12669,7 +12669,12 @@ def _secret_pty_grip_dispatcher(request: dict[str, Any]) -> dict[str, Any]:
             ttl_seconds=SECRET_PTY_GRIP_LEASE_TTL_SECONDS,
             metadata=lease_metadata,
         )
+        preserved = lease_result.get("preserved")
         candidate_acquired = lease_result.get("leases")
+        if not isinstance(preserved, list) or preserved:
+            raise RuntimeError(
+                "secret PTY resource acquisition must be fresh; preserved leases are forbidden"
+            )
         if (
             not isinstance(candidate_acquired, list)
             or len(candidate_acquired) != len(required_keys)
@@ -12680,9 +12685,18 @@ def _secret_pty_grip_dispatcher(request: dict[str, Any]) -> dict[str, Any]:
             for lease in candidate_acquired
             if isinstance(lease, dict)
         }
-        acquired = [dict(acquired_by_key[key]) for key in sorted(required_keys)]
         if set(acquired_by_key) != set(required_keys):
             raise RuntimeError("secret PTY resource acquisition returned wrong keys")
+        if any(
+            lease.get("owner_id") != owner_id
+            or lease.get("purpose") != lease_purpose
+            or lease.get("metadata_sha256") != expected_lease_metadata_sha256
+            for lease in acquired_by_key.values()
+        ):
+            raise RuntimeError(
+                "secret PTY resource acquisition is not bound to the current request"
+            )
+        acquired = [dict(acquired_by_key[key]) for key in sorted(required_keys)]
         authority_leases = [
             _secret_pty_authority_lease_snapshot(acquired_by_key[key])
             for key in sorted(required_keys)

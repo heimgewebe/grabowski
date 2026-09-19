@@ -2834,6 +2834,25 @@ class SecretPtyContractTests(unittest.TestCase):
             privileged_broker.validate_secret_pty_session_authority(
                 mismatched, execution
             )
+        extra = self._session_authority("e" * 64)
+        extra_lease = dict(extra["resource_leases"][0])
+        extra_lease["resource_key"] = "component:unrelated"
+        extra["resource_leases"] = [
+            *extra["resource_leases"],
+            extra_lease,
+        ]
+        extra["resource_lease_bindings_sha256"] = (
+            privileged_broker.canonical_sha256(extra["resource_leases"])
+        )
+        unsigned = dict(extra)
+        unsigned.pop("authority_sha256")
+        extra["authority_sha256"] = privileged_broker.canonical_sha256(unsigned)
+        with self.assertRaisesRegex(
+            PermissionError, "lease set differs"
+        ):
+            privileged_broker.validate_secret_pty_session_authority(
+                extra, execution
+            )
         unsafe = self._secret_pty_config()
         unsafe["actions"]["operator_secret_pty_getpass_probe"]["argv"] = [
             "/bin/sh", "-c", "true"

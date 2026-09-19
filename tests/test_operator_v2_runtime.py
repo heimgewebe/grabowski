@@ -3091,20 +3091,33 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             source = secret / "probe-value"
             source.write_text("typed-secret-pty-value", encoding="utf-8")
             source_sha = _sha256(source)
-            leases = [{
-                "resource_key": "host:heim-pc",
-                "owner_id": "task:GRABOWSKI-OPERATOR-SURFACE-V1-T172",
-                "acquired_at_unix": 1000,
-                "updated_at_unix": 1000,
-                "expires_at_unix": 9_999_999_999,
-                "metadata_sha256": "d" * 64,
-            }]
+            leases = []
             release_calls = []
             resources = types.ModuleType("grabowski_resources")
             resources.inspect_resources = lambda _keys: {}
-            resources.acquire_resources = lambda *_args, **_kwargs: {
-                "leases": leases
-            }
+
+            def acquire_resources(owner, keys, *, purpose, metadata, **_kwargs):
+                metadata_sha = hashlib.sha256(
+                    json.dumps(
+                        metadata,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                current = [{
+                    "resource_key": key,
+                    "owner_id": owner,
+                    "purpose": purpose,
+                    "acquired_at_unix": 1000,
+                    "updated_at_unix": 1000,
+                    "expires_at_unix": 9_999_999_999,
+                    "metadata_sha256": metadata_sha,
+                } for key in keys]
+                leases[:] = current
+                return {"leases": current, "preserved": []}
+
+            resources.acquire_resources = acquire_resources
             def release_resources(*args, **kwargs):
                 release_calls.append((args, kwargs))
                 return {"released": leases}
@@ -3311,6 +3324,105 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             )
             temp_root = state / "secret-pty-grip"
             self.assertEqual([], list(temp_root.iterdir()))
+
+    def test_secret_pty_grip_dispatcher_rejects_preserved_same_owner_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _work, secret, _browser, _export, _state, *patches = (
+                self._patched_runtime(root)
+            )
+            source = secret / "probe-value"
+            source.write_text("fresh-only-secret-pty-value", encoding="utf-8")
+            source_sha = _sha256(source)
+            owner_id = "task:GRABOWSKI-OPERATOR-SURFACE-V1-T172"
+            foreign = {
+                "resource_key": "host:heim-pc",
+                "owner_id": owner_id,
+                "purpose": "T172 typed secret PTY double-getpass probe",
+                "acquired_at_unix": 1000,
+                "updated_at_unix": 1000,
+                "expires_at_unix": 9_999_999_999,
+                "metadata_sha256": "9" * 64,
+            }
+            inspect_calls = 0
+            resources = types.ModuleType("grabowski_resources")
+
+            def inspect_resources(_keys):
+                nonlocal inspect_calls
+                inspect_calls += 1
+                return {} if inspect_calls == 1 else {"host:heim-pc": dict(foreign)}
+
+            resources.inspect_resources = inspect_resources
+            resources.acquire_resources = lambda *_args, **_kwargs: {
+                "leases": [dict(foreign)],
+                "preserved": [dict(foreign)],
+            }
+            resources.release_resources = (
+                lambda *_args, **_kwargs:
+                (_ for _ in ()).throw(AssertionError("foreign preserved lease must not be released"))
+            )
+
+            broker = types.ModuleType("grabowski_privileged_broker")
+            broker.resolve_secret_pty_execution = lambda *_args: {
+                "mode": "secret-pty",
+                "prompt_sequence": [
+                    "LUKS passphrase: ",
+                    "Repeat LUKS passphrase: ",
+                ],
+                "max_secret_bytes": 4096,
+                "required_resource_keys": ["host:heim-pc"],
+                "authority_task_id": "GRABOWSKI-OPERATOR-SURFACE-V1-T172",
+            }
+            audits = []
+            with (
+                patches[0], patches[1], patches[2], patches[3], patches[4],
+                patch.dict(
+                    sys.modules,
+                    {
+                        "grabowski_resources": resources,
+                        "grabowski_privileged_broker": broker,
+                    },
+                ),
+                patch.object(
+                    grabowski_mcp,
+                    "_secret_pty_grip_contract",
+                    return_value=({}, {}, "b" * 64),
+                ),
+                patch.object(grabowski_mcp, "_require_mutations_enabled"),
+                patch.object(grabowski_mcp, "_require_capability"),
+                patch.object(grabowski_mcp, "_require_valid_audit_chain"),
+                patch.object(
+                    grabowski_mcp,
+                    "_append_audit",
+                    side_effect=lambda value: audits.append(dict(value)),
+                ),
+                patch.object(
+                    grabowski_mcp.uuid,
+                    "uuid4",
+                    return_value=types.SimpleNamespace(hex="c" * 32),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "outcome is unclear",
+                ):
+                    grabowski_mcp._secret_pty_grip_dispatcher(
+                        {
+                            "source_path": str(source),
+                            "expected_source_sha256": source_sha,
+                        }
+                    )
+
+            unclear = [
+                item for item in audits
+                if item.get("operation") == "secret-pty-grip-acquisition-unclear"
+            ]
+            self.assertEqual(1, len(unclear))
+            self.assertEqual(owner_id, unclear[0]["owner_id"])
+            self.assertNotIn(
+                "fresh-only-secret-pty-value",
+                json.dumps(unclear[0], sort_keys=True),
+            )
 
     def test_secret_pty_grip_dispatcher_reconciles_partial_ambiguous_acquisition(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
