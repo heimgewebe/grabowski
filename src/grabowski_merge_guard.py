@@ -3628,29 +3628,63 @@ class CaptainMergeGuardRunner:
         max_pages: int = 1,
         max_items: int = 100,
     ) -> list[dict[str, Any]] | None:
-        pages = self._codex_api_json(
-            args,
-            label=label,
-            observations=observations,
-            errors=errors,
-        )
         if (
-            not isinstance(pages, list)
-            or any(not isinstance(page, list) for page in pages)
+            max_pages < 1
+            or max_items < 1
+            or args.count("--paginate") != 1
+            or args.count("--slurp") != 1
         ):
             errors.append(f"merge_guard_codex_{label}_pages_invalid")
             return None
-        if not pages or len(pages) > max_pages:
-            errors.append(f"merge_guard_codex_{label}_truncated")
+        page_args = [item for item in args if item not in {"--paginate", "--slurp"}]
+        endpoint_indexes = [
+            index
+            for index, item in enumerate(page_args)
+            if item.startswith(("repos/", "orgs/", "enterprises/"))
+        ]
+        if len(endpoint_indexes) != 1:
+            errors.append(f"merge_guard_codex_{label}_pages_invalid")
             return None
-        flattened = [item for page in pages for item in page]
-        if len(flattened) > max_items:
-            errors.append(f"merge_guard_codex_{label}_truncated")
+        endpoint_index = endpoint_indexes[0]
+        endpoint = page_args[endpoint_index]
+        query_fields = (
+            endpoint.split("?", 1)[1].split("&") if "?" in endpoint else []
+        )
+        if any(field.startswith("page=") for field in query_fields):
+            errors.append(f"merge_guard_codex_{label}_pages_invalid")
             return None
-        if any(not isinstance(item, dict) for item in flattened):
-            errors.append(f"merge_guard_codex_{label}_item_invalid")
-            return None
-        return [dict(item) for item in flattened]
+
+        flattened: list[dict[str, Any]] = []
+        # Fetch at most the allowed pages plus one bounded sentinel page. The
+        # sentinel proves that the history did not silently continue beyond the
+        # configured bound without asking gh to eagerly paginate the full PR.
+        for page_number in range(1, max_pages + 2):
+            separator = "&" if "?" in endpoint else "?"
+            current_args = list(page_args)
+            current_args[endpoint_index] = f"{endpoint}{separator}page={page_number}"
+            page = self._codex_api_json(
+                current_args,
+                label=label,
+                observations=observations,
+                errors=errors,
+            )
+            if not isinstance(page, list) or any(
+                not isinstance(item, dict) for item in page
+            ):
+                errors.append(f"merge_guard_codex_{label}_pages_invalid")
+                return None
+            if page_number > max_pages:
+                if page:
+                    errors.append(f"merge_guard_codex_{label}_truncated")
+                    return None
+                break
+            if len(flattened) + len(page) > max_items:
+                errors.append(f"merge_guard_codex_{label}_truncated")
+                return None
+            flattened.extend(dict(item) for item in page)
+            if not page:
+                break
+        return flattened
 
     def _codex_single_page(
         self,

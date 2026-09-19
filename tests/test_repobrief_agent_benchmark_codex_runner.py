@@ -3042,5 +3042,25 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 self.assertFalse(marker.exists())
 
 
+    def test_source_bootstrap_path_identity_comes_from_open_descriptor(self) -> None:
+        source = BOOTSTRAP_PATH.read_text(encoding="utf-8")
+        prefix, separator, _tail = source.rpartition("\n_main()")
+        self.assertTrue(separator)
+        namespace: dict[str, object] = {"__name__": "bootstrap_test"}
+        exec(compile(prefix, str(BOOTSTRAP_PATH), "exec"), namespace)
+        read_target = namespace["_read_target"]
+        self.assertTrue(callable(read_target))
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "entrypoint.py"
+            target.write_bytes(b"VALUE = 1\n")
+            attacker = Path(directory) / "attacker.py"
+            with patch.object(Path, "resolve", return_value=attacker):
+                raw, identity = read_target(target)
+        self.assertEqual(raw, b"VALUE = 1\n")
+        self.assertEqual(identity["path"], str(target))
+        self.assertEqual(identity["name"], target.name)
+
+
+
 if __name__ == "__main__":
     unittest.main()

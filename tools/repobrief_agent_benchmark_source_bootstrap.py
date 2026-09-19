@@ -81,40 +81,53 @@ def _read_target(path: Path) -> tuple[bytes, dict[str, object]]:
                 break
             data.extend(chunk)
         after_descriptor = os.fstat(descriptor)
+        try:
+            descriptor_path = os.readlink(f"/proc/self/fd/{descriptor}")
+        except OSError as exc:
+            raise RuntimeError(
+                "immutable source bootstrap cannot bind the opened target path"
+            ) from exc
+        if (
+            not os.path.isabs(descriptor_path)
+            or descriptor_path.endswith(" (deleted)")
+        ):
+            raise RuntimeError(
+                "immutable source bootstrap opened target path is unavailable"
+            )
+        after = requested.lstat()
+        identity_after_descriptor = (
+            after_descriptor.st_dev,
+            after_descriptor.st_ino,
+            after_descriptor.st_mode,
+            after_descriptor.st_size,
+            after_descriptor.st_mtime_ns,
+            after_descriptor.st_ctime_ns,
+        )
+        identity_after_path = (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if (
+            identity_after_descriptor != identity_before
+            or identity_after_path != identity_before
+            or len(data) != before.st_size
+            or len(data) > MAX_SOURCE_BYTES
+        ):
+            raise RuntimeError("immutable source bootstrap target changed during capture")
+        resolved = Path(descriptor_path)
+        raw = bytes(data)
+        return raw, {
+            "path": str(resolved),
+            "name": resolved.name,
+            "bytes": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
     finally:
         os.close(descriptor)
-    after = requested.lstat()
-    identity_after_descriptor = (
-        after_descriptor.st_dev,
-        after_descriptor.st_ino,
-        after_descriptor.st_mode,
-        after_descriptor.st_size,
-        after_descriptor.st_mtime_ns,
-        after_descriptor.st_ctime_ns,
-    )
-    identity_after_path = (
-        after.st_dev,
-        after.st_ino,
-        after.st_mode,
-        after.st_size,
-        after.st_mtime_ns,
-        after.st_ctime_ns,
-    )
-    if (
-        identity_after_descriptor != identity_before
-        or identity_after_path != identity_before
-        or len(data) != before.st_size
-        or len(data) > MAX_SOURCE_BYTES
-    ):
-        raise RuntimeError("immutable source bootstrap target changed during capture")
-    resolved = requested.resolve(strict=True)
-    raw = bytes(data)
-    return raw, {
-        "path": str(resolved),
-        "name": resolved.name,
-        "bytes": len(raw),
-        "sha256": hashlib.sha256(raw).hexdigest(),
-    }
 
 
 def _main() -> None:
