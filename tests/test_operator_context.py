@@ -397,6 +397,19 @@ print(json.dumps(runtime.resolve_host_capability({intent!r}), sort_keys=True))
         )
         self.assertIs(browser["transport"]["loopback_only"], True)
         self.assertEqual(browser["profile"]["default"], "ephemeral")
+        self.assertIn("recurring authenticated provider work", browser["decision_rule"])
+        self.assertIn("operator_profile", browser["decision_rule"])
+        self.assertIn(
+            "${HOME}/.local/state/grabowski/browser-profiles",
+            browser["decision_rule"],
+        )
+        self.assertIn("controlled worker restarts", browser["decision_rule"])
+        self.assertIn("target_unavailable", browser["decision_rule"])
+        self.assertIn("unbounded retry", browser["decision_rule"])
+        self.assertEqual(
+            browser["profile"]["persistent_profile_policy"],
+            "explicit-configured-root-only",
+        )
         self.assertIs(browser["human_browser_default"]["preserve"], True)
         self.assertEqual(browser["human_browser_default"]["browser"], "brave")
 
@@ -413,6 +426,9 @@ print(json.dumps(runtime.resolve_host_capability({intent!r}), sort_keys=True))
 
         entry = (ROOT / "GRABOWSKI.md").read_text(encoding="utf-8")
         self.assertIn("browser_operator_contract", entry)
+        self.assertIn("operator_profile", entry)
+        self.assertIn("~/.local/state/grabowski/browser-profiles", entry)
+        self.assertIn("reuse that same name", entry)
         runtime = (ROOT / "src" / "grabowski_runtime_extensions.py").read_text(
             encoding="utf-8"
         )

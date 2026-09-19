@@ -761,7 +761,7 @@
   "browser_operator_default": {
     "schema_version": 2,
     "authority": "grabowski",
-    "decision_rule": "Use this path by default for agent browser work unless a concrete task requirement cannot be satisfied by it.",
+    "decision_rule": "Use the canonical agent browser path by default. For recurring authenticated provider work, start with a stable named operator_profile, resolve it under ${HOME}/.local/state/grabowski/browser-profiles, and reuse the same name after controlled worker restarts. Keep one-off work ephemeral, never use normal human desktop browser profiles, and treat target_unavailable as a bounded stop/restart condition rather than an unbounded retry.",
     "canonical_browser": {
       "family": "chrome-stable",
       "vendor": "google",
@@ -808,7 +808,7 @@
     "profile": {
       "default": "ephemeral",
       "human_profile_reuse": false,
-      "persistent_profile_policy": "explicit-auth-or-trust-scope-only",
+      "persistent_profile_policy": "explicit-configured-root-only",
       "exclusive_profile_lease": true
     },
     "lifecycle": [

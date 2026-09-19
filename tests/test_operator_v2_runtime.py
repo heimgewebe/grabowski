@@ -2823,6 +2823,20 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                 self.assertIn("sha256", cookies_result)
                 self.assertNotIn("secret-cookie", json.dumps(cookies_result))
 
+    def test_managed_operator_browser_profile_is_opaque_to_profile_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _work, _secret, browser, _export, _state, *patches = self._patched_runtime(root)
+            prefs = browser / "Preferences"
+            prefs.write_text('{"session":"must-not-export"}\n', encoding="utf-8")
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patch.object(
+                grabowski_mcp, "OPERATOR_BROWSER_PROFILE_ROOT", browser
+            ):
+                with self.assertRaisesRegex(PermissionError, "opaque"):
+                    grabowski_mcp.grabowski_browser_profile_read(str(browser))
+                with self.assertRaisesRegex(PermissionError, "opaque"):
+                    grabowski_mcp.grabowski_browser_profile_read(str(prefs))
+
     def test_secret_use_rejects_secret_variants_in_argv_and_environment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

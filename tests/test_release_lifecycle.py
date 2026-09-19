@@ -265,6 +265,16 @@ class ReleaseLifecycleConsistencyTests(unittest.TestCase):
             browser["semantic_gateway"]["readback_grants_retry_authority"]
         )
         self.assertEqual(browser["profile"]["default"], "ephemeral")
+        self.assertEqual(
+            browser["profile"]["persistent_profile_policy"],
+            "explicit-configured-root-only",
+        )
+        self.assertIn("operator_profile", browser["decision_rule"])
+        self.assertIn(
+            "${HOME}/.local/state/grabowski/browser-profiles",
+            browser["decision_rule"],
+        )
+        self.assertIn("target_unavailable", browser["decision_rule"])
         # The embedded contract and the snapshotted contract file are identical.
         self.assertEqual(
             contract,
