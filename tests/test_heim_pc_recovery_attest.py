@@ -26,6 +26,8 @@ def _fixture(tmp_path: Path):
         "evidence_id": EVIDENCE_ID,
         "evidence_scope": SCOPE,
         "producer": PRODUCER,
+        "provenance_kind": "heim_pc.nixos_recovery_evidence_provenance",
+        "evidence_schema": SCHEMA,
         "source_revision": SOURCE,
         "recovery_contract_sha256": CONTRACT,
         "observed_at": "2026-09-19T08:00:00Z",
@@ -120,13 +122,38 @@ class RecoveryAttestationTest(unittest.TestCase):
                     expected_recovery_contract_sha256=CONTRACT,
                 )
 
-    def test_validate_restore_schema_is_bound(self):
+    def test_validate_rejects_cross_use_of_evidence_receipt_for_restore(self):
         with tempfile.TemporaryDirectory() as tmp:
             provenance, receipt = _fixture(Path(tmp))
             value = json.loads(provenance.read_text())
             value["kind"] = "heim_pc.nixos_recovery_restore_test_provenance"
             value["evidence_schema"] = SCHEMA + ".restore_test"
             value["evidence"]["kind"] = SCHEMA + ".restore_test"
+            _write(provenance, value)
+            with self.assertRaisesRegex(ValidationError, "provenance_kind mismatch"):
+                validate(
+                    provenance,
+                    receipt,
+                    expected_source_revision=SOURCE,
+                    expected_recovery_contract_sha256=CONTRACT,
+                )
+
+    def test_validate_restore_schema_is_bound(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            provenance, receipt = _fixture(Path(tmp))
+            receipt_value = json.loads(receipt.read_text())
+            receipt_value["provenance_kind"] = (
+                "heim_pc.nixos_recovery_restore_test_provenance"
+            )
+            receipt_value["evidence_schema"] = SCHEMA + ".restore_test"
+            _write(receipt, receipt_value)
+            receipt_sha = hashlib.sha256(receipt.read_bytes()).hexdigest()
+
+            value = json.loads(provenance.read_text())
+            value["kind"] = "heim_pc.nixos_recovery_restore_test_provenance"
+            value["evidence_schema"] = SCHEMA + ".restore_test"
+            value["evidence"]["kind"] = SCHEMA + ".restore_test"
+            value["evidence"]["producer_receipt_sha256"] = receipt_sha
             _write(provenance, value)
             result = validate(
                 provenance,
