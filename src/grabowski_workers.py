@@ -285,7 +285,23 @@ def _browser_adapter_policy(
         or "/google/chrome/" in normalized
         or name == "chrome"
     ):
-        nonstable = any(channel in normalized for channel in ("beta", "unstable", "dev"))
+        # Browser channel is an executable/install identity, not a property of
+        # arbitrary ancestor directories.  In particular, temporary test paths
+        # may legitimately contain strings such as "dev".
+        normalized_name = name.replace("_", "-")
+        parent_name = path.parent.name.lower().replace("_", "-")
+        nonstable_names = {
+            "google-chrome-beta",
+            "google-chrome-unstable",
+            "google-chrome-dev",
+            "chrome-beta",
+            "chrome-unstable",
+            "chrome-dev",
+        }
+        nonstable = (
+            normalized_name in nonstable_names
+            or parent_name in nonstable_names
+        )
         family = "chrome-nonstable" if nonstable else "chrome-stable"
         vendor = "google"
         adapter_id = "chrome-cdp"

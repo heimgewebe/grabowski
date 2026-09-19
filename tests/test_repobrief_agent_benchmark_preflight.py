@@ -8,6 +8,7 @@ import json
 import os
 import signal
 import shutil
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -16,6 +17,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
+BOOTSTRAP_PATH = ROOT / "tools" / "repobrief_agent_benchmark_source_bootstrap.py"
 SUPPORT_PATH = Path(__file__).resolve().parent / "repobrief_agent_benchmark_preflight_cases.py"
 SPEC = importlib.util.spec_from_file_location(
     "repobrief_agent_benchmark_preflight_cases", SUPPORT_PATH
@@ -25,6 +27,27 @@ if SPEC is None or SPEC.loader is None:
 support = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = support
 SPEC.loader.exec_module(support)
+
+
+def _load_tool_module(name: str, filename: str):
+    path = ROOT / "tools" / filename
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {filename}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+codex_runner = _load_tool_module(
+    "repobrief_agent_benchmark_codex_runner_for_preflight_tests",
+    "repobrief_agent_benchmark_codex_runner.py",
+)
+codex_preflight = _load_tool_module(
+    "repobrief_agent_benchmark_codex_preflight_for_tests",
+    "repobrief_agent_benchmark_codex_preflight.py",
+)
 
 _ORIGINAL_EXECUTE_PREFLIGHT = support.preflight.execute_preflight
 _TEST_PROVIDER_BINDING_ISSUED_AT: dict[Path, str] = {}
@@ -1265,7 +1288,7 @@ class RepoBriefAgentBenchmarkPreflightLedgerTests(unittest.TestCase):
             events = support.ledger_events(root / "state")
             self.assertEqual(
                 [event["event"] for event in events],
-                ["authorized", "preflight-failed"],
+                ["preflight-failed"],
             )
             self.assertEqual(events[-1]["payload"]["fixture_intents"], 0)
             self.assertFalse(events[-1]["payload"]["retry_permitted"])
@@ -1511,9 +1534,42 @@ class RepoBriefAgentBenchmarkPreflightLedgerTests(unittest.TestCase):
             events = support.ledger_events(root / "state")
             self.assertEqual(
                 [event["event"] for event in events],
-                ["authorized", "preflight-failed"],
+                ["preflight-failed"],
             )
             self.assertEqual(events[-1]["payload"]["fixture_intents"], 0)
+
+    def test_source_mutation_before_authorization_publishes_no_authorization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = support.fixture_environment(root)
+            kwargs = _fixture_kwargs(root, environment)
+            original = support.preflight._core.source_state
+            calls = 0
+
+            def mutating_source_state(source: Path) -> dict:
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    (source / "mutation-before-authorization.txt").write_text(
+                        "changed", encoding="utf-8"
+                    )
+                return original(source)
+
+            with mock.patch.object(
+                support.preflight._core,
+                "source_state",
+                side_effect=mutating_source_state,
+            ):
+                with self.assertRaisesRegex(
+                    support.preflight.PreflightError, "source checkout changed"
+                ):
+                    _ORIGINAL_EXECUTE_PREFLIGHT(**kwargs)
+            pair_root = next((root / "state" / "preflight-dispatch-ledger").iterdir())
+            self.assertFalse((pair_root / "authorization.json").exists())
+            events = support.ledger_events(root / "state")
+            self.assertEqual([event["event"] for event in events], ["preflight-failed"])
+            self.assertEqual(events[-1]["payload"]["fixture_intents"], 0)
+            self.assertFalse(events[-1]["payload"]["retry_permitted"])
 
     def test_source_mutation_records_terminal_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1526,7 +1582,7 @@ class RepoBriefAgentBenchmarkPreflightLedgerTests(unittest.TestCase):
             def mutating_source_state(source: Path) -> dict:
                 nonlocal calls
                 calls += 1
-                if calls == 2:
+                if calls == 3:
                     (source / "mutation.txt").write_text(
                         "changed", encoding="utf-8"
                     )
@@ -1545,6 +1601,1000 @@ class RepoBriefAgentBenchmarkPreflightLedgerTests(unittest.TestCase):
             self.assertEqual(events[-1]["event"], "preflight-failed")
             self.assertEqual(events[-1]["payload"]["fixture_intents"], 2)
             self.assertFalse(events[-1]["payload"]["retry_permitted"])
+
+
+class CodexProductionAuthorizationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        raw = BOOTSTRAP_PATH.read_bytes()
+        identity = {
+            "schema_version": codex_preflight.ENTRYPOINT_BOOTSTRAP_SCHEMA_VERSION,
+            "kind": codex_preflight.ENTRYPOINT_BOOTSTRAP_KIND,
+            "name": codex_preflight.ENTRYPOINT_BOOTSTRAP_NAME,
+            "bytes": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
+        codex_preflight._ENTRYPOINT_BOOTSTRAP_RAW = raw
+        codex_preflight._ENTRYPOINT_BOOTSTRAP_IDENTITY = identity
+        codex_preflight.core._register_startup_bootstrap_identity(identity)
+
+    @staticmethod
+    def _codex_pair(environment: dict) -> tuple[str, dict, dict]:
+        pair_id = f"{support.TASKSET}:{support.CASE}:r2"
+        requests = []
+        for original in (environment["baseline"], environment["treatment"]):
+            value = json.loads(json.dumps(original))
+            condition = value["condition"]
+            request_id = f"{pair_id}:{condition}"
+            value["pair_id"] = pair_id
+            value["repetition"] = 2
+            value["request_id"] = request_id
+            value["session_id"] = f"session:{request_id}"
+            value["workspace_id"] = f"workspace:{request_id}"
+            value["runner"] = {
+                "execution_contract": codex_runner.EXECUTION_CONTRACT,
+                "provider": codex_runner.PROVIDER,
+                "model": codex_runner.MODEL,
+                "sampling": codex_runner.SAMPLING,
+            }
+            requests.append(value)
+        request_root = environment["request_root"]
+        for path in request_root.glob("*.json"):
+            path.unlink()
+        for value in requests:
+            filename = value["request_id"].replace(":", "__") + ".json"
+            (request_root / filename).write_text(
+                json.dumps(value, sort_keys=True), encoding="utf-8"
+            )
+        environment["baseline"], environment["treatment"] = requests
+        return pair_id, requests[0], requests[1]
+
+    def test_codex_authorization_rejects_source_head_different_from_requested_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = support.fixture_environment(root)
+            pair_id, _baseline, _treatment = self._codex_pair(environment)
+            state_root = root / "state"
+            codex = root / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            codex.chmod(0o755)
+            codex_sha256 = hashlib.sha256(codex.read_bytes()).hexdigest()
+            original_source_state = codex_preflight.core.source_state
+
+            def wrong_head(source: Path) -> dict:
+                observed = original_source_state(source)
+                observed["head"] = "f" * 40
+                return observed
+
+            with (
+                mock.patch.object(
+                    codex_preflight.codex_runner,
+                    "validate_executable",
+                    return_value=str(codex.resolve()),
+                ),
+                mock.patch.object(codex_preflight.codex_runner, "validate_toolchain"),
+                mock.patch.object(
+                    codex_preflight.codex_runner,
+                    "validate_chatgpt_subscription",
+                    return_value=b'{"tokens":{}}',
+                ),
+                mock.patch.object(
+                    codex_preflight.core,
+                    "source_state",
+                    side_effect=wrong_head,
+                ),
+                mock.patch.object(
+                    codex_preflight.core,
+                    "probe_freshness",
+                    side_effect=AssertionError(
+                        "freshness must not run for the wrong requested commit"
+                    ),
+                ) as freshness,
+            ):
+                with self.assertRaisesRegex(
+                    codex_preflight.core.PreflightError,
+                    "source checkout HEAD does not match requested repository commit",
+                ):
+                    codex_preflight.authorize_pair(
+                        pair_id=pair_id,
+                        request_root=environment["request_root"],
+                        repository_map=environment["repository_map"],
+                        state_root=state_root,
+                        transcript_root=root / "transcripts",
+                        evidence_root=root / "evidence",
+                        report_out=root / "preflight-report.json",
+                        codex_command=str(codex.resolve()),
+                        codex_command_sha256=codex_sha256,
+                        max_cost_usd=support.Decimal("1.00"),
+                        validator_command=codex_preflight.core._command_array(
+                            environment["validator_command"]
+                        ),
+                    )
+            freshness.assert_not_called()
+            pair_root = next((state_root / "preflight-dispatch-ledger").iterdir())
+            self.assertFalse((pair_root / "authorization.json").exists())
+            events = support.ledger_events(state_root)
+            self.assertEqual(events[-1]["event"], "preflight-failed")
+            self.assertEqual(events[-1]["payload"]["provider_process_intents"], 0)
+
+
+    def test_codex_producer_ledger_is_consumable_by_exact_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = support.fixture_environment(root)
+            pair_id, baseline, treatment = self._codex_pair(environment)
+            state_root = root / "state"
+            transcript_root = root / "transcripts"
+            evidence_root = root / "evidence"
+            report_out = root / "preflight-report.json"
+            codex = root / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            codex.chmod(0o755)
+            codex_sha256 = hashlib.sha256(codex.read_bytes()).hexdigest()
+
+            with (
+                mock.patch.object(
+                    codex_preflight.codex_runner,
+                    "validate_executable",
+                    return_value=str(codex.resolve()),
+                ),
+                mock.patch.object(codex_preflight.codex_runner, "validate_toolchain"),
+                mock.patch.object(
+                    codex_preflight.codex_runner,
+                    "validate_chatgpt_subscription",
+                    return_value=b'{"tokens":{}}',
+                ),
+            ):
+                report = codex_preflight.authorize_pair(
+                    pair_id=pair_id,
+                    request_root=environment["request_root"],
+                    repository_map=environment["repository_map"],
+                    state_root=state_root,
+                    transcript_root=transcript_root,
+                    evidence_root=evidence_root,
+                    report_out=report_out,
+                    codex_command=str(codex.resolve()),
+                    codex_command_sha256=codex_sha256,
+                    max_cost_usd=support.Decimal("1.00"),
+                    validator_command=codex_preflight.core._command_array(
+                        environment["validator_command"]
+                    ),
+                )
+
+            self.assertEqual(report["status"], "authorized")
+            authorization_path = Path(report["dispatch_ledger"]["authorization"])
+            authorization = json.loads(authorization_path.read_text(encoding="utf-8"))
+            binding = authorization["binding"]
+            report_from_disk = json.loads(report_out.read_text(encoding="utf-8"))
+            self.assertRegex(
+                authorization["report_evidence_sha256"], r"^[0-9a-f]{64}$"
+            )
+            self.assertEqual(
+                authorization["report_evidence_sha256"],
+                codex_preflight.core._sha256_json(
+                    codex_preflight.core._dispatch_report_evidence_projection(
+                        report_from_disk
+                    )
+                ),
+            )
+            self.assertEqual(
+                report_from_disk["dispatch_ledger"]["authorization_sha256"],
+                codex_runner.base._sha256_json(authorization),
+            )
+            self.assertEqual(
+                binding["requests"]["treatment"]["sha256"],
+                codex_runner.base._sha256_json(treatment),
+            )
+            self.assertEqual(
+                binding["requests"]["baseline"]["sha256"],
+                codex_runner.base._sha256_json(baseline),
+            )
+            self.assertGreaterEqual(len(binding["mcp_command_files"]), 2)
+            code_files = {item["name"]: item for item in binding["code"]["files"]}
+            self.assertIn(Path(codex_runner.__file__).name, code_files)
+            self.assertIn(codex_preflight.ENTRYPOINT_BOOTSTRAP_NAME, code_files)
+            authentication = binding["provider"]["authentication"]
+            self.assertEqual(authentication["mode"], "chatgpt_subscription")
+            self.assertFalse(authentication["credential_digest_public"])
+            self.assertEqual(
+                authentication["credential_bytes"], len(b'{"tokens":{}}')
+            )
+            commitment = authentication["commitment"]
+            self.assertEqual(
+                commitment["kind"],
+                codex_preflight.CODEX_CREDENTIAL_COMMITMENT_KIND,
+            )
+            self.assertRegex(commitment["nonce"], r"^[0-9a-f]{32}$")
+            self.assertRegex(commitment["commitment_sha256"], r"^[0-9a-f]{64}$")
+            self.assertEqual(
+                commitment["commitment_sha256"],
+                codex_preflight._credential_commitment_sha256(
+                    b'{"tokens":{}}', commitment["nonce"]
+                ),
+            )
+            self.assertNotIn(
+                hashlib.sha256(b'{"tokens":{}}').hexdigest(),
+                json.dumps(authentication, sort_keys=True),
+            )
+
+            runtime_binding = {
+                "request_root": environment["request_root"],
+                "repository_map": environment["repository_map"],
+                "transcript_root": transcript_root,
+                "evidence_root": evidence_root,
+            }
+            consumed = codex_runner._load_preflight_dispatch_authorization(
+                treatment, state_root, runtime_binding=runtime_binding
+            )
+            self.assertEqual(
+                consumed["proxy_code"]["sha256"],
+                code_files[Path(codex_runner.__file__).name]["sha256"],
+            )
+            self.assertEqual(
+                [str(item["path"]) for item in consumed["mcp_files"]],
+                [item["path"] for item in binding["mcp_command_files"]],
+            )
+            self.assertIsInstance(consumed["repository_map_bytes"], bytes)
+            self.assertEqual(
+                codex_runner._repository_root_from_authorized_map_bytes(
+                    treatment, consumed["repository_map_bytes"]
+                ),
+                environment["source"].resolve(),
+            )
+
+            # Baseline consumes the same pair/provider/runtime authorization,
+            # without inheriting treatment-only MCP/RepoGround requirements.
+            baseline_consumed = codex_runner._load_preflight_dispatch_authorization(
+                baseline, state_root, runtime_binding=runtime_binding
+            )
+            self.assertEqual(baseline_consumed["mcp_files"], [])
+            self.assertIsNone(baseline_consumed["proxy_code"])
+            self.assertIsNone(baseline_consumed["manifest"])
+
+            for changed_condition, launch_request in (
+                ("treatment", baseline),
+                ("baseline", treatment),
+            ):
+                request_path = Path(
+                    binding["requests"][changed_condition]["file"]["path"]
+                )
+                original_request = request_path.read_bytes()
+                request_path.write_bytes(original_request + b"\n")
+                try:
+                    with self.assertRaisesRegex(
+                        codex_runner.RunnerError,
+                        f"{changed_condition} request file identity mismatch",
+                    ):
+                        codex_runner._load_preflight_dispatch_authorization(
+                            launch_request,
+                            state_root,
+                            runtime_binding=runtime_binding,
+                        )
+                finally:
+                    request_path.write_bytes(original_request)
+
+            wrong_runtime = dict(runtime_binding)
+            wrong_runtime["transcript_root"] = root / "other-transcripts"
+            with self.assertRaisesRegex(
+                codex_runner.RunnerError, "runtime binding mismatch: transcript_root"
+            ):
+                codex_runner._load_preflight_dispatch_authorization(
+                    baseline, state_root, runtime_binding=wrong_runtime
+                )
+
+            original_map = environment["repository_map"].read_bytes()
+            environment["repository_map"].write_bytes(original_map + b"\n")
+            try:
+                with self.assertRaisesRegex(
+                    codex_runner.RunnerError, "repository map identity mismatch"
+                ):
+                    codex_runner._load_preflight_dispatch_authorization(
+                        baseline, state_root, runtime_binding=runtime_binding
+                    )
+            finally:
+                environment["repository_map"].write_bytes(original_map)
+
+            report_bytes = report_out.read_bytes()
+            digest_path = Path(str(report_out) + ".sha256")
+            digest_bytes = digest_path.read_bytes()
+
+            report_out.unlink()
+            try:
+                with self.assertRaisesRegex(
+                    codex_runner.RunnerError, "preflight report is unavailable"
+                ):
+                    codex_runner._load_preflight_dispatch_authorization(
+                        baseline, state_root, runtime_binding=runtime_binding
+                    )
+            finally:
+                report_out.write_bytes(report_bytes)
+                report_out.chmod(0o600)
+
+            digest_path.unlink()
+            try:
+                with self.assertRaisesRegex(
+                    codex_runner.RunnerError,
+                    "preflight report digest is unavailable",
+                ):
+                    codex_runner._load_preflight_dispatch_authorization(
+                        baseline, state_root, runtime_binding=runtime_binding
+                    )
+            finally:
+                digest_path.write_bytes(digest_bytes)
+                digest_path.chmod(0o600)
+
+            stale_report = json.loads(report_bytes)
+            stale_report["snapshot"]["status"] = "stale"
+            stale_bytes = (
+                json.dumps(stale_report, ensure_ascii=False, indent=2, sort_keys=True)
+                + "\n"
+            ).encode("utf-8")
+            report_out.write_bytes(stale_bytes)
+            digest_path.write_text(
+                f"{hashlib.sha256(stale_bytes).hexdigest()}  {report_out.name}\n",
+                encoding="ascii",
+            )
+            try:
+                with self.assertRaisesRegex(
+                    codex_runner.RunnerError,
+                    "preflight report does not prove this dispatch authorization",
+                ):
+                    codex_runner._load_preflight_dispatch_authorization(
+                        baseline, state_root, runtime_binding=runtime_binding
+                    )
+            finally:
+                report_out.write_bytes(report_bytes)
+                digest_path.write_bytes(digest_bytes)
+
+            rebound_report = json.loads(report_bytes)
+            rebound_report["dispatch_ledger"]["authorization_sha256"] = "0" * 64
+            rebound_bytes = (
+                json.dumps(rebound_report, ensure_ascii=False, indent=2, sort_keys=True)
+                + "\n"
+            ).encode("utf-8")
+            report_out.write_bytes(rebound_bytes)
+            digest_path.write_text(
+                f"{hashlib.sha256(rebound_bytes).hexdigest()}  {report_out.name}\n",
+                encoding="ascii",
+            )
+            try:
+                with self.assertRaisesRegex(
+                    codex_runner.RunnerError,
+                    "preflight report does not prove this dispatch authorization",
+                ):
+                    codex_runner._load_preflight_dispatch_authorization(
+                        baseline, state_root, runtime_binding=runtime_binding
+                    )
+            finally:
+                report_out.write_bytes(report_bytes)
+                digest_path.write_bytes(digest_bytes)
+
+            forged_report = json.loads(report_bytes)
+            forged_report["timings"]["freshness_check_ms"] += 1
+            forged_bytes = (
+                json.dumps(forged_report, ensure_ascii=False, indent=2, sort_keys=True)
+                + "\n"
+            ).encode("utf-8")
+            report_out.write_bytes(forged_bytes)
+            digest_path.write_text(
+                f"{hashlib.sha256(forged_bytes).hexdigest()}  {report_out.name}\n",
+                encoding="ascii",
+            )
+            try:
+                with self.assertRaisesRegex(
+                    codex_runner.RunnerError,
+                    "preflight report evidence binding mismatch",
+                ):
+                    codex_runner._load_preflight_dispatch_authorization(
+                        baseline, state_root, runtime_binding=runtime_binding
+                    )
+            finally:
+                report_out.write_bytes(report_bytes)
+                digest_path.write_bytes(digest_bytes)
+
+            hidden = authorization_path.with_name("authorization.hidden")
+            authorization_path.rename(hidden)
+            try:
+                with self.assertRaisesRegex(
+                    codex_runner.RunnerError, "preflight dispatch authorization is unavailable"
+                ):
+                    codex_runner._load_preflight_dispatch_authorization(
+                        baseline, state_root, runtime_binding=runtime_binding
+                    )
+            finally:
+                hidden.rename(authorization_path)
+
+    def test_authorize_dispatch_rejects_cross_provider_binding_before_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = support.fixture_environment(root)
+            claude_baseline, _ = support.preflight.load_pair(
+                environment["request_root"], support.PAIR_ID
+            )
+            pair_id, _, _ = self._codex_pair(environment)
+            bad_state = root / "bad-state"
+            with self.assertRaisesRegex(
+                codex_preflight.core.PreflightError,
+                "provider binding does not match treatment runner contract",
+            ):
+                codex_preflight.core.authorize_dispatch(
+                    pair_id=pair_id,
+                    request_root=environment["request_root"],
+                    repository_map=environment["repository_map"],
+                    state_root=bad_state,
+                    transcript_root=root / "transcripts",
+                    evidence_root=root / "evidence",
+                    report_out=root / "report.json",
+                    provider_binding={
+                        "mode": "live_provider",
+                        "runner": dict(claude_baseline["runner"]),
+                    },
+                    max_cost_usd=support.Decimal("1.00"),
+                    validator_command=codex_preflight.core._command_array(
+                        environment["validator_command"]
+                    ),
+                )
+            self.assertFalse(bad_state.exists())
+
+    def test_authorize_dispatch_rejects_nonfinite_cost_before_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = support.fixture_environment(root)
+            pair_id, _, treatment = self._codex_pair(environment)
+            bad_state = root / "nan-state"
+            with self.assertRaisesRegex(
+                codex_preflight.core.PreflightError, "max cost must be finite"
+            ):
+                codex_preflight.core.authorize_dispatch(
+                    pair_id=pair_id,
+                    request_root=environment["request_root"],
+                    repository_map=environment["repository_map"],
+                    state_root=bad_state,
+                    transcript_root=root / "transcripts",
+                    evidence_root=root / "evidence",
+                    report_out=root / "report.json",
+                    provider_binding={
+                        "mode": "live_provider",
+                        "runner": dict(treatment["runner"]),
+                    },
+                    max_cost_usd=support.Decimal("NaN"),
+                    validator_command=codex_preflight.core._command_array(
+                        environment["validator_command"]
+                    ),
+                )
+            self.assertFalse(bad_state.exists())
+
+    def test_failed_late_authorization_does_not_publish_authorization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = support.fixture_environment(root)
+            pair_id, _, treatment = self._codex_pair(environment)
+            state_root = root / "state"
+            with (
+                mock.patch.object(
+                    codex_preflight.core,
+                    "probe_freshness",
+                    side_effect=codex_preflight.core.PreflightError("late preflight failure"),
+                ),
+                self.assertRaisesRegex(
+                    codex_preflight.core.PreflightError, "late preflight failure"
+                ),
+            ):
+                codex_preflight.core.authorize_dispatch(
+                    pair_id=pair_id,
+                    request_root=environment["request_root"],
+                    repository_map=environment["repository_map"],
+                    state_root=state_root,
+                    transcript_root=root / "transcripts",
+                    evidence_root=root / "evidence",
+                    report_out=root / "report.json",
+                    provider_binding={
+                        "mode": "live_provider",
+                        "runner": dict(treatment["runner"]),
+                    },
+                    max_cost_usd=support.Decimal("1.00"),
+                    validator_command=codex_preflight.core._command_array(
+                        environment["validator_command"]
+                    ),
+                )
+            pair_digest = hashlib.sha256(pair_id.encode("utf-8")).hexdigest()
+            pair_root = state_root / "preflight-dispatch-ledger" / pair_digest
+            self.assertTrue(pair_root.is_dir())
+            self.assertFalse((pair_root / "authorization.json").exists())
+            events = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in sorted((pair_root / "events").glob("*.json"))
+            ]
+            self.assertNotIn("authorized", [event["event"] for event in events])
+            self.assertEqual(events[-1]["event"], "preflight-failed")
+            self.assertFalse(events[-1]["payload"]["retry_permitted"])
+
+    def test_report_persistence_failure_leaves_no_dispatch_authorization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = support.fixture_environment(root)
+            pair_id, _, _ = self._codex_pair(environment)
+            state_root = root / "state"
+            report_out = root / "preflight-report.json"
+            codex = root / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            codex.chmod(0o755)
+            codex_sha256 = hashlib.sha256(codex.read_bytes()).hexdigest()
+
+            with (
+                mock.patch.object(
+                    codex_preflight.codex_runner,
+                    "validate_executable",
+                    return_value=str(codex.resolve()),
+                ),
+                mock.patch.object(codex_preflight.codex_runner, "validate_toolchain"),
+                mock.patch.object(
+                    codex_preflight.codex_runner,
+                    "validate_chatgpt_subscription",
+                    return_value=b'{"tokens":{}}',
+                ),
+                mock.patch.object(
+                    codex_preflight.core,
+                    "_write_report_artifacts",
+                    side_effect=codex_preflight.core.PreflightError("report persistence failed"),
+                ),
+                self.assertRaisesRegex(
+                    codex_preflight.core.PreflightError, "report persistence failed"
+                ),
+            ):
+                codex_preflight.authorize_pair(
+                    pair_id=pair_id,
+                    request_root=environment["request_root"],
+                    repository_map=environment["repository_map"],
+                    state_root=state_root,
+                    transcript_root=root / "transcripts",
+                    evidence_root=root / "evidence",
+                    report_out=report_out,
+                    codex_command=str(codex.resolve()),
+                    codex_command_sha256=codex_sha256,
+                    max_cost_usd=support.Decimal("1.00"),
+                    validator_command=codex_preflight.core._command_array(
+                        environment["validator_command"]
+                    ),
+                )
+
+            pair_digest = hashlib.sha256(pair_id.encode("utf-8")).hexdigest()
+            pair_root = state_root / "preflight-dispatch-ledger" / pair_digest
+            self.assertFalse((pair_root / "authorization.json").exists())
+            events = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in sorted((pair_root / "events").glob("*.json"))
+            ]
+            self.assertNotIn("authorized", [event["event"] for event in events])
+            self.assertEqual(events[-1]["event"], "preflight-failed")
+
+    def test_post_report_revalidation_failure_removes_success_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = support.fixture_environment(root)
+            pair_id, _, _ = self._codex_pair(environment)
+            state_root = root / "state"
+            report_out = root / "preflight-report.json"
+            codex = root / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            codex.chmod(0o755)
+            codex_sha256 = hashlib.sha256(codex.read_bytes()).hexdigest()
+            original_source_state = codex_preflight.core.source_state
+            calls = 0
+
+            def mutate_after_report(source: Path) -> dict:
+                nonlocal calls
+                calls += 1
+                if calls == 3:
+                    (source / "post-report-drift.txt").write_text(
+                        "changed", encoding="utf-8"
+                    )
+                return original_source_state(source)
+
+            with (
+                mock.patch.object(
+                    codex_preflight.codex_runner,
+                    "validate_executable",
+                    return_value=str(codex.resolve()),
+                ),
+                mock.patch.object(codex_preflight.codex_runner, "validate_toolchain"),
+                mock.patch.object(
+                    codex_preflight.codex_runner,
+                    "validate_chatgpt_subscription",
+                    return_value=b'{"tokens":{}}',
+                ),
+                mock.patch.object(
+                    codex_preflight.core,
+                    "source_state",
+                    side_effect=mutate_after_report,
+                ),
+                self.assertRaisesRegex(
+                    codex_preflight.core.PreflightError, "source checkout changed"
+                ),
+            ):
+                codex_preflight.authorize_pair(
+                    pair_id=pair_id,
+                    request_root=environment["request_root"],
+                    repository_map=environment["repository_map"],
+                    state_root=state_root,
+                    transcript_root=root / "transcripts",
+                    evidence_root=root / "evidence",
+                    report_out=report_out,
+                    codex_command=str(codex.resolve()),
+                    codex_command_sha256=codex_sha256,
+                    max_cost_usd=support.Decimal("1.00"),
+                    validator_command=codex_preflight.core._command_array(
+                        environment["validator_command"]
+                    ),
+                )
+
+            self.assertFalse(report_out.exists())
+            self.assertFalse(Path(str(report_out) + ".sha256").exists())
+            pair_digest = hashlib.sha256(pair_id.encode("utf-8")).hexdigest()
+            pair_root = state_root / "preflight-dispatch-ledger" / pair_digest
+            self.assertFalse((pair_root / "authorization.json").exists())
+            events = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in sorted((pair_root / "events").glob("*.json"))
+            ]
+            self.assertNotIn("authorized", [event["event"] for event in events])
+            self.assertEqual(events[-1]["event"], "preflight-failed")
+
+    def test_provider_specific_request_validation_has_no_cross_provider_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = support.fixture_environment(root)
+            claude_baseline, claude_treatment = support.preflight.load_pair(
+                environment["request_root"], support.PAIR_ID
+            )
+            self.assertIs(
+                support.preflight._core._request_validation_runner(claude_treatment),
+                support.preflight._core.runner,
+            )
+
+            pair_id, codex_baseline, codex_treatment = self._codex_pair(environment)
+            loaded_baseline, loaded_treatment = codex_preflight.core.load_pair(
+                environment["request_root"], pair_id
+            )
+            self.assertEqual(loaded_baseline["runner"], codex_baseline["runner"])
+            self.assertEqual(loaded_treatment["runner"], codex_treatment["runner"])
+
+            drift_cases = {
+                "execution_contract": "wrong-contract",
+                "provider": "anthropic-claude-code",
+                "model": "wrong-model",
+                "sampling": {"temperature": 0},
+            }
+            treatment_path = next(
+                path for path in environment["request_root"].glob("*.json")
+                if "treatment" in path.name
+            )
+            original_text = treatment_path.read_text(encoding="utf-8")
+            for field, value in drift_cases.items():
+                with self.subTest(field=field):
+                    candidate = json.loads(original_text)
+                    candidate["runner"][field] = value
+                    treatment_path.write_text(
+                        json.dumps(candidate, sort_keys=True), encoding="utf-8"
+                    )
+                    with self.assertRaises(codex_preflight.core.PreflightError):
+                        codex_preflight.core.load_pair(environment["request_root"], pair_id)
+                    treatment_path.write_text(original_text, encoding="utf-8")
+
+            mixed = json.loads(json.dumps(codex_baseline))
+            mixed["runner"] = dict(claude_baseline["runner"])
+            baseline_path = next(
+                path for path in environment["request_root"].glob("*.json")
+                if "baseline" in path.name
+            )
+            baseline_path.write_text(json.dumps(mixed, sort_keys=True), encoding="utf-8")
+            with self.assertRaisesRegex(
+                codex_preflight.core.PreflightError,
+                "paired requests use different provider contracts",
+            ):
+                codex_preflight.core.load_pair(environment["request_root"], pair_id)
+
+
+class McpCommandFileIdentityTests(unittest.TestCase):
+    def test_mcp_relative_script_is_authorized_against_explicit_preflight_base(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "server.py"
+            script.write_text("pass\n", encoding="utf-8")
+            executable = Path(sys.executable).resolve()
+            identities = support.preflight._core._command_file_identities(
+                [str(executable), "server.py"], relative_to=root
+            )
+            self.assertEqual(
+                [item["path"] for item in identities],
+                [str(executable), str(script.resolve())],
+            )
+            legacy = support.preflight._core._command_file_identities(
+                [str(executable), "server.py"]
+            )
+            self.assertEqual([item["path"] for item in legacy], [str(executable)])
+
+    def test_freshness_rpc_rejects_missing_jsonrpc_envelope(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            server = root / "mcp.py"
+            server.write_text(
+                "import json, sys\n"
+                "first=json.loads(sys.stdin.readline())\n"
+                "print(json.dumps({'jsonrpc':'2.0','id':first['id'],'result':{}}), flush=True)\n"
+                "second=json.loads(sys.stdin.readline())\n"
+                "print(json.dumps({'id':second['id'],'result':{'structuredContent':{'status':'fresh'}}}), flush=True)\n",
+                encoding="utf-8",
+            )
+            process = support.preflight._core.subprocess.Popen(
+                [sys.executable, str(server)],
+                stdin=support.preflight._core.subprocess.PIPE,
+                stdout=support.preflight._core.subprocess.PIPE,
+                stderr=support.preflight._core.subprocess.PIPE,
+            )
+            try:
+                support.preflight._core._rpc(
+                    process,
+                    {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}},
+                    timeout_seconds=2,
+                )
+                with self.assertRaisesRegex(
+                    support.preflight._core.PreflightError,
+                    "response envelope is invalid",
+                ):
+                    support.preflight._core._rpc(
+                        process,
+                        {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{}},
+                        timeout_seconds=2,
+                    )
+            finally:
+                if process.stdin is not None:
+                    process.stdin.close()
+                process.wait(timeout=2)
+                if process.stdout is not None:
+                    process.stdout.close()
+                if process.stderr is not None:
+                    process.stderr.close()
+
+    def test_freshness_rpc_rejects_unterminated_response_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            server = root / "mcp.py"
+            server.write_text(
+                "import json, sys\n"
+                "request=json.loads(sys.stdin.readline())\n"
+                "sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':{'structuredContent':{'status':'fresh'}}}))\n"
+                "sys.stdout.flush()\n",
+                encoding="utf-8",
+            )
+            process = support.preflight._core.subprocess.Popen(
+                [sys.executable, str(server)],
+                stdin=support.preflight._core.subprocess.PIPE,
+                stdout=support.preflight._core.subprocess.PIPE,
+                stderr=support.preflight._core.subprocess.PIPE,
+            )
+            try:
+                with self.assertRaisesRegex(
+                    support.preflight._core.PreflightError,
+                    "not newline terminated",
+                ):
+                    support.preflight._core._rpc(
+                        process,
+                        {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{}},
+                        timeout_seconds=2,
+                    )
+            finally:
+                if process.stdin is not None:
+                    process.stdin.close()
+                process.wait(timeout=2)
+                if process.stdout is not None:
+                    process.stdout.close()
+                if process.stderr is not None:
+                    process.stderr.close()
+
+    def test_mcp_path_executable_uses_explicit_runtime_search_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime_bin = root / "runtime-bin"
+            runtime_bin.mkdir()
+            executable = runtime_bin / "python3"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o755)
+            script = root / "server.py"
+            script.write_text("pass\n", encoding="utf-8")
+
+            identities = support.preflight._core._command_file_identities(
+                ["python3", "server.py"],
+                relative_to=root,
+                executable_search_path=str(runtime_bin),
+            )
+
+            self.assertEqual(
+                [item["path"] for item in identities],
+                [str(executable.resolve()), str(script.resolve())],
+            )
+            with self.assertRaisesRegex(
+                support.preflight._core.PreflightError,
+                "MCP command executable is unavailable on the runtime PATH",
+            ):
+                support.preflight._core._command_file_identities(
+                    ["missing-python", "server.py"],
+                    relative_to=root,
+                    executable_search_path=str(runtime_bin),
+                )
+
+    def test_direct_codex_preflight_rejects_unbootstrapped_start(self) -> None:
+        source = Path(codex_preflight.__file__).resolve()
+        completed = subprocess.run(
+            [sys.executable, str(source), "--help"],
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(
+            b"must be started through the immutable source bootstrap",
+            completed.stderr,
+        )
+
+    def test_immutable_bootstrap_captures_codex_preflight_before_execution(self) -> None:
+        source = Path(codex_preflight.__file__).resolve()
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                BOOTSTRAP_PATH.read_text(encoding="utf-8"),
+                str(source),
+                "--help",
+            ],
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stderr.decode("utf-8", errors="replace"),
+        )
+        self.assertIn(b"usage:", completed.stdout)
+
+    def test_codex_authorization_requires_bootstrap_binding(self) -> None:
+        saved_raw = codex_preflight._ENTRYPOINT_BOOTSTRAP_RAW
+        saved_identity = codex_preflight._ENTRYPOINT_BOOTSTRAP_IDENTITY
+        try:
+            codex_preflight._ENTRYPOINT_BOOTSTRAP_RAW = None
+            codex_preflight._ENTRYPOINT_BOOTSTRAP_IDENTITY = None
+            with self.assertRaisesRegex(
+                codex_preflight.core.PreflightError,
+                "requires immutable source bootstrap",
+            ):
+                codex_preflight.authorize_pair(
+                    pair_id="unused",
+                    request_root=Path("/unused"),
+                    repository_map=Path("/unused"),
+                    state_root=Path("/unused"),
+                    transcript_root=Path("/unused"),
+                    evidence_root=Path("/unused"),
+                    report_out=None,
+                    codex_command="/unused",
+                    codex_command_sha256="0" * 64,
+                    max_cost_usd=support.Decimal("1.00"),
+                    validator_command=["/unused"],
+                )
+        finally:
+            codex_preflight._ENTRYPOINT_BOOTSTRAP_RAW = saved_raw
+            codex_preflight._ENTRYPOINT_BOOTSTRAP_IDENTITY = saved_identity
+
+    def test_codex_code_identity_rejects_post_startup_source_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = support.fixture_environment(root)
+            _, _, treatment = CodexProductionAuthorizationTests._codex_pair(environment)
+            source = root / "repobrief_agent_benchmark_codex_preflight.py"
+            source.write_text("before = 1\n", encoding="utf-8")
+            _, identity = codex_preflight.core._read_startup_source_snapshot(
+                source, label="test preflight source"
+            )
+            codex_preflight.core._register_startup_code_identity(identity)
+            key = str(source.resolve())
+            try:
+                source.write_text("after = 2\n", encoding="utf-8")
+                with mock.patch.object(
+                    codex_preflight.core, "CODEX_PREFLIGHT_PATH", source
+                ):
+                    with self.assertRaisesRegex(
+                        codex_preflight.core.PreflightError,
+                        "preflight code file changed after module load",
+                    ):
+                        codex_preflight.core._preflight_code_identity(treatment)
+            finally:
+                codex_preflight.core._STARTUP_CODE_IDENTITIES.pop(key, None)
+
+
+    def test_codex_preflight_source_snapshot_identity_comes_from_open_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "codex-preflight.py"
+            target.write_bytes(b"VALUE = 1\n")
+            attacker = Path(temporary) / "attacker.py"
+            with mock.patch.object(Path, "resolve", return_value=attacker):
+                raw, identity = codex_preflight._read_source_snapshot(target)
+        self.assertEqual(raw, b"VALUE = 1\n")
+        self.assertEqual(identity["path"], str(target))
+        self.assertEqual(identity["name"], target.name)
+
+    def test_preflight_core_startup_snapshot_identity_comes_from_open_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "preflight-core.py"
+            target.write_bytes(b"VALUE = 2\n")
+            attacker = Path(temporary) / "attacker.py"
+            with mock.patch.object(Path, "resolve", return_value=attacker):
+                raw, identity = codex_preflight.core._read_startup_source_snapshot(
+                    target, label="test startup source"
+                )
+        self.assertEqual(raw, b"VALUE = 2\n")
+        self.assertEqual(identity["path"], str(target))
+        self.assertEqual(identity["name"], target.name)
+
+    def test_preflight_core_file_identity_comes_from_open_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "repository-map.json"
+            target.write_bytes(b"{}\n")
+            attacker = Path(temporary) / "attacker.json"
+            with mock.patch.object(Path, "resolve", return_value=attacker):
+                identity = codex_preflight.core._file_identity(
+                    target,
+                    maximum=1024,
+                    label="test repository map",
+                )
+        self.assertEqual(identity["path"], str(target))
+        self.assertEqual(identity["sha256"], hashlib.sha256(b"{}\n").hexdigest())
+
+
+    def test_codex_preflight_source_snapshot_rejects_symlinked_parent_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            real_parent = root / "real"
+            real_parent.mkdir()
+            target = real_parent / "codex-preflight.py"
+            target.write_bytes(b"VALUE = 6\n")
+            alias_parent = root / "alias"
+            alias_parent.symlink_to(real_parent, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "symlink-free|opened path"):
+                codex_preflight._read_source_snapshot(alias_parent / target.name)
+
+    def test_preflight_core_startup_snapshot_rejects_symlinked_parent_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            real_parent = root / "real"
+            real_parent.mkdir()
+            target = real_parent / "preflight-core.py"
+            target.write_bytes(b"VALUE = 7\n")
+            alias_parent = root / "alias"
+            alias_parent.symlink_to(real_parent, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "symlink-free|opened path"):
+                codex_preflight.core._read_startup_source_snapshot(
+                    alias_parent / target.name,
+                    label="test startup source",
+                )
+
+    def test_preflight_core_file_identity_rejects_symlinked_parent_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            real_parent = root / "real"
+            real_parent.mkdir()
+            target = real_parent / "repository-map.json"
+            target.write_bytes(b"{}\n")
+            alias_parent = root / "alias"
+            alias_parent.symlink_to(real_parent, target_is_directory=True)
+            with self.assertRaisesRegex(
+                codex_preflight.core.PreflightError,
+                "could not be opened safely|opened path",
+            ):
+                codex_preflight.core._file_identity(
+                    alias_parent / target.name,
+                    maximum=1024,
+                    label="test repository map",
+                )
 
 
 if __name__ == "__main__":
