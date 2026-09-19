@@ -1,0 +1,122 @@
+name: heim-pc-recovery-evidence-attest
+
+on:
+  workflow_dispatch:
+    inputs:
+      provenance_b64:
+        description: Base64 of the exact secret-safe Heim-PC recovery provenance JSON
+        required: true
+        type: string
+      producer_receipt_b64:
+        description: Base64 of the exact secret-safe Grabowski recovery producer receipt JSON
+        required: true
+        type: string
+
+concurrency:
+  group: heim-pc-recovery-evidence-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  attest:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout exact protected signer source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Materialize secret-safe operator receipts
+        id: materialize
+        env:
+          PROVENANCE_B64: ${{ inputs.provenance_b64 }}
+          PRODUCER_RECEIPT_B64: ${{ inputs.producer_receipt_b64 }}
+          PROVENANCE: ${{ runner.temp }}/heim-pc-recovery-provenance.json
+          PRODUCER_RECEIPT: ${{ runner.temp }}/heim-pc-recovery-producer-receipt.json
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "heimgewebe/grabowski"
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+          printf '%s' "$PROVENANCE_B64" | base64 --decode > "$PROVENANCE"
+          printf '%s' "$PRODUCER_RECEIPT_B64" | base64 --decode > "$PRODUCER_RECEIPT"
+          chmod 0600 "$PROVENANCE" "$PRODUCER_RECEIPT"
+
+          SOURCE_REVISION="$(
+            PROVENANCE="$PROVENANCE" python3 -c 'import json, os, re; from pathlib import Path; v=json.loads(Path(os.environ["PROVENANCE"]).read_text()); s=v.get("source_revision"); assert isinstance(s,str) and re.fullmatch(r"[0-9a-f]{40}",s); print(s)'
+          )"
+          test -n "$SOURCE_REVISION"
+          echo "source_revision=$SOURCE_REVISION" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout exact Heim-PC source revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: heimgewebe/heim-pc
+          ref: ${{ steps.materialize.outputs.source_revision }}
+          path: _heim-pc
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Bind provenance to merged Heim-PC source and contract
+        id: bind
+        env:
+          SOURCE_REVISION: ${{ steps.materialize.outputs.source_revision }}
+          HEIM_PC: ${{ github.workspace }}/_heim-pc
+          PROVENANCE: ${{ runner.temp }}/heim-pc-recovery-provenance.json
+          PRODUCER_RECEIPT: ${{ runner.temp }}/heim-pc-recovery-producer-receipt.json
+          PREDICATE: ${{ runner.temp }}/heim-pc-recovery-attestation-predicate.json
+        run: |
+          set -euo pipefail
+          test "$(git -C "$HEIM_PC" rev-parse HEAD)" = "$SOURCE_REVISION"
+          test -z "$(git -C "$HEIM_PC" status --porcelain=v1 --untracked-files=all)"
+          git -C "$HEIM_PC" fetch --no-tags https://github.com/heimgewebe/heim-pc.git main:refs/remotes/origin/main
+          git -C "$HEIM_PC" merge-base --is-ancestor "$SOURCE_REVISION" refs/remotes/origin/main
+          git -C "$HEIM_PC" rev-list --first-parent refs/remotes/origin/main | grep -Fx -- "$SOURCE_REVISION" >/dev/null
+
+          RECOVERY_CONTRACT="$HEIM_PC/nixos/production/recovery-contract-v1.json"
+          test -f "$RECOVERY_CONTRACT"
+          RECOVERY_CONTRACT_SHA256="$(sha256sum "$RECOVERY_CONTRACT" | cut -d ' ' -f 1)"
+
+          python3 tools/heim_pc_recovery_attest.py \
+            --provenance "$PROVENANCE" \
+            --producer-receipt "$PRODUCER_RECEIPT" \
+            --expected-source-revision "$SOURCE_REVISION" \
+            --expected-recovery-contract-sha256 "$RECOVERY_CONTRACT_SHA256" \
+            --predicate-out "$PREDICATE"
+          test -s "$PREDICATE"
+          echo "recovery_contract_sha256=$RECOVERY_CONTRACT_SHA256" >> "$GITHUB_OUTPUT"
+
+      - name: Attest exact reviewed provenance
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/heim-pc-recovery-provenance.json
+          predicate-type: https://heimgewebe.local/attestations/nixos-recovery-evidence/v1
+          predicate-path: ${{ runner.temp }}/heim-pc-recovery-attestation-predicate.json
+
+      - name: Collect exact Sigstore bundle
+        env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+          DEST: ${{ runner.temp }}/heim-pc-recovery-provenance.attestation.json
+        run: |
+          set -euo pipefail
+          test -n "$BUNDLE"
+          test -s "$BUNDLE"
+          cp -- "$BUNDLE" "$DEST"
+          test -s "$DEST"
+
+      - name: Upload compact attested evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: heim-pc-recovery-evidence-${{ steps.materialize.outputs.source_revision }}-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 3
+          path: |
+            ${{ runner.temp }}/heim-pc-recovery-provenance.json
+            ${{ runner.temp }}/heim-pc-recovery-provenance.attestation.json
