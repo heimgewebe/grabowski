@@ -21,6 +21,7 @@ MAX_ARGV_ITEMS = 128
 MAX_ARG_BYTES = 32 * 1024
 MAX_TARGET_BYTES = 48 * 1024
 MAX_GATE_MARKER_BYTES = 64 * 1024
+SECRET_PTY_MAX_OUTPUT_BYTES = 512 * 1024
 MAX_RECOVERY_AGE_SECONDS = 7 * 24 * 3600
 RECOVERY_LOCK_TIMEOUT_SECONDS = 2.0
 RECOVERY_LOCK_POLL_SECONDS = 0.02
@@ -1606,7 +1607,7 @@ def _resolve_secret_pty_action(
     if (
         isinstance(max_output_bytes, bool)
         or not isinstance(max_output_bytes, int)
-        or not 1 <= max_output_bytes <= 2_000_000
+        or not 1 <= max_output_bytes <= SECRET_PTY_MAX_OUTPUT_BYTES
     ):
         raise ValueError("secret PTY max_output_bytes is invalid")
     prompts = _validate_secret_pty_prompts(candidate["prompt_sequence"])

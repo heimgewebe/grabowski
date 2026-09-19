@@ -2845,6 +2845,39 @@ class SecretPtyContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "non-shell"):
                 privileged_broker.resolve_execution(unsafe, reference)
 
+    def test_secret_pty_output_bound_matches_runtime_cap(self) -> None:
+        root_tool = _load_root_broker_tool()
+        self.assertEqual(
+            root_tool.SECRET_PTY_MAX_TRANSCRIPT_BYTES,
+            privileged_broker.SECRET_PTY_MAX_OUTPUT_BYTES,
+        )
+        reference = privileged_broker.parse_reference(
+            json.dumps(self._reference()).encode(), now=1000
+        )
+        oversized = self._secret_pty_config()
+        oversized["actions"]["operator_secret_pty_getpass_probe"][
+            "max_output_bytes"
+        ] = privileged_broker.SECRET_PTY_MAX_OUTPUT_BYTES + 1
+        with patch.object(
+            privileged_broker, "_require_kill_switch_clear"
+        ), patch.object(
+            privileged_broker,
+            "_validate_recovery_gate",
+            return_value={
+                "recovery_marker_sha256": "1" * 64,
+                "recovery_marker_source_sha256": "2" * 64,
+                "recovery_marker_timestamp_unix": 999,
+                "recovery_marker_age_seconds": 1,
+                "recovery_marker_max_age_seconds": 86400,
+                "recovery_marker_freshness_reason": "fresh",
+                "recovery_marker_configured_target": "local-backup-disk:test",
+            },
+        ):
+            with self.assertRaisesRegex(ValueError, "max_output_bytes"):
+                privileged_broker.resolve_secret_pty_execution(
+                    oversized, reference
+                )
+
     def test_peer_bound_secret_reads_only_exact_hash_bound_descriptor(self) -> None:
         root_tool = _load_root_broker_tool()
         secret = os.urandom(48)
