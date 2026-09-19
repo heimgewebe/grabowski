@@ -116,6 +116,8 @@ def write_dispatch_authorization(
     pair_digest = hashlib.sha256(value["pair_id"].encode("utf-8")).hexdigest()
     pair_root = ledger_root / pair_digest
     pair_root.mkdir(mode=0o700)
+    events_root = pair_root / "events"
+    events_root.mkdir(mode=0o700)
     manifest = Path(value["repobrief"]["manifest"])
     baseline = request(
         condition="baseline",
@@ -136,6 +138,9 @@ def write_dispatch_authorization(
             },
         },
         "state_root": str(state_root.resolve()),
+        "max_cost_usd": "1.00",
+        "max_provider_processes": 2,
+        "synthetic_fixture": False,
         "report_out": str(report_out.resolve()),
         "report_digest_out": str(digest_out.resolve()),
         "manifest": file_identity(manifest),
@@ -190,6 +195,21 @@ def write_dispatch_authorization(
         "binding": binding,
         "retry_permitted": False,
     }
+    authorized_event = {
+        "kind": runner.PREFLIGHT_EVENT_KIND,
+        "version": runner.PREFLIGHT_LEDGER_VERSION,
+        "sequence": 0,
+        "event": "authorized",
+        "recorded_at": "2026-09-17T00:00:00Z",
+        "pair_id": value["pair_id"],
+        "contract_sha256": authorization["contract_sha256"],
+        "previous_event_sha256": authorization["contract_sha256"],
+        "payload": {"synthetic_fixture": False, "max_provider_processes": 2},
+    }
+    authorized_event_sha256 = runner.base._sha256_json(authorized_event)
+    event_path = events_root / "0000-authorized.json"
+    event_path.write_text(json.dumps(authorized_event, sort_keys=True), encoding="utf-8")
+    event_path.chmod(0o600)
     path = pair_root / "authorization.json"
     report = {
         "kind": runner.PREFLIGHT_AUTHORIZATION_REPORT_KIND,
@@ -203,7 +223,7 @@ def write_dispatch_authorization(
             "authorization_sha256": None,
             "contract_sha256": authorization["contract_sha256"],
             "event_count": 1,
-            "final_event_sha256": "f" * 64,
+            "final_event_sha256": authorized_event_sha256,
             "condition_intents": [],
             "provider_process_intents": 0,
             "fixture_intents": 0,
@@ -1616,7 +1636,8 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "for line in sys.stdin:\n"
                 "    m=json.loads(line); method=m.get('method'); ident=m.get('id')\n"
                 "    if method=='initialize':\n"
-                "        print(json.dumps({'jsonrpc':'2.0','id':ident,'result':{'protocolVersion':'x','serverInfo':{'name':'fixture'},'capabilities':{'tools':{},'resources':{},'prompts':{}}}}),flush=True)\n"
+                "        print(json.dumps({'jsonrpc':'2.0','id':ident,'result':{'protocolVersion':'x','serverInfo':{'name':'fixture'},'capabilities':{'tools':{'listChanged':True},'resources':{},'prompts':{}}}}),flush=True)\n"
+                "        print(json.dumps({'jsonrpc':'2.0','method':'notifications/tools/list_changed'}),flush=True)\n"
                 "    elif method=='tools/list':\n"
                 "        print(json.dumps({'jsonrpc':'2.0','id':ident,'result':{'tools':TOOLS}}),flush=True)\n"
                 "    elif method=='resources/list':\n"
@@ -1639,6 +1660,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr.decode())
             responses = {item["id"]: item for item in map(json.loads, completed.stdout.decode().splitlines())}
             self.assertEqual(set(responses[1]["result"]["capabilities"]), {"tools"})
+            self.assertEqual(responses[1]["result"]["capabilities"]["tools"], {})
             self.assertEqual({item["name"] for item in responses[2]["result"]["tools"]}, runner.ALLOWED_MCP)
             self.assertIn("error", responses[3])
             self.assertIn("error", responses[4])
@@ -2657,6 +2679,141 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             runner._revalidate_staged_repoground_manifest(binding)
             self.assertIsNone(runner.cleanup_staged_repoground_manifest(binding))
             self.assertFalse(staged.parent.exists())
+
+    def test_live_dispatch_intent_is_single_use_per_condition(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            treatment = request(condition="treatment")
+            manifest = root / "bundle.manifest.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+            treatment["repobrief"]["manifest"] = str(manifest)
+            treatment["repobrief"]["manifest_sha256"] = hashlib.sha256(
+                manifest.read_bytes()
+            ).hexdigest()
+            baseline = request(
+                condition="baseline",
+                commit=treatment["repository"]["commit"],
+            )
+            state_root = write_dispatch_authorization(root, treatment, [])
+            authorization = runner._load_preflight_dispatch_authorization(
+                baseline, state_root
+            )["authorization"]
+
+            first_sha256 = runner._record_preflight_dispatch_intent(
+                baseline, state_root, authorization
+            )
+            self.assertEqual(len(first_sha256), 64)
+            state = runner._validated_dispatch_event_state(
+                baseline, state_root, authorization
+            )
+            self.assertEqual(state["condition_intents"], ["baseline"])
+            self.assertEqual(state["next_sequence"], 2)
+
+            with self.assertRaisesRegex(
+                runner.RunnerError, "dispatch intent already exists for baseline"
+            ):
+                runner._record_preflight_dispatch_intent(
+                    baseline, state_root, authorization
+                )
+
+            runner._record_preflight_dispatch_intent(
+                treatment, state_root, authorization
+            )
+            state = runner._validated_dispatch_event_state(
+                treatment, state_root, authorization
+            )
+            self.assertEqual(
+                state["condition_intents"], ["baseline", "treatment"]
+            )
+            self.assertEqual(state["next_sequence"], 3)
+            with self.assertRaisesRegex(
+                runner.RunnerError, "dispatch intent already exists for treatment"
+            ):
+                runner._record_preflight_dispatch_intent(
+                    treatment, state_root, authorization
+                )
+
+
+    def test_manifest_artifact_contract_rejects_manifest_self_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = root / "chosen.bundle.manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "artifacts": [
+                            {
+                                "path": manifest.name,
+                                "bytes": 1,
+                                "sha256": "0" * 64,
+                            }
+                        ]
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                runner.RunnerError, "cannot declare itself as an artifact"
+            ):
+                runner._manifest_artifact_paths(manifest, manifest.read_bytes())
+
+
+    def test_raw_persistence_failure_gets_best_effort_diagnostics_without_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            value = request()
+            names = runner._provider_artifact_names(value)
+            original_write = runner._write_private_dirfd
+
+            def selective_write(descriptor, name, data, *, mode=0o600):
+                if name == names["stdout"]:
+                    raise OSError("synthetic transcript persistence failure")
+                return original_write(descriptor, name, data, mode=mode)
+
+            capture = {
+                "returncode": 0,
+                "stdout": b"captured stdout\n",
+                "stderr": b"",
+                "capture_error": None,
+                "stdout_overflow": False,
+                "stderr_overflow": False,
+            }
+            now = datetime.now(timezone.utc)
+            with patch.object(
+                runner, "_write_private_dirfd", side_effect=selective_write
+            ), patch.object(
+                runner,
+                "classify_stderr",
+                side_effect=AssertionError("semantic classifier must not run"),
+            ):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "failure_diagnostics_sha256"
+                ):
+                    runner.persist_provider_capture(
+                        value,
+                        transcript_root=root / "transcripts",
+                        evidence_root=root / "provider-evidence",
+                        capture=capture,
+                        started_at=now,
+                        ended_at=now,
+                        synthetic_fixture=False,
+                    )
+            diagnostics = json.loads(
+                (root / "provider-evidence" / names["diagnostics"]).read_text()
+            )
+            self.assertFalse(diagnostics["raw_persistence_complete"])
+            self.assertEqual(
+                diagnostics["raw_persisted"], {"stdout": False, "stderr": True}
+            )
+            self.assertEqual(
+                diagnostics["semantic_interpretation"], "not_performed"
+            )
+            self.assertFalse(
+                (root / "provider-evidence" / names["stderr_policy"]).exists()
+            )
+
 
     def test_manifest_artifact_contract_rejects_malformed_entries(self) -> None:
         cases = (
