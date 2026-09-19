@@ -77,12 +77,14 @@ target_secret_roots = {
     "${HOME}/.password-store",
     "${HOME}/.local/share/keyrings",
 }
-target_browser_roots = {
+legacy_browser_roots = {
     "${HOME}/.mozilla/firefox",
     "${HOME}/.config/BraveSoftware/Brave-Browser",
     "${HOME}/.config/google-chrome",
     "${HOME}/.config/chromium",
 }
+managed_browser_root = "${HOME}/.local/state/grabowski/browser-profiles"
+target_browser_roots = legacy_browser_roots
 target_sensitive_components = {
     ".ssh",
     ".gnupg",
@@ -150,6 +152,12 @@ def has_home_wide_root(data: dict) -> bool:
     return "${HOME}" in data["read_roots"] or "${HOME}" in data["write_roots"]
 
 
+def required_browser_roots(path: Path) -> set[str]:
+    if path.name == "access.trusted-owner.example.json":
+        return {managed_browser_root}
+    return legacy_browser_roots
+
+
 def require_home_wide_typed_roots(path: Path, label: str, data: dict) -> None:
     if not has_home_wide_root(data):
         return
@@ -201,8 +209,16 @@ def validate_policy(path: Path) -> None:
         missing = sorted(target_secret_roots - set(data["secret_roots"]))
         if missing:
             raise SystemExit(f"{path}: missing top-level secret roots: {missing}")
-    if data["browser_profile_roots"]:
-        missing = sorted(target_browser_roots - set(data["browser_profile_roots"]))
+    configured_browser_roots = set(data["browser_profile_roots"])
+    expected_browser_roots = required_browser_roots(path)
+    if path.name == "access.trusted-owner.example.json":
+        if configured_browser_roots != expected_browser_roots:
+            raise SystemExit(
+                f"{path}: trusted-owner browser roots must be exactly "
+                f"{managed_browser_root!r}; desktop browser profiles stay outside operator authority"
+            )
+    elif configured_browser_roots:
+        missing = sorted(expected_browser_roots - configured_browser_roots)
         if missing:
             raise SystemExit(f"{path}: missing top-level browser roots: {missing}")
     require_home_wide_typed_roots(path, "policy", data)
@@ -280,6 +296,15 @@ def validate_policy(path: Path) -> None:
                 f"{path}: profile {name} must exclude ${{HOME}}/repos/merges."
             )
         require_capabilities(path, f"profile {name}", profile["capabilities"])
+        profile_browser_roots = set(profile["browser_profile_roots"])
+        if (
+            path.name == "access.trusted-owner.example.json"
+            and profile_browser_roots not in (set(), {managed_browser_root})
+        ):
+            raise SystemExit(
+                f"{path}: profile {name} may use only the managed Grabowski "
+                "browser root or no browser root; desktop browser profiles stay outside operator authority"
+            )
         require_home_wide_typed_roots(path, f"profile {name}", profile)
         capabilities = set(profile["capabilities"])
         if name == "failover-mutate":
@@ -304,7 +329,9 @@ def validate_policy(path: Path) -> None:
                 "secret_export_roots."
             )
         if "browser_profile_read" in capabilities:
-            missing = sorted(target_browser_roots - set(profile["browser_profile_roots"]))
+            missing = sorted(
+                required_browser_roots(path) - set(profile["browser_profile_roots"])
+            )
             if missing:
                 raise SystemExit(
                     f"{path}: profile {name} missing browser profile roots: "
