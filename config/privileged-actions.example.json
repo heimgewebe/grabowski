@@ -93,6 +93,7 @@
       "allowed_peer_unit": "grabowski-operator.service",
       "allowed_peer_uid": 1000,
       "allowed_peer_executable": "/usr/local/bin/grabowski-privileged-request",
+      "allowed_peer_interpreter": "/usr/bin/python3",
       "authority_task_id": "GRABOWSKI-OPERATOR-SURFACE-V1-T172",
       "authority_host": "heim-pc",
       "action_schema": "grabowski.secret-pty.getpass.v1",
