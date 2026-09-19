@@ -623,6 +623,28 @@ class FakeGh:
         self.merged = False
         self.calls: list[tuple[str, ...]] = []
 
+    @staticmethod
+    def _bounded_api_page(payload: object, endpoint: str) -> object:
+        if (
+            not isinstance(payload, list)
+            or not payload
+            or not all(isinstance(page, list) for page in payload)
+        ):
+            return deepcopy(payload)
+        page_number = 1
+        if "?" in endpoint:
+            for field in endpoint.split("?", 1)[1].split("&"):
+                if field.startswith("page="):
+                    try:
+                        page_number = int(field.split("=", 1)[1])
+                    except ValueError:
+                        return None
+                    break
+        if page_number < 1:
+            return None
+        index = page_number - 1
+        return deepcopy(payload[index]) if index < len(payload) else []
+
     def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
         self.calls.append(tuple(argv))
         if argv[:2] == ["pr", "list"]:
@@ -740,19 +762,22 @@ class FakeGh:
                 }
             if "/issues/comments/" in endpoint and "/reactions" in endpoint:
                 if isinstance(state, dict) and "reaction_pages" in state:
-                    payload = state["reaction_pages"]
+                    pages = state["reaction_pages"]
                 else:
                     reactions = state.get("reactions", []) if isinstance(state, dict) else []
-                    payload = [reactions]
+                    pages = [reactions]
+                payload = self._bounded_api_page(pages, endpoint)
                 return {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""}
             if "/issues/" in endpoint and "/comments?per_page=100" in endpoint:
-                payload = state.get("request_pages") if isinstance(state, dict) else None
+                pages = state.get("request_pages") if isinstance(state, dict) else None
+                payload = self._bounded_api_page(pages, endpoint)
                 return {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""}
             if "/issues/comments/" in endpoint:
                 payload = state.get("request_comment") if isinstance(state, dict) else None
                 return {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""}
             if "/pulls/" in endpoint and "/reviews?per_page=100" in endpoint:
-                payload = state.get("review_pages") if isinstance(state, dict) else None
+                pages = state.get("review_pages") if isinstance(state, dict) else None
+                payload = self._bounded_api_page(pages, endpoint)
                 return {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""}
             if "/pulls/" in endpoint and "/reviews/" in endpoint:
                 payload = state.get("review") if isinstance(state, dict) else None
@@ -16348,7 +16373,11 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             self.assertTrue(
                 receipt["diagnostic_evidence_ignored_for_authority"]
             )
-            self.assertEqual(1, len(receipt["observations"]))
+            self.assertEqual(3, len(receipt["observations"]))
+            self.assertEqual(
+                {"threads", "finding_reviews"},
+                {item["label"] for item in receipt["observations"]},
+            )
             self.assertEqual([], receipt["errors"])
             findings = receipt["existing_review_findings"]
             self.assertEqual("clear", findings["status"])
@@ -16484,6 +16513,196 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             "merge_guard_review_findings_changes_requested_present",
             execution["merge_lease_guard"]["errors"],
         )
+
+    def test_codex_review_retrieval_stops_at_bounded_sentinel_page(self) -> None:
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        pages = [
+            [
+                {
+                    "id": 1000 + page_number,
+                    "state": "COMMENTED",
+                    "body": "reviewed",
+                    "submitted_at": "2026-07-26T08:01:00Z",
+                    "html_url": (
+                        "https://github.com/heimgewebe/grabowski/pull/96"
+                        f"#pullrequestreview-{1000 + page_number}"
+                    ),
+                    "user": {"login": "chatgpt-codex-connector[bot]"},
+                    "commit_id": CAPTAIN_HEAD,
+                }
+            ]
+            for page_number in range(11)
+        ]
+        gh = FakeGh(
+            view=view,
+            codex_state=captain_codex_live_state(
+                view, review_pages=pages, threads=[]
+            ),
+        )
+        runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
+        runner.repo_path = Path.cwd()
+        runner.github_runner = gh
+        observations: list[dict[str, object]] = []
+        errors: list[str] = []
+
+        items = runner._codex_bounded_pages(
+            [
+                "api",
+                "--paginate",
+                "--slurp",
+                "repos/heimgewebe/grabowski/pulls/96/reviews?per_page=100",
+            ],
+            label="reviews",
+            observations=observations,
+            errors=errors,
+            max_pages=10,
+            max_items=1000,
+        )
+
+        self.assertIsNone(items)
+        self.assertEqual(["merge_guard_codex_reviews_truncated"], errors)
+        review_calls = [
+            call
+            for call in gh.calls
+            if any("/pulls/96/reviews?per_page=100" in item for item in call)
+        ]
+        self.assertEqual(11, len(review_calls))
+        self.assertTrue(any("page=11" in item for item in review_calls[-1]))
+        self.assertFalse(
+            any("page=12" in item for call in review_calls for item in call)
+        )
+        self.assertFalse(
+            any("--paginate" in call or "--slurp" in call for call in review_calls)
+        )
+
+    def test_codex_bounded_pages_requires_exact_page_size_contract(self) -> None:
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        for endpoint in (
+            "repos/heimgewebe/grabowski/pulls/96/reviews",
+            "repos/heimgewebe/grabowski/pulls/96/reviews?per_page=30",
+            "repos/heimgewebe/grabowski/pulls/96/reviews?per_page=100&per_page=100",
+        ):
+            with self.subTest(endpoint=endpoint):
+                gh = FakeGh(view=view)
+                runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
+                runner.repo_path = Path.cwd()
+                runner.github_runner = gh
+                observations: list[dict[str, object]] = []
+                errors: list[str] = []
+                items = runner._codex_bounded_pages(
+                    ["api", "--paginate", "--slurp", endpoint],
+                    label="reviews",
+                    observations=observations,
+                    errors=errors,
+                    max_pages=10,
+                    max_items=1000,
+                )
+                self.assertIsNone(items)
+                self.assertEqual(
+                    ["merge_guard_codex_reviews_pages_invalid"],
+                    errors,
+                )
+                self.assertEqual([], observations)
+
+    def test_atomic_merge_guard_reads_trusted_blocker_from_second_review_page(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        review_evidence = parameters["review_evidence"]
+        assert isinstance(review_evidence, dict)
+        review_evidence["external_review_required"] = False
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        codex_review = {
+            "id": 202,
+            "state": "COMMENTED",
+            "body": "reviewed",
+            "submitted_at": "2026-07-26T08:01:00Z",
+            "html_url": "https://github.com/heimgewebe/grabowski/pull/96#pullrequestreview-202",
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "commit_id": CAPTAIN_HEAD,
+        }
+        stale_blocker = {
+            "id": 404,
+            "state": "CHANGES_REQUESTED",
+            "body": "structured blocker on older history page",
+            "submitted_at": "2026-07-26T07:59:00Z",
+            "html_url": "https://github.com/heimgewebe/grabowski/pull/96#pullrequestreview-404",
+            "user": {"login": "claude-code[bot]"},
+            "commit_id": "c" * 40,
+        }
+        state = captain_codex_live_state(
+            view,
+            review_pages=[[codex_review], [stale_blocker]],
+            threads=[],
+        )
+        gh = FakeGh(view=view, diff_text=CAPTAIN_DIFF_TEXT, codex_state=state)
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        execution = result["output"]["executions"][0]
+        self.assertFalse(execution["verification_passed"])
+        guard_errors = execution["merge_lease_guard"]["errors"]
+        self.assertIn(
+            "merge_guard_review_findings_changes_requested_present",
+            guard_errors,
+        )
+        self.assertNotIn(
+            "merge_guard_review_findings_reviews_truncated",
+            guard_errors,
+        )
+        self.assertNotIn(
+            "merge_guard_codex_finding_reviews_truncated",
+            guard_errors,
+        )
+        review_calls = [
+            call
+            for call in gh.calls
+            if any("/pulls/96/reviews?per_page=100" in item for item in call)
+        ]
+        self.assertTrue(review_calls)
+        self.assertTrue(
+            any(any("page=2" in item for item in call) for call in review_calls)
+        )
+        for call in review_calls:
+            self.assertNotIn("--paginate", call)
+            self.assertNotIn("--slurp", call)
+
 
     def test_atomic_merge_guard_allows_superseded_trusted_changes_requested(self) -> None:
         parameters = authorized_captain_run_parameters()
@@ -17312,7 +17531,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             view=view,
             diff_text=CAPTAIN_DIFF_TEXT,
             codex_state=captain_codex_live_state(
-                view, reaction_pages=[[reaction], []]
+                view, reaction_pages=[[reaction], [dict(reaction)]]
             ),
         )
 
