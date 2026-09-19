@@ -29,6 +29,7 @@ CommandRunner = Callable[[Path, list[str]], dict[str, Any]]
 GithubRunner = Callable[[Path, list[str]], dict[str, Any]]
 TransportTargetDispatcher = Callable[[str, dict[str, Any], str], dict[str, Any]]
 N8nProviderDispatcher = Callable[[str, dict[str, Any]], dict[str, Any]]
+SecretPtyDispatcher = Callable[[dict[str, Any]], dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -641,6 +642,29 @@ GRIP_SPECS: dict[str, GripSpec] = {
         operation_effect_class="external_provider",
         operation_class="n8n-workflow-edge-apply",
     ),
+    "secret-pty-getpass-probe": GripSpec(
+        name="secret-pty-getpass-probe",
+        version="1.0",
+        summary=(
+            "Run the fixed recovery-gated T172 double-getpass probe through the root-owned "
+            "secret PTY broker while keeping secret bytes outside grip parameters and receipts."
+        ),
+        effect=MUTATING,
+        required_parameters=("source_path", "expected_source_sha256"),
+        acceptance_ids=(
+            "secret-hash-bound",
+            "broker-contract-bound",
+            "exclusive-host-lease-bound",
+            "double-getpass-complete",
+            "secret-output-redacted",
+            "temporary-authority-cleaned",
+            "host-lease-released",
+        ),
+        runner="secret_pty_getpass_probe",
+        operation_effect_class="privileged_execution",
+        operation_class="secret-pty-getpass-probe",
+        capability="power_execute",
+    ),
     "transport-roundtrip": GripSpec(
         name="transport-roundtrip",
         version="2.2",
@@ -1028,6 +1052,7 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
         "reposkop-retirement-surface-observe",
         "n8n-workflow-edge-verify",
         "n8n-workflow-edge-apply",
+        "secret-pty-getpass-probe",
         "forrest-server-exit-apply",
         "transport-roundtrip",
         "convergence-assess",
@@ -1088,6 +1113,7 @@ GRIP_SURFACE_TARGETS = {
     ),
     "n8n-workflow-edge-verify": "one fixed-profile n8n workflow edge readback",
     "n8n-workflow-edge-apply": "one precondition-bound fixed-profile n8n single-edge mutation",
+    "secret-pty-getpass-probe": "one fixed T172 recovery-gated root double-getpass secret PTY probe",
     "transport-roundtrip": "one client-scope and runtime-bound transport roundtrip",
     "convergence-assess": "one hash-bound convergence closure assessment",
     "gate-evidence-preflight": "one fail-closed gate evidence preparation",
@@ -1179,6 +1205,11 @@ GRIP_RECOVERY_PATHS_BY_NAME = {
         "run n8n-workflow-edge-verify against the exact provider profile before any retry; "
         "after an ambiguous write, verify expected_state=final first and do not issue a new "
         "apply unless fresh readback proves the source is still isolated"
+    ),
+    "secret-pty-getpass-probe": (
+        "inspect the rootbroker audit and exact host lease state after any ambiguous result; "
+        "the PTY contract is retry_safe=false and a failed or lost response never authorizes "
+        "an unchanged second privileged prompt session"
     ),
     "browser-semantic-act": (
         "honor the canonical gateway retry_readback contract; after outcome_unknown perform "
@@ -1281,6 +1312,12 @@ GRIP_CONDITIONAL_PRECONDITIONS = {
         "requirements plus snapshot, target and element validity remain exclusively the canonical "
         "browser_semantic_gateway contract",
     ),
+    "secret-pty-getpass-probe": (
+        "source_path must resolve through the configured secret-use roots and expected_source_sha256 must bind its exact current bytes",
+        "the server acquires the exact root-contract required resource keys under the contract task owner only when every required key is initially free",
+        "reference and session authority are minted server-side from the commit-bound action contract; the rootbroker independently revalidates the installed root-owned contract before spawn",
+        "temporary reference/authority files and the exact acquired lease are cleaned in finally paths; secret bytes use only the existing bounded FD transport",
+    ),
     "transport-roundtrip": (
         "action=begin requires target_tool_name and target_arguments together; "
         "an unbound begin is refused fail-closed",
@@ -1326,7 +1363,8 @@ MECHANIC_FORBIDDEN_EFFECTS = tuple(sorted(CAPTAIN_HIGH_IMPACT_ACTIONS | {"force-
 GRIP_RISK_LEVELS = {
     name: (
         "high"
-        if name in GRIP_SURFACE_CAPTAIN_ONLY or name in {"worktree-hygiene-reconcile", "task-closeout-archive"}
+        if name in GRIP_SURFACE_CAPTAIN_ONLY
+        or name in {"worktree-hygiene-reconcile", "task-closeout-archive", "secret-pty-getpass-probe"}
         else "medium"
         if spec.effect == MUTATING
         else "low"
@@ -4139,6 +4177,105 @@ def _run_n8n_workflow_edge_apply(
         return {
             "receipt_status": "failed",
             "error": "n8n provider apply violated its published contract",
+        }
+    return output
+
+
+def _secret_pty_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
+    allowed = {"source_path", "expected_source_sha256"}
+    unknown = sorted(set(parameters) - allowed)
+    if unknown:
+        raise GripPreflightError(
+            "unknown secret PTY grip field(s): " + ", ".join(unknown)
+        )
+    source_path = parameters.get("source_path")
+    source_sha = parameters.get("expected_source_sha256")
+    if not isinstance(source_path, str) or not source_path.startswith("/"):
+        raise GripPreflightError("source_path must be an absolute path")
+    if (
+        not isinstance(source_sha, str)
+        or re.fullmatch(r"[0-9a-f]{64}", source_sha) is None
+    ):
+        raise GripPreflightError(
+            "expected_source_sha256 must be a lowercase SHA-256 digest"
+        )
+    return {
+        "source_path": source_path,
+        "expected_source_sha256": source_sha,
+    }
+
+
+def _run_secret_pty_getpass_probe(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+    secret_pty_dispatcher: SecretPtyDispatcher | None = None,
+) -> dict[str, Any]:
+    del spec, runner
+    request = _secret_pty_parameters(parameters)
+    if secret_pty_dispatcher is None:
+        _check(receipt, "broker-contract-bound", "fail", "dispatcher-unavailable")
+        raise GripActionError("secret PTY dispatcher is unavailable")
+    _check(
+        receipt,
+        "secret-hash-bound",
+        "pass",
+        request["expected_source_sha256"],
+    )
+    try:
+        output = secret_pty_dispatcher(request)
+    except (OSError, PermissionError, RuntimeError, TypeError, ValueError) as exc:
+        _check(receipt, "broker-contract-bound", "fail", type(exc).__name__)
+        raise GripActionError(
+            "secret PTY probe failed; rootbroker audit and host lease readback are required before retry"
+        ) from exc
+    if not isinstance(output, dict):
+        _check(receipt, "broker-contract-bound", "fail", "invalid-output")
+        raise GripActionError("secret PTY dispatcher returned invalid output")
+
+    broker = output.get("broker")
+    broker_ok = (
+        isinstance(broker, dict)
+        and broker.get("mode") == "secret-pty"
+        and broker.get("outcome") == "COMPLETED"
+        and broker.get("returncode") == 0
+        and broker.get("timed_out") is False
+        and broker.get("readback_required") is False
+        and broker.get("prompt_count") == broker.get("expected_prompt_count") == 2
+        and broker.get("failure_reason") is None
+        and output.get("broker_client_returncode") == 0
+        and output.get("broker_client_timed_out") is False
+    )
+    lease_bound = output.get("lease_bound") is True
+    redacted = output.get("secret_output_redacted") is True
+    temporary_clean = output.get("temporary_authority_cleaned") is True
+    lease_released = output.get("host_lease_released") is True
+    contract_sha = output.get("action_contract_sha256")
+
+    _check(receipt, "broker-contract-bound",
+           "pass" if isinstance(contract_sha, str) and len(contract_sha) == 64 else "fail",
+           str(contract_sha or "missing"))
+    _check(receipt, "exclusive-host-lease-bound",
+           "pass" if lease_bound else "fail",
+           str(output.get("lease_binding_sha256") or "missing"))
+    _check(receipt, "double-getpass-complete",
+           "pass" if broker_ok else "fail",
+           f"prompts={broker.get('prompt_count')}/{broker.get('expected_prompt_count')}" if isinstance(broker, dict) else "missing")
+    _check(receipt, "secret-output-redacted",
+           "pass" if redacted else "fail",
+           f"redaction_count={output.get('redaction_count')}")
+    _check(receipt, "temporary-authority-cleaned",
+           "pass" if temporary_clean else "fail",
+           str(output.get("temporary_artifact_count") or 0))
+    _check(receipt, "host-lease-released",
+           "pass" if lease_released else "fail",
+           str(output.get("lease_owner_id") or "missing"))
+    if not all((broker_ok, lease_bound, redacted, temporary_clean, lease_released)):
+        return {
+            "receipt_status": "failed",
+            "error": "secret PTY probe violated its fail-closed completion or cleanup contract",
+            **output,
         }
     return output
 
@@ -15849,6 +15986,7 @@ _RUNNERS = {
     "reposkop_retirement_surface_observe": _run_reposkop_retirement_surface_observe,
     "n8n_workflow_edge_verify": _run_n8n_workflow_edge_verify,
     "n8n_workflow_edge_apply": _run_n8n_workflow_edge_apply,
+    "secret_pty_getpass_probe": _run_secret_pty_getpass_probe,
     "forrest_server_exit_apply": _run_forrest_server_exit_apply,
     "transport_roundtrip": _run_transport_roundtrip,
     "convergence_assess": _run_convergence_assess,
@@ -15884,6 +16022,7 @@ def run_grip(
     github_runner: GithubRunner | None = None,
     transport_target_dispatcher: TransportTargetDispatcher | None = None,
     n8n_provider_dispatcher: N8nProviderDispatcher | None = None,
+    secret_pty_dispatcher: SecretPtyDispatcher | None = None,
 ) -> dict[str, Any]:
     parameters = dict(parameters or {})
     spec = GRIP_SPECS.get(name)
@@ -15943,6 +16082,14 @@ def run_grip(
                 receipt,
                 command,
                 n8n_provider_dispatcher,
+            )
+        elif spec.runner == "secret_pty_getpass_probe":
+            output = action(
+                spec,
+                parameters,
+                receipt,
+                command,
+                secret_pty_dispatcher,
             )
         else:
             output = action(spec, parameters, receipt, command)
@@ -16110,6 +16257,7 @@ def grip_run(
     github_runner: GithubRunner | None = None,
     transport_target_dispatcher: TransportTargetDispatcher | None = None,
     n8n_provider_dispatcher: N8nProviderDispatcher | None = None,
+    secret_pty_dispatcher: SecretPtyDispatcher | None = None,
 ) -> dict[str, Any]:
     parameters = dict(parameters or {})
     try:
@@ -16130,6 +16278,7 @@ def grip_run(
         github_runner=github_runner,
         transport_target_dispatcher=transport_target_dispatcher,
         n8n_provider_dispatcher=n8n_provider_dispatcher,
+        secret_pty_dispatcher=secret_pty_dispatcher,
     )
 
 

@@ -1484,6 +1484,7 @@ class GripFoundationTests(unittest.TestCase):
                 "forrest-server-exit-apply",
                 "n8n-workflow-edge-apply",
                 "n8n-workflow-edge-verify",
+                "secret-pty-getpass-probe",
                 "checkout-binding-terminal-apply",
                 "checkout-binding-terminal-preview",
                 "checkout-binding-identity-rebind-apply",
@@ -10215,6 +10216,138 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("/bin/false", env["GIT_ASKPASS"])
         self.assertEqual("cat", env["GIT_PAGER"])
         self.assertEqual("cat", env["PAGER"])
+
+class SecretPtyGripTests(unittest.TestCase):
+    def _success_output(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "action_contract_sha256": "b" * 64,
+            "lease_binding_sha256": "c" * 64,
+            "lease_owner_id": "task:GRABOWSKI-OPERATOR-SURFACE-V1-T172",
+            "lease_bound": True,
+            "secret_output_redacted": True,
+            "redaction_count": 0,
+            "temporary_artifact_count": 2,
+            "temporary_authority_cleaned": True,
+            "host_lease_released": True,
+            "retry_safe": False,
+            "broker_client_returncode": 0,
+            "broker_client_timed_out": False,
+            "broker": {
+                "schema_version": 1,
+                "mode": "secret-pty",
+                "outcome": "COMPLETED",
+                "returncode": 0,
+                "timed_out": False,
+                "retry_safe": False,
+                "readback_required": False,
+                "prompt_count": 2,
+                "expected_prompt_count": 2,
+                "failure_reason": None,
+            },
+        }
+
+    def test_secret_pty_grip_is_high_risk_power_execute_surface(self) -> None:
+        spec = {
+            item["name"]: item
+            for item in grips.list_grips(profile="operator")
+        }["secret-pty-getpass-probe"]
+        self.assertEqual("mutating", spec["effect"])
+        self.assertEqual("high", spec["risk"])
+        self.assertEqual("power_execute", spec["required_capability"])
+        self.assertNotIn("secret-pty-getpass-probe", grips.MECHANIC_NORMAL_GRIPS)
+
+    def test_secret_pty_grip_passes_only_complete_cleanup_bound_result(self) -> None:
+        observed: list[dict[str, object]] = []
+
+        def dispatch(request):
+            observed.append(dict(request))
+            return self._success_output()
+
+        result = grips.run_grip(
+            "secret-pty-getpass-probe",
+            {
+                "source_path": "/private/value",
+                "expected_source_sha256": "a" * 64,
+            },
+            allow_mutation=True,
+            secret_pty_dispatcher=dispatch,
+        )
+        self.assertEqual("passed", result["status"])
+        self.assertEqual(
+            [{
+                "source_path": "/private/value",
+                "expected_source_sha256": "a" * 64,
+            }],
+            observed,
+        )
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        for check_id in (
+            "secret-hash-bound",
+            "broker-contract-bound",
+            "exclusive-host-lease-bound",
+            "double-getpass-complete",
+            "secret-output-redacted",
+            "temporary-authority-cleaned",
+            "host-lease-released",
+        ):
+            self.assertEqual("pass", checks[check_id])
+
+    def test_secret_pty_grip_fails_closed_on_unclear_broker_result(self) -> None:
+        output = self._success_output()
+        output["broker"] = {
+            **output["broker"],
+            "outcome": "UNCLEAR",
+            "returncode": 1,
+            "readback_required": True,
+            "failure_reason": "prompt-repeated",
+        }
+        result = grips.run_grip(
+            "secret-pty-getpass-probe",
+            {
+                "source_path": "/private/value",
+                "expected_source_sha256": "a" * 64,
+            },
+            allow_mutation=True,
+            secret_pty_dispatcher=lambda _request: output,
+        )
+        self.assertEqual("failed", result["status"])
+        self.assertFalse(result["output"]["retry_safe"])
+        self.assertTrue(result["output"]["broker"]["readback_required"])
+
+    def test_secret_pty_grip_fails_closed_on_broker_client_failure(self) -> None:
+        output = self._success_output()
+        output["broker_client_returncode"] = 1
+        result = grips.run_grip(
+            "secret-pty-getpass-probe",
+            {
+                "source_path": "/private/value",
+                "expected_source_sha256": "a" * 64,
+            },
+            allow_mutation=True,
+            secret_pty_dispatcher=lambda _request: output,
+        )
+        self.assertEqual("failed", result["status"])
+        self.assertEqual(
+            "secret PTY probe violated its fail-closed completion or cleanup contract",
+            result["output"]["error"],
+        )
+        self.assertFalse(result["output"]["retry_safe"])
+
+    def test_secret_pty_grip_rejects_caller_authority_fields(self) -> None:
+        result = grips.run_grip(
+            "secret-pty-getpass-probe",
+            {
+                "source_path": "/private/value",
+                "expected_source_sha256": "a" * 64,
+                "task_id": "caller-selected",
+            },
+            allow_mutation=True,
+            secret_pty_dispatcher=lambda _request: self._success_output(),
+        )
+        self.assertEqual("blocked", result["status"])
+        self.assertIn("unknown secret PTY grip field", result["output"]["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

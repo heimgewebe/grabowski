@@ -3077,6 +3077,219 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                         call()
 
 
+    def test_secret_pty_grip_dispatcher_mints_authority_and_cleans_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            capabilities = [
+                "file_read", "file_write", "audit_verify", "audit_read",
+                "rollback_text", "bundle_registry", "secret_use",
+                "resource_lease", "privileged_reference", "power_execute",
+            ]
+            work, secret, _browser, _export, state, *patches = (
+                self._patched_runtime(root, capabilities=capabilities)
+            )
+            source = secret / "probe-value"
+            source.write_text("typed-secret-pty-value", encoding="utf-8")
+            source_sha = _sha256(source)
+            leases = [{
+                "resource_key": "host:heim-pc",
+                "owner_id": "task:GRABOWSKI-OPERATOR-SURFACE-V1-T172",
+                "acquired_at_unix": 1000,
+                "updated_at_unix": 1000,
+                "expires_at_unix": 9_999_999_999,
+                "metadata_sha256": "d" * 64,
+            }]
+            release_calls = []
+            resources = types.ModuleType("grabowski_resources")
+            resources.inspect_resources = lambda _keys: []
+            resources.acquire_resources = lambda *_args, **_kwargs: {
+                "leases": leases
+            }
+            def release_resources(*args, **kwargs):
+                release_calls.append((args, kwargs))
+                return {"released": leases}
+            resources.release_resources = release_resources
+
+            broker = types.ModuleType("grabowski_privileged_broker")
+            broker.canonical_sha256 = lambda value: hashlib.sha256(
+                json.dumps(
+                    value, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            execution = {
+                "mode": "secret-pty",
+                "argv": ["/usr/bin/python3", "-c", "pass"],
+                "cwd": "/",
+                "timeout_seconds": 30,
+                "prompt_sequence": [
+                    "LUKS passphrase: ",
+                    "Repeat LUKS passphrase: ",
+                ],
+                "max_secret_bytes": 4096,
+                "max_output_bytes": 262144,
+                "authority_task_id": "GRABOWSKI-OPERATOR-SURFACE-V1-T172",
+                "authority_host": "heim-pc",
+                "action_schema": "grabowski.secret-pty.getpass.v1",
+                "privilege_context": "root",
+                "required_resource_keys": ["host:heim-pc"],
+                "redaction_contract_sha256": "e" * 64,
+            }
+            broker.resolve_secret_pty_execution = (
+                lambda _config, _reference: dict(execution)
+            )
+            observed_authority = []
+            broker.validate_secret_pty_session_authority = (
+                lambda authority, _execution:
+                observed_authority.append(dict(authority)) or dict(authority)
+            )
+            broker_result = {
+                "schema_version": 1,
+                "mode": "secret-pty",
+                "outcome": "COMPLETED",
+                "returncode": 0,
+                "timed_out": False,
+                "retry_safe": False,
+                "readback_required": False,
+                "prompt_count": 2,
+                "expected_prompt_count": 2,
+                "failure_reason": None,
+            }
+            with (
+                patches[0], patches[1], patches[2], patches[3], patches[4],
+                patch.dict(
+                    sys.modules,
+                    {
+                        "grabowski_resources": resources,
+                        "grabowski_privileged_broker": broker,
+                    },
+                ),
+                patch.object(
+                    grabowski_mcp,
+                    "_secret_pty_grip_contract",
+                    return_value=({}, {}, "b" * 64),
+                ),
+                patch.object(grabowski_mcp, "_require_mutations_enabled"),
+                patch.object(grabowski_mcp, "_require_capability"),
+                patch.object(grabowski_mcp, "_require_valid_audit_chain"),
+                patch.object(grabowski_mcp, "_append_audit"),
+                patch.object(
+                    grabowski_mcp,
+                    "_append_audit_with_digest",
+                    return_value="f" * 64,
+                ),
+                patch.object(
+                    grabowski_mcp,
+                    "_materialize_secret_reference",
+                    return_value={
+                        "fd": 9,
+                        "path": "/proc/self/fd/9",
+                        "temporary": None,
+                        "transport": "memfd",
+                    },
+                ),
+                patch.object(grabowski_mcp, "_cleanup_secret_reference"),
+                patch.object(
+                    grabowski_mcp,
+                    "_run_secret_command",
+                    return_value={
+                        "returncode": 0,
+                        "timed_out": False,
+                        "duration_seconds": 0.1,
+                        "stdout": json.dumps(broker_result),
+                        "stderr": "",
+                        "stdout_truncated": False,
+                        "stderr_truncated": False,
+                        "redaction_count": 0,
+                    },
+                ),
+            ):
+                result = grabowski_mcp._secret_pty_grip_dispatcher(
+                    {
+                        "source_path": str(source),
+                        "expected_source_sha256": source_sha,
+                    }
+                )
+
+            self.assertEqual("memfd", result["secret_transport"])
+            self.assertTrue(result["temporary_authority_cleaned"])
+            self.assertTrue(result["host_lease_released"])
+            self.assertTrue(result["secret_output_redacted"])
+            self.assertEqual(0, result["redaction_count"])
+            self.assertEqual(broker_result, result["broker"])
+            self.assertEqual(1, len(observed_authority))
+            authority = observed_authority[0]
+            self.assertEqual(
+                "GRABOWSKI-OPERATOR-SURFACE-V1-T172",
+                authority["task_id"],
+            )
+            self.assertEqual(["host:heim-pc"], [
+                item["resource_key"]
+                for item in authority["resource_leases"]
+            ])
+            self.assertNotIn("typed-secret-pty-value", json.dumps(result))
+            self.assertEqual(1, len(release_calls))
+            temp_root = state / "secret-pty-grip"
+            self.assertEqual([], list(temp_root.iterdir()))
+
+    def test_secret_pty_grip_dispatcher_refuses_existing_required_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work, secret, _browser, _export, _state, *patches = (
+                self._patched_runtime(root)
+            )
+            source = secret / "probe-value"
+            source.write_text("busy-secret-pty-value", encoding="utf-8")
+            source_sha = _sha256(source)
+            resources = types.ModuleType("grabowski_resources")
+            resources.inspect_resources = lambda _keys: [{
+                "resource_key": "host:heim-pc",
+                "owner_id": "foreign-owner",
+            }]
+            def forbidden_acquire(*_args, **_kwargs):
+                raise AssertionError("acquire must not run for an occupied lease")
+            resources.acquire_resources = forbidden_acquire
+            broker = types.ModuleType("grabowski_privileged_broker")
+            broker.resolve_secret_pty_execution = lambda *_args: {
+                "mode": "secret-pty",
+                "prompt_sequence": [
+                    "LUKS passphrase: ",
+                    "Repeat LUKS passphrase: ",
+                ],
+                "max_secret_bytes": 4096,
+                "required_resource_keys": ["host:heim-pc"],
+                "authority_task_id": "GRABOWSKI-OPERATOR-SURFACE-V1-T172",
+            }
+            with (
+                patches[0], patches[1], patches[2], patches[3], patches[4],
+                patch.dict(
+                    sys.modules,
+                    {
+                        "grabowski_resources": resources,
+                        "grabowski_privileged_broker": broker,
+                    },
+                ),
+                patch.object(
+                    grabowski_mcp,
+                    "_secret_pty_grip_contract",
+                    return_value=({}, {}, "b" * 64),
+                ),
+                patch.object(grabowski_mcp, "_require_mutations_enabled"),
+                patch.object(grabowski_mcp, "_require_capability"),
+                patch.object(grabowski_mcp, "_require_valid_audit_chain"),
+            ):
+                with self.assertRaisesRegex(
+                    PermissionError,
+                    "already held",
+                ):
+                    grabowski_mcp._secret_pty_grip_dispatcher(
+                        {
+                            "source_path": str(source),
+                            "expected_source_sha256": source_sha,
+                        }
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()
 
