@@ -1,8 +1,8 @@
 import hashlib
 import json
+import tempfile
+import unittest
 from pathlib import Path
-
-import pytest
 
 from tools.heim_pc_recovery_attest import ValidationError, validate
 
@@ -61,73 +61,85 @@ def _fixture(tmp_path: Path):
     return provenance_path, receipt_path
 
 
-def test_validate_emits_exact_heim_pc_predicate(tmp_path):
-    provenance, receipt = _fixture(tmp_path)
-    result = validate(
-        provenance,
-        receipt,
-        expected_source_revision=SOURCE,
-        expected_recovery_contract_sha256=CONTRACT,
-    )
-    assert set(result) == {
-        "schema_version",
-        "kind",
-        "provenance_kind",
-        "provenance_sha256",
-        "producer",
-        "evidence_id",
-        "evidence_scope",
-        "evidence_schema",
-        "evidence_sha256",
-        "producer_receipt_sha256",
-        "source_revision",
-        "recovery_contract_sha256",
-        "observed_at",
-        "production_effects_authorized",
-    }
-    assert result["kind"] == "heim_pc.nixos_recovery_provenance_attestation"
-    assert result["producer"] == PRODUCER
-    assert result["source_revision"] == SOURCE
-    assert result["production_effects_authorized"] is False
-
-
-def test_validate_rejects_receipt_digest_mismatch(tmp_path):
-    provenance, receipt = _fixture(tmp_path)
-    value = json.loads(receipt.read_text())
-    value["evidence_summary_sha256"] = "6" * 64
-    _write(receipt, value)
-    with pytest.raises(ValidationError, match="producer receipt digest mismatch"):
-        validate(
-            provenance,
-            receipt,
-            expected_source_revision=SOURCE,
-            expected_recovery_contract_sha256=CONTRACT,
+class RecoveryAttestationTest(unittest.TestCase):
+    def test_validate_emits_exact_heim_pc_predicate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            provenance, receipt = _fixture(Path(tmp))
+            result = validate(
+                provenance,
+                receipt,
+                expected_source_revision=SOURCE,
+                expected_recovery_contract_sha256=CONTRACT,
+            )
+        self.assertEqual(
+            set(result),
+            {
+                "schema_version",
+                "kind",
+                "provenance_kind",
+                "provenance_sha256",
+                "producer",
+                "evidence_id",
+                "evidence_scope",
+                "evidence_schema",
+                "evidence_sha256",
+                "producer_receipt_sha256",
+                "source_revision",
+                "recovery_contract_sha256",
+                "observed_at",
+                "production_effects_authorized",
+            },
         )
+        self.assertEqual(result["kind"], "heim_pc.nixos_recovery_provenance_attestation")
+        self.assertEqual(result["producer"], PRODUCER)
+        self.assertEqual(result["source_revision"], SOURCE)
+        self.assertIs(result["production_effects_authorized"], False)
 
+    def test_validate_rejects_receipt_digest_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            provenance, receipt = _fixture(Path(tmp))
+            value = json.loads(receipt.read_text())
+            value["evidence_summary_sha256"] = "6" * 64
+            _write(receipt, value)
+            with self.assertRaisesRegex(ValidationError, "producer receipt digest mismatch"):
+                validate(
+                    provenance,
+                    receipt,
+                    expected_source_revision=SOURCE,
+                    expected_recovery_contract_sha256=CONTRACT,
+                )
 
-def test_validate_rejects_source_drift(tmp_path):
-    provenance, receipt = _fixture(tmp_path)
-    with pytest.raises(ValidationError, match="source revision mismatch"):
-        validate(
-            provenance,
-            receipt,
-            expected_source_revision="a" * 40,
-            expected_recovery_contract_sha256=CONTRACT,
+    def test_validate_rejects_source_drift(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            provenance, receipt = _fixture(Path(tmp))
+            with self.assertRaisesRegex(ValidationError, "source revision mismatch"):
+                validate(
+                    provenance,
+                    receipt,
+                    expected_source_revision="a" * 40,
+                    expected_recovery_contract_sha256=CONTRACT,
+                )
+
+    def test_validate_restore_schema_is_bound(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            provenance, receipt = _fixture(Path(tmp))
+            value = json.loads(provenance.read_text())
+            value["kind"] = "heim_pc.nixos_recovery_restore_test_provenance"
+            value["evidence_schema"] = SCHEMA + ".restore_test"
+            value["evidence"]["kind"] = SCHEMA + ".restore_test"
+            _write(provenance, value)
+            result = validate(
+                provenance,
+                receipt,
+                expected_source_revision=SOURCE,
+                expected_recovery_contract_sha256=CONTRACT,
+            )
+        self.assertEqual(
+            result["provenance_kind"],
+            "heim_pc.nixos_recovery_restore_test_provenance",
         )
+        self.assertEqual(result["evidence_schema"], SCHEMA + ".restore_test")
 
 
-def test_validate_restore_schema_is_bound(tmp_path):
-    provenance, receipt = _fixture(tmp_path)
-    value = json.loads(provenance.read_text())
-    value["kind"] = "heim_pc.nixos_recovery_restore_test_provenance"
-    value["evidence_schema"] = SCHEMA + ".restore_test"
-    value["evidence"]["kind"] = SCHEMA + ".restore_test"
-    _write(provenance, value)
-    result = validate(
-        provenance,
-        receipt,
-        expected_source_revision=SOURCE,
-        expected_recovery_contract_sha256=CONTRACT,
-    )
-    assert result["provenance_kind"] == "heim_pc.nixos_recovery_restore_test_provenance"
-    assert result["evidence_schema"] == SCHEMA + ".restore_test"
+if __name__ == "__main__":
+    unittest.main()
