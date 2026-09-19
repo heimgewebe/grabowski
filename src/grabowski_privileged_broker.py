@@ -1868,8 +1868,13 @@ def resolve_secret_pty_execution(
     Keeping this path separate prevents non-secret broker response and audit
     sinks from inheriting a secret-tainted dispatcher return value.
     """
-    candidate = _configured_action(config, reference)
-    if candidate.get("mode") != "secret-pty":
+    actions = config.get("actions")
+    candidate = (
+        actions.get(reference["action"])
+        if isinstance(actions, dict)
+        else None
+    )
+    if not isinstance(candidate, dict) or candidate.get("mode") != "secret-pty":
         raise PermissionError("privileged action is not a secret PTY action")
     return _resolve_secret_pty_action(candidate, reference)
 
@@ -1878,7 +1883,14 @@ def resolve_non_secret_execution(
     config: dict[str, Any], reference: dict[str, Any]
 ) -> dict[str, Any]:
     """Resolve only modes whose execution object is safe for normal output paths."""
-    candidate = _configured_action(config, reference)
+    actions = config.get("actions")
+    candidate = (
+        actions.get(reference["action"])
+        if isinstance(actions, dict)
+        else None
+    )
+    if not isinstance(candidate, dict):
+        raise PermissionError("privileged action is not configured")
     mode = candidate.get("mode", "template")
     if mode == "secret-pty":
         raise PermissionError("secret PTY action requires the dedicated resolver")
