@@ -3134,6 +3134,71 @@ class OperatorContractTests(unittest.TestCase):
         self.assertIn('"argv_sha256"', source)
         self.assertIn("_redacted_command", source)
 
+    def test_argv_redaction_does_not_treat_positional_path_lexemes_as_sensitive_options(self) -> None:
+        operator = _load_operator_module()
+        argv = [
+            "/tmp/t203-secret-worktree/task-output",
+            "stdout.log",
+            "25",
+            "--output=/tmp/t203-secret-worktree/result",
+            "after-output",
+        ]
+        self.assertEqual(operator._redact_argv(argv), argv)
+        self.assertEqual(operator._argv_secret_values(argv), [])
+
+    def test_argv_redaction_does_not_treat_path_text_before_unrelated_equals_as_sensitive(self) -> None:
+        operator = _load_operator_module()
+        argv = [
+            "/tmp/t203-secret-worktree/cache=123456789",
+            "https://example.invalid/secret-worktree/download?version=123456789",
+            "stdout.log",
+        ]
+        self.assertEqual(operator._redact_argv(argv), argv)
+        self.assertEqual(operator._argv_secret_values(argv), [])
+
+    def test_argv_redaction_preserves_sensitive_option_and_assignment_contract(self) -> None:
+        operator = _load_operator_module()
+        token = "plain-secret-value-12345"
+        password = "password-value-23456"
+        env_secret = "environment-value-34567"
+        argv = [
+            "command",
+            "--token",
+            token,
+            f"--password={password}",
+            f"TOKEN={env_secret}",
+        ]
+        self.assertEqual(
+            operator._redact_argv(argv),
+            [
+                "command",
+                "--token",
+                "<REDACTED>",
+                "--password=<REDACTED>",
+                "TOKEN=<REDACTED>",
+            ],
+        )
+        self.assertEqual(
+            operator._argv_secret_values(argv),
+            [token, password, env_secret],
+        )
+
+    def test_argv_redaction_preserves_sensitive_query_parameters(self) -> None:
+        operator = _load_operator_module()
+        query_secret = "query-secret-value-45678"
+        query = (
+            "https://example.invalid/path?version=1"
+            f"&secret={query_secret}&mode=raw"
+        )
+        self.assertEqual(
+            operator._redact_argv([query]),
+            [
+                "https://example.invalid/path?version=1"
+                "&secret=<REDACTED>&mode=raw"
+            ],
+        )
+        self.assertEqual(operator._argv_secret_values([query]), [query_secret])
+
     def test_operator_mutations_have_capability_and_kill_switch_gate(self) -> None:
         source = SOURCE.read_text(encoding="utf-8")
         self.assertIn("OPERATOR_CAPABILITIES", source)

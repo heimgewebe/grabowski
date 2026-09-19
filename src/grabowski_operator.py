@@ -2381,6 +2381,33 @@ def _argv_hash(argv: list[str]) -> str:
     return _json_sha256(argv)
 
 
+def _sensitive_argv_name(name: str) -> bool:
+    key = name.lstrip("-").replace("-", "_").upper()
+    return any(part in key for part in SENSITIVE_ENV_PARTS)
+
+
+def _argv_inline_secret_spans(item: str) -> list[tuple[int, int, str]]:
+    if "=" not in item:
+        return []
+    if item.startswith("-"):
+        name, value = item.split("=", 1)
+        if _sensitive_argv_name(name):
+            start = len(name) + 1
+            return [(start, len(item), value)]
+        return []
+
+    name, value = item.split("=", 1)
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) and _sensitive_argv_name(name):
+        start = len(name) + 1
+        return [(start, len(item), value)]
+
+    spans: list[tuple[int, int, str]] = []
+    for match in re.finditer(r"[?&;]([A-Za-z0-9_-]+)=([^?&;]*)", item):
+        if _sensitive_argv_name(match.group(1)):
+            spans.append((match.start(2), match.end(2), match.group(2)))
+    return spans
+
+
 def _redact_argv(argv: list[str]) -> list[str]:
     redacted: list[str] = []
     hide_next = False
@@ -2390,13 +2417,18 @@ def _redact_argv(argv: list[str]) -> list[str]:
             hide_next = False
             continue
 
-        key = item.split("=", 1)[0].lstrip("-").replace("-", "_").upper()
-        if any(part in key for part in SENSITIVE_ENV_PARTS):
-            if "=" in item:
-                redacted.append(f"{item.split('=', 1)[0]}=<REDACTED>")
-            else:
-                redacted.append(item)
-                hide_next = True
+        inline_secrets = _argv_inline_secret_spans(item)
+        if inline_secrets:
+            redacted_item = item
+            for start, end, _value in reversed(inline_secrets):
+                redacted_item = (
+                    redacted_item[:start] + "<REDACTED>" + redacted_item[end:]
+                )
+            redacted.append(_redact(redacted_item))
+            continue
+        if "=" not in item and item.startswith("-") and _sensitive_argv_name(item):
+            redacted.append(item)
+            hide_next = True
             continue
         redacted.append(_redact(item))
     return redacted
@@ -2411,12 +2443,11 @@ def _argv_secret_values(argv: list[str]) -> list[str]:
             hide_next = False
             continue
 
-        key = item.split("=", 1)[0].lstrip("-").replace("-", "_").upper()
-        if not any(part in key for part in SENSITIVE_ENV_PARTS):
+        inline_secrets = _argv_inline_secret_spans(item)
+        if inline_secrets:
+            values.extend(value for _start, _end, value in inline_secrets)
             continue
-        if "=" in item:
-            values.append(item.split("=", 1)[1])
-        else:
+        if "=" not in item and item.startswith("-") and _sensitive_argv_name(item):
             hide_next = True
     return values
 
