@@ -28,6 +28,39 @@ from typing import Any
 SOURCE_SNAPSHOT_MAX_BYTES = 16 * 1024 * 1024
 
 
+
+def _open_absolute_regular_nofollow(path: Path, *, label: str) -> int:
+    requested = path.expanduser()
+    if not requested.is_absolute():
+        raise RuntimeError(f"{label} path must be absolute")
+    parts = requested.parts
+    if (
+        len(parts) < 2
+        or parts[0] != os.sep
+        or any(part in {"", ".", ".."} for part in parts[1:])
+        or not hasattr(os, "O_NOFOLLOW")
+        or not hasattr(os, "O_DIRECTORY")
+    ):
+        raise RuntimeError(f"{label} path is not safely openable")
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    directories: list[int] = []
+    try:
+        current = os.open(os.sep, directory_flags)
+        directories.append(current)
+        for component in parts[1:-1]:
+            current = os.open(component, directory_flags, dir_fd=current)
+            directories.append(current)
+            if not stat.S_ISDIR(os.fstat(current).st_mode):
+                raise RuntimeError(f"{label} parent path is not a directory")
+        return os.open(parts[-1], file_flags, dir_fd=current)
+    except OSError as exc:
+        raise RuntimeError(f"{label} path must be symlink-free") from exc
+    finally:
+        for directory_fd in reversed(directories):
+            os.close(directory_fd)
+
+
 def _read_startup_source_snapshot(path: Path, *, label: str) -> tuple[bytes, dict[str, Any]]:
     requested = path.expanduser()
     try:
@@ -38,11 +71,7 @@ def _read_startup_source_snapshot(path: Path, *, label: str) -> tuple[bytes, dic
         raise RuntimeError(f"{label} must be a regular non-symlink file")
     if before.st_size <= 0 or before.st_size > SOURCE_SNAPSHOT_MAX_BYTES:
         raise RuntimeError(f"{label} is empty or oversized")
-    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(requested, flags)
-    except OSError as exc:
-        raise RuntimeError(f"{label} could not be opened safely") from exc
+    descriptor = _open_absolute_regular_nofollow(requested, label=label)
     try:
         opened = os.fstat(descriptor)
         if (opened.st_dev, opened.st_ino, opened.st_size) != (
@@ -63,7 +92,11 @@ def _read_startup_source_snapshot(path: Path, *, label: str) -> tuple[bytes, dic
             descriptor_path = os.readlink(f"/proc/self/fd/{descriptor}")
         except OSError as exc:
             raise RuntimeError(f"{label} opened path cannot be bound") from exc
-        if not os.path.isabs(descriptor_path) or descriptor_path.endswith(" (deleted)"):
+        if (
+            not os.path.isabs(descriptor_path)
+            or descriptor_path.endswith(" (deleted)")
+            or os.path.normpath(descriptor_path) != os.path.normpath(str(requested))
+        ):
             raise RuntimeError(f"{label} opened path is unavailable")
         try:
             after = requested.lstat()
@@ -365,10 +398,9 @@ def _file_identity(
         raise PreflightError(f"{label} is empty or oversized")
     if require_private and metadata.st_mode & 0o077:
         raise PreflightError(f"{label} must not be group- or world-accessible")
-    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(requested, flags)
-    except OSError as exc:
+        descriptor = _open_absolute_regular_nofollow(requested, label=label)
+    except RuntimeError as exc:
         raise PreflightError(f"{label} could not be opened safely") from exc
     digest = hashlib.sha256()
     count = 0
@@ -394,7 +426,11 @@ def _file_identity(
             descriptor_path = os.readlink(f"/proc/self/fd/{descriptor}")
         except OSError as exc:
             raise PreflightError(f"{label} opened path cannot be bound") from exc
-        if not os.path.isabs(descriptor_path) or descriptor_path.endswith(" (deleted)"):
+        if (
+            not os.path.isabs(descriptor_path)
+            or descriptor_path.endswith(" (deleted)")
+            or os.path.normpath(descriptor_path) != os.path.normpath(str(requested))
+        ):
             raise PreflightError(f"{label} opened path is unavailable")
         try:
             final = requested.lstat()

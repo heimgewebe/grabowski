@@ -2550,5 +2550,52 @@ class McpCommandFileIdentityTests(unittest.TestCase):
         self.assertEqual(identity["sha256"], hashlib.sha256(b"{}\n").hexdigest())
 
 
+    def test_codex_preflight_source_snapshot_rejects_symlinked_parent_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            real_parent = root / "real"
+            real_parent.mkdir()
+            target = real_parent / "codex-preflight.py"
+            target.write_bytes(b"VALUE = 6\n")
+            alias_parent = root / "alias"
+            alias_parent.symlink_to(real_parent, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "symlink-free|opened path"):
+                codex_preflight._read_source_snapshot(alias_parent / target.name)
+
+    def test_preflight_core_startup_snapshot_rejects_symlinked_parent_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            real_parent = root / "real"
+            real_parent.mkdir()
+            target = real_parent / "preflight-core.py"
+            target.write_bytes(b"VALUE = 7\n")
+            alias_parent = root / "alias"
+            alias_parent.symlink_to(real_parent, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "symlink-free|opened path"):
+                codex_preflight.core._read_startup_source_snapshot(
+                    alias_parent / target.name,
+                    label="test startup source",
+                )
+
+    def test_preflight_core_file_identity_rejects_symlinked_parent_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            real_parent = root / "real"
+            real_parent.mkdir()
+            target = real_parent / "repository-map.json"
+            target.write_bytes(b"{}\n")
+            alias_parent = root / "alias"
+            alias_parent.symlink_to(real_parent, target_is_directory=True)
+            with self.assertRaisesRegex(
+                codex_preflight.core.PreflightError,
+                "could not be opened safely|opened path",
+            ):
+                codex_preflight.core._file_identity(
+                    alias_parent / target.name,
+                    maximum=1024,
+                    label="test repository map",
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

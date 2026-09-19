@@ -1245,6 +1245,37 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertIn("process", observed)
         self.assertIsNotNone(observed["process"].poll())
 
+    def test_run_bounded_reaps_then_reraises_keyboard_interrupt(self) -> None:
+        real_popen = runner.subprocess.Popen
+        observed: dict[str, subprocess.Popen] = {}
+
+        def tracked_popen(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            observed["process"] = process
+            return process
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "sleeper.py"
+            script.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+            with (
+                patch.object(runner.subprocess, "Popen", tracked_popen),
+                patch.object(
+                    runner.time,
+                    "monotonic",
+                    side_effect=KeyboardInterrupt(),
+                ),
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    runner.run_bounded(
+                        [sys.executable, str(script)],
+                        cwd=root,
+                        timeout_seconds=30,
+                        stdin_data=b"",
+                    )
+        self.assertIn("process", observed)
+        self.assertIsNotNone(observed["process"].poll())
+
     def test_direct_child_pids_falls_back_when_task_children_file_is_missing(self) -> None:
         child = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(30)"],
@@ -1819,6 +1850,81 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             stage_parent = runtime_root / "repoground-mcp-upstream-runtime"
             self.assertTrue(stage_parent.is_dir())
             self.assertEqual([], list(stage_parent.iterdir()))
+
+    def test_mcp_proxy_propagates_post_spawn_keyboard_interrupt_and_reaps(self) -> None:
+        real_popen = runner.subprocess.Popen
+        observed: dict[str, subprocess.Popen] = {}
+
+        def tracked_popen(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            observed["process"] = process
+            return process
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            upstream = root / "mcp.py"
+            upstream.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+            manifest = root / "bound.bundle.manifest.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+            runtime_root = root / "proxy-runtime"
+            runtime_root.mkdir(mode=0o700)
+            authorized = [
+                file_identity(Path(sys.executable)),
+                file_identity(upstream),
+            ]
+            command = [
+                str(Path(sys.executable).resolve()),
+                str(upstream),
+                "--bundle-root",
+                str(root),
+            ]
+            with (
+                patch.object(runner.subprocess, "Popen", tracked_popen),
+                patch.object(
+                    runner.threading.Thread,
+                    "start",
+                    side_effect=KeyboardInterrupt(),
+                ),
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    runner.run_mcp_proxy(
+                        command,
+                        str(manifest),
+                        hashlib.sha256(manifest.read_bytes()).hexdigest(),
+                        authorized,
+                        str(runtime_root),
+                    )
+            self.assertIn("process", observed)
+            self.assertIsNotNone(observed["process"].poll())
+            stage_parent = runtime_root / "repoground-mcp-upstream-runtime"
+            self.assertTrue(stage_parent.is_dir())
+            self.assertEqual([], list(stage_parent.iterdir()))
+
+    def test_mcp_proxy_stops_client_reader_on_error_without_stdin_eof(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            upstream = root / "mcp.py"
+            upstream.write_text(
+                "import sys, time\n"
+                "sys.stdout.write('not-json\\n'); sys.stdout.flush()\n"
+                "time.sleep(30)\n",
+                encoding="utf-8",
+            )
+            process = subprocess.Popen(
+                proxy_command(upstream, root),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            assert process.stdin is not None
+            try:
+                returncode = process.wait(timeout=5)
+            finally:
+                process.stdin.close()
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+            self.assertNotEqual(returncode, 0)
 
     def test_mcp_upstream_is_bound_and_manifest_root_is_forced(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3151,6 +3257,24 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
 
 
 
+    def test_source_bootstrap_rejects_symlinked_parent_path(self) -> None:
+        source = BOOTSTRAP_PATH.read_text(encoding="utf-8")
+        prefix, separator, _tail = source.rpartition("\n_main()")
+        self.assertTrue(separator)
+        namespace: dict[str, object] = {"__name__": "bootstrap_test"}
+        exec(compile(prefix, str(BOOTSTRAP_PATH), "exec"), namespace)
+        read_target = namespace["_read_target"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            real_parent = root / "real"
+            real_parent.mkdir()
+            target = real_parent / "entrypoint.py"
+            target.write_bytes(b"VALUE = 4\n")
+            alias_parent = root / "alias"
+            alias_parent.symlink_to(real_parent, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "symlink-free|opened target path"):
+                read_target(alias_parent / target.name)
+
     def test_source_snapshot_path_identity_comes_from_open_descriptor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "base-runner.py"
@@ -3161,6 +3285,18 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertEqual(raw, b"VALUE = 3\n")
         self.assertEqual(identity["path"], str(target))
         self.assertEqual(identity["name"], target.name)
+
+    def test_source_snapshot_rejects_symlinked_parent_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            real_parent = root / "real"
+            real_parent.mkdir()
+            target = real_parent / "base-runner.py"
+            target.write_bytes(b"VALUE = 5\n")
+            alias_parent = root / "alias"
+            alias_parent.symlink_to(real_parent, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "symlink-free|opened path"):
+                runner._read_source_snapshot(alias_parent / target.name)
 
     def test_runtime_file_snapshot_path_identity_comes_from_open_descriptor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3176,6 +3312,26 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertEqual(raw, b"{}\n")
         self.assertEqual(identity["path"], str(target))
         self.assertEqual(identity["sha256"], hashlib.sha256(raw).hexdigest())
+
+
+    def test_runtime_file_snapshot_rejects_symlinked_parent_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            real_parent = root / "real"
+            real_parent.mkdir()
+            target = real_parent / "manifest.json"
+            target.write_bytes(b"{}\n")
+            alias_parent = root / "alias"
+            alias_parent.symlink_to(real_parent, target_is_directory=True)
+            with self.assertRaisesRegex(
+                runner.RunnerError,
+                "symlink-free|opened path|could not be opened safely",
+            ):
+                runner._runtime_file_snapshot(
+                    alias_parent / target.name,
+                    label="test runtime file",
+                    max_bytes=1024,
+                )
 
 
 if __name__ == "__main__":

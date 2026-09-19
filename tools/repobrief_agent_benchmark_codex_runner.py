@@ -45,6 +45,39 @@ ENTRYPOINT_BOOTSTRAP_NAME = "repobrief_agent_benchmark_source_bootstrap.py"
 ENTRYPOINT_BOOTSTRAP_PATH = Path(__file__).with_name(ENTRYPOINT_BOOTSTRAP_NAME)
 
 
+
+def _open_absolute_regular_nofollow(path: Path, *, label: str) -> int:
+    requested = path.expanduser()
+    if not requested.is_absolute():
+        raise RuntimeError(f"{label} path must be absolute")
+    parts = requested.parts
+    if (
+        len(parts) < 2
+        or parts[0] != os.sep
+        or any(part in {"", ".", ".."} for part in parts[1:])
+        or not hasattr(os, "O_NOFOLLOW")
+        or not hasattr(os, "O_DIRECTORY")
+    ):
+        raise RuntimeError(f"{label} path is not safely openable")
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    directories: list[int] = []
+    try:
+        current = os.open(os.sep, directory_flags)
+        directories.append(current)
+        for component in parts[1:-1]:
+            current = os.open(component, directory_flags, dir_fd=current)
+            directories.append(current)
+            if not stat.S_ISDIR(os.fstat(current).st_mode):
+                raise RuntimeError(f"{label} parent path is not a directory")
+        return os.open(parts[-1], file_flags, dir_fd=current)
+    except OSError as exc:
+        raise RuntimeError(f"{label} path must be symlink-free") from exc
+    finally:
+        for directory_fd in reversed(directories):
+            os.close(directory_fd)
+
+
 def _read_source_snapshot(path: Path) -> tuple[bytes, dict[str, Any]]:
     requested = path.expanduser()
     before = requested.lstat()
@@ -52,8 +85,8 @@ def _read_source_snapshot(path: Path) -> tuple[bytes, dict[str, Any]]:
         raise RuntimeError(f"cannot safely load {path.name}")
     if before.st_size <= 0 or before.st_size > SOURCE_SNAPSHOT_MAX_BYTES:
         raise RuntimeError(f"cannot safely load {path.name}")
-    descriptor = os.open(
-        requested, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = _open_absolute_regular_nofollow(
+        requested, label=f"{path.name} source"
     )
     try:
         opened = os.fstat(descriptor)
@@ -75,7 +108,11 @@ def _read_source_snapshot(path: Path) -> tuple[bytes, dict[str, Any]]:
             descriptor_path = os.readlink(f"/proc/self/fd/{descriptor}")
         except OSError as exc:
             raise RuntimeError(f"{path.name} opened path cannot be bound") from exc
-        if not os.path.isabs(descriptor_path) or descriptor_path.endswith(" (deleted)"):
+        if (
+            not os.path.isabs(descriptor_path)
+            or descriptor_path.endswith(" (deleted)")
+            or os.path.normpath(descriptor_path) != os.path.normpath(str(requested))
+        ):
             raise RuntimeError(f"{path.name} opened path is unavailable")
         after = requested.lstat()
         if (
@@ -1541,10 +1578,9 @@ def _runtime_file_snapshot(
         raise RunnerError(f"{label} must be a regular non-symlink file")
     if linked.st_size < 0 or linked.st_size > max_bytes:
         raise RunnerError(f"{label} size is invalid")
-    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(requested, flags)
-    except OSError as exc:
+        descriptor = _open_absolute_regular_nofollow(requested, label=label)
+    except RuntimeError as exc:
         raise RunnerError(f"{label} could not be opened safely") from exc
     try:
         opened = os.fstat(descriptor)
@@ -1561,7 +1597,11 @@ def _runtime_file_snapshot(
             descriptor_path = os.readlink(f"/proc/self/fd/{descriptor}")
         except OSError as exc:
             raise RunnerError(f"{label} opened path cannot be bound") from exc
-        if not os.path.isabs(descriptor_path) or descriptor_path.endswith(" (deleted)"):
+        if (
+            not os.path.isabs(descriptor_path)
+            or descriptor_path.endswith(" (deleted)")
+            or os.path.normpath(descriptor_path) != os.path.normpath(str(requested))
+        ):
             raise RunnerError(f"{label} opened path is unavailable")
         try:
             after = requested.lstat()
@@ -2747,19 +2787,19 @@ def run_mcp_proxy(
         Path(runtime_root_text), upstream, manifest, authorized_files
     )
     bound_upstream = [str(item) for item in upstream_stage["argv"]]
+    process: subprocess.Popen[bytes] | None = None
     try:
-        process = subprocess.Popen(
-            bound_upstream, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            env=provider_env(), shell=False,
-        )
-    except OSError as exc:
-        stage_cleanup_error = cleanup_staged_mcp_upstream(upstream_stage)
-        if stage_cleanup_error is not None:
-            raise RunnerError(
-                "MCP upstream could not be started and private runtime cleanup failed"
-            ) from exc
-        raise RunnerError("MCP upstream could not be started") from exc
-    try:
+        try:
+            process = subprocess.Popen(
+                bound_upstream,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=provider_env(),
+                shell=False,
+            )
+        except OSError as exc:
+            raise RunnerError("MCP upstream could not be started") from exc
         if process.stdin is None or process.stdout is None or process.stderr is None:
             raise RunnerError("MCP upstream pipes unavailable")
         output_lock = threading.Lock()
@@ -2812,13 +2852,50 @@ def run_mcp_proxy(
         stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
         stderr_thread.start()
 
+        client_stop = threading.Event()
+
         def client_to_upstream() -> None:
             nonlocal resource_list_upstream_id
+            client_selector: selectors.BaseSelector | None = None
+            client_fd: int | None = None
+            client_was_blocking: bool | None = None
+            pending_input = bytearray()
             try:
-                while True:
-                    raw = _read_bounded_mcp_line(sys.stdin.buffer, peer="client")
-                    if not raw:
-                        break
+                client_fd = sys.stdin.buffer.fileno()
+                client_was_blocking = os.get_blocking(client_fd)
+                os.set_blocking(client_fd, False)
+                client_selector = selectors.DefaultSelector()
+                client_selector.register(client_fd, selectors.EVENT_READ)
+                while not client_stop.is_set():
+                    newline = pending_input.find(b"\n")
+                    if newline < 0:
+                        if len(pending_input) > base.MAX_MCP_MESSAGE_BYTES:
+                            raise RunnerError("MCP client message too large")
+                        events = client_selector.select(0.25)
+                        if not events:
+                            continue
+                        try:
+                            chunk = os.read(
+                                client_fd,
+                                min(
+                                    65536,
+                                    base.MAX_MCP_MESSAGE_BYTES + 1 - len(pending_input),
+                                ),
+                            )
+                        except BlockingIOError:
+                            continue
+                        if not chunk:
+                            if pending_input:
+                                raise RunnerError(
+                                    "MCP client message must be newline terminated"
+                                )
+                            break
+                        pending_input.extend(chunk)
+                        continue
+                    raw = bytes(pending_input[: newline + 1])
+                    del pending_input[: newline + 1]
+                    if len(raw) > base.MAX_MCP_MESSAGE_BYTES:
+                        raise RunnerError("MCP client message too large")
                     message = json.loads(raw)
                     if not isinstance(message, dict):
                         raise RunnerError("MCP client message must be an object")
@@ -2911,41 +2988,66 @@ def run_mcp_proxy(
                 errors.append(exc)
                 terminate_upstream()
             finally:
+                client_stop.set()
+                if client_selector is not None:
+                    try:
+                        client_selector.close()
+                    except BaseException as exc:
+                        errors.append(exc)
+                if client_fd is not None and client_was_blocking is not None:
+                    try:
+                        os.set_blocking(client_fd, client_was_blocking)
+                    except (OSError, ValueError) as exc:
+                        errors.append(exc)
                 try:
                     process.stdin.close()
-                except OSError:
+                except (OSError, ValueError):
                     pass
 
-        client_thread = threading.Thread(target=client_to_upstream, daemon=True)
+        client_thread = threading.Thread(target=client_to_upstream, daemon=False)
         client_thread.start()
         returncode: int | None = None
 
     except BaseException as exc:
-        # The upstream exists already. Setup failures (including Thread.start)
-        # therefore own the same kill/reap/stage-cleanup obligation as failures
-        # in the main proxy loop below.
         cleanup_failures: list[str] = []
-        try:
-            if process.poll() is None:
-                process.kill()
-        except BaseException as cleanup_exc:
-            cleanup_failures.append(
-                f"process-kill:{type(cleanup_exc).__name__}"
-            )
-        try:
-            process.wait(timeout=5)
-        except BaseException as cleanup_exc:
-            cleanup_failures.append(
-                f"process-reap:{type(cleanup_exc).__name__}"
-            )
-        for stream in (process.stdin, process.stdout, process.stderr):
-            if stream is None or stream.closed:
-                continue
+        setup_client_stop = locals().get("client_stop")
+        if isinstance(setup_client_stop, threading.Event):
+            setup_client_stop.set()
+        if process is not None:
             try:
-                stream.close()
+                if process.poll() is None:
+                    process.kill()
             except BaseException as cleanup_exc:
                 cleanup_failures.append(
-                    f"stream-close:{type(cleanup_exc).__name__}"
+                    f"process-kill:{type(cleanup_exc).__name__}"
+                )
+            try:
+                process.wait(timeout=5)
+            except BaseException as cleanup_exc:
+                cleanup_failures.append(
+                    f"process-reap:{type(cleanup_exc).__name__}"
+                )
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is None or stream.closed:
+                    continue
+                try:
+                    stream.close()
+                except BaseException as cleanup_exc:
+                    cleanup_failures.append(
+                        f"stream-close:{type(cleanup_exc).__name__}"
+                    )
+        setup_client_thread = locals().get("client_thread")
+        if (
+            isinstance(setup_client_thread, threading.Thread)
+            and setup_client_thread.ident is not None
+        ):
+            try:
+                setup_client_thread.join(timeout=1)
+                if setup_client_thread.is_alive():
+                    cleanup_failures.append("client-thread-still-running")
+            except BaseException as cleanup_exc:
+                cleanup_failures.append(
+                    f"client-thread-join:{type(cleanup_exc).__name__}"
                 )
         setup_stderr_thread = locals().get("stderr_thread")
         if (
@@ -2954,6 +3056,8 @@ def run_mcp_proxy(
         ):
             try:
                 setup_stderr_thread.join(timeout=5)
+                if setup_stderr_thread.is_alive():
+                    cleanup_failures.append("stderr-thread-still-running")
             except BaseException as cleanup_exc:
                 cleanup_failures.append(
                     f"stderr-thread-join:{type(cleanup_exc).__name__}"
@@ -2966,9 +3070,12 @@ def run_mcp_proxy(
                 "MCP upstream setup failed and cleanup was incomplete: "
                 + ",".join(cleanup_failures)
             ) from exc
+        if not isinstance(exc, Exception):
+            raise
         if isinstance(exc, RunnerError):
             raise
         raise RunnerError("benchmark MCP proxy setup failed") from exc
+
     try:
         while True:
             raw = _read_bounded_mcp_line(process.stdout, peer="upstream")
@@ -3071,6 +3178,12 @@ def run_mcp_proxy(
             _proxy_write(message, output_lock)
         client_thread.join(timeout=1)
         if client_thread.is_alive():
+            client_stop.set()
+            client_thread.join(timeout=1)
+            if client_thread.is_alive():
+                raise RunnerError(
+                    "MCP client intake could not be stopped at upstream EOF"
+                )
             raise RunnerError("MCP client intake remained active at upstream EOF")
         if errors:
             raise RunnerError("benchmark MCP proxy stream failed") from errors[0]
@@ -3085,6 +3198,7 @@ def run_mcp_proxy(
             raise RunnerError("MCP upstream responses remained pending at upstream EOF")
         returncode = process.wait(timeout=5)
     finally:
+        client_stop.set()
         if process.poll() is None:
             terminate_upstream()
         try:
@@ -3097,6 +3211,13 @@ def run_mcp_proxy(
             except subprocess.TimeoutExpired as followup:
                 errors.append(followup)
                 returncode = process.returncode if isinstance(process.returncode, int) else -1
+        try:
+            process.stdin.close()
+        except (OSError, ValueError):
+            pass
+        client_thread.join(timeout=1)
+        if client_thread.is_alive():
+            errors.append(RunnerError("MCP client intake remained active during cleanup"))
         process.stdout.close()
         stderr_thread.join(timeout=5)
         if upstream_stderr:
@@ -3301,22 +3422,23 @@ def run_bounded(
 
     _enable_child_subreaper()
     baseline_children = _direct_child_pids()
+    process: subprocess.Popen[bytes] | None = None
 
     try:
-        process = subprocess.Popen(
-            list(command),
-            cwd=cwd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=dict(environment) if environment is not None else provider_env(),
-            shell=False,
-            start_new_session=True,
-        )
-    except OSError as exc:
-        raise RunnerError("Codex process could not be started") from exc
+        try:
+            process = subprocess.Popen(
+                list(command),
+                cwd=cwd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=dict(environment) if environment is not None else provider_env(),
+                shell=False,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            raise RunnerError("Codex process could not be started") from exc
 
-    try:
         deadline = time.monotonic() + timeout_seconds
         buffers = {"stdout": bytearray(), "stderr": bytearray()}
         limits = {"stdout": stdout_limit, "stderr": stderr_limit}
@@ -3436,7 +3558,7 @@ def run_bounded(
                     assert stream is not None
                     os.set_blocking(stream.fileno(), False)
                     selector.register(stream, selectors.EVENT_READ, label)
-            except BaseException as exc:
+            except Exception as exc:
                 note_error(f"capture_setup_failed:{type(exc).__name__}")
                 kill_process_tree()
 
@@ -3449,7 +3571,7 @@ def run_bounded(
                     selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
                 else:
                     process.stdin.close()
-            except BaseException as exc:
+            except Exception as exc:
                 note_error(f"stdin_setup_failed:{type(exc).__name__}")
                 kill_process_tree()
 
@@ -3504,14 +3626,14 @@ def run_bounded(
                             selector.unregister(key.fileobj)
                             continue
                         store(str(key.data), chunk)
-            except BaseException as exc:
+            except Exception as exc:
                 note_error(f"capture_stream_failed:{type(exc).__name__}")
                 kill_process_tree()
 
         if selector is not None:
             try:
                 selector.close()
-            except BaseException as exc:
+            except Exception as exc:
                 note_error(f"selector_cleanup_failed:{type(exc).__name__}")
 
         if capture_error is not None:
@@ -3528,14 +3650,14 @@ def run_bounded(
                 except subprocess.TimeoutExpired:
                     note_error("timeout")
                     kill_process_tree()
-                except BaseException as exc:
+                except Exception as exc:
                     note_error(f"process_wait_failed:{type(exc).__name__}")
                     kill_process_tree()
 
         if process.poll() is None:
             try:
                 process.wait(timeout=5)
-            except BaseException as followup:
+            except Exception as followup:
                 note_error(f"process_reap_failed:{type(followup).__name__}")
         returncode = process.returncode if isinstance(process.returncode, int) else -1
         if process.poll() is not None:
@@ -3642,6 +3764,9 @@ def run_bounded(
                 emergency_errors.append(
                     f"emergency_stream_cleanup_failed:{type(cleanup_exc).__name__}"
                 )
+        if not isinstance(exc, Exception):
+            raise
+
         existing_buffers = locals().get("buffers")
         stdout = (
             bytes(existing_buffers.get("stdout", b""))

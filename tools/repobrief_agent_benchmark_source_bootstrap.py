@@ -39,6 +39,39 @@ def _python_c_program() -> tuple[bytes, str]:
     return program, target
 
 
+
+def _open_absolute_regular_nofollow(path: Path, *, label: str) -> int:
+    requested = path.expanduser()
+    if not requested.is_absolute():
+        raise RuntimeError(f"{label} path must be absolute")
+    parts = requested.parts
+    if (
+        len(parts) < 2
+        or parts[0] != os.sep
+        or any(part in {"", ".", ".."} for part in parts[1:])
+        or not hasattr(os, "O_NOFOLLOW")
+        or not hasattr(os, "O_DIRECTORY")
+    ):
+        raise RuntimeError(f"{label} path is not safely openable")
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    directories: list[int] = []
+    try:
+        current = os.open(os.sep, directory_flags)
+        directories.append(current)
+        for component in parts[1:-1]:
+            current = os.open(component, directory_flags, dir_fd=current)
+            directories.append(current)
+            if not stat.S_ISDIR(os.fstat(current).st_mode):
+                raise RuntimeError(f"{label} parent path is not a directory")
+        return os.open(parts[-1], file_flags, dir_fd=current)
+    except OSError as exc:
+        raise RuntimeError(f"{label} path must be symlink-free") from exc
+    finally:
+        for directory_fd in reversed(directories):
+            os.close(directory_fd)
+
+
 def _read_target(path: Path) -> tuple[bytes, dict[str, object]]:
     requested = path.expanduser()
     if not requested.is_absolute():
@@ -56,8 +89,8 @@ def _read_target(path: Path) -> tuple[bytes, dict[str, object]]:
         before.st_mtime_ns,
         before.st_ctime_ns,
     )
-    descriptor = os.open(
-        requested, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = _open_absolute_regular_nofollow(
+        requested, label="immutable source bootstrap target"
     )
     try:
         opened = os.fstat(descriptor)
@@ -90,6 +123,7 @@ def _read_target(path: Path) -> tuple[bytes, dict[str, object]]:
         if (
             not os.path.isabs(descriptor_path)
             or descriptor_path.endswith(" (deleted)")
+            or os.path.normpath(descriptor_path) != os.path.normpath(str(requested))
         ):
             raise RuntimeError(
                 "immutable source bootstrap opened target path is unavailable"
