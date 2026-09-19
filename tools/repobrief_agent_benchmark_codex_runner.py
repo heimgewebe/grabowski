@@ -2759,175 +2759,216 @@ def run_mcp_proxy(
                 "MCP upstream could not be started and private runtime cleanup failed"
             ) from exc
         raise RunnerError("MCP upstream could not be started") from exc
-    if process.stdin is None or process.stdout is None or process.stderr is None:
-        process.kill()
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired as exc:
-            raise RunnerError("MCP upstream could not be reaped") from exc
-        stage_cleanup_error = cleanup_staged_mcp_upstream(upstream_stage)
-        if stage_cleanup_error is not None:
-            raise RunnerError(
-                "MCP upstream pipes unavailable and private runtime cleanup failed"
-            )
-        raise RunnerError("MCP upstream pipes unavailable")
-    output_lock = threading.Lock()
-    state_lock = threading.Lock()
-    pending_requests: dict[Any, str] = {}
-    pending_treatment_tools: dict[Any, str] = {}
-    tools_inventory_validated = False
-    resource_calls: dict[Any, tuple[str, str | None]] = {}
-    frozen_resources: dict[str, Any] | None = None
-    frozen_uris: set[str] = set()
-    resource_list_upstream_id: Any | None = None
-    resource_list_waiters: list[Any] = []
-    errors: list[BaseException] = []
-    upstream_stderr = bytearray()
-    upstream_stderr_overflow = False
+    try:
+        if process.stdin is None or process.stdout is None or process.stderr is None:
+            raise RunnerError("MCP upstream pipes unavailable")
+        output_lock = threading.Lock()
+        state_lock = threading.Lock()
+        pending_requests: dict[Any, str] = {}
+        pending_treatment_tools: dict[Any, str] = {}
+        tools_inventory_validated = False
+        resource_calls: dict[Any, tuple[str, str | None]] = {}
+        frozen_resources: dict[str, Any] | None = None
+        frozen_uris: set[str] = set()
+        resource_list_upstream_id: Any | None = None
+        resource_list_waiters: list[Any] = []
+        errors: list[BaseException] = []
+        upstream_stderr = bytearray()
+        upstream_stderr_overflow = False
 
-    # Keep the upstream in the inherited provider process group. The outer
-    # runner can therefore still kill Codex, this proxy, and RepoGround as one
-    # containment unit. Proxy-local failures additionally own/reap this child.
-    def terminate_upstream() -> None:
-        if process.poll() is not None:
-            return
-        try:
-            process.kill()
-        except ProcessLookupError:
-            return
-        except OSError as exc:
-            errors.append(exc)
+        # Keep the upstream in the inherited provider process group. The outer
+        # runner can therefore still kill Codex, this proxy, and RepoGround as one
+        # containment unit. Proxy-local failures additionally own/reap this child.
+        def terminate_upstream() -> None:
+            if process.poll() is not None:
+                return
+            try:
+                process.kill()
+            except ProcessLookupError:
+                return
+            except OSError as exc:
+                errors.append(exc)
 
-    def send(message: Mapping[str, Any]) -> None:
-        raw = canonical(message).encode("utf-8") + b"\n"
-        process.stdin.write(raw)
-        process.stdin.flush()
+        def send(message: Mapping[str, Any]) -> None:
+            raw = canonical(message).encode("utf-8") + b"\n"
+            process.stdin.write(raw)
+            process.stdin.flush()
 
-    def drain_stderr() -> None:
-        nonlocal upstream_stderr_overflow
-        try:
-            while True:
-                chunk = process.stderr.read(65536)
-                if not chunk:
-                    break
-                room = MAX_STDERR_BYTES + 1 - len(upstream_stderr)
-                upstream_stderr.extend(chunk[: max(room, 0)])
-                if len(upstream_stderr) > MAX_STDERR_BYTES:
-                    upstream_stderr_overflow = True
-        except BaseException as exc:
-            errors.append(exc)
-            terminate_upstream()
+        def drain_stderr() -> None:
+            nonlocal upstream_stderr_overflow
+            try:
+                while True:
+                    chunk = process.stderr.read(65536)
+                    if not chunk:
+                        break
+                    room = MAX_STDERR_BYTES + 1 - len(upstream_stderr)
+                    upstream_stderr.extend(chunk[: max(room, 0)])
+                    if len(upstream_stderr) > MAX_STDERR_BYTES:
+                        upstream_stderr_overflow = True
+            except BaseException as exc:
+                errors.append(exc)
+                terminate_upstream()
 
-    stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
-    stderr_thread.start()
+        stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+        stderr_thread.start()
 
-    def client_to_upstream() -> None:
-        nonlocal resource_list_upstream_id
-        try:
-            while True:
-                raw = _read_bounded_mcp_line(sys.stdin.buffer, peer="client")
-                if not raw:
-                    break
-                message = json.loads(raw)
-                if not isinstance(message, dict):
-                    raise RunnerError("MCP client message must be an object")
-                if message.get("jsonrpc") != "2.0":
-                    raise RunnerError("MCP client JSON-RPC version is invalid")
-                if "params" in message and not isinstance(message.get("params"), (dict, list)):
-                    raise RunnerError("MCP client JSON-RPC params are invalid")
-                method = message.get("method")
-                has_identifier = "id" in message
-                identifier = message.get("id")
-                if has_identifier and not _valid_jsonrpc_request_id(identifier):
-                    raise RunnerError("MCP client request ID is invalid")
-                if method == "tools/call" and not has_identifier:
-                    raise RunnerError("MCP tools/call request ID is required")
-                if method not in MCP_CLIENT_METHODS:
-                    if identifier is not None:
-                        _proxy_write(_proxy_error(identifier, "benchmark MCP method is not authorized"), output_lock)
-                    continue
-                pending_kind: str | None = None
-                pending_treatment_tool: str | None = None
-                if method == "initialize":
-                    pending_kind = "initialize"
-                elif method == "tools/list":
-                    pending_kind = "tools/list"
-                elif method == "tools/call":
-                    params = message.get("params") if isinstance(message.get("params"), dict) else {}
-                    name = params.get("name")
-                    if name == "repobrief_resource_read":
-                        arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
-                        action = arguments.get("action")
-                        uri = arguments.get("uri")
-                        if identifier is None or action not in {"list", "read"}:
-                            if identifier is not None:
-                                _proxy_write(_proxy_error(identifier, "invalid resource request"), output_lock)
+        def client_to_upstream() -> None:
+            nonlocal resource_list_upstream_id
+            try:
+                while True:
+                    raw = _read_bounded_mcp_line(sys.stdin.buffer, peer="client")
+                    if not raw:
+                        break
+                    message = json.loads(raw)
+                    if not isinstance(message, dict):
+                        raise RunnerError("MCP client message must be an object")
+                    if message.get("jsonrpc") != "2.0":
+                        raise RunnerError("MCP client JSON-RPC version is invalid")
+                    if "params" in message and not isinstance(message.get("params"), (dict, list)):
+                        raise RunnerError("MCP client JSON-RPC params are invalid")
+                    method = message.get("method")
+                    has_identifier = "id" in message
+                    identifier = message.get("id")
+                    if has_identifier and not _valid_jsonrpc_request_id(identifier):
+                        raise RunnerError("MCP client request ID is invalid")
+                    if method == "tools/call" and not has_identifier:
+                        raise RunnerError("MCP tools/call request ID is required")
+                    if method not in MCP_CLIENT_METHODS:
+                        if identifier is not None:
+                            _proxy_write(_proxy_error(identifier, "benchmark MCP method is not authorized"), output_lock)
+                        continue
+                    pending_kind: str | None = None
+                    pending_treatment_tool: str | None = None
+                    if method == "initialize":
+                        pending_kind = "initialize"
+                    elif method == "tools/list":
+                        pending_kind = "tools/list"
+                    elif method == "tools/call":
+                        params = message.get("params") if isinstance(message.get("params"), dict) else {}
+                        name = params.get("name")
+                        if name == "repobrief_resource_read":
+                            arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
+                            action = arguments.get("action")
+                            uri = arguments.get("uri")
+                            if identifier is None or action not in {"list", "read"}:
+                                if identifier is not None:
+                                    _proxy_write(_proxy_error(identifier, "invalid resource request"), output_lock)
+                                continue
+                            coalesced = False
+                            with state_lock:
+                                if identifier in pending_requests:
+                                    raise RunnerError("MCP client reused a pending request ID")
+                                if action == "list" and frozen_resources is not None:
+                                    cached = canonical(frozen_resources)
+                                else:
+                                    cached = None
+                                if action == "list" and frozen_resources is None and resource_list_upstream_id is not None:
+                                    pending_requests[identifier] = "resource-list-waiter"
+                                    resource_list_waiters.append(identifier)
+                                    coalesced = True
+                                if action == "read" and frozen_resources is None:
+                                    error = "list frozen resources before reading"
+                                elif action == "read" and (not isinstance(uri, str) or uri not in frozen_uris):
+                                    error = "resource URI is not in the frozen list"
+                                else:
+                                    error = None
+                            if cached is not None:
+                                _proxy_write({"jsonrpc":"2.0","id":identifier,"result":{"content":[{"type":"text","text":cached}],"isError":False}}, output_lock)
+                                continue
+                            if coalesced:
+                                continue
+                            if error is not None:
+                                _proxy_write({"jsonrpc":"2.0","id":identifier,"result":{"content":[{"type":"text","text":error}],"isError":True}}, output_lock)
+                                continue
+                            with state_lock:
+                                pending_requests[identifier] = "resource"
+                                resource_calls[identifier] = (str(action), str(uri) if uri is not None else None)
+                                if action == "list":
+                                    resource_list_upstream_id = identifier
+                            if action == "list":
+                                send({"jsonrpc":"2.0","id":identifier,"method":"resources/list","params":{}})
+                            else:
+                                send({"jsonrpc":"2.0","id":identifier,"method":"resources/read","params":{"uri":uri}})
                             continue
-                        coalesced = False
+                        if name not in UPSTREAM_MCP:
+                            if identifier is not None:
+                                _proxy_write(_proxy_error(identifier, "benchmark MCP tool is not authorized"), output_lock)
+                            continue
+                        _pin_treatment_arguments(message, manifest)
+                        pending_kind = "tools/call"
+                        pending_treatment_tool = str(name)
+                    elif identifier is not None:
+                        pending_kind = "passthrough"
+                    if identifier is not None:
                         with state_lock:
                             if identifier in pending_requests:
                                 raise RunnerError("MCP client reused a pending request ID")
-                            if action == "list" and frozen_resources is not None:
-                                cached = canonical(frozen_resources)
-                            else:
-                                cached = None
-                            if action == "list" and frozen_resources is None and resource_list_upstream_id is not None:
-                                pending_requests[identifier] = "resource-list-waiter"
-                                resource_list_waiters.append(identifier)
-                                coalesced = True
-                            if action == "read" and frozen_resources is None:
-                                error = "list frozen resources before reading"
-                            elif action == "read" and (not isinstance(uri, str) or uri not in frozen_uris):
-                                error = "resource URI is not in the frozen list"
-                            else:
-                                error = None
-                        if cached is not None:
-                            _proxy_write({"jsonrpc":"2.0","id":identifier,"result":{"content":[{"type":"text","text":cached}],"isError":False}}, output_lock)
-                            continue
-                        if coalesced:
-                            continue
-                        if error is not None:
-                            _proxy_write({"jsonrpc":"2.0","id":identifier,"result":{"content":[{"type":"text","text":error}],"isError":True}}, output_lock)
-                            continue
-                        with state_lock:
-                            pending_requests[identifier] = "resource"
-                            resource_calls[identifier] = (str(action), str(uri) if uri is not None else None)
-                            if action == "list":
-                                resource_list_upstream_id = identifier
-                        if action == "list":
-                            send({"jsonrpc":"2.0","id":identifier,"method":"resources/list","params":{}})
-                        else:
-                            send({"jsonrpc":"2.0","id":identifier,"method":"resources/read","params":{"uri":uri}})
-                        continue
-                    if name not in UPSTREAM_MCP:
-                        if identifier is not None:
-                            _proxy_write(_proxy_error(identifier, "benchmark MCP tool is not authorized"), output_lock)
-                        continue
-                    _pin_treatment_arguments(message, manifest)
-                    pending_kind = "tools/call"
-                    pending_treatment_tool = str(name)
-                elif identifier is not None:
-                    pending_kind = "passthrough"
-                if identifier is not None:
-                    with state_lock:
-                        if identifier in pending_requests:
-                            raise RunnerError("MCP client reused a pending request ID")
-                        pending_requests[identifier] = pending_kind or "passthrough"
-                        if pending_treatment_tool is not None:
-                            pending_treatment_tools[identifier] = pending_treatment_tool
-                send(message)
-        except BaseException as exc:
-            errors.append(exc)
-            terminate_upstream()
-        finally:
-            try:
-                process.stdin.close()
-            except OSError:
-                pass
+                            pending_requests[identifier] = pending_kind or "passthrough"
+                            if pending_treatment_tool is not None:
+                                pending_treatment_tools[identifier] = pending_treatment_tool
+                    send(message)
+            except BaseException as exc:
+                errors.append(exc)
+                terminate_upstream()
+            finally:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
 
-    client_thread = threading.Thread(target=client_to_upstream, daemon=True)
-    client_thread.start()
-    returncode: int | None = None
+        client_thread = threading.Thread(target=client_to_upstream, daemon=True)
+        client_thread.start()
+        returncode: int | None = None
+
+    except BaseException as exc:
+        # The upstream exists already. Setup failures (including Thread.start)
+        # therefore own the same kill/reap/stage-cleanup obligation as failures
+        # in the main proxy loop below.
+        cleanup_failures: list[str] = []
+        try:
+            if process.poll() is None:
+                process.kill()
+        except BaseException as cleanup_exc:
+            cleanup_failures.append(
+                f"process-kill:{type(cleanup_exc).__name__}"
+            )
+        try:
+            process.wait(timeout=5)
+        except BaseException as cleanup_exc:
+            cleanup_failures.append(
+                f"process-reap:{type(cleanup_exc).__name__}"
+            )
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is None or stream.closed:
+                continue
+            try:
+                stream.close()
+            except BaseException as cleanup_exc:
+                cleanup_failures.append(
+                    f"stream-close:{type(cleanup_exc).__name__}"
+                )
+        setup_stderr_thread = locals().get("stderr_thread")
+        if (
+            isinstance(setup_stderr_thread, threading.Thread)
+            and setup_stderr_thread.ident is not None
+        ):
+            try:
+                setup_stderr_thread.join(timeout=5)
+            except BaseException as cleanup_exc:
+                cleanup_failures.append(
+                    f"stderr-thread-join:{type(cleanup_exc).__name__}"
+                )
+        stage_cleanup_error = cleanup_staged_mcp_upstream(upstream_stage)
+        if stage_cleanup_error is not None:
+            cleanup_failures.append(f"stage-cleanup:{stage_cleanup_error}")
+        if cleanup_failures:
+            raise RunnerError(
+                "MCP upstream setup failed and cleanup was incomplete: "
+                + ",".join(cleanup_failures)
+            ) from exc
+        if isinstance(exc, RunnerError):
+            raise
+        raise RunnerError("benchmark MCP proxy setup failed") from exc
     try:
         while True:
             raw = _read_bounded_mcp_line(process.stdout, peer="upstream")
@@ -3275,270 +3316,367 @@ def run_bounded(
     except OSError as exc:
         raise RunnerError("Codex process could not be started") from exc
 
-    deadline = time.monotonic() + timeout_seconds
-    buffers = {"stdout": bytearray(), "stderr": bytearray()}
-    limits = {"stdout": stdout_limit, "stderr": stderr_limit}
-    overflow = {"stdout": False, "stderr": False}
-    capture_error: str | None = None
-    selector: selectors.BaseSelector | None = None
+    try:
+        deadline = time.monotonic() + timeout_seconds
+        buffers = {"stdout": bytearray(), "stderr": bytearray()}
+        limits = {"stdout": stdout_limit, "stderr": stderr_limit}
+        overflow = {"stdout": False, "stderr": False}
+        capture_error: str | None = None
+        selector: selectors.BaseSelector | None = None
 
-    def note_error(marker: str) -> None:
-        nonlocal capture_error
-        if capture_error is None:
-            capture_error = marker
-        elif marker not in capture_error.split(";"):
-            capture_error += ";" + marker
+        def note_error(marker: str) -> None:
+            nonlocal capture_error
+            if capture_error is None:
+                capture_error = marker
+            elif marker not in capture_error.split(";"):
+                capture_error += ";" + marker
 
-    def kill_process_tree() -> None:
-        group_killed = False
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-            group_killed = True
-        except ProcessLookupError:
-            return
-        except OSError as exc:
-            note_error(f"process_group_kill_failed:{type(exc).__name__}")
-        if group_killed or process.poll() is not None:
-            return
-        try:
-            process.kill()
-        except ProcessLookupError:
-            return
-        except OSError as exc:
-            note_error(f"process_kill_failed:{type(exc).__name__}")
-
-    def process_group_exists() -> bool:
-        try:
-            os.killpg(process.pid, 0)
-        except ProcessLookupError:
-            return False
-        except OSError as exc:
-            note_error(f"process_group_probe_failed:{type(exc).__name__}")
-            return True
-        return True
-
-    def adopted_provider_children() -> set[int]:
-        try:
-            return _direct_child_pids() - baseline_children
-        except RunnerError:
-            note_error("provider_child_scan_failed")
-            return set()
-
-    def kill_adopted_children(children: set[int]) -> None:
-        for child_pid in sorted(children):
+        def kill_process_tree() -> None:
+            group_killed = False
             try:
-                os.kill(child_pid, signal.SIGKILL)
+                os.killpg(process.pid, signal.SIGKILL)
+                group_killed = True
             except ProcessLookupError:
-                continue
+                return
             except OSError as exc:
-                note_error(f"adopted_child_kill_failed:{type(exc).__name__}")
-
-    def reap_adopted_children(children: set[int]) -> None:
-        for child_pid in sorted(children):
+                note_error(f"process_group_kill_failed:{type(exc).__name__}")
+            if group_killed or process.poll() is not None:
+                return
             try:
-                os.waitpid(child_pid, os.WNOHANG)
-            except ChildProcessError:
-                continue
+                process.kill()
+            except ProcessLookupError:
+                return
             except OSError as exc:
-                note_error(f"adopted_child_reap_failed:{type(exc).__name__}")
+                note_error(f"process_kill_failed:{type(exc).__name__}")
 
-    def contain_surviving_process_group() -> None:
-        group_present = process_group_exists()
-        adopted = adopted_provider_children()
-        if not group_present and not adopted:
-            return
-        if group_present:
-            note_error("process_group_survived_provider_exit")
-            kill_process_tree()
-        if adopted:
-            note_error("adopted_descendant_survived_provider_exit")
-            kill_adopted_children(adopted)
-        cleanup_deadline = time.monotonic() + 1.0
-        while time.monotonic() < cleanup_deadline:
-            adopted = adopted_provider_children()
-            if adopted:
-                kill_adopted_children(adopted)
-                reap_adopted_children(adopted)
+        def process_group_exists() -> bool:
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                return False
+            except OSError as exc:
+                note_error(f"process_group_probe_failed:{type(exc).__name__}")
+                return True
+            return True
+
+        def adopted_provider_children() -> set[int]:
+            try:
+                return _direct_child_pids() - baseline_children
+            except RunnerError:
+                note_error("provider_child_scan_failed")
+                return set()
+
+        def kill_adopted_children(children: set[int]) -> None:
+            for child_pid in sorted(children):
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    continue
+                except OSError as exc:
+                    note_error(f"adopted_child_kill_failed:{type(exc).__name__}")
+
+        def reap_adopted_children(children: set[int]) -> None:
+            for child_pid in sorted(children):
+                try:
+                    os.waitpid(child_pid, os.WNOHANG)
+                except ChildProcessError:
+                    continue
+                except OSError as exc:
+                    note_error(f"adopted_child_reap_failed:{type(exc).__name__}")
+
+        def contain_surviving_process_group() -> None:
             group_present = process_group_exists()
             adopted = adopted_provider_children()
             if not group_present and not adopted:
                 return
             if group_present:
+                note_error("process_group_survived_provider_exit")
                 kill_process_tree()
-            time.sleep(0.01)
-        adopted = adopted_provider_children()
-        if adopted:
-            kill_adopted_children(adopted)
-            reap_adopted_children(adopted)
-        if process_group_exists() or adopted_provider_children():
-            note_error("process_group_cleanup_failed")
-    def store(label: str, chunk: bytes) -> None:
-        if not chunk or overflow[label]:
-            return
-        limit = limits[label]
-        room = max(limit + 1 - len(buffers[label]), 0)
-        buffers[label].extend(chunk[:room])
-        if len(buffers[label]) > limit:
-            overflow[label] = True
-            note_error(f"{label}_limit_exceeded")
-            kill_process_tree()
-
-    streams = ((process.stdout, "stdout"), (process.stderr, "stderr"))
-    if process.stdin is None or process.stdout is None or process.stderr is None:
-        note_error("capture_pipe_unavailable")
-        kill_process_tree()
-    else:
-        try:
-            selector = selectors.DefaultSelector()
-            for stream, label in streams:
-                assert stream is not None
-                os.set_blocking(stream.fileno(), False)
-                selector.register(stream, selectors.EVENT_READ, label)
-        except BaseException as exc:
-            note_error(f"capture_setup_failed:{type(exc).__name__}")
-            kill_process_tree()
-
-    stdin_pending = memoryview(stdin_data)
-    if selector is not None and capture_error is None:
-        assert process.stdin is not None
-        try:
-            os.set_blocking(process.stdin.fileno(), False)
-            if stdin_pending:
-                selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
-            else:
-                process.stdin.close()
-        except BaseException as exc:
-            note_error(f"stdin_setup_failed:{type(exc).__name__}")
-            kill_process_tree()
-
-    if selector is not None and capture_error is None:
-        try:
-            while selector.get_map():
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    note_error("timeout")
+            if adopted:
+                note_error("adopted_descendant_survived_provider_exit")
+                kill_adopted_children(adopted)
+            cleanup_deadline = time.monotonic() + 1.0
+            while time.monotonic() < cleanup_deadline:
+                adopted = adopted_provider_children()
+                if adopted:
+                    kill_adopted_children(adopted)
+                    reap_adopted_children(adopted)
+                group_present = process_group_exists()
+                adopted = adopted_provider_children()
+                if not group_present and not adopted:
+                    return
+                if group_present:
                     kill_process_tree()
-                    break
-                wait_for = 0 if process.poll() is not None else max(min(remaining, 0.25), 0)
-                events = selector.select(wait_for)
-                if not events and process.poll() is not None:
-                    for key in list(selector.get_map().values()):
-                        if key.data == "stdin":
-                            selector.unregister(key.fileobj)
-                            key.fileobj.close()
-                            continue
-                        try:
-                            chunk = os.read(key.fileobj.fileno(), 65536)
-                        except BlockingIOError:
-                            continue
-                        if not chunk:
-                            selector.unregister(key.fileobj)
-                        else:
-                            store(str(key.data), chunk)
-                    continue
-                for key, _mask in events:
-                    if key.data == "stdin":
-                        try:
-                            written = os.write(key.fileobj.fileno(), stdin_pending)
-                        except BlockingIOError:
-                            continue
-                        except OSError as exc:
-                            note_error(f"stdin_write_failed:{type(exc).__name__}")
-                            kill_process_tree()
-                            selector.unregister(key.fileobj)
-                            continue
-                        if written <= 0:
-                            note_error("stdin_write_failed:short_write")
-                            kill_process_tree()
-                            selector.unregister(key.fileobj)
-                            continue
-                        stdin_pending = stdin_pending[written:]
-                        if not stdin_pending:
-                            selector.unregister(key.fileobj)
-                            key.fileobj.close()
-                        continue
-                    chunk = os.read(key.fileobj.fileno(), 65536)
-                    if not chunk:
-                        selector.unregister(key.fileobj)
-                        continue
-                    store(str(key.data), chunk)
-        except BaseException as exc:
-            note_error(f"capture_stream_failed:{type(exc).__name__}")
-            kill_process_tree()
+                time.sleep(0.01)
+            adopted = adopted_provider_children()
+            if adopted:
+                kill_adopted_children(adopted)
+                reap_adopted_children(adopted)
+            if process_group_exists() or adopted_provider_children():
+                note_error("process_group_cleanup_failed")
+        def store(label: str, chunk: bytes) -> None:
+            if not chunk or overflow[label]:
+                return
+            limit = limits[label]
+            room = max(limit + 1 - len(buffers[label]), 0)
+            buffers[label].extend(chunk[:room])
+            if len(buffers[label]) > limit:
+                overflow[label] = True
+                note_error(f"{label}_limit_exceeded")
+                kill_process_tree()
 
-    if selector is not None:
-        try:
-            selector.close()
-        except BaseException as exc:
-            note_error(f"selector_cleanup_failed:{type(exc).__name__}")
-
-    if capture_error is not None:
-        kill_process_tree()
-
-    if capture_error is None and process.poll() is None:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            note_error("timeout")
+        streams = ((process.stdout, "stdout"), (process.stderr, "stderr"))
+        if process.stdin is None or process.stdout is None or process.stderr is None:
+            note_error("capture_pipe_unavailable")
             kill_process_tree()
         else:
             try:
-                process.wait(timeout=remaining)
-            except subprocess.TimeoutExpired:
+                selector = selectors.DefaultSelector()
+                for stream, label in streams:
+                    assert stream is not None
+                    os.set_blocking(stream.fileno(), False)
+                    selector.register(stream, selectors.EVENT_READ, label)
+            except BaseException as exc:
+                note_error(f"capture_setup_failed:{type(exc).__name__}")
+                kill_process_tree()
+
+        stdin_pending = memoryview(stdin_data)
+        if selector is not None and capture_error is None:
+            assert process.stdin is not None
+            try:
+                os.set_blocking(process.stdin.fileno(), False)
+                if stdin_pending:
+                    selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
+                else:
+                    process.stdin.close()
+            except BaseException as exc:
+                note_error(f"stdin_setup_failed:{type(exc).__name__}")
+                kill_process_tree()
+
+        if selector is not None and capture_error is None:
+            try:
+                while selector.get_map():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        note_error("timeout")
+                        kill_process_tree()
+                        break
+                    wait_for = 0 if process.poll() is not None else max(min(remaining, 0.25), 0)
+                    events = selector.select(wait_for)
+                    if not events and process.poll() is not None:
+                        for key in list(selector.get_map().values()):
+                            if key.data == "stdin":
+                                selector.unregister(key.fileobj)
+                                key.fileobj.close()
+                                continue
+                            try:
+                                chunk = os.read(key.fileobj.fileno(), 65536)
+                            except BlockingIOError:
+                                continue
+                            if not chunk:
+                                selector.unregister(key.fileobj)
+                            else:
+                                store(str(key.data), chunk)
+                        continue
+                    for key, _mask in events:
+                        if key.data == "stdin":
+                            try:
+                                written = os.write(key.fileobj.fileno(), stdin_pending)
+                            except BlockingIOError:
+                                continue
+                            except OSError as exc:
+                                note_error(f"stdin_write_failed:{type(exc).__name__}")
+                                kill_process_tree()
+                                selector.unregister(key.fileobj)
+                                continue
+                            if written <= 0:
+                                note_error("stdin_write_failed:short_write")
+                                kill_process_tree()
+                                selector.unregister(key.fileobj)
+                                continue
+                            stdin_pending = stdin_pending[written:]
+                            if not stdin_pending:
+                                selector.unregister(key.fileobj)
+                                key.fileobj.close()
+                            continue
+                        chunk = os.read(key.fileobj.fileno(), 65536)
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+                            continue
+                        store(str(key.data), chunk)
+            except BaseException as exc:
+                note_error(f"capture_stream_failed:{type(exc).__name__}")
+                kill_process_tree()
+
+        if selector is not None:
+            try:
+                selector.close()
+            except BaseException as exc:
+                note_error(f"selector_cleanup_failed:{type(exc).__name__}")
+
+        if capture_error is not None:
+            kill_process_tree()
+
+        if capture_error is None and process.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 note_error("timeout")
                 kill_process_tree()
-            except BaseException as exc:
-                note_error(f"process_wait_failed:{type(exc).__name__}")
-                kill_process_tree()
+            else:
+                try:
+                    process.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    note_error("timeout")
+                    kill_process_tree()
+                except BaseException as exc:
+                    note_error(f"process_wait_failed:{type(exc).__name__}")
+                    kill_process_tree()
 
-    if process.poll() is None:
-        try:
-            process.wait(timeout=5)
-        except BaseException as followup:
-            note_error(f"process_reap_failed:{type(followup).__name__}")
-    returncode = process.returncode if isinstance(process.returncode, int) else -1
-    if process.poll() is not None:
-        contain_surviving_process_group()
+        if process.poll() is None:
+            try:
+                process.wait(timeout=5)
+            except BaseException as followup:
+                note_error(f"process_reap_failed:{type(followup).__name__}")
+        returncode = process.returncode if isinstance(process.returncode, int) else -1
+        if process.poll() is not None:
+            contain_surviving_process_group()
 
-    # After a capture fault, drain whatever bytes the terminated process left in
-    # its pipes.  This is best-effort and bounded; failures themselves become
-    # evidence-bearing capture errors rather than escaping past the caller.
-    if capture_error is not None:
-        for stream, label in streams:
-            if stream is None:
+        # After a capture fault, drain whatever bytes the terminated process left in
+        # its pipes.  This is best-effort and bounded; failures themselves become
+        # evidence-bearing capture errors rather than escaping past the caller.
+        if capture_error is not None:
+            for stream, label in streams:
+                if stream is None:
+                    continue
+                try:
+                    os.set_blocking(stream.fileno(), False)
+                except (OSError, ValueError) as exc:
+                    note_error(f"capture_drain_setup_failed:{type(exc).__name__}")
+                    continue
+                while True:
+                    try:
+                        chunk = os.read(stream.fileno(), 65536)
+                    except BlockingIOError:
+                        break
+                    except (OSError, ValueError) as exc:
+                        note_error(f"capture_drain_failed:{type(exc).__name__}")
+                        break
+                    if not chunk:
+                        break
+                    store(label, chunk)
+
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is None or stream.closed:
                 continue
             try:
-                os.set_blocking(stream.fileno(), False)
-            except (OSError, ValueError) as exc:
-                note_error(f"capture_drain_setup_failed:{type(exc).__name__}")
-                continue
-            while True:
-                try:
-                    chunk = os.read(stream.fileno(), 65536)
-                except BlockingIOError:
-                    break
-                except (OSError, ValueError) as exc:
-                    note_error(f"capture_drain_failed:{type(exc).__name__}")
-                    break
-                if not chunk:
-                    break
-                store(label, chunk)
+                stream.close()
+            except OSError as exc:
+                note_error(f"stream_cleanup_failed:{type(exc).__name__}")
 
-    for stream in (process.stdin, process.stdout, process.stderr):
-        if stream is None or stream.closed:
-            continue
+        return {
+            "returncode": returncode,
+            "stdout": bytes(buffers["stdout"]),
+            "stderr": bytes(buffers["stderr"]),
+            "capture_error": capture_error,
+            "stdout_overflow": overflow["stdout"],
+            "stderr_overflow": overflow["stderr"],
+        }
+
+    except BaseException as exc:
+        # Emergency containment for any post-Popen exception not handled by the
+        # normal bounded-capture path. Once Popen returned, no catchable failure
+        # may leave the provider process or adopted descendants alive.
+        emergency_errors = [f"capture_unhandled:{type(exc).__name__}"]
         try:
-            stream.close()
-        except OSError as exc:
-            note_error(f"stream_cleanup_failed:{type(exc).__name__}")
-
-    return {
-        "returncode": returncode,
-        "stdout": bytes(buffers["stdout"]),
-        "stderr": bytes(buffers["stderr"]),
-        "capture_error": capture_error,
-        "stdout_overflow": overflow["stdout"],
-        "stderr_overflow": overflow["stderr"],
-    }
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except BaseException as cleanup_exc:
+            emergency_errors.append(
+                f"emergency_process_group_kill_failed:{type(cleanup_exc).__name__}"
+            )
+            try:
+                if process.poll() is None:
+                    process.kill()
+            except BaseException as kill_exc:
+                emergency_errors.append(
+                    f"emergency_process_kill_failed:{type(kill_exc).__name__}"
+                )
+        try:
+            process.wait(timeout=5)
+        except BaseException as cleanup_exc:
+            emergency_errors.append(
+                f"emergency_process_reap_failed:{type(cleanup_exc).__name__}"
+            )
+        try:
+            adopted = _direct_child_pids() - baseline_children
+        except BaseException as cleanup_exc:
+            emergency_errors.append(
+                f"emergency_child_scan_failed:{type(cleanup_exc).__name__}"
+            )
+            adopted = set()
+        for child_pid in sorted(adopted):
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                continue
+            except BaseException as cleanup_exc:
+                emergency_errors.append(
+                    f"emergency_child_kill_failed:{type(cleanup_exc).__name__}"
+                )
+                continue
+            try:
+                os.waitpid(child_pid, 0)
+            except ChildProcessError:
+                pass
+            except BaseException as cleanup_exc:
+                emergency_errors.append(
+                    f"emergency_child_reap_failed:{type(cleanup_exc).__name__}"
+                )
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is None or stream.closed:
+                continue
+            try:
+                stream.close()
+            except BaseException as cleanup_exc:
+                emergency_errors.append(
+                    f"emergency_stream_cleanup_failed:{type(cleanup_exc).__name__}"
+                )
+        existing_buffers = locals().get("buffers")
+        stdout = (
+            bytes(existing_buffers.get("stdout", b""))
+            if isinstance(existing_buffers, dict)
+            else b""
+        )
+        stderr = (
+            bytes(existing_buffers.get("stderr", b""))
+            if isinstance(existing_buffers, dict)
+            else b""
+        )
+        existing_overflow = locals().get("overflow")
+        stdout_overflow = (
+            bool(existing_overflow.get("stdout", False))
+            if isinstance(existing_overflow, dict)
+            else False
+        )
+        stderr_overflow = (
+            bool(existing_overflow.get("stderr", False))
+            if isinstance(existing_overflow, dict)
+            else False
+        )
+        return {
+            "returncode": (
+                process.returncode
+                if isinstance(process.returncode, int)
+                and not isinstance(process.returncode, bool)
+                else -1
+            ),
+            "stdout": stdout,
+            "stderr": stderr,
+            "capture_error": ";".join(emergency_errors),
+            "stdout_overflow": stdout_overflow,
+            "stderr_overflow": stderr_overflow,
+        }
 
 
 def classify_stderr(raw: bytes) -> dict[str, Any]:

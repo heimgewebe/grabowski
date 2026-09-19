@@ -1211,6 +1211,40 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertIn(b"captured-before-selector-failure", capture["stdout"])
             self.assertIn("capture_stream_failed:OSError", str(capture["capture_error"]))
 
+    def test_run_bounded_emergency_reaps_unhandled_post_start_exception(self) -> None:
+        real_popen = runner.subprocess.Popen
+        observed: dict[str, subprocess.Popen] = {}
+
+        def tracked_popen(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            observed["process"] = process
+            return process
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "sleeper.py"
+            script.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+            with (
+                patch.object(runner.subprocess, "Popen", tracked_popen),
+                patch.object(
+                    runner.time,
+                    "monotonic",
+                    side_effect=RuntimeError("simulated post-start setup failure"),
+                ),
+            ):
+                capture = runner.run_bounded(
+                    [sys.executable, str(script)],
+                    cwd=root,
+                    timeout_seconds=30,
+                    stdin_data=b"",
+                )
+
+        self.assertIn(
+            "capture_unhandled:RuntimeError", str(capture["capture_error"])
+        )
+        self.assertIn("process", observed)
+        self.assertIsNotNone(observed["process"].poll())
+
     def test_direct_child_pids_falls_back_when_task_children_file_is_missing(self) -> None:
         child = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(30)"],
@@ -1730,6 +1764,61 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertEqual(pgid, parent_pgid)
             with self.assertRaises(ProcessLookupError):
                 os.kill(pid, 0)
+
+    def test_mcp_proxy_reaps_upstream_when_helper_thread_start_fails(self) -> None:
+        real_popen = runner.subprocess.Popen
+        observed: dict[str, subprocess.Popen] = {}
+
+        def tracked_popen(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            observed["process"] = process
+            return process
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            upstream = root / "mcp.py"
+            upstream.write_text(
+                "import time\ntime.sleep(30)\n",
+                encoding="utf-8",
+            )
+            manifest = root / "bound.bundle.manifest.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+            runtime_root = root / "proxy-runtime"
+            runtime_root.mkdir(mode=0o700)
+            authorized = [
+                file_identity(Path(sys.executable)),
+                file_identity(upstream),
+            ]
+            command = [
+                str(Path(sys.executable).resolve()),
+                str(upstream),
+                "--bundle-root",
+                str(root),
+            ]
+            with (
+                patch.object(runner.subprocess, "Popen", tracked_popen),
+                patch.object(
+                    runner.threading.Thread,
+                    "start",
+                    side_effect=RuntimeError("simulated thread start failure"),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "benchmark MCP proxy setup failed"
+                ):
+                    runner.run_mcp_proxy(
+                        command,
+                        str(manifest),
+                        hashlib.sha256(manifest.read_bytes()).hexdigest(),
+                        authorized,
+                        str(runtime_root),
+                    )
+
+            self.assertIn("process", observed)
+            self.assertIsNotNone(observed["process"].poll())
+            stage_parent = runtime_root / "repoground-mcp-upstream-runtime"
+            self.assertTrue(stage_parent.is_dir())
+            self.assertEqual([], list(stage_parent.iterdir()))
 
     def test_mcp_upstream_is_bound_and_manifest_root_is_forced(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
