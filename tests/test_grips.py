@@ -16193,7 +16193,11 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             self.assertTrue(
                 receipt["diagnostic_evidence_ignored_for_authority"]
             )
-            self.assertEqual(1, len(receipt["observations"]))
+            self.assertEqual(2, len(receipt["observations"]))
+            self.assertEqual(
+                {"threads", "finding_reviews"},
+                {item["label"] for item in receipt["observations"]},
+            )
             self.assertEqual([], receipt["errors"])
             findings = receipt["existing_review_findings"]
             self.assertEqual("clear", findings["status"])
