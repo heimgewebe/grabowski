@@ -172,6 +172,10 @@ class RepositoryContractTests(unittest.TestCase):
                     "destination": "config/coding-agent-catalog.json",
                 },
                 {
+                    "source": "config/privileged-actions.example.json",
+                    "destination": "config/privileged-actions.example.json",
+                },
+                {
                     "source": "tools/maintain_runtime_state.py",
                     "destination": "tools/maintain_runtime_state.py",
                 },
