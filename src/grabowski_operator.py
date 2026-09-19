@@ -1033,10 +1033,21 @@ def _transport_roundtrip_exempt_call(
     if grip_name == "transport-roundtrip":
         # The handshake grip must remain exempt to avoid recursive gating.
         return True
-    # Every other grip stays behind the signed one-call boundary. A read-only
-    # grip may still execute child processes, so its effect label alone is not
-    # sufficient authority for transport replay exemption.
-    return False
+    if grip_name != "captain-preflight":
+        # Generic read-only grip labels are not transport authority: other
+        # grips may still execute child processes or drift to a wider effect.
+        return False
+    if arguments.get("profile") != "captain":
+        return False
+    if arguments.get("allow_mutation", False) is not False:
+        return False
+    spec = grabowski_grips.GRIP_SPECS.get("captain-preflight")
+    return bool(
+        spec is not None
+        and spec.effect == grabowski_grips.READ_ONLY
+        and spec.runner == "captain_preflight"
+        and spec.uses_github is False
+    )
 
 
 _PROVENANCE_RECOVERY_REPAIR_TOOL = "grabowski_recovery_provenance_repair"
