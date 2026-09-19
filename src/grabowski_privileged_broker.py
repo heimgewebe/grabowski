@@ -1879,7 +1879,7 @@ def resolve_secret_pty_execution(
     return _resolve_secret_pty_action(candidate, reference)
 
 
-def resolve_non_secret_execution(
+def resolve_regular_execution(
     config: dict[str, Any], reference: dict[str, Any]
 ) -> dict[str, Any]:
     """Resolve only modes whose execution object is safe for normal output paths."""
@@ -1916,7 +1916,7 @@ def resolve_execution(config: dict[str, Any], reference: dict[str, Any]) -> dict
     candidate = _configured_action(config, reference)
     if candidate.get("mode", "template") == "secret-pty":
         return resolve_secret_pty_execution(config, reference)
-    return resolve_non_secret_execution(config, reference)
+    return resolve_regular_execution(config, reference)
 
 
 def resolve_action(config: dict[str, Any], reference: dict[str, Any]) -> tuple[list[str], int]:

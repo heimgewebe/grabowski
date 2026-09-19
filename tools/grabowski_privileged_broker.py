@@ -30,7 +30,7 @@ from grabowski_privileged_broker import (
     parse_reference,
     publish_recovery_marker,
     resolve_execution,
-    resolve_non_secret_execution,
+    resolve_regular_execution,
     _require_kill_switch_clear,
 )
 
@@ -1827,7 +1827,7 @@ def _run_non_secret_reference_request(data: bytes) -> int:
     reference = parse_reference(data)
     config = load_root_config(CONFIG)
     operator_peer: dict[str, object] | None = None
-    execution = resolve_non_secret_execution(config, reference)
+    execution = resolve_regular_execution(config, reference)
     if (
         reference.get("action") in {
             POWER_ACTION,
@@ -1852,7 +1852,7 @@ def _run_non_secret_reference_request(data: bytes) -> int:
         raise ValueError("privileged cwd is not an existing directory")
     claim_once(STATE / "used", str(reference["request_id"]))
     if reference.get("action") == POWER_ACTION:
-        refreshed_execution = resolve_non_secret_execution(config, reference)
+        refreshed_execution = resolve_regular_execution(config, reference)
         stable_fields = (
             "mode", "argv", "cwd", "timeout_seconds",
             "allowed_peer_uid", "allowed_peer_unit",
@@ -1866,7 +1866,7 @@ def _run_non_secret_reference_request(data: bytes) -> int:
         cwd = execution.get("cwd")
         if cwd is not None and not Path(str(cwd)).is_dir():
             raise ValueError("privileged cwd changed before final gate")
-        final_execution = resolve_non_secret_execution(config, reference)
+        final_execution = resolve_regular_execution(config, reference)
         if any(final_execution.get(key) != execution.get(key) for key in stable_fields):
             raise PermissionError("power execution contract changed at final gate")
         execution = final_execution

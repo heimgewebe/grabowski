@@ -2774,7 +2774,7 @@ class SecretPtyContractTests(unittest.TestCase):
         with self.assertRaisesRegex(
             PermissionError, "dedicated resolver"
         ):
-            privileged_broker.resolve_non_secret_execution(
+            privileged_broker.resolve_regular_execution(
                 self._secret_pty_config(), reference
             )
         gate = {
