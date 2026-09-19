@@ -2176,7 +2176,7 @@
     },
     {
       "category": "browser-worker",
-      "description": "Start Chrome/CDP, optionally arming one fail-closed startup-only BiDi standby.\n\nSupplying ``chromedriver_executable`` does not select BiDi directly. Grabowski first\nstarts the canonical Chrome/CDP worker and returns it when the CDP endpoint becomes\nready. Only when CDP startup remains unavailable before any worker is returned does\nGrabowski terminalize that private primary attempt and start a new Chrome/WebDriver-\nBiDi worker on the same leased loopback port. No later worker/backend switch exists.",
+      "description": "Start Chrome/CDP, optionally with a named persistent operator profile.\n\noperator_profile resolves only below the dedicated managed profile root and is\nmutually exclusive with a raw persistent_profile. Named operator profiles use\na bounded six-hour default runtime when runtime_seconds is omitted.\n\nSupplying ``chromedriver_executable`` does not select BiDi directly. Grabowski first\nstarts the canonical Chrome/CDP worker and returns it when the CDP endpoint becomes\nready. Only when CDP startup remains unavailable before any worker is returned does\nGrabowski terminalize that private primary attempt and start a new Chrome/WebDriver-\nBiDi worker on the same leased loopback port. No later worker/backend switch exists.",
       "effects": [
         "process-start",
         "profile-create-or-use",
@@ -3721,7 +3721,7 @@
       "src/grabowski_work_acquire.py": "5a2357c98ac59da8e7a8d9f9832e34281828ccd8f7b0aef077a229f137c569b7",
       "src/grabowski_work_admission.py": "5c7529ac26df8ae698d59dbac8267dc1065711b9579274267e9a661e55748c2a",
       "src/grabowski_worker_process.py": "36b8bef1785e9e41c4a8a041b95cc69f3686c881680a89ac6680f2074f5919c0",
-      "src/grabowski_workers.py": "99f7ae5b0beb2f986dcc403cc666a2e95f1218aade668014dea00c6a7b110e99",
+      "src/grabowski_workers.py": "c5a2d443f7ace2f0f2a967b21a5b9dd9875ef2460145ea599668fc817f898a2e",
       "src/grabowski_worktree_ensure.py": "4b16010a5209e0b1ca02633eee2ce14da9fe1ff989fc04110995a3bc62abaff0"
     }
   }

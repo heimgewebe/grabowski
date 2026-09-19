@@ -461,6 +461,12 @@ def _agent_instructions_metadata() -> dict[str, Any]:
 
 HOME = Path.home().resolve()
 STATE_DIR = HOME / ".local" / "state" / "grabowski"
+OPERATOR_BROWSER_PROFILE_ROOT = Path(
+    os.environ.get(
+        "GRABOWSKI_OPERATOR_BROWSER_PROFILE_ROOT",
+        str(STATE_DIR / "browser-profiles"),
+    )
+).expanduser()
 POLICY_PATH = HOME / ".config" / "grabowski" / "access.json"
 AUDIT_LOG = STATE_DIR / "write-audit.jsonl"
 QUARANTINE_DIR = STATE_DIR / "quarantine"
@@ -2229,6 +2235,18 @@ def _roots(kind: str, *, ignore_missing: bool = False) -> list[Path]:
 
 def _is_within(path: Path, roots: list[Path]) -> bool:
     return any(path == root or root in path.parents for root in roots)
+
+
+def _operator_browser_profile_root_path() -> Path:
+    root = OPERATOR_BROWSER_PROFILE_ROOT.expanduser()
+    if not root.is_absolute():
+        raise RuntimeError("managed operator browser profile root must be absolute")
+    return Path(os.path.abspath(root))
+
+
+def _is_operator_browser_profile_path(path: Path) -> bool:
+    root = _operator_browser_profile_root_path()
+    return path == root or root in path.parents
 
 
 def _excluded_roots(kind: str) -> list[Path]:
@@ -7167,6 +7185,10 @@ def grabowski_browser_profile_read(
     """Read bounded metadata/text under configured browser profile roots."""
     _require_capability("browser_profile_read")
     target = _resolve_browser_profile_existing(path)
+    if _is_operator_browser_profile_path(target):
+        raise PermissionError(
+            "managed operator browser profiles are opaque and cannot be exported"
+        )
     st = _nofollow_metadata(target)
     kind = (
         "directory"

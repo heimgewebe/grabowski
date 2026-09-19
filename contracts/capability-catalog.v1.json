@@ -2116,7 +2116,7 @@
     },
     {
       "category": "browser-worker",
-      "description": "Start Chrome/CDP, optionally arming one fail-closed startup-only BiDi standby.\n\nSupplying ``chromedriver_executable`` does not select BiDi directly. Grabowski first\nstarts the canonical Chrome/CDP worker and returns it when the CDP endpoint becomes\nready. Only when CDP startup remains unavailable before any worker is returned does\nGrabowski terminalize that private primary attempt and start a new Chrome/WebDriver-\nBiDi worker on the same leased loopback port. No later worker/backend switch exists.",
+      "description": "Start Chrome/CDP, optionally with a named persistent operator profile.\n\noperator_profile resolves only below the dedicated managed profile root and is\nmutually exclusive with a raw persistent_profile. Named operator profiles use\na bounded six-hour default runtime when runtime_seconds is omitted.\n\nSupplying ``chromedriver_executable`` does not select BiDi directly. Grabowski first\nstarts the canonical Chrome/CDP worker and returns it when the CDP endpoint becomes\nready. Only when CDP startup remains unavailable before any worker is returned does\nGrabowski terminalize that private primary attempt and start a new Chrome/WebDriver-\nBiDi worker on the same leased loopback port. No later worker/backend switch exists.",
       "effects": [
         "process-start",
         "profile-create-or-use",

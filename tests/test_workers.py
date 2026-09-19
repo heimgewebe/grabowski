@@ -1436,6 +1436,121 @@ globalThis.fetch = async () => ({
         self.assertTrue(resolved.is_dir())
         self.assertFalse(ephemeral)
 
+    def test_named_operator_profile_uses_managed_root_and_long_bounded_default(self) -> None:
+        managed_root = self.root / "managed-browser-profiles"
+        with patch.object(workers.base, "OPERATOR_BROWSER_PROFILE_ROOT", managed_root), patch.object(
+            workers.base, "_load_policy", return_value={}
+        ), patch.object(workers.base, "_profile_values", return_value=[str(managed_root)]), patch.object(
+            workers, "_executable", return_value=self.binary.resolve()
+        ), patch.object(workers.operator, "_run", return_value=result()):
+            worker = workers.browser_start(
+                str(self.binary), port=9245, operator_profile="provider-operator"
+            )["worker"]
+        self.assertEqual(worker["runtime_seconds"], 21600)
+        self.assertEqual(Path(worker["profile_path"]).parent, managed_root)
+        self.assertEqual(managed_root.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(Path(worker["profile_path"]).stat().st_mode & 0o777, 0o700)
+        self.assertEqual(worker["control_plane"]["profile"]["scope_kind"], "managed-operator-profile")
+
+    def test_named_operator_profile_rejects_unconfigured_managed_root(self) -> None:
+        managed_root = self.root / "managed-browser-profiles"
+        another_root = self.root / "another-root"
+        another_root.mkdir()
+        with patch.object(workers.base, "OPERATOR_BROWSER_PROFILE_ROOT", managed_root), patch.object(
+            workers.base, "_load_policy", return_value={}
+        ), patch.object(workers.base, "_profile_values", return_value=[str(another_root)]):
+            with self.assertRaisesRegex(PermissionError, "explicitly configured"):
+                workers._operator_browser_profile_path("provider-operator")
+        self.assertFalse(managed_root.exists())
+
+    def test_persistent_profile_outside_allowed_root_remains_blocked(self) -> None:
+        allowed_root = self.root / "allowed-browser-profiles"
+        allowed_root.mkdir()
+        outside = self.root / "outside-profile"
+        with patch.object(workers.base, "_load_policy", return_value={}), patch.object(
+            workers.base, "_profile_values", return_value=[str(allowed_root)]
+        ):
+            with self.assertRaisesRegex(PermissionError, "outside configured roots"):
+                workers._browser_profile("0" * 20, str(outside))
+        self.assertFalse(outside.exists())
+
+    def test_persistent_profile_rejects_symlink_components(self) -> None:
+        allowed_root = self.root / "allowed-browser-profiles"
+        allowed_root.mkdir()
+        real_parent = allowed_root / "real"
+        real_parent.mkdir()
+        alias = allowed_root / "alias"
+        alias.symlink_to(real_parent, target_is_directory=True)
+        with patch.object(workers.base, "_load_policy", return_value={}), patch.object(
+            workers.base, "_profile_values", return_value=[str(allowed_root)]
+        ):
+            with self.assertRaisesRegex(PermissionError, "symlink components"):
+                workers._browser_profile("0" * 20, str(alias / "provider"))
+
+    def test_persistent_profile_survives_stop_and_restart(self) -> None:
+        profile_root = self.root / "browser-profiles"
+        profile_root.mkdir()
+        profile = profile_root / "provider"
+        with patch.object(workers.base, "_load_policy", return_value={}), patch.object(
+            workers.base, "_profile_values", return_value=[str(profile_root)]
+        ), patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            first = workers.browser_start(str(self.binary), port=9246, persistent_profile=str(profile), runtime_seconds=60)["worker"]
+            marker = profile / "session-state-marker"
+            marker.write_text("survives", encoding="utf-8")
+            stopped = workers.worker_stop(first["worker_id"], expected_kind="browser")
+            self.assertEqual(stopped["worker"]["state"], "stopped")
+            self.assertTrue(profile.is_dir())
+            second = workers.browser_start(str(self.binary), port=9247, persistent_profile=str(profile), runtime_seconds=60)["worker"]
+        self.assertNotEqual(first["worker_id"], second["worker_id"])
+        self.assertEqual(first["profile_path"], second["profile_path"])
+        self.assertEqual(marker.read_text(encoding="utf-8"), "survives")
+
+    def test_persistent_profile_survives_runtime_timeout_terminalization(self) -> None:
+        profile_root = self.root / "browser-profiles"
+        profile_root.mkdir()
+        profile = profile_root / "provider-timeout"
+        with patch.object(workers.base, "_load_policy", return_value={}), patch.object(
+            workers.base, "_profile_values", return_value=[str(profile_root)]
+        ), patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            worker = workers.browser_start(str(self.binary), port=9248, persistent_profile=str(profile), runtime_seconds=60)["worker"]
+        marker = profile / "session-state-marker"
+        marker.write_text("survives-timeout", encoding="utf-8")
+        timeout_probe = result(stdout=(
+            "LoadState=loaded\nActiveState=inactive\nSubState=dead\n"
+            "Result=timeout\nExecMainCode=2\nExecMainStatus=15\n"
+            "RuntimeMaxUSec=1min\nActiveEnterTimestampMonotonic=1000000\n"
+            "ActiveExitTimestampMonotonic=61000000\n"
+        ))
+        with patch.object(workers.operator, "_run", return_value=timeout_probe):
+            status = workers.worker_status(worker["worker_id"], expected_kind="browser")
+        self.assertEqual(status["state"], "completed")
+        self.assertTrue(profile.is_dir())
+        self.assertEqual(marker.read_text(encoding="utf-8"), "survives-timeout")
+
+    def test_running_worker_without_cdp_target_is_attention_and_recoverable(self) -> None:
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            worker = workers.browser_start(str(self.binary), port=9249, runtime_seconds=60)["worker"]
+        active_probe = result(stdout=(
+            "LoadState=loaded\nActiveState=active\nSubState=running\n"
+            "Result=success\nExecMainStatus=0\n"
+        ))
+        with patch.object(workers.operator, "_run", return_value=active_probe), patch.object(
+            workers, "_browser_cdp_target_health", return_value={"state": "target_unavailable"}
+        ):
+            status = workers.worker_status(worker["worker_id"], expected_kind="browser")
+            listed = workers.worker_list("browser", limit=20, view="current")
+        self.assertEqual(status["state"], "running")
+        self.assertEqual(status["control_plane"]["outcome"]["control_state"], "target_unavailable")
+        self.assertTrue(status["control_plane"]["outcome"]["recovery"]["required"])
+        projected = next(item for item in listed["workers"] if item["worker_id"] == worker["worker_id"])
+        self.assertEqual(projected["projection"]["reason"], "browser-target-unavailable")
+
     def test_browser_args_cannot_override_binding_or_profile(self) -> None:
         with patch.object(workers, "_executable", return_value=self.binary.resolve()):
             for argument in (

@@ -96,6 +96,32 @@ Jeder Browserworker least atomar:
 
 Dadurch kann dasselbe persistente Profil nicht gleichzeitig von zwei Workern verwendet werden. Verschiedene persistente Profile bleiben parallel nutzbar. Terminalisierung gibt nur exakt worker-eigene Leases frei; fremde Ersatz-Leases werden nicht übernommen oder gelöscht.
 
+## Benannte persistente Operatorprofile
+
+Für wiederkehrende Providerarbeit darf `grabowski_browser_worker_start` ein benanntes
+`operator_profile` verwenden. Der Name wird ausschließlich unter dem dedizierten,
+explizit als `browser_profile_root` freigegebenen Grabowski-Root
+`~/.local/state/grabowski/browser-profiles` aufgelöst. Normale Desktopprofile wie
+`~/.config/google-chrome` gehören nicht zu diesem Vertrag.
+
+Der managed Root und jedes persistente Profil müssen dem laufenden Benutzer gehören,
+Modus `0700` besitzen und dürfen keine Symlink-Komponenten verwenden. Managed
+Operatorprofile sind für `grabowski_browser_profile_read` vollständig opak; Cookies,
+Tokens, LocalStorage, Preferences und sonstige Profildateien werden nicht als
+MCP-Artefakte oder Text ausgegeben.
+
+Prozess- und Profillebensdauer sind getrennt: Stop oder `RuntimeMaxSec` beendet den
+Worker und gibt seine Leases frei, löscht aber ein persistentes Profil nicht. Ein
+späterer Worker kann dasselbe Profil nach erneutem exklusivem
+`browser-profile:<pfad>`-Lease verwenden. Für benannte Operatorprofile gilt ohne
+explizite Runtime ein weiterhin begrenzter Default von sechs Stunden.
+
+Der Workerstatus prüft bei laufenden CDP-Workern zusätzlich die lokale Target-Ebene.
+Ein laufender systemd-Prozess ohne genau ein steuerbares CDP-Seitentarget wird als
+`target_unavailable` und handlungsbedürftig projiziert. Das autorisiert keinen
+unkontrollierten Retry: der Worker wird kontrolliert beendet und neu gestartet; nur
+bei persistentem Profil darf derselbe Profilzustand wiederverwendet werden.
+
 ## Öffentliche Projektion
 
 Bestehende Workerfelder und History-Semantik bleiben erhalten. Browserworker erhalten zusätzlich `control_plane` mit:
