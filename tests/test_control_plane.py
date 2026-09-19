@@ -2009,7 +2009,10 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
 
     def test_broker_script_keeps_structured_denials_out_of_systemd_failed_state(self) -> None:
         broker = (ROOT / "tools" / "grabowski_privileged_broker.py").read_text(encoding="utf-8")
-        self.assertIn("return 0\n\n\nif __name__ ==", broker)
+        self.assertIn("def _run_secret_transport_request(data: bytes) -> int:", broker)
+        self.assertIn("def _run_non_secret_reference_request(data: bytes) -> int:", broker)
+        self.assertIn("return _run_secret_transport_request(data)", broker)
+        self.assertIn("_run_non_secret_reference_request(data)\n    return 0", broker)
         self.assertIn("except (FileExistsError, FileNotFoundError, PermissionError, ValueError) as exc:", broker)
         self.assertIn("raise SystemExit(0)", broker)
         self.assertIn("except Exception as exc:", broker)
