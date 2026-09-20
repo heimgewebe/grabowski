@@ -1,10 +1,17 @@
 import hashlib
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
-from tools.heim_pc_recovery_attest import ValidationError, validate
+from tools.heim_pc_recovery_attest import (
+    PRODUCER_SIGNATURE_NAMESPACE,
+    PRODUCER_SIGNER_PRINCIPAL,
+    SSH_KEYGEN,
+    ValidationError,
+    validate,
+)
 
 
 SOURCE = "9" * 40
@@ -19,7 +26,54 @@ def _write(path: Path, value: dict) -> None:
     path.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _signing_material(tmp_path: Path) -> tuple[Path, Path]:
+    key = tmp_path / "producer-signing-key"
+    subprocess.run(
+        [SSH_KEYGEN, "-q", "-t", "ed25519", "-N", "", "-f", str(key)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    public_key = Path(str(key) + ".pub").read_text(encoding="utf-8").strip()
+    allowed_signers = tmp_path / "allowed-signers"
+    allowed_signers.write_text(
+        (
+            f'{PRODUCER_SIGNER_PRINCIPAL} '
+            f'namespaces="{PRODUCER_SIGNATURE_NAMESPACE}" {public_key}\n'
+        ),
+        encoding="utf-8",
+    )
+    return key, allowed_signers
+
+
+def _sign_receipt(
+    receipt_path: Path,
+    signing_key: Path,
+    *,
+    namespace: str = PRODUCER_SIGNATURE_NAMESPACE,
+) -> Path:
+    signature_path = Path(str(receipt_path) + ".sig")
+    signature_path.unlink(missing_ok=True)
+    subprocess.run(
+        [
+            SSH_KEYGEN,
+            "-Y",
+            "sign",
+            "-f",
+            str(signing_key),
+            "-n",
+            namespace,
+            str(receipt_path),
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return signature_path
+
+
 def _fixture(tmp_path: Path):
+    signing_key, allowed_signers = _signing_material(tmp_path)
     receipt = {
         "schema_version": 1,
         "kind": "heim_pc.grabowski_recovery_producer_receipt",
@@ -37,6 +91,7 @@ def _fixture(tmp_path: Path):
     }
     receipt_path = tmp_path / "receipt.json"
     _write(receipt_path, receipt)
+    signature_path = _sign_receipt(receipt_path, signing_key)
     receipt_sha = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
 
     provenance = {
@@ -60,19 +115,38 @@ def _fixture(tmp_path: Path):
     }
     provenance_path = tmp_path / "provenance.json"
     _write(provenance_path, provenance)
-    return provenance_path, receipt_path
+    return (
+        provenance_path,
+        receipt_path,
+        signature_path,
+        allowed_signers,
+        signing_key,
+    )
+
+
+def _validate(
+    provenance: Path,
+    receipt: Path,
+    signature: Path,
+    allowed_signers: Path,
+    *,
+    source_revision: str = SOURCE,
+):
+    return validate(
+        provenance,
+        receipt,
+        signature,
+        allowed_signers,
+        expected_source_revision=source_revision,
+        expected_recovery_contract_sha256=CONTRACT,
+    )
 
 
 class RecoveryAttestationTest(unittest.TestCase):
     def test_validate_emits_exact_heim_pc_predicate(self):
         with tempfile.TemporaryDirectory() as tmp:
-            provenance, receipt = _fixture(Path(tmp))
-            result = validate(
-                provenance,
-                receipt,
-                expected_source_revision=SOURCE,
-                expected_recovery_contract_sha256=CONTRACT,
-            )
+            provenance, receipt, signature, allowed_signers, _ = _fixture(Path(tmp))
+            result = _validate(provenance, receipt, signature, allowed_signers)
         self.assertEqual(
             set(result),
             {
@@ -97,70 +171,95 @@ class RecoveryAttestationTest(unittest.TestCase):
         self.assertEqual(result["source_revision"], SOURCE)
         self.assertIs(result["production_effects_authorized"], False)
 
+    def test_validate_rejects_self_consistent_but_unauthenticated_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (
+                provenance,
+                receipt,
+                signature,
+                allowed_signers,
+                _,
+            ) = _fixture(Path(tmp))
+            receipt_value = json.loads(receipt.read_text(encoding="utf-8"))
+            receipt_value["evidence_summary_sha256"] = "6" * 64
+            _write(receipt, receipt_value)
+
+            provenance_value = json.loads(provenance.read_text(encoding="utf-8"))
+            provenance_value["evidence"]["producer_receipt_sha256"] = hashlib.sha256(
+                receipt.read_bytes()
+            ).hexdigest()
+            _write(provenance, provenance_value)
+
+            with self.assertRaisesRegex(
+                ValidationError,
+                "producer receipt signature is not authenticated",
+            ):
+                _validate(provenance, receipt, signature, allowed_signers)
+
     def test_validate_rejects_receipt_digest_mismatch(self):
         with tempfile.TemporaryDirectory() as tmp:
-            provenance, receipt = _fixture(Path(tmp))
-            value = json.loads(receipt.read_text())
+            (
+                provenance,
+                receipt,
+                _,
+                allowed_signers,
+                signing_key,
+            ) = _fixture(Path(tmp))
+            value = json.loads(receipt.read_text(encoding="utf-8"))
             value["evidence_summary_sha256"] = "6" * 64
             _write(receipt, value)
+            signature = _sign_receipt(receipt, signing_key)
             with self.assertRaisesRegex(ValidationError, "producer receipt digest mismatch"):
-                validate(
-                    provenance,
-                    receipt,
-                    expected_source_revision=SOURCE,
-                    expected_recovery_contract_sha256=CONTRACT,
-                )
+                _validate(provenance, receipt, signature, allowed_signers)
 
     def test_validate_rejects_source_drift(self):
         with tempfile.TemporaryDirectory() as tmp:
-            provenance, receipt = _fixture(Path(tmp))
+            provenance, receipt, signature, allowed_signers, _ = _fixture(Path(tmp))
             with self.assertRaisesRegex(ValidationError, "source revision mismatch"):
-                validate(
+                _validate(
                     provenance,
                     receipt,
-                    expected_source_revision="a" * 40,
-                    expected_recovery_contract_sha256=CONTRACT,
+                    signature,
+                    allowed_signers,
+                    source_revision="a" * 40,
                 )
 
     def test_validate_rejects_cross_use_of_evidence_receipt_for_restore(self):
         with tempfile.TemporaryDirectory() as tmp:
-            provenance, receipt = _fixture(Path(tmp))
-            value = json.loads(provenance.read_text())
+            provenance, receipt, signature, allowed_signers, _ = _fixture(Path(tmp))
+            value = json.loads(provenance.read_text(encoding="utf-8"))
             value["kind"] = "heim_pc.nixos_recovery_restore_test_provenance"
             value["evidence_schema"] = SCHEMA + ".restore_test"
             value["evidence"]["kind"] = SCHEMA + ".restore_test"
             _write(provenance, value)
             with self.assertRaisesRegex(ValidationError, "provenance_kind mismatch"):
-                validate(
-                    provenance,
-                    receipt,
-                    expected_source_revision=SOURCE,
-                    expected_recovery_contract_sha256=CONTRACT,
-                )
+                _validate(provenance, receipt, signature, allowed_signers)
 
     def test_validate_restore_schema_is_bound(self):
         with tempfile.TemporaryDirectory() as tmp:
-            provenance, receipt = _fixture(Path(tmp))
-            receipt_value = json.loads(receipt.read_text())
+            (
+                provenance,
+                receipt,
+                _,
+                allowed_signers,
+                signing_key,
+            ) = _fixture(Path(tmp))
+            receipt_value = json.loads(receipt.read_text(encoding="utf-8"))
             receipt_value["provenance_kind"] = (
                 "heim_pc.nixos_recovery_restore_test_provenance"
             )
             receipt_value["evidence_schema"] = SCHEMA + ".restore_test"
             _write(receipt, receipt_value)
+            signature = _sign_receipt(receipt, signing_key)
             receipt_sha = hashlib.sha256(receipt.read_bytes()).hexdigest()
 
-            value = json.loads(provenance.read_text())
+            value = json.loads(provenance.read_text(encoding="utf-8"))
             value["kind"] = "heim_pc.nixos_recovery_restore_test_provenance"
             value["evidence_schema"] = SCHEMA + ".restore_test"
             value["evidence"]["kind"] = SCHEMA + ".restore_test"
             value["evidence"]["producer_receipt_sha256"] = receipt_sha
             _write(provenance, value)
-            result = validate(
-                provenance,
-                receipt,
-                expected_source_revision=SOURCE,
-                expected_recovery_contract_sha256=CONTRACT,
-            )
+            result = _validate(provenance, receipt, signature, allowed_signers)
         self.assertEqual(
             result["provenance_kind"],
             "heim_pc.nixos_recovery_restore_test_provenance",
