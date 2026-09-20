@@ -40,6 +40,7 @@ class GrokReviewRoleTests(unittest.TestCase):
         self.assertNotIn("--allow", actual)
         self.assertNotIn("--deny", actual)
         self.assertNotIn("-p", actual)
+        self.assertIn("--verbatim", actual)
         self.assertEqual(actual[actual.index("--sandbox") + 1], "read-only")
         self.assertEqual(actual[actual.index("--prompt-file") + 1], "/dev/stdin")
         prompt = prompt_bytes.decode("utf-8")
@@ -61,6 +62,7 @@ class GrokReviewRoleTests(unittest.TestCase):
         )
         self.assertLess(max(len(item.encode("utf-8")) for item in actual), 4096)
         self.assertGreater(len(prompt_bytes), len(review_diff))
+        self.assertIn("--verbatim", actual)
         self.assertEqual(actual[actual.index("--prompt-file") + 1], "/dev/stdin")
 
     def test_streaming_review_command_rejects_oversized_or_non_utf8_diff(self) -> None:
@@ -365,7 +367,7 @@ class GrokReviewRoleTests(unittest.TestCase):
             "--always-approve", "--yolo", "--dangerously-skip-permissions",
             "--permission-mode", "--allow", "--deny", "--sandbox", "--tools",
             "--disallowed-tools", "--output-format", "--max-turns", "--json-schema",
-            "--prompt-file",
+            "--verbatim", "--prompt-file",
         )
         for option in controlled:
             for item in ((option, "value"), (f"{option}=value",)):
