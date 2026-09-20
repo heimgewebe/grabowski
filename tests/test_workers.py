@@ -1309,6 +1309,46 @@ globalThis.fetch = async () => ({
         self.assertEqual(policy["adapter_id"], "chrome-cdp")
         self.assertEqual(policy["selection_role"], "reproducible-test")
 
+    def test_chrome_channel_detection_ignores_unrelated_ancestor_names(self) -> None:
+        for path in (
+            "/tmp/random-dev-parent/google-chrome",
+            "/usr/bin/google-chrome-stable",
+        ):
+            with self.subTest(path=path):
+                stable = workers._browser_adapter_policy(path)
+                self.assertEqual(stable["family"], "chrome-stable")
+                self.assertEqual(stable["selection_role"], "canonical-operator")
+
+        for path in (
+            "/usr/bin/google-chrome-beta",
+            "/usr/bin/google-chrome-unstable",
+            "/opt/google/chrome-dev/chrome",
+            "/usr/bin/google-chrome-canary",
+            "/opt/google/chrome-canary/chrome",
+        ):
+            with self.subTest(path=path):
+                policy = workers._browser_adapter_policy(path)
+                self.assertEqual(policy["family"], "chrome-nonstable")
+                self.assertEqual(policy["selection_role"], "fallback-test")
+
+        for path in (
+            "/usr/bin/google-chrome-nightly",
+            "/opt/google/chrome-nightly/chrome",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "unsupported Google Chrome channel",
+                ):
+                    workers._browser_adapter_policy(path)
+                projected = workers._browser_adapter_policy(
+                    path,
+                    require_supported=False,
+                )
+                self.assertEqual(projected["family"], "unsupported")
+                self.assertEqual(projected["vendor"], "google")
+                self.assertFalse(projected["implemented"])
+
     def test_non_chromium_browser_fails_closed_before_profile_creation(self) -> None:
         firefox = self.root / "firefox"
         firefox.write_text("#!/bin/sh\nexit 0\n")

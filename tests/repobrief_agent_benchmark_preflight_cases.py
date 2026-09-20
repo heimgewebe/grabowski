@@ -377,7 +377,7 @@ class RepoBriefAgentBenchmarkPreflightTests(unittest.TestCase):
                     treatment_fixture=None,
                 )
             events = ledger_events(root / "state")
-            self.assertEqual([event["event"] for event in events], ["authorized", "preflight-failed"])
+            self.assertEqual([event["event"] for event in events], ["preflight-failed"])
             self.assertEqual(events[-1]["payload"]["provider_process_intents"], 0)
             self.assertFalse(events[-1]["payload"]["retry_permitted"])
             with self.assertRaisesRegex(preflight.PreflightError, "blocks retry"):
