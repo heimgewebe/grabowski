@@ -383,11 +383,7 @@ def apply(
         not isinstance(lease_snapshots, list)
         or len(lease_snapshots) != len(resource_keys)
     ):
-        try:
-            resources.release_resources(owner_id, resource_keys)
-        except Exception:
-            pass
-        return {
+        output = {
             "receipt_status": "failed",
             "state": "lease_snapshot_invalid",
             "effect_started": False,
@@ -396,7 +392,31 @@ def apply(
             "lease_owner_id": owner_id,
             "resource_keys": resource_keys,
             "readback_required": True,
+            "next_action": (
+                "authoritative local and remote readback before any new intent"
+            ),
         }
+        try:
+            released = resources.release_resources(owner_id, resource_keys)
+        except Exception as exc:
+            cleanup_next_action = (
+                "inspect and clean the exact owned leases before any new intent"
+            )
+            output["lease_cleanup_required"] = True
+            output["lease_release"] = {
+                "status": "failed",
+                "error_class": type(exc).__name__,
+            }
+            output["lease_cleanup_next_action"] = cleanup_next_action
+            output["next_action"] = (
+                f"{output['next_action']}; then {cleanup_next_action}"
+            )
+        else:
+            output["lease_release"] = {
+                "status": "released",
+                "count": len(released.get("released", [])),
+            }
+        return output
 
     output: dict[str, Any] | None = None
     effect_started = False
@@ -718,6 +738,8 @@ def apply(
                     and readback.get("head") == expected_local_head
                     and readback.get("clean") is True
                     and readback.get("upstream") == expected_upstream
+                    and readback.get("tracking_head")
+                    == initial.get("tracking_head")
                 )
                 local_post_verified = bool(local_final_exact)
                 if (

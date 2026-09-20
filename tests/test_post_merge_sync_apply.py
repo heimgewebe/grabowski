@@ -672,6 +672,76 @@ class PostMergeSyncApplyTests(unittest.TestCase):
                 git_stdout(repo, "write-tree"),
             )
 
+    def test_invalid_lease_snapshot_release_failure_surfaces_cleanup_required(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            leases = LeaseHarness()
+
+            def malformed_acquire(
+                owner_id: str,
+                resource_keys: list[str],
+                *,
+                purpose: str,
+                ttl_seconds: int,
+            ) -> dict[str, object]:
+                acquired = leases.acquire(
+                    owner_id,
+                    resource_keys,
+                    purpose=purpose,
+                    ttl_seconds=ttl_seconds,
+                )
+                snapshots = list(acquired["leases"])
+                return {"leases": snapshots[:-1]}
+
+            def failing_release(
+                owner_id: str,
+                resource_keys: list[str],
+                *,
+                expected_leases: list[dict[str, object]] | None = None,
+                force: bool = False,
+            ) -> dict[str, object]:
+                del owner_id, resource_keys, expected_leases, force
+                leases.release_calls += 1
+                raise RuntimeError("cleanup state unknown")
+
+            with (
+                patch.object(
+                    sync_apply.resources,
+                    "acquire_resources",
+                    malformed_acquire,
+                ),
+                patch.object(
+                    sync_apply.resources,
+                    "release_resources",
+                    failing_release,
+                ),
+            ):
+                result = self.apply(repo, remote, base, target)
+
+            self.assertEqual("failed", result["receipt_status"])
+            self.assertEqual("lease_snapshot_invalid", result["state"])
+            self.assertFalse(result["effect_started"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertTrue(result["readback_required"])
+            self.assertTrue(result["lease_cleanup_required"])
+            self.assertEqual("failed", result["lease_release"]["status"])
+            self.assertEqual("RuntimeError", result["lease_release"]["error_class"])
+            self.assertIn(
+                "authoritative local and remote readback",
+                result["next_action"],
+            )
+            self.assertIn("inspect and clean", result["next_action"])
+            self.assertIn(
+                "inspect and clean",
+                result["lease_cleanup_next_action"],
+            )
+            self.assertEqual(1, leases.release_calls)
+            self.assertEqual(3, len(leases.live))
+            self.assertEqual(base, git_stdout(repo, "rev-parse", "HEAD"))
+            self.assertEqual("", git_stdout(repo, "status", "--porcelain"))
+
     def test_preimage_drift_after_lease_is_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo, remote, base, target = self.fixture(Path(tmp))
@@ -713,6 +783,57 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             self.assertEqual("remote_head_drift_after_lease", result["state"])
             self.assertFalse(result["effect_started"])
             self.assertEqual(base, git_stdout(repo, "rev-parse", "HEAD"))
+            self.assertEqual(1, leases.release_calls)
+
+    def test_tracking_ref_advance_before_branch_check_requires_readback(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            leases = LeaseHarness()
+
+            def branch_ref_missing_after_tracking_update(
+                path: Path,
+                argv: list[str],
+            ) -> dict[str, object]:
+                if argv == [
+                    "show-ref",
+                    "--verify",
+                    "--hash",
+                    "refs/heads/main",
+                ]:
+                    return {
+                        "returncode": 1,
+                        "stdout": "",
+                        "stderr": "",
+                    }
+                return git(path, argv)
+
+            with patched_leases(leases):
+                result = self.apply(
+                    repo,
+                    remote,
+                    base,
+                    target,
+                    runner=branch_ref_missing_after_tracking_update,
+                )
+
+            self.assertEqual("failed", result["receipt_status"])
+            self.assertEqual("outcome_unknown", result["state"])
+            self.assertTrue(result["effect_started"])
+            self.assertFalse(result["worktree_effect_started"])
+            self.assertFalse(result["branch_cas_started"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertTrue(result["readback_required"])
+            self.assertFalse(result["post_state_verified"])
+            self.assertEqual(
+                target,
+                git_stdout(repo, "rev-parse", "refs/remotes/origin/main"),
+            )
+            self.assertEqual(base, git_stdout(repo, "rev-parse", "HEAD"))
+            self.assertEqual(base, git_stdout(repo, "rev-parse", "refs/heads/main"))
+            self.assertEqual("", git_stdout(repo, "status", "--porcelain"))
+            self.assertEqual(target, result["readback"]["tracking_head"])
             self.assertEqual(1, leases.release_calls)
 
     def test_final_remote_drift_blocks_even_when_local_effect_is_exact(self) -> None:
