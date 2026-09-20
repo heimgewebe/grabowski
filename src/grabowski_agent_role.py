@@ -603,7 +603,7 @@ def _grok_streaming_review_command(
         "--always-approve", "--yolo", "--dangerously-skip-permissions",
         "--permission-mode", "--allow", "--deny", "--disable-web-search",
         "--no-subagents", "--sandbox", "--tools", "--disallowed-tools",
-        "--output-format", "--max-turns", "--json-schema", "--prompt-file",
+        "--output-format", "--max-turns", "--json-schema", "--verbatim", "--prompt-file",
     }
     if any(
         item in controlled
@@ -636,6 +636,7 @@ def _grok_streaming_review_command(
             "streaming-json",
             "--max-turns",
             str(GROK_REVIEW_MAX_TURNS),
+            "--verbatim",
             "--prompt-file",
             "/dev/stdin",
         ]
