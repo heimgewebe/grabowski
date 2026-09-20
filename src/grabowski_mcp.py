@@ -13281,6 +13281,28 @@ def _operator_obligation_gate_audit_complete(
     )
 
 
+def _grip_result_readback_runtime_binding() -> dict[str, Any]:
+    deployment = _deployment_metadata()
+    binding = {
+        "release_id": deployment.get("release_id"),
+        "repo_head": deployment.get("repo_head"),
+        "entrypoint_contract_sha256": deployment.get("entrypoint_contract_sha256"),
+    }
+    if (
+        not isinstance(binding["release_id"], str)
+        or not binding["release_id"]
+        or not isinstance(binding["repo_head"], str)
+        or re.fullmatch(r"[0-9a-f]{40}", binding["repo_head"]) is None
+        or not isinstance(binding["entrypoint_contract_sha256"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", binding["entrypoint_contract_sha256"])
+        is None
+    ):
+        raise RuntimeError(
+            "durable grip result readback requires an exact deployed runtime binding"
+        )
+    return binding
+
+
 def _grip_run_core(
     name: str,
     parameters: dict[str, Any] | None = None,
@@ -13289,6 +13311,7 @@ def _grip_run_core(
     ctx: Context | None = None,
     *,
     transport_target_dispatcher: grabowski_grips.TransportTargetDispatcher | None = None,
+    secret_pty_dispatcher: grabowski_grips.SecretPtyDispatcher | None = None,
 ) -> dict[str, Any]:
     """Run one allowlisted Grabowski grip and return its receipt-bound result."""
     grip_capability = grabowski_grips.grip_required_capability(name)
@@ -13555,7 +13578,7 @@ def _grip_run_core(
         allow_mutation=allow_mutation,
         transport_target_dispatcher=transport_target_dispatcher,
         n8n_provider_dispatcher=_n8n_provider_dispatcher,
-        secret_pty_dispatcher=_secret_pty_grip_dispatcher,
+        secret_pty_dispatcher=secret_pty_dispatcher or _secret_pty_grip_dispatcher,
     )
     if (
         name == "operator-obligation-close"
@@ -13832,6 +13855,7 @@ async def _grip_run_mcp(
         name, allow_mutation
     )
     loop = asyncio.get_running_loop()
+    server_milestones: set[str] = set()
 
     def target_dispatcher(
         target_tool_name: str,
@@ -13849,16 +13873,45 @@ async def _grip_run_mcp(
         )
         return future.result()
 
+    def tracked_secret_pty_dispatcher(request: dict[str, Any]) -> dict[str, Any]:
+        server_milestones.add("secret_pty_dispatcher_entered")
+        return _secret_pty_grip_dispatcher(request)
+
     def run_core() -> dict[str, Any]:
         try:
-            return _grip_run_core(
+            durable_readback = grabowski_grips.grip_requires_durable_result_readback(name)
+            runtime_binding: dict[str, Any] | None = None
+            if durable_readback:
+                runtime_binding = _grip_result_readback_runtime_binding()
+                grabowski_grips.prepare_grip_result_readback_store()
+            result = _grip_run_core(
                 name,
                 effective_parameters,
                 profile,
                 effective_allow_mutation,
                 ctx,
                 transport_target_dispatcher=target_dispatcher,
+                secret_pty_dispatcher=(
+                    tracked_secret_pty_dispatcher
+                    if name == "secret-pty-getpass-probe"
+                    else None
+                ),
             )
+            if durable_readback:
+                assert runtime_binding is not None
+                result = dict(result)
+                result["result_readback"] = (
+                    grabowski_grips.persist_grip_result_readback(
+                        name,
+                        result,
+                        tool_name="grip_run",
+                        runtime_binding=runtime_binding,
+                        profile=profile,
+                        allow_mutation=effective_allow_mutation,
+                        server_milestones=server_milestones,
+                    )
+                )
+            return result
         finally:
             if retained_claim_challenge is not None:
                 _discard_pending_transport_target(retained_claim_challenge)

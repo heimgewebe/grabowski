@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
@@ -7,6 +8,7 @@ import hashlib
 import inspect
 import json
 import sqlite3
+import stat as statmod
 import subprocess
 import sys
 import tempfile
@@ -45,6 +47,7 @@ if "mcp" not in sys.modules:
     sys.modules["mcp.types"] = fake_types
 
 import grabowski_grips as grips
+import grabowski_effect_receipt as effect_receipt
 import grabowski_grip_orchestration as grip_orchestration
 import grabowski_sagas as sagas
 import grabowski_merge_guard as merge_guard
@@ -1510,6 +1513,7 @@ class GripFoundationTests(unittest.TestCase):
                 "n8n-workflow-edge-apply",
                 "n8n-workflow-edge-verify",
                 "secret-pty-getpass-probe",
+                "grip-result-readback",
                 "checkout-binding-terminal-apply",
                 "checkout-binding-terminal-preview",
                 "checkout-binding-identity-rebind-apply",
@@ -10394,6 +10398,189 @@ class SecretPtyGripTests(unittest.TestCase):
         )
         self.assertEqual("blocked", result["status"])
         self.assertIn("unknown secret PTY grip field", result["output"]["error"])
+
+
+class GripResultReadbackTests(unittest.TestCase):
+    @staticmethod
+    def _allowed_session_decision() -> dict[str, object]:
+        return {
+            "allowed": True,
+            "session_profile": {"profile": "trusted-owner"},
+        }
+
+    def _run_mcp_secret_probe(
+        self,
+        parameters: dict[str, object],
+        *,
+        dispatcher,
+    ) -> dict[str, object]:
+        import grabowski_mcp as mcp_module
+
+        with patch.object(mcp_module, "_require_capability"), patch.object(
+            mcp_module, "_require_mutations_enabled"
+        ), patch.object(
+            mcp_module,
+            "_session_grip_policy_decision",
+            return_value=self._allowed_session_decision(),
+        ), patch.object(
+            mcp_module,
+            "_grip_result_readback_runtime_binding",
+            return_value={
+                "release_id": "test-release",
+                "repo_head": "b" * 40,
+                "entrypoint_contract_sha256": "c" * 64,
+            },
+        ), patch.object(
+            mcp_module, "_secret_pty_grip_dispatcher", side_effect=dispatcher
+        ):
+            return asyncio.run(
+                mcp_module._grip_run_mcp(
+                    "secret-pty-getpass-probe",
+                    parameters,
+                    profile="operator",
+                    allow_mutation=True,
+                )
+            )
+
+    def test_missing_readback_is_effect_free(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            grips,
+            "GRIP_RESULT_READBACK_ROOT",
+            Path(directory) / "grip-result-readback",
+        ):
+            root = grips.GRIP_RESULT_READBACK_ROOT
+            self.assertFalse(root.exists())
+            result = grips.grip_run(
+                "grip-result-readback",
+                {"receipt_sha256": "a" * 64},
+                profile="observer",
+            )
+            self.assertEqual("blocked", result["status"])
+            self.assertEqual("preflight", result["receipt"]["phase"])
+            self.assertFalse(root.exists())
+
+    def test_result_readback_proves_pre_dispatch_block_without_raw_parameters(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            grips,
+            "GRIP_RESULT_READBACK_ROOT",
+            Path(directory) / "grip-result-readback",
+        ):
+            dispatcher = Mock(side_effect=AssertionError("dispatcher must not run"))
+            result = self._run_mcp_secret_probe(
+                {
+                    "source_path": "relative/path",
+                    "expected_source_sha256": "a" * 64,
+                },
+                dispatcher=dispatcher,
+            )
+            dispatcher.assert_not_called()
+            self.assertEqual("blocked", result["status"])
+            self.assertEqual("preflight", result["receipt"]["phase"])
+            readback = grips.read_grip_result_readback(result["receipt_sha256"])
+            self.assertFalse(
+                readback["effect_boundary"]["secret_pty_dispatcher_entered"]
+            )
+            self.assertFalse(readback["secret_material_persisted"])
+            self.assertEqual("grip_run", readback["tool_name"])
+            self.assertEqual("test-release", readback["runtime_binding"]["release_id"])
+            self.assertEqual("b" * 40, readback["runtime_binding"]["repo_head"])
+            self.assertEqual(
+                grips.sha256_json(readback["runtime_binding"]),
+                readback["runtime_binding_sha256"],
+            )
+            rendered = Path(result["result_readback"]["path"]).read_text(
+                encoding="utf-8"
+            )
+            self.assertNotIn("relative/path", rendered)
+            self.assertNotIn(result["output"]["error"], rendered)
+            self.assertEqual(
+                0o600,
+                statmod.S_IMODE(
+                    Path(result["result_readback"]["path"]).stat().st_mode
+                ),
+            )
+
+    def test_result_readback_proves_dispatcher_entry_before_action_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            grips,
+            "GRIP_RESULT_READBACK_ROOT",
+            Path(directory) / "grip-result-readback",
+        ):
+            dispatcher = Mock(side_effect=RuntimeError("synthetic pre-effect failure"))
+            result = self._run_mcp_secret_probe(
+                {
+                    "source_path": "/private/value",
+                    "expected_source_sha256": "a" * 64,
+                },
+                dispatcher=dispatcher,
+            )
+            dispatcher.assert_called_once()
+            self.assertEqual("failed", result["status"])
+            self.assertEqual("action", result["receipt"]["phase"])
+            readback = grips.grip_run(
+                "grip-result-readback",
+                {"receipt_sha256": result["receipt_sha256"]},
+                profile="observer",
+            )
+            self.assertEqual("passed", readback["status"])
+            self.assertTrue(
+                readback["output"]["effect_boundary"][
+                    "secret_pty_dispatcher_entered"
+                ]
+            )
+            self.assertFalse(readback["output"]["secret_material_persisted"])
+            domain_receipts = effect_receipt.collect_domain_receipts(result)
+            self.assertIn(result["receipt_sha256"], domain_receipts)
+            self.assertIn(
+                result["result_readback"]["result_readback_receipt_sha256"],
+                domain_receipts,
+            )
+            self.assertNotEqual(
+                result["receipt_sha256"],
+                result["result_readback"]["result_readback_receipt_sha256"],
+            )
+            self.assertNotIn(
+                "/private/value",
+                Path(result["result_readback"]["path"]).read_text(encoding="utf-8"),
+            )
+
+    def test_result_readback_persistence_is_create_only_and_integrity_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            grips,
+            "GRIP_RESULT_READBACK_ROOT",
+            Path(directory) / "grip-result-readback",
+        ):
+            dispatcher = Mock(side_effect=RuntimeError("synthetic pre-effect failure"))
+            result = self._run_mcp_secret_probe(
+                {
+                    "source_path": "/private/value",
+                    "expected_source_sha256": "a" * 64,
+                },
+                dispatcher=dispatcher,
+            )
+            replay = grips.persist_grip_result_readback(
+                "secret-pty-getpass-probe",
+                result,
+                tool_name="grip_run",
+                runtime_binding={
+                    "release_id": "test-release",
+                    "repo_head": "b" * 40,
+                    "entrypoint_contract_sha256": "c" * 64,
+                },
+                profile="operator",
+                allow_mutation=True,
+                server_milestones={"secret_pty_dispatcher_entered"},
+            )
+            self.assertTrue(replay["replayed"])
+            path = Path(replay["path"])
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["phase"] = "preflight"
+            path.write_text(
+                json.dumps(payload, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "identity or digest"):
+                grips.read_grip_result_readback(result["receipt_sha256"])
 
 
 if __name__ == "__main__":
