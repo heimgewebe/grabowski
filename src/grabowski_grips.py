@@ -6783,6 +6783,7 @@ def _run_post_merge_sync_apply(
     serialized = bool(output.get("resource_keys")) and state not in {
         "lease_acquisition_blocked",
         "lease_snapshot_invalid",
+        "lease_preimage_drift",
     }
     _check(
         receipt,
