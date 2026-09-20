@@ -3601,6 +3601,7 @@ def engage_receipt_bound_deployment_admission(
         expected_head=expected_head,
         source_identity_sha256=source_identity_sha256,
         timeout_seconds=timeout_seconds,
+        reuse_existing_exact_marker=True,
     )
 
 
@@ -3609,6 +3610,7 @@ def _engage_operator_deployment_admission(
     expected_head: str,
     source_identity_sha256: str,
     timeout_seconds: int,
+    reuse_existing_exact_marker: bool = False,
 ) -> dict[str, Any]:
     if OPERATOR_ADMISSION_HEAD_RE.fullmatch(expected_head or "") is None:
         raise ValueError("deployment admission expected_head is invalid")
@@ -3619,7 +3621,26 @@ def _engage_operator_deployment_admission(
     now = int(time.time())
     existing = _secure_admission_marker_payload(OPERATOR_ADMISSION_MARKER_PATH)
     if existing is not None:
+        created = existing.get("created_at_unix")
         expires = existing.get("expires_at_unix")
+        existing_active = bool(
+            isinstance(created, int)
+            and not isinstance(created, bool)
+            and isinstance(expires, int)
+            and not isinstance(expires, bool)
+            and created <= now < expires
+        )
+        if reuse_existing_exact_marker and existing_active:
+            if (
+                existing.get("expected_head") == marker_expected_head
+                and existing.get("source_identity_sha256")
+                == marker_source_identity_sha256
+            ):
+                return existing
+            core.fail(
+                "Aktiver Deployment-Admission-Marker gehört einem anderen Recovery-Lauf",
+                phase="operator-admission-marker",
+            )
         if not isinstance(expires, int) or isinstance(expires, bool) or expires > now:
             core.fail(
                 "Ein aktiver oder unklarer Deployment-Admission-Marker existiert bereits",
