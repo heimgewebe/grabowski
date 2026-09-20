@@ -403,7 +403,7 @@ def _browser_adapter_policy(
             or parent_name in nonstable_names
         )
         stable = (
-            normalized_name == "google-chrome"
+            normalized_name in {"google-chrome", "google-chrome-stable"}
             or (normalized_name == "chrome" and parent_name == "chrome")
         )
         if not nonstable and not stable:

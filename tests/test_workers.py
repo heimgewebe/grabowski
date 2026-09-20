@@ -1310,11 +1310,14 @@ globalThis.fetch = async () => ({
         self.assertEqual(policy["selection_role"], "reproducible-test")
 
     def test_chrome_channel_detection_ignores_unrelated_ancestor_names(self) -> None:
-        stable = workers._browser_adapter_policy(
-            "/tmp/random-dev-parent/google-chrome"
-        )
-        self.assertEqual(stable["family"], "chrome-stable")
-        self.assertEqual(stable["selection_role"], "canonical-operator")
+        for path in (
+            "/tmp/random-dev-parent/google-chrome",
+            "/usr/bin/google-chrome-stable",
+        ):
+            with self.subTest(path=path):
+                stable = workers._browser_adapter_policy(path)
+                self.assertEqual(stable["family"], "chrome-stable")
+                self.assertEqual(stable["selection_role"], "canonical-operator")
 
         for path in (
             "/usr/bin/google-chrome-beta",
