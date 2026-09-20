@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from argparse import Namespace
+from contextlib import ExitStack
 from datetime import datetime, timezone
 import hashlib
 import importlib.util
@@ -720,7 +721,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             treatment = runner.build_command(
                 request(condition="treatment"), "/opt/codex", checkout, schema, codex_home,
                 authorized_mcp_files=[
-                    {"path": "/usr/bin/python3", "bytes": 1, "sha256": "0" * 64, "mode": "0o755"}
+                    file_identity(runner.MCP_PROXY_PYTHON_LINK)
                 ],
                 proxy_path=(root / "bound-proxy.py").resolve(),
                 manifest_path=(root / "bound.bundle.manifest.json").resolve(),
@@ -742,6 +743,68 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertNotIn("mcp_servers.repobrief", baseline_joined)
         self.assertIn("mcp_servers.repobrief", treatment_joined)
         self.assertIn("--codex-mcp-proxy", treatment_joined)
+
+
+    def test_mcp_proxy_python_resolves_symlink_and_validates_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "python3.10"
+            target.write_bytes(b"python")
+            target.chmod(0o755)
+            link = root / "python3"
+            link.symlink_to(target.name)
+            with (
+                patch.object(runner, "MCP_PROXY_PYTHON_LINK", link),
+                patch.object(
+                    runner,
+                    "_validate_support_executable",
+                    return_value=str(target.resolve()),
+                ) as validate,
+            ):
+                self.assertEqual(
+                    runner._validated_mcp_proxy_python(),
+                    str(target.resolve()),
+                )
+            validate.assert_called_once_with(target.resolve(), owner_uid=0)
+
+    def test_mcp_proxy_python_must_match_preflight_authorized_identity(self) -> None:
+        authorized = file_identity(runner.MCP_PROXY_PYTHON_LINK)
+        authorized["sha256"] = "0" * 64
+        with self.assertRaisesRegex(
+            runner.RunnerError,
+            "not preflight-authorized",
+        ):
+            runner._validated_mcp_proxy_python([authorized])
+
+    def test_treatment_command_uses_validated_resolved_proxy_python(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "repo"
+            checkout.mkdir()
+            schema = root / "schema.json"
+            codex_home = root / "codex-home"
+            resolved_python = "/usr/bin/python3.10"
+            with patch.object(
+                runner,
+                "_validated_mcp_proxy_python",
+                return_value=resolved_python,
+            ) as validate:
+                command = runner.build_command(
+                    request(condition="treatment"),
+                    "/opt/codex",
+                    checkout,
+                    schema,
+                    codex_home,
+                    authorized_mcp_files=[],
+                    proxy_path=(root / "bound-proxy.py").resolve(),
+                    manifest_path=(root / "bound.bundle.manifest.json").resolve(),
+                    mcp_runtime_root=(root / "state").resolve(),
+                )
+            validate.assert_called_once_with([])
+            self.assertIn(
+                f'mcp_servers.repobrief.command="{resolved_python}"',
+                command,
+            )
 
     def test_raw_provider_evidence_is_written_before_unqualified_stderr_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1014,6 +1077,100 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             login_status.assert_not_called()
             provider_launch.assert_not_called()
 
+    def test_execute_wires_irreversible_effect_callbacks_into_failure_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            value = request()
+            planned_request_root(root, value)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            codex_home = root / "codex-home"
+            codex_home.mkdir()
+            args = Namespace(
+                request_root=root / "requests",
+                repository_map=root / "repositories.json",
+                state_root=root / "state",
+                transcript_root=root / "transcripts",
+                provider_evidence_root=root / "provider-evidence",
+                codex_command="/opt/codex",
+                codex_command_sha256="1" * 64,
+                allow_live_provider=True,
+                stream_fixture=None,
+                stderr_fixture=None,
+                fixture_returncode=0,
+            )
+            dispatch = {
+                "authorization": {"contract": "test"},
+                "provider_codex": {},
+                "provider_authentication": {},
+                "repository_map_bytes": b"{}",
+                "binding": {},
+            }
+
+            def record_intent(*_args, **kwargs):
+                callback = kwargs.get("intent_persisted_callback")
+                self.assertIsNotNone(callback)
+                callback()
+                return "a" * 64
+
+            def launch(*_args, **kwargs):
+                callback = kwargs.get("process_started_callback")
+                self.assertIsNotNone(callback)
+                callback()
+                raise KeyboardInterrupt()
+
+            with ExitStack() as stack:
+                for name, return_value in (
+                    ("validate_executable", "/opt/codex"),
+                    ("validate_toolchain", "/usr/bin:/bin"),
+                    ("validate_chatgpt_subscription", b"opaque-chatgpt-auth"),
+                    ("_repository_root_from_authorized_map_bytes", root),
+                    ("prepare_provider_evidence", {"plan": True}),
+                    ("create_checkout", checkout),
+                    ("stage_codex_home", codex_home),
+                    ("build_command", ["codex"]),
+                    ("provider_env", {}),
+                    ("cleanup_codex_home", None),
+                ):
+                    stack.enter_context(
+                        patch.object(runner, name, return_value=return_value)
+                    )
+                for name in (
+                    "_assert_authorized_codex_executable",
+                    "_assert_authorized_chatgpt_auth",
+                    "_assert_authorized_runtime_binding",
+                    "close_provider_evidence_plan",
+                    "write_schema",
+                ):
+                    stack.enter_context(patch.object(runner, name))
+                stack.enter_context(
+                    patch.object(
+                        runner,
+                        "_load_preflight_dispatch_authorization",
+                        return_value=dispatch,
+                    )
+                )
+                intent = stack.enter_context(
+                    patch.object(
+                        runner,
+                        "_record_preflight_dispatch_intent",
+                        side_effect=record_intent,
+                    )
+                )
+                provider = stack.enter_context(
+                    patch.object(runner, "run_bounded", side_effect=launch)
+                )
+                failed = stack.enter_context(
+                    patch.object(runner, "_record_preflight_dispatch_failed")
+                )
+                with self.assertRaises(KeyboardInterrupt):
+                    runner.execute(value, args)
+
+            intent.assert_called_once()
+            provider.assert_called_once()
+            failed.assert_called_once()
+            self.assertTrue(failed.call_args.kwargs["provider_process_started"])
+
     def test_treatment_manifest_mismatch_fails_before_workspace_consumption(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1278,6 +1435,45 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertEqual(provider_started, [True])
         self.assertIn("process", observed)
         self.assertIsNotNone(observed["process"].poll())
+
+    def test_run_bounded_marks_provider_started_when_popen_interrupt_leaves_child(self) -> None:
+        real_popen = runner.subprocess.Popen
+        observed: dict[str, subprocess.Popen] = {}
+        provider_started: list[bool] = []
+
+        def spawn_then_interrupt(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            observed["process"] = process
+            raise KeyboardInterrupt()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "sleeper.py"
+            script.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+            with patch.object(
+                runner.subprocess,
+                "Popen",
+                side_effect=spawn_then_interrupt,
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    runner.run_bounded(
+                        [sys.executable, str(script)],
+                        cwd=root,
+                        timeout_seconds=30,
+                        stdin_data=b"",
+                        process_started_callback=lambda: provider_started.append(True),
+                    )
+
+        self.assertEqual(provider_started, [True])
+        self.assertIn("process", observed)
+        self.assertIsNotNone(observed["process"].poll())
+        for stream in (
+            observed["process"].stdin,
+            observed["process"].stdout,
+            observed["process"].stderr,
+        ):
+            if stream is not None:
+                stream.close()
 
     def test_run_bounded_popen_failure_preserves_original_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2752,7 +2948,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             staged_manifest.write_text("{}\n", encoding="utf-8")
             command = runner.build_command(
                 request(condition="treatment"), "/opt/codex", checkout, schema, codex_home,
-                authorized_mcp_files=[], proxy_path=Path(binding["path"]),
+                authorized_mcp_files=[file_identity(runner.MCP_PROXY_PYTHON_LINK)], proxy_path=Path(binding["path"]),
                 manifest_path=staged_manifest.resolve(),
                 mcp_runtime_root=state_root.resolve(),
             )
@@ -2838,7 +3034,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             codex_home = root / "codex-home"; (codex_home / "tmp").mkdir(parents=True)
             command = runner.build_command(
                 request(condition="treatment"), "/opt/codex", checkout, schema, codex_home,
-                authorized_mcp_files=[], proxy_path=(root / "bound-proxy.py").resolve(),
+                authorized_mcp_files=[file_identity(runner.MCP_PROXY_PYTHON_LINK)], proxy_path=(root / "bound-proxy.py").resolve(),
                 manifest_path=staged.resolve(),
                 mcp_runtime_root=state_root.resolve(),
             )

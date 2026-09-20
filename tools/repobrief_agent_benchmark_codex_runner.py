@@ -43,6 +43,7 @@ ENTRYPOINT_BOOTSTRAP_KIND = "grabowski.python_c_source_bootstrap"
 ENTRYPOINT_BOOTSTRAP_SCHEMA_VERSION = 1
 ENTRYPOINT_BOOTSTRAP_NAME = "repobrief_agent_benchmark_source_bootstrap.py"
 ENTRYPOINT_BOOTSTRAP_PATH = Path(__file__).with_name(ENTRYPOINT_BOOTSTRAP_NAME)
+MCP_PROXY_PYTHON_LINK = Path("/usr/bin/python3")
 
 
 
@@ -571,11 +572,38 @@ def _validate_support_executable(
     return str(path)
 
 
+def _validated_mcp_proxy_python(
+    authorized_files: Sequence[Mapping[str, Any]] | None = None,
+) -> str:
+    try:
+        resolved = MCP_PROXY_PYTHON_LINK.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise RunnerError(
+            "required Codex MCP proxy Python executable is unavailable"
+        ) from exc
+    validated = _validate_support_executable(resolved, owner_uid=0)
+    if authorized_files is not None:
+        expected = _normalized_authorized_mcp_files(list(authorized_files))
+        current = _mcp_authorization_identity(
+            _bind_mcp_file(
+                resolved,
+                label="Codex MCP proxy Python executable",
+                executable=True,
+            )
+        )
+        if current not in expected:
+            raise RunnerError(
+                "Codex MCP proxy Python executable is not preflight-authorized"
+            )
+    return validated
+
+
 def validate_toolchain(codex: str) -> str:
     bundled_rg = Path(codex).parent.parent / "codex-path" / "rg"
     _validate_support_executable(bundled_rg, require_read_only_mount=True)
     for path in (Path("/usr/bin/cat"), Path("/usr/bin/sed"), Path("/usr/bin/bash")):
         _validate_support_executable(path, owner_uid=0)
+    _validated_mcp_proxy_python()
     return f"{bundled_rg.parent}:/usr/bin:/bin"
 
 
@@ -3858,6 +3886,7 @@ def build_command(
             raise RunnerError("treatment requires a staged absolute RepoGround manifest path")
         if mcp_runtime_root is None or not mcp_runtime_root.is_absolute():
             raise RunnerError("treatment requires a private absolute MCP runtime root")
+        proxy_python = _validated_mcp_proxy_python(authorized_mcp_files)
         upstream = [str(item) for item in request["repobrief"]["mcp_command"]]
         binding = request["repobrief"]
         proxy_args = [
@@ -3868,7 +3897,7 @@ def build_command(
             str(mcp_runtime_root),
         ]
         command[2:2] = [
-            "-c", 'mcp_servers.repobrief.command="/usr/bin/python3"',
+            "-c", f"mcp_servers.repobrief.command={_toml_string(proxy_python)}",
             "-c", "mcp_servers.repobrief.args=" + canonical(proxy_args),
         ]
     return command
@@ -4284,6 +4313,14 @@ def run_bounded(
                 f"emergency_child_scan_failed:{type(cleanup_exc).__name__}"
             )
             adopted = set()
+        if adopted and process is None and process_started_callback is not None:
+            try:
+                process_started_callback()
+            except BaseException as callback_exc:
+                emergency_errors.append(
+                    "emergency_process_started_callback_failed:"
+                    f"{type(callback_exc).__name__}"
+                )
         for child_pid in sorted(adopted):
             try:
                 os.kill(child_pid, signal.SIGKILL)
