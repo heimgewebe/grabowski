@@ -2058,11 +2058,18 @@ def _validated_dispatch_event_state(
     request: Mapping[str, Any], state_root: Path, authorization: Mapping[str, Any]
 ) -> dict[str, Any]:
     pair_id = str(request["pair_id"])
-    pair_root = state_root / "preflight-dispatch-ledger" / hashlib.sha256(pair_id.encode()).hexdigest()
+    pair_root = (
+        state_root
+        / "preflight-dispatch-ledger"
+        / hashlib.sha256(pair_id.encode()).hexdigest()
+    )
     events_root = pair_root / "events"
-    _require_private_ledger_directory(events_root, label="preflight dispatch event ledger")
+    _require_private_ledger_directory(
+        events_root, label="preflight dispatch event ledger"
+    )
     entries = sorted(events_root.iterdir(), key=lambda path: path.name)
-    if not 1 <= len(entries) <= 3:
+    # authorized + two (intent, terminal-outcome) pairs
+    if not 1 <= len(entries) <= 5:
         raise RunnerError("preflight dispatch event ledger cardinality is invalid")
     binding = authorization.get("binding")
     contract = authorization.get("contract_sha256")
@@ -2083,17 +2090,64 @@ def _validated_dispatch_event_state(
         or ledger.get("retry_permitted") is not False
     ):
         raise RunnerError("preflight report initial dispatch ledger is invalid")
+
     previous = contract
     intents: list[str] = []
+    outcomes: dict[str, str] = {}
+    terminal_failure = False
+    pending_condition: str | None = None
     authorized_sha256: str | None = None
-    for sequence, path in enumerate(entries):
+
+    def valid_sha256(value: Any) -> bool:
+        return (
+            isinstance(value, str)
+            and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+        )
+
+    def valid_transcript(value: Any) -> bool:
+        if not isinstance(value, dict):
+            return False
+        status = value.get("status")
+        if status == "present":
+            byte_count = value.get("bytes")
+            return (
+                valid_sha256(value.get("sha256"))
+                and isinstance(byte_count, int)
+                and not isinstance(byte_count, bool)
+                and byte_count >= 0
+                and isinstance(value.get("artifact"), str)
+                and bool(value.get("artifact"))
+            )
+        if status in {"absent", "unavailable"}:
+            reason = value.get("reason")
+            return reason is None or isinstance(reason, str)
+        return False
+
+    def valid_error(value: Any) -> bool:
+        if not isinstance(value, dict):
+            return False
+        size = value.get("error_bytes")
+        return (
+            isinstance(value.get("error_type"), str)
+            and bool(value.get("error_type"))
+            and isinstance(size, int)
+            and not isinstance(size, bool)
+            and size >= 0
+            and valid_sha256(value.get("error_sha256"))
+        )
+
+    for sequence, event_path in enumerate(entries):
         event = base._load_object_bytes(
-            _read_bound_regular_file(path, label="preflight dispatch event", max_bytes=MAX_DISPATCH_EVENT_BYTES),
+            _read_bound_regular_file(
+                event_path,
+                label="preflight dispatch event",
+                max_bytes=MAX_DISPATCH_EVENT_BYTES,
+            ),
             label="preflight dispatch event",
         )
         event_type = event.get("event")
         if (
-            path.name != f"{sequence:04d}-{event_type}.json"
+            event_path.name != f"{sequence:04d}-{event_type}.json"
             or event.get("kind") != PREFLIGHT_EVENT_KIND
             or event.get("version") != PREFLIGHT_LEDGER_VERSION
             or event.get("sequence") != sequence
@@ -2104,6 +2158,7 @@ def _validated_dispatch_event_state(
             raise RunnerError("preflight dispatch event chain is invalid")
         event_sha256 = base._sha256_json(event)
         payload = event.get("payload")
+
         if sequence == 0:
             if (
                 event_type != "authorized"
@@ -2113,27 +2168,109 @@ def _validated_dispatch_event_state(
             ):
                 raise RunnerError("preflight authorized event is invalid")
             authorized_sha256 = event_sha256
-        else:
-            condition = payload.get("condition") if isinstance(payload, dict) else None
-            expected = binding.get("requests", {}).get(condition)
+            previous = event_sha256
+            continue
+
+        if not isinstance(payload, dict):
+            raise RunnerError("preflight dispatch event payload is invalid")
+        condition = payload.get("condition")
+        expected = binding.get("requests", {}).get(condition)
+
+        if event_type == "dispatch-intent":
+            next_process_index = len(intents) + 1
             if (
-                event_type != "dispatch-intent"
+                terminal_failure
+                or len(intents) != len(outcomes)
                 or condition not in {"baseline", "treatment"}
                 or condition in intents
                 or not isinstance(expected, dict)
                 or payload.get("request_id") != expected.get("request_id")
                 or payload.get("request_sha256") != expected.get("sha256")
-                or payload.get("process_index") != len(intents) + 1
+                or payload.get("process_index") != next_process_index
+                or payload.get("order") != next_process_index
                 or payload.get("synthetic_fixture") is not False
                 or payload.get("max_cost_usd") != binding.get("max_cost_usd")
             ):
                 raise RunnerError("preflight dispatch intent event is invalid")
             intents.append(str(condition))
+            pending_condition = str(condition)
+
+        elif event_type in {"condition-completed", "condition-failed"}:
+            process_index = len(intents)
+            observed_cost = payload.get("observed_cost_usd")
+            if (
+                observed_cost is not None
+                or payload.get("observed_cost_status")
+                != "not-reported-by-codex-subscription-stream"
+            ):
+                raise RunnerError("preflight dispatch outcome cost is invalid")
+            common_valid = (
+                len(intents) == len(outcomes) + 1
+                and condition == intents[-1]
+                and condition not in outcomes
+                and not terminal_failure
+                and isinstance(expected, dict)
+                and payload.get("request_id") == expected.get("request_id")
+                and payload.get("request_sha256") == expected.get("sha256")
+                and payload.get("process_index") == process_index
+                and payload.get("order") == process_index
+                and payload.get("synthetic_fixture") is False
+                and isinstance(payload.get("provider_process_started"), bool)
+                and isinstance(payload.get("outcome_ambiguous"), bool)
+                and valid_transcript(payload.get("transcript"))
+                and isinstance(payload.get("observed_cost_status"), str)
+                and bool(payload.get("observed_cost_status"))
+            )
+            if not common_valid:
+                raise RunnerError("preflight dispatch outcome event is invalid")
+
+            if event_type == "condition-completed":
+                if (
+                    payload.get("provider_process_started") is not True
+                    or payload.get("outcome_ambiguous") is not False
+                    or payload.get("transcript", {}).get("status") != "present"
+                    or not valid_sha256(payload.get("receipt_sha256"))
+                    or payload.get("error") is not None
+                ):
+                    raise RunnerError(
+                        "preflight dispatch completed event is invalid"
+                    )
+            else:
+                if (
+                    payload.get("outcome_ambiguous")
+                    is not payload.get("provider_process_started")
+                    or (
+                        payload.get("provider_process_started") is False
+                        and payload.get("transcript", {}).get("status") == "present"
+                    )
+                    or payload.get("receipt_sha256") is not None
+                    or not valid_error(payload.get("error"))
+                ):
+                    raise RunnerError("preflight dispatch failed event is invalid")
+                terminal_failure = True
+
+            outcomes[str(condition)] = str(event_type)
+            pending_condition = None
+
+        else:
+            raise RunnerError("preflight dispatch event type is invalid")
+
         previous = event_sha256
+
     if authorized_sha256 != ledger.get("final_event_sha256"):
-        raise RunnerError("preflight authorized event does not match durable report")
-    return {"pair_root": pair_root, "events_root": events_root, "next_sequence": len(entries),
-            "previous_event_sha256": previous, "condition_intents": intents}
+        raise RunnerError(
+            "preflight authorized event does not match durable report"
+        )
+    return {
+        "pair_root": pair_root,
+        "events_root": events_root,
+        "next_sequence": len(entries),
+        "previous_event_sha256": previous,
+        "condition_intents": intents,
+        "condition_outcomes": outcomes,
+        "pending_condition": pending_condition,
+        "terminal_failure": terminal_failure,
+    }
 
 
 def _record_preflight_dispatch_intent(
@@ -2142,20 +2279,36 @@ def _record_preflight_dispatch_intent(
     authorization: Mapping[str, Any],
 ) -> str:
     pair_id = str(request["pair_id"])
-    pair_root = state_root / "preflight-dispatch-ledger" / hashlib.sha256(pair_id.encode()).hexdigest()
+    pair_root = (
+        state_root
+        / "preflight-dispatch-ledger"
+        / hashlib.sha256(pair_id.encode()).hexdigest()
+    )
     pair_path, pair_fd = _open_private_directory(pair_root, create_final=False)
     lock_fd: int | None = None
     try:
-        flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
-        lock_fd = os.open(DISPATCH_INTENT_LOCK_NAME, flags, 0o600, dir_fd=pair_fd)
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        lock_fd = os.open(
+            DISPATCH_INTENT_LOCK_NAME, flags, 0o600, dir_fd=pair_fd
+        )
         lock_stat = os.fstat(lock_fd)
-        linked = os.stat(DISPATCH_INTENT_LOCK_NAME, dir_fd=pair_fd, follow_symlinks=False)
+        linked = os.stat(
+            DISPATCH_INTENT_LOCK_NAME,
+            dir_fd=pair_fd,
+            follow_symlinks=False,
+        )
         if (
             not stat.S_ISREG(lock_stat.st_mode)
             or lock_stat.st_uid != os.geteuid()
             or stat.S_IMODE(lock_stat.st_mode) != 0o600
             or lock_stat.st_nlink != 1
-            or (lock_stat.st_dev, lock_stat.st_ino) != (linked.st_dev, linked.st_ino)
+            or (lock_stat.st_dev, lock_stat.st_ino)
+            != (linked.st_dev, linked.st_ino)
         ):
             raise RunnerError("preflight dispatch intent lock is unsafe")
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
@@ -2166,17 +2319,48 @@ def _record_preflight_dispatch_intent(
             label="preflight dispatch authorization",
             max_bytes=MAX_DISPATCH_AUTHORIZATION_BYTES,
         )
-        current = base._load_object_bytes(current_raw, label="preflight dispatch authorization")
+        current = base._load_object_bytes(
+            current_raw, label="preflight dispatch authorization"
+        )
         if canonical(current) != canonical(dict(authorization)):
-            raise RunnerError("preflight dispatch authorization changed before intent")
-        _assert_preflight_report_evidence(current, current["binding"], pair_root / "authorization.json")
-        state = _validated_dispatch_event_state(request, state_root, current)
+            raise RunnerError(
+                "preflight dispatch authorization changed before intent"
+            )
+        _assert_preflight_report_evidence(
+            current,
+            current["binding"],
+            pair_root / "authorization.json",
+        )
+        state = _validated_dispatch_event_state(
+            request, state_root, current
+        )
         condition = str(request.get("condition"))
         intents = list(state["condition_intents"])
         if condition in intents:
-            raise RunnerError(f"preflight dispatch intent already exists for {condition}")
+            raise RunnerError(
+                f"preflight dispatch intent already exists for {condition}"
+            )
+        if state["terminal_failure"]:
+            raise RunnerError(
+                "preflight dispatch pair is terminal after failure"
+            )
+        if state["pending_condition"] is not None:
+            raise RunnerError(
+                "prior dispatch intent has no terminal outcome"
+            )
         if len(intents) >= 2:
-            raise RunnerError("preflight dispatch ledger refuses a third provider process")
+            raise RunnerError(
+                "preflight dispatch ledger refuses a third provider process"
+            )
+        order = request.get("order")
+        expected_order = len(intents) + 1
+        if (
+            isinstance(order, bool)
+            or not isinstance(order, int)
+            or order != expected_order
+        ):
+            raise RunnerError("preflight dispatch order is invalid")
+
         sequence = int(state["next_sequence"])
         binding = current["binding"]
         event = {
@@ -2192,17 +2376,28 @@ def _record_preflight_dispatch_intent(
                 "condition": condition,
                 "request_id": request["request_id"],
                 "request_sha256": base._sha256_json(request),
-                "process_index": len(intents) + 1,
+                "process_index": expected_order,
+                "order": order,
                 "synthetic_fixture": False,
                 "max_cost_usd": binding.get("max_cost_usd"),
             },
         }
-        events_path, events_fd = _open_private_directory(state["events_root"], create_final=False)
+        events_path, events_fd = _open_private_directory(
+            state["events_root"], create_final=False
+        )
         try:
             _write_private_dirfd(
                 events_fd,
                 f"{sequence:04d}-dispatch-intent.json",
-                (json.dumps(event, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"),
+                (
+                    json.dumps(
+                        event,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        indent=2,
+                    )
+                    + "\n"
+                ).encode("utf-8"),
             )
             _directory_fd_matches(events_path, events_fd)
         finally:
@@ -2215,6 +2410,268 @@ def _record_preflight_dispatch_intent(
             finally:
                 os.close(lock_fd)
         os.close(pair_fd)
+
+
+def _dispatch_failure_transcript_evidence(
+    request: Mapping[str, Any], authorization: Mapping[str, Any]
+) -> dict[str, Any]:
+    binding = authorization.get("binding")
+    if not isinstance(binding, dict):
+        return {"status": "unavailable", "reason": "binding-invalid"}
+    root = Path(str(binding.get("transcript_root")))
+    if not root.is_absolute():
+        return {"status": "unavailable", "reason": "transcript-root-invalid"}
+    path = root / _provider_artifact_names(request)["stdout"]
+    try:
+        linked = path.lstat()
+    except FileNotFoundError:
+        return {"status": "absent", "reason": "not-persisted"}
+    except OSError:
+        return {"status": "unavailable", "reason": "metadata-unavailable"}
+    if stat.S_ISLNK(linked.st_mode) or not stat.S_ISREG(linked.st_mode):
+        return {"status": "unavailable", "reason": "unsafe-artifact"}
+    try:
+        raw = _read_bound_regular_file(
+            path,
+            label="preflight dispatch failure transcript",
+            max_bytes=MAX_TRANSCRIPT_BYTES,
+        )
+    except RunnerError:
+        return {"status": "unavailable", "reason": "read-failed"}
+    return {
+        "status": "present",
+        "artifact": str(path),
+        "bytes": len(raw),
+        "sha256": sha_bytes(raw),
+    }
+
+
+def _dispatch_receipt_transcript_evidence(
+    receipt_value: Mapping[str, Any],
+) -> dict[str, Any]:
+    transcript = receipt_value.get("transcript")
+    if not isinstance(transcript, dict):
+        raise RunnerError("dispatch completion transcript evidence is invalid")
+    sha256 = transcript.get("sha256")
+    byte_count = transcript.get("bytes")
+    artifact = transcript.get("artifact")
+    if (
+        not isinstance(sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", sha256) is None
+        or isinstance(byte_count, bool)
+        or not isinstance(byte_count, int)
+        or byte_count < 0
+        or not isinstance(artifact, str)
+        or not artifact
+    ):
+        raise RunnerError("dispatch completion transcript evidence is invalid")
+    return {
+        "status": "present",
+        "artifact": artifact,
+        "bytes": byte_count,
+        "sha256": sha256,
+    }
+
+
+def _dispatch_error_evidence(exc: BaseException) -> dict[str, Any]:
+    raw = str(exc).encode("utf-8", errors="replace")
+    return {
+        "error_type": type(exc).__name__,
+        "error_bytes": len(raw),
+        "error_sha256": sha_bytes(raw),
+    }
+
+
+def _record_preflight_dispatch_outcome(
+    request: Mapping[str, Any],
+    state_root: Path,
+    authorization: Mapping[str, Any],
+    *,
+    event_type: str,
+    provider_process_started: bool,
+    outcome_ambiguous: bool,
+    transcript: Mapping[str, Any],
+    receipt_sha256: str | None,
+    error: Mapping[str, Any] | None,
+    observed_cost_usd: str | None = None,
+    observed_cost_status: str = "unavailable",
+) -> str:
+    if event_type not in {"condition-completed", "condition-failed"}:
+        raise RunnerError("preflight dispatch outcome type is invalid")
+    pair_id = str(request["pair_id"])
+    pair_root = (
+        state_root
+        / "preflight-dispatch-ledger"
+        / hashlib.sha256(pair_id.encode()).hexdigest()
+    )
+    pair_path, pair_fd = _open_private_directory(pair_root, create_final=False)
+    lock_fd: int | None = None
+    try:
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        lock_fd = os.open(
+            DISPATCH_INTENT_LOCK_NAME, flags, 0o600, dir_fd=pair_fd
+        )
+        lock_stat = os.fstat(lock_fd)
+        linked = os.stat(
+            DISPATCH_INTENT_LOCK_NAME,
+            dir_fd=pair_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(lock_stat.st_mode)
+            or lock_stat.st_uid != os.geteuid()
+            or stat.S_IMODE(lock_stat.st_mode) != 0o600
+            or lock_stat.st_nlink != 1
+            or (lock_stat.st_dev, lock_stat.st_ino)
+            != (linked.st_dev, linked.st_ino)
+        ):
+            raise RunnerError("preflight dispatch outcome lock is unsafe")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        _directory_fd_matches(pair_path, pair_fd)
+        current_raw = _read_bound_regular_file_at(
+            pair_fd,
+            "authorization.json",
+            label="preflight dispatch authorization",
+            max_bytes=MAX_DISPATCH_AUTHORIZATION_BYTES,
+        )
+        current = base._load_object_bytes(
+            current_raw, label="preflight dispatch authorization"
+        )
+        if canonical(current) != canonical(dict(authorization)):
+            raise RunnerError(
+                "preflight dispatch authorization changed before outcome"
+            )
+        _assert_preflight_report_evidence(
+            current,
+            current["binding"],
+            pair_root / "authorization.json",
+        )
+        state = _validated_dispatch_event_state(
+            request, state_root, current
+        )
+        condition = str(request.get("condition"))
+        if state["terminal_failure"]:
+            raise RunnerError(
+                "preflight dispatch pair is terminal after failure"
+            )
+        if state["pending_condition"] != condition:
+            raise RunnerError(
+                "preflight dispatch outcome has no matching pending intent"
+            )
+        process_index = len(state["condition_intents"])
+        order = request.get("order")
+        if (
+            isinstance(order, bool)
+            or not isinstance(order, int)
+            or order != process_index
+        ):
+            raise RunnerError("preflight dispatch outcome order is invalid")
+        sequence = int(state["next_sequence"])
+        event = {
+            "kind": PREFLIGHT_EVENT_KIND,
+            "version": PREFLIGHT_LEDGER_VERSION,
+            "sequence": sequence,
+            "event": event_type,
+            "recorded_at": iso(utc_now()),
+            "pair_id": pair_id,
+            "contract_sha256": current["contract_sha256"],
+            "previous_event_sha256": state["previous_event_sha256"],
+            "payload": {
+                "condition": condition,
+                "request_id": request["request_id"],
+                "request_sha256": base._sha256_json(request),
+                "process_index": process_index,
+                "order": order,
+                "synthetic_fixture": False,
+                "provider_process_started": provider_process_started,
+                "outcome_ambiguous": outcome_ambiguous,
+                "transcript": dict(transcript),
+                "observed_cost_usd": observed_cost_usd,
+                "observed_cost_status": observed_cost_status,
+                "receipt_sha256": receipt_sha256,
+                "error": None if error is None else dict(error),
+            },
+        }
+        events_path, events_fd = _open_private_directory(
+            state["events_root"], create_final=False
+        )
+        try:
+            _write_private_dirfd(
+                events_fd,
+                f"{sequence:04d}-{event_type}.json",
+                (
+                    json.dumps(
+                        event,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        indent=2,
+                    )
+                    + "\n"
+                ).encode("utf-8"),
+            )
+            _directory_fd_matches(events_path, events_fd)
+        finally:
+            os.close(events_fd)
+        return base._sha256_json(event)
+    finally:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
+        os.close(pair_fd)
+
+
+def _record_preflight_dispatch_completed(
+    request: Mapping[str, Any],
+    state_root: Path,
+    authorization: Mapping[str, Any],
+    receipt_value: Mapping[str, Any],
+) -> str:
+    return _record_preflight_dispatch_outcome(
+        request,
+        state_root,
+        authorization,
+        event_type="condition-completed",
+        provider_process_started=True,
+        outcome_ambiguous=False,
+        transcript=_dispatch_receipt_transcript_evidence(receipt_value),
+        receipt_sha256=base._sha256_json(receipt_value),
+        error=None,
+        observed_cost_usd=None,
+        observed_cost_status="not-reported-by-codex-subscription-stream",
+    )
+
+
+def _record_preflight_dispatch_failed(
+    request: Mapping[str, Any],
+    state_root: Path,
+    authorization: Mapping[str, Any],
+    exc: BaseException,
+    *,
+    provider_process_started: bool,
+) -> str:
+    return _record_preflight_dispatch_outcome(
+        request,
+        state_root,
+        authorization,
+        event_type="condition-failed",
+        provider_process_started=provider_process_started,
+        outcome_ambiguous=provider_process_started,
+        transcript=_dispatch_failure_transcript_evidence(
+            request, authorization
+        ),
+        receipt_sha256=None,
+        error=_dispatch_error_evidence(exc),
+        observed_cost_usd=None,
+        observed_cost_status="not-reported-by-codex-subscription-stream",
+    )
+
 
 def _load_preflight_mcp_authorization(
     request: Mapping[str, Any], state_root: Path
@@ -4467,6 +4924,8 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
     authorized_proxy_base_code: dict[str, Any] | None = None
     authorized_manifest: dict[str, Any] | None = None
     dispatch_authorization: dict[str, Any] | None = None
+    dispatch_intent_recorded = False
+    provider_process_started = False
     if not synthetic:
         assert codex is not None
         dispatch_authorization = _load_preflight_dispatch_authorization(
@@ -4563,12 +5022,14 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                 _record_preflight_dispatch_intent(
                     request, state_path, dispatch_authorization["authorization"]
                 )
+                dispatch_intent_recorded = True
                 capture = run_bounded(
                     command, cwd=checkout,
                     timeout_seconds=int(request["budgets"]["wall_seconds"]),
                     stdin_data=(prompt_for(request) + "\n").encode("utf-8"),
                     environment=provider_env(codex=codex, codex_home=codex_home),
                 )
+                provider_process_started = True
             except BaseException as exc:
                 manifest_cleanup_error = (
                     None if manifest_binding is None
@@ -4581,10 +5042,37 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                     or proxy_cleanup_error is not None
                     or cleanup_error is not None
                 ):
-                    raise RunnerError(
+                    failure_exc = RunnerError(
                         "Codex failed before capture completion and private runtime cleanup failed: "
                         f"manifest={manifest_cleanup_error} proxy={proxy_cleanup_error} home={cleanup_error}"
-                    ) from exc
+                    )
+                    if dispatch_intent_recorded and dispatch_authorization is not None:
+                        try:
+                            _record_preflight_dispatch_failed(
+                                request,
+                                state_path,
+                                dispatch_authorization["authorization"],
+                                failure_exc,
+                                provider_process_started=provider_process_started,
+                            )
+                        except Exception as ledger_exc:
+                            raise RunnerError(
+                                "Codex provider failure could not be terminalized in dispatch ledger"
+                            ) from ledger_exc
+                    raise failure_exc from exc
+                if dispatch_intent_recorded and dispatch_authorization is not None:
+                    try:
+                        _record_preflight_dispatch_failed(
+                            request,
+                            state_path,
+                            dispatch_authorization["authorization"],
+                            exc,
+                            provider_process_started=provider_process_started,
+                        )
+                    except Exception as ledger_exc:
+                        raise RunnerError(
+                            "Codex provider failure could not be terminalized in dispatch ledger"
+                        ) from ledger_exc
                 raise
             capture = dict(capture)
             if manifest_binding is not None:
@@ -4617,51 +5105,92 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                 previous = capture.get("capture_error")
                 capture["capture_error"] = cleanup_marker if previous is None else f"{previous};{cleanup_marker}"
         ended = utc_now()
-        evidence = persist_provider_capture(
-            request, transcript_root=args.transcript_root,
-            evidence_root=args.provider_evidence_root, capture=capture,
-            started_at=started, ended_at=ended, synthetic_fixture=synthetic,
-            evidence_plan=evidence_plan,
-        )
+        try:
+            evidence = persist_provider_capture(
+                request, transcript_root=args.transcript_root,
+                evidence_root=args.provider_evidence_root, capture=capture,
+                started_at=started, ended_at=ended, synthetic_fixture=synthetic,
+                evidence_plan=evidence_plan,
+            )
+        except BaseException as exc:
+            if dispatch_intent_recorded and dispatch_authorization is not None:
+                try:
+                    _record_preflight_dispatch_failed(
+                        request,
+                        state_path,
+                        dispatch_authorization["authorization"],
+                        exc,
+                        provider_process_started=provider_process_started,
+                    )
+                except Exception as ledger_exc:
+                    raise RunnerError(
+                        "Codex evidence failure could not be terminalized in dispatch ledger"
+                    ) from ledger_exc
+            raise
     finally:
         close_provider_evidence_plan(evidence_plan)
-    stderr_policy = evidence["stderr_policy"]
+    try:
+        stderr_policy = evidence["stderr_policy"]
 
-    if capture.get("capture_error") is not None:
-        raise RunnerError(
-            "Codex capture failed after evidence persistence: "
-            f"{capture['capture_error']} diagnostics={evidence['diagnostics_sha256']} "
-            f"stderr_policy={evidence['stderr_policy_sha256']}"
-        )
-    if not stderr_policy["stderr"]["allowed"]:
-        raise RunnerError(
-            "Codex stderr is not qualified by the fail-closed policy after evidence "
-            f"persistence: classification={stderr_policy['stderr']['classification']} "
-            f"sha256={stderr_policy['stderr']['sha256']} "
-            f"bytes={stderr_policy['stderr']['bytes']} "
-            f"diagnostics={evidence['diagnostics_sha256']} "
-            f"stderr_policy={evidence['stderr_policy_sha256']}"
-        )
+        if capture.get("capture_error") is not None:
+            raise RunnerError(
+                "Codex capture failed after evidence persistence: "
+                f"{capture['capture_error']} diagnostics={evidence['diagnostics_sha256']} "
+                f"stderr_policy={evidence['stderr_policy_sha256']}"
+            )
+        if not stderr_policy["stderr"]["allowed"]:
+            raise RunnerError(
+                "Codex stderr is not qualified by the fail-closed policy after evidence "
+                f"persistence: classification={stderr_policy['stderr']['classification']} "
+                f"sha256={stderr_policy['stderr']['sha256']} "
+                f"bytes={stderr_policy['stderr']['bytes']} "
+                f"diagnostics={evidence['diagnostics_sha256']} "
+                f"stderr_policy={evidence['stderr_policy_sha256']}"
+            )
 
-    if not synthetic:
-        validate_executable(
-            args.codex_command,
-            args.codex_command_sha256,
-            require_read_only_mount=True,
-        )
-    if base._run_checked(["git", "status", "--porcelain"], cwd=checkout):
-        raise RunnerError("Codex changed read-only checkout")
+        if not synthetic:
+            validate_executable(
+                args.codex_command,
+                args.codex_command_sha256,
+                require_read_only_mount=True,
+            )
+        if base._run_checked(["git", "status", "--porcelain"], cwd=checkout):
+            raise RunnerError("Codex changed read-only checkout")
 
-    normalized = receipt(
-        request,
-        bytes(capture["stdout"]),
-        evidence["stdout_artifact"],
-        int(capture["returncode"]),
-        started,
-        ended,
-    )
+        normalized = receipt(
+            request,
+            bytes(capture["stdout"]),
+            evidence["stdout_artifact"],
+            int(capture["returncode"]),
+            started,
+            ended,
+        )
+    except BaseException as exc:
+        if dispatch_intent_recorded and dispatch_authorization is not None:
+            try:
+                _record_preflight_dispatch_failed(
+                    request,
+                    state_path,
+                    dispatch_authorization["authorization"],
+                    exc,
+                    provider_process_started=provider_process_started,
+                )
+            except Exception as ledger_exc:
+                raise RunnerError(
+                    "Codex terminal validation failure could not be terminalized in dispatch ledger"
+                ) from ledger_exc
+        raise
+
     if synthetic:
         return base.build_fixture_report(request, normalized)
+    if dispatch_authorization is None or not dispatch_intent_recorded:
+        raise RunnerError("live dispatch outcome has no recorded provider intent")
+    _record_preflight_dispatch_completed(
+        request,
+        state_path,
+        dispatch_authorization["authorization"],
+        normalized,
+    )
     return normalized
 
 

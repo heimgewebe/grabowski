@@ -2893,7 +2893,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertIsNone(runner.cleanup_staged_repoground_manifest(binding))
             self.assertFalse(staged.parent.exists())
 
-    def test_live_dispatch_intent_is_single_use_per_condition(self) -> None:
+    def test_live_dispatch_requires_terminal_success_before_second_condition(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             treatment = request(condition="treatment")
@@ -2920,14 +2920,36 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 baseline, state_root, authorization
             )
             self.assertEqual(state["condition_intents"], ["baseline"])
+            self.assertEqual(state["condition_outcomes"], {})
+            self.assertEqual(state["pending_condition"], "baseline")
             self.assertEqual(state["next_sequence"], 2)
 
             with self.assertRaisesRegex(
-                runner.RunnerError, "dispatch intent already exists for baseline"
+                runner.RunnerError,
+                "dispatch intent already exists for baseline",
             ):
                 runner._record_preflight_dispatch_intent(
                     baseline, state_root, authorization
                 )
+            with self.assertRaisesRegex(
+                runner.RunnerError,
+                "prior dispatch intent has no terminal outcome",
+            ):
+                runner._record_preflight_dispatch_intent(
+                    treatment, state_root, authorization
+                )
+
+            receipt = {
+                "transcript": {
+                    "sha256": "a" * 64,
+                    "bytes": 17,
+                    "artifact": "baseline.jsonl",
+                }
+            }
+            completed_sha256 = runner._record_preflight_dispatch_completed(
+                baseline, state_root, authorization, receipt
+            )
+            self.assertEqual(len(completed_sha256), 64)
 
             runner._record_preflight_dispatch_intent(
                 treatment, state_root, authorization
@@ -2938,14 +2960,128 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertEqual(
                 state["condition_intents"], ["baseline", "treatment"]
             )
-            self.assertEqual(state["next_sequence"], 3)
+            self.assertEqual(
+                state["condition_outcomes"],
+                {"baseline": "condition-completed"},
+            )
+            self.assertEqual(state["pending_condition"], "treatment")
+            self.assertEqual(state["next_sequence"], 4)
+
+            treatment_receipt = {
+                "transcript": {
+                    "sha256": "b" * 64,
+                    "bytes": 19,
+                    "artifact": "treatment.jsonl",
+                }
+            }
+            runner._record_preflight_dispatch_completed(
+                treatment, state_root, authorization, treatment_receipt
+            )
+            final_state = runner._validated_dispatch_event_state(
+                treatment, state_root, authorization
+            )
+            self.assertEqual(
+                final_state["condition_outcomes"],
+                {
+                    "baseline": "condition-completed",
+                    "treatment": "condition-completed",
+                },
+            )
+            self.assertIsNone(final_state["pending_condition"])
+            self.assertFalse(final_state["terminal_failure"])
+            self.assertEqual(final_state["next_sequence"], 5)
+
+    def test_failed_or_ambiguous_first_dispatch_terminalizes_pair(self) -> None:
+        for provider_process_started in (False, True):
+            with self.subTest(
+                provider_process_started=provider_process_started
+            ), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                treatment = request(condition="treatment")
+                manifest = root / "bundle.manifest.json"
+                manifest.write_text("{}\n", encoding="utf-8")
+                treatment["repobrief"]["manifest"] = str(manifest)
+                treatment["repobrief"]["manifest_sha256"] = hashlib.sha256(
+                    manifest.read_bytes()
+                ).hexdigest()
+                baseline = request(
+                    condition="baseline",
+                    commit=treatment["repository"]["commit"],
+                )
+                state_root = write_dispatch_authorization(
+                    root, treatment, []
+                )
+                authorization = runner._load_preflight_dispatch_authorization(
+                    baseline, state_root
+                )["authorization"]
+
+                runner._record_preflight_dispatch_intent(
+                    baseline, state_root, authorization
+                )
+                runner._record_preflight_dispatch_failed(
+                    baseline,
+                    state_root,
+                    authorization,
+                    runner.RunnerError("simulated provider failure"),
+                    provider_process_started=provider_process_started,
+                )
+                state = runner._validated_dispatch_event_state(
+                    baseline, state_root, authorization
+                )
+                self.assertEqual(
+                    state["condition_outcomes"],
+                    {"baseline": "condition-failed"},
+                )
+                self.assertTrue(state["terminal_failure"])
+                self.assertIsNone(state["pending_condition"])
+                self.assertEqual(state["next_sequence"], 3)
+
+                events_root = state["events_root"]
+                failed = json.loads(
+                    (events_root / "0002-condition-failed.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(
+                    failed["payload"]["outcome_ambiguous"],
+                    provider_process_started,
+                )
+                self.assertIsNone(
+                    failed["payload"]["observed_cost_usd"]
+                )
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "pair is terminal after failure",
+                ):
+                    runner._record_preflight_dispatch_intent(
+                        treatment, state_root, authorization
+                    )
+
+    def test_dispatch_rejects_out_of_order_first_condition(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            treatment = request(condition="treatment")
+            manifest = root / "bundle.manifest.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+            treatment["repobrief"]["manifest"] = str(manifest)
+            treatment["repobrief"]["manifest_sha256"] = hashlib.sha256(
+                manifest.read_bytes()
+            ).hexdigest()
+            baseline = request(
+                condition="baseline",
+                commit=treatment["repository"]["commit"],
+            )
+            state_root = write_dispatch_authorization(root, treatment, [])
+            authorization = runner._load_preflight_dispatch_authorization(
+                baseline, state_root
+            )["authorization"]
+
             with self.assertRaisesRegex(
-                runner.RunnerError, "dispatch intent already exists for treatment"
+                runner.RunnerError, "dispatch order is invalid"
             ):
                 runner._record_preflight_dispatch_intent(
                     treatment, state_root, authorization
                 )
-
 
     def test_dispatch_intent_reads_authorization_through_bound_pair_fd(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
