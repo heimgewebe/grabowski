@@ -1523,7 +1523,9 @@ def _mcp_authorization_identity(binding: Mapping[str, Any]) -> dict[str, Any]:
         "path": str(path.resolve(strict=True)),
         "bytes": int(identity[2]),
         "sha256": digest,
-        "mode": oct(stat.S_IMODE(int(identity[3]))),
+        # Preflight serializes only the ordinary rwx permission bits.
+        # Normalize runtime identity to that same explicit 9-bit contract.
+        "mode": oct(stat.S_IMODE(int(identity[3])) & 0o777),
     }
 
 
@@ -2721,6 +2723,8 @@ def _bind_mcp_file(path: Path, *, label: str, executable: bool) -> dict[str, Any
         raise RunnerError(f"{label} must be a regular non-symlink file")
     if executable and linked.st_mode & 0o111 == 0:
         raise RunnerError(f"{label} is not executable")
+    if executable and linked.st_mode & 0o7000:
+        raise RunnerError(f"{label} executable permissions are unsafe")
     data = _read_bound_regular_file(path, label=label, max_bytes=MAX_PROVIDER_EXECUTABLE_BYTES)
     after = path.lstat()
     return {

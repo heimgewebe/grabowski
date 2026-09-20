@@ -752,6 +752,70 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertIn("--codex-mcp-proxy", treatment_joined)
 
 
+    def test_validate_support_executable_enforces_permissions_and_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "tool"
+            path.write_bytes(b"tool")
+            path.chmod(0o755)
+            self.assertEqual(
+                runner._validate_support_executable(
+                    path,
+                    owner_uid=os.geteuid(),
+                ),
+                str(path),
+            )
+            with self.assertRaisesRegex(
+                runner.RunnerError,
+                "owner is unsafe",
+            ):
+                runner._validate_support_executable(
+                    path,
+                    owner_uid=os.geteuid() + 1,
+                )
+            path.chmod(0o775)
+            with self.assertRaisesRegex(
+                runner.RunnerError,
+                "permissions are unsafe",
+            ):
+                runner._validate_support_executable(
+                    path,
+                    owner_uid=os.geteuid(),
+                )
+
+    def test_mcp_executable_rejects_special_permission_bits(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "mcp-python"
+            path.write_bytes(b"tool")
+            path.chmod(0o4755)
+            with self.assertRaisesRegex(
+                runner.RunnerError,
+                "executable permissions are unsafe",
+            ):
+                runner._bind_mcp_file(
+                    path,
+                    label="MCP executable",
+                    executable=True,
+                )
+
+    def test_mcp_authorization_identity_normalizes_to_preflight_mode_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "file"
+            path.write_bytes(b"x")
+            identity = (
+                path.stat().st_dev,
+                path.stat().st_ino,
+                1,
+                stat.S_IFREG | 0o4755,
+            )
+            normalized = runner._mcp_authorization_identity(
+                {
+                    "path": path,
+                    "identity": identity,
+                    "sha256": "a" * 64,
+                }
+            )
+            self.assertEqual(normalized["mode"], "0o755")
+
     def test_mcp_proxy_python_resolves_symlink_and_validates_target(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
