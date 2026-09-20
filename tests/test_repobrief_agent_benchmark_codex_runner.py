@@ -781,6 +781,15 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     path,
                     owner_uid=os.geteuid(),
                 )
+            path.chmod(0o4755)
+            with self.assertRaisesRegex(
+                runner.RunnerError,
+                "permissions are unsafe",
+            ):
+                runner._validate_support_executable(
+                    path,
+                    owner_uid=os.geteuid(),
+                )
 
     def test_mcp_executable_rejects_special_permission_bits(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

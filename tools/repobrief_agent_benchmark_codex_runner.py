@@ -563,7 +563,11 @@ def _validate_support_executable(
         raise RunnerError(f"required Codex support executable is unavailable: {path}") from exc
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
         raise RunnerError(f"required Codex support executable is unsafe: {path}")
-    if metadata.st_mode & 0o111 == 0 or metadata.st_mode & 0o022:
+    if (
+        metadata.st_mode & 0o111 == 0
+        or metadata.st_mode & 0o022
+        or metadata.st_mode & 0o7000
+    ):
         raise RunnerError(f"required Codex support executable permissions are unsafe: {path}")
     if owner_uid is not None and metadata.st_uid != owner_uid:
         raise RunnerError(f"required Codex support executable owner is unsafe: {path}")
