@@ -3289,8 +3289,8 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             self.assertEqual(
                 [
                     "secret_pty_lease_acquired",
-                    "secret_pty_broker_execution_started",
-                    "secret_pty_broker_execution_returned",
+                    "secret_pty_broker_client_invocation_attempted",
+                    "secret_pty_broker_client_returned",
                     "secret_pty_domain_effect_completed",
                 ],
                 milestones,

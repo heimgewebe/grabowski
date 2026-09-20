@@ -1854,8 +1854,8 @@ def persist_grip_result_readback(
             for key in (
                 "secret_pty_dispatcher_entered",
                 "secret_pty_lease_acquired",
-                "secret_pty_broker_execution_started",
-                "secret_pty_broker_execution_returned",
+                "secret_pty_broker_client_invocation_attempted",
+                "secret_pty_broker_client_returned",
                 "secret_pty_domain_effect_completed",
             )
         },
@@ -16632,6 +16632,27 @@ def _blocked_surface_receipt(name: str, parameters: dict[str, Any], reason: str)
     receipt = _new_receipt(spec, parameters)
     _check(receipt, "surface_allowlist", "fail", reason)
     return _finish(receipt, "blocked", "preflight", {"error": reason})
+
+
+def _failed_surface_receipt(
+    name: str,
+    parameters: dict[str, Any],
+    reason: str,
+) -> dict[str, Any]:
+    spec = GRIP_SPECS.get(name)
+    if spec is None:
+        spec = GripSpec(
+            name=name,
+            version="0",
+            summary="grip surface dispatch failed",
+            effect=READ_ONLY,
+            required_parameters=(),
+            acceptance_ids=("grip-run-allowlist",),
+            runner="surface_failure",
+        )
+    receipt = _new_receipt(spec, parameters)
+    _check(receipt, "surface_dispatch", "fail", reason)
+    return _finish(receipt, "failed", "action", {"error": reason})
 
 
 def grip_run(
