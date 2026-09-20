@@ -10442,6 +10442,88 @@ class GripResultReadbackTests(unittest.TestCase):
                 )
             )
 
+    def test_runtime_binding_requires_exact_current_serving_process(self) -> None:
+        import grabowski_mcp as mcp_module
+
+        deployment = {
+            "completion_status": "complete",
+            "runtime_binding_valid": True,
+            "artifact_integrity_valid": True,
+            "entrypoint_contract_identity_valid": True,
+            "release_id": "release-a",
+            "repo_head": "b" * 40,
+            "entrypoint_contract_sha256": "c" * 64,
+        }
+        current = {
+            "matches_deployed_manifest": True,
+            "process_release_id": "release-a",
+            "process_repo_head": "b" * 40,
+        }
+        with patch.object(
+            mcp_module, "_deployment_metadata", return_value=deployment
+        ), patch.object(
+            mcp_module.grabowski_serving_process,
+            "identity",
+            return_value=current,
+        ) as identity:
+            self.assertEqual(
+                {
+                    "release_id": "release-a",
+                    "repo_head": "b" * 40,
+                    "entrypoint_contract_sha256": "c" * 64,
+                },
+                mcp_module._grip_result_readback_runtime_binding(),
+            )
+        identity.assert_called_once_with(
+            current_release_id="release-a",
+            current_repo_head="b" * 40,
+        )
+
+        for projection in (
+            {
+                "matches_deployed_manifest": False,
+                "process_release_id": "release-old",
+                "process_repo_head": "d" * 40,
+            },
+            {
+                "matches_deployed_manifest": None,
+                "process_release_id": None,
+                "process_repo_head": None,
+            },
+        ):
+            with self.subTest(projection=projection), patch.object(
+                mcp_module, "_deployment_metadata", return_value=deployment
+            ), patch.object(
+                mcp_module.grabowski_serving_process,
+                "identity",
+                return_value=projection,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "serving process to match"
+                ):
+                    mcp_module._grip_result_readback_runtime_binding()
+
+    def test_runtime_binding_requires_integrity_valid_deployment(self) -> None:
+        import grabowski_mcp as mcp_module
+
+        deployment = {
+            "completion_status": "complete",
+            "runtime_binding_valid": True,
+            "artifact_integrity_valid": False,
+            "entrypoint_contract_identity_valid": True,
+            "release_id": "release-a",
+            "repo_head": "b" * 40,
+            "entrypoint_contract_sha256": "c" * 64,
+        }
+        with patch.object(
+            mcp_module, "_deployment_metadata", return_value=deployment
+        ), patch.object(
+            mcp_module.grabowski_serving_process, "identity"
+        ) as identity:
+            with self.assertRaisesRegex(RuntimeError, "integrity-valid"):
+                mcp_module._grip_result_readback_runtime_binding()
+        identity.assert_not_called()
+
     def test_missing_readback_is_effect_free(self) -> None:
         with tempfile.TemporaryDirectory() as directory, patch.object(
             grips,
@@ -10542,6 +10624,43 @@ class GripResultReadbackTests(unittest.TestCase):
             self.assertNotIn(
                 "/private/value",
                 Path(result["result_readback"]["path"]).read_text(encoding="utf-8"),
+            )
+
+    def test_result_readback_binds_completed_domain_effect_milestones(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            grips,
+            "GRIP_RESULT_READBACK_ROOT",
+            Path(directory) / "grip-result-readback",
+        ):
+            def completed_dispatch(_request, *, milestone_recorder=None):
+                self.assertIsNotNone(milestone_recorder)
+                for milestone in (
+                    "secret_pty_lease_acquired",
+                    "secret_pty_broker_execution_started",
+                    "secret_pty_broker_execution_returned",
+                    "secret_pty_domain_effect_completed",
+                ):
+                    milestone_recorder(milestone)
+                return SecretPtyGripTests()._success_output()
+
+            result = self._run_mcp_secret_probe(
+                {
+                    "source_path": "/private/value",
+                    "expected_source_sha256": "a" * 64,
+                },
+                dispatcher=completed_dispatch,
+            )
+            self.assertEqual("passed", result["status"])
+            readback = grips.read_grip_result_readback(result["receipt_sha256"])
+            self.assertEqual(
+                {
+                    "secret_pty_dispatcher_entered": True,
+                    "secret_pty_lease_acquired": True,
+                    "secret_pty_broker_execution_started": True,
+                    "secret_pty_broker_execution_returned": True,
+                    "secret_pty_domain_effect_completed": True,
+                },
+                readback["effect_boundary"],
             )
 
     def test_result_readback_persistence_is_create_only_and_integrity_bound(self) -> None:

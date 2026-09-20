@@ -12628,9 +12628,17 @@ def _secret_pty_authority_lease_snapshot(lease: dict[str, Any]) -> dict[str, Any
     return {field: lease[field] for field in fields}
 
 
-def _secret_pty_grip_dispatcher(request: dict[str, Any]) -> dict[str, Any]:
+def _secret_pty_grip_dispatcher(
+    request: dict[str, Any],
+    *,
+    milestone_recorder: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
     import grabowski_privileged_broker
     import grabowski_resources
+
+    def record_milestone(name: str) -> None:
+        if milestone_recorder is not None:
+            milestone_recorder(name)
 
     if not isinstance(request, dict) or set(request) != {"source_path", "expected_source_sha256"}:
         raise ValueError("secret PTY grip request shape is invalid")
@@ -12734,6 +12742,7 @@ def _secret_pty_grip_dispatcher(request: dict[str, Any]) -> dict[str, Any]:
             "action_contract_sha256": action_contract_sha256,
             "source_sha256": snapshot["sha256"],
         })
+        record_milestone("secret_pty_lease_acquired")
 
         authority: dict[str, Any] = {
             "schema_version": 1,
@@ -12908,6 +12917,7 @@ def _secret_pty_grip_dispatcher(request: dict[str, Any]) -> dict[str, Any]:
             raise PermissionError(
                 "secret PTY grip requires memfd-backed inherited descriptor transport"
             )
+        record_milestone("secret_pty_broker_execution_started")
         command_result = _run_secret_command(
             [
                 "/usr/local/bin/grabowski-privileged-request",
@@ -12923,6 +12933,7 @@ def _secret_pty_grip_dispatcher(request: dict[str, Any]) -> dict[str, Any]:
             max_output_bytes=min(int(execution["max_output_bytes"]), 512 * 1024),
             secret_data=snapshot["data"],
         )
+        record_milestone("secret_pty_broker_execution_returned")
         try:
             parsed = json.loads(command_result["stdout"].strip())
         except json.JSONDecodeError as exc:
@@ -13092,6 +13103,7 @@ def _secret_pty_grip_dispatcher(request: dict[str, Any]) -> dict[str, Any]:
         "host_lease_released": True,
         "retry_safe": False,
     }
+    record_milestone("secret_pty_domain_effect_completed")
     result_sha256 = grabowski_grips.sha256_json(result)
     result["audit_record_sha256"] = _append_audit_with_digest({
         "timestamp_unix": int(time.time()),
@@ -13283,6 +13295,15 @@ def _operator_obligation_gate_audit_complete(
 
 def _grip_result_readback_runtime_binding() -> dict[str, Any]:
     deployment = _deployment_metadata()
+    if (
+        deployment.get("completion_status") != "complete"
+        or deployment.get("runtime_binding_valid") is not True
+        or deployment.get("artifact_integrity_valid") is not True
+        or deployment.get("entrypoint_contract_identity_valid") is not True
+    ):
+        raise RuntimeError(
+            "durable grip result readback requires a complete integrity-valid deployed runtime"
+        )
     binding = {
         "release_id": deployment.get("release_id"),
         "repo_head": deployment.get("repo_head"),
@@ -13299,6 +13320,18 @@ def _grip_result_readback_runtime_binding() -> dict[str, Any]:
     ):
         raise RuntimeError(
             "durable grip result readback requires an exact deployed runtime binding"
+        )
+    serving = grabowski_serving_process.identity(
+        current_release_id=binding["release_id"],
+        current_repo_head=binding["repo_head"],
+    )
+    if (
+        serving.get("matches_deployed_manifest") is not True
+        or serving.get("process_release_id") != binding["release_id"]
+        or serving.get("process_repo_head") != binding["repo_head"]
+    ):
+        raise RuntimeError(
+            "durable grip result readback requires the serving process to match the bound deployed runtime"
         )
     return binding
 
@@ -13875,7 +13908,10 @@ async def _grip_run_mcp(
 
     def tracked_secret_pty_dispatcher(request: dict[str, Any]) -> dict[str, Any]:
         server_milestones.add("secret_pty_dispatcher_entered")
-        return _secret_pty_grip_dispatcher(request)
+        return _secret_pty_grip_dispatcher(
+            request,
+            milestone_recorder=server_milestones.add,
+        )
 
     def run_core() -> dict[str, Any]:
         try:

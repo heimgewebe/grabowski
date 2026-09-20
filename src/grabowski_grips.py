@@ -1850,11 +1850,14 @@ def persist_grip_result_readback(
         "checks_sha256": sha256_json(checks),
         "server_milestones": milestones,
         "effect_boundary": {
-            "secret_pty_dispatcher_entered": (
-                "secret_pty_dispatcher_entered" in milestones
-                if name == "secret-pty-getpass-probe"
-                else None
-            ),
+            key: (key in milestones if name == "secret-pty-getpass-probe" else None)
+            for key in (
+                "secret_pty_dispatcher_entered",
+                "secret_pty_lease_acquired",
+                "secret_pty_broker_execution_started",
+                "secret_pty_broker_execution_returned",
+                "secret_pty_domain_effect_completed",
+            )
         },
         "secret_material_persisted": False,
         "does_not_establish": [

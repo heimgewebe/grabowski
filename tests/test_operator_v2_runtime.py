@@ -3182,6 +3182,7 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                 "expected_prompt_count": 2,
                 "failure_reason": None,
             }
+            milestones = []
             with (
                 patches[0], patches[1], patches[2], patches[3], patches[4],
                 patch.dict(
@@ -3235,7 +3236,8 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                     {
                         "source_path": str(source),
                         "expected_source_sha256": source_sha,
-                    }
+                    },
+                    milestone_recorder=milestones.append,
                 )
                 run_secret_command.return_value = {
                     "returncode": None,
@@ -3284,6 +3286,15 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                         }
                     )
 
+            self.assertEqual(
+                [
+                    "secret_pty_lease_acquired",
+                    "secret_pty_broker_execution_started",
+                    "secret_pty_broker_execution_returned",
+                    "secret_pty_domain_effect_completed",
+                ],
+                milestones,
+            )
             self.assertEqual("memfd", result["secret_transport"])
             self.assertTrue(result["temporary_authority_cleaned"])
             self.assertTrue(result["host_lease_released"])
