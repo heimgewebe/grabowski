@@ -26,7 +26,7 @@ This document describes the repository contract. Current runtime state must be r
 - Authority: `grabowski`
 - Canonical browser: `chrome-stable` via `chrome-cdp` / `cdp`.
 - Primary transport: `direct-cdp` on `127.0.0.1`; loopback-only is `true`.
-- Profile default: `ephemeral`; persistent profiles are `explicit-auth-or-trust-scope-only`.
+- Profile default: `ephemeral`; persistent profiles are `explicit-configured-root-only`.
 - Human default: preserve `brave`; it is not agent-primary.
 - Lifecycle: `grabowski_browser_worker_start` → `direct_cdp_action` → `direct_cdp_readback` → `grabowski_browser_worker_stop` → `profile_and_lease_cleanup_readback`.
 - Vendor MCPs remain optional diagnostics/adapters and never own browser lifecycle authority.

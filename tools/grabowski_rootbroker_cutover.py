@@ -27,6 +27,7 @@ BLOCKADE_STORE_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_blockade
 BLOCKADE_AUTHORITY_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_blockade_authority.py")
 COMMAND_IDENTITY_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_command_identity.py")
 BROKER_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_privileged_broker.py")
+SECRET_PTY_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_secret_pty.py")
 BROKER_WRAPPER_TARGET = Path("/usr/local/libexec/grabowski-privileged-broker")
 PROCESS_OBSERVER_TARGET = Path("/usr/local/libexec/grabowski-process-reference-observer")
 PLATFORM_CONNECTOR_CAPTURE_TARGET = Path(
@@ -67,6 +68,7 @@ PUBLISH_ACTION = "publish_recovery_marker"
 POWER_ACTION = "operator_power_argv"
 OPERATOR_SERVICE_CONTROL_ACTION = "operator_system_service_control"
 ROOTBROKER_CUTOVER_ACTION = "operator_rootbroker_cutover"
+SECRET_PTY_ACTION = "operator_secret_pty_getpass_probe"
 BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
 ROOT_TASK_ACTION = "operator_root_task_systemd_unit"
 PROCESS_OBSERVER_ACTION = "observe_process_references"
@@ -177,6 +179,12 @@ ARTIFACTS = (
     Artifact(
         "src/grabowski_privileged_broker.py",
         BROKER_MODULE_TARGET,
+        0o644,
+        True,
+    ),
+    Artifact(
+        "src/grabowski_secret_pty.py",
+        SECRET_PTY_MODULE_TARGET,
         0o644,
         True,
     ),
@@ -1638,6 +1646,94 @@ def _rootbroker_cutover_action_from_repository(
     return json.loads(json.dumps(action))
 
 
+def _secret_pty_action_from_repository(
+    repository: Path,
+    *,
+    expected_head: str,
+    runner: RunCommand,
+) -> dict[str, Any]:
+    relative_path = "config/privileged-actions.example.json"
+    data = _repository_blob(
+        repository,
+        commit_id=expected_head,
+        relative_path=relative_path,
+        runner=runner,
+    )
+    example = _decode_json_object(data, label=relative_path)
+    actions = example.get("actions")
+    if not isinstance(actions, dict):
+        raise CutoverError("example privileged action catalog is malformed")
+    action = actions.get(SECRET_PTY_ACTION)
+    if not isinstance(action, dict):
+        raise CutoverError("example catalog has no secret PTY action")
+    required = {
+        "enabled", "mode", "target_pattern", "argv", "cwd",
+        "timeout_seconds", "prompt_sequence", "max_secret_bytes",
+        "max_output_bytes", "kill_switch_path", "legacy_kill_switch_path",
+        "recovery_gate", "allowed_peer_uid", "allowed_peer_unit",
+        "allowed_peer_executable", "allowed_peer_interpreter",
+        "authority_task_id", "authority_host",
+        "action_schema", "privilege_context", "required_resource_keys",
+        "redaction_contract_sha256",
+    }
+    if set(action) != required:
+        raise CutoverError("secret PTY action keys are invalid")
+    expected_script = (
+        "import getpass; a=getpass.getpass('LUKS passphrase: '); "
+        "b=getpass.getpass('Repeat LUKS passphrase: '); "
+        "raise SystemExit(0 if a and a == b else 3)"
+    )
+    if action.get("enabled") is not True or action.get("mode") != "secret-pty":
+        raise CutoverError("secret PTY action must be enabled")
+    if action.get("target_pattern") != "probe":
+        raise CutoverError("secret PTY target pattern is invalid")
+    if action.get("argv") != ["/usr/bin/python3", "-c", expected_script]:
+        raise CutoverError("secret PTY argv is invalid")
+    if (
+        action.get("cwd") != "/"
+        or action.get("timeout_seconds") != 30
+        or action.get("prompt_sequence") != [
+            "LUKS passphrase: ",
+            "Repeat LUKS passphrase: ",
+        ]
+        or action.get("max_secret_bytes") != 4096
+        or action.get("max_output_bytes") != 262144
+    ):
+        raise CutoverError("secret PTY bounds or prompt contract are invalid")
+    if (
+        action.get("kill_switch_path") != str(CANONICAL_KILL_SWITCH)
+        or action.get("legacy_kill_switch_path") != str(LEGACY_KILL_SWITCH)
+    ):
+        raise CutoverError("secret PTY kill-switch binding is invalid")
+    recovery_gate = action.get("recovery_gate")
+    expected_gate = {
+        "recovery_marker_path": "/var/lib/grabowski/power-worker-recovery-gate.json",
+        "max_recovery_age_seconds": 86400,
+        "require_root_owned_gate_files": True,
+        "configured_target": CONFIGURED_TARGET,
+    }
+    if recovery_gate != expected_gate:
+        raise CutoverError("secret PTY recovery gate is invalid")
+    if (
+        action.get("allowed_peer_uid") != 1000
+        or action.get("allowed_peer_unit") != OPERATOR_UNIT
+        or action.get("allowed_peer_executable") != str(REQUEST_CLIENT_TARGET)
+        or action.get("allowed_peer_interpreter") != "/usr/bin/python3"
+    ):
+        raise CutoverError("secret PTY peer binding is invalid")
+    if (
+        action.get("authority_task_id") != "GRABOWSKI-OPERATOR-SURFACE-V1-T172"
+        or action.get("authority_host") != "heim-pc"
+        or action.get("action_schema") != "grabowski.secret-pty.getpass.v1"
+        or action.get("privilege_context") != "root"
+        or action.get("required_resource_keys") != ["host:heim-pc"]
+        or action.get("redaction_contract_sha256")
+        != "59534d36a9b51064f09c6d1509440a36ea92b47e39be3d9ba442c889589852bd"
+    ):
+        raise CutoverError("secret PTY authority binding is invalid")
+    return json.loads(json.dumps(action))
+
+
 def _bootstrap_recovery_action_from_repository(
     repository: Path,
     *,
@@ -1783,6 +1879,7 @@ def merge_privileged_config(
     bootstrap_recovery: dict[str, Any] | None = None,
     operator_service_control: dict[str, Any] | None = None,
     rootbroker_cutover: dict[str, Any] | None = None,
+    secret_pty: dict[str, Any] | None = None,
     local_backup_ntfs_actions: dict[str, dict[str, Any]] | None = None,
     allow_controlled_updates: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -1865,6 +1962,18 @@ def merge_privileged_config(
         merged_actions[ROOTBROKER_CUTOVER_ACTION] = json.loads(
             json.dumps(rootbroker_cutover)
         )
+
+    secret_pty_before = actions.get(SECRET_PTY_ACTION)
+    if secret_pty is not None:
+        if (
+            not allow_controlled_updates
+            and secret_pty_before is not None
+            and secret_pty_before != secret_pty
+        ):
+            raise CutoverError(
+                "installed secret PTY action differs from commit-bound contract"
+            )
+        merged_actions[SECRET_PTY_ACTION] = json.loads(json.dumps(secret_pty))
 
     local_backup_ntfs_before: dict[str, Any] = {}
     if local_backup_ntfs_actions is not None:
@@ -1956,6 +2065,8 @@ def merge_privileged_config(
         controlled.add(OPERATOR_SERVICE_CONTROL_ACTION)
     if rootbroker_cutover is not None:
         controlled.add(ROOTBROKER_CUTOVER_ACTION)
+    if secret_pty is not None:
+        controlled.add(SECRET_PTY_ACTION)
     if local_backup_ntfs_actions is not None:
         controlled.update(local_backup_ntfs_actions)
     evidence = {
@@ -2006,6 +2117,15 @@ def merge_privileged_config(
             if rootbroker_cutover is not None else None
         ),
         "rootbroker_cutover_preexisting": rootbroker_cutover_before is not None,
+        "secret_pty_sha256": (
+            _sha256(_canonical_json(secret_pty))
+            if secret_pty is not None else None
+        ),
+        "secret_pty_preexisting": secret_pty_before is not None,
+        "secret_pty_before_sha256": (
+            _sha256(_canonical_json(secret_pty_before))
+            if isinstance(secret_pty_before, dict) else None
+        ),
         "local_backup_ntfs_action_sha256": (
             {name: _sha256(_canonical_json(action)) for name, action in sorted(local_backup_ntfs_actions.items())}
             if local_backup_ntfs_actions is not None else {}
@@ -2043,6 +2163,7 @@ def _operator_authority_attestation(
 ) -> dict[str, Any]:
     required_artifacts = {
         "broker_module": BROKER_MODULE_TARGET,
+        "secret_pty_module": SECRET_PTY_MODULE_TARGET,
         "broker_wrapper": BROKER_WRAPPER_TARGET,
         "platform_connector_capture": PLATFORM_CONNECTOR_CAPTURE_TARGET,
         "cutover_helper": CUTOVER_HELPER_TARGET,
@@ -2064,6 +2185,7 @@ def _operator_authority_attestation(
     lifecycle = actions.get(BLOCKADE_LIFECYCLE_ACTION)
     service_control = actions.get(OPERATOR_SERVICE_CONTROL_ACTION)
     rootbroker_cutover = actions.get(ROOTBROKER_CUTOVER_ACTION)
+    secret_pty = actions.get(SECRET_PTY_ACTION)
     platform_connector_capture = actions.get(PLATFORM_CONNECTOR_CAPTURE_ACTION)
     local_backup_storage = {
         name: actions.get(name) for name in LOCAL_BACKUP_STORAGE_ACTIONS
@@ -2075,6 +2197,7 @@ def _operator_authority_attestation(
             lifecycle,
             service_control,
             rootbroker_cutover,
+            secret_pty,
             platform_connector_capture,
         )
     ):
@@ -2092,7 +2215,17 @@ def _operator_authority_attestation(
     assert isinstance(lifecycle, dict)
     assert isinstance(service_control, dict)
     assert isinstance(rootbroker_cutover, dict)
+    assert isinstance(secret_pty, dict)
     assert isinstance(platform_connector_capture, dict)
+    if (
+        secret_pty.get("allowed_peer_uid") != 1000
+        or secret_pty.get("allowed_peer_unit") != OPERATOR_UNIT
+        or secret_pty.get("allowed_peer_executable") != str(REQUEST_CLIENT_TARGET)
+        or secret_pty.get("allowed_peer_interpreter") != "/usr/bin/python3"
+        or secret_pty.get("authority_task_id") != "GRABOWSKI-OPERATOR-SURFACE-V1-T172"
+        or secret_pty.get("authority_host") != "heim-pc"
+    ):
+        raise CutoverError("secret PTY authority binding is incoherent")
     if (
         platform_connector_capture.get("allowed_peer_uid") != 1000
         or platform_connector_capture.get("allowed_peer_unit") != OPERATOR_UNIT
@@ -2128,6 +2261,7 @@ def _operator_authority_attestation(
             ROOTBROKER_CUTOVER_ACTION: _sha256(
                 _canonical_json(rootbroker_cutover)
             ),
+            SECRET_PTY_ACTION: _sha256(_canonical_json(secret_pty)),
             PLATFORM_CONNECTOR_CAPTURE_ACTION: _sha256(
                 _canonical_json(platform_connector_capture)
             ),
@@ -2677,6 +2811,9 @@ def _apply_cutover_locked(
     rootbroker_cutover = _rootbroker_cutover_action_from_repository(
         repository, expected_head=expected_head, runner=runner
     )
+    secret_pty = _secret_pty_action_from_repository(
+        repository, expected_head=expected_head, runner=runner
+    )
     local_backup_ntfs_actions = (
         _local_backup_ntfs_actions_from_repository(
             repository, expected_head=expected_head, runner=runner
@@ -2705,6 +2842,7 @@ def _apply_cutover_locked(
         bootstrap_recovery=bootstrap_recovery,
         operator_service_control=operator_service_control,
         rootbroker_cutover=rootbroker_cutover,
+        secret_pty=secret_pty,
         local_backup_ntfs_actions=local_backup_ntfs_actions,
         allow_controlled_updates=automatic,
     )
@@ -3038,6 +3176,9 @@ def build_plan(*, repository: Path, expected_head: str, runner: RunCommand = _ru
     rootbroker_cutover = _rootbroker_cutover_action_from_repository(
         repository, expected_head=expected_head, runner=runner
     )
+    secret_pty = _secret_pty_action_from_repository(
+        repository, expected_head=expected_head, runner=runner
+    )
     local_backup_ntfs_actions = _local_backup_ntfs_actions_from_repository(
         repository, expected_head=expected_head, runner=runner
     )
@@ -3058,6 +3199,7 @@ def build_plan(*, repository: Path, expected_head: str, runner: RunCommand = _ru
         bootstrap_recovery=bootstrap_recovery,
         operator_service_control=operator_service_control,
         rootbroker_cutover=rootbroker_cutover,
+        secret_pty=secret_pty,
         local_backup_ntfs_actions=local_backup_ntfs_actions,
     )
     return {

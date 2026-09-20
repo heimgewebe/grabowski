@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat as statmod
 import subprocess
 import sys
 import time
@@ -29,6 +30,7 @@ CommandRunner = Callable[[Path, list[str]], dict[str, Any]]
 GithubRunner = Callable[[Path, list[str]], dict[str, Any]]
 TransportTargetDispatcher = Callable[[str, dict[str, Any], str], dict[str, Any]]
 N8nProviderDispatcher = Callable[[str, dict[str, Any]], dict[str, Any]]
+SecretPtyDispatcher = Callable[[dict[str, Any]], dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -48,6 +50,14 @@ class GripSpec:
 
 GRIP_RECEIPT_KIND = "grabowski.operator_grip_receipt"
 GRIP_RECEIPT_SCHEMA_VERSION = 1
+GRIP_RESULT_READBACK_KIND = "grabowski.grip_result_readback"
+GRIP_RESULT_READBACK_SCHEMA_VERSION = 1
+GRIP_RESULT_READBACK_MAX_BYTES = 128 * 1024
+GRIP_RESULT_READBACK_ROOT = (
+    Path.home() / ".local" / "state" / "grabowski" / "grip-result-readback"
+)
+DURABLE_GRIP_RESULT_READBACK_GRIPS = frozenset({"secret-pty-getpass-probe"})
+_GRIP_RESULT_MILESTONE_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,95}\Z")
 READ_ONLY = "read_only"
 MUTATING = "mutating"
 INTRINSIC_PROTECTED_BRANCHES = frozenset({"main", "master"})
@@ -641,6 +651,47 @@ GRIP_SPECS: dict[str, GripSpec] = {
         operation_effect_class="external_provider",
         operation_class="n8n-workflow-edge-apply",
     ),
+    "secret-pty-getpass-probe": GripSpec(
+        name="secret-pty-getpass-probe",
+        version="1.0",
+        summary=(
+            "Run the fixed recovery-gated T172 double-getpass probe through the root-owned "
+            "secret PTY broker while keeping secret bytes outside grip parameters and receipts."
+        ),
+        effect=MUTATING,
+        required_parameters=("source_path", "expected_source_sha256"),
+        acceptance_ids=(
+            "secret-hash-bound",
+            "broker-contract-bound",
+            "exclusive-host-lease-bound",
+            "double-getpass-complete",
+            "secret-output-redacted",
+            "temporary-authority-cleaned",
+            "host-lease-released",
+            "retry-locked",
+        ),
+        runner="secret_pty_getpass_probe",
+        operation_effect_class="privileged_execution",
+        operation_class="secret-pty-getpass-probe",
+        capability="power_execute",
+    ),
+    "grip-result-readback": GripSpec(
+        name="grip-result-readback",
+        version="1.0",
+        summary=(
+            "Read one durable secret-free result projection for a non-repeatable grip "
+            "without re-running the original grip."
+        ),
+        effect=READ_ONLY,
+        required_parameters=("receipt_sha256",),
+        acceptance_ids=(
+            "receipt-sha-bound",
+            "durable-result-integrity",
+            "no-retry-authority",
+        ),
+        runner="grip_result_readback",
+        capability="file_read",
+    ),
     "transport-roundtrip": GripSpec(
         name="transport-roundtrip",
         version="2.2",
@@ -1028,6 +1079,8 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
         "reposkop-retirement-surface-observe",
         "n8n-workflow-edge-verify",
         "n8n-workflow-edge-apply",
+        "secret-pty-getpass-probe",
+        "grip-result-readback",
         "forrest-server-exit-apply",
         "transport-roundtrip",
         "convergence-assess",
@@ -1088,6 +1141,8 @@ GRIP_SURFACE_TARGETS = {
     ),
     "n8n-workflow-edge-verify": "one fixed-profile n8n workflow edge readback",
     "n8n-workflow-edge-apply": "one precondition-bound fixed-profile n8n single-edge mutation",
+    "secret-pty-getpass-probe": "one fixed T172 recovery-gated root double-getpass secret PTY probe",
+    "grip-result-readback": "one durable secret-free non-repeatable grip result projection",
     "transport-roundtrip": "one client-scope and runtime-bound transport roundtrip",
     "convergence-assess": "one hash-bound convergence closure assessment",
     "gate-evidence-preflight": "one fail-closed gate evidence preparation",
@@ -1179,6 +1234,11 @@ GRIP_RECOVERY_PATHS_BY_NAME = {
         "run n8n-workflow-edge-verify against the exact provider profile before any retry; "
         "after an ambiguous write, verify expected_state=final first and do not issue a new "
         "apply unless fresh readback proves the source is still isolated"
+    ),
+    "secret-pty-getpass-probe": (
+        "inspect the rootbroker audit and exact host lease state after any ambiguous result; "
+        "the PTY contract is retry_safe=false and a failed or lost response never authorizes "
+        "an unchanged second privileged prompt session"
     ),
     "browser-semantic-act": (
         "honor the canonical gateway retry_readback contract; after outcome_unknown perform "
@@ -1281,6 +1341,12 @@ GRIP_CONDITIONAL_PRECONDITIONS = {
         "requirements plus snapshot, target and element validity remain exclusively the canonical "
         "browser_semantic_gateway contract",
     ),
+    "secret-pty-getpass-probe": (
+        "source_path must resolve through the configured secret-use roots and expected_source_sha256 must bind its exact current bytes",
+        "the server acquires the exact root-contract required resource keys under the contract task owner only when every required key is initially free",
+        "reference and session authority are minted server-side from the commit-bound action contract; the rootbroker independently revalidates the installed root-owned contract before spawn",
+        "temporary reference/authority files and the exact acquired lease are cleaned in finally paths; secret bytes use only the existing bounded FD transport",
+    ),
     "transport-roundtrip": (
         "action=begin requires target_tool_name and target_arguments together; "
         "an unbound begin is refused fail-closed",
@@ -1326,7 +1392,8 @@ MECHANIC_FORBIDDEN_EFFECTS = tuple(sorted(CAPTAIN_HIGH_IMPACT_ACTIONS | {"force-
 GRIP_RISK_LEVELS = {
     name: (
         "high"
-        if name in GRIP_SURFACE_CAPTAIN_ONLY or name in {"worktree-hygiene-reconcile", "task-closeout-archive"}
+        if name in GRIP_SURFACE_CAPTAIN_ONLY
+        or name in {"worktree-hygiene-reconcile", "task-closeout-archive", "secret-pty-getpass-probe"}
         else "medium"
         if spec.effect == MUTATING
         else "low"
@@ -1564,6 +1631,301 @@ def canonical_json(value: Any) -> str:
 def sha256_json(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
+
+
+
+def grip_requires_durable_result_readback(name: str) -> bool:
+    return name in DURABLE_GRIP_RESULT_READBACK_GRIPS
+
+
+def _grip_result_readback_file_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _grip_result_readback_root(*, create: bool = False) -> Path:
+    root = GRIP_RESULT_READBACK_ROOT
+    parent = root.parent
+    parent_metadata = parent.lstat()
+    if (
+        not statmod.S_ISDIR(parent_metadata.st_mode)
+        or parent_metadata.st_uid != os.getuid()
+        or statmod.S_IMODE(parent_metadata.st_mode) & 0o077
+    ):
+        raise PermissionError(
+            "grip result readback parent must be a private owned directory"
+        )
+    if root.is_symlink():
+        raise PermissionError("grip result readback root may not be a symlink")
+    if not root.exists():
+        if not create:
+            raise FileNotFoundError("grip result readback root does not exist")
+        root.mkdir(mode=0o700, exist_ok=True)
+    metadata = root.lstat()
+    if (
+        not statmod.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or statmod.S_IMODE(metadata.st_mode) & 0o077
+    ):
+        raise PermissionError(
+            "grip result readback root must be a private owned directory"
+        )
+    return root.resolve(strict=True)
+
+
+def _read_grip_result_readback_file(path: Path) -> dict[str, Any]:
+    root = _grip_result_readback_root()
+    if path.parent.resolve(strict=True) != root:
+        raise PermissionError("grip result readback path escaped its private root")
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        linked = path.lstat()
+        if (
+            not statmod.S_ISREG(opened.st_mode)
+            or not statmod.S_ISREG(linked.st_mode)
+            or _grip_result_readback_file_identity(opened)
+            != _grip_result_readback_file_identity(linked)
+            or opened.st_uid != os.getuid()
+            or opened.st_nlink != 1
+            or statmod.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_size <= 0
+            or opened.st_size > GRIP_RESULT_READBACK_MAX_BYTES
+        ):
+            raise PermissionError("grip result readback file is unsafe")
+        remaining = opened.st_size
+        chunks: list[bytes] = []
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                raise RuntimeError("grip result readback file was truncated")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+        rebound = path.lstat()
+        if (
+            _grip_result_readback_file_identity(opened)
+            != _grip_result_readback_file_identity(after)
+            or _grip_result_readback_file_identity(opened)
+            != _grip_result_readback_file_identity(rebound)
+        ):
+            raise RuntimeError("grip result readback changed while reading")
+    finally:
+        os.close(descriptor)
+    try:
+        value = json.loads(b"".join(chunks).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("grip result readback is invalid JSON") from exc
+    if not isinstance(value, dict):
+        raise RuntimeError("grip result readback must be a JSON object")
+    return value
+
+
+def _validate_grip_result_readback_payload(
+    value: dict[str, Any], *, receipt_sha256: str
+) -> dict[str, Any]:
+    if re.fullmatch(r"[0-9a-f]{64}", receipt_sha256) is None:
+        raise ValueError("receipt_sha256 must be a lowercase SHA-256 digest")
+    unsigned = {key: item for key, item in value.items() if key != "readback_sha256"}
+    if (
+        value.get("kind") != GRIP_RESULT_READBACK_KIND
+        or value.get("schema_version") != GRIP_RESULT_READBACK_SCHEMA_VERSION
+        or value.get("receipt_sha256") != receipt_sha256
+        or value.get("readback_sha256") != sha256_json(unsigned)
+        or value.get("secret_material_persisted") is not False
+    ):
+        raise RuntimeError("grip result readback identity or digest is invalid")
+    return value
+
+
+def read_grip_result_readback(receipt_sha256: str) -> dict[str, Any]:
+    if re.fullmatch(r"[0-9a-f]{64}", receipt_sha256) is None:
+        raise ValueError("receipt_sha256 must be a lowercase SHA-256 digest")
+    try:
+        path = _grip_result_readback_root() / f"{receipt_sha256}.json"
+        value = _read_grip_result_readback_file(path)
+    except FileNotFoundError as exc:
+        raise GripPreflightError(
+            "durable grip result readback is missing for the supplied receipt"
+        ) from exc
+    return _validate_grip_result_readback_payload(
+        value, receipt_sha256=receipt_sha256
+    )
+
+
+def prepare_grip_result_readback_store() -> Path:
+    return _grip_result_readback_root(create=True)
+
+
+def persist_grip_result_readback(
+    name: str,
+    result: dict[str, Any],
+    *,
+    tool_name: str,
+    runtime_binding: dict[str, Any],
+    profile: str,
+    allow_mutation: bool,
+    server_milestones: set[str] | tuple[str, ...] | list[str] = (),
+) -> dict[str, Any]:
+    if not grip_requires_durable_result_readback(name):
+        raise ValueError(f"grip does not use durable result readback: {name}")
+    receipt = result.get("receipt")
+    receipt_sha256 = result.get("receipt_sha256")
+    if (
+        not isinstance(receipt, dict)
+        or not isinstance(receipt_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", receipt_sha256) is None
+        or receipt.get("receipt_sha256") != receipt_sha256
+        or sha256_json(
+            {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+        )
+        != receipt_sha256
+        or receipt.get("grip", {}).get("name") != name
+        or result.get("status") != receipt.get("status")
+    ):
+        raise RuntimeError("grip result is not bound to a valid receipt")
+    if tool_name != "grip_run":
+        raise ValueError("grip result readback tool_name must be grip_run")
+    if (
+        not isinstance(runtime_binding, dict)
+        or set(runtime_binding)
+        != {"release_id", "repo_head", "entrypoint_contract_sha256"}
+        or not isinstance(runtime_binding.get("release_id"), str)
+        or not runtime_binding["release_id"]
+        or not isinstance(runtime_binding.get("repo_head"), str)
+        or re.fullmatch(r"[0-9a-f]{40}", runtime_binding["repo_head"]) is None
+        or not isinstance(runtime_binding.get("entrypoint_contract_sha256"), str)
+        or re.fullmatch(
+            r"[0-9a-f]{64}", runtime_binding["entrypoint_contract_sha256"]
+        )
+        is None
+    ):
+        raise ValueError("grip result readback runtime binding is invalid")
+    milestones = sorted(set(server_milestones))
+    if any(
+        not isinstance(item, str)
+        or _GRIP_RESULT_MILESTONE_RE.fullmatch(item) is None
+        for item in milestones
+    ):
+        raise ValueError("grip result readback contains an invalid server milestone")
+    checks = receipt.get("checks")
+    if not isinstance(checks, list) or not all(
+        isinstance(item, dict) for item in checks
+    ):
+        raise RuntimeError("grip receipt checks are invalid")
+    safe_checks = []
+    for item in checks:
+        check_id = item.get("id")
+        status = item.get("status")
+        if not isinstance(check_id, str) or not isinstance(status, str):
+            raise RuntimeError("grip receipt check identity is invalid")
+        safe_checks.append({"id": check_id, "status": status})
+    payload: dict[str, Any] = {
+        "schema_version": GRIP_RESULT_READBACK_SCHEMA_VERSION,
+        "kind": GRIP_RESULT_READBACK_KIND,
+        "tool_name": tool_name,
+        "grip": dict(receipt.get("grip") or {}),
+        "runtime_binding": dict(runtime_binding),
+        "runtime_binding_sha256": sha256_json(runtime_binding),
+        "profile": profile,
+        "allow_mutation": allow_mutation is True,
+        "parameters_sha256": receipt.get("parameters_sha256"),
+        "status": receipt.get("status"),
+        "phase": receipt.get("phase"),
+        "started_at": receipt.get("started_at"),
+        "ended_at": receipt.get("ended_at"),
+        "receipt_sha256": receipt_sha256,
+        "output_sha256": receipt.get("output_sha256"),
+        "checks": safe_checks,
+        "checks_sha256": sha256_json(checks),
+        "server_milestones": milestones,
+        "effect_boundary": {
+            key: (key in milestones if name == "secret-pty-getpass-probe" else None)
+            for key in (
+                "secret_pty_dispatcher_entered",
+                "secret_pty_lease_acquired",
+                "secret_pty_broker_client_invocation_attempted",
+                "secret_pty_broker_client_returned",
+                "secret_pty_domain_effect_completed",
+            )
+        },
+        "secret_material_persisted": False,
+        "does_not_establish": [
+            "domain_effect_outcome_when_dispatcher_entered",
+            "retry_authority",
+            "secret_content",
+            "raw_grip_output",
+        ],
+    }
+    payload["readback_sha256"] = sha256_json(payload)
+    root = _grip_result_readback_root(create=True)
+    path = root / f"{receipt_sha256}.json"
+    data = (
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if len(data) > GRIP_RESULT_READBACK_MAX_BYTES:
+        raise RuntimeError("grip result readback exceeds its size bound")
+    replayed = False
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except FileExistsError:
+        existing = _validate_grip_result_readback_payload(
+            _read_grip_result_readback_file(path),
+            receipt_sha256=receipt_sha256,
+        )
+        if existing != payload:
+            raise RuntimeError(
+                "existing grip result readback conflicts with current result"
+            )
+        replayed = True
+    else:
+        try:
+            view = memoryview(data)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise RuntimeError("grip result readback write was short")
+                view = view[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        directory = os.open(root, os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        _validate_grip_result_readback_payload(
+            _read_grip_result_readback_file(path),
+            receipt_sha256=receipt_sha256,
+        )
+    return {
+        "schema_version": 1,
+        "kind": "grabowski.grip_result_readback_binding",
+        "receipt_sha256": receipt_sha256,
+        "readback_sha256": payload["readback_sha256"],
+        "result_readback_receipt_sha256": payload["readback_sha256"],
+        "runtime_binding_sha256": payload["runtime_binding_sha256"],
+        "path": str(path),
+        "replayed": replayed,
+        "secret_material_persisted": False,
+    }
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -4142,6 +4504,167 @@ def _run_n8n_workflow_edge_apply(
         }
     return output
 
+
+def _secret_pty_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
+    allowed = {"source_path", "expected_source_sha256"}
+    unknown = sorted(set(parameters) - allowed)
+    if unknown:
+        raise GripPreflightError(
+            "unknown secret PTY grip field(s): " + ", ".join(unknown)
+        )
+    source_path = parameters.get("source_path")
+    source_sha = parameters.get("expected_source_sha256")
+    if not isinstance(source_path, str) or not source_path.startswith("/"):
+        raise GripPreflightError("source_path must be an absolute path")
+    if (
+        not isinstance(source_sha, str)
+        or re.fullmatch(r"[0-9a-f]{64}", source_sha) is None
+    ):
+        raise GripPreflightError(
+            "expected_source_sha256 must be a lowercase SHA-256 digest"
+        )
+    return {
+        "source_path": source_path,
+        "expected_source_sha256": source_sha,
+    }
+
+
+def _run_secret_pty_getpass_probe(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+    secret_pty_dispatcher: SecretPtyDispatcher | None = None,
+) -> dict[str, Any]:
+    del spec, runner
+    request = _secret_pty_parameters(parameters)
+    if secret_pty_dispatcher is None:
+        _check(receipt, "broker-contract-bound", "fail", "dispatcher-unavailable")
+        raise GripActionError("secret PTY dispatcher is unavailable")
+    _check(
+        receipt,
+        "secret-hash-bound",
+        "pass",
+        request["expected_source_sha256"],
+    )
+    try:
+        output = secret_pty_dispatcher(request)
+    except (OSError, PermissionError, RuntimeError, TypeError, ValueError) as exc:
+        _check(receipt, "broker-contract-bound", "fail", type(exc).__name__)
+        raise GripActionError(
+            "secret PTY probe failed; rootbroker audit and host lease readback are required before retry"
+        ) from exc
+    if not isinstance(output, dict):
+        _check(receipt, "broker-contract-bound", "fail", "invalid-output")
+        raise GripActionError("secret PTY dispatcher returned invalid output")
+
+    broker = output.get("broker")
+    broker_ok = (
+        isinstance(broker, dict)
+        and broker.get("mode") == "secret-pty"
+        and broker.get("outcome") == "COMPLETED"
+        and broker.get("returncode") == 0
+        and broker.get("timed_out") is False
+        and broker.get("retry_safe") is False
+        and broker.get("readback_required") is False
+        and broker.get("prompt_count") == broker.get("expected_prompt_count") == 2
+        and broker.get("failure_reason_present") is False
+        and output.get("broker_client_returncode") == 0
+        and output.get("broker_client_timed_out") is False
+    )
+    lease_bound = output.get("lease_bound") is True
+    redacted = output.get("secret_output_redacted") is True
+    temporary_clean = output.get("temporary_authority_cleaned") is True
+    lease_released = output.get("host_lease_released") is True
+    retry_locked = (
+        output.get("retry_safe") is False
+        and isinstance(broker, dict)
+        and broker.get("retry_safe") is False
+    )
+    contract_sha = output.get("action_contract_sha256")
+
+    _check(receipt, "broker-contract-bound",
+           "pass" if isinstance(contract_sha, str) and len(contract_sha) == 64 else "fail",
+           str(contract_sha or "missing"))
+    _check(receipt, "exclusive-host-lease-bound",
+           "pass" if lease_bound else "fail",
+           str(output.get("lease_binding_sha256") or "missing"))
+    _check(receipt, "double-getpass-complete",
+           "pass" if broker_ok else "fail",
+           f"prompts={broker.get('prompt_count')}/{broker.get('expected_prompt_count')}" if isinstance(broker, dict) else "missing")
+    _check(receipt, "secret-output-redacted",
+           "pass" if redacted else "fail",
+           f"redaction_count={output.get('redaction_count')}")
+    _check(receipt, "temporary-authority-cleaned",
+           "pass" if temporary_clean else "fail",
+           str(output.get("temporary_artifact_count") or 0))
+    _check(receipt, "host-lease-released",
+           "pass" if lease_released else "fail",
+           str(output.get("lease_owner_id") or "missing"))
+    _check(receipt, "retry-locked",
+           "pass" if retry_locked else "fail",
+           "retry_safe=false" if retry_locked else "retry contract violated")
+    if not all((
+        broker_ok,
+        lease_bound,
+        redacted,
+        temporary_clean,
+        lease_released,
+        retry_locked,
+    )):
+        return {
+            "receipt_status": "failed",
+            "error": "secret PTY probe violated its fail-closed completion or cleanup contract",
+            "retry_safe": False,
+            "secret_output_redacted": redacted,
+            "temporary_authority_cleaned": temporary_clean,
+            "host_lease_released": lease_released,
+        }
+    return output
+
+
+def _run_grip_result_readback(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    if set(parameters) != {"receipt_sha256"}:
+        raise GripPreflightError(
+            "grip-result-readback accepts exactly receipt_sha256"
+        )
+    receipt_sha256 = parameters.get("receipt_sha256")
+    if (
+        not isinstance(receipt_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", receipt_sha256) is None
+    ):
+        raise GripPreflightError(
+            "receipt_sha256 must be a lowercase SHA-256 digest"
+        )
+    try:
+        result = read_grip_result_readback(receipt_sha256)
+    except GripPreflightError:
+        raise
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise GripPreflightError(
+            "durable grip result readback failed integrity validation: "
+            + type(exc).__name__
+        ) from exc
+    _check(receipt, "receipt-sha-bound", "pass", receipt_sha256)
+    _check(
+        receipt,
+        "durable-result-integrity",
+        "pass",
+        str(result["readback_sha256"]),
+    )
+    _check(
+        receipt,
+        "no-retry-authority",
+        "pass",
+        "readback-only; original grip is not executed",
+    )
+    return result
 
 def _run_transport_roundtrip(
     spec: GripSpec,
@@ -15849,6 +16372,8 @@ _RUNNERS = {
     "reposkop_retirement_surface_observe": _run_reposkop_retirement_surface_observe,
     "n8n_workflow_edge_verify": _run_n8n_workflow_edge_verify,
     "n8n_workflow_edge_apply": _run_n8n_workflow_edge_apply,
+    "secret_pty_getpass_probe": _run_secret_pty_getpass_probe,
+    "grip_result_readback": _run_grip_result_readback,
     "forrest_server_exit_apply": _run_forrest_server_exit_apply,
     "transport_roundtrip": _run_transport_roundtrip,
     "convergence_assess": _run_convergence_assess,
@@ -15884,6 +16409,7 @@ def run_grip(
     github_runner: GithubRunner | None = None,
     transport_target_dispatcher: TransportTargetDispatcher | None = None,
     n8n_provider_dispatcher: N8nProviderDispatcher | None = None,
+    secret_pty_dispatcher: SecretPtyDispatcher | None = None,
 ) -> dict[str, Any]:
     parameters = dict(parameters or {})
     spec = GRIP_SPECS.get(name)
@@ -15943,6 +16469,14 @@ def run_grip(
                 receipt,
                 command,
                 n8n_provider_dispatcher,
+            )
+        elif spec.runner == "secret_pty_getpass_probe":
+            output = action(
+                spec,
+                parameters,
+                receipt,
+                command,
+                secret_pty_dispatcher,
             )
         else:
             output = action(spec, parameters, receipt, command)
@@ -16100,6 +16634,27 @@ def _blocked_surface_receipt(name: str, parameters: dict[str, Any], reason: str)
     return _finish(receipt, "blocked", "preflight", {"error": reason})
 
 
+def _failed_surface_receipt(
+    name: str,
+    parameters: dict[str, Any],
+    reason: str,
+) -> dict[str, Any]:
+    spec = GRIP_SPECS.get(name)
+    if spec is None:
+        spec = GripSpec(
+            name=name,
+            version="0",
+            summary="grip surface dispatch failed",
+            effect=READ_ONLY,
+            required_parameters=(),
+            acceptance_ids=("grip-run-allowlist",),
+            runner="surface_failure",
+        )
+    receipt = _new_receipt(spec, parameters)
+    _check(receipt, "surface_dispatch", "fail", reason)
+    return _finish(receipt, "failed", "action", {"error": reason})
+
+
 def grip_run(
     name: str,
     parameters: dict[str, Any] | None = None,
@@ -16110,6 +16665,7 @@ def grip_run(
     github_runner: GithubRunner | None = None,
     transport_target_dispatcher: TransportTargetDispatcher | None = None,
     n8n_provider_dispatcher: N8nProviderDispatcher | None = None,
+    secret_pty_dispatcher: SecretPtyDispatcher | None = None,
 ) -> dict[str, Any]:
     parameters = dict(parameters or {})
     try:
@@ -16130,6 +16686,7 @@ def grip_run(
         github_runner=github_runner,
         transport_target_dispatcher=transport_target_dispatcher,
         n8n_provider_dispatcher=n8n_provider_dispatcher,
+        secret_pty_dispatcher=secret_pty_dispatcher,
     )
 
 

@@ -90,7 +90,62 @@ def _load_json_object(payload: bytes, *, label: str) -> dict[str, Any]:
     return value
 
 
-def upgraded(policy: dict[str, Any], template: dict[str, Any]) -> dict[str, Any]:
+def _read_bound_template(path: Path) -> tuple[bytes, str]:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        linked = path.lstat()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(linked.st_mode)
+            or _identity(opened) != _identity(linked)
+            or opened.st_nlink != 1
+            or opened.st_size > MAX_POLICY_BYTES
+        ):
+            raise ValueError("template must be one stable regular file")
+        payload = _read_descriptor(descriptor, max_bytes=MAX_POLICY_BYTES)
+        after = os.fstat(descriptor)
+        rebound = path.lstat()
+        if _identity(opened) != _identity(after) or _identity(opened) != _identity(rebound):
+            raise ValueError("template changed while reading")
+        return payload, _sha256_bytes(payload)
+    finally:
+        os.close(descriptor)
+
+
+def _browser_profile_roots_for_convergence(
+    template: dict[str, Any],
+    template_trusted_owner: dict[str, Any],
+) -> list[str]:
+    top_level = template.get("browser_profile_roots")
+    trusted = template_trusted_owner.get("browser_profile_roots")
+    for label, value in (
+        ("template browser_profile_roots", top_level),
+        ("template trusted-owner browser_profile_roots", trusted),
+    ):
+        if (
+            not isinstance(value, list)
+            or not value
+            or not all(isinstance(item, str) and item for item in value)
+            or len(value) != len(set(value))
+        ):
+            raise ValueError(f"{label} must be a non-empty unique string list")
+    if top_level != trusted:
+        raise ValueError(
+            "template top-level and trusted-owner browser_profile_roots must match"
+        )
+    return copy.deepcopy(top_level)
+
+
+def upgraded(
+    policy: dict[str, Any],
+    template: dict[str, Any],
+    *,
+    converge_browser_profile_roots: bool = False,
+) -> dict[str, Any]:
     if policy.get("version") != 2:
         raise ValueError("only version 2 policies are supported")
     profiles = policy.get("profiles")
@@ -117,6 +172,12 @@ def upgraded(policy: dict[str, Any], template: dict[str, Any]) -> dict[str, Any]
             "template must contain valid observe, maintain, failover-mutate and trusted-owner profiles"
         )
 
+    managed_browser_roots = (
+        _browser_profile_roots_for_convergence(template, template_trusted_owner)
+        if converge_browser_profile_roots
+        else None
+    )
+
     trusted_capabilities = trusted_owner.get("capabilities")
     template_trusted_capabilities = template_trusted_owner.get("capabilities")
     if not isinstance(trusted_capabilities, list) or not all(
@@ -141,6 +202,10 @@ def upgraded(policy: dict[str, Any], template: dict[str, Any]) -> dict[str, Any]
     ):
         raise ValueError("template failover-mutate capabilities are not the fixed G6.5 contract")
     upgraded_trusted_owner = copy.deepcopy(trusted_owner)
+    if managed_browser_roots is not None:
+        upgraded_trusted_owner["browser_profile_roots"] = copy.deepcopy(
+            managed_browser_roots
+        )
     upgraded_trusted_capabilities = upgraded_trusted_owner["capabilities"]
     if "terminal_execute" in upgraded_trusted_capabilities:
         # Preserve trusted-owner compatibility while adding only narrow typed
@@ -161,6 +226,8 @@ def upgraded(policy: dict[str, Any], template: dict[str, Any]) -> dict[str, Any]
         raise ValueError("template capability definitions are invalid")
 
     result = copy.deepcopy(policy)
+    if managed_browser_roots is not None:
+        result["browser_profile_roots"] = copy.deepcopy(managed_browser_roots)
     if isinstance(template_definitions, dict):
         merged_definitions = copy.deepcopy(policy_definitions or {})
         for capability, description in template_definitions.items():
@@ -177,6 +244,10 @@ def upgraded(policy: dict[str, Any], template: dict[str, Any]) -> dict[str, Any]
     if active_profile not in result["profiles"]:
         raise ValueError("active profile would be lost")
     expected_trusted_owner = copy.deepcopy(trusted_owner)
+    if managed_browser_roots is not None:
+        expected_trusted_owner["browser_profile_roots"] = copy.deepcopy(
+            managed_browser_roots
+        )
     expected_capabilities = expected_trusted_owner["capabilities"]
     if "terminal_execute" in expected_capabilities:
         for capability in ("bureau_mutation", "maulwurf_recovery_control"):
@@ -258,6 +329,15 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("policy", type=Path)
     parser.add_argument("--expected-sha256")
+    parser.add_argument("--expected-template-sha256")
+    parser.add_argument(
+        "--converge-browser-profile-roots",
+        action="store_true",
+        help=(
+            "replace only top-level and trusted-owner browser_profile_roots "
+            "with the matching trusted-owner template roots"
+        ),
+    )
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
 
@@ -270,8 +350,39 @@ def main() -> int:
             raise SystemExit("policy SHA-256 precondition failed")
 
         policy = _load_json_object(policy_bytes, label="policy")
-        template = _load_json_object(TEMPLATE.read_bytes(), label="template")
-        result = upgraded(policy, template)
+        template_bytes, template_sha256 = _read_bound_template(TEMPLATE)
+        if (
+            args.expected_template_sha256
+            and template_sha256 != args.expected_template_sha256
+        ):
+            raise SystemExit("template SHA-256 precondition failed")
+        if args.apply and args.converge_browser_profile_roots:
+            if not args.expected_sha256:
+                raise SystemExit(
+                    "browser profile root convergence apply requires "
+                    "--expected-sha256 from the reviewed dry-run"
+                )
+            if not args.expected_template_sha256:
+                raise SystemExit(
+                    "browser profile root convergence apply requires "
+                    "--expected-template-sha256 from the reviewed dry-run"
+                )
+        template = _load_json_object(template_bytes, label="template")
+        baseline = upgraded(policy, template)
+        if args.converge_browser_profile_roots and baseline != policy:
+            raise SystemExit(
+                "browser profile root convergence requires the access-profile "
+                "baseline to be current; run/review the normal profile upgrade separately"
+            )
+        result = (
+            upgraded(
+                policy,
+                template,
+                converge_browser_profile_roots=True,
+            )
+            if args.converge_browser_profile_roots
+            else baseline
+        )
         encoded = (
             json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         ).encode("utf-8")
@@ -291,8 +402,16 @@ def main() -> int:
             "changed": before != after,
             "before_sha256": before,
             "after_sha256": after,
+            "template_sha256": template_sha256,
             "active_profile": result["active_profile"],
             "profiles": sorted(result["profiles"]),
+            "browser_profile_roots_converged": bool(
+                args.converge_browser_profile_roots
+            ),
+            "browser_profile_roots_changed": (
+                policy.get("browser_profile_roots")
+                != result.get("browser_profile_roots")
+            ),
             "does_not_establish": [
                 "client_tool_snapshot_refresh",
                 "new_action_authority",

@@ -96,6 +96,8 @@ _CLAUDE_REVIEW_ACTORS = frozenset({
 })
 _TRUSTED_REVIEW_FINDING_ACTORS = _CODEX_REVIEW_ACTORS | _CLAUDE_REVIEW_ACTORS
 _CODEX_REQUEST_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+_CODEX_REVIEW_MAX_PAGES = 10
+_CODEX_REVIEW_MAX_ITEMS = 1000
 _CODEX_REQUEST_RE = re.compile(
     r"<!--\s*grabowski-codex-review-request:v1\s*(\{.*?\})\s*-->",
     re.DOTALL,
@@ -3616,6 +3618,80 @@ class CaptainMergeGuardRunner:
             errors.append(f"merge_guard_codex_{label}_invalid_json")
             return None
 
+    def _codex_bounded_pages(
+        self,
+        args: list[str],
+        *,
+        label: str,
+        observations: list[dict[str, Any]],
+        errors: list[str],
+        max_pages: int = 1,
+        max_items: int = 100,
+    ) -> list[dict[str, Any]] | None:
+        if (
+            max_pages < 1
+            or max_items < 1
+            or args.count("--paginate") != 1
+            or args.count("--slurp") != 1
+        ):
+            errors.append(f"merge_guard_codex_{label}_pages_invalid")
+            return None
+        page_args = [item for item in args if item not in {"--paginate", "--slurp"}]
+        endpoint_indexes = [
+            index
+            for index, item in enumerate(page_args)
+            if item.startswith(("repos/", "orgs/", "enterprises/"))
+        ]
+        if len(endpoint_indexes) != 1:
+            errors.append(f"merge_guard_codex_{label}_pages_invalid")
+            return None
+        endpoint_index = endpoint_indexes[0]
+        endpoint = page_args[endpoint_index]
+        query_fields = (
+            endpoint.split("?", 1)[1].split("&") if "?" in endpoint else []
+        )
+        if any(field.startswith("page=") for field in query_fields):
+            errors.append(f"merge_guard_codex_{label}_pages_invalid")
+            return None
+        per_page_fields = [
+            field for field in query_fields if field.startswith("per_page=")
+        ]
+        if per_page_fields != ["per_page=100"]:
+            errors.append(f"merge_guard_codex_{label}_pages_invalid")
+            return None
+
+        flattened: list[dict[str, Any]] = []
+        # Fetch at most the allowed pages plus one bounded sentinel page. The
+        # sentinel proves that the history did not silently continue beyond the
+        # configured bound without asking gh to eagerly paginate the full PR.
+        for page_number in range(1, max_pages + 2):
+            separator = "&" if "?" in endpoint else "?"
+            current_args = list(page_args)
+            current_args[endpoint_index] = f"{endpoint}{separator}page={page_number}"
+            page = self._codex_api_json(
+                current_args,
+                label=label,
+                observations=observations,
+                errors=errors,
+            )
+            if not isinstance(page, list) or any(
+                not isinstance(item, dict) for item in page
+            ):
+                errors.append(f"merge_guard_codex_{label}_pages_invalid")
+                return None
+            if page_number > max_pages:
+                if page:
+                    errors.append(f"merge_guard_codex_{label}_truncated")
+                    return None
+                break
+            if len(flattened) + len(page) > max_items:
+                errors.append(f"merge_guard_codex_{label}_truncated")
+                return None
+            flattened.extend(dict(item) for item in page)
+            if not page:
+                break
+        return flattened
+
     def _codex_single_page(
         self,
         args: list[str],
@@ -3624,22 +3700,12 @@ class CaptainMergeGuardRunner:
         observations: list[dict[str, Any]],
         errors: list[str],
     ) -> list[dict[str, Any]] | None:
-        pages = self._codex_api_json(
+        return self._codex_bounded_pages(
             args,
             label=label,
             observations=observations,
             errors=errors,
         )
-        if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
-            errors.append(f"merge_guard_codex_{label}_pages_invalid")
-            return None
-        if len(pages) != 1:
-            errors.append(f"merge_guard_codex_{label}_truncated")
-            return None
-        if any(not isinstance(item, dict) for item in pages[0]):
-            errors.append(f"merge_guard_codex_{label}_item_invalid")
-            return None
-        return [dict(item) for item in pages[0]]
 
     def _review_thread_sets(
         self,
@@ -3920,6 +3986,46 @@ class CaptainMergeGuardRunner:
             observations=observations,
             errors=errors,
         )
+        review_items = self._codex_bounded_pages(
+            [
+                "api",
+                "--paginate",
+                "--slurp",
+                f"repos/{repository}/pulls/{pr_number}/reviews?per_page=100",
+            ],
+            label="finding_reviews",
+            observations=observations,
+            errors=errors,
+            max_pages=_CODEX_REVIEW_MAX_PAGES,
+            max_items=_CODEX_REVIEW_MAX_ITEMS,
+        )
+        if isinstance(threads_payload, dict) and review_items is not None:
+            normalized_payload = json.loads(json.dumps(threads_payload))
+            try:
+                pull_request = normalized_payload["data"]["repository"]["pullRequest"]
+            except (KeyError, TypeError):
+                pull_request = None
+            if isinstance(pull_request, dict):
+                pull_request["reviews"] = {
+                    "nodes": [
+                        {
+                            "databaseId": item.get("id"),
+                            "state": item.get("state"),
+                            "submittedAt": item.get("submitted_at"),
+                            "author": item.get("user"),
+                            "commit": {"oid": item.get("commit_id")},
+                        }
+                        for item in review_items
+                    ],
+                    "pageInfo": {
+                        "hasPreviousPage": False,
+                        "pages_loaded": max(
+                            1,
+                            (len(review_items) + 99) // 100,
+                        ),
+                    },
+                }
+                threads_payload = normalized_payload
         return self._review_thread_sets(
             threads_payload,
             head_sha=head_sha,
@@ -4209,7 +4315,7 @@ class CaptainMergeGuardRunner:
         )
 
 
-        review_items = self._codex_single_page(
+        review_items = self._codex_bounded_pages(
             [
                 "api",
                 "--paginate",
@@ -4219,6 +4325,8 @@ class CaptainMergeGuardRunner:
             label="reviews",
             observations=observations,
             errors=errors,
+            max_pages=_CODEX_REVIEW_MAX_PAGES,
+            max_items=_CODEX_REVIEW_MAX_ITEMS,
         )
         live_reviews: list[dict[str, Any]] = []
         if review_items is not None:

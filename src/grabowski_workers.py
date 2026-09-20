@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import http.client
 import ipaddress
 import json
 import os
@@ -52,6 +53,10 @@ BROWSER_SEMANTIC_TEMP_NAME = re.compile(
 BROWSER_SEMANTIC_TEMP_CLEANUP_LIMIT = 256
 BROWSER_BIDI_SESSION_NAME = ".webdriver-bidi-session.json"
 BROWSER_BIDI_ADAPTER_ID = "chrome-webdriver-bidi"
+BROWSER_OPERATOR_PROFILE_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
+DEFAULT_OPERATOR_BROWSER_RUNTIME_SECONDS = 21600
+BROWSER_TARGET_HEALTH_MAX_BYTES = 64 * 1024
+BROWSER_TARGET_HEALTH_TIMEOUT_SECONDS = 1.0
 BROWSER_FALLBACK_SAFE_START_ARGS = frozenset({"--headless", "--headless=new", "--disable-gpu", "--no-default-browser-check", "--disable-dev-shm-usage"})
 WORKER_LIMIT_CORE_PROPERTY = "--property=LimitCORE=0"
 DEFAULT_BROWSER_EXECUTABLES = (
@@ -230,17 +235,105 @@ def _executable(
     return resolved
 
 
-def _browser_profile(worker_id: str, persistent_profile: str | None) -> tuple[Path, bool]:
+def _reject_browser_profile_symlink_components(
+    candidate: Path, *, allow_missing_leaf: bool = False
+) -> None:
+    current = Path(candidate.anchor)
+    parts = candidate.parts[1:]
+    for index, part in enumerate(parts):
+        current = current / part
+        is_leaf = index == len(parts) - 1
+        if current.is_symlink():
+            raise PermissionError(
+                f"persistent browser profile may not use symlink components: {current}"
+            )
+        if not current.exists():
+            if allow_missing_leaf and is_leaf:
+                return
+            raise FileNotFoundError(str(current))
+
+
+def _normalized_browser_profile_candidate(raw: str | Path) -> Path:
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        raise ValueError("persistent browser profile must be absolute")
+    return Path(os.path.abspath(str(candidate)))
+
+
+def _operator_browser_profile_path(name: str) -> Path:
+    if not isinstance(name, str) or BROWSER_OPERATOR_PROFILE_NAME.fullmatch(name) is None:
+        raise ValueError(
+            "operator_profile must be a lower-case name using letters, digits, '.', '_' or '-'"
+        )
+    root = _normalized_browser_profile_candidate(base.OPERATOR_BROWSER_PROFILE_ROOT)
+    policy = base._load_policy()
+    try:
+        root_values = base._browser_profile_root_values(policy)
+    except RuntimeError as exc:
+        raise PermissionError(
+            "managed operator browser profile root is not explicitly configured"
+        ) from exc
+    configured_roots = {
+        _normalized_browser_profile_candidate(base._policy_path(value))
+        for value in root_values
+    }
+    if root not in configured_roots:
+        raise PermissionError(
+            "managed operator browser profile root is not explicitly configured"
+        )
+    if root.exists() or root.is_symlink():
+        _reject_browser_profile_symlink_components(root)
+        if not root.is_dir():
+            raise PermissionError(
+                "managed operator browser profile root must be a directory"
+            )
+    else:
+        _reject_browser_profile_symlink_components(root.parent)
+        root.mkdir(mode=0o700)
+    metadata = root.stat()
+    if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
+        raise PermissionError(
+            "managed operator browser profile root must be owned by the current user with mode 0700"
+        )
+    return root / name
+
+
+def _browser_profile_overlaps_managed_root(candidate: Path) -> bool:
+    managed_root = _normalized_browser_profile_candidate(
+        base.OPERATOR_BROWSER_PROFILE_ROOT
+    )
+    return (
+        candidate == managed_root
+        or managed_root in candidate.parents
+        or candidate in managed_root.parents
+    )
+
+
+def _browser_profile(
+    worker_id: str,
+    persistent_profile: str | None,
+    *,
+    allow_managed_operator_profile: bool = False,
+) -> tuple[Path, bool]:
     if persistent_profile is None:
         profile = WORKER_STATE / "profiles" / worker_id
         profile.mkdir(parents=True, exist_ok=False, mode=0o700)
         return profile, True
-    candidate = Path(persistent_profile).expanduser()
-    if not candidate.is_absolute():
-        raise ValueError("persistent browser profile must be absolute")
-    if candidate.exists() or candidate.is_symlink():
-        if candidate.is_symlink() or not candidate.is_dir():
-            raise PermissionError("persistent browser profile must be a non-symlink directory")
+    candidate = _normalized_browser_profile_candidate(persistent_profile)
+    if (
+        not allow_managed_operator_profile
+        and _browser_profile_overlaps_managed_root(candidate)
+    ):
+        raise PermissionError(
+            "raw persistent_profile may not overlap the managed operator browser "
+            "profile root; use operator_profile"
+        )
+    _reject_browser_profile_symlink_components(candidate, allow_missing_leaf=True)
+    if candidate.exists():
+        if not candidate.is_dir():
+            raise PermissionError(
+                "persistent browser profile must be a non-symlink directory"
+            )
         resolved = candidate.resolve(strict=True)
     else:
         parent = candidate.parent.resolve(strict=True)
@@ -250,6 +343,11 @@ def _browser_profile(worker_id: str, persistent_profile: str | None) -> tuple[Pa
         raise PermissionError("persistent browser profile is outside configured roots")
     if not resolved.exists():
         resolved.mkdir(mode=0o700)
+    metadata = resolved.stat()
+    if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
+        raise PermissionError(
+            "persistent browser profile must be owned by the current user with mode 0700"
+        )
     return resolved, False
 
 
@@ -468,6 +566,83 @@ def _browser_profile_identity(profile_path: str | None) -> str | None:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def _browser_profile_scope_kind(record: dict[str, Any]) -> str:
+    mode = _browser_profile_mode(record)
+    if mode == "ephemeral":
+        return "worker-ephemeral"
+    if mode != "persistent":
+        return "unknown"
+    profile_path = record.get("profile_path")
+    if isinstance(profile_path, str) and profile_path:
+        profile = _normalized_browser_profile_candidate(profile_path)
+        root = _normalized_browser_profile_candidate(base.OPERATOR_BROWSER_PROFILE_ROOT)
+        if profile == root or root in profile.parents:
+            return "managed-operator-profile"
+    return "explicit-auth-trust-scope"
+
+
+def _browser_control_recovery(record: dict[str, Any], control_state: str) -> dict[str, Any]:
+    if control_state != "target_unavailable":
+        return {
+            "required": False,
+            "supported": True,
+            "action": "none",
+            "profile_reusable": _browser_profile_mode(record) == "persistent",
+        }
+    persistent = _browser_profile_mode(record) == "persistent"
+    return {
+        "required": True,
+        "supported": True,
+        "action": (
+            "restart-worker-reusing-persistent-profile"
+            if persistent
+            else "restart-worker-with-fresh-ephemeral-profile"
+        ),
+        "profile_reusable": persistent,
+    }
+
+
+def _browser_cdp_target_health(record: dict[str, Any]) -> dict[str, Any]:
+    adapter = _browser_record_adapter(record)
+    if adapter.get("protocol") != "cdp":
+        return {"state": "not_applicable"}
+    port = record.get("port")
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        return {"state": "target_unavailable"}
+    connection = http.client.HTTPConnection(
+        "127.0.0.1", port, timeout=BROWSER_TARGET_HEALTH_TIMEOUT_SECONDS
+    )
+    try:
+        connection.request("GET", "/json/list")
+        response = connection.getresponse()
+        payload = response.read(BROWSER_TARGET_HEALTH_MAX_BYTES + 1)
+        if response.status != 200 or len(payload) > BROWSER_TARGET_HEALTH_MAX_BYTES:
+            return {"state": "target_unavailable"}
+        targets = json.loads(payload.decode("utf-8"))
+        if not isinstance(targets, list):
+            return {"state": "target_unavailable"}
+        matches = 0
+        for target in targets:
+            if (
+                not isinstance(target, dict)
+                or target.get("type") != "page"
+                or not isinstance(target.get("webSocketDebuggerUrl"), str)
+            ):
+                continue
+            endpoint = urlsplit(target["webSocketDebuggerUrl"])
+            if (
+                endpoint.scheme == "ws"
+                and endpoint.hostname in {"127.0.0.1", "localhost", "::1"}
+                and endpoint.port == port
+            ):
+                matches += 1
+        return {"state": "ready" if matches >= 1 else "target_unavailable"}
+    except (OSError, ValueError, json.JSONDecodeError, UnicodeDecodeError):
+        return {"state": "target_unavailable"}
+    finally:
+        connection.close()
+
+
 def _browser_control_plane(record: dict[str, Any]) -> dict[str, Any]:
     if record.get("kind") != "browser":
         raise ValueError("browser control-plane projection requires a browser worker")
@@ -478,6 +653,22 @@ def _browser_control_plane(record: dict[str, Any]) -> dict[str, Any]:
     profile_path = record.get("profile_path")
     profile_mode = _browser_profile_mode(record)
     profile_identity = _browser_profile_identity(profile_path)
+    last_observation = (
+        json.loads(record["last_observation_json"])
+        if record.get("last_observation_json")
+        else {}
+    )
+    browser_control = (
+        last_observation.get("browser_control")
+        if isinstance(last_observation, dict)
+        else None
+    )
+    control_state = (
+        browser_control.get("state")
+        if isinstance(browser_control, dict)
+        and isinstance(browser_control.get("state"), str)
+        else "unobserved"
+    )
     profile_lease_identity = (
         hashlib.sha256(f"browser-profile:{profile_path}".encode("utf-8")).hexdigest()
         if profile_path
@@ -512,13 +703,7 @@ def _browser_control_plane(record: dict[str, Any]) -> dict[str, Any]:
         "endpoint": runtime_contract["endpoint"],
         "profile": {
             "mode": profile_mode,
-            "scope_kind": (
-                "worker-ephemeral"
-                if profile_mode == "ephemeral"
-                else "explicit-auth-trust-scope"
-                if profile_mode == "persistent"
-                else "unknown"
-            ),
+            "scope_kind": _browser_profile_scope_kind(record),
             "canonicalized": profile_mode in {"ephemeral", "persistent"},
             "exclusive_lease": True,
             "identity_sha256": profile_identity,
@@ -526,6 +711,8 @@ def _browser_control_plane(record: dict[str, Any]) -> dict[str, Any]:
         },
         "outcome": {
             "state": record.get("state"),
+            "control_state": control_state,
+            "recovery": _browser_control_recovery(record, control_state),
             "readback": "grabowski-browser-worker-status",
         },
         "does_not_establish": [
@@ -1229,12 +1416,19 @@ def _observe(record: dict[str, Any]) -> dict[str, Any]:
         state = "completed" if unit_result in {None, "", "success"} else "failed"
     else:
         state = "interrupted"
-    return {
+    observation = {
         "state": state,
         "properties": properties,
         "probe": result,
         "observed_at_unix": observed_at_unix,
     }
+    if record.get("kind") == "browser":
+        observation["browser_control"] = (
+            _browser_cdp_target_health(record)
+            if state == "running"
+            else {"state": "process_not_running"}
+        )
+    return observation
 
 
 def _start(
@@ -5736,9 +5930,14 @@ def _browser_start_cdp_worker(
     extra: list[str],
     persistent_profile: str | None,
     runtime: int,
+    managed_operator_profile: bool = False,
 ) -> dict[str, Any]:
     worker_id = uuid.uuid4().hex[:20]
-    profile, ephemeral = _browser_profile(worker_id, persistent_profile)
+    profile, ephemeral = _browser_profile(
+        worker_id,
+        persistent_profile,
+        allow_managed_operator_profile=managed_operator_profile,
+    )
     argv = _browser_adapter_launch_argv(
         adapter,
         executable=binary,
@@ -5868,9 +6067,28 @@ def browser_start(
     port: int,
     args: list[str] | None = None,
     persistent_profile: str | None = None,
-    runtime_seconds: int = 3600,
+    operator_profile: str | None = None,
+    runtime_seconds: int | None = None,
     chromedriver_executable: str | None = None,
 ) -> dict[str, Any]:
+    if persistent_profile is not None and operator_profile is not None:
+        raise ValueError(
+            "persistent_profile and operator_profile are mutually exclusive"
+        )
+    if operator_profile is not None and chromedriver_executable is not None:
+        raise ValueError(
+            "qualified BiDi fallback does not support operator_profile; "
+            "use an ephemeral primary and standby"
+        )
+    managed_operator_profile = operator_profile is not None
+    if operator_profile is not None:
+        persistent_profile = str(_operator_browser_profile_path(operator_profile))
+    if runtime_seconds is None:
+        runtime_seconds = (
+            DEFAULT_OPERATOR_BROWSER_RUNTIME_SECONDS
+            if operator_profile is not None
+            else 3600
+        )
     runtime = operator._job_runtime(runtime_seconds)
     binary = _executable(
         executable,
@@ -5888,6 +6106,7 @@ def browser_start(
             port=port,
             extra=extra,
             persistent_profile=persistent_profile,
+            managed_operator_profile=managed_operator_profile,
             runtime=runtime,
         )
 
@@ -6280,6 +6499,18 @@ def _current_worker_projection(
     freshly_observed: bool,
 ) -> dict[str, Any] | None:
     state = record["state"]
+    browser_control = observation.get("browser_control")
+    if (
+        state in WORKER_ACTIVE_STATES
+        and isinstance(browser_control, dict)
+        and browser_control.get("state") == "target_unavailable"
+    ):
+        return {
+            "bucket": "attention",
+            "fresh": True,
+            "action_required": True,
+            "reason": "browser-target-unavailable",
+        }
     if state in WORKER_ACTIVE_STATES:
         return {
             "bucket": "active",
@@ -6482,10 +6713,15 @@ def grabowski_browser_worker_start(
     port: int,
     args: list[str] | None = None,
     persistent_profile: str | None = None,
-    runtime_seconds: int = 3600,
+    operator_profile: str | None = None,
+    runtime_seconds: int | None = None,
     chromedriver_executable: str | None = None,
 ) -> dict[str, Any]:
-    """Start Chrome/CDP, optionally arming one fail-closed startup-only BiDi standby.
+    """Start Chrome/CDP, optionally with a named persistent operator profile.
+
+    operator_profile resolves only below the dedicated managed profile root and is
+    mutually exclusive with a raw persistent_profile. Named operator profiles use
+    a bounded six-hour default runtime when runtime_seconds is omitted.
 
     Supplying ``chromedriver_executable`` does not select BiDi directly. Grabowski first
     starts the canonical Chrome/CDP worker and returns it when the CDP endpoint becomes
@@ -6499,6 +6735,7 @@ def grabowski_browser_worker_start(
         port=port,
         args=args,
         persistent_profile=persistent_profile,
+        operator_profile=operator_profile,
         runtime_seconds=runtime_seconds,
         chromedriver_executable=chromedriver_executable,
     )

@@ -4,17 +4,14 @@
     "*"
   ],
   "browser_profile_roots": [
-    "${HOME}/.mozilla/firefox",
-    "${HOME}/.config/BraveSoftware/Brave-Browser",
-    "${HOME}/.config/google-chrome",
-    "${HOME}/.config/chromium"
+    "${HOME}/.local/state/grabowski/browser-profiles"
   ],
   "capability_definitions": {
     "artifact_transfer": "Transfer regular files with hash-bound source and destination preconditions.",
     "audit_verify": "Verify the tamper-evident write audit chain.",
     "audit_read": "Read bounded safe fields from the verified audit chain without granting audit mutation authority.",
-    "browser_profile_read": "Read bounded browser profile metadata and text under explicit browser profile roots; binary databases are metadata-only.",
-    "browser_worker": "Start and control isolated agent-owned browser workers with loopback-only debugging.",
+    "browser_profile_read": "Read bounded browser profile metadata and text under explicit browser profile roots; managed operator browser profiles are always opaque.",
+    "browser_worker": "Start and control isolated agent-owned browser workers with loopback-only debugging and optional named managed persistent profiles.",
     "bundle_registry": "Read the curated Lens/repoLens latest-complete bundle registry.",
     "bureau_mutation": "Use only the typed Bureau candidate, proposal, review, publication and coordinated-pickup mutation surfaces without granting generic terminal execution.",
     "maulwurf_recovery_control": "Toggle only the local der-kleine-Maulwurf NORMAL/RECOVERY marker; grants no generic file or terminal authority.",
@@ -202,10 +199,7 @@
         "*"
       ],
       "browser_profile_roots": [
-        "${HOME}/.mozilla/firefox",
-        "${HOME}/.config/BraveSoftware/Brave-Browser",
-        "${HOME}/.config/google-chrome",
-        "${HOME}/.config/chromium"
+        "${HOME}/.local/state/grabowski/browser-profiles"
       ],
       "capabilities": [
         "file_read",
@@ -218,7 +212,6 @@
         "secret_reveal",
         "secret_use",
         "secret_export",
-        "browser_profile_read",
         "terminal_execute",
         "bureau_mutation",
         "maulwurf_recovery_control",

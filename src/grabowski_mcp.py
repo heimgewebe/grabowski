@@ -461,6 +461,12 @@ def _agent_instructions_metadata() -> dict[str, Any]:
 
 HOME = Path.home().resolve()
 STATE_DIR = HOME / ".local" / "state" / "grabowski"
+OPERATOR_BROWSER_PROFILE_ROOT = Path(
+    os.environ.get(
+        "GRABOWSKI_OPERATOR_BROWSER_PROFILE_ROOT",
+        str(STATE_DIR / "browser-profiles"),
+    )
+).expanduser()
 POLICY_PATH = HOME / ".config" / "grabowski" / "access.json"
 AUDIT_LOG = STATE_DIR / "write-audit.jsonl"
 QUARANTINE_DIR = STATE_DIR / "quarantine"
@@ -2229,6 +2235,18 @@ def _roots(kind: str, *, ignore_missing: bool = False) -> list[Path]:
 
 def _is_within(path: Path, roots: list[Path]) -> bool:
     return any(path == root or root in path.parents for root in roots)
+
+
+def _operator_browser_profile_root_path() -> Path:
+    root = OPERATOR_BROWSER_PROFILE_ROOT.expanduser()
+    if not root.is_absolute():
+        raise RuntimeError("managed operator browser profile root must be absolute")
+    return Path(os.path.abspath(root))
+
+
+def _is_operator_browser_profile_path(path: Path) -> bool:
+    root = _operator_browser_profile_root_path()
+    return path == root or root in path.parents
 
 
 def _excluded_roots(kind: str) -> list[Path]:
@@ -7167,6 +7185,10 @@ def grabowski_browser_profile_read(
     """Read bounded metadata/text under configured browser profile roots."""
     _require_capability("browser_profile_read")
     target = _resolve_browser_profile_existing(path)
+    if _is_operator_browser_profile_path(target):
+        raise PermissionError(
+            "managed operator browser profiles are opaque and cannot be exported"
+        )
     st = _nofollow_metadata(target)
     kind = (
         "directory"
@@ -12547,6 +12569,562 @@ def _captain_audit_completion(
     )
 
 
+SECRET_PTY_GRIP_ACTION = "operator_secret_pty_getpass_probe"
+SECRET_PTY_GRIP_REFERENCE_TTL_SECONDS = 240
+SECRET_PTY_GRIP_LEASE_TTL_SECONDS = 300
+SECRET_PTY_GRIP_SAFE_BROKER_FIELDS = (
+    "schema_version", "mode", "outcome", "returncode", "timed_out",
+    "retry_safe", "readback_required", "prompt_count",
+    "expected_prompt_count",
+)
+
+
+def _secret_pty_grip_contract() -> tuple[dict[str, Any], dict[str, Any], str]:
+    source = Path(__file__).resolve().parents[1] / "config" / "privileged-actions.example.json"
+    metadata = source.lstat()
+    if source.is_symlink() or not statmod.S_ISREG(metadata.st_mode):
+        raise RuntimeError("secret PTY source contract is not a regular file")
+    if metadata.st_size <= 0 or metadata.st_size > 512 * 1024:
+        raise RuntimeError("secret PTY source contract exceeds its size bound")
+    value = json.loads(source.read_text(encoding="utf-8"))
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schema_version", "actions"}
+        or value.get("schema_version") not in {1, 2}
+        or not isinstance(value.get("actions"), dict)
+    ):
+        raise RuntimeError("secret PTY source contract has invalid top-level shape")
+    action = value["actions"].get(SECRET_PTY_GRIP_ACTION)
+    if not isinstance(action, dict):
+        raise RuntimeError("secret PTY action is absent from the source contract")
+    return value, dict(action), grabowski_grips.sha256_json(action)
+
+
+def _secret_pty_grip_reference(now: int) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "execution": "unprivileged-reference-only",
+        "may_execute": False,
+        "requires_external_privileged_agent": True,
+        "replay_policy": "single-use-external-broker",
+        "action": SECRET_PTY_GRIP_ACTION,
+        "target": "probe",
+        "justification": "T172 typed secret PTY double-getpass probe",
+        "request_id": uuid.uuid4().hex,
+        "created_at_unix": now,
+        "expires_at_unix": now + SECRET_PTY_GRIP_REFERENCE_TTL_SECONDS,
+    }
+    payload["reference_sha256"] = grabowski_grips.sha256_json(payload)
+    return payload
+
+
+def _secret_pty_authority_lease_snapshot(lease: dict[str, Any]) -> dict[str, Any]:
+    fields = (
+        "resource_key", "owner_id", "acquired_at_unix", "updated_at_unix",
+        "expires_at_unix", "metadata_sha256",
+    )
+    if not isinstance(lease, dict) or any(field not in lease for field in fields):
+        raise RuntimeError("secret PTY lease snapshot is incomplete")
+    return {field: lease[field] for field in fields}
+
+
+def _secret_pty_grip_dispatcher(
+    request: dict[str, Any],
+    *,
+    milestone_recorder: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    import grabowski_privileged_broker
+    import grabowski_resources
+
+    def record_milestone(name: str) -> None:
+        if milestone_recorder is not None:
+            milestone_recorder(name)
+
+    if not isinstance(request, dict) or set(request) != {"source_path", "expected_source_sha256"}:
+        raise ValueError("secret PTY grip request shape is invalid")
+    source_path = request["source_path"]
+    expected_sha = request["expected_source_sha256"]
+    _validate_sha256(expected_sha, "expected_source_sha256")
+    _require_mutations_enabled("secret_use", path=source_path, fresh_preflight=True)
+    for capability in ("secret_use", "resource_lease", "privileged_reference", "power_execute"):
+        _require_capability(capability)
+    _require_valid_audit_chain()
+
+    source = _resolve_secret_use_source(source_path)
+    policy = _load_policy()
+    snapshot = _read_bound_regular_bytes(source, _policy_limit(policy, "max_read_bytes"))
+    if snapshot["sha256"] != expected_sha:
+        raise RuntimeError("secret PTY source digest precondition failed")
+
+    config, _action, action_contract_sha256 = _secret_pty_grip_contract()
+    now = int(time.time())
+    reference = _secret_pty_grip_reference(now)
+    execution = grabowski_privileged_broker.resolve_secret_pty_execution(config, reference)
+    if (
+        execution.get("mode") != "secret-pty"
+        or execution.get("prompt_sequence")
+        != ["LUKS passphrase: ", "Repeat LUKS passphrase: "]
+    ):
+        raise RuntimeError("secret PTY source contract is not the fixed double-getpass probe")
+    if snapshot["size"] > int(execution["max_secret_bytes"]):
+        raise ValueError("secret PTY source exceeds the action input bound")
+
+    required_keys = execution.get("required_resource_keys")
+    task_id = execution.get("authority_task_id")
+    if (
+        not isinstance(required_keys, list) or not required_keys
+        or not all(isinstance(key, str) and key for key in required_keys)
+        or not isinstance(task_id, str) or not task_id
+    ):
+        raise RuntimeError("secret PTY authority contract is incomplete")
+    owner_id = f"task:{task_id}"
+    if grabowski_resources.inspect_resources(required_keys):
+        raise PermissionError(
+            "secret PTY required resource lease is already held; no lease is reused or stolen"
+        )
+
+    lease_purpose = "T172 typed secret PTY double-getpass probe"
+    lease_metadata = {
+        "t172_secret_pty_grip": True,
+        "action_contract_sha256": action_contract_sha256,
+        "request_id": reference["request_id"],
+    }
+    expected_lease_metadata_sha256 = grabowski_grips.sha256_json(lease_metadata)
+    acquired: list[dict[str, Any]] | None = None
+    try:
+        lease_result = grabowski_resources.acquire_resources(
+            owner_id,
+            required_keys,
+            purpose=lease_purpose,
+            ttl_seconds=SECRET_PTY_GRIP_LEASE_TTL_SECONDS,
+            metadata=lease_metadata,
+        )
+        preserved = lease_result.get("preserved")
+        candidate_acquired = lease_result.get("leases")
+        if not isinstance(preserved, list) or preserved:
+            raise RuntimeError(
+                "secret PTY resource acquisition must be fresh; preserved leases are forbidden"
+            )
+        if (
+            not isinstance(candidate_acquired, list)
+            or len(candidate_acquired) != len(required_keys)
+        ):
+            raise RuntimeError("secret PTY resource acquisition returned incomplete leases")
+        acquired_by_key = {
+            lease.get("resource_key"): lease
+            for lease in candidate_acquired
+            if isinstance(lease, dict)
+        }
+        if set(acquired_by_key) != set(required_keys):
+            raise RuntimeError("secret PTY resource acquisition returned wrong keys")
+        if any(
+            lease.get("owner_id") != owner_id
+            or lease.get("purpose") != lease_purpose
+            or lease.get("metadata_sha256") != expected_lease_metadata_sha256
+            for lease in acquired_by_key.values()
+        ):
+            raise RuntimeError(
+                "secret PTY resource acquisition is not bound to the current request"
+            )
+        acquired = [dict(acquired_by_key[key]) for key in sorted(required_keys)]
+        authority_leases = [
+            _secret_pty_authority_lease_snapshot(acquired_by_key[key])
+            for key in sorted(required_keys)
+        ]
+        lease_binding_sha256 = grabowski_privileged_broker.canonical_sha256(authority_leases)
+        record_milestone("secret_pty_lease_acquired")
+        _append_audit({
+            "timestamp_unix": int(time.time()),
+            "operation": "secret-pty-grip-lease-acquire",
+            "action": SECRET_PTY_GRIP_ACTION,
+            "owner_id": owner_id,
+            "resource_keys": sorted(required_keys),
+            "lease_binding_sha256": lease_binding_sha256,
+            "action_contract_sha256": action_contract_sha256,
+            "source_sha256": snapshot["sha256"],
+        })
+
+        authority: dict[str, Any] = {
+            "schema_version": 1,
+            "kind": "grabowski_secret_pty_session_authority",
+            "task_id": task_id,
+            "host": execution["authority_host"],
+            "session_id": uuid.uuid4().hex,
+            "action": SECRET_PTY_GRIP_ACTION,
+            "action_schema": execution["action_schema"],
+            "privilege_context": execution["privilege_context"],
+            "lease_owner_id": owner_id,
+            "resource_leases": authority_leases,
+            "resource_lease_bindings_sha256": lease_binding_sha256,
+            "created_at_unix": now,
+            "expires_at_unix": min(
+            int(reference["expires_at_unix"]),
+            min(int(item["expires_at_unix"]) for item in authority_leases),
+        ),
+            "timeout_seconds": execution["timeout_seconds"],
+            "input_max_bytes": execution["max_secret_bytes"],
+            "output_max_bytes": execution["max_output_bytes"],
+            "source_sha256": snapshot["sha256"],
+            "argv_sha256": grabowski_privileged_broker.canonical_sha256(execution["argv"]),
+            "redaction_contract_sha256": execution["redaction_contract_sha256"],
+        }
+        authority["authority_sha256"] = grabowski_privileged_broker.canonical_sha256(authority)
+        grabowski_privileged_broker.validate_secret_pty_session_authority(authority, execution)
+
+        temp_root = _state_subdir(STATE_DIR / "secret-pty-grip")
+        reference_path = temp_root / f"reference-{reference['request_id']}.json"
+        authority_path = temp_root / f"authority-{authority['session_id']}.json"
+        temporary_paths = [reference_path, authority_path]
+        secret_reference: dict[str, Any] | None = None
+        primary_error: BaseException | None = None
+        command_result: dict[str, Any] | None = None
+        broker_public: dict[str, Any] | None = None
+        temporary_cleaned = False
+        lease_released = False
+    except BaseException as exc:
+        cleanup_leases = acquired
+        cleanup_keys = sorted(required_keys) if cleanup_leases is not None else []
+        acquisition_state = "known"
+        if cleanup_leases is None:
+            try:
+                observed = grabowski_resources.inspect_resources(required_keys)
+                if not isinstance(observed, dict):
+                    raise RuntimeError(
+                        "secret PTY ambiguous acquisition readback has invalid shape"
+                    )
+                if set(observed) - set(required_keys):
+                    raise RuntimeError(
+                        "secret PTY ambiguous acquisition readback contains unexpected keys"
+                    )
+                observed_keys = sorted(observed)
+                observed_leases = [observed[key] for key in observed_keys]
+                if any(
+                    not isinstance(lease, dict)
+                    or lease.get("owner_id") != owner_id
+                    or lease.get("purpose") != lease_purpose
+                    or lease.get("metadata_sha256")
+                    != expected_lease_metadata_sha256
+                    for lease in observed_leases
+                ):
+                    raise RuntimeError(
+                        "secret PTY ambiguous acquisition readback is not owned by this request"
+                    )
+                cleanup_leases = [dict(lease) for lease in observed_leases]
+                cleanup_keys = observed_keys
+                if not observed_keys:
+                    acquisition_state = "absent"
+                elif set(observed_keys) == set(required_keys):
+                    acquisition_state = "reconciled-full"
+                else:
+                    acquisition_state = "reconciled-partial"
+            except BaseException as reconcile_exc:
+                _append_audit({
+                    "timestamp_unix": int(time.time()),
+                    "operation": "secret-pty-grip-acquisition-unclear",
+                    "action": SECRET_PTY_GRIP_ACTION,
+                    "owner_id": owner_id,
+                    "resource_keys": sorted(required_keys),
+                    "action_contract_sha256": action_contract_sha256,
+                    "request_id": reference["request_id"],
+                    "error_type": type(exc).__name__,
+                    "reconcile_error_type": type(reconcile_exc).__name__,
+                })
+                raise RuntimeError(
+                    "secret PTY resource acquisition outcome is unclear; exact lease readback is required"
+                ) from reconcile_exc
+
+        cleanup_released = not cleanup_keys
+        if cleanup_keys:
+            try:
+                released = grabowski_resources.release_resources(
+                    owner_id,
+                    cleanup_keys,
+                    force=False,
+                    expected_leases=cleanup_leases,
+                )
+                released_rows = released.get("released")
+                cleanup_released = (
+                    isinstance(released_rows, list)
+                    and {item.get("resource_key") for item in released_rows}
+                    == set(cleanup_keys)
+                    and not grabowski_resources.inspect_resources(cleanup_keys)
+                )
+            except BaseException as cleanup_exc:
+                _append_audit({
+                    "timestamp_unix": int(time.time()),
+                    "operation": "secret-pty-grip-preexecution-cleanup-failed",
+                    "action": SECRET_PTY_GRIP_ACTION,
+                    "owner_id": owner_id,
+                    "resource_keys": sorted(required_keys),
+                    "cleanup_resource_keys": cleanup_keys,
+                    "action_contract_sha256": action_contract_sha256,
+                    "request_id": reference["request_id"],
+                    "acquisition_state": acquisition_state,
+                    "error_type": type(exc).__name__,
+                    "cleanup_error_type": type(cleanup_exc).__name__,
+                    "lease_cleanup_complete": False,
+                })
+                raise RuntimeError(
+                    "secret PTY pre-execution lease cleanup failed"
+                ) from cleanup_exc
+            if not cleanup_released:
+                cleanup_exc = RuntimeError(
+                    "secret PTY pre-execution lease cleanup did not release the exact observed lease set"
+                )
+                _append_audit({
+                    "timestamp_unix": int(time.time()),
+                    "operation": "secret-pty-grip-preexecution-cleanup-failed",
+                    "action": SECRET_PTY_GRIP_ACTION,
+                    "owner_id": owner_id,
+                    "resource_keys": sorted(required_keys),
+                    "cleanup_resource_keys": cleanup_keys,
+                    "action_contract_sha256": action_contract_sha256,
+                    "request_id": reference["request_id"],
+                    "acquisition_state": acquisition_state,
+                    "error_type": type(exc).__name__,
+                    "cleanup_error_type": type(cleanup_exc).__name__,
+                    "lease_cleanup_complete": False,
+                })
+                raise RuntimeError(
+                    "secret PTY pre-execution lease cleanup failed"
+                ) from cleanup_exc
+
+        _append_audit({
+            "timestamp_unix": int(time.time()),
+            "operation": "secret-pty-grip-preexecution-failed",
+            "action": SECRET_PTY_GRIP_ACTION,
+            "owner_id": owner_id,
+            "resource_keys": sorted(required_keys),
+            "cleanup_resource_keys": cleanup_keys,
+            "action_contract_sha256": action_contract_sha256,
+            "request_id": reference["request_id"],
+            "acquisition_state": acquisition_state,
+            "lease_cleanup_complete": cleanup_released,
+            "error_type": type(exc).__name__,
+        })
+        raise RuntimeError(
+            "secret PTY grip failed before broker execution"
+        ) from exc
+    try:
+        _write_json_evidence(reference_path, reference)
+        _write_json_evidence(authority_path, authority)
+        os.chmod(reference_path, 0o600)
+        os.chmod(authority_path, 0o600)
+
+        secret_reference = _materialize_secret_reference(snapshot["data"])
+        secret_fd = secret_reference.get("fd")
+        if not isinstance(secret_fd, int):
+            raise PermissionError(
+                "secret PTY grip requires memfd-backed inherited descriptor transport"
+            )
+        record_milestone("secret_pty_broker_client_invocation_attempted")
+        command_result = _run_secret_command(
+            [
+                "/usr/local/bin/grabowski-privileged-request",
+                str(reference_path),
+                "--secret-fd-path", str(secret_reference["path"]),
+                "--secret-sha256", snapshot["sha256"],
+                "--session-authority-file", str(authority_path),
+            ],
+            cwd=Path("/"),
+            environment=_secret_use_environment(None, snapshot["data"]),
+            pass_fd=secret_fd,
+            timeout_seconds=int(execution["timeout_seconds"]) + 15,
+            max_output_bytes=min(int(execution["max_output_bytes"]), 512 * 1024),
+            secret_data=snapshot["data"],
+        )
+        record_milestone("secret_pty_broker_client_returned")
+        try:
+            parsed = json.loads(command_result["stdout"].strip())
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("secret PTY broker client returned non-JSON output") from exc
+        if not isinstance(parsed, dict):
+            raise RuntimeError("secret PTY broker response is not an object")
+        broker_public = {
+            field: parsed.get(field)
+            for field in SECRET_PTY_GRIP_SAFE_BROKER_FIELDS
+            if field in parsed
+        }
+        broker_public["failure_reason_present"] = parsed.get("failure_reason") is not None
+    except BaseException as exc:
+        primary_error = exc
+    finally:
+        if secret_reference is not None:
+            _cleanup_secret_reference(secret_reference)
+        clean_errors: list[str] = []
+        for path in temporary_paths:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                clean_errors.append(type(exc).__name__)
+        temporary_cleaned = not clean_errors and all(not path.exists() for path in temporary_paths)
+        try:
+            released = grabowski_resources.release_resources(
+                owner_id, required_keys, force=False, expected_leases=acquired
+            )
+            released_rows = released.get("released")
+            lease_released = (
+                isinstance(released_rows, list)
+                and {item.get("resource_key") for item in released_rows} == set(required_keys)
+                and not grabowski_resources.inspect_resources(required_keys)
+            )
+            _append_audit({
+                "timestamp_unix": int(time.time()),
+                "operation": "secret-pty-grip-lease-release",
+                "action": SECRET_PTY_GRIP_ACTION,
+                "owner_id": owner_id,
+                "resource_keys": sorted(required_keys),
+                "lease_binding_sha256": lease_binding_sha256,
+                "released": lease_released,
+            })
+        except BaseException as exc:
+            if primary_error is None:
+                primary_error = exc
+            lease_released = False
+
+    broker_client_returncode = (
+        command_result.get("returncode")
+        if isinstance(command_result, dict)
+        else None
+    )
+    broker_client_timed_out = (
+        command_result.get("timed_out")
+        if isinstance(command_result, dict)
+        else None
+    )
+    raw_redaction_count = (
+        command_result.get("redaction_count")
+        if isinstance(command_result, dict)
+        else None
+    )
+    redaction_count = (
+        raw_redaction_count
+        if isinstance(raw_redaction_count, int)
+        and not isinstance(raw_redaction_count, bool)
+        and raw_redaction_count >= 0
+        else None
+    )
+    stdout_text = (
+        command_result.get("stdout")
+        if isinstance(command_result, dict)
+        else None
+    )
+    stderr_text = (
+        command_result.get("stderr")
+        if isinstance(command_result, dict)
+        else None
+    )
+    output_clean = (
+        redaction_count == 0
+        and isinstance(stdout_text, str)
+        and isinstance(stderr_text, str)
+        and not _contains_secret_variant(stdout_text, snapshot["data"])
+        and not _contains_secret_variant(stderr_text, snapshot["data"])
+    )
+    broker_completion_ok = (
+        isinstance(broker_public, dict)
+        and broker_public.get("mode") == "secret-pty"
+        and broker_public.get("outcome") == "COMPLETED"
+        and broker_public.get("returncode") == 0
+        and broker_public.get("timed_out") is False
+        and broker_public.get("retry_safe") is False
+        and broker_public.get("readback_required") is False
+        and broker_public.get("prompt_count")
+        == broker_public.get("expected_prompt_count")
+        == 2
+        and broker_public.get("failure_reason_present") is False
+        and broker_client_returncode == 0
+        and broker_client_timed_out is False
+    )
+    if primary_error is None and not all(
+        (broker_completion_ok, output_clean, temporary_cleaned, lease_released)
+    ):
+        primary_error = RuntimeError(
+            "secret PTY broker completion, redaction, or cleanup contract failed"
+        )
+
+    if primary_error is not None:
+        try:
+            _append_audit_with_digest({
+                "timestamp_unix": int(time.time()),
+                "operation": "secret-pty-getpass-probe-failed",
+                "action": SECRET_PTY_GRIP_ACTION,
+                "source_sha256": snapshot["sha256"],
+                "source_size": snapshot["size"],
+                "action_contract_sha256": action_contract_sha256,
+                "reference_sha256": reference["reference_sha256"],
+                "authority_sha256": authority["authority_sha256"],
+                "lease_binding_sha256": lease_binding_sha256,
+                "broker_client_returncode": broker_client_returncode,
+                "broker_client_timed_out": broker_client_timed_out,
+                "broker_response_observed": broker_public is not None,
+                "broker_completion_ok": broker_completion_ok,
+                "temporary_authority_cleaned": temporary_cleaned,
+                "host_lease_released": lease_released,
+                "redaction_count": redaction_count,
+                "secret_output_redacted": output_clean,
+                "retry_safe": False,
+                "error_type": type(primary_error).__name__,
+            })
+        except BaseException as audit_exc:
+            raise RuntimeError(
+                "secret PTY grip failure audit could not be persisted"
+            ) from audit_exc
+        raise RuntimeError(
+            "secret PTY grip execution failed after cleanup/readback"
+        ) from primary_error
+    if command_result is None or broker_public is None or redaction_count is None:
+        raise RuntimeError("secret PTY grip lacks broker execution evidence")
+
+    result = {
+        "schema_version": 1,
+        "action": SECRET_PTY_GRIP_ACTION,
+        "source_path": str(source),
+        "source_sha256": snapshot["sha256"],
+        "source_size": snapshot["size"],
+        "secret_transport": (
+            secret_reference.get("transport") if isinstance(secret_reference, dict) else None
+        ),
+        "action_contract_sha256": action_contract_sha256,
+        "reference_sha256": reference["reference_sha256"],
+        "authority_sha256": authority["authority_sha256"],
+        "lease_owner_id": owner_id,
+        "lease_binding_sha256": lease_binding_sha256,
+        "lease_bound": True,
+        "broker": broker_public,
+        "broker_client_returncode": broker_client_returncode,
+        "broker_client_timed_out": broker_client_timed_out,
+        "redaction_count": redaction_count,
+        "secret_output_redacted": True,
+        "temporary_artifact_count": len(temporary_paths),
+        "temporary_authority_cleaned": True,
+        "host_lease_released": True,
+        "retry_safe": False,
+    }
+    record_milestone("secret_pty_domain_effect_completed")
+    result_sha256 = grabowski_grips.sha256_json(result)
+    result["audit_record_sha256"] = _append_audit_with_digest({
+        "timestamp_unix": int(time.time()),
+        "operation": "secret-pty-getpass-probe",
+        "action": SECRET_PTY_GRIP_ACTION,
+        "source_sha256": snapshot["sha256"],
+        "source_size": snapshot["size"],
+        "action_contract_sha256": action_contract_sha256,
+        "reference_sha256": reference["reference_sha256"],
+        "authority_sha256": authority["authority_sha256"],
+        "lease_binding_sha256": lease_binding_sha256,
+        "broker_result_sha256": grabowski_grips.sha256_json(broker_public),
+        "result_sha256": result_sha256,
+        "temporary_authority_cleaned": True,
+        "host_lease_released": True,
+        "redaction_count": redaction_count,
+        "retry_safe": False,
+    })
+    return result
+
+
 def _n8n_secret_loader(
     action: str,
     secret_path: str,
@@ -12715,6 +13293,57 @@ def _operator_obligation_gate_audit_complete(
     )
 
 
+def _grip_result_readback_runtime_preflight() -> tuple[dict[str, Any], str | None]:
+    deployment = _deployment_metadata()
+    binding = {
+        "release_id": deployment.get("release_id"),
+        "repo_head": deployment.get("repo_head"),
+        "entrypoint_contract_sha256": deployment.get("entrypoint_contract_sha256"),
+    }
+    if (
+        not isinstance(binding["release_id"], str)
+        or not binding["release_id"]
+        or not isinstance(binding["repo_head"], str)
+        or re.fullmatch(r"[0-9a-f]{40}", binding["repo_head"]) is None
+        or not isinstance(binding["entrypoint_contract_sha256"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", binding["entrypoint_contract_sha256"])
+        is None
+    ):
+        raise RuntimeError(
+            "durable grip result readback requires an exact deployed runtime binding"
+        )
+    if (
+        deployment.get("completion_status") != "complete"
+        or deployment.get("runtime_binding_valid") is not True
+        or deployment.get("artifact_integrity_valid") is not True
+        or deployment.get("entrypoint_contract_identity_valid") is not True
+    ):
+        return binding, "deployment-integrity-invalid"
+    try:
+        serving = grabowski_serving_process.identity(
+            current_release_id=binding["release_id"],
+            current_repo_head=binding["repo_head"],
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        return binding, f"serving-process-readback-{type(exc).__name__}"
+    if (
+        serving.get("matches_deployed_manifest") is not True
+        or serving.get("process_release_id") != binding["release_id"]
+        or serving.get("process_repo_head") != binding["repo_head"]
+    ):
+        return binding, "serving-process-mismatch"
+    return binding, None
+
+
+def _grip_result_readback_runtime_binding() -> dict[str, Any]:
+    binding, blocker = _grip_result_readback_runtime_preflight()
+    if blocker is not None:
+        raise RuntimeError(
+            "durable grip result readback runtime preflight blocked: " + blocker
+        )
+    return binding
+
+
 def _grip_run_core(
     name: str,
     parameters: dict[str, Any] | None = None,
@@ -12723,6 +13352,7 @@ def _grip_run_core(
     ctx: Context | None = None,
     *,
     transport_target_dispatcher: grabowski_grips.TransportTargetDispatcher | None = None,
+    secret_pty_dispatcher: grabowski_grips.SecretPtyDispatcher | None = None,
 ) -> dict[str, Any]:
     """Run one allowlisted Grabowski grip and return its receipt-bound result."""
     grip_capability = grabowski_grips.grip_required_capability(name)
@@ -12989,6 +13619,7 @@ def _grip_run_core(
         allow_mutation=allow_mutation,
         transport_target_dispatcher=transport_target_dispatcher,
         n8n_provider_dispatcher=_n8n_provider_dispatcher,
+        secret_pty_dispatcher=secret_pty_dispatcher or _secret_pty_grip_dispatcher,
     )
     if (
         name == "operator-obligation-close"
@@ -13265,6 +13896,7 @@ async def _grip_run_mcp(
         name, allow_mutation
     )
     loop = asyncio.get_running_loop()
+    server_milestones: set[str] = set()
 
     def target_dispatcher(
         target_tool_name: str,
@@ -13282,16 +13914,85 @@ async def _grip_run_mcp(
         )
         return future.result()
 
+    def tracked_secret_pty_dispatcher(request: dict[str, Any]) -> dict[str, Any]:
+        server_milestones.add("secret_pty_dispatcher_entered")
+        return _secret_pty_grip_dispatcher(
+            request,
+            milestone_recorder=server_milestones.add,
+        )
+
     def run_core() -> dict[str, Any]:
         try:
-            return _grip_run_core(
-                name,
-                effective_parameters,
-                profile,
-                effective_allow_mutation,
-                ctx,
-                transport_target_dispatcher=target_dispatcher,
-            )
+            durable_readback = grabowski_grips.grip_requires_durable_result_readback(name)
+            runtime_binding: dict[str, Any] | None = None
+            runtime_blocker: str | None = None
+            if durable_readback:
+                grabowski_grips.prepare_grip_result_readback_store()
+                runtime_binding, runtime_blocker = (
+                    _grip_result_readback_runtime_preflight()
+                )
+            if runtime_blocker is not None:
+                result = grabowski_grips._blocked_surface_receipt(
+                    name,
+                    dict(effective_parameters or {}),
+                    "durable grip result readback runtime preflight blocked: "
+                    + runtime_blocker,
+                )
+            else:
+                try:
+                    result = _grip_run_core(
+                        name,
+                        effective_parameters,
+                        profile,
+                        effective_allow_mutation,
+                        ctx,
+                        transport_target_dispatcher=target_dispatcher,
+                        secret_pty_dispatcher=(
+                            tracked_secret_pty_dispatcher
+                            if name == "secret-pty-getpass-probe"
+                            else None
+                        ),
+                    )
+                except (
+                    OSError,
+                    PermissionError,
+                    RuntimeError,
+                    TypeError,
+                    ValueError,
+                ) as exc:
+                    if not durable_readback:
+                        raise
+                    reason = (
+                        "durable grip server dispatch failed: "
+                        + type(exc).__name__
+                    )
+                    if "secret_pty_dispatcher_entered" in server_milestones:
+                        result = grabowski_grips._failed_surface_receipt(
+                            name,
+                            dict(effective_parameters or {}),
+                            reason,
+                        )
+                    else:
+                        result = grabowski_grips._blocked_surface_receipt(
+                            name,
+                            dict(effective_parameters or {}),
+                            reason,
+                        )
+            if durable_readback:
+                assert runtime_binding is not None
+                result = dict(result)
+                result["result_readback"] = (
+                    grabowski_grips.persist_grip_result_readback(
+                        name,
+                        result,
+                        tool_name="grip_run",
+                        runtime_binding=runtime_binding,
+                        profile=profile,
+                        allow_mutation=effective_allow_mutation,
+                        server_milestones=server_milestones,
+                    )
+                )
+            return result
         finally:
             if retained_claim_challenge is not None:
                 _discard_pending_transport_target(retained_claim_challenge)

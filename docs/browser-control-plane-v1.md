@@ -96,6 +96,75 @@ Jeder Browserworker least atomar:
 
 Dadurch kann dasselbe persistente Profil nicht gleichzeitig von zwei Workern verwendet werden. Verschiedene persistente Profile bleiben parallel nutzbar. Terminalisierung gibt nur exakt worker-eigene Leases frei; fremde Ersatz-Leases werden nicht übernommen oder gelöscht.
 
+## Benannte persistente Operatorprofile
+
+Für wiederkehrende Providerarbeit darf `grabowski_browser_worker_start` ein benanntes
+`operator_profile` verwenden. Der Name wird ausschließlich unter dem dedizierten,
+explizit als `browser_profile_root` freigegebenen Grabowski-Root
+`~/.local/state/grabowski/browser-profiles` aufgelöst. Normale Desktopprofile wie
+`~/.config/google-chrome` gehören nicht zu diesem Vertrag.
+
+Der managed Root und jedes persistente Profil müssen dem laufenden Benutzer gehören,
+Modus `0700` besitzen und dürfen keine Symlink-Komponenten verwenden. Managed
+Operatorprofile sind für `grabowski_browser_profile_read` vollständig opak; Cookies,
+Tokens, LocalStorage, Preferences und sonstige Profildateien werden nicht als
+MCP-Artefakte oder Text ausgegeben.
+
+Prozess- und Profillebensdauer sind getrennt: Stop oder `RuntimeMaxSec` beendet den
+Worker und gibt seine Leases frei, löscht aber ein persistentes Profil nicht. Ein
+späterer Worker kann dasselbe Profil nach erneutem exklusivem
+`browser-profile:<pfad>`-Lease verwenden. Für benannte Operatorprofile gilt ohne
+explizite Runtime ein weiterhin begrenzter Default von sechs Stunden.
+
+Benannte `operator_profile`-Sessions verwenden ausschließlich den kanonischen
+CDP-Pfad. Der startup-only WebDriver-BiDi-Fallback ist absichtlich nur für eine
+ephemere Primary-/Standby-Kombination zulässig; die Kombination aus
+`operator_profile` und `chromedriver_executable` wird vor Profilerstellung
+fail-closed abgewiesen.
+
+### Live-Policy-Aktivierung
+
+Der Runtime-Deploy ändert die produktive `~/.config/grabowski/access.json` absichtlich
+nicht. Die Umstellung bestehender Trusted-Owner-Installationen auf den dedizierten
+Managed-Browser-Root erfolgt daher separat und fail-closed über den vorhandenen
+Policy-Upgrader. Die Browserroot-Konvergenz ist ausdrücklich opt-in; der normale
+Access-Profile-Upgradepfad behält sein bisheriges Verhalten.
+
+Zuerst nur lesen und die erwartete Änderung samt `before_sha256` und
+`template_sha256` prüfen:
+
+```bash
+python tools/upgrade_access_profiles.py ~/.config/grabowski/access.json \
+  --converge-browser-profile-roots
+```
+
+Erst danach darf genau derselbe Policy- und Template-Snapshot atomar angewendet
+werden:
+
+```bash
+python tools/upgrade_access_profiles.py ~/.config/grabowski/access.json \
+  --expected-sha256 <before_sha256> \
+  --expected-template-sha256 <template_sha256> \
+  --converge-browser-profile-roots \
+  --apply
+```
+
+Diese Migration ersetzt ausschließlich die Top-Level- und Trusted-Owner-
+`browser_profile_roots` durch die im versionierten Trusted-Owner-Template identische
+Rootliste. Sie verändert keine übrige Trusted-Owner-Autorität, verlangt identische
+Top-Level-/Profil-Roots im Template, hält die Policy als private reguläre `0600`-Datei
+und bricht bei Identitäts- oder Hashdrift vor dem atomaren Replace ab. Ein Runtime-
+Deploy und diese Policy-Migration sind daher zwei getrennte, jeweils belegpflichtige
+Effekte.
+
+Der Workerstatus prüft bei laufenden CDP-Workern zusätzlich die lokale Target-Ebene.
+Ein laufender systemd-Prozess ohne mindestens ein steuerbares, zum lokalen
+Worker-Port gehörendes CDP-Seitentarget wird als `target_unavailable` und
+handlungsbedürftig projiziert. Mehrere gesunde Tabs oder Popups bleiben dagegen
+steuerbar und lösen keinen künstlichen Restart aus. Das autorisiert keinen
+unkontrollierten Retry: der Worker wird kontrolliert beendet und neu gestartet; nur
+bei persistentem Profil darf derselbe Profilzustand wiederverwendet werden.
+
 ## Öffentliche Projektion
 
 Bestehende Workerfelder und History-Semantik bleiben erhalten. Browserworker erhalten zusätzlich `control_plane` mit:

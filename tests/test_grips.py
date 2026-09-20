@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
@@ -7,6 +8,7 @@ import hashlib
 import inspect
 import json
 import sqlite3
+import stat as statmod
 import subprocess
 import sys
 import tempfile
@@ -45,6 +47,7 @@ if "mcp" not in sys.modules:
     sys.modules["mcp.types"] = fake_types
 
 import grabowski_grips as grips
+import grabowski_effect_receipt as effect_receipt
 import grabowski_grip_orchestration as grip_orchestration
 import grabowski_sagas as sagas
 import grabowski_merge_guard as merge_guard
@@ -623,6 +626,28 @@ class FakeGh:
         self.merged = False
         self.calls: list[tuple[str, ...]] = []
 
+    @staticmethod
+    def _bounded_api_page(payload: object, endpoint: str) -> object:
+        if (
+            not isinstance(payload, list)
+            or not payload
+            or not all(isinstance(page, list) for page in payload)
+        ):
+            return deepcopy(payload)
+        page_number = 1
+        if "?" in endpoint:
+            for field in endpoint.split("?", 1)[1].split("&"):
+                if field.startswith("page="):
+                    try:
+                        page_number = int(field.split("=", 1)[1])
+                    except ValueError:
+                        return None
+                    break
+        if page_number < 1:
+            return None
+        index = page_number - 1
+        return deepcopy(payload[index]) if index < len(payload) else []
+
     def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
         self.calls.append(tuple(argv))
         if argv[:2] == ["pr", "list"]:
@@ -740,19 +765,22 @@ class FakeGh:
                 }
             if "/issues/comments/" in endpoint and "/reactions" in endpoint:
                 if isinstance(state, dict) and "reaction_pages" in state:
-                    payload = state["reaction_pages"]
+                    pages = state["reaction_pages"]
                 else:
                     reactions = state.get("reactions", []) if isinstance(state, dict) else []
-                    payload = [reactions]
+                    pages = [reactions]
+                payload = self._bounded_api_page(pages, endpoint)
                 return {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""}
             if "/issues/" in endpoint and "/comments?per_page=100" in endpoint:
-                payload = state.get("request_pages") if isinstance(state, dict) else None
+                pages = state.get("request_pages") if isinstance(state, dict) else None
+                payload = self._bounded_api_page(pages, endpoint)
                 return {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""}
             if "/issues/comments/" in endpoint:
                 payload = state.get("request_comment") if isinstance(state, dict) else None
                 return {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""}
             if "/pulls/" in endpoint and "/reviews?per_page=100" in endpoint:
-                payload = state.get("review_pages") if isinstance(state, dict) else None
+                pages = state.get("review_pages") if isinstance(state, dict) else None
+                payload = self._bounded_api_page(pages, endpoint)
                 return {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""}
             if "/pulls/" in endpoint and "/reviews/" in endpoint:
                 payload = state.get("review") if isinstance(state, dict) else None
@@ -1484,6 +1512,8 @@ class GripFoundationTests(unittest.TestCase):
                 "forrest-server-exit-apply",
                 "n8n-workflow-edge-apply",
                 "n8n-workflow-edge-verify",
+                "secret-pty-getpass-probe",
+                "grip-result-readback",
                 "checkout-binding-terminal-apply",
                 "checkout-binding-terminal-preview",
                 "checkout-binding-identity-rebind-apply",
@@ -10216,6 +10246,638 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("cat", env["GIT_PAGER"])
         self.assertEqual("cat", env["PAGER"])
 
+class SecretPtyGripTests(unittest.TestCase):
+    def _success_output(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "action_contract_sha256": "b" * 64,
+            "lease_binding_sha256": "c" * 64,
+            "lease_owner_id": "task:GRABOWSKI-OPERATOR-SURFACE-V1-T172",
+            "lease_bound": True,
+            "secret_output_redacted": True,
+            "redaction_count": 0,
+            "temporary_artifact_count": 2,
+            "temporary_authority_cleaned": True,
+            "host_lease_released": True,
+            "retry_safe": False,
+            "broker_client_returncode": 0,
+            "broker_client_timed_out": False,
+            "broker": {
+                "schema_version": 1,
+                "mode": "secret-pty",
+                "outcome": "COMPLETED",
+                "returncode": 0,
+                "timed_out": False,
+                "retry_safe": False,
+                "readback_required": False,
+                "prompt_count": 2,
+                "expected_prompt_count": 2,
+                "failure_reason_present": False,
+            },
+        }
+
+    def test_secret_pty_grip_is_high_risk_power_execute_surface(self) -> None:
+        spec = {
+            item["name"]: item
+            for item in grips.list_grips(profile="operator")
+        }["secret-pty-getpass-probe"]
+        self.assertEqual("mutating", spec["effect"])
+        self.assertEqual("high", spec["risk"])
+        self.assertEqual("power_execute", spec["required_capability"])
+        self.assertNotIn("secret-pty-getpass-probe", grips.MECHANIC_NORMAL_GRIPS)
+
+    def test_secret_pty_grip_passes_only_complete_cleanup_bound_result(self) -> None:
+        observed: list[dict[str, object]] = []
+
+        def dispatch(request):
+            observed.append(dict(request))
+            return self._success_output()
+
+        result = grips.run_grip(
+            "secret-pty-getpass-probe",
+            {
+                "source_path": "/private/value",
+                "expected_source_sha256": "a" * 64,
+            },
+            allow_mutation=True,
+            secret_pty_dispatcher=dispatch,
+        )
+        self.assertEqual("passed", result["status"])
+        self.assertEqual(
+            [{
+                "source_path": "/private/value",
+                "expected_source_sha256": "a" * 64,
+            }],
+            observed,
+        )
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        for check_id in (
+            "secret-hash-bound",
+            "broker-contract-bound",
+            "exclusive-host-lease-bound",
+            "double-getpass-complete",
+            "secret-output-redacted",
+            "temporary-authority-cleaned",
+            "host-lease-released",
+            "retry-locked",
+        ):
+            self.assertEqual("pass", checks[check_id])
+
+    def test_secret_pty_grip_fails_closed_on_unclear_broker_result(self) -> None:
+        output = self._success_output()
+        output["broker"] = {
+            **output["broker"],
+            "outcome": "UNCLEAR",
+            "returncode": 1,
+            "readback_required": True,
+            "failure_reason_present": True,
+        }
+        result = grips.run_grip(
+            "secret-pty-getpass-probe",
+            {
+                "source_path": "/private/value",
+                "expected_source_sha256": "a" * 64,
+            },
+            allow_mutation=True,
+            secret_pty_dispatcher=lambda _request: output,
+        )
+        self.assertEqual("failed", result["status"])
+        self.assertFalse(result["output"]["retry_safe"])
+        self.assertNotIn("broker", result["output"])
+
+    def test_secret_pty_grip_fails_closed_on_broker_client_failure(self) -> None:
+        output = self._success_output()
+        output["broker_client_returncode"] = 1
+        result = grips.run_grip(
+            "secret-pty-getpass-probe",
+            {
+                "source_path": "/private/value",
+                "expected_source_sha256": "a" * 64,
+            },
+            allow_mutation=True,
+            secret_pty_dispatcher=lambda _request: output,
+        )
+        self.assertEqual("failed", result["status"])
+        self.assertEqual(
+            "secret PTY probe violated its fail-closed completion or cleanup contract",
+            result["output"]["error"],
+        )
+        self.assertFalse(result["output"]["retry_safe"])
+
+    def test_secret_pty_grip_fails_closed_when_retry_is_not_locked(self) -> None:
+        output = self._success_output()
+        output["retry_safe"] = True
+        result = grips.run_grip(
+            "secret-pty-getpass-probe",
+            {
+                "source_path": "/private/value",
+                "expected_source_sha256": "a" * 64,
+            },
+            allow_mutation=True,
+            secret_pty_dispatcher=lambda _request: output,
+        )
+        self.assertEqual("failed", result["status"])
+        checks = {
+            item["id"]: item["status"]
+            for item in result["receipt"]["checks"]
+        }
+        self.assertEqual("fail", checks["retry-locked"])
+        self.assertFalse(result["output"]["retry_safe"])
+        self.assertNotIn("broker", result["output"])
+
+    def test_secret_pty_grip_rejects_caller_authority_fields(self) -> None:
+        result = grips.run_grip(
+            "secret-pty-getpass-probe",
+            {
+                "source_path": "/private/value",
+                "expected_source_sha256": "a" * 64,
+                "task_id": "caller-selected",
+            },
+            allow_mutation=True,
+            secret_pty_dispatcher=lambda _request: self._success_output(),
+        )
+        self.assertEqual("blocked", result["status"])
+        self.assertIn("unknown secret PTY grip field", result["output"]["error"])
+
+
+class GripResultReadbackTests(unittest.TestCase):
+    @staticmethod
+    def _allowed_session_decision() -> dict[str, object]:
+        return {
+            "allowed": True,
+            "session_profile": {"profile": "trusted-owner"},
+        }
+
+    def _run_mcp_secret_probe(
+        self,
+        parameters: dict[str, object],
+        *,
+        dispatcher,
+    ) -> dict[str, object]:
+        import grabowski_mcp as mcp_module
+
+        with patch.object(mcp_module, "_require_capability"), patch.object(
+            mcp_module, "_require_mutations_enabled"
+        ), patch.object(
+            mcp_module,
+            "_session_grip_policy_decision",
+            return_value=self._allowed_session_decision(),
+        ), patch.object(
+            mcp_module,
+            "_grip_result_readback_runtime_preflight",
+            return_value=(
+                {
+                    "release_id": "test-release",
+                    "repo_head": "b" * 40,
+                    "entrypoint_contract_sha256": "c" * 64,
+                },
+                None,
+            ),
+        ), patch.object(
+            mcp_module, "_secret_pty_grip_dispatcher", side_effect=dispatcher
+        ):
+            return asyncio.run(
+                mcp_module._grip_run_mcp(
+                    "secret-pty-getpass-probe",
+                    parameters,
+                    profile="operator",
+                    allow_mutation=True,
+                )
+            )
+
+    def test_runtime_binding_requires_exact_current_serving_process(self) -> None:
+        import grabowski_mcp as mcp_module
+
+        deployment = {
+            "completion_status": "complete",
+            "runtime_binding_valid": True,
+            "artifact_integrity_valid": True,
+            "entrypoint_contract_identity_valid": True,
+            "release_id": "release-a",
+            "repo_head": "b" * 40,
+            "entrypoint_contract_sha256": "c" * 64,
+        }
+        current = {
+            "matches_deployed_manifest": True,
+            "process_release_id": "release-a",
+            "process_repo_head": "b" * 40,
+        }
+        with patch.object(
+            mcp_module, "_deployment_metadata", return_value=deployment
+        ), patch.object(
+            mcp_module.grabowski_serving_process,
+            "identity",
+            return_value=current,
+        ) as identity:
+            binding, blocker = mcp_module._grip_result_readback_runtime_preflight()
+            self.assertIsNone(blocker)
+            self.assertEqual(
+                {
+                    "release_id": "release-a",
+                    "repo_head": "b" * 40,
+                    "entrypoint_contract_sha256": "c" * 64,
+                },
+                binding,
+            )
+            self.assertEqual(
+                binding,
+                mcp_module._grip_result_readback_runtime_binding(),
+            )
+        self.assertEqual(2, identity.call_count)
+        identity.assert_called_with(
+            current_release_id="release-a",
+            current_repo_head="b" * 40,
+        )
+
+        for projection in (
+            {
+                "matches_deployed_manifest": False,
+                "process_release_id": "release-old",
+                "process_repo_head": "d" * 40,
+            },
+            {
+                "matches_deployed_manifest": None,
+                "process_release_id": None,
+                "process_repo_head": None,
+            },
+        ):
+            with self.subTest(projection=projection), patch.object(
+                mcp_module, "_deployment_metadata", return_value=deployment
+            ), patch.object(
+                mcp_module.grabowski_serving_process,
+                "identity",
+                return_value=projection,
+            ):
+                binding, blocker = mcp_module._grip_result_readback_runtime_preflight()
+                self.assertEqual("serving-process-mismatch", blocker)
+                self.assertEqual("release-a", binding["release_id"])
+                with self.assertRaisesRegex(
+                    RuntimeError, "runtime preflight blocked"
+                ):
+                    mcp_module._grip_result_readback_runtime_binding()
+
+    def test_runtime_binding_requires_integrity_valid_deployment(self) -> None:
+        import grabowski_mcp as mcp_module
+
+        deployment = {
+            "completion_status": "complete",
+            "runtime_binding_valid": True,
+            "artifact_integrity_valid": False,
+            "entrypoint_contract_identity_valid": True,
+            "release_id": "release-a",
+            "repo_head": "b" * 40,
+            "entrypoint_contract_sha256": "c" * 64,
+        }
+        with patch.object(
+            mcp_module, "_deployment_metadata", return_value=deployment
+        ), patch.object(
+            mcp_module.grabowski_serving_process, "identity"
+        ) as identity:
+            binding, blocker = mcp_module._grip_result_readback_runtime_preflight()
+            self.assertEqual("deployment-integrity-invalid", blocker)
+            self.assertEqual("release-a", binding["release_id"])
+            with self.assertRaisesRegex(RuntimeError, "runtime preflight blocked"):
+                mcp_module._grip_result_readback_runtime_binding()
+        identity.assert_not_called()
+
+    def test_runtime_preflight_block_is_persisted_before_dispatch(self) -> None:
+        import grabowski_mcp as mcp_module
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            grips,
+            "GRIP_RESULT_READBACK_ROOT",
+            Path(directory) / "grip-result-readback",
+        ), patch.object(
+            mcp_module, "_require_capability"
+        ), patch.object(
+            mcp_module,
+            "_grip_result_readback_runtime_preflight",
+            return_value=(
+                {
+                    "release_id": "test-release",
+                    "repo_head": "b" * 40,
+                    "entrypoint_contract_sha256": "c" * 64,
+                },
+                "serving-process-mismatch",
+            ),
+        ), patch.object(
+            mcp_module, "_secret_pty_grip_dispatcher"
+        ) as dispatcher:
+            result = asyncio.run(
+                mcp_module._grip_run_mcp(
+                    "secret-pty-getpass-probe",
+                    {
+                        "source_path": "/private/value",
+                        "expected_source_sha256": "a" * 64,
+                    },
+                    profile="operator",
+                    allow_mutation=True,
+                )
+            )
+            dispatcher.assert_not_called()
+            self.assertEqual("blocked", result["status"])
+            self.assertEqual("preflight", result["receipt"]["phase"])
+            readback = grips.read_grip_result_readback(result["receipt_sha256"])
+            self.assertFalse(
+                readback["effect_boundary"]["secret_pty_dispatcher_entered"]
+            )
+            self.assertEqual(
+                "test-release", readback["runtime_binding"]["release_id"]
+            )
+
+    def test_outer_pre_dispatch_exception_is_persisted_as_blocked(self) -> None:
+        import grabowski_mcp as mcp_module
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            grips,
+            "GRIP_RESULT_READBACK_ROOT",
+            Path(directory) / "grip-result-readback",
+        ), patch.object(
+            mcp_module, "_require_capability"
+        ), patch.object(
+            mcp_module,
+            "_grip_result_readback_runtime_preflight",
+            return_value=(
+                {
+                    "release_id": "test-release",
+                    "repo_head": "b" * 40,
+                    "entrypoint_contract_sha256": "c" * 64,
+                },
+                None,
+            ),
+        ), patch.object(
+            mcp_module,
+            "_grip_run_core",
+            side_effect=PermissionError("synthetic gate"),
+        ):
+            result = asyncio.run(
+                mcp_module._grip_run_mcp(
+                    "secret-pty-getpass-probe",
+                    {
+                        "source_path": "/private/value",
+                        "expected_source_sha256": "a" * 64,
+                    },
+                    profile="operator",
+                    allow_mutation=True,
+                )
+            )
+            self.assertEqual("blocked", result["status"])
+            readback = grips.read_grip_result_readback(result["receipt_sha256"])
+            self.assertFalse(
+                readback["effect_boundary"]["secret_pty_dispatcher_entered"]
+            )
+
+    def test_missing_readback_is_effect_free(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            grips,
+            "GRIP_RESULT_READBACK_ROOT",
+            Path(directory) / "grip-result-readback",
+        ):
+            root = grips.GRIP_RESULT_READBACK_ROOT
+            self.assertFalse(root.exists())
+            result = grips.grip_run(
+                "grip-result-readback",
+                {"receipt_sha256": "a" * 64},
+                profile="observer",
+            )
+            self.assertEqual("blocked", result["status"])
+            self.assertEqual("preflight", result["receipt"]["phase"])
+            self.assertFalse(root.exists())
+
+    def test_result_readback_proves_pre_dispatch_block_without_raw_parameters(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            grips,
+            "GRIP_RESULT_READBACK_ROOT",
+            Path(directory) / "grip-result-readback",
+        ):
+            dispatcher = Mock(side_effect=AssertionError("dispatcher must not run"))
+            result = self._run_mcp_secret_probe(
+                {
+                    "source_path": "relative/path",
+                    "expected_source_sha256": "a" * 64,
+                },
+                dispatcher=dispatcher,
+            )
+            dispatcher.assert_not_called()
+            self.assertEqual("blocked", result["status"])
+            self.assertEqual("preflight", result["receipt"]["phase"])
+            readback = grips.read_grip_result_readback(result["receipt_sha256"])
+            self.assertFalse(
+                readback["effect_boundary"]["secret_pty_dispatcher_entered"]
+            )
+            self.assertFalse(readback["secret_material_persisted"])
+            self.assertEqual("grip_run", readback["tool_name"])
+            self.assertEqual("test-release", readback["runtime_binding"]["release_id"])
+            self.assertEqual("b" * 40, readback["runtime_binding"]["repo_head"])
+            self.assertEqual(
+                grips.sha256_json(readback["runtime_binding"]),
+                readback["runtime_binding_sha256"],
+            )
+            rendered = Path(result["result_readback"]["path"]).read_text(
+                encoding="utf-8"
+            )
+            self.assertNotIn("relative/path", rendered)
+            self.assertNotIn(result["output"]["error"], rendered)
+            self.assertEqual(
+                0o600,
+                statmod.S_IMODE(
+                    Path(result["result_readback"]["path"]).stat().st_mode
+                ),
+            )
+
+    def test_result_readback_proves_dispatcher_entry_before_action_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            grips,
+            "GRIP_RESULT_READBACK_ROOT",
+            Path(directory) / "grip-result-readback",
+        ):
+            dispatcher = Mock(side_effect=RuntimeError("synthetic pre-effect failure"))
+            result = self._run_mcp_secret_probe(
+                {
+                    "source_path": "/private/value",
+                    "expected_source_sha256": "a" * 64,
+                },
+                dispatcher=dispatcher,
+            )
+            dispatcher.assert_called_once()
+            self.assertEqual("failed", result["status"])
+            self.assertEqual("action", result["receipt"]["phase"])
+            readback = grips.grip_run(
+                "grip-result-readback",
+                {"receipt_sha256": result["receipt_sha256"]},
+                profile="observer",
+            )
+            self.assertEqual("passed", readback["status"])
+            self.assertTrue(
+                readback["output"]["effect_boundary"][
+                    "secret_pty_dispatcher_entered"
+                ]
+            )
+            self.assertFalse(readback["output"]["secret_material_persisted"])
+            domain_receipts = effect_receipt.collect_domain_receipts(result)
+            self.assertIn(result["receipt_sha256"], domain_receipts)
+            self.assertIn(
+                result["result_readback"]["result_readback_receipt_sha256"],
+                domain_receipts,
+            )
+            self.assertNotEqual(
+                result["receipt_sha256"],
+                result["result_readback"]["result_readback_receipt_sha256"],
+            )
+            self.assertNotIn(
+                "/private/value",
+                Path(result["result_readback"]["path"]).read_text(encoding="utf-8"),
+            )
+
+    def test_result_readback_binds_completed_domain_effect_milestones(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            grips,
+            "GRIP_RESULT_READBACK_ROOT",
+            Path(directory) / "grip-result-readback",
+        ):
+            def completed_dispatch(_request, *, milestone_recorder=None):
+                self.assertIsNotNone(milestone_recorder)
+                for milestone in (
+                    "secret_pty_lease_acquired",
+                    "secret_pty_broker_client_invocation_attempted",
+                    "secret_pty_broker_client_returned",
+                    "secret_pty_domain_effect_completed",
+                ):
+                    milestone_recorder(milestone)
+                return SecretPtyGripTests()._success_output()
+
+            result = self._run_mcp_secret_probe(
+                {
+                    "source_path": "/private/value",
+                    "expected_source_sha256": "a" * 64,
+                },
+                dispatcher=completed_dispatch,
+            )
+            self.assertEqual("passed", result["status"])
+            readback = grips.read_grip_result_readback(result["receipt_sha256"])
+            self.assertEqual(
+                {
+                    "secret_pty_dispatcher_entered": True,
+                    "secret_pty_lease_acquired": True,
+                    "secret_pty_broker_client_invocation_attempted": True,
+                    "secret_pty_broker_client_returned": True,
+                    "secret_pty_domain_effect_completed": True,
+                },
+                readback["effect_boundary"],
+            )
+
+    def test_effect_receipt_digests_recover_pre_dispatch_and_domain_completion_after_response_loss(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            grips,
+            "GRIP_RESULT_READBACK_ROOT",
+            Path(directory) / "grip-result-readback",
+        ):
+            dispatcher = Mock(side_effect=AssertionError("dispatcher must not run"))
+            direct_result = self._run_mcp_secret_probe(
+                {
+                    "source_path": "relative/path",
+                    "expected_source_sha256": "a" * 64,
+                },
+                dispatcher=dispatcher,
+            )
+            domain_receipts = effect_receipt.collect_domain_receipts(direct_result)
+            self.assertGreaterEqual(len(domain_receipts), 2)
+            del direct_result
+            recovered: list[dict[str, object]] = []
+            for candidate in domain_receipts:
+                readback = grips.grip_run(
+                    "grip-result-readback",
+                    {"receipt_sha256": candidate},
+                    profile="observer",
+                )
+                if readback["status"] == "passed":
+                    recovered.append(readback["output"])
+            self.assertEqual(1, len(recovered))
+            self.assertFalse(
+                recovered[0]["effect_boundary"]["secret_pty_dispatcher_entered"]
+            )
+            dispatcher.assert_not_called()
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            grips,
+            "GRIP_RESULT_READBACK_ROOT",
+            Path(directory) / "grip-result-readback",
+        ):
+            def completed_dispatch(_request, *, milestone_recorder=None):
+                self.assertIsNotNone(milestone_recorder)
+                for milestone in (
+                    "secret_pty_lease_acquired",
+                    "secret_pty_broker_client_invocation_attempted",
+                    "secret_pty_broker_client_returned",
+                    "secret_pty_domain_effect_completed",
+                ):
+                    milestone_recorder(milestone)
+                return SecretPtyGripTests()._success_output()
+
+            direct_result = self._run_mcp_secret_probe(
+                {
+                    "source_path": "/private/value",
+                    "expected_source_sha256": "a" * 64,
+                },
+                dispatcher=completed_dispatch,
+            )
+            domain_receipts = effect_receipt.collect_domain_receipts(direct_result)
+            self.assertGreaterEqual(len(domain_receipts), 2)
+            del direct_result
+            recovered = []
+            for candidate in domain_receipts:
+                readback = grips.grip_run(
+                    "grip-result-readback",
+                    {"receipt_sha256": candidate},
+                    profile="observer",
+                )
+                if readback["status"] == "passed":
+                    recovered.append(readback["output"])
+            self.assertEqual(1, len(recovered))
+            self.assertTrue(
+                recovered[0]["effect_boundary"]["secret_pty_domain_effect_completed"]
+            )
+            self.assertFalse(recovered[0]["secret_material_persisted"])
+
+    def test_result_readback_persistence_is_create_only_and_integrity_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            grips,
+            "GRIP_RESULT_READBACK_ROOT",
+            Path(directory) / "grip-result-readback",
+        ):
+            dispatcher = Mock(side_effect=RuntimeError("synthetic pre-effect failure"))
+            result = self._run_mcp_secret_probe(
+                {
+                    "source_path": "/private/value",
+                    "expected_source_sha256": "a" * 64,
+                },
+                dispatcher=dispatcher,
+            )
+            replay = grips.persist_grip_result_readback(
+                "secret-pty-getpass-probe",
+                result,
+                tool_name="grip_run",
+                runtime_binding={
+                    "release_id": "test-release",
+                    "repo_head": "b" * 40,
+                    "entrypoint_contract_sha256": "c" * 64,
+                },
+                profile="operator",
+                allow_mutation=True,
+                server_milestones={"secret_pty_dispatcher_entered"},
+            )
+            self.assertTrue(replay["replayed"])
+            path = Path(replay["path"])
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["phase"] = "preflight"
+            path.write_text(
+                json.dumps(payload, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "identity or digest"):
+                grips.read_grip_result_readback(result["receipt_sha256"])
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -16193,7 +16855,11 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             self.assertTrue(
                 receipt["diagnostic_evidence_ignored_for_authority"]
             )
-            self.assertEqual(1, len(receipt["observations"]))
+            self.assertEqual(3, len(receipt["observations"]))
+            self.assertEqual(
+                {"threads", "finding_reviews"},
+                {item["label"] for item in receipt["observations"]},
+            )
             self.assertEqual([], receipt["errors"])
             findings = receipt["existing_review_findings"]
             self.assertEqual("clear", findings["status"])
@@ -16329,6 +16995,196 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             "merge_guard_review_findings_changes_requested_present",
             execution["merge_lease_guard"]["errors"],
         )
+
+    def test_codex_review_retrieval_stops_at_bounded_sentinel_page(self) -> None:
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        pages = [
+            [
+                {
+                    "id": 1000 + page_number,
+                    "state": "COMMENTED",
+                    "body": "reviewed",
+                    "submitted_at": "2026-07-26T08:01:00Z",
+                    "html_url": (
+                        "https://github.com/heimgewebe/grabowski/pull/96"
+                        f"#pullrequestreview-{1000 + page_number}"
+                    ),
+                    "user": {"login": "chatgpt-codex-connector[bot]"},
+                    "commit_id": CAPTAIN_HEAD,
+                }
+            ]
+            for page_number in range(11)
+        ]
+        gh = FakeGh(
+            view=view,
+            codex_state=captain_codex_live_state(
+                view, review_pages=pages, threads=[]
+            ),
+        )
+        runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
+        runner.repo_path = Path.cwd()
+        runner.github_runner = gh
+        observations: list[dict[str, object]] = []
+        errors: list[str] = []
+
+        items = runner._codex_bounded_pages(
+            [
+                "api",
+                "--paginate",
+                "--slurp",
+                "repos/heimgewebe/grabowski/pulls/96/reviews?per_page=100",
+            ],
+            label="reviews",
+            observations=observations,
+            errors=errors,
+            max_pages=10,
+            max_items=1000,
+        )
+
+        self.assertIsNone(items)
+        self.assertEqual(["merge_guard_codex_reviews_truncated"], errors)
+        review_calls = [
+            call
+            for call in gh.calls
+            if any("/pulls/96/reviews?per_page=100" in item for item in call)
+        ]
+        self.assertEqual(11, len(review_calls))
+        self.assertTrue(any("page=11" in item for item in review_calls[-1]))
+        self.assertFalse(
+            any("page=12" in item for call in review_calls for item in call)
+        )
+        self.assertFalse(
+            any("--paginate" in call or "--slurp" in call for call in review_calls)
+        )
+
+    def test_codex_bounded_pages_requires_exact_page_size_contract(self) -> None:
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        for endpoint in (
+            "repos/heimgewebe/grabowski/pulls/96/reviews",
+            "repos/heimgewebe/grabowski/pulls/96/reviews?per_page=30",
+            "repos/heimgewebe/grabowski/pulls/96/reviews?per_page=100&per_page=100",
+        ):
+            with self.subTest(endpoint=endpoint):
+                gh = FakeGh(view=view)
+                runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
+                runner.repo_path = Path.cwd()
+                runner.github_runner = gh
+                observations: list[dict[str, object]] = []
+                errors: list[str] = []
+                items = runner._codex_bounded_pages(
+                    ["api", "--paginate", "--slurp", endpoint],
+                    label="reviews",
+                    observations=observations,
+                    errors=errors,
+                    max_pages=10,
+                    max_items=1000,
+                )
+                self.assertIsNone(items)
+                self.assertEqual(
+                    ["merge_guard_codex_reviews_pages_invalid"],
+                    errors,
+                )
+                self.assertEqual([], observations)
+
+    def test_atomic_merge_guard_reads_trusted_blocker_from_second_review_page(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        review_evidence = parameters["review_evidence"]
+        assert isinstance(review_evidence, dict)
+        review_evidence["external_review_required"] = False
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        codex_review = {
+            "id": 202,
+            "state": "COMMENTED",
+            "body": "reviewed",
+            "submitted_at": "2026-07-26T08:01:00Z",
+            "html_url": "https://github.com/heimgewebe/grabowski/pull/96#pullrequestreview-202",
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "commit_id": CAPTAIN_HEAD,
+        }
+        stale_blocker = {
+            "id": 404,
+            "state": "CHANGES_REQUESTED",
+            "body": "structured blocker on older history page",
+            "submitted_at": "2026-07-26T07:59:00Z",
+            "html_url": "https://github.com/heimgewebe/grabowski/pull/96#pullrequestreview-404",
+            "user": {"login": "claude-code[bot]"},
+            "commit_id": "c" * 40,
+        }
+        state = captain_codex_live_state(
+            view,
+            review_pages=[[codex_review], [stale_blocker]],
+            threads=[],
+        )
+        gh = FakeGh(view=view, diff_text=CAPTAIN_DIFF_TEXT, codex_state=state)
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        execution = result["output"]["executions"][0]
+        self.assertFalse(execution["verification_passed"])
+        guard_errors = execution["merge_lease_guard"]["errors"]
+        self.assertIn(
+            "merge_guard_review_findings_changes_requested_present",
+            guard_errors,
+        )
+        self.assertNotIn(
+            "merge_guard_review_findings_reviews_truncated",
+            guard_errors,
+        )
+        self.assertNotIn(
+            "merge_guard_codex_finding_reviews_truncated",
+            guard_errors,
+        )
+        review_calls = [
+            call
+            for call in gh.calls
+            if any("/pulls/96/reviews?per_page=100" in item for item in call)
+        ]
+        self.assertTrue(review_calls)
+        self.assertTrue(
+            any(any("page=2" in item for item in call) for call in review_calls)
+        )
+        for call in review_calls:
+            self.assertNotIn("--paginate", call)
+            self.assertNotIn("--slurp", call)
+
 
     def test_atomic_merge_guard_allows_superseded_trusted_changes_requested(self) -> None:
         parameters = authorized_captain_run_parameters()
@@ -17157,7 +18013,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             view=view,
             diff_text=CAPTAIN_DIFF_TEXT,
             codex_state=captain_codex_live_state(
-                view, reaction_pages=[[reaction], []]
+                view, reaction_pages=[[reaction], [dict(reaction)]]
             ),
         )
 
