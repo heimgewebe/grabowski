@@ -3995,9 +3995,12 @@ def run_bounded(
     _enable_child_subreaper()
     baseline_children = _direct_child_pids()
     process: subprocess.Popen[bytes] | None = None
+    popen_in_progress = False
+    process_started_callback_completed = False
 
     try:
         try:
+            popen_in_progress = True
             process = subprocess.Popen(
                 list(command),
                 cwd=cwd,
@@ -4009,10 +4012,13 @@ def run_bounded(
                 start_new_session=True,
             )
         except OSError as exc:
+            popen_in_progress = False
             raise RunnerError("Codex process could not be started") from exc
 
+        popen_in_progress = False
         if process_started_callback is not None:
             process_started_callback()
+            process_started_callback_completed = True
         deadline = time.monotonic() + timeout_seconds
         buffers = {"stdout": bytearray(), "stderr": bytearray()}
         limits = {"stdout": stdout_limit, "stderr": stderr_limit}
@@ -4306,16 +4312,29 @@ def run_bounded(
                 emergency_errors.append(
                     f"emergency_process_reap_failed:{type(cleanup_exc).__name__}"
                 )
+        child_scan_failed = False
         try:
             adopted = _direct_child_pids() - baseline_children
         except BaseException as cleanup_exc:
             emergency_errors.append(
                 f"emergency_child_scan_failed:{type(cleanup_exc).__name__}"
             )
+            child_scan_failed = True
             adopted = set()
-        if adopted and process is None and process_started_callback is not None:
+        provider_start_uncertain = (
+            process is not None
+            or bool(adopted)
+            or child_scan_failed
+            or popen_in_progress
+        )
+        if (
+            provider_start_uncertain
+            and process_started_callback is not None
+            and not process_started_callback_completed
+        ):
             try:
                 process_started_callback()
+                process_started_callback_completed = True
             except BaseException as callback_exc:
                 emergency_errors.append(
                     "emergency_process_started_callback_failed:"

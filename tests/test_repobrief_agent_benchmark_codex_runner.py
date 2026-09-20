@@ -718,15 +718,22 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             baseline = runner.build_command(
                 request(), "/opt/codex", checkout, schema, codex_home
             )
-            treatment = runner.build_command(
-                request(condition="treatment"), "/opt/codex", checkout, schema, codex_home,
-                authorized_mcp_files=[
-                    file_identity(runner.MCP_PROXY_PYTHON_LINK)
-                ],
-                proxy_path=(root / "bound-proxy.py").resolve(),
-                manifest_path=(root / "bound.bundle.manifest.json").resolve(),
-                mcp_runtime_root=(root / "state").resolve(),
-            )
+            with patch.object(
+                runner,
+                "_validated_mcp_proxy_python",
+                return_value="/fixture/python3",
+            ):
+                treatment = runner.build_command(
+                    request(condition="treatment"),
+                    "/opt/codex",
+                    checkout,
+                    schema,
+                    codex_home,
+                    authorized_mcp_files=[],
+                    proxy_path=(root / "bound-proxy.py").resolve(),
+                    manifest_path=(root / "bound.bundle.manifest.json").resolve(),
+                    mcp_runtime_root=(root / "state").resolve(),
+                )
         baseline_joined = " ".join(baseline)
         treatment_joined = " ".join(treatment)
         for flag in (
@@ -768,13 +775,28 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             validate.assert_called_once_with(target.resolve(), owner_uid=0)
 
     def test_mcp_proxy_python_must_match_preflight_authorized_identity(self) -> None:
-        authorized = file_identity(runner.MCP_PROXY_PYTHON_LINK)
-        authorized["sha256"] = "0" * 64
-        with self.assertRaisesRegex(
-            runner.RunnerError,
-            "not preflight-authorized",
-        ):
-            runner._validated_mcp_proxy_python([authorized])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "python3.10"
+            target.write_bytes(b"fixture-python")
+            target.chmod(0o755)
+            link = root / "python3"
+            link.symlink_to(target.name)
+            authorized = file_identity(link)
+            authorized["sha256"] = "0" * 64
+            with (
+                patch.object(runner, "MCP_PROXY_PYTHON_LINK", link),
+                patch.object(
+                    runner,
+                    "_validate_support_executable",
+                    return_value=str(target.resolve()),
+                ),
+                self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "not preflight-authorized",
+                ),
+            ):
+                runner._validated_mcp_proxy_python([authorized])
 
     def test_treatment_command_uses_validated_resolved_proxy_python(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1435,6 +1457,54 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertEqual(provider_started, [True])
         self.assertIn("process", observed)
         self.assertIsNotNone(observed["process"].poll())
+
+    def test_run_bounded_retries_interrupted_provider_start_marker_after_popen(self) -> None:
+        callback_calls: list[int] = []
+        provider_started: list[bool] = []
+
+        def interrupted_marker() -> None:
+            callback_calls.append(len(callback_calls) + 1)
+            if len(callback_calls) == 1:
+                raise KeyboardInterrupt()
+            provider_started.append(True)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "sleeper.py"
+            script.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+            with self.assertRaises(KeyboardInterrupt):
+                runner.run_bounded(
+                    [sys.executable, str(script)],
+                    cwd=root,
+                    timeout_seconds=30,
+                    stdin_data=b"",
+                    process_started_callback=interrupted_marker,
+                )
+
+        self.assertEqual(callback_calls, [1, 2])
+        self.assertEqual(provider_started, [True])
+
+    def test_run_bounded_marks_ambiguous_when_emergency_child_scan_fails(self) -> None:
+        provider_started: list[bool] = []
+
+        with (
+            patch.object(
+                runner,
+                "_direct_child_pids",
+                side_effect=[set(), runner.RunnerError("simulated /proc failure")],
+            ),
+            patch.object(runner.subprocess, "Popen", side_effect=KeyboardInterrupt()),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            runner.run_bounded(
+                [sys.executable, "-c", "pass"],
+                cwd=ROOT,
+                timeout_seconds=30,
+                stdin_data=b"",
+                process_started_callback=lambda: provider_started.append(True),
+            )
+
+        self.assertEqual(provider_started, [True])
 
     def test_run_bounded_marks_provider_started_when_popen_interrupt_leaves_child(self) -> None:
         real_popen = runner.subprocess.Popen
@@ -2946,12 +3016,22 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             codex_home = root / "codex-home"; (codex_home / "tmp").mkdir(parents=True)
             staged_manifest = root / "staged.bundle.manifest.json"
             staged_manifest.write_text("{}\n", encoding="utf-8")
-            command = runner.build_command(
-                request(condition="treatment"), "/opt/codex", checkout, schema, codex_home,
-                authorized_mcp_files=[file_identity(runner.MCP_PROXY_PYTHON_LINK)], proxy_path=Path(binding["path"]),
-                manifest_path=staged_manifest.resolve(),
-                mcp_runtime_root=state_root.resolve(),
-            )
+            with patch.object(
+                runner,
+                "_validated_mcp_proxy_python",
+                return_value="/fixture/python3",
+            ):
+                command = runner.build_command(
+                    request(condition="treatment"),
+                    "/opt/codex",
+                    checkout,
+                    schema,
+                    codex_home,
+                    authorized_mcp_files=[],
+                    proxy_path=Path(binding["path"]),
+                    manifest_path=staged_manifest.resolve(),
+                    mcp_runtime_root=state_root.resolve(),
+                )
             encoded = next(item for item in command if item.startswith("mcp_servers.repobrief.args="))
             proxy_args = json.loads(encoded.split("=", 1)[1])
             self.assertEqual(proxy_args[:2], ["-I", "-c"])
@@ -3032,12 +3112,22 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             checkout = root / "repo"; checkout.mkdir()
             schema = root / "schema.json"
             codex_home = root / "codex-home"; (codex_home / "tmp").mkdir(parents=True)
-            command = runner.build_command(
-                request(condition="treatment"), "/opt/codex", checkout, schema, codex_home,
-                authorized_mcp_files=[file_identity(runner.MCP_PROXY_PYTHON_LINK)], proxy_path=(root / "bound-proxy.py").resolve(),
-                manifest_path=staged.resolve(),
-                mcp_runtime_root=state_root.resolve(),
-            )
+            with patch.object(
+                runner,
+                "_validated_mcp_proxy_python",
+                return_value="/fixture/python3",
+            ):
+                command = runner.build_command(
+                    request(condition="treatment"),
+                    "/opt/codex",
+                    checkout,
+                    schema,
+                    codex_home,
+                    authorized_mcp_files=[],
+                    proxy_path=(root / "bound-proxy.py").resolve(),
+                    manifest_path=staged.resolve(),
+                    mcp_runtime_root=state_root.resolve(),
+                )
             encoded = next(item for item in command if item.startswith("mcp_servers.repobrief.args="))
             self.assertIn(str(staged), encoded)
             self.assertNotIn(str(manifest), encoded)
