@@ -1503,7 +1503,7 @@ def _normalized_authorized_mcp_files(value: Any) -> list[dict[str, Any]]:
             or not isinstance(digest, str)
             or re.fullmatch(r"[0-9a-f]{64}", digest) is None
             or not isinstance(mode, str)
-            or re.fullmatch(r"0o[0-7]{3}", mode) is None
+            or re.fullmatch(r"0o[0-7]{1,3}", mode) is None
             or path_text in seen
         ):
             raise RunnerError("preflight MCP command file authorization is invalid")

@@ -825,6 +825,24 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             )
             self.assertEqual(normalized["mode"], "0o755")
 
+    def test_mcp_authorized_mode_parser_accepts_unpadded_oct_output(self) -> None:
+        authorized = {
+            "path": "/tmp/mcp-helper",
+            "bytes": 1,
+            "sha256": "a" * 64,
+            "mode": "0o75",
+        }
+        self.assertEqual(
+            runner._normalized_authorized_mcp_files([authorized]),
+            [authorized],
+        )
+        rejected = dict(authorized, mode="0o1000")
+        with self.assertRaisesRegex(
+            runner.RunnerError,
+            "authorization is invalid",
+        ):
+            runner._normalized_authorized_mcp_files([rejected])
+
     def test_mcp_proxy_python_resolves_symlink_and_validates_target(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

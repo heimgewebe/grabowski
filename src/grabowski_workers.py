@@ -392,14 +392,31 @@ def _browser_adapter_policy(
             "google-chrome-beta",
             "google-chrome-unstable",
             "google-chrome-dev",
+            "google-chrome-canary",
             "chrome-beta",
             "chrome-unstable",
             "chrome-dev",
+            "chrome-canary",
         }
         nonstable = (
             normalized_name in nonstable_names
             or parent_name in nonstable_names
         )
+        stable = (
+            normalized_name == "google-chrome"
+            or (normalized_name == "chrome" and parent_name == "chrome")
+        )
+        if not nonstable and not stable:
+            if require_supported:
+                raise ValueError("browser executable has unsupported Google Chrome channel")
+            return {
+                "family": "unsupported",
+                "vendor": "google",
+                "adapter_id": None,
+                "protocol": None,
+                "selection_role": "unsupported",
+                "implemented": False,
+            }
         family = "chrome-nonstable" if nonstable else "chrome-stable"
         vendor = "google"
         adapter_id = "chrome-cdp"

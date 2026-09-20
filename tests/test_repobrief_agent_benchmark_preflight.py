@@ -1213,6 +1213,38 @@ class RepoBriefAgentBenchmarkPreflightLedgerTests(unittest.TestCase):
             ):
                 _execute_with_test_provider_binding(**kwargs)
 
+    def test_keyboard_interrupt_after_dispatch_intent_is_terminalized(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = support.fixture_environment(root)
+            kwargs = _preflight_kwargs(root, environment)
+            with mock.patch.object(
+                support.preflight._core.runner,
+                "execute",
+                side_effect=KeyboardInterrupt(),
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    _execute_with_test_provider_binding(**kwargs)
+            events = support.ledger_events(root / "state")
+            self.assertEqual(
+                [event["event"] for event in events],
+                [
+                    "authorized",
+                    "dispatch-intent",
+                    "condition-failed",
+                    "preflight-failed",
+                ],
+            )
+            self.assertEqual(
+                events[2]["payload"]["error"]["error_type"],
+                "KeyboardInterrupt",
+            )
+            self.assertEqual(
+                events[-1]["payload"]["error"]["error_type"],
+                "KeyboardInterrupt",
+            )
+            self.assertFalse(events[-1]["payload"]["retry_permitted"])
+
     def test_ambiguous_launch_retry_keeps_test_authorization_across_clock_tick(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2106,6 +2138,54 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
             ]
             self.assertNotIn("authorized", [event["event"] for event in events])
             self.assertEqual(events[-1]["event"], "preflight-failed")
+            self.assertFalse(events[-1]["payload"]["retry_permitted"])
+
+    def test_authorize_dispatch_keyboard_interrupt_records_terminal_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = support.fixture_environment(root)
+            pair_id, _, treatment = self._codex_pair(environment)
+            state_root = root / "state"
+            with (
+                mock.patch.object(
+                    codex_preflight.core,
+                    "probe_freshness",
+                    side_effect=KeyboardInterrupt(),
+                ),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                codex_preflight.core.authorize_dispatch(
+                    pair_id=pair_id,
+                    request_root=environment["request_root"],
+                    repository_map=environment["repository_map"],
+                    state_root=state_root,
+                    transcript_root=root / "transcripts",
+                    evidence_root=root / "evidence",
+                    report_out=root / "report.json",
+                    provider_binding={
+                        "mode": "live_provider",
+                        "runner": dict(treatment["runner"]),
+                    },
+                    max_cost_usd=support.Decimal("1.00"),
+                    validator_command=codex_preflight.core._command_array(
+                        environment["validator_command"]
+                    ),
+                )
+            pair_digest = hashlib.sha256(pair_id.encode("utf-8")).hexdigest()
+            pair_root = state_root / "preflight-dispatch-ledger" / pair_digest
+            self.assertFalse((pair_root / "authorization.json").exists())
+            events = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in sorted((pair_root / "events").glob("*.json"))
+            ]
+            self.assertEqual(
+                [event["event"] for event in events],
+                ["preflight-failed"],
+            )
+            self.assertEqual(
+                events[-1]["payload"]["error"]["error_type"],
+                "KeyboardInterrupt",
+            )
             self.assertFalse(events[-1]["payload"]["retry_permitted"])
 
     def test_report_persistence_failure_leaves_no_dispatch_authorization(self) -> None:

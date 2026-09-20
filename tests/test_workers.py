@@ -1320,11 +1320,31 @@ globalThis.fetch = async () => ({
             "/usr/bin/google-chrome-beta",
             "/usr/bin/google-chrome-unstable",
             "/opt/google/chrome-dev/chrome",
+            "/usr/bin/google-chrome-canary",
+            "/opt/google/chrome-canary/chrome",
         ):
             with self.subTest(path=path):
                 policy = workers._browser_adapter_policy(path)
                 self.assertEqual(policy["family"], "chrome-nonstable")
                 self.assertEqual(policy["selection_role"], "fallback-test")
+
+        for path in (
+            "/usr/bin/google-chrome-nightly",
+            "/opt/google/chrome-nightly/chrome",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "unsupported Google Chrome channel",
+                ):
+                    workers._browser_adapter_policy(path)
+                projected = workers._browser_adapter_policy(
+                    path,
+                    require_supported=False,
+                )
+                self.assertEqual(projected["family"], "unsupported")
+                self.assertEqual(projected["vendor"], "google")
+                self.assertFalse(projected["implemented"])
 
     def test_non_chromium_browser_fails_closed_before_profile_creation(self) -> None:
         firefox = self.root / "firefox"

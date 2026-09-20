@@ -1888,12 +1888,12 @@ def authorize_dispatch(
         )
         _publish_dispatch_authorization(ledger, binding, prepared=publication)
         return report
-    except Exception as exc:
-        cleanup_error: Exception | None = None
+    except BaseException as exc:
+        cleanup_error: BaseException | None = None
         if report_persisted and ledger.get("authorization_sha256") is None:
             try:
                 _remove_report_artifacts(report_out)
-            except Exception as report_cleanup_exc:
+            except BaseException as report_cleanup_exc:
                 cleanup_error = report_cleanup_exc
         _record_preflight_failure(ledger, cleanup_error or exc)
         if cleanup_error is not None:
@@ -2070,7 +2070,7 @@ def execute_preflight(
                     synthetic=synthetic,
                     observed_cost=observed_cost,
                 )
-            except Exception as exc:
+            except BaseException as exc:
                 _record_condition_failure(ledger, request, transcript_root, exc)
                 raise
 
@@ -2172,7 +2172,7 @@ def execute_preflight(
             "does_not_establish": list(DOES_NOT_ESTABLISH),
         }
         return report
-    except Exception as exc:
+    except BaseException as exc:
         _record_preflight_failure(ledger, exc)
         raise
 
