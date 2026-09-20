@@ -2365,6 +2365,10 @@ class DeploymentAdmissionAuthorityTests(unittest.TestCase):
             )
 
     def test_receipt_bound_admission_reuses_exact_active_marker(self) -> None:
+        now = 150
+        required_remaining = (
+            dual._midcutover_admission_reuse_minimum_remaining_seconds(10)
+        )
         marker = {
             "schema_version": 1,
             "kind": dual.OPERATOR_ADMISSION_MARKER_KIND,
@@ -2372,7 +2376,7 @@ class DeploymentAdmissionAuthorityTests(unittest.TestCase):
             "expected_head": HEAD_GREEN,
             "source_identity_sha256": "ab" * 32,
             "created_at_unix": 100,
-            "expires_at_unix": 200,
+            "expires_at_unix": now + required_remaining,
         }
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "deployment-admission-drain.json"
@@ -2380,7 +2384,7 @@ class DeploymentAdmissionAuthorityTests(unittest.TestCase):
             path.chmod(0o600)
             with (
                 mock.patch.object(dual, "OPERATOR_ADMISSION_MARKER_PATH", path),
-                mock.patch.object(dual.time, "time", return_value=150),
+                mock.patch.object(dual.time, "time", return_value=now),
                 mock.patch.object(
                     dual, "_create_private_admission_marker"
                 ) as create_marker,
@@ -2396,6 +2400,65 @@ class DeploymentAdmissionAuthorityTests(unittest.TestCase):
         self.assertEqual(observed, marker)
         create_marker.assert_not_called()
         release_marker.assert_not_called()
+
+    def test_receipt_bound_admission_rejects_exact_marker_with_short_remainder(
+        self,
+    ) -> None:
+        now = 150
+        required_remaining = (
+            dual._midcutover_admission_reuse_minimum_remaining_seconds(10)
+        )
+        marker = {
+            "schema_version": 1,
+            "kind": dual.OPERATOR_ADMISSION_MARKER_KIND,
+            "token": "11" * 32,
+            "expected_head": HEAD_GREEN,
+            "source_identity_sha256": "ab" * 32,
+            "created_at_unix": 100,
+            "expires_at_unix": now + required_remaining - 1,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "deployment-admission-drain.json"
+            path.write_text(json.dumps(marker), encoding="utf-8")
+            path.chmod(0o600)
+            with (
+                mock.patch.object(dual, "OPERATOR_ADMISSION_MARKER_PATH", path),
+                mock.patch.object(dual.time, "time", return_value=now),
+                mock.patch.object(
+                    dual, "_create_private_admission_marker"
+                ) as create_marker,
+                mock.patch.object(
+                    dual, "release_operator_deployment_admission"
+                ) as release_marker,
+            ):
+                with self.assertRaisesRegex(
+                    dual.core.DeployError, "Restlaufzeit"
+                ):
+                    dual.engage_receipt_bound_deployment_admission(
+                        expected_head=HEAD_GREEN,
+                        source_identity_sha256="ab" * 32,
+                        timeout_seconds=10,
+                    )
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted, marker)
+        create_marker.assert_not_called()
+        release_marker.assert_not_called()
+
+    def test_midcutover_reuse_budget_is_narrower_than_full_deployment_lifetime(
+        self,
+    ) -> None:
+        for timeout_seconds in (5, 40, 120):
+            with self.subTest(timeout_seconds=timeout_seconds):
+                reuse = dual._midcutover_admission_reuse_minimum_remaining_seconds(
+                    timeout_seconds
+                )
+                full = dual._operator_admission_marker_lifetime_seconds(
+                    timeout_seconds
+                )
+                self.assertLess(reuse, full)
+                self.assertLessEqual(
+                    reuse, dual.OPERATOR_ADMISSION_MARKER_MAX_LIFETIME_SECONDS
+                )
 
     def test_receipt_bound_admission_rejects_foreign_active_marker(self) -> None:
         marker = {

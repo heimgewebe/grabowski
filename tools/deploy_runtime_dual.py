@@ -392,6 +392,9 @@ OPERATOR_ADMISSION_STOP_OPERATIONS = 6
 OPERATOR_ADMISSION_START_OPERATIONS = 4
 OPERATOR_ADMISSION_SYSTEMD_QUERY_WINDOWS = 12
 OPERATOR_ADMISSION_RECOVERY_MARGIN_SECONDS = 120
+MIDCUTOVER_ADMISSION_REUSE_DYNAMIC_TIMEOUT_WINDOWS = 3
+MIDCUTOVER_ADMISSION_REUSE_STOP_OPERATIONS = 2
+MIDCUTOVER_ADMISSION_REUSE_START_OPERATIONS = 2
 OPERATOR_ADMISSION_REQUIRED_IDLE_SAMPLES = 2
 OPERATOR_ADMISSION_PROBE_SECONDS = 30
 TUNNEL_DRAIN_DIRECT_METRIC_NAMES = (
@@ -3419,6 +3422,75 @@ def _operator_admission_marker_lifetime_seconds(timeout_seconds: int) -> int:
     return required
 
 
+def _midcutover_admission_reuse_minimum_remaining_seconds(
+    timeout_seconds: int,
+) -> int:
+    """Bound the marker-active suffix of one receipt-bound resume.
+
+    Snapshot rebind happens before admission is engaged. From marker reuse to
+    release, the worst supported path is the bootstrap drain, one green
+    reprobe, canonical listener/readiness waits, two service stops, two service
+    starts, and the same conservative systemd-query and recovery margins used
+    by the full deployment contract.
+    """
+    if (
+        not isinstance(timeout_seconds, int)
+        or isinstance(timeout_seconds, bool)
+        or timeout_seconds <= 0
+    ):
+        core.fail(
+            "Mid-Cutover-Admission-Timeout muss positiv und ganzzahlig sein",
+            phase="operator-admission-marker",
+        )
+    if timeout_seconds > OPERATOR_ADMISSION_MAX_TIMEOUT_SECONDS:
+        core.fail(
+            "Mid-Cutover-Admission-Timeout überschreitet das unterstützte Maximum",
+            phase="operator-admission-marker",
+            details={
+                "timeout_seconds": timeout_seconds,
+                "maximum_timeout_seconds": OPERATOR_ADMISSION_MAX_TIMEOUT_SECONDS,
+            },
+        )
+    required = (
+        min(timeout_seconds, OPERATOR_ADMISSION_PROBE_SECONDS)
+        + OPERATOR_ADMISSION_BOOTSTRAP_DRAIN_SECONDS
+        + timeout_seconds * MIDCUTOVER_ADMISSION_REUSE_DYNAMIC_TIMEOUT_WINDOWS
+        + MIDCUTOVER_ADMISSION_REUSE_STOP_OPERATIONS
+        * 2
+        * core.TIMEOUTS["service_stop"]
+        + MIDCUTOVER_ADMISSION_REUSE_START_OPERATIONS
+        * 2
+        * core.TIMEOUTS["service_start"]
+        + OPERATOR_ADMISSION_SYSTEMD_QUERY_WINDOWS
+        * core.TIMEOUTS["systemd_query"]
+        + OPERATOR_ADMISSION_RECOVERY_MARGIN_SECONDS
+    )
+    if required > OPERATOR_ADMISSION_MARKER_MAX_LIFETIME_SECONDS:
+        core.fail(
+            "Deployment-Admission-Marker kann den Mid-Cutover-Recovery-Restpfad nicht abdecken",
+            phase="operator-admission-marker",
+            details={
+                "timeout_seconds": timeout_seconds,
+                "probe_seconds": min(
+                    timeout_seconds, OPERATOR_ADMISSION_PROBE_SECONDS
+                ),
+                "bootstrap_drain_seconds": OPERATOR_ADMISSION_BOOTSTRAP_DRAIN_SECONDS,
+                "dynamic_timeout_windows": (
+                    MIDCUTOVER_ADMISSION_REUSE_DYNAMIC_TIMEOUT_WINDOWS
+                ),
+                "stop_operations": MIDCUTOVER_ADMISSION_REUSE_STOP_OPERATIONS,
+                "start_operations": MIDCUTOVER_ADMISSION_REUSE_START_OPERATIONS,
+                "systemd_query_windows": OPERATOR_ADMISSION_SYSTEMD_QUERY_WINDOWS,
+                "recovery_margin_seconds": OPERATOR_ADMISSION_RECOVERY_MARGIN_SECONDS,
+                "required_remaining_seconds": required,
+                "maximum_lifetime_seconds": (
+                    OPERATOR_ADMISSION_MARKER_MAX_LIFETIME_SECONDS
+                ),
+            },
+        )
+    return required
+
+
 def _runtime_deploy_observer_job() -> tuple[Path, dict[str, Any]] | None:
     unit = os.environ.get("GRABOWSKI_JOB_UNIT")
     directory_text = os.environ.get("GRABOWSKI_JOB_DIRECTORY")
@@ -3636,6 +3708,23 @@ def _engage_operator_deployment_admission(
                 and existing.get("source_identity_sha256")
                 == marker_source_identity_sha256
             ):
+                required_remaining = (
+                    _midcutover_admission_reuse_minimum_remaining_seconds(
+                        timeout_seconds
+                    )
+                )
+                remaining = int(expires) - now
+                if remaining < required_remaining:
+                    core.fail(
+                        "Aktiver Deployment-Admission-Marker hat zu wenig Restlaufzeit für Mid-Cutover-Recovery",
+                        phase="operator-admission-marker",
+                        details={
+                            "remaining_lifetime_seconds": remaining,
+                            "required_remaining_seconds": required_remaining,
+                            "marker_extended": False,
+                            "marker_replaced": False,
+                        },
+                    )
                 return existing
             core.fail(
                 "Aktiver Deployment-Admission-Marker gehört einem anderen Recovery-Lauf",
