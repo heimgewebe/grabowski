@@ -343,6 +343,32 @@ GRIP_SPECS: dict[str, GripSpec] = {
         acceptance_ids=("acceptance-1", "acceptance-2"),
         runner="post_merge_sync",
     ),
+    "post-merge-sync-apply": GripSpec(
+        name="post-merge-sync-apply",
+        version="1.0",
+        summary="Apply one exact protected-branch post-merge fast-forward under an exclusive repository guard.",
+        effect=MUTATING,
+        required_parameters=(
+            "repo",
+            "target_branch",
+            "expected_local_head",
+            "expected_remote_head",
+            "confirmation",
+        ),
+        acceptance_ids=(
+            "protected-canonical-checkout",
+            "clean-exact-preimage",
+            "remote-head-bound",
+            "fast-forward-only",
+            "worktree-common-dir-branch-serialized",
+            "branch-ref-cas",
+            "post-state-verified",
+            "outcome-unknown-fail-closed",
+        ),
+        runner="post_merge_sync_apply",
+        operation_effect_class="worktree_admin",
+        operation_class="worktree-admin",
+    ),
     "situation": GripSpec(
         name="situation",
         version="1.0",
@@ -1094,6 +1120,7 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
         "captain-run",
         "pr-check-readiness",
         "post-merge-sync",
+        "post-merge-sync-apply",
         "operator-obligation-open",
         "operator-obligation-list",
         "operator-obligation-status",
@@ -1155,6 +1182,7 @@ GRIP_SURFACE_TARGETS = {
     "captain-run": "action-specific high-impact Captain execution",
     "pr-check-readiness": "pull request readiness evidence",
     "post-merge-sync": "post-merge local checkout sync",
+    "post-merge-sync-apply": "one exact clean canonical protected branch plus its worktree and Git common directory",
     "operator-obligation-open": "one durable operator obligation open record",
     "operator-obligation-list": "bounded operator obligation continuation inventory",
     "operator-obligation-status": "one integrity-bound operator obligation status",
@@ -1173,6 +1201,11 @@ GRIP_SURFACE_RECOVERY_PATHS = {
     MUTATING: "inspect the emitted receipt, verify target/scope, then use git/GitHub rollback or retry from the recorded head",
 }
 GRIP_RECOVERY_PATHS_BY_NAME = {
+    "post-merge-sync-apply": (
+        "read back the exact canonical checkout, protected branch, remote-tracking ref and advertised remote head; "
+        "outcome_unknown never authorizes replay. Form a fresh intent only after authoritative readback establishes "
+        "either the exact clean preimage or the exact clean final state."
+    ),
     "remote-head-materialize": (
         "read back the exact writer lane, imported object and exact remote branch head before retry; "
         "never infer authority to advance the existing lane from an imported object; use work-acquire for a successor lane"
@@ -1346,6 +1379,13 @@ GRIP_CONDITIONAL_PRECONDITIONS = {
         "the server acquires the exact root-contract required resource keys under the contract task owner only when every required key is initially free",
         "reference and session authority are minted server-side from the commit-bound action contract; the rootbroker independently revalidates the installed root-owned contract before spawn",
         "temporary reference/authority files and the exact acquired lease are cleaned in finally paths; secret bytes use only the existing bounded FD transport",
+    ),
+    "post-merge-sync-apply": (
+        "target_branch must be main or master and already checked out in the primary canonical worktree",
+        "expected_local_head must be an ancestor of expected_remote_head; both are exact Git object ids",
+        "confirmation must equal apply-protected-post-merge-sync",
+        "the operation acquires an exclusive broad repository guard plus exact checkout and Git-common-dir resources before any fetch/ref/worktree mutation",
+        "any ambiguous post-effect state returns outcome_unknown with retry_authorized=false",
     ),
     "transport-roundtrip": (
         "action=begin requires target_tool_name and target_arguments together; "
@@ -6611,6 +6651,150 @@ def _run_post_merge_sync(
         "target_branch": target,
         "planned_commands": commands,
     }
+
+
+def _run_post_merge_sync_apply(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec
+    import grabowski_post_merge_sync_apply as sync_apply
+
+    repo = _repo_path(parameters)
+    target_branch = _short_branch_name(parameters, "target_branch")
+    expected_local_head = _sha_parameter(
+        parameters, "expected_local_head"
+    ).lower()
+    expected_remote_head = _sha_parameter(
+        parameters, "expected_remote_head"
+    ).lower()
+    confirmation = _string_parameter(parameters, "confirmation")
+    remote = parameters.get("remote", "origin")
+    if (
+        not isinstance(remote, str)
+        or remote in {"", ".", ".."}
+        or REMOTE_NAME_RE.fullmatch(remote) is None
+    ):
+        raise GripPreflightError("remote must be one configured remote name")
+
+    remote_target = _validate_remote_materialization_target(
+        repo, remote, receipt, runner
+    )
+
+    def remote_head_reader(stage: str, effect_started: bool) -> str:
+        return _remote_materialization_head(
+            repo,
+            remote_target,
+            target_branch,
+            receipt,
+            runner,
+            f"post_merge_sync_remote_{stage}",
+            expected_remote_head,
+            effect_started=effect_started,
+        )
+
+    try:
+        output = sync_apply.apply(
+            repo=repo,
+            target_branch=target_branch,
+            expected_local_head=expected_local_head,
+            expected_remote_head=expected_remote_head,
+            remote=remote,
+            remote_target=remote_target,
+            confirmation=confirmation,
+            runner=runner,
+            remote_head_reader=remote_head_reader,
+            pinned_target_factory=_remote_materialization_pinned_target,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise GripPreflightError(str(exc)) from exc
+
+    state = str(output.get("state") or "unknown")
+    blocked_canonical = state in {
+        "unsupported_target_branch",
+        "canonical_checkout_mismatch",
+    }
+    _check(
+        receipt,
+        "protected-canonical-checkout",
+        "fail" if blocked_canonical else "pass",
+        state,
+    )
+    blocked_preimage = state in {
+        "dirty_checkout",
+        "local_head_mismatch",
+        "upstream_mismatch",
+        "preimage_drift_after_lease",
+        "lease_preimage_drift",
+    }
+    _check(
+        receipt,
+        "clean-exact-preimage",
+        "fail" if blocked_preimage else "pass",
+        state,
+    )
+    remote_bad = state in {
+        "remote_read_failed",
+        "remote_head_mismatch",
+        "remote_read_failed_after_lease",
+        "remote_head_drift_after_lease",
+    }
+    _check(
+        receipt,
+        "remote-head-bound",
+        "fail" if remote_bad else "pass",
+        str(output.get("remote_head") or expected_remote_head),
+    )
+    _check(
+        receipt,
+        "fast-forward-only",
+        "fail" if state == "non_fast_forward" else "pass",
+        state,
+    )
+    serialized = bool(output.get("resource_keys")) and state not in {
+        "lease_acquisition_blocked",
+        "lease_snapshot_invalid",
+    }
+    _check(
+        receipt,
+        "worktree-common-dir-branch-serialized",
+        "pass" if serialized else ("skip" if state == "already_synced" else "fail"),
+        state,
+    )
+    branch_cas = output.get("branch_cas_started") is True
+    final_verified = output.get("post_state_verified") is True
+    _check(
+        receipt,
+        "branch-ref-cas",
+        "pass"
+        if branch_cas and final_verified
+        else ("skip" if not branch_cas else "fail"),
+        state,
+    )
+    _check(
+        receipt,
+        "post-state-verified",
+        "pass"
+        if final_verified
+        else ("skip" if not output.get("effect_started") else "fail"),
+        state,
+    )
+    fail_closed = (
+        state != "outcome_unknown"
+        or (
+            output.get("retry_authorized") is False
+            and output.get("readback_required") is True
+        )
+    )
+    _check(
+        receipt,
+        "outcome-unknown-fail-closed",
+        "pass" if fail_closed else "fail",
+        f"state={state}; retry_authorized={output.get('retry_authorized')}",
+    )
+    return output
 
 
 def _reject_branch_publish_configuration(
@@ -16355,6 +16539,7 @@ _RUNNERS = {
     "checkout_owner_handoff_preview": _run_checkout_owner_handoff_preview,
     "checkout_owner_handoff_apply": _run_checkout_owner_handoff_apply,
     "post_merge_sync": _run_post_merge_sync,
+    "post_merge_sync_apply": _run_post_merge_sync_apply,
     "situation": _run_situation,
     "scout": _run_scout,
     "runtime_deploy_check": _run_runtime_deploy_check,

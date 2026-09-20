@@ -1535,6 +1535,7 @@ class GripFoundationTests(unittest.TestCase):
                 "operator-obligation-resolve",
                 "operator-obligation-status",
                 "post-merge-sync",
+                "post-merge-sync-apply",
                 "pr-check-readiness",
                 "pr-base-converge",
                 "pr-create-or-update",
