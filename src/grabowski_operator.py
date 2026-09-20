@@ -1162,7 +1162,9 @@ def _deployment_admission_midcutover_recovery_evidence(
 
         gate = provenance_recovery.evaluate_resume_gate(expected_head)
         lane = gate.get("recovery_lane")
-        binding = gate.get("resume_binding")
+        binding = (
+            lane.get("resume_binding") if isinstance(lane, dict) else None
+        )
         validated_binding = (
             provenance_recovery.midcutover._validated_resume_binding(binding)
             if isinstance(binding, dict)
@@ -1196,9 +1198,6 @@ def _deployment_admission_midcutover_recovery_evidence(
         isinstance(lane, dict)
         and lane.get("lane")
         == provenance_recovery.midcutover.LANE_MID_CUTOVER_RESUME
-    )
-    checks["lane_binding_matches_gate"] = (
-        isinstance(lane, dict) and lane.get("resume_binding") == binding
     )
     checks["resume_binding_valid"] = (
         isinstance(validated_binding, dict) and validated_binding == binding
@@ -2013,13 +2012,12 @@ def _install_deployment_admission_gate() -> None:
             marker = _read_deployment_admission_marker()
             midcutover_recovery_evidence: dict[str, Any] | None = None
             if marker.get("active") is True and marker.get("valid") is True:
-                midcutover_recovery_evidence = (
-                    _deployment_admission_midcutover_recovery_evidence(
-                        tool_name,
-                        arguments,
-                        tool,
-                        marker,
-                    )
+                midcutover_recovery_evidence = await asyncio.to_thread(
+                    _deployment_admission_midcutover_recovery_evidence,
+                    tool_name,
+                    arguments,
+                    tool,
+                    marker,
                 )
                 if midcutover_recovery_evidence.get("allowed") is True:
                     current_marker = _read_deployment_admission_marker()

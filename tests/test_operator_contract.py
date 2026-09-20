@@ -508,7 +508,6 @@ class OperatorContractTests(unittest.TestCase):
                     "lane": lane,
                     "resume_binding": binding,
                 },
-                "resume_binding": binding,
             }
 
         fake = types.SimpleNamespace(
@@ -606,7 +605,6 @@ class OperatorContractTests(unittest.TestCase):
                         "lane": lane,
                         "resume_binding": binding,
                     },
-                    "resume_binding": binding,
                 },
                 midcutover=types.SimpleNamespace(
                     LANE_MID_CUTOVER_RESUME="mid-cutover",
@@ -656,6 +654,87 @@ class OperatorContractTests(unittest.TestCase):
         wrong_lane = evidence_for(canonical, lane="scheduled-deploy")
         self.assertFalse(wrong_lane["allowed"])
         self.assertIn("mid_cutover_resume_classified", wrong_lane["reasons"])
+
+    def test_midcutover_recovery_evidence_runs_off_event_loop(self) -> None:
+        operator = _load_operator_module()
+        head = "b" * 40
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocking_evidence(*_args, **_kwargs):
+            entered.set()
+            if not release.wait(2.0):
+                raise AssertionError("blocking recovery evidence was not released")
+            return {"allowed": True}
+
+        async def exercise():
+            timer = threading.Timer(0.5, release.set)
+            timer.start()
+            started = time.monotonic()
+            call = operator.asyncio.create_task(
+                operator.mcp._tool_manager.call_tool(
+                    "grabowski_recovery_provenance_repair",
+                    {"expected_head": head},
+                )
+            )
+            try:
+                await operator.asyncio.sleep(0)
+                heartbeat = operator.asyncio.Event()
+                operator.asyncio.get_running_loop().call_soon(heartbeat.set)
+                await operator.asyncio.wait_for(heartbeat.wait(), timeout=0.25)
+                self.assertLess(time.monotonic() - started, 0.25)
+                deadline = time.monotonic() + 0.5
+                while not entered.is_set() and time.monotonic() < deadline:
+                    await operator.asyncio.sleep(0.01)
+                self.assertTrue(entered.is_set())
+                release.set()
+                return await call
+            finally:
+                release.set()
+                timer.cancel()
+
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "deployment-admission-drain.json"
+            payload = {
+                "schema_version": 1,
+                "kind": operator.DEPLOYMENT_ADMISSION_MARKER_KIND,
+                "token": "a" * 64,
+                "expected_head": head,
+                "source_identity_sha256": "c" * 64,
+                "created_at_unix": int(time.time()) - 1,
+                "expires_at_unix": int(time.time()) + 60,
+            }
+            marker.write_text(json.dumps(payload), encoding="utf-8")
+            marker.chmod(0o600)
+            operator.mcp._registered_tools[
+                "grabowski_recovery_provenance_repair"
+            ] = types.SimpleNamespace(
+                is_async=False,
+                context_kwarg=None,
+                annotations=types.SimpleNamespace(readOnlyHint=False),
+            )
+            with (
+                patch.object(operator, "DEPLOYMENT_ADMISSION_MARKER_PATH", marker),
+                patch.object(
+                    operator,
+                    "_deployment_admission_midcutover_recovery_evidence",
+                    side_effect=blocking_evidence,
+                ),
+                patch.object(
+                    operator,
+                    "_require_transport_roundtrip_for_tool",
+                    return_value=None,
+                ),
+                patch.object(
+                    operator.grabowski_effect_interceptor,
+                    "fence_enforcement_required",
+                    return_value=False,
+                ),
+            ):
+                operator._configure_http_runtime()
+                result = operator.asyncio.run(exercise())
+        self.assertTrue(result["called"])
+        self.assertEqual(0, operator._deployment_admission_active_tool_calls())
 
     def test_deployment_admission_gate_allows_only_exact_bound_midcutover_recovery(
         self,
