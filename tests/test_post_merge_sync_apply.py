@@ -261,6 +261,99 @@ class PostMergeSyncApplyTests(unittest.TestCase):
         self.assertEqual("", git_stdout(repo, "status", "--porcelain"))
         return repo, remote, base, remote_head
 
+    def fixture_remote_object_absent(
+        self, root: Path
+    ) -> tuple[Path, Path, str, str]:
+        remote = root / "remote.git"
+        repo = root / "repo"
+        publisher = root / "publisher"
+        subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+        subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.name", "Grabowski Test"],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "config",
+                "user.email",
+                "grabowski@example.invalid",
+            ],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "core.hooksPath", "/dev/null"],
+            check=True,
+        )
+        (repo / "state.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "state.txt"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True
+        )
+        base = git_stdout(repo, "rev-parse", "HEAD")
+        subprocess.run(
+            ["git", "-C", str(repo), "remote", "add", "origin", str(remote)],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "push", "-q", "-u", "origin", "main"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "clone", "-q", "-b", "main", str(remote), str(publisher)],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(publisher), "config", "user.name", "Publisher"],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(publisher),
+                "config",
+                "user.email",
+                "publisher@example.invalid",
+            ],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(publisher), "config", "core.hooksPath", "/dev/null"],
+            check=True,
+        )
+        (publisher / "state.txt").write_text("remote\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(publisher), "commit", "-q", "-am", "remote update"],
+            check=True,
+        )
+        remote_head = git_stdout(publisher, "rev-parse", "HEAD")
+        subprocess.run(
+            ["git", "-C", str(publisher), "push", "-q", "origin", "main"],
+            check=True,
+        )
+        self.assertEqual(base, git_stdout(repo, "rev-parse", "HEAD"))
+        self.assertEqual(base, git_stdout(repo, "rev-parse", "refs/remotes/origin/main"))
+        missing = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "cat-file",
+                "-e",
+                f"{remote_head}^{{commit}}",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertNotEqual(0, missing.returncode)
+        self.assertEqual("", git_stdout(repo, "status", "--porcelain"))
+        return repo, remote, base, remote_head
+
     def remote_reader(self, remote: Path):
         def read(_stage: str, _effect_started: bool) -> str:
             output = subprocess.check_output(
@@ -338,6 +431,25 @@ class PostMergeSyncApplyTests(unittest.TestCase):
                 any(":branch:" in key for key in result["resource_keys"])
             )
 
+    def test_materializes_absent_remote_commit_before_ancestry_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture_remote_object_absent(Path(tmp))
+            leases = LeaseHarness()
+            with patched_leases(leases):
+                result = self.apply(repo, remote, base, target)
+
+            self.assertEqual("passed", result["receipt_status"])
+            self.assertEqual("synced", result["state"])
+            self.assertEqual(target, git_stdout(repo, "rev-parse", "HEAD"))
+            subprocess.run(
+                ["git", "-C", str(repo), "cat-file", "-e", f"{target}^{{commit}}"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertEqual(1, leases.acquire_calls)
+            self.assertEqual(1, leases.release_calls)
+
     def test_dirty_checkout_is_blocked_before_leases(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo, remote, base, target = self.fixture(Path(tmp))
@@ -387,8 +499,13 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             with patched_leases(leases):
                 result = self.apply(repo, remote, local, target)
 
+            self.assertEqual("blocked", result["receipt_status"])
             self.assertEqual("non_fast_forward", result["state"])
-            self.assertEqual(0, leases.acquire_calls)
+            self.assertTrue(result["effect_started"])
+            self.assertFalse(result["worktree_effect_started"])
+            self.assertFalse(result["branch_cas_started"])
+            self.assertEqual(1, leases.acquire_calls)
+            self.assertEqual(1, leases.release_calls)
             self.assertEqual(local, git_stdout(repo, "rev-parse", "HEAD"))
 
     def test_wrong_current_branch_is_blocked(self) -> None:

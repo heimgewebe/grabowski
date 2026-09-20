@@ -25,6 +25,10 @@ class PostMergeSyncApplyError(RuntimeError):
     pass
 
 
+class PostMergeSyncNonFastForward(PostMergeSyncApplyError):
+    pass
+
+
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -332,26 +336,6 @@ def apply(
             "merge_commit_created": False,
         }
 
-    ancestry = _run(
-        repo,
-        runner,
-        [
-            "--no-replace-objects",
-            "merge-base",
-            "--is-ancestor",
-            expected_local_head,
-            expected_remote_head,
-        ],
-        allowed_returncodes=(0, 1),
-    )
-    if int(ancestry.get("returncode", 1)) != 0:
-        return _blocked(
-            "non_fast_forward",
-            before=initial,
-            old_head=expected_local_head,
-            new_head=expected_remote_head,
-        )
-
     preimage = {
         "repo": str(repo),
         "target_branch": target_branch,
@@ -507,6 +491,23 @@ def apply(
                 if remote_head_reader("after_fetch", True) != expected_remote_head:
                     raise PostMergeSyncApplyError(
                         "remote branch advanced during exact-head materialization"
+                    )
+
+                ancestry = _run(
+                    repo,
+                    runner,
+                    [
+                        "--no-replace-objects",
+                        "merge-base",
+                        "--is-ancestor",
+                        expected_local_head,
+                        expected_remote_head,
+                    ],
+                    allowed_returncodes=(0, 1),
+                )
+                if int(ancestry.get("returncode", 1)) != 0:
+                    raise PostMergeSyncNonFastForward(
+                        "materialized remote head is not a fast-forward of the local head"
                     )
 
                 tracking_ref = f"refs/remotes/{remote}/{target_branch}"
@@ -719,7 +720,16 @@ def apply(
                     and readback.get("upstream") == expected_upstream
                 )
                 local_post_verified = bool(local_final_exact)
-                if remote_final_exact:
+                if (
+                    isinstance(exc, PostMergeSyncNonFastForward)
+                    and not worktree_effect_started
+                    and not branch_cas_started
+                    and old_exact
+                ):
+                    state = "non_fast_forward"
+                    receipt_status = "blocked"
+                    post_verified = False
+                elif remote_final_exact:
                     state = "effect_confirmed_after_error"
                     receipt_status = "passed"
                     post_verified = True
