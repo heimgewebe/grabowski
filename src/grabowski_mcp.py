@@ -12628,9 +12628,17 @@ def _secret_pty_authority_lease_snapshot(lease: dict[str, Any]) -> dict[str, Any
     return {field: lease[field] for field in fields}
 
 
-def _secret_pty_grip_dispatcher(request: dict[str, Any]) -> dict[str, Any]:
+def _secret_pty_grip_dispatcher(
+    request: dict[str, Any],
+    *,
+    milestone_recorder: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
     import grabowski_privileged_broker
     import grabowski_resources
+
+    def record_milestone(name: str) -> None:
+        if milestone_recorder is not None:
+            milestone_recorder(name)
 
     if not isinstance(request, dict) or set(request) != {"source_path", "expected_source_sha256"}:
         raise ValueError("secret PTY grip request shape is invalid")
@@ -12724,6 +12732,7 @@ def _secret_pty_grip_dispatcher(request: dict[str, Any]) -> dict[str, Any]:
             for key in sorted(required_keys)
         ]
         lease_binding_sha256 = grabowski_privileged_broker.canonical_sha256(authority_leases)
+        record_milestone("secret_pty_lease_acquired")
         _append_audit({
             "timestamp_unix": int(time.time()),
             "operation": "secret-pty-grip-lease-acquire",
@@ -12908,6 +12917,7 @@ def _secret_pty_grip_dispatcher(request: dict[str, Any]) -> dict[str, Any]:
             raise PermissionError(
                 "secret PTY grip requires memfd-backed inherited descriptor transport"
             )
+        record_milestone("secret_pty_broker_client_invocation_attempted")
         command_result = _run_secret_command(
             [
                 "/usr/local/bin/grabowski-privileged-request",
@@ -12923,6 +12933,7 @@ def _secret_pty_grip_dispatcher(request: dict[str, Any]) -> dict[str, Any]:
             max_output_bytes=min(int(execution["max_output_bytes"]), 512 * 1024),
             secret_data=snapshot["data"],
         )
+        record_milestone("secret_pty_broker_client_returned")
         try:
             parsed = json.loads(command_result["stdout"].strip())
         except json.JSONDecodeError as exc:
@@ -13092,6 +13103,7 @@ def _secret_pty_grip_dispatcher(request: dict[str, Any]) -> dict[str, Any]:
         "host_lease_released": True,
         "retry_safe": False,
     }
+    record_milestone("secret_pty_domain_effect_completed")
     result_sha256 = grabowski_grips.sha256_json(result)
     result["audit_record_sha256"] = _append_audit_with_digest({
         "timestamp_unix": int(time.time()),
@@ -13281,6 +13293,57 @@ def _operator_obligation_gate_audit_complete(
     )
 
 
+def _grip_result_readback_runtime_preflight() -> tuple[dict[str, Any], str | None]:
+    deployment = _deployment_metadata()
+    binding = {
+        "release_id": deployment.get("release_id"),
+        "repo_head": deployment.get("repo_head"),
+        "entrypoint_contract_sha256": deployment.get("entrypoint_contract_sha256"),
+    }
+    if (
+        not isinstance(binding["release_id"], str)
+        or not binding["release_id"]
+        or not isinstance(binding["repo_head"], str)
+        or re.fullmatch(r"[0-9a-f]{40}", binding["repo_head"]) is None
+        or not isinstance(binding["entrypoint_contract_sha256"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", binding["entrypoint_contract_sha256"])
+        is None
+    ):
+        raise RuntimeError(
+            "durable grip result readback requires an exact deployed runtime binding"
+        )
+    if (
+        deployment.get("completion_status") != "complete"
+        or deployment.get("runtime_binding_valid") is not True
+        or deployment.get("artifact_integrity_valid") is not True
+        or deployment.get("entrypoint_contract_identity_valid") is not True
+    ):
+        return binding, "deployment-integrity-invalid"
+    try:
+        serving = grabowski_serving_process.identity(
+            current_release_id=binding["release_id"],
+            current_repo_head=binding["repo_head"],
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        return binding, f"serving-process-readback-{type(exc).__name__}"
+    if (
+        serving.get("matches_deployed_manifest") is not True
+        or serving.get("process_release_id") != binding["release_id"]
+        or serving.get("process_repo_head") != binding["repo_head"]
+    ):
+        return binding, "serving-process-mismatch"
+    return binding, None
+
+
+def _grip_result_readback_runtime_binding() -> dict[str, Any]:
+    binding, blocker = _grip_result_readback_runtime_preflight()
+    if blocker is not None:
+        raise RuntimeError(
+            "durable grip result readback runtime preflight blocked: " + blocker
+        )
+    return binding
+
+
 def _grip_run_core(
     name: str,
     parameters: dict[str, Any] | None = None,
@@ -13289,6 +13352,7 @@ def _grip_run_core(
     ctx: Context | None = None,
     *,
     transport_target_dispatcher: grabowski_grips.TransportTargetDispatcher | None = None,
+    secret_pty_dispatcher: grabowski_grips.SecretPtyDispatcher | None = None,
 ) -> dict[str, Any]:
     """Run one allowlisted Grabowski grip and return its receipt-bound result."""
     grip_capability = grabowski_grips.grip_required_capability(name)
@@ -13555,7 +13619,7 @@ def _grip_run_core(
         allow_mutation=allow_mutation,
         transport_target_dispatcher=transport_target_dispatcher,
         n8n_provider_dispatcher=_n8n_provider_dispatcher,
-        secret_pty_dispatcher=_secret_pty_grip_dispatcher,
+        secret_pty_dispatcher=secret_pty_dispatcher or _secret_pty_grip_dispatcher,
     )
     if (
         name == "operator-obligation-close"
@@ -13832,6 +13896,7 @@ async def _grip_run_mcp(
         name, allow_mutation
     )
     loop = asyncio.get_running_loop()
+    server_milestones: set[str] = set()
 
     def target_dispatcher(
         target_tool_name: str,
@@ -13849,16 +13914,85 @@ async def _grip_run_mcp(
         )
         return future.result()
 
+    def tracked_secret_pty_dispatcher(request: dict[str, Any]) -> dict[str, Any]:
+        server_milestones.add("secret_pty_dispatcher_entered")
+        return _secret_pty_grip_dispatcher(
+            request,
+            milestone_recorder=server_milestones.add,
+        )
+
     def run_core() -> dict[str, Any]:
         try:
-            return _grip_run_core(
-                name,
-                effective_parameters,
-                profile,
-                effective_allow_mutation,
-                ctx,
-                transport_target_dispatcher=target_dispatcher,
-            )
+            durable_readback = grabowski_grips.grip_requires_durable_result_readback(name)
+            runtime_binding: dict[str, Any] | None = None
+            runtime_blocker: str | None = None
+            if durable_readback:
+                grabowski_grips.prepare_grip_result_readback_store()
+                runtime_binding, runtime_blocker = (
+                    _grip_result_readback_runtime_preflight()
+                )
+            if runtime_blocker is not None:
+                result = grabowski_grips._blocked_surface_receipt(
+                    name,
+                    dict(effective_parameters or {}),
+                    "durable grip result readback runtime preflight blocked: "
+                    + runtime_blocker,
+                )
+            else:
+                try:
+                    result = _grip_run_core(
+                        name,
+                        effective_parameters,
+                        profile,
+                        effective_allow_mutation,
+                        ctx,
+                        transport_target_dispatcher=target_dispatcher,
+                        secret_pty_dispatcher=(
+                            tracked_secret_pty_dispatcher
+                            if name == "secret-pty-getpass-probe"
+                            else None
+                        ),
+                    )
+                except (
+                    OSError,
+                    PermissionError,
+                    RuntimeError,
+                    TypeError,
+                    ValueError,
+                ) as exc:
+                    if not durable_readback:
+                        raise
+                    reason = (
+                        "durable grip server dispatch failed: "
+                        + type(exc).__name__
+                    )
+                    if "secret_pty_dispatcher_entered" in server_milestones:
+                        result = grabowski_grips._failed_surface_receipt(
+                            name,
+                            dict(effective_parameters or {}),
+                            reason,
+                        )
+                    else:
+                        result = grabowski_grips._blocked_surface_receipt(
+                            name,
+                            dict(effective_parameters or {}),
+                            reason,
+                        )
+            if durable_readback:
+                assert runtime_binding is not None
+                result = dict(result)
+                result["result_readback"] = (
+                    grabowski_grips.persist_grip_result_readback(
+                        name,
+                        result,
+                        tool_name="grip_run",
+                        runtime_binding=runtime_binding,
+                        profile=profile,
+                        allow_mutation=effective_allow_mutation,
+                        server_milestones=server_milestones,
+                    )
+                )
+            return result
         finally:
             if retained_claim_challenge is not None:
                 _discard_pending_transport_target(retained_claim_challenge)
