@@ -13,6 +13,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import platform
 import select
@@ -24,13 +25,188 @@ import time
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+SOURCE_SNAPSHOT_MAX_BYTES = 16 * 1024 * 1024
+
+
+
+def _open_absolute_regular_nofollow(path: Path, *, label: str) -> int:
+    requested = path.expanduser()
+    if not requested.is_absolute():
+        raise RuntimeError(f"{label} path must be absolute")
+    parts = requested.parts
+    if (
+        len(parts) < 2
+        or parts[0] != os.sep
+        or any(part in {"", ".", ".."} for part in parts[1:])
+        or not hasattr(os, "O_NOFOLLOW")
+        or not hasattr(os, "O_DIRECTORY")
+    ):
+        raise RuntimeError(f"{label} path is not safely openable")
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    directories: list[int] = []
+    try:
+        current = os.open(os.sep, directory_flags)
+        directories.append(current)
+        for component in parts[1:-1]:
+            current = os.open(component, directory_flags, dir_fd=current)
+            directories.append(current)
+            if not stat.S_ISDIR(os.fstat(current).st_mode):
+                raise RuntimeError(f"{label} parent path is not a directory")
+        return os.open(parts[-1], file_flags, dir_fd=current)
+    except OSError as exc:
+        raise RuntimeError(f"{label} path must be symlink-free") from exc
+    finally:
+        for directory_fd in reversed(directories):
+            os.close(directory_fd)
+
+
+def _read_startup_source_snapshot(path: Path, *, label: str) -> tuple[bytes, dict[str, Any]]:
+    requested = path.expanduser()
+    try:
+        before = requested.lstat()
+    except OSError as exc:
+        raise RuntimeError(f"{label} is unavailable") from exc
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise RuntimeError(f"{label} must be a regular non-symlink file")
+    if before.st_size <= 0 or before.st_size > SOURCE_SNAPSHOT_MAX_BYTES:
+        raise RuntimeError(f"{label} is empty or oversized")
+    descriptor = _open_absolute_regular_nofollow(requested, label=label)
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino, opened.st_size) != (
+            before.st_dev, before.st_ino, before.st_size
+        ):
+            raise RuntimeError(f"{label} changed before load")
+        data = bytearray()
+        while len(data) <= SOURCE_SNAPSHOT_MAX_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(1024 * 1024, SOURCE_SNAPSHOT_MAX_BYTES + 1 - len(data)),
+            )
+            if not chunk:
+                break
+            data.extend(chunk)
+        after_descriptor = os.fstat(descriptor)
+        try:
+            descriptor_path = os.readlink(f"/proc/self/fd/{descriptor}")
+        except OSError as exc:
+            raise RuntimeError(f"{label} opened path cannot be bound") from exc
+        if (
+            not os.path.isabs(descriptor_path)
+            or descriptor_path.endswith(" (deleted)")
+            or os.path.normpath(descriptor_path) != os.path.normpath(str(requested))
+        ):
+            raise RuntimeError(f"{label} opened path is unavailable")
+        try:
+            after = requested.lstat()
+        except OSError as exc:
+            raise RuntimeError(f"{label} disappeared during load") from exc
+        if (
+            len(data) != opened.st_size
+            or len(data) > SOURCE_SNAPSHOT_MAX_BYTES
+            or (after_descriptor.st_dev, after_descriptor.st_ino, after_descriptor.st_size)
+            != (opened.st_dev, opened.st_ino, opened.st_size)
+            or (after.st_dev, after.st_ino, after.st_size)
+            != (opened.st_dev, opened.st_ino, opened.st_size)
+        ):
+            raise RuntimeError(f"{label} changed during load")
+        resolved = Path(descriptor_path)
+        identity = {
+            "path": str(resolved),
+            "name": resolved.name,
+            "bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+        return bytes(data), identity
+    finally:
+        os.close(descriptor)
+
+
+def _record_startup_code_identity(identity: Mapping[str, Any]) -> None:
+    path = identity.get("path")
+    if not isinstance(path, str) or not path:
+        raise RuntimeError("preflight startup code identity is invalid")
+    current = {
+        "path": path,
+        "name": identity.get("name"),
+        "bytes": identity.get("bytes"),
+        "sha256": identity.get("sha256"),
+    }
+    previous = _STARTUP_CODE_IDENTITIES.get(path)
+    if previous is not None and previous != current:
+        raise RuntimeError("preflight code changed between module loads")
+    _STARTUP_CODE_IDENTITIES[path] = current
+
+
+def _load_startup_source_module(
+    name: str, path: Path, raw: bytes, identity: Mapping[str, Any]
+) -> Any:
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {path.name}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        exec(compile(raw, str(path), "exec"), module.__dict__)
+        _after_raw, after_identity = _read_startup_source_snapshot(
+            path, label=f"{path.name} source"
+        )
+        if dict(identity) != after_identity:
+            raise RuntimeError(f"{path.name} changed while being loaded")
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    module.__grabowski_source_identity__ = dict(identity)
+    return module
+
+
 MODULE_PATH = Path(__file__).with_name("repobrief_agent_benchmark_runner.py")
-SPEC = importlib.util.spec_from_file_location("repobrief_agent_benchmark_runner", MODULE_PATH)
-if SPEC is None or SPEC.loader is None:
-    raise RuntimeError("cannot load RepoBrief benchmark runner")
-runner = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = runner
-SPEC.loader.exec_module(runner)
+CODEX_MODULE_PATH = Path(__file__).with_name("repobrief_agent_benchmark_codex_runner.py")
+CODEX_PREFLIGHT_PATH = Path(__file__).with_name("repobrief_agent_benchmark_codex_preflight.py")
+CODEX_BOOTSTRAP_PATH = Path(__file__).with_name(
+    "repobrief_agent_benchmark_source_bootstrap.py"
+)
+CODEX_BOOTSTRAP_KIND = "grabowski.python_c_source_bootstrap"
+CODEX_BOOTSTRAP_SCHEMA_VERSION = 1
+_STARTUP_CODE_IDENTITIES: dict[str, dict[str, Any]] = {}
+_STARTUP_BOOTSTRAP_IDENTITY: dict[str, Any] | None = None
+_CORE_SOURCE_RAW, _CORE_SOURCE_IDENTITY = _read_startup_source_snapshot(
+    Path(__file__), label="preflight core source"
+)
+_RUNNER_SOURCE_RAW, _RUNNER_SOURCE_IDENTITY = _read_startup_source_snapshot(
+    MODULE_PATH, label="benchmark runner source"
+)
+_record_startup_code_identity(_CORE_SOURCE_IDENTITY)
+_record_startup_code_identity(_RUNNER_SOURCE_IDENTITY)
+runner = _load_startup_source_module(
+    "repobrief_agent_benchmark_runner",
+    MODULE_PATH,
+    _RUNNER_SOURCE_RAW,
+    _RUNNER_SOURCE_IDENTITY,
+)
+_codex_runner_cache: Any | None = None
+
+
+def _codex_runner_module() -> Any:
+    global _codex_runner_cache
+    if _codex_runner_cache is not None:
+        return _codex_runner_cache
+    try:
+        raw, identity = _read_startup_source_snapshot(
+            CODEX_MODULE_PATH, label="Codex benchmark runner source"
+        )
+        _record_startup_code_identity(identity)
+        module = _load_startup_source_module(
+            "repobrief_agent_benchmark_codex_runner_for_preflight",
+            CODEX_MODULE_PATH,
+            raw,
+            identity,
+        )
+    except RuntimeError as exc:
+        raise PreflightError(str(exc)) from exc
+    _codex_runner_cache = module
+    return module
 
 REPORT_KIND = "repobrief.agent_benchmark_live_preflight"
 FIXTURE_REPORT_KIND = "repobrief.agent_benchmark_preflight_fixture_report"
@@ -64,6 +240,37 @@ DOES_NOT_ESTABLISH = (
 
 class PreflightError(ValueError):
     """The preflight contract or evidence is invalid."""
+
+
+def _register_startup_code_identity(identity: Mapping[str, Any]) -> None:
+    try:
+        _record_startup_code_identity(identity)
+    except RuntimeError as exc:
+        raise PreflightError(str(exc)) from exc
+
+
+def _register_startup_bootstrap_identity(identity: Mapping[str, Any]) -> None:
+    global _STARTUP_BOOTSTRAP_IDENTITY
+    expected_keys = {"schema_version", "kind", "name", "bytes", "sha256"}
+    if (
+        set(identity) != expected_keys
+        or identity.get("schema_version") != CODEX_BOOTSTRAP_SCHEMA_VERSION
+        or identity.get("kind") != CODEX_BOOTSTRAP_KIND
+        or identity.get("name") != CODEX_BOOTSTRAP_PATH.name
+        or not isinstance(identity.get("bytes"), int)
+        or isinstance(identity.get("bytes"), bool)
+        or int(identity["bytes"]) <= 0
+        or not isinstance(identity.get("sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", str(identity["sha256"])) is None
+    ):
+        raise PreflightError("Codex immutable source bootstrap identity is invalid")
+    current = dict(identity)
+    if (
+        _STARTUP_BOOTSTRAP_IDENTITY is not None
+        and _STARTUP_BOOTSTRAP_IDENTITY != current
+    ):
+        raise PreflightError("Codex immutable source bootstrap changed between loads")
+    _STARTUP_BOOTSTRAP_IDENTITY = current
 
 
 def _utc_now() -> datetime:
@@ -147,6 +354,32 @@ def _write_report_artifacts(report_path: Path, value: Mapping[str, Any]) -> None
         raise
 
 
+def _remove_report_artifacts(report_path: Path) -> None:
+    report_path = report_path.expanduser().resolve()
+    digest_path = Path(str(report_path) + ".sha256")
+    failures: list[str] = []
+    for path in (digest_path, report_path):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            failures.append(f"{path.name}:{type(exc).__name__}")
+    try:
+        descriptor = os.open(report_path.parent, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0))
+    except OSError as exc:
+        failures.append(f"parent:{type(exc).__name__}")
+    else:
+        try:
+            os.fsync(descriptor)
+        except OSError as exc:
+            failures.append(f"parent-fsync:{type(exc).__name__}")
+        finally:
+            os.close(descriptor)
+    if failures:
+        raise PreflightError(
+            "cannot remove incomplete preflight report artifacts: " + ",".join(failures)
+        )
+
+
 def _file_identity(
     path: Path,
     *,
@@ -165,10 +398,9 @@ def _file_identity(
         raise PreflightError(f"{label} is empty or oversized")
     if require_private and metadata.st_mode & 0o077:
         raise PreflightError(f"{label} must not be group- or world-accessible")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(requested, flags)
-    except OSError as exc:
+        descriptor = _open_absolute_regular_nofollow(requested, label=label)
+    except RuntimeError as exc:
         raise PreflightError(f"{label} could not be opened safely") from exc
     digest = hashlib.sha256()
     count = 0
@@ -189,35 +421,65 @@ def _file_identity(
             if count > maximum:
                 raise PreflightError(f"{label} is oversized")
             digest.update(chunk)
+        final_descriptor = os.fstat(descriptor)
+        try:
+            descriptor_path = os.readlink(f"/proc/self/fd/{descriptor}")
+        except OSError as exc:
+            raise PreflightError(f"{label} opened path cannot be bound") from exc
+        if (
+            not os.path.isabs(descriptor_path)
+            or descriptor_path.endswith(" (deleted)")
+            or os.path.normpath(descriptor_path) != os.path.normpath(str(requested))
+        ):
+            raise PreflightError(f"{label} opened path is unavailable")
+        try:
+            final = requested.lstat()
+        except OSError as exc:
+            raise PreflightError(f"{label} disappeared during validation") from exc
+        if (
+            final_descriptor.st_dev != current.st_dev
+            or final_descriptor.st_ino != current.st_ino
+            or final_descriptor.st_size != current.st_size
+            or final.st_dev != current.st_dev
+            or final.st_ino != current.st_ino
+            or final.st_size != current.st_size
+            or count != current.st_size
+        ):
+            raise PreflightError(f"{label} changed during validation")
+        return {
+            "path": descriptor_path,
+            "bytes": count,
+            "sha256": digest.hexdigest(),
+            "mode": oct(current.st_mode & 0o777),
+        }
     finally:
         os.close(descriptor)
-    try:
-        final = requested.lstat()
-    except OSError as exc:
-        raise PreflightError(f"{label} disappeared during validation") from exc
-    if (
-        final.st_dev != metadata.st_dev
-        or final.st_ino != metadata.st_ino
-        or final.st_size != metadata.st_size
-        or count != metadata.st_size
-    ):
-        raise PreflightError(f"{label} changed during validation")
-    return {
-        "path": str(requested.resolve()),
-        "bytes": count,
-        "sha256": digest.hexdigest(),
-        "mode": oct(metadata.st_mode & 0o777),
-    }
 
 
-def _command_file_identities(command: Sequence[Any]) -> list[dict[str, Any]]:
+def _command_file_identities(
+    command: Sequence[Any],
+    *,
+    relative_to: Path | None = None,
+    executable_search_path: str | None = None,
+) -> list[dict[str, Any]]:
     identities: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for raw in command:
+    relative_root = None if relative_to is None else relative_to.expanduser().resolve()
+    for index, raw in enumerate(command):
         if not isinstance(raw, str) or not raw:
             continue
         candidate = Path(raw).expanduser()
-        if not candidate.is_absolute() or not candidate.exists():
+        if not candidate.is_absolute():
+            if index == 0 and executable_search_path is not None:
+                resolved_executable = shutil.which(raw, path=executable_search_path)
+                if resolved_executable is None:
+                    raise PreflightError("MCP command executable is unavailable on the runtime PATH")
+                candidate = Path(resolved_executable)
+            elif relative_root is None:
+                continue
+            else:
+                candidate = relative_root / candidate
+        if not candidate.exists():
             continue
         resolved = candidate.resolve()
         key = str(resolved)
@@ -243,26 +505,77 @@ def _dispatch_provider_binding(claude: str, synthetic: bool) -> dict[str, Any]:
     raise PreflightError("live preflight provider binding adapter is unavailable")
 
 
-def _preflight_code_identity() -> dict[str, Any]:
+def _request_validation_runner(request: Mapping[str, Any]) -> Any:
+    contract = request.get("runner")
+    if not isinstance(contract, Mapping):
+        raise PreflightError("request runner contract is invalid")
+    provider = contract.get("provider")
+    if provider == runner.PROVIDER:
+        return runner
+    if provider == "openai-codex-cli":
+        codex_runner = _codex_runner_module()
+        if contract.get("execution_contract") != codex_runner.EXECUTION_CONTRACT:
+            raise PreflightError("Codex request execution contract mismatch")
+        return codex_runner
+    raise PreflightError("request provider is not supported by benchmark preflight")
+
+
+def _validate_provider_request(request: Mapping[str, Any]) -> Any:
+    selected = _request_validation_runner(request)
+    try:
+        selected.validate_request(request)
+    except selected.RunnerError as exc:
+        raise PreflightError(str(exc)) from exc
+    return selected
+
+
+def _preflight_code_identity(request: Mapping[str, Any]) -> dict[str, Any]:
+    selected = _request_validation_runner(request)
+    if selected is runner:
+        paths = (
+            Path(__file__).resolve(),
+            Path(__file__).with_name("repobrief_agent_benchmark_preflight.py").resolve(),
+            MODULE_PATH.resolve(),
+        )
+    else:
+        paths = (
+            Path(__file__).resolve(),
+            CODEX_PREFLIGHT_PATH.resolve(),
+            MODULE_PATH.resolve(),
+            CODEX_BOOTSTRAP_PATH.resolve(),
+            CODEX_MODULE_PATH.resolve(),
+        )
+    require_startup_binding = selected is not runner
     files: list[dict[str, Any]] = []
-    for path in (
-        Path(__file__).resolve(),
-        Path(__file__).with_name("repobrief_agent_benchmark_preflight.py").resolve(),
-        MODULE_PATH.resolve(),
-    ):
-        if path.is_symlink() or not path.is_file():
-            raise PreflightError(f"preflight code file is unavailable: {path.name}")
-        try:
-            raw = path.read_bytes()
-        except OSError as exc:
-            raise PreflightError(f"cannot read preflight code file: {path.name}") from exc
-        if not raw or len(raw) > MAX_LEDGER_ARTIFACT_BYTES:
-            raise PreflightError(f"preflight code file is empty or oversized: {path.name}")
+    for path in paths:
+        current = _file_identity(
+            path,
+            maximum=MAX_LEDGER_ARTIFACT_BYTES,
+            label=f"preflight code file {path.name}",
+        )
+        startup = (
+            _STARTUP_BOOTSTRAP_IDENTITY
+            if path == CODEX_BOOTSTRAP_PATH.resolve()
+            else _STARTUP_CODE_IDENTITIES.get(str(path.resolve()))
+        )
+        if startup is not None:
+            if (
+                startup.get("name") != path.name
+                or startup.get("bytes") != current.get("bytes")
+                or startup.get("sha256") != current.get("sha256")
+            ):
+                raise PreflightError(
+                    f"preflight code file changed after module load: {path.name}"
+                )
+        elif require_startup_binding:
+            raise PreflightError(
+                f"preflight code file lacks startup binding: {path.name}"
+            )
         files.append(
             {
                 "name": path.name,
-                "bytes": len(raw),
-                "sha256": _sha256_bytes(raw),
+                "bytes": current["bytes"],
+                "sha256": current["sha256"],
             }
         )
     return {
@@ -285,6 +598,7 @@ def _dispatch_binding(
     max_cost_usd: Decimal,
     validator_command: Sequence[str],
     synthetic: bool,
+    provider_binding: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     repobrief = treatment.get("repobrief")
     if not isinstance(repobrief, Mapping):
@@ -342,7 +656,15 @@ def _dispatch_binding(
             label="RepoBrief manifest",
         ),
         "mcp_command_sha256": _sha256_json(mcp_command),
-        "mcp_command_files": _command_file_identities(mcp_command),
+        "mcp_command_files": _command_file_identities(
+            mcp_command,
+            relative_to=Path.cwd(),
+            executable_search_path=(
+                _request_validation_runner(treatment).provider_env().get("PATH")
+                if treatment.get("runner", {}).get("provider") == "openai-codex-cli"
+                else None
+            ),
+        ),
         "state_root": str(state_root.expanduser().resolve()),
         "transcript_root": str(transcript_root.expanduser().resolve()),
         "evidence_root": str(evidence_root.expanduser().resolve()),
@@ -356,8 +678,12 @@ def _dispatch_binding(
         "validator_command_sha256": _sha256_json(list(validator_command)),
         "validator_command_files": _command_file_identities(validator_command),
         "synthetic_fixture": synthetic,
-        "provider": _dispatch_provider_binding(claude, synthetic),
-        "code": _preflight_code_identity(),
+        "provider": (
+            dict(provider_binding)
+            if provider_binding is not None
+            else _dispatch_provider_binding(claude, synthetic)
+        ),
+        "code": _preflight_code_identity(treatment),
     }
 
 
@@ -375,6 +701,7 @@ def _assert_dispatch_binding_unchanged(
     max_cost_usd: Decimal,
     validator_command: Sequence[str],
     synthetic: bool,
+    provider_binding: Mapping[str, Any] | None = None,
 ) -> None:
     baseline, treatment = load_pair(request_root, pair_id)
     current = _dispatch_binding(
@@ -390,6 +717,7 @@ def _assert_dispatch_binding_unchanged(
         max_cost_usd=max_cost_usd,
         validator_command=validator_command,
         synthetic=synthetic,
+        provider_binding=provider_binding,
     )
     if _sha256_json(current) != _sha256_json(expected):
         raise PreflightError(
@@ -479,21 +807,12 @@ def _initialize_dispatch_ledger(
         os.mkdir(events_root, 0o700)
     except OSError as exc:
         raise PreflightError("cannot create dispatch ledger event directory") from exc
-    authorization = {
-        "kind": LEDGER_KIND,
-        "version": LEDGER_VERSION,
-        "created_at": _iso(_utc_now()),
-        "contract_sha256": contract_sha256,
-        "binding": dict(binding),
-        "retry_permitted": False,
-    }
-    _write_private_exclusive(pair_root / "authorization.json", authorization)
-    ledger: dict[str, Any] = {
+    return {
         "root": pair_root,
         "events_root": events_root,
         "pair_id": binding["pair_id"],
         "contract_sha256": contract_sha256,
-        "authorization_sha256": _sha256_json(authorization),
+        "authorization_sha256": None,
         "next_sequence": 0,
         "previous_event_sha256": contract_sha256,
         "condition_intents": [],
@@ -503,16 +822,118 @@ def _initialize_dispatch_ledger(
         "failure_recorded": False,
         "terminal_recorded": False,
     }
-    _append_ledger_event(
-        ledger,
-        "authorized",
-        {
+
+
+def _prepare_dispatch_publication(
+    ledger: Mapping[str, Any], binding: Mapping[str, Any]
+) -> dict[str, Any]:
+    if _sha256_json(binding) != ledger["contract_sha256"]:
+        raise PreflightError("dispatch authorization binding changed before publication")
+    authorization_path = Path(ledger["root"]) / "authorization.json"
+    if ledger.get("authorization_sha256") is not None or authorization_path.exists():
+        raise PreflightError("dispatch authorization is already published")
+    sequence = int(ledger["next_sequence"])
+    event = {
+        "kind": LEDGER_EVENT_KIND,
+        "version": LEDGER_VERSION,
+        "sequence": sequence,
+        "event": "authorized",
+        "recorded_at": _iso(_utc_now()),
+        "pair_id": ledger["pair_id"],
+        "contract_sha256": ledger["contract_sha256"],
+        "previous_event_sha256": ledger["previous_event_sha256"],
+        "payload": {
             "synthetic_fixture": bool(binding["synthetic_fixture"]),
             "max_provider_processes": int(binding["max_provider_processes"]),
         },
-    )
-    return ledger
+    }
+    authorization = {
+        "kind": LEDGER_KIND,
+        "version": LEDGER_VERSION,
+        "created_at": _iso(_utc_now()),
+        "contract_sha256": ledger["contract_sha256"],
+        "binding": dict(binding),
+        "retry_permitted": False,
+    }
+    return {
+        "event": event,
+        "event_path": Path(ledger["events_root"]) / f"{sequence:04d}-authorized.json",
+        "event_sha256": _sha256_json(event),
+        "authorization": authorization,
+        "authorization_path": authorization_path,
+        "authorization_sha256": _sha256_json(authorization),
+    }
 
+
+def _dispatch_ledger_report_after_publication(
+    ledger: Mapping[str, Any], publication: Mapping[str, Any]
+) -> dict[str, Any]:
+    report = _dispatch_ledger_report(ledger)
+    report["authorization_sha256"] = publication["authorization_sha256"]
+    report["event_count"] = int(ledger["next_sequence"]) + 1
+    report["final_event_sha256"] = publication["event_sha256"]
+    return report
+
+
+def _dispatch_report_evidence_projection(
+    report: Mapping[str, Any],
+) -> dict[str, Any]:
+    projected = json.loads(_canonical_json(report))
+    ledger = projected.get("dispatch_ledger")
+    if not isinstance(ledger, dict):
+        raise PreflightError("dispatch report ledger is invalid")
+    ledger["authorization_sha256"] = None
+    return projected
+
+
+def _bind_dispatch_report_evidence(
+    publication: dict[str, Any],
+    report: dict[str, Any],
+) -> None:
+    authorization = publication.get("authorization")
+    ledger = report.get("dispatch_ledger")
+    if not isinstance(authorization, dict) or not isinstance(ledger, dict):
+        raise PreflightError("dispatch report evidence binding is invalid")
+    authorization["report_evidence_sha256"] = _sha256_json(
+        _dispatch_report_evidence_projection(report)
+    )
+    publication["authorization_sha256"] = _sha256_json(authorization)
+    ledger["authorization_sha256"] = publication["authorization_sha256"]
+
+
+def _publish_dispatch_authorization(
+    ledger: dict[str, Any],
+    binding: Mapping[str, Any],
+    *,
+    prepared: Mapping[str, Any] | None = None,
+) -> None:
+    publication = (
+        _prepare_dispatch_publication(ledger, binding)
+        if prepared is None
+        else dict(prepared)
+    )
+    if _sha256_json(binding) != ledger["contract_sha256"]:
+        raise PreflightError("dispatch authorization binding changed before publication")
+    if publication.get("authorization_sha256") != _sha256_json(publication["authorization"]):
+        raise PreflightError("prepared dispatch authorization identity is invalid")
+    if publication.get("event_sha256") != _sha256_json(publication["event"]):
+        raise PreflightError("prepared dispatch authorization event identity is invalid")
+    if int(publication["event"].get("sequence", -1)) != int(ledger["next_sequence"]):
+        raise PreflightError("prepared dispatch authorization sequence is stale")
+    if publication["event"].get("previous_event_sha256") != ledger["previous_event_sha256"]:
+        raise PreflightError("prepared dispatch authorization event chain is stale")
+    authorization_path = Path(publication["authorization_path"])
+    event_path = Path(publication["event_path"])
+    if authorization_path.exists() or event_path.exists():
+        raise PreflightError("dispatch authorization publication path already exists")
+
+    # The report/digest is already durable at this point.  These are the final
+    # create-only publication writes; no success-path persistence follows.
+    _write_private_exclusive(event_path, publication["event"])
+    ledger["next_sequence"] = int(ledger["next_sequence"]) + 1
+    ledger["previous_event_sha256"] = publication["event_sha256"]
+    _write_private_exclusive(authorization_path, publication["authorization"])
+    ledger["authorization_sha256"] = publication["authorization_sha256"]
 
 def _append_ledger_event(
     ledger: dict[str, Any], event_type: str, payload: Mapping[str, Any]
@@ -891,8 +1312,10 @@ def load_pair(request_root: Path, pair_id: str) -> tuple[dict[str, Any], dict[st
         raise PreflightError("pair must contain baseline and treatment")
     baseline = by_condition["baseline"]
     treatment = by_condition["treatment"]
-    runner.validate_request(baseline)
-    runner.validate_request(treatment)
+    baseline_runner = _validate_provider_request(baseline)
+    treatment_runner = _validate_provider_request(treatment)
+    if baseline_runner is not treatment_runner:
+        raise PreflightError("paired requests use different provider contracts")
     _validate_pair(baseline, treatment)
     runner.load_planned_request(baseline, request_root)
     runner.load_planned_request(treatment, request_root)
@@ -971,6 +1394,21 @@ def _assert_source_unchanged(before: Mapping[str, Any], after: Mapping[str, Any]
             raise PreflightError(f"source checkout changed during preflight: {field}")
 
 
+def _assert_source_matches_requested_commit(
+    observed: Mapping[str, Any], request: Mapping[str, Any]
+) -> None:
+    repository = request.get("repository")
+    expected = repository.get("commit") if isinstance(repository, Mapping) else None
+    if (
+        not isinstance(expected, str)
+        or re.fullmatch(r"[0-9a-f]{40}", expected) is None
+        or observed.get("head") != expected
+    ):
+        raise PreflightError(
+            "source checkout HEAD does not match requested repository commit"
+        )
+
+
 def prepare_snapshot(treatment: Mapping[str, Any]) -> tuple[dict[str, Any], int]:
     started = time.monotonic()
     binding = treatment.get("repobrief")
@@ -1006,6 +1444,8 @@ def _readline_with_timeout(stream, *, timeout_seconds: float) -> bytes:
         raise PreflightError("RepoBrief MCP closed before responding")
     if len(line) > MAX_MCP_LINE_BYTES:
         raise PreflightError("RepoBrief MCP response is oversized")
+    if not line.endswith(b"\n"):
+        raise PreflightError("RepoBrief MCP response is not newline terminated")
     return line
 
 
@@ -1019,9 +1459,17 @@ def _rpc(process: subprocess.Popen, message: Mapping[str, Any], *, timeout_secon
         response = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise PreflightError("RepoBrief MCP returned invalid JSON") from exc
-    if not isinstance(response, dict) or response.get("id") != message.get("id"):
-        raise PreflightError("RepoBrief MCP response identity mismatch")
-    if "error" in response:
+    if (
+        not isinstance(response, dict)
+        or response.get("jsonrpc") != "2.0"
+        or response.get("id") != message.get("id")
+    ):
+        raise PreflightError("RepoBrief MCP response envelope is invalid")
+    has_result = "result" in response
+    has_error = "error" in response
+    if has_result == has_error:
+        raise PreflightError("RepoBrief MCP response envelope is invalid")
+    if has_error:
         raise PreflightError("RepoBrief MCP returned a JSON-RPC error")
     result = response.get("result")
     if not isinstance(result, dict):
@@ -1305,6 +1753,153 @@ def _claude_identity(claude: str) -> dict[str, Any]:
     }
 
 
+def authorize_dispatch(
+    *,
+    pair_id: str,
+    request_root: Path,
+    repository_map: Path,
+    state_root: Path,
+    transcript_root: Path,
+    evidence_root: Path,
+    report_out: Path | None,
+    provider_binding: Mapping[str, Any],
+    max_cost_usd: Decimal,
+    validator_command: Sequence[str],
+) -> dict[str, Any]:
+    """Create one live provider dispatch authorization without launching a provider."""
+
+    if (
+        not max_cost_usd.is_finite()
+        or max_cost_usd <= 0
+        or max_cost_usd > MAX_PER_RUN_COST_USD
+    ):
+        raise PreflightError(f"max cost must be finite, > 0 and <= {MAX_PER_RUN_COST_USD}")
+    if report_out is None:
+        raise PreflightError("live dispatch authorization requires a durable report output")
+    if not isinstance(provider_binding, Mapping) or provider_binding.get("mode") != "live_provider":
+        raise PreflightError("live provider binding is invalid")
+    baseline, treatment = load_pair(request_root, pair_id)
+    provider_runner = provider_binding.get("runner")
+    if (
+        not isinstance(provider_runner, Mapping)
+        or _canonical_json(provider_runner) != _canonical_json(treatment.get("runner"))
+    ):
+        raise PreflightError(
+            "live provider binding does not match treatment runner contract"
+        )
+    binding = _dispatch_binding(
+        baseline=baseline,
+        treatment=treatment,
+        request_root=request_root,
+        repository_map=repository_map,
+        state_root=state_root,
+        transcript_root=transcript_root,
+        evidence_root=evidence_root,
+        report_out=report_out,
+        claude="",
+        max_cost_usd=max_cost_usd,
+        validator_command=validator_command,
+        synthetic=False,
+        provider_binding=provider_binding,
+    )
+    ledger = _initialize_dispatch_ledger(binding=binding, state_root=state_root)
+    report_persisted = False
+    try:
+        _assert_output_paths_available(
+            baseline=baseline,
+            treatment=treatment,
+            transcript_root=transcript_root,
+            evidence_root=evidence_root,
+            report_out=report_out,
+        )
+        source = runner.load_repository_root(baseline, repository_map)
+        before = source_state(source)
+        _assert_source_matches_requested_commit(before, baseline)
+        snapshot, snapshot_preparation_ms = prepare_snapshot(treatment)
+        freshness, freshness_check_ms = probe_freshness(treatment)
+        if freshness["status"] != "fresh":
+            raise PreflightError(
+                f"treatment snapshot is not fresh: {freshness['status']}"
+            )
+        after = source_state(source)
+        _assert_source_unchanged(before, after)
+        _assert_dispatch_binding_unchanged(
+            binding,
+            pair_id=pair_id,
+            request_root=request_root,
+            repository_map=repository_map,
+            state_root=state_root,
+            transcript_root=transcript_root,
+            evidence_root=evidence_root,
+            report_out=report_out,
+            claude="",
+            max_cost_usd=max_cost_usd,
+            validator_command=validator_command,
+            synthetic=False,
+            provider_binding=provider_binding,
+        )
+
+        publication = _prepare_dispatch_publication(ledger, binding)
+        report = {
+            "kind": "repobrief.agent_benchmark_preflight_dispatch_authorization",
+            "version": VERSION,
+            "status": "authorized",
+            "pair_id": pair_id,
+            "synthetic_fixture": False,
+            "dispatch_ledger": _dispatch_ledger_report_after_publication(ledger, publication),
+            "request_sha256": {
+                "baseline": _sha256_json(baseline),
+                "treatment": _sha256_json(treatment),
+            },
+            "snapshot": {**snapshot, **freshness},
+            "source_before": before,
+            "source_after": after,
+            "timings": {
+                "snapshot_preparation_ms": snapshot_preparation_ms,
+                "freshness_check_ms": freshness_check_ms,
+            },
+            "provider": dict(provider_binding),
+            "default_promoted": False,
+            "does_not_establish": list(DOES_NOT_ESTABLISH),
+        }
+        _bind_dispatch_report_evidence(publication, report)
+
+        # Durable producer evidence must exist before the capability becomes
+        # consumable.  A report/digest failure therefore leaves no authorization.
+        _write_report_artifacts(report_out, report)
+        report_persisted = True
+
+        publication_source = source_state(source)
+        _assert_source_unchanged(before, publication_source)
+        _assert_dispatch_binding_unchanged(
+            binding,
+            pair_id=pair_id,
+            request_root=request_root,
+            repository_map=repository_map,
+            state_root=state_root,
+            transcript_root=transcript_root,
+            evidence_root=evidence_root,
+            report_out=report_out,
+            claude="",
+            max_cost_usd=max_cost_usd,
+            validator_command=validator_command,
+            synthetic=False,
+            provider_binding=provider_binding,
+        )
+        _publish_dispatch_authorization(ledger, binding, prepared=publication)
+        return report
+    except BaseException as exc:
+        cleanup_error: BaseException | None = None
+        if report_persisted and ledger.get("authorization_sha256") is None:
+            try:
+                _remove_report_artifacts(report_out)
+            except BaseException as report_cleanup_exc:
+                cleanup_error = report_cleanup_exc
+        _record_preflight_failure(ledger, cleanup_error or exc)
+        if cleanup_error is not None:
+            raise cleanup_error from exc
+        raise
+
 def execute_preflight(
     *,
     pair_id: str,
@@ -1353,6 +1948,7 @@ def execute_preflight(
         )
         source = runner.load_repository_root(baseline, repository_map)
         before = source_state(source)
+        _assert_source_matches_requested_commit(before, baseline)
         snapshot, snapshot_preparation_ms = prepare_snapshot(treatment)
         freshness, freshness_check_ms = probe_freshness(treatment)
         if freshness["status"] != "fresh":
@@ -1370,6 +1966,23 @@ def execute_preflight(
             if synthetic
             else _claude_identity(claude)
         )
+        authorization_source = source_state(source)
+        _assert_source_unchanged(before, authorization_source)
+        _assert_dispatch_binding_unchanged(
+            binding,
+            pair_id=pair_id,
+            request_root=request_root,
+            repository_map=repository_map,
+            state_root=state_root,
+            transcript_root=transcript_root,
+            evidence_root=evidence_root,
+            report_out=report_out,
+            claude=claude,
+            max_cost_usd=max_cost_usd,
+            validator_command=validator_command,
+            synthetic=synthetic,
+        )
+        _publish_dispatch_authorization(ledger, binding)
 
         ordered = sorted([baseline, treatment], key=lambda item: int(item["order"]))
         fixture_by_condition = {
@@ -1457,7 +2070,7 @@ def execute_preflight(
                     synthetic=synthetic,
                     observed_cost=observed_cost,
                 )
-            except Exception as exc:
+            except BaseException as exc:
                 _record_condition_failure(ledger, request, transcript_root, exc)
                 raise
 
@@ -1559,7 +2172,7 @@ def execute_preflight(
             "does_not_establish": list(DOES_NOT_ESTABLISH),
         }
         return report
-    except Exception as exc:
+    except BaseException as exc:
         _record_preflight_failure(ledger, exc)
         raise
 

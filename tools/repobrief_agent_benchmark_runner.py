@@ -389,7 +389,9 @@ def _validate_provider_executable(
     return str(path)
 
 
-def validate_request(request: Mapping[str, Any]) -> None:
+def _validate_request_common(request: Mapping[str, Any]) -> None:
+    """Validate provider-neutral request invariants without a provider contract."""
+
     unknown = set(request).difference(REQUEST_FIELDS)
     missing = REQUEST_FIELDS.difference(request)
     if unknown:
@@ -428,11 +430,15 @@ def validate_request(request: Mapping[str, Any]) -> None:
     if _list(request.get("does_not_establish")) != list(DOES_NOT_ESTABLISH):
         raise RunnerError("request does_not_establish contract mismatch")
     _validate_repository(request)
-    _validate_runner(request)
     _validate_budgets(request)
     _validate_isolation(request)
     _validate_tool_policy(request)
     _validate_repobrief(request)
+
+
+def validate_request(request: Mapping[str, Any]) -> None:
+    _validate_request_common(request)
+    _validate_runner(request)
 
 
 def _validate_repository(request: Mapping[str, Any]) -> None:
