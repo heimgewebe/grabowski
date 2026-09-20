@@ -810,14 +810,32 @@ def apply(
         }
     output.setdefault("lease_owner_id", owner_id)
     if release_error is not None:
-        output["receipt_status"] = "blocked"
-        output["state"] = "lease_cleanup_required"
+        cleanup_next_action = (
+            "inspect and clean the exact owned leases before any new intent"
+        )
+        prior_next_action = output.get("next_action")
+        if isinstance(prior_next_action, str) and prior_next_action.strip():
+            output.setdefault("effect_next_action", prior_next_action)
+        if output.get("receipt_status") == "passed":
+            output["receipt_status"] = "blocked"
+        elif output.get("receipt_status") not in {"blocked", "failed"}:
+            output["receipt_status"] = "blocked"
         output["retry_authorized"] = False
+        output["lease_cleanup_required"] = True
         output["lease_release"] = {
             "status": "failed",
             "error_class": type(release_error).__name__,
         }
-        output["next_action"] = (
-            "inspect and clean the exact owned leases before any new intent"
-        )
+        output["lease_cleanup_next_action"] = cleanup_next_action
+        if output.get("readback_required") is True:
+            readback_next_action = (
+                prior_next_action
+                if isinstance(prior_next_action, str) and prior_next_action.strip()
+                else "authoritative local and remote readback before any new intent"
+            )
+            output["next_action"] = (
+                f"{readback_next_action}; then {cleanup_next_action}"
+            )
+        else:
+            output["next_action"] = cleanup_next_action
     return output

@@ -590,7 +590,87 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             self.assertEqual("outcome_unknown", result["state"])
             self.assertFalse(result["retry_authorized"])
             self.assertTrue(result["readback_required"])
+            self.assertEqual(base, git_stdout(repo, "rev-parse", "HEAD"))
+            self.assertEqual(base, git_stdout(repo, "rev-parse", "refs/heads/main"))
+            self.assertEqual("M  state.txt", git_stdout(repo, "status", "--porcelain"))
+            self.assertEqual(
+                git_stdout(repo, "rev-parse", f"{target}^{{tree}}"),
+                git_stdout(repo, "write-tree"),
+            )
+            self.assertNotEqual(
+                git_stdout(repo, "rev-parse", f"{base}^{{tree}}"),
+                git_stdout(repo, "write-tree"),
+            )
+            self.assertEqual(
+                "state.txt",
+                git_stdout(repo, "diff", "--cached", "--name-only"),
+            )
             self.assertEqual(1, leases.release_calls)
+
+    def test_cas_failure_with_release_failure_preserves_git_ambiguity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            leases = LeaseHarness()
+
+            def failing_runner(path: Path, argv: list[str]) -> dict[str, object]:
+                if argv == ["update-ref", "refs/heads/main", target, base]:
+                    return {
+                        "returncode": 1,
+                        "stdout": "",
+                        "stderr": "injected CAS failure",
+                    }
+                return git(path, argv)
+
+            def failing_release(
+                owner_id: str,
+                resource_keys: list[str],
+                *,
+                expected_leases: list[dict[str, object]] | None = None,
+                force: bool = False,
+            ) -> dict[str, object]:
+                del owner_id, resource_keys, expected_leases, force
+                raise RuntimeError("cleanup state unknown")
+
+            with (
+                patch.object(sync_apply.resources, "acquire_resources", leases.acquire),
+                patch.object(sync_apply.resources, "inspect_resources", leases.inspect),
+                patch.object(sync_apply.resources, "release_resources", failing_release),
+            ):
+                result = self.apply(
+                    repo,
+                    remote,
+                    base,
+                    target,
+                    runner=failing_runner,
+                )
+
+            self.assertEqual("failed", result["receipt_status"])
+            self.assertEqual("outcome_unknown", result["state"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertTrue(result["readback_required"])
+            self.assertFalse(result["post_state_verified"])
+            self.assertTrue(result["lease_cleanup_required"])
+            self.assertEqual("failed", result["lease_release"]["status"])
+            self.assertIn(
+                "authoritative local and remote readback",
+                result["next_action"],
+            )
+            self.assertIn("inspect and clean", result["next_action"])
+            self.assertEqual(
+                "authoritative local and remote readback before any new intent",
+                result["effect_next_action"],
+            )
+            self.assertIn(
+                "inspect and clean",
+                result["lease_cleanup_next_action"],
+            )
+            self.assertEqual(base, git_stdout(repo, "rev-parse", "HEAD"))
+            self.assertEqual(base, git_stdout(repo, "rev-parse", "refs/heads/main"))
+            self.assertEqual("M  state.txt", git_stdout(repo, "status", "--porcelain"))
+            self.assertEqual(
+                git_stdout(repo, "rev-parse", f"{target}^{{tree}}"),
+                git_stdout(repo, "write-tree"),
+            )
 
     def test_preimage_drift_after_lease_is_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -777,7 +857,8 @@ class PostMergeSyncApplyTests(unittest.TestCase):
                 result = self.apply(repo, remote, base, target)
 
             self.assertEqual("blocked", result["receipt_status"])
-            self.assertEqual("lease_cleanup_required", result["state"])
+            self.assertEqual("synced", result["state"])
+            self.assertTrue(result["lease_cleanup_required"])
             self.assertRegex(
                 str(result["lease_owner_id"]),
                 r"^operator:post-merge-sync-[0-9a-f]{16}-[0-9a-f]{24}$",
@@ -785,7 +866,12 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             self.assertFalse(result["retry_authorized"])
             self.assertTrue(result["effect_started"])
             self.assertTrue(result["post_state_verified"])
+            self.assertEqual("failed", result["lease_release"]["status"])
             self.assertIn("inspect and clean", result["next_action"])
+            self.assertIn(
+                "inspect and clean",
+                result["lease_cleanup_next_action"],
+            )
             self.assertEqual(target, git_stdout(repo, "rev-parse", "HEAD"))
 
 
