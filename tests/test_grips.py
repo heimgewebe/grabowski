@@ -1490,6 +1490,68 @@ class GripFoundationTests(unittest.TestCase):
         self.assertIn("core._run_captain_pr_merge", orchestration_source)
         self.assertIn("grabowski_grip_orchestration", core_source)
 
+    def test_post_merge_sync_apply_skips_unreached_acceptance_checks(self) -> None:
+        parameters = {
+            "repo": "/tmp/grabowski-pr1261-acceptance-test",
+            "target_branch": "main",
+            "expected_local_head": "1" * 40,
+            "expected_remote_head": "2" * 40,
+            "confirmation": "apply-protected-post-merge-sync",
+        }
+        cases = {
+            "confirmation_mismatch": {
+                "protected-canonical-checkout": "skip",
+                "clean-exact-preimage": "skip",
+                "remote-head-bound": "skip",
+            },
+            "invalid_bound_heads": {
+                "protected-canonical-checkout": "skip",
+                "clean-exact-preimage": "skip",
+                "remote-head-bound": "skip",
+            },
+            "canonical_checkout_mismatch": {
+                "protected-canonical-checkout": "fail",
+                "clean-exact-preimage": "skip",
+                "remote-head-bound": "skip",
+            },
+            "dirty_checkout": {
+                "protected-canonical-checkout": "pass",
+                "clean-exact-preimage": "fail",
+                "remote-head-bound": "skip",
+            },
+        }
+        for state, expected in cases.items():
+            with self.subTest(state=state):
+                receipt: dict[str, object] = {"checks": []}
+                with (
+                    patch.object(
+                        grips,
+                        "_validate_remote_materialization_target",
+                        return_value="https://example.invalid/grabowski.git",
+                    ),
+                    patch(
+                        "grabowski_post_merge_sync_apply.apply",
+                        return_value={
+                            "receipt_status": "blocked",
+                            "state": state,
+                            "retry_authorized": False,
+                        },
+                    ),
+                ):
+                    output = grips._run_post_merge_sync_apply(
+                        grips.GRIP_SPECS["post-merge-sync-apply"],
+                        parameters,
+                        receipt,
+                        FakeGit(),
+                    )
+                self.assertEqual(state, output["state"])
+                statuses = {
+                    item["id"]: item["status"]
+                    for item in receipt["checks"]
+                }
+                for check_id, status in expected.items():
+                    self.assertEqual(status, statuses[check_id])
+
     def test_list_grips_exposes_core_foundation_specs(self) -> None:
         listed = grips.list_grips()
         specs = {item["name"]: item for item in listed}

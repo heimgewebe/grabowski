@@ -6712,14 +6712,25 @@ def _run_post_merge_sync_apply(
         raise GripPreflightError(str(exc)) from exc
 
     state = str(output.get("state") or "unknown")
+    before_snapshot = state in {
+        "unsupported_target_branch",
+        "confirmation_mismatch",
+        "invalid_bound_heads",
+        "invalid_remote",
+    }
     blocked_canonical = state in {
         "unsupported_target_branch",
         "canonical_checkout_mismatch",
     }
+    canonical_status = (
+        "fail"
+        if blocked_canonical
+        else ("skip" if before_snapshot else "pass")
+    )
     _check(
         receipt,
         "protected-canonical-checkout",
-        "fail" if blocked_canonical else "pass",
+        canonical_status,
         state,
     )
     blocked_preimage = state in {
@@ -6729,10 +6740,16 @@ def _run_post_merge_sync_apply(
         "preimage_drift_after_lease",
         "lease_preimage_drift",
     }
+    preimage_unverified = before_snapshot or state == "canonical_checkout_mismatch"
+    preimage_status = (
+        "fail"
+        if blocked_preimage
+        else ("skip" if preimage_unverified else "pass")
+    )
     _check(
         receipt,
         "clean-exact-preimage",
-        "fail" if blocked_preimage else "pass",
+        preimage_status,
         state,
     )
     remote_bad = state in {
@@ -6741,10 +6758,20 @@ def _run_post_merge_sync_apply(
         "remote_read_failed_after_lease",
         "remote_head_drift_after_lease",
     }
+    remote_unverified = preimage_unverified or state in {
+        "dirty_checkout",
+        "local_head_mismatch",
+        "upstream_mismatch",
+    }
+    remote_status = (
+        "fail"
+        if remote_bad
+        else ("skip" if remote_unverified else "pass")
+    )
     _check(
         receipt,
         "remote-head-bound",
-        "fail" if remote_bad else "pass",
+        remote_status,
         str(output.get("remote_head") or expected_remote_head),
     )
     _check(
