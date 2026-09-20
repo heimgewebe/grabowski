@@ -34,7 +34,7 @@ import tempfile
 import sys
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 SOURCE_SNAPSHOT_MAX_BYTES = 16 * 1024 * 1024
@@ -2277,6 +2277,8 @@ def _record_preflight_dispatch_intent(
     request: Mapping[str, Any],
     state_root: Path,
     authorization: Mapping[str, Any],
+    *,
+    intent_persisted_callback: Callable[[], None] | None = None,
 ) -> str:
     pair_id = str(request["pair_id"])
     pair_root = (
@@ -2399,6 +2401,8 @@ def _record_preflight_dispatch_intent(
                     + "\n"
                 ).encode("utf-8"),
             )
+            if intent_persisted_callback is not None:
+                intent_persisted_callback()
             _directory_fd_matches(events_path, events_fd)
         finally:
             os.close(events_fd)
@@ -3947,6 +3951,7 @@ def run_bounded(
     timeout_seconds: int,
     stdin_data: bytes,
     environment: Mapping[str, str] | None = None,
+    process_started_callback: Callable[[], None] | None = None,
     stdout_limit: int = MAX_TRANSCRIPT_BYTES,
     stderr_limit: int = MAX_STDERR_BYTES,
 ) -> dict[str, Any]:
@@ -3977,6 +3982,8 @@ def run_bounded(
         except OSError as exc:
             raise RunnerError("Codex process could not be started") from exc
 
+        if process_started_callback is not None:
+            process_started_callback()
         deadline = time.monotonic() + timeout_seconds
         buffers = {"stdout": bytearray(), "stderr": bytearray()}
         limits = {"stdout": stdout_limit, "stderr": stderr_limit}
@@ -4926,6 +4933,15 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
     dispatch_authorization: dict[str, Any] | None = None
     dispatch_intent_recorded = False
     provider_process_started = False
+
+    def mark_dispatch_intent_recorded() -> None:
+        nonlocal dispatch_intent_recorded
+        dispatch_intent_recorded = True
+
+    def mark_provider_process_started() -> None:
+        nonlocal provider_process_started
+        provider_process_started = True
+
     if not synthetic:
         assert codex is not None
         dispatch_authorization = _load_preflight_dispatch_authorization(
@@ -5020,16 +5036,18 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                 if dispatch_authorization is None:
                     raise RunnerError("live dispatch authorization is unavailable before provider intent")
                 _record_preflight_dispatch_intent(
-                    request, state_path, dispatch_authorization["authorization"]
+                    request,
+                    state_path,
+                    dispatch_authorization["authorization"],
+                    intent_persisted_callback=mark_dispatch_intent_recorded,
                 )
-                dispatch_intent_recorded = True
                 capture = run_bounded(
                     command, cwd=checkout,
                     timeout_seconds=int(request["budgets"]["wall_seconds"]),
                     stdin_data=(prompt_for(request) + "\n").encode("utf-8"),
                     environment=provider_env(codex=codex, codex_home=codex_home),
+                    process_started_callback=mark_provider_process_started,
                 )
-                provider_process_started = True
             except BaseException as exc:
                 manifest_cleanup_error = (
                     None if manifest_binding is None

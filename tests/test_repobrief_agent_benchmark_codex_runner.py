@@ -1248,6 +1248,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
     def test_run_bounded_reaps_then_reraises_keyboard_interrupt(self) -> None:
         real_popen = runner.subprocess.Popen
         observed: dict[str, subprocess.Popen] = {}
+        provider_started: list[bool] = []
 
         def tracked_popen(*args, **kwargs):
             process = real_popen(*args, **kwargs)
@@ -1272,7 +1273,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         cwd=root,
                         timeout_seconds=30,
                         stdin_data=b"",
+                        process_started_callback=lambda: provider_started.append(True),
                     )
+        self.assertEqual(provider_started, [True])
         self.assertIn("process", observed)
         self.assertIsNotNone(observed["process"].poll())
 
@@ -3082,6 +3085,73 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 runner._record_preflight_dispatch_intent(
                     treatment, state_root, authorization
                 )
+
+    def test_dispatch_intent_marks_durable_write_before_postwrite_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            treatment = request(condition="treatment")
+            manifest = root / "bundle.manifest.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+            treatment["repobrief"]["manifest"] = str(manifest)
+            treatment["repobrief"]["manifest_sha256"] = hashlib.sha256(
+                manifest.read_bytes()
+            ).hexdigest()
+            baseline = request(
+                condition="baseline",
+                commit=treatment["repository"]["commit"],
+            )
+            state_root = write_dispatch_authorization(root, treatment, [])
+            authorization = runner._load_preflight_dispatch_authorization(
+                baseline, state_root
+            )["authorization"]
+            persisted: list[bool] = []
+            original_match = runner._directory_fd_matches
+
+            def fail_after_event_write(path, descriptor):
+                original_match(path, descriptor)
+                if Path(path).name == "events":
+                    raise runner.RunnerError(
+                        "simulated post-write directory validation failure"
+                    )
+
+            with patch.object(
+                runner,
+                "_directory_fd_matches",
+                side_effect=fail_after_event_write,
+            ):
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "simulated post-write directory validation failure",
+                ):
+                    runner._record_preflight_dispatch_intent(
+                        baseline,
+                        state_root,
+                        authorization,
+                        intent_persisted_callback=lambda: persisted.append(True),
+                    )
+
+            self.assertEqual(persisted, [True])
+            state = runner._validated_dispatch_event_state(
+                baseline, state_root, authorization
+            )
+            self.assertEqual(state["pending_condition"], "baseline")
+            runner._record_preflight_dispatch_failed(
+                baseline,
+                state_root,
+                authorization,
+                runner.RunnerError(
+                    "simulated post-write directory validation failure"
+                ),
+                provider_process_started=False,
+            )
+            terminal = runner._validated_dispatch_event_state(
+                baseline, state_root, authorization
+            )
+            self.assertTrue(terminal["terminal_failure"])
+            self.assertEqual(
+                terminal["condition_outcomes"],
+                {"baseline": "condition-failed"},
+            )
 
     def test_dispatch_intent_reads_authorization_through_bound_pair_fd(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
