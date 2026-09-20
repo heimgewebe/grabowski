@@ -124,6 +124,61 @@ class LeaseHarness:
         return {"released": released}
 
 
+
+class ConcurrentLeaseHarness(LeaseHarness):
+    def __init__(self) -> None:
+        super().__init__()
+        self.owner_ids: list[str] = []
+        self.on_first_acquire = None
+        self.nested_result: dict[str, object] | None = None
+
+    def acquire(
+        self,
+        owner_id: str,
+        resource_keys: list[str],
+        *,
+        purpose: str,
+        ttl_seconds: int,
+    ) -> dict[str, object]:
+        self.acquire_calls += 1
+        self.owner_ids.append(owner_id)
+        if self.live:
+            live_owners = {
+                str(item["owner_id"])
+                for item in self.live.values()
+            }
+            if live_owners != {owner_id}:
+                raise RuntimeError("resource conflict")
+            return {
+                "leases": [
+                    dict(self.live[key])
+                    for key in resource_keys
+                ]
+            }
+
+        leases = []
+        for key in resource_keys:
+            lease = {
+                "resource_key": key,
+                "owner_id": owner_id,
+                "purpose": purpose,
+                "acquired_at_unix": 1,
+                "updated_at_unix": 1,
+                "expires_at_unix": 1 + ttl_seconds,
+                "metadata_sha256": "a" * 64,
+                "reclaimed_from_owner": None,
+            }
+            self.live[key] = lease
+            leases.append(lease)
+
+        callback = self.on_first_acquire
+        self.on_first_acquire = None
+        if callback is not None:
+            self.nested_result = callback()
+        return {"leases": leases}
+
+
+
 @contextmanager
 def patched_leases(harness: LeaseHarness):
     with (
@@ -514,6 +569,42 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             self.assertEqual(1, leases.release_calls)
 
 
+    def test_identical_concurrent_apply_blocks_second_before_git_effect(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            leases = ConcurrentLeaseHarness()
+            leases.on_first_acquire = lambda: self.apply(
+                repo,
+                remote,
+                base,
+                target,
+            )
+
+            with (
+                patch.object(
+                    sync_apply.secrets,
+                    "token_hex",
+                    side_effect=["a" * 24, "b" * 24],
+                ),
+                patched_leases(leases),
+            ):
+                first = self.apply(repo, remote, base, target)
+
+            self.assertEqual("synced", first["state"])
+            self.assertIsNotNone(leases.nested_result)
+            second = leases.nested_result or {}
+            self.assertEqual("lease_acquisition_blocked", second["state"])
+            self.assertFalse(second["effect_started"])
+            self.assertFalse(second["retry_authorized"])
+            self.assertEqual(2, leases.acquire_calls)
+            self.assertEqual(2, len(leases.owner_ids))
+            self.assertNotEqual(leases.owner_ids[0], leases.owner_ids[1])
+            self.assertEqual(first["lease_owner_id"], leases.owner_ids[0])
+            self.assertEqual(second["lease_owner_id"], leases.owner_ids[1])
+            self.assertEqual(target, git_stdout(repo, "rev-parse", "HEAD"))
+            self.assertEqual("", git_stdout(repo, "status", "--porcelain"))
+
+
     def test_foreign_repository_guard_conflict_blocks_before_git_effect(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo, remote, base, target = self.fixture(Path(tmp))
@@ -570,6 +661,10 @@ class PostMergeSyncApplyTests(unittest.TestCase):
 
             self.assertEqual("blocked", result["receipt_status"])
             self.assertEqual("lease_cleanup_required", result["state"])
+            self.assertRegex(
+                str(result["lease_owner_id"]),
+                r"^operator:post-merge-sync-[0-9a-f]{16}-[0-9a-f]{24}$",
+            )
             self.assertFalse(result["retry_authorized"])
             self.assertTrue(result["effect_started"])
             self.assertTrue(result["post_state_verified"])

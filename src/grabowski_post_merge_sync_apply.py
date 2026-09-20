@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import secrets
 from typing import Any, Callable
 
 import grabowski_resources as resources
@@ -362,7 +363,10 @@ def apply(
         "tracking_head": initial.get("tracking_head"),
     }
     preimage_sha256 = _sha256_json(preimage)
-    owner_id = f"operator:post-merge-sync-{preimage_sha256[:24]}"
+    owner_id = (
+        f"operator:post-merge-sync-{preimage_sha256[:16]}-"
+        f"{secrets.token_hex(12)}"
+    )
     resource_keys = resources.normalize_resource_keys(
         [
             f"repo:{repo}",
@@ -385,6 +389,7 @@ def apply(
             "lease_acquisition_blocked",
             before=initial,
             preimage_sha256=preimage_sha256,
+            lease_owner_id=owner_id,
             resource_keys=resource_keys,
             error_class=type(exc).__name__,
         )
@@ -404,6 +409,7 @@ def apply(
             "effect_started": False,
             "retry_authorized": False,
             "preimage_sha256": preimage_sha256,
+            "lease_owner_id": owner_id,
             "resource_keys": resource_keys,
             "readback_required": True,
         }
@@ -792,6 +798,7 @@ def apply(
             "preimage_sha256": preimage_sha256,
             "resource_keys": resource_keys,
         }
+    output.setdefault("lease_owner_id", owner_id)
     if release_error is not None:
         output["receipt_status"] = "blocked"
         output["state"] = "lease_cleanup_required"
