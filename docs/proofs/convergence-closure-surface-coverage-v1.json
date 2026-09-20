@@ -156,6 +156,13 @@
     },
     {
       "surface_kind": "grip",
+      "surface_id": "post-merge-sync-apply",
+      "classification": "effect_only",
+      "convergence_requirement": "post_effect_verification_required",
+      "reason": "The grip applies one exact protected-branch fast-forward under an exclusive repository guard and verifies its local and remote postconditions; that synchronization effect is not a system closeout."
+    },
+    {
+      "surface_kind": "grip",
       "surface_id": "pr-check-readiness",
       "classification": "read_only_observation",
       "convergence_requirement": "not_a_closeout",
