@@ -1029,6 +1029,22 @@ class CodingAgentRouterTests(unittest.TestCase):
             ),
         )
 
+    def test_review_execution_contract_accepts_review_only_codex_route(self) -> None:
+        with self.assertRaisesRegex(
+            router.CodingAgentRouterError, "enabled contrast route"
+        ):
+            router.contrast_route_execution_contract("codex-sol-review-high")
+        review = router.review_route_execution_contract("codex-sol-review-high")
+        advisory = router.advisory_route_execution_contract(
+            "codex-sol-review-high"
+        )
+        self.assertEqual(review, advisory)
+        self.assertEqual(review["harness"], "codex")
+        self.assertEqual(review["model"], "gpt-5.6-sol")
+        self.assertEqual(review["quota_pools"], ["openai-agentic"])
+        self.assertFalse(review["paid_only"])
+        self.assertIsNone(review["permission_mode"])
+
     def test_task_specific_defaults_keep_controller_integration_authoritative(self) -> None:
         for task_class, kwargs in (
             ("complex-patch", {}),
@@ -1820,6 +1836,47 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertIn(
             "reviewer shares the primary model lineage",
             result["excluded"]["reviewer:claude-opus-5-high"],
+        )
+
+    def test_codex_reviewer_preserves_provider_independence(self) -> None:
+        for harness, state in self.state["catalog"]["harnesses"].items():
+            state["available"] = harness == "codex"
+        self.state["pools"]["openai-agentic"] = {"remaining_ratio": 0.9}
+        self._write_state()
+
+        direct = self._route("independent-review")
+        self.assertEqual([], direct["reviewers"])
+        self.assertEqual("no-independent-review-route", direct["review_status"])
+        self.assertIn("reviewer:codex-sol-review-high", direct["excluded"])
+        self.assertIn(
+            "reviewer shares the primary provider family",
+            direct["excluded"]["reviewer:codex-sol-review-high"],
+        )
+
+        self.state = self._fresh_state()
+        for harness, state in self.state["catalog"]["harnesses"].items():
+            state["available"] = harness in {"claude", "codex"}
+        self.state["pools"]["claude-pro"] = {"remaining_ratio": 0.9}
+        self.state["pools"]["openai-agentic"] = {"remaining_ratio": 0.9}
+        self._write_state()
+
+        delegated = self._route(
+            "architecture",
+            changed_files=24,
+            duration_minutes=180,
+            novelty="high",
+            risk_flags=["high-risk"],
+            need_review=True,
+            verification_policy="independent_review",
+        )
+        self.assertEqual("claude-opus-5-writer-high", delegated["writer_route"])
+        self.assertEqual(
+            "codex-sol-review-high",
+            delegated["reviewers"][0]["route"],
+        )
+        self.assertNotEqual(
+            delegated["scoped_writer"]["provider_family"],
+            delegated["reviewers"][0]["provider_family"],
         )
 
     def test_selected_scoped_writer_fails_closed_without_independent_review_route(

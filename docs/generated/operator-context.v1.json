@@ -2727,6 +2727,7 @@
     "parallel_disjoint_lanes_allowed": true,
     "review_and_contrast_agent_priority": [
       "claude",
+      "grok",
       "codex",
       "antigravity",
       "opencode",
