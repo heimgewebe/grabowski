@@ -469,6 +469,418 @@ class OperatorContractTests(unittest.TestCase):
         self.assertTrue(result["called"])
         self.assertTrue(operator._DEPLOYMENT_ADMISSION_GATE_INSTALLED)
 
+    def test_midcutover_recovery_admission_requires_exact_marker_bound_evidence(
+        self,
+    ) -> None:
+        operator = _load_operator_module()
+        head = "b" * 40
+        source_identity = "c" * 64
+        canonical_binding = {
+            "cutover_id": "bgc-bound-recovery",
+            "resume_phase": "resume-phase",
+            "expected_head": head,
+            "source_identity_sha256": source_identity,
+            "expected_runtime_binding_sha256": "d" * 64,
+            "expected_selector_sha256": "e" * 64,
+            "switch_selector_sha256": "f" * 64,
+            "binding_sha256": "1" * 64,
+        }
+        marker = {
+            "state": "active",
+            "active": True,
+            "valid": True,
+            "expected_head": head,
+            "source_identity_sha256": source_identity,
+        }
+        tool = types.SimpleNamespace(
+            annotations=types.SimpleNamespace(readOnlyHint=False)
+        )
+
+        def validated(value):
+            return dict(value) if value == canonical_binding else None
+
+        def gate(binding=canonical_binding, *, allowed=True, lane="mid-cutover"):
+            return {
+                "allowed": allowed,
+                "reasons": [] if allowed else ["no_competing_deployment"],
+                "expected_head": head,
+                "recovery_lane": {
+                    "lane": lane,
+                    "resume_binding": binding,
+                },
+            }
+
+        fake = types.SimpleNamespace(
+            evaluate_resume_gate=lambda _head: gate(),
+            midcutover=types.SimpleNamespace(
+                LANE_MID_CUTOVER_RESUME="mid-cutover",
+                RESUME_PHASES=("resume-phase",),
+                _validated_resume_binding=validated,
+            ),
+        )
+        with patch.dict(
+            sys.modules, {"grabowski_provenance_recovery": fake}, clear=False
+        ):
+            evidence = operator._deployment_admission_midcutover_recovery_evidence(
+                "grabowski_recovery_provenance_repair",
+                {"expected_head": head},
+                tool,
+                marker,
+            )
+        self.assertTrue(evidence["allowed"], evidence["reasons"])
+        self.assertEqual([], evidence["reasons"])
+        self.assertIn("retry_authority", evidence["does_not_establish"])
+
+        expired = {**marker, "state": "expired", "active": False}
+        with patch.dict(
+            sys.modules, {"grabowski_provenance_recovery": fake}, clear=False
+        ):
+            evidence = operator._deployment_admission_midcutover_recovery_evidence(
+                "grabowski_recovery_provenance_repair",
+                {"expected_head": head},
+                tool,
+                expired,
+            )
+        self.assertFalse(evidence["allowed"])
+        self.assertIn("active_marker", evidence["reasons"])
+
+        with patch.dict(
+            sys.modules, {"grabowski_provenance_recovery": fake}, clear=False
+        ):
+            evidence = operator._deployment_admission_midcutover_recovery_evidence(
+                "grabowski_recovery_provenance_repair",
+                {"expected_head": "a" * 40},
+                tool,
+                marker,
+            )
+        self.assertFalse(evidence["allowed"])
+        self.assertIn("expected_head_matches_marker", evidence["reasons"])
+
+        with patch.dict(
+            sys.modules, {"grabowski_provenance_recovery": fake}, clear=False
+        ):
+            evidence = operator._deployment_admission_midcutover_recovery_evidence(
+                "grabowski_recovery_provenance_repair",
+                {"expected_head": head, "recovery": True},
+                tool,
+                marker,
+            )
+        self.assertFalse(evidence["allowed"])
+        self.assertIn("arguments_are_narrow", evidence["reasons"])
+
+    def test_midcutover_recovery_admission_rejects_binding_gate_and_state_drift(
+        self,
+    ) -> None:
+        operator = _load_operator_module()
+        head = "b" * 40
+        source_identity = "c" * 64
+        marker = {
+            "state": "active",
+            "active": True,
+            "valid": True,
+            "expected_head": head,
+            "source_identity_sha256": source_identity,
+        }
+        tool = types.SimpleNamespace(
+            annotations=types.SimpleNamespace(readOnlyHint=False)
+        )
+        canonical = {
+            "cutover_id": "bgc-bound-recovery",
+            "resume_phase": "resume-phase",
+            "expected_head": head,
+            "source_identity_sha256": source_identity,
+            "expected_runtime_binding_sha256": "d" * 64,
+            "expected_selector_sha256": "e" * 64,
+            "switch_selector_sha256": "f" * 64,
+            "binding_sha256": "1" * 64,
+        }
+
+        def evidence_for(binding, *, allowed=True, lane="mid-cutover"):
+            fake = types.SimpleNamespace(
+                evaluate_resume_gate=lambda _head: {
+                    "allowed": allowed,
+                    "reasons": [] if allowed else ["no_competing_deployment"],
+                    "expected_head": head,
+                    "recovery_lane": {
+                        "lane": lane,
+                        "resume_binding": binding,
+                    },
+                },
+                midcutover=types.SimpleNamespace(
+                    LANE_MID_CUTOVER_RESUME="mid-cutover",
+                    RESUME_PHASES=("resume-phase",),
+                    _validated_resume_binding=(
+                        lambda value: dict(value) if value == canonical else None
+                    ),
+                ),
+            )
+            with patch.dict(
+                sys.modules, {"grabowski_provenance_recovery": fake}, clear=False
+            ):
+                return operator._deployment_admission_midcutover_recovery_evidence(
+                    "grabowski_recovery_provenance_repair",
+                    {"expected_head": head},
+                    tool,
+                    marker,
+                )
+
+        cases = {
+            "wrong-cutover": {**canonical, "cutover_id": "bgc-foreign"},
+            "wrong-phase": {**canonical, "resume_phase": "foreign-phase"},
+            "stale-binding": {**canonical, "binding_sha256": "2" * 64},
+            "wrong-runtime": {
+                **canonical,
+                "expected_runtime_binding_sha256": "3" * 64,
+            },
+            "wrong-selector": {
+                **canonical,
+                "expected_selector_sha256": "4" * 64,
+            },
+            "foreign-binding": {
+                **canonical,
+                "source_identity_sha256": "5" * 64,
+            },
+            "state-drift": {**canonical, "expected_head": "a" * 40},
+        }
+        for name, binding in cases.items():
+            with self.subTest(name=name):
+                evidence = evidence_for(binding)
+                self.assertFalse(evidence["allowed"], evidence)
+
+        competing = evidence_for(canonical, allowed=False)
+        self.assertFalse(competing["allowed"])
+        self.assertIn("resume_gate_allowed", competing["reasons"])
+
+        wrong_lane = evidence_for(canonical, lane="scheduled-deploy")
+        self.assertFalse(wrong_lane["allowed"])
+        self.assertIn("mid_cutover_resume_classified", wrong_lane["reasons"])
+
+    def test_midcutover_recovery_evidence_runs_off_event_loop(self) -> None:
+        operator = _load_operator_module()
+        head = "b" * 40
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocking_evidence(*_args, **_kwargs):
+            entered.set()
+            if not release.wait(2.0):
+                raise AssertionError("blocking recovery evidence was not released")
+            return {"allowed": True}
+
+        async def exercise():
+            timer = threading.Timer(0.5, release.set)
+            timer.start()
+            started = time.monotonic()
+            call = operator.asyncio.create_task(
+                operator.mcp._tool_manager.call_tool(
+                    "grabowski_recovery_provenance_repair",
+                    {"expected_head": head},
+                )
+            )
+            try:
+                await operator.asyncio.sleep(0)
+                heartbeat = operator.asyncio.Event()
+                operator.asyncio.get_running_loop().call_soon(heartbeat.set)
+                await operator.asyncio.wait_for(heartbeat.wait(), timeout=0.25)
+                self.assertLess(time.monotonic() - started, 0.25)
+                deadline = time.monotonic() + 0.5
+                while not entered.is_set() and time.monotonic() < deadline:
+                    await operator.asyncio.sleep(0.01)
+                self.assertTrue(entered.is_set())
+                release.set()
+                return await call
+            finally:
+                release.set()
+                timer.cancel()
+
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "deployment-admission-drain.json"
+            payload = {
+                "schema_version": 1,
+                "kind": operator.DEPLOYMENT_ADMISSION_MARKER_KIND,
+                "token": "a" * 64,
+                "expected_head": head,
+                "source_identity_sha256": "c" * 64,
+                "created_at_unix": int(time.time()) - 1,
+                "expires_at_unix": int(time.time()) + 60,
+            }
+            marker.write_text(json.dumps(payload), encoding="utf-8")
+            marker.chmod(0o600)
+            operator.mcp._registered_tools[
+                "grabowski_recovery_provenance_repair"
+            ] = types.SimpleNamespace(
+                is_async=False,
+                context_kwarg=None,
+                annotations=types.SimpleNamespace(readOnlyHint=False),
+            )
+            with (
+                patch.object(operator, "DEPLOYMENT_ADMISSION_MARKER_PATH", marker),
+                patch.object(
+                    operator,
+                    "_deployment_admission_midcutover_recovery_evidence",
+                    side_effect=blocking_evidence,
+                ),
+                patch.object(
+                    operator,
+                    "_require_transport_roundtrip_for_tool",
+                    return_value=None,
+                ),
+                patch.object(
+                    operator.grabowski_effect_interceptor,
+                    "fence_enforcement_required",
+                    return_value=False,
+                ),
+            ):
+                operator._configure_http_runtime()
+                result = operator.asyncio.run(exercise())
+        self.assertTrue(result["called"])
+        self.assertEqual(0, operator._deployment_admission_active_tool_calls())
+
+    def test_deployment_admission_gate_allows_only_exact_bound_midcutover_recovery(
+        self,
+    ) -> None:
+        operator = _load_operator_module()
+        head = "b" * 40
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "deployment-admission-drain.json"
+            payload = {
+                "schema_version": 1,
+                "kind": operator.DEPLOYMENT_ADMISSION_MARKER_KIND,
+                "token": "a" * 64,
+                "expected_head": head,
+                "source_identity_sha256": "c" * 64,
+                "created_at_unix": int(time.time()) - 1,
+                "expires_at_unix": int(time.time()) + 60,
+            }
+            marker.write_text(json.dumps(payload), encoding="utf-8")
+            marker.chmod(0o600)
+            operator.mcp._registered_tools[
+                "grabowski_recovery_provenance_repair"
+            ] = types.SimpleNamespace(
+                is_async=False,
+                context_kwarg=None,
+                annotations=types.SimpleNamespace(readOnlyHint=False),
+            )
+            with (
+                patch.object(operator, "DEPLOYMENT_ADMISSION_MARKER_PATH", marker),
+                patch.object(
+                    operator,
+                    "_deployment_admission_midcutover_recovery_evidence",
+                    side_effect=lambda tool_name, _arguments, _tool, _marker: {
+                        "allowed": (
+                            tool_name == "grabowski_recovery_provenance_repair"
+                        )
+                    },
+                ) as recovery_admission,
+                patch.object(
+                    operator,
+                    "_require_transport_roundtrip_for_tool",
+                    return_value=None,
+                ),
+                patch.object(
+                    operator.grabowski_effect_interceptor,
+                    "fence_enforcement_required",
+                    return_value=False,
+                ),
+            ):
+                operator._configure_http_runtime()
+                result = operator.asyncio.run(
+                    operator.mcp._tool_manager.call_tool(
+                        "grabowski_recovery_provenance_repair",
+                        {"expected_head": head},
+                    )
+                )
+                with self.assertRaisesRegex(
+                    RuntimeError, "rejects new tool calls"
+                ):
+                    operator.asyncio.run(
+                        operator.mcp._tool_manager.call_tool("write", {})
+                    )
+        self.assertTrue(result["called"])
+        self.assertEqual(2, recovery_admission.call_count)
+        self.assertEqual(
+            "grabowski_recovery_provenance_repair",
+            recovery_admission.call_args_list[0].args[0],
+        )
+        self.assertEqual("write", recovery_admission.call_args_list[1].args[0])
+        self.assertEqual(0, operator._deployment_admission_active_tool_calls())
+
+    def test_midcutover_recovery_admission_rechecks_marker_after_evidence(self) -> None:
+        head = "b" * 40
+        source_identity = "c" * 64
+        for drift in ("replaced", "expired", "absent"):
+            with self.subTest(drift=drift):
+                operator = _load_operator_module()
+                now = int(time.time())
+                with tempfile.TemporaryDirectory() as directory:
+                    marker = Path(directory) / "deployment-admission-drain.json"
+                    payload = {
+                        "schema_version": 1,
+                        "kind": operator.DEPLOYMENT_ADMISSION_MARKER_KIND,
+                        "token": "a" * 64,
+                        "expected_head": head,
+                        "source_identity_sha256": source_identity,
+                        "created_at_unix": now - 2,
+                        "expires_at_unix": now + 60,
+                    }
+                    marker.write_text(json.dumps(payload), encoding="utf-8")
+                    marker.chmod(0o600)
+                    operator.mcp._registered_tools[
+                        "grabowski_recovery_provenance_repair"
+                    ] = types.SimpleNamespace(
+                        is_async=False,
+                        context_kwarg=None,
+                        annotations=types.SimpleNamespace(readOnlyHint=False),
+                    )
+
+                    def admit_then_drift(*_args, **_kwargs):
+                        if drift == "replaced":
+                            replacement = {**payload, "token": "d" * 64}
+                            marker.write_text(json.dumps(replacement), encoding="utf-8")
+                            marker.chmod(0o600)
+                        elif drift == "expired":
+                            expired = {**payload, "expires_at_unix": now - 1}
+                            marker.write_text(json.dumps(expired), encoding="utf-8")
+                            marker.chmod(0o600)
+                        else:
+                            marker.unlink()
+                        return {"allowed": True}
+
+                    with (
+                        patch.object(
+                            operator, "DEPLOYMENT_ADMISSION_MARKER_PATH", marker
+                        ),
+                        patch.object(
+                            operator,
+                            "_deployment_admission_midcutover_recovery_evidence",
+                            side_effect=admit_then_drift,
+                        ),
+                        patch.object(
+                            operator,
+                            "_require_transport_roundtrip_for_tool",
+                            return_value=None,
+                        ),
+                        patch.object(
+                            operator.grabowski_effect_interceptor,
+                            "fence_enforcement_required",
+                            return_value=False,
+                        ),
+                    ):
+                        operator._configure_http_runtime()
+                        with self.assertRaisesRegex(
+                            RuntimeError,
+                            "marker changed while mid-cutover recovery admission",
+                        ):
+                            operator.asyncio.run(
+                                operator.mcp._tool_manager.call_tool(
+                                    "grabowski_recovery_provenance_repair",
+                                    {"expected_head": head},
+                                )
+                            )
+                    self.assertEqual(
+                        0, operator._deployment_admission_active_tool_calls()
+                    )
+
     def test_connector_tool_policy_blocks_before_domain_tool_execution(self) -> None:
         operator = _load_operator_module()
         domain_started = False

@@ -1089,6 +1089,180 @@ def _provenance_recovery_transport_exempt_call(tool_name: Any, tool: Any) -> boo
     )
 
 
+def _deployment_admission_midcutover_recovery_evidence(
+    tool_name: Any,
+    arguments: Any,
+    tool: Any,
+    marker: dict[str, Any],
+) -> dict[str, Any]:
+    """Prove the one recovery call that may cross an active deployment drain.
+
+    The marker remains the sole admission truth. The exception is derived from
+    current durable cutover state and never from caller-supplied recovery
+    metadata. The domain tool re-evaluates the same recovery gate under the
+    deployment schedule lock before it can dispatch an effect.
+    """
+    checks: dict[str, bool] = {
+        "active_marker": (
+            marker.get("active") is True
+            and marker.get("valid") is True
+            and marker.get("state") == "active"
+        ),
+        "exact_recovery_tool": tool_name == _PROVENANCE_RECOVERY_REPAIR_TOOL,
+        "tool_is_mutating": _tool_read_only_hint(tool) is False,
+        "arguments_are_mapping": isinstance(arguments, dict),
+    }
+    allowed_argument_keys = frozenset(
+        {
+            "expected_head",
+            "source_repository",
+            "source_lease_owner_id",
+            "delay_seconds",
+        }
+    )
+    checks["arguments_are_narrow"] = (
+        isinstance(arguments, dict)
+        and not (set(arguments) - allowed_argument_keys)
+    )
+    expected_head = (
+        arguments.get("expected_head") if isinstance(arguments, dict) else None
+    )
+    marker_head = marker.get("expected_head")
+    marker_source_identity = marker.get("source_identity_sha256")
+    checks["expected_head_matches_marker"] = (
+        isinstance(expected_head, str)
+        and isinstance(marker_head, str)
+        and DEPLOYMENT_ADMISSION_HEAD_RE.fullmatch(expected_head) is not None
+        and DEPLOYMENT_ADMISSION_HEAD_RE.fullmatch(marker_head) is not None
+        and hmac.compare_digest(expected_head, marker_head)
+    )
+    checks["marker_source_identity_valid"] = (
+        isinstance(marker_source_identity, str)
+        and DEPLOYMENT_ADMISSION_TOKEN_RE.fullmatch(marker_source_identity)
+        is not None
+    )
+    if not all(checks.values()):
+        reasons = sorted(name for name, passed in checks.items() if not passed)
+        return {
+            "schema_version": 1,
+            "kind": "grabowski_deployment_admission_midcutover_recovery_evidence",
+            "allowed": False,
+            "reasons": reasons,
+            "checks": checks,
+            "does_not_establish": [
+                "retry_authority",
+                "effect_started",
+                "future_marker_state",
+                "permission_for_other_tools",
+            ],
+        }
+
+    try:
+        import grabowski_provenance_recovery as provenance_recovery
+
+        gate = provenance_recovery.evaluate_resume_gate(expected_head)
+        lane = gate.get("recovery_lane")
+        binding = (
+            lane.get("resume_binding") if isinstance(lane, dict) else None
+        )
+        validated_binding = (
+            provenance_recovery.midcutover._validated_resume_binding(binding)
+            if isinstance(binding, dict)
+            else None
+        )
+    except Exception:  # noqa: BLE001 - unavailable evidence is never authority
+        checks["resume_gate_available"] = False
+        reasons = sorted(name for name, passed in checks.items() if not passed)
+        return {
+            "schema_version": 1,
+            "kind": "grabowski_deployment_admission_midcutover_recovery_evidence",
+            "allowed": False,
+            "reasons": reasons,
+            "checks": checks,
+            "does_not_establish": [
+                "retry_authority",
+                "effect_started",
+                "future_marker_state",
+                "permission_for_other_tools",
+            ],
+        }
+
+    checks["resume_gate_available"] = True
+    checks["resume_gate_allowed"] = (
+        gate.get("allowed") is True and not gate.get("reasons")
+    )
+    checks["resume_gate_expected_head_bound"] = (
+        gate.get("expected_head") == expected_head
+    )
+    checks["mid_cutover_resume_classified"] = (
+        isinstance(lane, dict)
+        and lane.get("lane")
+        == provenance_recovery.midcutover.LANE_MID_CUTOVER_RESUME
+    )
+    checks["resume_binding_valid"] = (
+        isinstance(validated_binding, dict) and validated_binding == binding
+    )
+    authoritative_binding = (
+        validated_binding if isinstance(validated_binding, dict) else {}
+    )
+    checks["cutover_id_bound"] = bool(authoritative_binding.get("cutover_id"))
+    checks["expected_head_bound"] = (
+        authoritative_binding.get("expected_head") == expected_head
+    )
+    bound_source_identity = authoritative_binding.get("source_identity_sha256")
+    checks["source_identity_bound"] = (
+        isinstance(bound_source_identity, str)
+        and isinstance(marker_source_identity, str)
+        and DEPLOYMENT_ADMISSION_TOKEN_RE.fullmatch(bound_source_identity)
+        is not None
+        and hmac.compare_digest(bound_source_identity, marker_source_identity)
+    )
+    checks["runtime_identity_bound"] = (
+        isinstance(
+            authoritative_binding.get("expected_runtime_binding_sha256"), str
+        )
+        and DEPLOYMENT_ADMISSION_TOKEN_RE.fullmatch(
+            authoritative_binding["expected_runtime_binding_sha256"]
+        )
+        is not None
+    )
+    checks["selector_identity_bound"] = all(
+        isinstance(authoritative_binding.get(key), str)
+        and DEPLOYMENT_ADMISSION_TOKEN_RE.fullmatch(authoritative_binding[key])
+        is not None
+        for key in ("expected_selector_sha256", "switch_selector_sha256")
+    )
+    checks["resume_binding_hash_bound"] = (
+        isinstance(authoritative_binding.get("binding_sha256"), str)
+        and DEPLOYMENT_ADMISSION_TOKEN_RE.fullmatch(
+            authoritative_binding["binding_sha256"]
+        )
+        is not None
+    )
+    checks["recovery_phase_allowed"] = (
+        authoritative_binding.get("resume_phase")
+        in provenance_recovery.midcutover.RESUME_PHASES
+    )
+
+    reasons = sorted(name for name, passed in checks.items() if not passed)
+    return {
+        "schema_version": 1,
+        "kind": "grabowski_deployment_admission_midcutover_recovery_evidence",
+        "allowed": not reasons,
+        "reasons": reasons,
+        "checks": checks,
+        "cutover_id": authoritative_binding.get("cutover_id"),
+        "resume_phase": authoritative_binding.get("resume_phase"),
+        "resume_binding_sha256": authoritative_binding.get("binding_sha256"),
+        "does_not_establish": [
+            "retry_authority",
+            "effect_started",
+            "future_marker_state",
+            "permission_for_other_tools",
+        ],
+    }
+
+
 def _provenance_recovery_fence_runtime_sha256() -> str:
     deployment = base._deployment_metadata()
     release_id = deployment.get("release_id")
@@ -1836,7 +2010,46 @@ def _install_deployment_admission_gate() -> None:
         release_in_finally = True
         try:
             marker = _read_deployment_admission_marker()
-            if marker.get("active") or marker.get("state") == "invalid":
+            midcutover_recovery_evidence: dict[str, Any] | None = None
+            if marker.get("active") is True and marker.get("valid") is True:
+                midcutover_recovery_evidence = await asyncio.to_thread(
+                    _deployment_admission_midcutover_recovery_evidence,
+                    tool_name,
+                    arguments,
+                    tool,
+                    marker,
+                )
+                if midcutover_recovery_evidence.get("allowed") is True:
+                    current_marker = _read_deployment_admission_marker()
+                    marker_identity_keys = (
+                        "token",
+                        "expected_head",
+                        "source_identity_sha256",
+                        "created_at_unix",
+                        "expires_at_unix",
+                    )
+                    marker_still_bound = (
+                        current_marker.get("active") is True
+                        and current_marker.get("valid") is True
+                        and current_marker.get("state") == "active"
+                        and all(
+                            current_marker.get(key) == marker.get(key)
+                            for key in marker_identity_keys
+                        )
+                    )
+                    if not marker_still_bound:
+                        raise RuntimeError(
+                            "Grabowski deployment admission marker changed while "
+                            "mid-cutover recovery admission was evaluated"
+                        )
+                    marker = current_marker
+            if marker.get("state") == "invalid" or (
+                marker.get("active") is True
+                and not (
+                    isinstance(midcutover_recovery_evidence, dict)
+                    and midcutover_recovery_evidence.get("allowed") is True
+                )
+            ):
                 raise RuntimeError(
                     "Grabowski deployment admission drain rejects new tool calls "
                     f"while marker state is {marker.get('state')}"
