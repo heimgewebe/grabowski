@@ -37,7 +37,11 @@ class UpgradeAccessProfilesTests(unittest.TestCase):
             "profiles": {"trusted-owner": self.trusted_owner},
             "mode": "trusted-owner",
         }
+        self.managed_browser_roots = [
+            "${HOME}/.local/state/grabowski/browser-profiles"
+        ]
         self.template = {
+            "browser_profile_roots": copy.deepcopy(self.managed_browser_roots),
             "capability_definitions": {
                 "bureau_mutation": "Typed Bureau mutation without generic terminal."
             },
@@ -53,6 +57,9 @@ class UpgradeAccessProfilesTests(unittest.TestCase):
                     ],
                 },
                 "trusted-owner": {
+                    "browser_profile_roots": copy.deepcopy(
+                        self.managed_browser_roots
+                    ),
                     "capabilities": [
                         "file_read", "terminal_execute", "bureau_mutation"
                     ]
@@ -125,6 +132,197 @@ class UpgradeAccessProfilesTests(unittest.TestCase):
         self.assertIn("bureau_mutation", result["profiles"]["trusted-owner"]["capabilities"])
         self.assertIn("audit_read", result["profiles"]["observe"]["capabilities"])
         self.assertIn("audit_read", result["profiles"]["maintain"]["capabilities"])
+
+    def test_browser_profile_root_convergence_is_explicit_and_narrow(self) -> None:
+        legacy_roots = [
+            "${HOME}/.mozilla/firefox",
+            "${HOME}/.config/google-chrome",
+        ]
+        policy = copy.deepcopy(self.policy)
+        policy["browser_profile_roots"] = copy.deepcopy(legacy_roots)
+        policy["profiles"]["trusted-owner"]["browser_profile_roots"] = copy.deepcopy(
+            legacy_roots
+        )
+
+        default_result = upgrader.upgraded(policy, self.template)
+        self.assertEqual(default_result["browser_profile_roots"], legacy_roots)
+        self.assertEqual(
+            default_result["profiles"]["trusted-owner"]["browser_profile_roots"],
+            legacy_roots,
+        )
+
+        result = upgrader.upgraded(
+            policy,
+            self.template,
+            converge_browser_profile_roots=True,
+        )
+        self.assertEqual(
+            result["browser_profile_roots"],
+            self.managed_browser_roots,
+        )
+        expected_trusted = copy.deepcopy(policy["profiles"]["trusted-owner"])
+        expected_trusted["browser_profile_roots"] = copy.deepcopy(
+            self.managed_browser_roots
+        )
+        expected_trusted["capabilities"].extend(
+            ["bureau_mutation", "maulwurf_recovery_control"]
+        )
+        self.assertEqual(result["profiles"]["trusted-owner"], expected_trusted)
+        self.assertEqual(
+            policy["profiles"]["trusted-owner"]["browser_profile_roots"],
+            legacy_roots,
+        )
+
+    def test_browser_profile_root_convergence_rejects_template_scope_drift(self) -> None:
+        template = copy.deepcopy(self.template)
+        template["profiles"]["trusted-owner"]["browser_profile_roots"] = [
+            "${HOME}/.local/state/grabowski/other-browser-profiles"
+        ]
+        with self.assertRaisesRegex(
+            ValueError,
+            "top-level and trusted-owner browser_profile_roots must match",
+        ):
+            upgrader.upgraded(
+                self.policy,
+                template,
+                converge_browser_profile_roots=True,
+            )
+
+    def test_apply_can_converge_browser_roots_with_sha_bound_atomic_replace(self) -> None:
+        legacy_roots = [
+            "${HOME}/.mozilla/firefox",
+            "${HOME}/.config/BraveSoftware/Brave-Browser",
+            "${HOME}/.config/google-chrome",
+            "${HOME}/.config/chromium",
+        ]
+        policy = upgrader.upgraded(self.policy, self.template)
+        policy["browser_profile_roots"] = copy.deepcopy(legacy_roots)
+        policy["profiles"]["trusted-owner"]["browser_profile_roots"] = copy.deepcopy(
+            legacy_roots
+        )
+        self._write_policy(policy)
+        before = self.policy_path.read_bytes()
+        expected = hashlib.sha256(before).hexdigest()
+        template_path = self.root / "template.json"
+        template_path.write_text(json.dumps(self.template), encoding="utf-8")
+
+        with mock.patch.object(upgrader, "TEMPLATE", template_path):
+            dry_run = self._run_main(
+                str(self.policy_path),
+                "--converge-browser-profile-roots",
+            )
+            self.assertTrue(dry_run["changed"])
+            self.assertFalse(dry_run["applied"])
+            self.assertTrue(dry_run["browser_profile_roots_converged"])
+            self.assertTrue(dry_run["browser_profile_roots_changed"])
+            self.assertEqual(self.policy_path.read_bytes(), before)
+
+            result = self._run_main(
+                str(self.policy_path),
+                "--expected-sha256",
+                expected,
+                "--expected-template-sha256",
+                dry_run["template_sha256"],
+                "--converge-browser-profile-roots",
+                "--apply",
+            )
+
+        value = json.loads(self.policy_path.read_text(encoding="utf-8"))
+        self.assertTrue(result["applied"])
+        self.assertEqual(
+            value["browser_profile_roots"],
+            self.managed_browser_roots,
+        )
+        self.assertEqual(
+            value["profiles"]["trusted-owner"]["browser_profile_roots"],
+            self.managed_browser_roots,
+        )
+        self.assertEqual(stat.S_IMODE(self.policy_path.stat().st_mode), 0o600)
+
+    def test_browser_root_apply_requires_reviewed_template_sha(self) -> None:
+        legacy_roots = ["${HOME}/.config/google-chrome"]
+        policy = upgrader.upgraded(self.policy, self.template)
+        policy["browser_profile_roots"] = copy.deepcopy(legacy_roots)
+        policy["profiles"]["trusted-owner"]["browser_profile_roots"] = copy.deepcopy(
+            legacy_roots
+        )
+        self._write_policy(policy)
+        before = self.policy_path.read_bytes()
+        expected = hashlib.sha256(before).hexdigest()
+        template_path = self.root / "template.json"
+        template_path.write_text(json.dumps(self.template), encoding="utf-8")
+
+        with mock.patch.object(upgrader, "TEMPLATE", template_path):
+            dry_run = self._run_main(
+                str(self.policy_path),
+                "--converge-browser-profile-roots",
+            )
+            with self.assertRaisesRegex(SystemExit, "expected-sha256"):
+                self._run_main(
+                    str(self.policy_path),
+                    "--expected-template-sha256",
+                    dry_run["template_sha256"],
+                    "--converge-browser-profile-roots",
+                    "--apply",
+                )
+            with self.assertRaisesRegex(SystemExit, "expected-template-sha256"):
+                self._run_main(
+                    str(self.policy_path),
+                    "--expected-sha256",
+                    expected,
+                    "--converge-browser-profile-roots",
+                    "--apply",
+                )
+            with self.assertRaisesRegex(SystemExit, "template SHA-256 precondition failed"):
+                self._run_main(
+                    str(self.policy_path),
+                    "--expected-sha256",
+                    expected,
+                    "--expected-template-sha256",
+                    "0" * 64,
+                    "--converge-browser-profile-roots",
+                    "--apply",
+                )
+
+        self.assertEqual(self.policy_path.read_bytes(), before)
+        self.assertEqual(
+            dry_run["template_sha256"],
+            hashlib.sha256(template_path.read_bytes()).hexdigest(),
+        )
+
+    def test_cli_browser_root_convergence_rejects_unrelated_profile_drift(self) -> None:
+        policy = copy.deepcopy(self.policy)
+        legacy_roots = ["${HOME}/.config/google-chrome"]
+        policy["browser_profile_roots"] = copy.deepcopy(legacy_roots)
+        policy["profiles"]["trusted-owner"]["browser_profile_roots"] = copy.deepcopy(
+            legacy_roots
+        )
+        self._write_policy(policy)
+        template_path = self.root / "template.json"
+        template_path.write_text(json.dumps(self.template), encoding="utf-8")
+        output = io.StringIO()
+
+        with mock.patch.object(upgrader, "TEMPLATE", template_path):
+            with mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "upgrade_access_profiles.py",
+                    str(self.policy_path),
+                    "--converge-browser-profile-roots",
+                ],
+            ):
+                with contextlib.redirect_stdout(output):
+                    with self.assertRaisesRegex(
+                        SystemExit,
+                        "access-profile baseline to be current",
+                    ):
+                        upgrader.main()
+
+        self.assertEqual(
+            json.loads(self.policy_path.read_text(encoding="utf-8")),
+            policy,
+        )
 
     def test_upgrade_rejects_unsafe_failover_template(self) -> None:
         template = copy.deepcopy(self.template)
