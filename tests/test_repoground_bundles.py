@@ -2887,6 +2887,7 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
                 {
                     "authority": "canonical_publication",
                     "manifest_path": str(manifest),
+                    "stem": "qualified-stem",
                 }
             ]
         }
@@ -2906,12 +2907,11 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
                         mcp, "_repoground_manifest_summary", return_value=status
                     ),
                 ):
-                    resolved = mcp._repoground_working_repo(
-                        selector, "qualified-stem"
-                    )
+                    resolved, pinned_stem = mcp._repoground_working_repo(selector)
 
                 self.assertEqual(resolved, publication_source)
-                catalog.assert_called_once_with(selector, "qualified-stem")
+                self.assertEqual(pinned_stem, "qualified-stem")
+                catalog.assert_called_once_with(selector, None)
 
     def test_working_repo_qualified_identity_does_not_fall_back_to_nested_checkout(
         self,
@@ -2924,6 +2924,7 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
                 {
                     "authority": "canonical_publication",
                     "manifest_path": str(manifest),
+                    "stem": "qualified-stem",
                 }
             ]
         }
@@ -2968,6 +2969,7 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
                 {
                     "authority": "canonical_publication",
                     "manifest_path": str(manifest),
+                    "stem": "qualified-stem",
                 }
             ]
         }
@@ -2989,7 +2991,7 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
                     manifest,
                     None,
                 ),
-            ),
+            ) as select_manifest,
             patch.object(
                 mcp,
                 "repoground_context_pack",
@@ -3006,10 +3008,12 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
                 "heimgewebe/demo-repo",
                 base,
                 target,
-                stem="qualified-stem",
                 context_budget_bytes=10_000,
             )
 
+        select_manifest.assert_called_once_with(
+            "heimgewebe/demo-repo", "qualified-stem"
+        )
         self.assertTrue(result["available"])
         self.assertEqual(result["change_identity"]["base_commit"], base)
         self.assertEqual(result["change_identity"]["target_commit"], target)
