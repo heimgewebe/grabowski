@@ -11324,9 +11324,7 @@ def repoground_context_pack(
         )
     )
     status = _repoground_bundle_status_for_manifest(manifest_path)
-    manifest_sha = (
-        _repoground_file_sha256(manifest_path) if manifest_path.is_file() else None
-    )
+    manifest_sha = pinned_publication.manifest_sha256
     preflight = _repoground_agent_preflight(task_profile, manifest_path)
     preflight_status = (
         preflight.get("status")
@@ -11592,6 +11590,50 @@ def repoground_context_pack(
             "query_completeness",
         ],
     }
+    try:
+        final_status = _repoground_manifest_summary(pinned_publication.manifest_path)
+    except (OSError, PermissionError, ValueError):
+        final_status = None
+    if (
+        not isinstance(final_status, dict)
+        or final_status.get("manifest_sha256") != pinned_publication.manifest_sha256
+        or final_status.get("stem") != pinned_publication.stem
+        or final_status.get("publication_run_id")
+        != pinned_publication.publication_run_id
+    ):
+        final_freshness = {
+            "kind": "grabowski.repoground_freshness_check",
+            "schema_version": 3,
+            "repo": repo,
+            "stem": pinned_publication.stem,
+            "freshness": "unknown",
+            "freshness_status": "publication_unavailable",
+            "reason": "catalog_selection_changed",
+        }
+        return {
+            "kind": "grabowski.repoground_context_pack",
+            "schema_version": 1,
+            "repo": repo,
+            "task_profile": task_profile,
+            "stem": pinned_publication.stem,
+            "available": False,
+            "freshness": final_freshness,
+            "reason": "catalog_selection_changed",
+            "bundle_repo": None,
+            "bounded_evidence": {
+                "query": query,
+                "normalized_query_shape": "unavailable",
+                "hit_count": 0,
+                "snippets": [],
+                "ranges": [],
+            },
+            "does_not_establish": [
+                "actual_agent_reading",
+                "repo_understood",
+                "claims_true",
+                "runtime_correctness",
+            ],
+        }
     return payload
 
 
@@ -12399,6 +12441,59 @@ def repoground_context_compose(
         k=min(max(len(changed_paths), 1), 10),
         max_snippets=_REPOGROUND_CONTEXT_LANE_CONFIG["query_snippets"]["max_items"],
     )
+    if not baseline.get("available", False):
+        baseline_reason = str(baseline.get("reason") or "publication_unavailable")
+        return {
+            "kind": "grabowski.repoground_context_compose",
+            "schema_version": 1,
+            "available": False,
+            "status": "unavailable",
+            "reason": baseline_reason,
+            "change_identity": change_identity,
+            "dirty_overlay": dirty_overlay,
+            "freshness": baseline.get("freshness"),
+            "context": blocked_context,
+            "context_budget": {
+                "requested_bytes": context_budget_bytes,
+                "effective_limit_bytes": context_budget_bytes,
+                "used_bytes": blocked_used_bytes,
+                "remaining_bytes": max(
+                    0, context_budget_bytes - blocked_used_bytes
+                ),
+                "hard_limit_applies_to": "context",
+                "lane_counts": blocked_lane_counts,
+            },
+            "retrieval_lanes": {
+                "used": ["direct_changes"],
+                "skipped": [
+                    "agent_impact",
+                    "query_context",
+                    "entry_manifest",
+                    "pr_delta_cards",
+                    "diff_locality",
+                    "symbol_navigation",
+                    "call_graph",
+                    "citation",
+                    "live_evidence",
+                ],
+            },
+            "stop_criteria": {
+                "triggered": ["publication_unavailable"],
+                "available": [
+                    "diff_sha256_mismatch",
+                    "impact_context_blocked",
+                    "budget_exhausted",
+                ],
+            },
+            "does_not_establish": [
+                "truth",
+                "completeness",
+                "patch_correctness",
+                "test_sufficiency",
+                "merge_readiness",
+                "runtime_behavior",
+            ],
+        }
     baseline_bytes = _repoground_json_bytes(baseline)
     compact_target_bytes = max(1, (baseline_bytes * 2) // 3)
     effective_limit = min(context_budget_bytes, compact_target_bytes)

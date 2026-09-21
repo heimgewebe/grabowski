@@ -3231,6 +3231,83 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
         self.assertEqual(error["expected_manifest_sha256"], "a" * 64)
         self.assertEqual(error["observed_manifest_sha256"], "b" * 64)
 
+    def test_context_pack_fails_closed_when_manifest_changes_after_selection(
+        self,
+    ) -> None:
+        manifest, _head = self._write_bundle_and_repo()
+        original_select = mcp._repoground_selected_manifest_for_repo
+        calls = {"count": 0}
+
+        def select(repo, stem):
+            calls["count"] += 1
+            result = original_select(repo, stem)
+            if calls["count"] == 1:
+                document = json.loads(manifest.read_text(encoding="utf-8"))
+                document["changed_after_pin"] = True
+                manifest.write_text(json.dumps(document), encoding="utf-8")
+            return result
+
+        preflight = {
+            "status": "pass",
+            "available": True,
+            "required_reading": {"required": [], "recommended": []},
+            "answer_compliance_template": {},
+            "does_not_establish": [],
+        }
+        with (
+            patch.object(
+                mcp, "_repoground_selected_manifest_for_repo", side_effect=select
+            ),
+            patch.object(mcp, "_repoground_agent_preflight", return_value=preflight),
+        ):
+            result = mcp.repoground_context_pack("demo-repo", query=None)
+
+        self.assertFalse(result["available"])
+        self.assertEqual(result["reason"], "catalog_selection_changed")
+        self.assertEqual(
+            result["freshness"]["reason"], "catalog_selection_changed"
+        )
+        self.assertNotIn("context_ref", result)
+
+    def test_context_compose_fails_closed_when_context_pack_detects_publication_drift(
+        self,
+    ) -> None:
+        base, target = self._composer_fixture()
+        manifest = next(self.merges.glob("*bundle.manifest.json"))
+        original_select = mcp._repoground_selected_manifest_for_repo
+        calls = {"count": 0}
+
+        def select(repo, stem):
+            calls["count"] += 1
+            result = original_select(repo, stem)
+            if calls["count"] == 1:
+                document = json.loads(manifest.read_text(encoding="utf-8"))
+                document["changed_after_pin"] = True
+                manifest.write_text(json.dumps(document), encoding="utf-8")
+            return result
+
+        with (
+            patch.object(
+                mcp, "_repoground_selected_manifest_for_repo", side_effect=select
+            ),
+            patch.object(mcp, "_repoground_agent_impact_context") as impact,
+        ):
+            result = mcp.repoground_context_compose(
+                "demo-repo",
+                base,
+                target,
+                context_budget_bytes=10_000,
+            )
+
+        self.assertEqual(calls["count"], 2)
+        self.assertFalse(result["available"])
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["reason"], "catalog_selection_changed")
+        self.assertEqual(
+            result["stop_criteria"]["triggered"], ["publication_unavailable"]
+        )
+        impact.assert_not_called()
+
     def test_context_lane_policy_rejects_missing_or_unknown_configuration(self) -> None:
         lane_values = {name: [] for name in mcp._REPOGROUND_CONTEXT_LANE_CONFIG}
         lane_values["unconfigured_lane"] = []
