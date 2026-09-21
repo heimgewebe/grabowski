@@ -175,6 +175,8 @@ Ein Wert wie `execution_mode=direct_operator` darf damit nicht mehr als Aussage 
 
 Plan-/Review-Routen bleiben read-only. Eine Route mit planartigem Permission-Modus darf nicht stillschweigend Writerautorität erhalten.
 
+`grok-4.6-review-high` ist die provider-unabhängige xAI-Reviewerroute, sobald SuperGrok-Authentifizierung und Modell-Readback frisch verfügbar sind. `codex-sol-review-high` ist ebenfalls eine echte read-only Reviewerroute. Sie teilt jedoch die OpenAI-Providerfamilie mit dem Controller und wird deshalb bei OpenAI-Primärarbeit durch die bestehenden Independence-Gates ausgeschlossen; nach Auswahl eines nicht-OpenAI Scoped Writers kann sie regulär als unabhängiger Reviewer konkurrieren.
+
 Kontrastrouten dürfen mutierende Kandidaten in ihrem isolierten Vergleichspfad erzeugen, wenn der bestehende Competition-Vertrag dies erlaubt. Diese Kandidaten bleiben advisory, bis der Controller sie in einen autoritativen Lane-/Candidate-Pfad übernimmt.
 
 Das ist von einem echten `scoped_writer` zu unterscheiden: Ein lane-gebundener Scoped Writer ist innerhalb seiner Lane autoritativ für die delegierte Implementierung, aber nicht für Integration, Merge, Deployment oder Closeout.
