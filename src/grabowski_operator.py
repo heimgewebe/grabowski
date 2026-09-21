@@ -1644,11 +1644,18 @@ def _record_repoground_consultation(tool_name: Any) -> None:
     name = _repoground_consultation_tool_name(tool_name)
     if name is None:
         return
-    logging.getLogger(__name__).info(
+    event = (
         "repoground-consultation-completed "
-        "tool=%s source=mcp-tool-boundary arguments_logged=false outcome=success",
-        name,
+        f"tool={name} source=mcp-tool-boundary "
+        "arguments_logged=false outcome=success"
     )
+    try:
+        sys.stderr.write(event + "\n")
+        sys.stderr.flush()
+    except Exception:
+        # Observability must never turn a successful read-only tool call into
+        # a failed call when the process log sink is unavailable.
+        return
 
 
 def _deployment_admission_register_tool_call(
