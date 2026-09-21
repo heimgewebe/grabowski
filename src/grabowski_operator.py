@@ -1629,6 +1629,28 @@ def _deployment_admission_active_tool_calls() -> int:
         return len(_DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY)
 
 
+def _repoground_consultation_tool_name(tool_name: Any) -> str | None:
+    """Return one bounded public RepoGround tool name suitable for telemetry."""
+    if (
+        not isinstance(tool_name, str)
+        or re.fullmatch(r"repoground_[a-z0-9_]+", tool_name) is None
+    ):
+        return None
+    return tool_name[:_DEPLOYMENT_ADMISSION_MAX_TOOL_NAME_CHARS]
+
+
+def _record_repoground_consultation(tool_name: Any) -> None:
+    """Record one successfully completed RepoGround consultation without content."""
+    name = _repoground_consultation_tool_name(tool_name)
+    if name is None:
+        return
+    logging.getLogger(__name__).info(
+        "repoground-consultation-completed "
+        "tool=%s source=mcp-tool-boundary arguments_logged=false outcome=success",
+        name,
+    )
+
+
 def _deployment_admission_register_tool_call(
     tool_name: Any,
     kind: str,
@@ -1810,6 +1832,17 @@ def _run_sync_tool_call(
     kwargs: dict[str, Any],
 ) -> Any:
     return asyncio.run(original(*args, **kwargs))
+
+
+def _run_sync_tool_call_observed(
+    original: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    tool_name: Any,
+) -> Any:
+    result = _run_sync_tool_call(original, args, kwargs)
+    _record_repoground_consultation(tool_name)
+    return result
 
 
 async def _begin_fence_enforcement_async(
@@ -2147,20 +2180,24 @@ def _install_deployment_admission_gate() -> None:
             if kind == _DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC:
                 loop = asyncio.get_running_loop()
                 try:
+                    if effect_admission is not None:
+                        call_runner = _run_sync_tool_call_with_effect
+                        call_extra_args: tuple[Any, ...] = (
+                            effect_admission,
+                            fence_token,
+                        )
+                    elif _repoground_consultation_tool_name(tool_name) is not None:
+                        call_runner = _run_sync_tool_call_observed
+                        call_extra_args = (tool_name,)
+                    else:
+                        call_runner = _run_sync_tool_call
+                        call_extra_args = ()
                     worker_future = _SYNC_TOOL_EXECUTOR.submit(
-                        (
-                            _run_sync_tool_call_with_effect
-                            if effect_admission is not None
-                            else _run_sync_tool_call
-                        ),
+                        call_runner,
                         original,
                         args,
                         kwargs,
-                        *(
-                            (effect_admission, fence_token)
-                            if effect_admission is not None
-                            else ()
-                        ),
+                        *call_extra_args,
                     )
                 except BaseException as error:
                     # Submit never accepted work: no domain effect started. A
@@ -2223,7 +2260,7 @@ def _install_deployment_admission_gate() -> None:
                                 _release_when_worker_finishes
                             )
                             callback_registered = True
-                        except BaseException as callback_error:
+                        except BaseException:
                             def _fallback_wait_and_release() -> None:
                                 try:
                                     try:
@@ -2305,6 +2342,7 @@ def _install_deployment_admission_gate() -> None:
                     raise
             try:
                 result = await original(*args, **kwargs)
+                _record_repoground_consultation(tool_name)
             except BaseException as error:
                 if effect_admission is not None:
                     if fence_token is not None:
