@@ -424,30 +424,28 @@ class DeploymentAdmissionGateTests(unittest.TestCase):
     def test_gate_schema_rejected_repoground_call_is_not_recorded_as_consultation(
         self,
     ) -> None:
-        try:
-            from mcp.server.fastmcp import FastMCP as RealFastMCP
-            from mcp.types import ToolAnnotations as RealToolAnnotations
-        except ImportError:
-            self.skipTest("real FastMCP unavailable in dependency-free validation")
-
-        real_mcp = RealFastMCP("repoground-schema-rejection-probe")
-
-        @real_mcp.tool(
-            name="repoground_context_pack",
-            annotations=RealToolAnnotations(readOnlyHint=True),
-        )
-        def probe(repo: str) -> dict[str, str]:
-            return {"repo": repo}
-
         operator = _load_operator_module()
-        operator.mcp._tool_manager.call_tool = real_mcp._tool_manager.call_tool
-        operator.mcp._tool_manager.get_tool = real_mcp._tool_manager.get_tool
+        domain_started = False
+
+        async def schema_validating_call(name, arguments, *args, **kwargs):
+            nonlocal domain_started
+            if (
+                name != "repoground_context_pack"
+                or set(arguments) != {"repo"}
+                or not isinstance(arguments.get("repo"), str)
+            ):
+                raise ValueError("schema-rejected")
+            domain_started = True
+            return {"called": True}
+
+        operator.mcp._tool_manager.call_tool = schema_validating_call
+        operator.mcp._tool_manager.get_tool = lambda _name: _sync_tool()
         operator._configure_http_runtime()
 
         with patch.object(
             operator, "_record_repoground_consultation"
         ) as record:
-            with self.assertRaises(Exception):
+            with self.assertRaisesRegex(ValueError, "schema-rejected"):
                 asyncio.run(
                     operator.mcp._tool_manager.call_tool(
                         "repoground_context_pack",
@@ -455,6 +453,7 @@ class DeploymentAdmissionGateTests(unittest.TestCase):
                     )
                 )
 
+        self.assertFalse(domain_started)
         record.assert_not_called()
 
     def test_gate_sync_tool_exception_releases_by_identity(self) -> None:
