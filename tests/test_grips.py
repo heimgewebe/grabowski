@@ -1620,6 +1620,78 @@ class GripFoundationTests(unittest.TestCase):
                 }
                 self.assertEqual(expected_status, statuses["fast-forward-only"])
 
+    def test_post_merge_sync_apply_clean_preimage_requires_explicit_verification(
+        self,
+    ) -> None:
+        parameters = {
+            "repo": "/tmp/grabowski-pr1261-preimage-test",
+            "target_branch": "main",
+            "expected_local_head": "1" * 40,
+            "expected_remote_head": "2" * 40,
+            "confirmation": "apply-protected-post-merge-sync",
+        }
+        cases = (
+            ({"state": "outcome_unknown", "resource_keys": ["repo:/tmp/x"]}, "skip"),
+            (
+                {
+                    "state": "outcome_unknown",
+                    "resource_keys": ["repo:/tmp/x"],
+                    "serialization_verified": True,
+                },
+                "skip",
+            ),
+            (
+                {
+                    "state": "outcome_unknown",
+                    "resource_keys": ["repo:/tmp/x"],
+                    "serialization_verified": True,
+                    "preimage_verified": True,
+                },
+                "pass",
+            ),
+            (
+                {
+                    "state": "preimage_drift_after_lease",
+                    "resource_keys": ["repo:/tmp/x"],
+                    "serialization_verified": True,
+                    "preimage_verified": False,
+                },
+                "fail",
+            ),
+        )
+        for output_patch, expected_status in cases:
+            with self.subTest(output_patch=output_patch):
+                receipt: dict[str, object] = {"checks": []}
+                output = {
+                    "receipt_status": "blocked",
+                    "retry_authorized": False,
+                    "readback_required": True,
+                    **output_patch,
+                }
+                with (
+                    patch.object(
+                        grips,
+                        "_validate_remote_materialization_target",
+                        return_value="https://example.invalid/grabowski.git",
+                    ),
+                    patch(
+                        "grabowski_post_merge_sync_apply.apply",
+                        return_value=output,
+                    ),
+                ):
+                    grips._run_post_merge_sync_apply(
+                        grips.GRIP_SPECS["post-merge-sync-apply"],
+                        parameters,
+                        receipt,
+                        FakeGit(),
+                    )
+                statuses = {
+                    item["id"]: item["status"]
+                    for item in receipt["checks"]
+                }
+                self.assertEqual(expected_status, statuses["clean-exact-preimage"])
+
+
     def test_post_merge_sync_apply_fails_serialization_on_lease_drift(self) -> None:
         parameters = {
             "repo": "/tmp/grabowski-pr1261-serialization-test",

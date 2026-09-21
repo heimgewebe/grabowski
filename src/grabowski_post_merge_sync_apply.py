@@ -326,6 +326,7 @@ def apply(
             "receipt_status": "passed",
             "state": "already_synced",
             "effect_started": False,
+            "preimage_verified": True,
             "idempotent": True,
             "retry_authorized": False,
             "old_head": expected_remote_head,
@@ -423,6 +424,7 @@ def apply(
     worktree_effect_started = False
     branch_cas_started = False
     serialization_verified = False
+    preimage_verified = False
     fast_forward_verified = False
     release_error: Exception | None = None
     try:
@@ -461,6 +463,9 @@ def apply(
                     resource_keys=resource_keys,
                     serialization_verified=serialization_verified,
                 )
+
+        if output is None:
+            preimage_verified = True
 
         if output is None:
             try:
@@ -876,6 +881,7 @@ def apply(
             "preimage_sha256": preimage_sha256,
             "resource_keys": resource_keys,
         }
+    output.setdefault("preimage_verified", preimage_verified)
     output.setdefault("lease_owner_id", owner_id)
     if release_error is not None:
         cleanup_next_action = (

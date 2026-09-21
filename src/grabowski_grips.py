@@ -6745,7 +6745,11 @@ def _run_post_merge_sync_apply(
     preimage_status = (
         "fail"
         if blocked_preimage
-        else ("skip" if preimage_unverified else "pass")
+        else (
+            "pass"
+            if output.get("preimage_verified") is True
+            else "skip"
+        )
     )
     _check(
         receipt,
