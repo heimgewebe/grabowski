@@ -821,6 +821,39 @@ class CodingAgentRouterTests(unittest.TestCase):
         with self.assertRaisesRegex(router.CodingAgentRouterError, "no scoped-writer, review or contrast capability"):
             router._validate_catalog(enabled_without_capability)
 
+    def test_enabled_codex_reviewer_requires_exact_read_only_sandbox(self) -> None:
+        def codex_reviewer(catalog):
+            return next(
+                item for item in catalog["routes"]
+                if item["id"] == "codex-sol-review-high"
+            )
+
+        missing = json.loads(json.dumps(self.catalog))
+        route = codex_reviewer(missing)
+        sandbox_index = route["argv_prefix"].index("--sandbox")
+        del route["argv_prefix"][sandbox_index : sandbox_index + 2]
+        with self.assertRaisesRegex(
+            router.CodingAgentRouterError, "exactly one --sandbox read-only"
+        ):
+            router._validate_catalog(missing)
+
+        writable = json.loads(json.dumps(self.catalog))
+        route = codex_reviewer(writable)
+        sandbox_index = route["argv_prefix"].index("--sandbox")
+        route["argv_prefix"][sandbox_index + 1] = "workspace-write"
+        with self.assertRaisesRegex(
+            router.CodingAgentRouterError, "exactly one --sandbox read-only"
+        ):
+            router._validate_catalog(writable)
+
+        duplicate = json.loads(json.dumps(self.catalog))
+        route = codex_reviewer(duplicate)
+        route["argv_prefix"].extend(["--sandbox", "read-only"])
+        with self.assertRaisesRegex(
+            router.CodingAgentRouterError, "exactly one --sandbox read-only"
+        ):
+            router._validate_catalog(duplicate)
+
     def test_sonnet_alias_is_resolved_without_claiming_an_unknown_current_model(
         self,
     ) -> None:
@@ -1044,6 +1077,11 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertEqual(review["quota_pools"], ["openai-agentic"])
         self.assertFalse(review["paid_only"])
         self.assertIsNone(review["permission_mode"])
+        self.assertEqual(
+            ["--sandbox", "read-only", "--ask-for-approval", "never"],
+            review["argv_prefix"][-4:],
+        )
+        self.assertEqual(1, review["argv_prefix"].count("--sandbox"))
 
     def test_task_specific_defaults_keep_controller_integration_authoritative(self) -> None:
         for task_class, kwargs in (

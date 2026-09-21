@@ -362,6 +362,39 @@ def _validated_route_argv_prefix(route: dict[str, Any]) -> list[str]:
     return argv
 
 
+def _route_option_values(route: dict[str, Any], flag: str) -> list[str]:
+    argv = _validated_route_argv_prefix(route)
+    identifier = route.get("id")
+    label = identifier if isinstance(identifier, str) and identifier else "route"
+    values: list[str] = []
+    for index, argument in enumerate(argv):
+        if argument == flag:
+            if index + 1 >= len(argv) or argv[index + 1].startswith("-"):
+                raise CodingAgentRouterError(f"{label}: {flag} is missing a value")
+            values.append(argv[index + 1])
+        elif argument.startswith(f"{flag}="):
+            value = argument.split("=", 1)[1]
+            if not value:
+                raise CodingAgentRouterError(f"{label}: {flag} has an empty value")
+            values.append(value)
+    return values
+
+
+def _validate_codex_review_launch_contract(route: dict[str, Any]) -> None:
+    if not (
+        route.get("enabled") is True
+        and route.get("review_only") is True
+        and route.get("harness") == "codex"
+    ):
+        return
+    identifier = route.get("id")
+    label = identifier if isinstance(identifier, str) and identifier else "route"
+    if _route_option_values(route, "--sandbox") != ["read-only"]:
+        raise CodingAgentRouterError(
+            f"{label}: enabled Codex review_only route must bind exactly one --sandbox read-only"
+        )
+
+
 def _route_permission_mode(route: dict[str, Any]) -> str | None:
     raw_argv = route.get("argv_prefix")
     if route.get("controller") is True and (raw_argv is None or raw_argv == []):
@@ -593,6 +626,7 @@ def _validate_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
                 raise CodingAgentRouterError(
                     f"{identifier}: {role_flag} must be a boolean"
                 )
+        _validate_codex_review_launch_contract(route)
         if route.get("model") in PAID_ONLY_MODEL_IDS:
             if route.get("paid_only") is not True:
                 raise CodingAgentRouterError(
