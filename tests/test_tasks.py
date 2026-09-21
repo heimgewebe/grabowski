@@ -5829,6 +5829,7 @@ class TaskTests(unittest.TestCase):
                 "snapshot",
                 "cursor_and_query",
                 "page_setup_total",
+                "terminal_evidence_filter",
                 "observation",
                 "serialization",
                 "total",
@@ -7746,6 +7747,48 @@ class TaskTests(unittest.TestCase):
             result = tasks.reconcile_tasks_check()
         self.assertEqual(result["scanned"], 0)
         observe.assert_not_called()
+
+    def test_reconcile_check_bulk_reads_terminal_evidence_once_per_page(self) -> None:
+        terminal_tasks = [self._start()["task"] for _ in range(3)]
+        for index, record in enumerate(terminal_tasks):
+            tasks._set_state(
+                str(record["task_id"]),
+                "failed",
+                observation={
+                    "state": "failed",
+                    "source": f"bulk-terminal-evidence-{index}",
+                },
+            )
+
+        with patch.object(
+            tasks.resources,
+            "task_terminalization_records",
+            wraps=tasks.resources.task_terminalization_records,
+        ) as bulk_read, patch.object(
+            tasks.resources,
+            "task_terminalization_record",
+            side_effect=AssertionError(
+                "global page filter must not perform per-task terminalization reads"
+            ),
+        ):
+            result = tasks.reconcile_tasks_check(limit=3)
+
+        self.assertEqual(0, result["scanned"])
+        bulk_read.assert_called_once()
+        requested_ids = bulk_read.call_args.args[0]
+        self.assertEqual(
+            {str(record["task_id"]) for record in terminal_tasks},
+            set(requested_ids),
+        )
+        self.assertTrue(bulk_read.call_args.kwargs["include_projection"])
+        self.assertIn(
+            "terminal_evidence_filter",
+            result["pagination"]["timings_ms"],
+        )
+        self.assertGreaterEqual(
+            result["pagination"]["timings_ms"]["terminal_evidence_filter"],
+            0.0,
+        )
 
     def test_reconcile_resume_requires_reason(self) -> None:
         with self.assertRaisesRegex(ValueError, "reason is required"):
