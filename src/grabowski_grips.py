@@ -6737,14 +6737,18 @@ def _run_post_merge_sync_apply(
         "dirty_checkout",
         "local_head_mismatch",
         "upstream_mismatch",
+        "local_preimage_commit_unreadable",
         "preimage_drift_after_lease",
         "lease_preimage_drift",
     }
-    preimage_unverified = before_snapshot or state == "canonical_checkout_mismatch"
     preimage_status = (
         "fail"
         if blocked_preimage
-        else ("skip" if preimage_unverified else "pass")
+        else (
+            "pass"
+            if output.get("preimage_verified") is True
+            else "skip"
+        )
     )
     _check(
         receipt,
@@ -6757,16 +6761,17 @@ def _run_post_merge_sync_apply(
         "remote_head_mismatch",
         "remote_read_failed_after_lease",
         "remote_head_drift_after_lease",
-    }
-    remote_unverified = preimage_unverified or state in {
-        "dirty_checkout",
-        "local_head_mismatch",
-        "upstream_mismatch",
+        "effect_confirmed_remote_drift",
+        "effect_confirmed_remote_unreadable",
     }
     remote_status = (
         "fail"
         if remote_bad
-        else ("skip" if remote_unverified else "pass")
+        else (
+            "pass"
+            if output.get("remote_head_verified") is True
+            else "skip"
+        )
     )
     _check(
         receipt,
@@ -6774,21 +6779,31 @@ def _run_post_merge_sync_apply(
         remote_status,
         str(output.get("remote_head") or expected_remote_head),
     )
+    fast_forward_status = (
+        "fail"
+        if state == "non_fast_forward"
+        else (
+            "pass"
+            if output.get("fast_forward_verified") is True
+            else "skip"
+        )
+    )
     _check(
         receipt,
         "fast-forward-only",
-        "fail" if state == "non_fast_forward" else "pass",
+        fast_forward_status,
         state,
     )
-    serialized = bool(output.get("resource_keys")) and state not in {
-        "lease_acquisition_blocked",
-        "lease_snapshot_invalid",
-        "lease_preimage_drift",
-    }
+    serialization_attempted = bool(output.get("resource_keys"))
+    serialization_status = (
+        "pass"
+        if output.get("serialization_verified") is True
+        else ("fail" if serialization_attempted else "skip")
+    )
     _check(
         receipt,
         "worktree-common-dir-branch-serialized",
-        "pass" if serialized else ("skip" if state == "already_synced" else "fail"),
+        serialization_status,
         state,
     )
     branch_cas = output.get("branch_cas_started") is True
