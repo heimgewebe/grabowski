@@ -10329,19 +10329,58 @@ def _reconcile_candidate_states() -> tuple[str, ...]:
     )
 
 
+def _update_sqlite_revision_digest(
+    digest: Any,
+    value: Any,
+) -> None:
+    if value is None:
+        tag = b"N"
+        payload = b""
+    elif isinstance(value, int):
+        tag = b"I"
+        payload = str(value).encode("ascii")
+    elif isinstance(value, float):
+        tag = b"F"
+        payload = value.hex().encode("ascii")
+    elif isinstance(value, str):
+        tag = b"T"
+        payload = value.encode("utf-8")
+    elif isinstance(value, bytes):
+        tag = b"B"
+        payload = value
+    else:
+        raise RuntimeError(
+            f"Unsupported SQLite revision value type: {type(value).__name__}"
+        )
+    digest.update(tag)
+    digest.update(len(payload).to_bytes(8, "big"))
+    digest.update(payload)
+
+
 def _sqlite_rows_revision(
     connection: sqlite3.Connection,
     query: str,
     parameters: tuple[Any, ...] = (),
 ) -> dict[str, Any]:
     digest = hashlib.sha256()
+    cursor = connection.execute(query, parameters)
+    description = cursor.description or ()
+    digest.update(b"sqlite-row-stream-v1")
+    digest.update(len(description).to_bytes(4, "big"))
+    for column in description:
+        _update_sqlite_revision_digest(digest, str(column[0]))
     count = 0
-    for row in connection.execute(query, parameters):
-        encoded = _canonical_json(dict(row)).encode("utf-8")
-        digest.update(len(encoded).to_bytes(8, "big"))
-        digest.update(encoded)
+    for row in cursor:
+        digest.update(b"R")
+        digest.update(len(row).to_bytes(4, "big"))
+        for value in row:
+            _update_sqlite_revision_digest(digest, value)
         count += 1
-    return {"row_count": count, "rows_sha256": digest.hexdigest()}
+    return {
+        "algorithm": "sqlite-row-stream-v1",
+        "row_count": count,
+        "rows_sha256": digest.hexdigest(),
+    }
 
 
 def _reconcile_resource_store_revision() -> dict[str, Any]:

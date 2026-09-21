@@ -5347,6 +5347,77 @@ class TaskTests(unittest.TestCase):
                 tasks.TASK_RECONCILE_CHECK_MAX_BYTES,
             )
 
+    def test_sqlite_rows_revision_streams_full_typed_rows_without_json_materialization(
+        self,
+    ) -> None:
+        with sqlite3.connect(":memory:") as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute(
+                "CREATE TABLE sample ("
+                "id INTEGER, text_value TEXT, blob_value BLOB, "
+                "real_value REAL, nullable TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO sample VALUES (?, ?, ?, ?, ?)",
+                (1, "alpha", b"\x00\xff", 1.25, None),
+            )
+            with patch.object(
+                tasks,
+                "_canonical_json",
+                side_effect=AssertionError("row revision must not JSON-materialize rows"),
+            ):
+                first = tasks._sqlite_rows_revision(
+                    connection, "SELECT * FROM sample ORDER BY id"
+                )
+
+            connection.execute(
+                "UPDATE sample SET text_value=? WHERE id=?",
+                ("beta", 1),
+            )
+            second = tasks._sqlite_rows_revision(
+                connection, "SELECT * FROM sample ORDER BY id"
+            )
+
+        self.assertEqual("sqlite-row-stream-v1", first["algorithm"])
+        self.assertEqual(1, first["row_count"])
+        self.assertNotEqual(first["rows_sha256"], second["rows_sha256"])
+
+    def test_reconcile_check_cursor_fails_closed_after_existing_row_change(
+        self,
+    ) -> None:
+        first = self._start(resource_keys=["service:reconcile-row-drift-a.service"])
+        self._start(resource_keys=["service:reconcile-row-drift-b.service"])
+        observation = {
+            "state": "running",
+            "properties": {"ActiveState": "active", "SubState": "running"},
+            "probe": None,
+            "observer": {"kind": "test"},
+            "observed_at_unix": 201,
+        }
+        with patch.object(
+            tasks, "_reconcile_observation", return_value=observation
+        ), patch.object(
+            tasks, "_terminal_convergence_evidence", return_value=(False, False)
+        ):
+            page = tasks.reconcile_tasks_check(limit=1)
+
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE tasks SET last_observation_json=? WHERE task_id=?",
+                ('{"drift":true}', first["task"]["task_id"]),
+            )
+            connection.commit()
+
+        with patch.object(
+            tasks, "_reconcile_observation", return_value=observation
+        ), patch.object(
+            tasks, "_terminal_convergence_evidence", return_value=(False, False)
+        ), self.assertRaisesRegex(ValueError, "cursor_snapshot_changed"):
+            tasks.reconcile_tasks_check(
+                limit=1,
+                cursor=page["pagination"]["next_cursor"],
+            )
+
     def test_reconcile_check_cursor_fails_closed_after_store_change(self) -> None:
         self._start(resource_keys=["service:reconcile-cursor-a.service"])
         self._start(resource_keys=["service:reconcile-cursor-b.service"])
