@@ -427,6 +427,8 @@ class GrokReviewRoleTests(unittest.TestCase):
             {"type": "thought", "data": "review bound diff"},
             {"type": "available_commands", "tools": []},
             {"type": "usage", "usage": {"input_tokens": 1}},
+            {"type": "memory_flush_started"},
+            {"type": "memory_flush_completed"},
             {"type": "text", "data": "Reviewed.\n\n"},
             {"type": "text", "data": '{"verdict":"PASS","findings":[]}'},
             {"type": "end", "stopReason": "end_turn", "num_turns": 1},
@@ -438,6 +440,19 @@ class GrokReviewRoleTests(unittest.TestCase):
         self.assertEqual(json.loads(document), {"verdict": "PASS", "findings": []})
         self.assertEqual(metadata["review_provider_completed_tool_calls"], 0)
         self.assertEqual(metadata["review_provider_num_turns"], 1)
+
+    def test_extract_stream_rejects_unknown_provider_event(self) -> None:
+        events = [
+            {"type": "available_commands", "tools": []},
+            {"type": "memory_flush_future"},
+            {"type": "text", "data": '{"verdict":"PASS","findings":[]}'},
+            {"type": "end", "stopReason": "end_turn", "num_turns": 1},
+        ]
+        document, error, _ = role._extract_grok_stream_review_document(
+            stream_bytes(events), expected_head="a" * 40, expected_base_head="b" * 40
+        )
+        self.assertIsNone(document)
+        self.assertIn("unsupported event type", error)
 
     def test_extract_stream_requires_empty_tool_availability_evidence(self) -> None:
         base_events = [
