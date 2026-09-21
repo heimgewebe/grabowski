@@ -11424,8 +11424,29 @@ def _repoground_validate_revision(value: str, *, label: str) -> str:
     return value
 
 
-def _repoground_working_repo(repo: str) -> Path:
+def _repoground_working_repo(repo: str, stem: str | None = None) -> Path:
     root = (HOME / "repos").resolve(strict=False)
+    if "/" in repo or "__" in repo:
+        resolution = _repoground_catalog_resolution(repo, stem)
+        selected = [
+            item
+            for item in resolution.get("selected", [])
+            if item.get("authority") == "canonical_publication"
+            and isinstance(item.get("manifest_path"), str)
+        ]
+        if len(selected) != 1:
+            raise ValueError("repository checkout is missing or invalid")
+        try:
+            status = _repoground_manifest_summary(Path(selected[0]["manifest_path"]))
+            candidate, source_kind, _source_ref = _repoground_freshness_source(
+                repo, status
+            )
+        except (OSError, PermissionError, ValueError) as exc:
+            raise ValueError("repository checkout is missing or invalid") from exc
+        if source_kind != "publication_source_checkout":
+            raise ValueError("repository checkout is missing or invalid")
+        return candidate
+
     candidate = root / repo
     resolved = candidate.resolve(strict=False)
     if (
@@ -12091,7 +12112,7 @@ def repoground_context_compose(
     if query is not None and (not isinstance(query, str) or not query.strip() or len(query) > 500):
         raise ValueError("query must be a non-empty string up to 500 characters when provided")
 
-    repo_path = _repoground_working_repo(repo)
+    repo_path = _repoground_working_repo(repo, stem)
     base_commit = _repoground_resolve_commit(repo_path, base_revision)
     target_commit = _repoground_resolve_commit(repo_path, target_revision)
     changes, diff_sha256 = _repoground_revision_changes(repo_path, base_commit, target_commit)

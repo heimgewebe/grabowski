@@ -2875,6 +2875,148 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
             "does_not_establish": ["test_sufficiency", "runtime_behavior"],
         }
 
+    def test_working_repo_qualified_identity_uses_publication_source(self) -> None:
+        source_name = "heimgewebe__demo-repo__main--" + ("a" * 40)
+        publication_source = (
+            self.home / "repos" / ".repoground-sources" / source_name
+        )
+        publication_source.mkdir(parents=True)
+        manifest = self.merges / "qualified.bundle.manifest.json"
+        resolution = {
+            "selected": [
+                {
+                    "authority": "canonical_publication",
+                    "manifest_path": str(manifest),
+                }
+            ]
+        }
+        status = {
+            "publication_authority": "canonical_publication",
+            "publication_ref": "main",
+            "source_provenance": {"repository": {"name": source_name}},
+        }
+
+        for selector in ("heimgewebe/demo-repo", "heimgewebe__demo-repo"):
+            with self.subTest(selector=selector):
+                with (
+                    patch.object(
+                        mcp, "_repoground_catalog_resolution", return_value=resolution
+                    ) as catalog,
+                    patch.object(
+                        mcp, "_repoground_manifest_summary", return_value=status
+                    ),
+                ):
+                    resolved = mcp._repoground_working_repo(
+                        selector, "qualified-stem"
+                    )
+
+                self.assertEqual(resolved, publication_source)
+                catalog.assert_called_once_with(selector, "qualified-stem")
+
+    def test_working_repo_qualified_identity_does_not_fall_back_to_nested_checkout(
+        self,
+    ) -> None:
+        nested = self.home / "repos" / "heimgewebe" / "demo-repo"
+        nested.mkdir(parents=True)
+        manifest = self.merges / "qualified.bundle.manifest.json"
+        resolution = {
+            "selected": [
+                {
+                    "authority": "canonical_publication",
+                    "manifest_path": str(manifest),
+                }
+            ]
+        }
+        status = {
+            "publication_authority": "canonical_publication",
+            "publication_ref": "main",
+            "source_provenance": {
+                "repository": {
+                    "name": "heimgewebe__demo-repo__main--" + ("b" * 40)
+                }
+            },
+        }
+
+        with (
+            patch.object(mcp, "_repoground_catalog_resolution", return_value=resolution),
+            patch.object(mcp, "_repoground_manifest_summary", return_value=status),
+            self.assertRaisesRegex(
+                ValueError, "repository checkout is missing or invalid"
+            ),
+        ):
+            mcp._repoground_working_repo("heimgewebe/demo-repo")
+
+    def test_context_compose_qualified_repo_uses_publication_source_checkout(
+        self,
+    ) -> None:
+        base, target = self._composer_fixture()
+        conventional = self.home / "repos" / "demo-repo"
+        source_name = "heimgewebe__demo-repo__main--" + target
+        publication_source = (
+            self.home / "repos" / ".repoground-sources" / source_name
+        )
+        publication_source.parent.mkdir(parents=True)
+        subprocess.run(
+            ["git", "clone", "--quiet", str(conventional), str(publication_source)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        manifest = self.merges / "qualified.bundle.manifest.json"
+        resolution = {
+            "selected": [
+                {
+                    "authority": "canonical_publication",
+                    "manifest_path": str(manifest),
+                }
+            ]
+        }
+        status = {
+            "publication_authority": "canonical_publication",
+            "publication_ref": "main",
+            "source_provenance": {"repository": {"name": source_name}},
+        }
+
+        with (
+            patch.object(mcp, "_repoground_catalog_resolution", return_value=resolution),
+            patch.object(mcp, "_repoground_manifest_summary", return_value=status),
+            patch.object(
+                mcp,
+                "_repoground_selected_manifest_for_repo",
+                return_value=(
+                    {"freshness": "fresh_exact"},
+                    "qualified-stem",
+                    manifest,
+                    None,
+                ),
+            ),
+            patch.object(
+                mcp,
+                "repoground_context_pack",
+                return_value=self._composer_context_pack(),
+            ),
+            patch.object(
+                mcp,
+                "_repoground_agent_impact_context",
+                return_value=self._composer_impact(),
+            ),
+            patch.object(mcp, "_repoground_manifest_surface_metadata", return_value={}),
+        ):
+            result = mcp.repoground_context_compose(
+                "heimgewebe/demo-repo",
+                base,
+                target,
+                stem="qualified-stem",
+                context_budget_bytes=10_000,
+            )
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["change_identity"]["base_commit"], base)
+        self.assertEqual(result["change_identity"]["target_commit"], target)
+        self.assertEqual(
+            result["context"]["target_symbols"][0]["qualified_name"], "run"
+        )
+
     def test_context_lane_policy_rejects_missing_or_unknown_configuration(self) -> None:
         lane_values = {name: [] for name in mcp._REPOGROUND_CONTEXT_LANE_CONFIG}
         lane_values["unconfigured_lane"] = []
