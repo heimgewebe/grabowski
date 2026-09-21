@@ -7790,6 +7790,71 @@ class TaskTests(unittest.TestCase):
             0.0,
         )
 
+    def test_reconcile_check_limit_stays_within_bulk_terminalization_bound(
+        self,
+    ) -> None:
+        too_many_terminal_ids = [f"{index:024x}" for index in range(501)]
+        with self.assertRaisesRegex(
+            ValueError,
+            "task_ids must contain at most 500 unique task ids",
+        ):
+            tasks.resources.task_terminalization_records(too_many_terminal_ids)
+
+        self.assertLessEqual(tasks.TASK_RECONCILE_CHECK_LIMIT, 500)
+        with self.assertRaisesRegex(ValueError, "limit must be between 1 and 200"):
+            tasks.reconcile_tasks_check(
+                limit=tasks.TASK_RECONCILE_CHECK_LIMIT + 1,
+            )
+
+    def test_reconcile_check_bulk_missing_terminal_evidence_keeps_mixed_page(
+        self,
+    ) -> None:
+        terminal = self._start()["task"]
+        running = self._start()["task"]
+        terminal_id = str(terminal["task_id"])
+        running_id = str(running["task_id"])
+        tasks._set_state(
+            terminal_id,
+            "failed",
+            observation={"state": "failed", "source": "missing-bulk-evidence"},
+        )
+        with sqlite3.connect(self.resource_database) as connection:
+            connection.execute(
+                "DELETE FROM task_terminalizations WHERE task_id=?",
+                (terminal_id,),
+            )
+            connection.commit()
+
+        def observation(record: dict[str, object]) -> dict[str, object]:
+            return {
+                "state": record["state"],
+                "properties": {},
+                "probe": None,
+                "observer": {"kind": "test"},
+                "observed_at_unix": 204,
+            }
+
+        with patch.object(
+            tasks,
+            "_reconcile_observation",
+            side_effect=observation,
+        ), patch.object(
+            tasks.resources,
+            "task_terminalization_records",
+            wraps=tasks.resources.task_terminalization_records,
+        ) as bulk_read:
+            result = tasks.reconcile_tasks_check(limit=2)
+
+        self.assertEqual(2, result["scanned"])
+        self.assertEqual(2, result["pagination"]["returned"])
+        self.assertEqual(
+            {terminal_id, running_id},
+            {str(item["task_id"]) for item in result["observations"]},
+        )
+        bulk_read.assert_called_once()
+        self.assertEqual([terminal_id], bulk_read.call_args.args[0])
+        self.assertTrue(bulk_read.call_args.kwargs["include_projection"])
+
     def test_reconcile_resume_requires_reason(self) -> None:
         with self.assertRaisesRegex(ValueError, "reason is required"):
             tasks.reconcile_tasks_resume()
