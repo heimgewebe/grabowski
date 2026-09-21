@@ -1699,6 +1699,7 @@ class BureauIntakeAdapterTests(unittest.TestCase):
         self.assertEqual(
             arguments[arguments.index("--state-root") + 1], state_root
         )
+        self.assertNotIn("--resource-db", arguments)
         self.assertEqual(
             bureau_invoke.call_args.kwargs["required_readback"],
             ["publication_receipt", "task_spec_revision", "resource_leases"],
