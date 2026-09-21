@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -410,6 +412,93 @@ class KleinerMaulwurfDeployTests(unittest.TestCase):
             runtime_binding=state.old_binding,
             cutover_id=km._rollback_cutover_id(state),
         )
+
+    def _fleet_config_path(self, registry: dict[str, object], directory: str) -> Path:
+        path = Path(directory) / "fleet.json"
+        path.write_text(json.dumps(registry), encoding="utf-8")
+        return path
+
+    def test_canonical_fleet_identity_accepts_commonserver_only(self) -> None:
+        registry = {
+            "schema_version": 1,
+            "hosts": {
+                "commonserver": {
+                    "transport": "local",
+                    "enabled": True,
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._fleet_config_path(registry, directory)
+            with patch.object(km, "FLEET_CONFIG", path):
+                km._require_canonical_fleet_identity()
+
+    def test_canonical_fleet_identity_rejects_non_object_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fleet.json"
+            path.write_text("[]", encoding="utf-8")
+            with patch.object(km, "FLEET_CONFIG", path):
+                with self.assertRaisesRegex(
+                    km.KleinerMaulwurfDeployError,
+                    "fleet registry schema is invalid",
+                ):
+                    km._require_canonical_fleet_identity()
+
+    def test_canonical_fleet_identity_rejects_legacy_fleet_alias(self) -> None:
+        registry = {
+            "schema_version": 1,
+            "hosts": {
+                "commonserver": {
+                    "transport": "local",
+                    "enabled": True,
+                },
+                "wg-prod-1": {
+                    "transport": "local",
+                    "enabled": True,
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._fleet_config_path(registry, directory)
+            with patch.object(km, "FLEET_CONFIG", path):
+                with self.assertRaisesRegex(
+                    km.KleinerMaulwurfDeployError,
+                    "legacy wg-prod-1",
+                ):
+                    km._require_canonical_fleet_identity()
+
+    def test_prepare_rejects_fleet_drift_before_stack_or_build_effects(self) -> None:
+        runtime = Path("/runtime")
+        snapshot = SimpleNamespace(repo_head="a" * 40)
+        registry = {
+            "schema_version": 1,
+            "hosts": {
+                "wg-prod-1": {
+                    "transport": "local",
+                    "enabled": True,
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._fleet_config_path(registry, directory)
+            with (
+                patch.object(km, "FLEET_CONFIG", path),
+                patch.object(
+                    km.core, "require_runtime_replaceable", return_value=runtime
+                ),
+                patch.object(km.core, "snapshot_from_worktree", return_value=snapshot),
+                patch.object(km, "_require_stack_active") as stack,
+                patch.object(km.core, "capture_pointer") as capture_pointer,
+                patch.object(km.core, "build_release") as build,
+            ):
+                with self.assertRaisesRegex(
+                    km.KleinerMaulwurfDeployError,
+                    "canonical commonserver fleet host",
+                ):
+                    km._prepare_deploy(ROOT, "a" * 40)
+        stack.assert_not_called()
+        capture_pointer.assert_not_called()
+        build.assert_not_called()
 
     def test_prepare_rejects_head_drift_before_service_or_build_effects(self) -> None:
         runtime = Path("/runtime")
