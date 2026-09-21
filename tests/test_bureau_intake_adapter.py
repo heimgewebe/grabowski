@@ -1632,12 +1632,22 @@ class BureauIntakeAdapterTests(unittest.TestCase):
         directory = self._write_proposal(proposal_id)
         state_root = "/home/alex/.local/state/bureau"
         keys = [f"path:{state_root}"]
+        required_metadata = {
+            "kind": intake.resources.BUREAU_TASK_PUBLICATION_AUTHORITY_KIND,
+            "authority_action_class": "task_creation_from_external_evidence",
+            "authority_capability": "bureau_mutation",
+            "task_id": "INIT-T001",
+            "operation": "state-task-publication",
+            "proposal_sha256": "c" * 64,
+            "bureau_phase": "work",
+        }
         preview = {
             "kind": "bureau_task_publication_preview",
             "status": "ready",
             "publication_mode": "state_store",
             "coordination_state_root": state_root,
             "required_resource_keys": keys,
+            "required_lease_metadata": required_metadata,
         }
 
         def invoke(arguments, **_kwargs):
@@ -1680,6 +1690,7 @@ class BureauIntakeAdapterTests(unittest.TestCase):
 
         preview_call.assert_called_once()
         self.assertEqual(acquire.call_args.args[1], keys)
+        self.assertEqual(acquire.call_args.kwargs["metadata"], required_metadata)
         self.assertEqual(
             acquire.call_args.kwargs["metadata"]["operation"],
             "state-task-publication",
