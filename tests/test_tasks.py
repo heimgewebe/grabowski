@@ -5370,6 +5370,34 @@ class TaskTests(unittest.TestCase):
                     connection, "SELECT * FROM sample ORDER BY id"
                 )
 
+            compatible_query = (
+                "SELECT id, text_value, real_value, nullable "
+                "FROM sample ORDER BY id"
+            )
+            current_compatible = tasks._sqlite_rows_revision(
+                connection, compatible_query
+            )
+            dual_current, legacy = (
+                tasks._sqlite_rows_revisions_for_legacy_cursor(
+                    connection, compatible_query
+                )
+            )
+            legacy_row = connection.execute(compatible_query).fetchone()
+            self.assertIsNotNone(legacy_row)
+            assert legacy_row is not None
+            legacy_encoded = tasks._canonical_json(dict(legacy_row)).encode("utf-8")
+            legacy_digest = hashlib.sha256()
+            legacy_digest.update(len(legacy_encoded).to_bytes(8, "big"))
+            legacy_digest.update(legacy_encoded)
+            self.assertEqual(current_compatible, dual_current)
+            self.assertEqual(
+                {
+                    "row_count": 1,
+                    "rows_sha256": legacy_digest.hexdigest(),
+                },
+                legacy,
+            )
+
             connection.execute(
                 "UPDATE sample SET text_value=? WHERE id=?",
                 ("beta", 1),
@@ -5381,6 +5409,132 @@ class TaskTests(unittest.TestCase):
         self.assertEqual("sqlite-row-stream-v1", first["algorithm"])
         self.assertEqual(1, first["row_count"])
         self.assertNotEqual(first["rows_sha256"], second["rows_sha256"])
+
+    def _legacy_reconcile_cursor_after_first_candidate(self) -> str:
+        candidate_states = tasks._reconcile_candidate_states()
+        placeholders = ",".join("?" for _ in candidate_states)
+        with tasks._task_read_snapshot() as connection:
+            _current_snapshot, legacy_snapshot = (
+                tasks._reconcile_check_store_snapshots_for_legacy_cursor(connection)
+            )
+            first = connection.execute(
+                f"SELECT created_at_unix, task_id FROM tasks "
+                f"WHERE state IN ({placeholders}) "
+                "ORDER BY created_at_unix, task_id LIMIT 1",
+                candidate_states,
+            ).fetchone()
+        self.assertIsNotNone(first)
+        assert first is not None
+        return tasks.consumer_surface.encode_cursor(
+            (
+                f"{tasks.TASK_RECONCILE_CHECK_CURSOR_SCOPE}:"
+                f"{legacy_snapshot['snapshot_sha256']}"
+            ),
+            {
+                "created_at_unix": int(first["created_at_unix"]),
+                "task_id": str(first["task_id"]),
+            },
+        )
+
+    def test_reconcile_check_accepts_legacy_cursor_for_unchanged_store_and_migrates_scope(
+        self,
+    ) -> None:
+        for suffix in ("a", "b", "c"):
+            self._start(resource_keys=[f"service:reconcile-legacy-{suffix}.service"])
+        legacy_cursor = self._legacy_reconcile_cursor_after_first_candidate()
+        self.assertTrue(
+            tasks._is_legacy_reconcile_check_cursor_scope(
+                tasks.consumer_surface.decode_cursor_scope(legacy_cursor)
+            )
+        )
+        observation = {
+            "state": "running",
+            "properties": {"ActiveState": "active", "SubState": "running"},
+            "probe": None,
+            "observer": {"kind": "test"},
+            "observed_at_unix": 201,
+        }
+
+        with patch.object(
+            tasks, "_reconcile_observation", return_value=observation
+        ), patch.object(
+            tasks, "_terminal_convergence_evidence", return_value=(False, False)
+        ):
+            page = tasks.reconcile_tasks_check(limit=1, cursor=legacy_cursor)
+
+        next_cursor = page["pagination"]["next_cursor"]
+        self.assertIsNotNone(next_cursor)
+        next_scope = tasks.consumer_surface.decode_cursor_scope(next_cursor)
+        self.assertIsInstance(next_scope, str)
+        assert next_scope is not None
+        self.assertTrue(
+            next_scope.startswith(
+                tasks.TASK_RECONCILE_CHECK_CURSOR_CURRENT_SCOPE + ":"
+            )
+        )
+        self.assertFalse(
+            tasks._is_legacy_reconcile_check_cursor_scope(next_scope)
+        )
+
+    def test_reconcile_check_legacy_cursor_still_fails_closed_after_store_drift(
+        self,
+    ) -> None:
+        first = self._start(
+            resource_keys=["service:reconcile-legacy-drift-a.service"]
+        )
+        self._start(resource_keys=["service:reconcile-legacy-drift-b.service"])
+        legacy_cursor = self._legacy_reconcile_cursor_after_first_candidate()
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE tasks SET last_observation_json=? WHERE task_id=?",
+                ('{"legacy-drift":true}', first["task"]["task_id"]),
+            )
+            connection.commit()
+
+        with self.assertRaisesRegex(ValueError, "cursor_snapshot_changed"):
+            tasks.reconcile_tasks_check(limit=1, cursor=legacy_cursor)
+
+    def test_reconcile_check_new_stale_cursor_never_runs_legacy_hash(
+        self,
+    ) -> None:
+        first = self._start(
+            resource_keys=["service:reconcile-current-drift-a.service"]
+        )
+        self._start(resource_keys=["service:reconcile-current-drift-b.service"])
+        observation = {
+            "state": "running",
+            "properties": {"ActiveState": "active", "SubState": "running"},
+            "probe": None,
+            "observer": {"kind": "test"},
+            "observed_at_unix": 201,
+        }
+        with patch.object(
+            tasks, "_reconcile_observation", return_value=observation
+        ), patch.object(
+            tasks, "_terminal_convergence_evidence", return_value=(False, False)
+        ):
+            page = tasks.reconcile_tasks_check(limit=1)
+
+        cursor = page["pagination"]["next_cursor"]
+        scope = tasks.consumer_surface.decode_cursor_scope(cursor)
+        self.assertIsInstance(scope, str)
+        assert scope is not None
+        self.assertTrue(
+            scope.startswith(tasks.TASK_RECONCILE_CHECK_CURSOR_CURRENT_SCOPE + ":")
+        )
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE tasks SET last_observation_json=? WHERE task_id=?",
+                ('{"current-drift":true}', first["task"]["task_id"]),
+            )
+            connection.commit()
+
+        with patch.object(
+            tasks,
+            "_reconcile_check_store_snapshots_for_legacy_cursor",
+            side_effect=AssertionError("new cursor must not use legacy hashing"),
+        ), self.assertRaisesRegex(ValueError, "cursor_snapshot_changed"):
+            tasks.reconcile_tasks_check(limit=1, cursor=cursor)
 
     def test_reconcile_check_cursor_fails_closed_after_existing_row_change(
         self,

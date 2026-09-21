@@ -99,12 +99,7 @@ def encode_cursor(scope: str, position: dict[str, Any]) -> str:
     return encoded
 
 
-def decode_cursor(
-    cursor: str | None,
-    scope: str,
-    *,
-    snapshot_scope: str | None = None,
-) -> dict[str, Any] | None:
+def _decode_cursor_value(cursor: str | None) -> dict[str, Any] | None:
     if cursor in (None, ""):
         return None
     if not isinstance(cursor, str) or len(cursor) > MAX_CONSUMER_CURSOR_BYTES:
@@ -120,10 +115,32 @@ def decode_cursor(
     expected = hashlib.sha256(canonical_json_bytes(value)).hexdigest()
     if not isinstance(checksum, str) or not hmac.compare_digest(checksum, expected):
         raise ValueError("cursor checksum is invalid")
-    actual_scope = value.get("scope")
-    position = value.get("position")
-    if not isinstance(position, dict):
+    if not isinstance(value.get("position"), dict):
         raise ValueError("cursor position is invalid")
+    return value
+
+
+def decode_cursor_scope(cursor: str | None) -> str | None:
+    value = _decode_cursor_value(cursor)
+    if value is None:
+        return None
+    scope = value.get("scope")
+    if not isinstance(scope, str):
+        raise ValueError("cursor scope is invalid")
+    return scope
+
+
+def decode_cursor(
+    cursor: str | None,
+    scope: str,
+    *,
+    snapshot_scope: str | None = None,
+) -> dict[str, Any] | None:
+    value = _decode_cursor_value(cursor)
+    if value is None:
+        return None
+    actual_scope = value.get("scope")
+    position = value["position"]
     if actual_scope != scope:
         if (
             snapshot_scope
