@@ -5436,6 +5436,30 @@ class TaskTests(unittest.TestCase):
             },
         )
 
+    def _row_stream_reconcile_cursor_after_first_candidate(self) -> str:
+        candidate_states = tasks._reconcile_candidate_states()
+        placeholders = ",".join("?" for _ in candidate_states)
+        with tasks._task_read_snapshot() as connection:
+            snapshot = tasks._reconcile_check_store_snapshot(connection)
+            first = connection.execute(
+                f"SELECT created_at_unix, task_id FROM tasks "
+                f"WHERE state IN ({placeholders}) "
+                "ORDER BY created_at_unix, task_id LIMIT 1",
+                candidate_states,
+            ).fetchone()
+        self.assertIsNotNone(first)
+        assert first is not None
+        return tasks.consumer_surface.encode_cursor(
+            (
+                f"{tasks.TASK_RECONCILE_CHECK_CURSOR_ROW_STREAM_SCOPE}:"
+                f"{snapshot['snapshot_sha256']}"
+            ),
+            {
+                "created_at_unix": int(first["created_at_unix"]),
+                "task_id": str(first["task_id"]),
+            },
+        )
+
     def test_reconcile_check_accepts_legacy_cursor_for_unchanged_store_and_migrates_scope(
         self,
     ) -> None:
@@ -5535,6 +5559,217 @@ class TaskTests(unittest.TestCase):
             side_effect=AssertionError("new cursor must not use legacy hashing"),
         ), self.assertRaisesRegex(ValueError, "cursor_snapshot_changed"):
             tasks.reconcile_tasks_check(limit=1, cursor=cursor)
+
+    def test_reconcile_check_accepts_row_stream_cursor_and_migrates_to_revision_scope(
+        self,
+    ) -> None:
+        for suffix in ("a", "b", "c"):
+            self._start(resource_keys=[f"service:reconcile-row-stream-{suffix}.service"])
+        row_stream_cursor = self._row_stream_reconcile_cursor_after_first_candidate()
+        observation = {
+            "state": "running",
+            "properties": {"ActiveState": "active", "SubState": "running"},
+            "probe": None,
+            "observer": {"kind": "test"},
+            "observed_at_unix": 201,
+        }
+
+        with patch.object(
+            tasks, "_reconcile_observation", return_value=observation
+        ), patch.object(
+            tasks, "_terminal_convergence_evidence", return_value=(False, False)
+        ):
+            page = tasks.reconcile_tasks_check(limit=1, cursor=row_stream_cursor)
+
+        next_cursor = page["pagination"]["next_cursor"]
+        self.assertIsNotNone(next_cursor)
+        next_scope = tasks.consumer_surface.decode_cursor_scope(next_cursor)
+        self.assertIsInstance(next_scope, str)
+        assert next_scope is not None
+        self.assertTrue(
+            next_scope.startswith(
+                tasks.TASK_RECONCILE_CHECK_CURSOR_CURRENT_SCOPE + ":"
+            )
+        )
+
+    def test_reconcile_check_revision_path_skips_full_store_hash(self) -> None:
+        self._start(resource_keys=["service:reconcile-revision-fast-a.service"])
+        self._start(resource_keys=["service:reconcile-revision-fast-b.service"])
+        observation = {
+            "state": "running",
+            "properties": {"ActiveState": "active", "SubState": "running"},
+            "probe": None,
+            "observer": {"kind": "test"},
+            "observed_at_unix": 201,
+        }
+
+        with patch.object(
+            tasks,
+            "_reconcile_check_store_snapshot",
+            side_effect=AssertionError("revision cursor path must not hash all rows"),
+        ), patch.object(
+            tasks,
+            "_reconcile_check_store_snapshots_for_legacy_cursor",
+            side_effect=AssertionError("current cursor path must not use legacy hashing"),
+        ), patch.object(
+            tasks, "_reconcile_observation", return_value=observation
+        ), patch.object(
+            tasks, "_terminal_convergence_evidence", return_value=(False, False)
+        ):
+            page = tasks.reconcile_tasks_check(limit=1)
+
+        next_cursor = page["pagination"]["next_cursor"]
+        self.assertIsNotNone(next_cursor)
+        scope = tasks.consumer_surface.decode_cursor_scope(next_cursor)
+        self.assertIsInstance(scope, str)
+        assert scope is not None
+        self.assertTrue(
+            scope.startswith(
+                tasks.TASK_RECONCILE_CHECK_CURSOR_CURRENT_SCOPE + ":"
+            )
+        )
+
+    def test_task_reconcile_revision_token_changes_only_for_candidate_rows(self) -> None:
+        started = self._start(
+            resource_keys=["service:reconcile-token-candidate.service"]
+        )
+        task_id = str(started["task"]["task_id"])
+        with sqlite3.connect(self.database) as connection:
+            before = connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (tasks.TASK_RECONCILE_REVISION_METADATA_KEY,),
+            ).fetchone()[0]
+            connection.execute(
+                "UPDATE tasks SET state='completed' WHERE task_id=?",
+                (task_id,),
+            )
+            after_candidate = connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (tasks.TASK_RECONCILE_REVISION_METADATA_KEY,),
+            ).fetchone()[0]
+            connection.execute(
+                "UPDATE tasks SET last_observation_json=? WHERE task_id=?",
+                ('{"noncandidate":true}', task_id),
+            )
+            after_noncandidate = connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (tasks.TASK_RECONCILE_REVISION_METADATA_KEY,),
+            ).fetchone()[0]
+            connection.commit()
+        self.assertRegex(before, r"\A[0-9a-f]{64}\Z")
+        self.assertRegex(after_candidate, r"\A[0-9a-f]{64}\Z")
+        self.assertNotEqual(before, after_candidate)
+        self.assertEqual(after_candidate, after_noncandidate)
+
+    def test_task_reconcile_revision_trigger_rejects_malformed_token(self) -> None:
+        started = self._start(
+            resource_keys=["service:reconcile-token-malformed.service"]
+        )
+        task_id = str(started["task"]["task_id"])
+        with sqlite3.connect(self.database) as connection:
+            before_observation = connection.execute(
+                "SELECT last_observation_json FROM tasks WHERE task_id=?",
+                (task_id,),
+            ).fetchone()[0]
+            connection.execute(
+                "UPDATE metadata SET value='broken' WHERE key=?",
+                (tasks.TASK_RECONCILE_REVISION_METADATA_KEY,),
+            )
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "task reconcile revision token is invalid",
+            ):
+                connection.execute(
+                    "UPDATE tasks SET last_observation_json=? WHERE task_id=?",
+                    ('{"should_not_commit":true}', task_id),
+                )
+            connection.rollback()
+        with sqlite3.connect(self.database) as connection:
+            after_observation = connection.execute(
+                "SELECT last_observation_json FROM tasks WHERE task_id=?",
+                (task_id,),
+            ).fetchone()[0]
+        self.assertEqual(before_observation, after_observation)
+
+    def test_reconcile_check_row_stream_cursor_survives_contract_promotion_window(
+        self,
+    ) -> None:
+        for suffix in ("a", "b", "c"):
+            self._start(
+                resource_keys=[f"service:reconcile-row-stream-promotion-{suffix}.service"]
+            )
+        cursor = self._row_stream_reconcile_cursor_after_first_candidate()
+        with sqlite3.connect(self.resource_database) as connection:
+            trigger_names = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='trigger' AND name LIKE 'resource_reconcile_%_v1'"
+                )
+            ]
+            for trigger_name in trigger_names:
+                connection.execute(f'DROP TRIGGER "{trigger_name}"')
+            connection.execute(
+                "DELETE FROM metadata WHERE key IN (?, ?)",
+                (
+                    resources.RESOURCE_RECONCILE_REVISION_CONTRACT_METADATA_KEY,
+                    resources.RESOURCE_RECONCILE_REVISION_METADATA_KEY,
+                ),
+            )
+            connection.commit()
+        observation = {
+            "state": "running",
+            "properties": {"ActiveState": "active", "SubState": "running"},
+            "probe": None,
+            "observer": {"kind": "test"},
+            "observed_at_unix": 201,
+        }
+        with patch.object(
+            tasks, "_reconcile_observation", return_value=observation
+        ), patch.object(
+            tasks, "_terminal_convergence_evidence", return_value=(False, False)
+        ):
+            page = tasks.reconcile_tasks_check(limit=1, cursor=cursor)
+        next_cursor = page["pagination"]["next_cursor"]
+        self.assertIsNotNone(next_cursor)
+        scope = tasks.consumer_surface.decode_cursor_scope(next_cursor)
+        self.assertIsInstance(scope, str)
+        assert scope is not None
+        self.assertTrue(
+            scope.startswith(
+                tasks.TASK_RECONCILE_CHECK_CURSOR_ROW_STREAM_SCOPE + ":"
+            )
+        )
+
+    def test_reconcile_check_revision_trigger_drift_fails_closed(self) -> None:
+        self._start(resource_keys=["service:reconcile-revision-drift-a.service"])
+        self._start(resource_keys=["service:reconcile-revision-drift-b.service"])
+        observation = {
+            "state": "running",
+            "properties": {"ActiveState": "active", "SubState": "running"},
+            "probe": None,
+            "observer": {"kind": "test"},
+            "observed_at_unix": 201,
+        }
+        with patch.object(
+            tasks, "_reconcile_observation", return_value=observation
+        ), patch.object(
+            tasks, "_terminal_convergence_evidence", return_value=(False, False)
+        ):
+            page = tasks.reconcile_tasks_check(limit=1)
+
+        with sqlite3.connect(self.database) as connection:
+            connection.execute("DROP TRIGGER task_reconcile_revision_update_v1")
+            connection.commit()
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "Task reconcile revision triggers are incomplete or drifted",
+        ):
+            tasks.reconcile_tasks_check(
+                limit=1,
+                cursor=page["pagination"]["next_cursor"],
+            )
 
     def test_reconcile_check_cursor_fails_closed_after_existing_row_change(
         self,
@@ -8187,6 +8422,80 @@ class TaskTests(unittest.TestCase):
                 f"{self.database.name}.schema-*.backup"
             )
         )
+
+    def test_schema_v5_missing_reconcile_revision_contract_is_backed_up_and_promoted(
+        self,
+    ) -> None:
+        with tasks._database():
+            pass
+        self.assertEqual([], self._task_migration_backups())
+
+        with sqlite3.connect(self.database) as connection:
+            trigger_names = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='trigger' AND name LIKE 'task_reconcile_revision_%_v1'"
+                )
+            ]
+            for trigger_name in trigger_names:
+                connection.execute(f'DROP TRIGGER "{trigger_name}"')
+            connection.execute(
+                "DELETE FROM metadata WHERE key IN (?, ?)",
+                (
+                    tasks.TASK_RECONCILE_REVISION_CONTRACT_METADATA_KEY,
+                    tasks.TASK_RECONCILE_REVISION_METADATA_KEY,
+                ),
+            )
+            connection.commit()
+
+        self.assertEqual(
+            "5:reconcile-revision-contract-missing",
+            tasks._preflight_task_store(),
+        )
+
+        with tasks._database():
+            pass
+
+        with sqlite3.connect(self.database) as connection:
+            metadata = dict(connection.execute("SELECT key, value FROM metadata"))
+            self.assertEqual(
+                tasks.TASK_RECONCILE_REVISION_CONTRACT_VERSION,
+                metadata[tasks.TASK_RECONCILE_REVISION_CONTRACT_METADATA_KEY],
+            )
+            revision_token = metadata[tasks.TASK_RECONCILE_REVISION_METADATA_KEY]
+            self.assertRegex(revision_token, r"\A[0-9a-f]{64}\Z")
+            observed_triggers = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='trigger' AND name LIKE 'task_reconcile_revision_%_v1'"
+                )
+            }
+        self.assertEqual(
+            set(tasks._task_reconcile_revision_trigger_sql()),
+            observed_triggers,
+        )
+
+        backups = self._task_migration_backups()
+        self.assertEqual(1, len(backups))
+        with sqlite3.connect(backups[0]) as backup:
+            backup_metadata = dict(backup.execute("SELECT key, value FROM metadata"))
+            self.assertNotIn(
+                tasks.TASK_RECONCILE_REVISION_CONTRACT_METADATA_KEY,
+                backup_metadata,
+            )
+            self.assertNotIn(
+                tasks.TASK_RECONCILE_REVISION_METADATA_KEY,
+                backup_metadata,
+            )
+            self.assertEqual(
+                [],
+                backup.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='trigger' AND name LIKE 'task_reconcile_revision_%_v1'"
+                ).fetchall(),
+            )
 
     def _create_task_schema_version(
         self,

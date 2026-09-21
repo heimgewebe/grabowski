@@ -303,6 +303,11 @@ RESOURCE_SUPPORTED_SCHEMA_VERSIONS = ("1", "2", "3")
 RESOURCE_LEASE_CONTRACT_METADATA_KEY = "resource_lease_contract_version"
 RESOURCE_LEASE_CONTRACT_CURRENT_VERSION = "1"
 RESOURCE_LEASE_CONTRACT_SUPPORTED_VERSIONS = ("1",)
+RESOURCE_RECONCILE_REVISION_CONTRACT_METADATA_KEY = (
+    "resource_reconcile_snapshot_revision_contract_v1"
+)
+RESOURCE_RECONCILE_REVISION_METADATA_KEY = "resource_reconcile_snapshot_revision_v1"
+RESOURCE_RECONCILE_REVISION_CONTRACT_VERSION = "1"
 RESOURCE_SCHEMA_MIGRATION_PATHS = {
     "1": ("1", RESOURCE_CURRENT_SCHEMA_VERSION),
     "2": ("2", RESOURCE_CURRENT_SCHEMA_VERSION),
@@ -449,6 +454,205 @@ def _publish_resource_lease_contract(connection: sqlite3.Connection) -> None:
             "Resource lease contract changed while opening; use a compatible runtime"
         )
 
+
+def _normalize_reconcile_contract_sql(value: str) -> str:
+    return " ".join(value.split())
+
+
+def _resource_reconcile_revision_trigger_sql() -> dict[str, str]:
+    bump = (
+        "SELECT CASE WHEN (SELECT COUNT(*) FROM metadata "
+        f"WHERE key='{RESOURCE_RECONCILE_REVISION_METADATA_KEY}' "
+        "AND length(value)=64 "
+        "AND value NOT GLOB '*[^0-9a-f]*')=1 "
+        "THEN 1 ELSE RAISE(ABORT, 'resource reconcile revision token is invalid') END; "
+        "UPDATE metadata SET value=lower(hex(randomblob(32))) "
+        f"WHERE key='{RESOURCE_RECONCILE_REVISION_METADATA_KEY}';"
+    )
+    return {
+        "resource_reconcile_leases_insert_v1": (
+            "CREATE TRIGGER resource_reconcile_leases_insert_v1 "
+            "AFTER INSERT ON leases "
+            "WHEN NEW.owner_id LIKE 'task:%' "
+            f"BEGIN {bump} END"
+        ),
+        "resource_reconcile_leases_update_v1": (
+            "CREATE TRIGGER resource_reconcile_leases_update_v1 "
+            "AFTER UPDATE ON leases "
+            "WHEN OLD.owner_id LIKE 'task:%' OR NEW.owner_id LIKE 'task:%' "
+            f"BEGIN {bump} END"
+        ),
+        "resource_reconcile_leases_delete_v1": (
+            "CREATE TRIGGER resource_reconcile_leases_delete_v1 "
+            "AFTER DELETE ON leases "
+            "WHEN OLD.owner_id LIKE 'task:%' "
+            f"BEGIN {bump} END"
+        ),
+        "resource_reconcile_terminalizations_insert_v1": (
+            "CREATE TRIGGER resource_reconcile_terminalizations_insert_v1 "
+            "AFTER INSERT ON task_terminalizations "
+            f"BEGIN {bump} END"
+        ),
+        "resource_reconcile_terminalizations_update_v1": (
+            "CREATE TRIGGER resource_reconcile_terminalizations_update_v1 "
+            "AFTER UPDATE ON task_terminalizations "
+            f"BEGIN {bump} END"
+        ),
+        "resource_reconcile_terminalizations_delete_v1": (
+            "CREATE TRIGGER resource_reconcile_terminalizations_delete_v1 "
+            "AFTER DELETE ON task_terminalizations "
+            f"BEGIN {bump} END"
+        ),
+        "resource_reconcile_adoptions_insert_v1": (
+            "CREATE TRIGGER resource_reconcile_adoptions_insert_v1 "
+            "AFTER INSERT ON task_authority_adoptions "
+            f"BEGIN {bump} END"
+        ),
+        "resource_reconcile_adoptions_update_v1": (
+            "CREATE TRIGGER resource_reconcile_adoptions_update_v1 "
+            "AFTER UPDATE ON task_authority_adoptions "
+            f"BEGIN {bump} END"
+        ),
+        "resource_reconcile_adoptions_delete_v1": (
+            "CREATE TRIGGER resource_reconcile_adoptions_delete_v1 "
+            "AFTER DELETE ON task_authority_adoptions "
+            f"BEGIN {bump} END"
+        ),
+    }
+
+
+def _resource_reconcile_revision_contract(
+    connection: sqlite3.Connection,
+    *,
+    required: bool = True,
+) -> dict[str, Any] | None:
+    contract_rows = connection.execute(
+        "SELECT value FROM metadata WHERE key=?",
+        (RESOURCE_RECONCILE_REVISION_CONTRACT_METADATA_KEY,),
+    ).fetchall()
+    revision_rows = connection.execute(
+        "SELECT value FROM metadata WHERE key=?",
+        (RESOURCE_RECONCILE_REVISION_METADATA_KEY,),
+    ).fetchall()
+    expected_triggers = _resource_reconcile_revision_trigger_sql()
+    placeholders = ",".join("?" for _ in expected_triggers)
+    trigger_rows = connection.execute(
+        "SELECT name, tbl_name, sql FROM sqlite_master "
+        f"WHERE type='trigger' AND name IN ({placeholders})",
+        tuple(expected_triggers),
+    ).fetchall()
+    if not contract_rows and not revision_rows and not trigger_rows:
+        if required:
+            raise RuntimeError(
+                "Resource reconcile revision contract is missing; open the store "
+                "with a compatible Grabowski writer before retrying"
+            )
+        return None
+    if len(contract_rows) != 1 or len(revision_rows) != 1:
+        raise RuntimeError(
+            "Resource reconcile revision metadata is incomplete or ambiguous"
+        )
+    contract_version = str(contract_rows[0][0])
+    if contract_version != RESOURCE_RECONCILE_REVISION_CONTRACT_VERSION:
+        raise RuntimeError(
+            "Unsupported resource reconcile revision contract version; "
+            "use a compatible runtime"
+        )
+    revision_text = str(revision_rows[0][0])
+    if (
+        len(revision_text) != 64
+        or revision_text != revision_text.lower()
+        or any(char not in "0123456789abcdef" for char in revision_text)
+    ):
+        raise RuntimeError("Resource reconcile revision token is malformed")
+    observed: dict[str, tuple[str, str]] = {}
+    for row in trigger_rows:
+        sql = row[2]
+        if not isinstance(sql, str):
+            raise RuntimeError("Resource reconcile revision trigger SQL is missing")
+        observed[str(row[0])] = (
+            str(row[1]),
+            _normalize_reconcile_contract_sql(sql),
+        )
+    expected_tables = {
+        "resource_reconcile_leases_insert_v1": "leases",
+        "resource_reconcile_leases_update_v1": "leases",
+        "resource_reconcile_leases_delete_v1": "leases",
+        "resource_reconcile_terminalizations_insert_v1": "task_terminalizations",
+        "resource_reconcile_terminalizations_update_v1": "task_terminalizations",
+        "resource_reconcile_terminalizations_delete_v1": "task_terminalizations",
+        "resource_reconcile_adoptions_insert_v1": "task_authority_adoptions",
+        "resource_reconcile_adoptions_update_v1": "task_authority_adoptions",
+        "resource_reconcile_adoptions_delete_v1": "task_authority_adoptions",
+    }
+    expected = {
+        name: (
+            expected_tables[name],
+            _normalize_reconcile_contract_sql(sql),
+        )
+        for name, sql in expected_triggers.items()
+    }
+    if observed != expected:
+        raise RuntimeError(
+            "Resource reconcile revision triggers are incomplete or drifted"
+        )
+    return {
+        "contract_version": contract_version,
+        "revision": revision_text,
+    }
+
+
+def _publish_resource_reconcile_revision_contract(
+    connection: sqlite3.Connection,
+) -> dict[str, Any]:
+    existing = _resource_reconcile_revision_contract(connection, required=False)
+    if existing is not None:
+        return existing
+    connection.execute(
+        "INSERT INTO metadata(key, value) VALUES(?, ?)",
+        (
+            RESOURCE_RECONCILE_REVISION_CONTRACT_METADATA_KEY,
+            RESOURCE_RECONCILE_REVISION_CONTRACT_VERSION,
+        ),
+    )
+    connection.execute(
+        "INSERT INTO metadata(key, value) VALUES(?, lower(hex(randomblob(32))))",
+        (RESOURCE_RECONCILE_REVISION_METADATA_KEY,),
+    )
+    for sql in _resource_reconcile_revision_trigger_sql().values():
+        connection.execute(sql)
+    published = _resource_reconcile_revision_contract(connection)
+    assert published is not None
+    return published
+
+
+def _reconcile_revision_snapshot() -> dict[str, Any] | None:
+    if not _resource_store_file_ready():
+        return {
+            "present": False,
+            "schema_version": None,
+            "contract_version": None,
+            "revision": None,
+        }
+    with _resource_readonly_sqlite(RESOURCE_DB) as connection:
+        version = _resource_schema_version(connection)
+        if version != RESOURCE_CURRENT_SCHEMA_VERSION:
+            return None
+        _validate_resource_schema_current(
+            connection,
+            require_lease_contract=False,
+        )
+        contract = _resource_reconcile_revision_contract(
+            connection,
+            required=False,
+        )
+        if contract is None:
+            return None
+        return {
+            "present": True,
+            "schema_version": version,
+            **contract,
+        }
 
 def _validate_resource_schema_legacy(connection: sqlite3.Connection) -> None:
     if _resource_database_tables(connection) != {"metadata", "leases"}:
@@ -795,6 +999,15 @@ def _preflight_resource_store() -> str | None:
             )
         if version == RESOURCE_CURRENT_SCHEMA_VERSION and lease_contract is None:
             return f"{version}:lease-contract-missing"
+        if (
+            version == RESOURCE_CURRENT_SCHEMA_VERSION
+            and _resource_reconcile_revision_contract(
+                connection,
+                required=False,
+            )
+            is None
+        ):
+            return f"{version}:reconcile-revision-contract-missing"
         return version
 
 
@@ -920,6 +1133,7 @@ def _open_current_resource_database() -> sqlite3.Connection:
                 "Resource database schema changed while opening; retry with a compatible runtime"
             )
         _validate_resource_schema_current(connection)
+        _resource_reconcile_revision_contract(connection)
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=FULL")
         connection.execute("PRAGMA foreign_keys=ON")
@@ -982,18 +1196,25 @@ def _database() -> sqlite3.Connection:
                 _validate_resource_schema_current(
                     connection, require_lease_contract=False
                 )
-                if _resource_lease_contract_version(
+                lease_contract = _resource_lease_contract_version(
                     connection, required=False
-                ) is None:
+                )
+                reconcile_contract = _resource_reconcile_revision_contract(
+                    connection, required=False
+                )
+                if lease_contract is None or reconcile_contract is None:
                     _resource_sqlite_integrity(connection, "Resource database")
                     fingerprint = _resource_sqlite_fingerprint(connection)
                     _verified_resource_migration_backup(version, fingerprint)
+                if lease_contract is None:
                     _publish_resource_lease_contract(connection)
                 else:
                     _validate_resource_lease_contract(connection)
+            _publish_resource_reconcile_revision_contract(connection)
             if _resource_schema_version(connection) != "3":
                 raise RuntimeError("Resource database migration did not reach schema 3")
             _validate_resource_schema_current(connection)
+            _resource_reconcile_revision_contract(connection)
             _resource_sqlite_integrity(connection, "Migrated resource database")
             connection.commit()
             connection.execute("PRAGMA journal_mode=WAL")
