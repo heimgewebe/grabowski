@@ -6737,6 +6737,7 @@ def _run_post_merge_sync_apply(
         "dirty_checkout",
         "local_head_mismatch",
         "upstream_mismatch",
+        "local_preimage_commit_unreadable",
         "preimage_drift_after_lease",
         "lease_preimage_drift",
     }
@@ -6774,21 +6775,31 @@ def _run_post_merge_sync_apply(
         remote_status,
         str(output.get("remote_head") or expected_remote_head),
     )
+    fast_forward_status = (
+        "fail"
+        if state == "non_fast_forward"
+        else (
+            "pass"
+            if output.get("fast_forward_verified") is True
+            else "skip"
+        )
+    )
     _check(
         receipt,
         "fast-forward-only",
-        "fail" if state == "non_fast_forward" else "pass",
+        fast_forward_status,
         state,
     )
-    serialized = bool(output.get("resource_keys")) and state not in {
-        "lease_acquisition_blocked",
-        "lease_snapshot_invalid",
-        "lease_preimage_drift",
-    }
+    serialization_attempted = bool(output.get("resource_keys"))
+    serialization_status = (
+        "pass"
+        if output.get("serialization_verified") is True
+        else ("fail" if serialization_attempted else "skip")
+    )
     _check(
         receipt,
         "worktree-common-dir-branch-serialized",
-        "pass" if serialized else ("skip" if state == "already_synced" else "fail"),
+        serialization_status,
         state,
     )
     branch_cas = output.get("branch_cas_started") is True

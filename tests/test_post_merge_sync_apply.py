@@ -409,6 +409,8 @@ class PostMergeSyncApplyTests(unittest.TestCase):
 
             self.assertEqual("passed", result["receipt_status"])
             self.assertEqual("synced", result["state"])
+            self.assertTrue(result["serialization_verified"])
+            self.assertTrue(result["fast_forward_verified"])
             self.assertEqual(target, git_stdout(repo, "rev-parse", "HEAD"))
             self.assertEqual("main", git_stdout(repo, "branch", "--show-current"))
             self.assertEqual("", git_stdout(repo, "status", "--porcelain"))
@@ -504,6 +506,8 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             self.assertTrue(result["effect_started"])
             self.assertFalse(result["worktree_effect_started"])
             self.assertFalse(result["branch_cas_started"])
+            self.assertTrue(result["serialization_verified"])
+            self.assertFalse(result["fast_forward_verified"])
             self.assertEqual(1, leases.acquire_calls)
             self.assertEqual(1, leases.release_calls)
             self.assertEqual(local, git_stdout(repo, "rev-parse", "HEAD"))
@@ -739,6 +743,113 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             )
             self.assertEqual(1, leases.release_calls)
             self.assertEqual(3, len(leases.live))
+            self.assertEqual(base, git_stdout(repo, "rev-parse", "HEAD"))
+            self.assertEqual("", git_stdout(repo, "status", "--porcelain"))
+
+    def test_post_lease_inspect_exception_with_release_failure_is_fail_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            leases = LeaseHarness()
+
+            def failing_inspect(
+                _keys: list[str],
+            ) -> dict[str, dict[str, object]]:
+                raise RuntimeError("lease inspection unavailable")
+
+            def failing_release(
+                owner_id: str,
+                resource_keys: list[str],
+                *,
+                expected_leases: list[dict[str, object]] | None = None,
+                force: bool = False,
+            ) -> dict[str, object]:
+                del owner_id, resource_keys, expected_leases, force
+                leases.release_calls += 1
+                raise RuntimeError("cleanup state unknown")
+
+            with (
+                patch.object(sync_apply.resources, "acquire_resources", leases.acquire),
+                patch.object(sync_apply.resources, "inspect_resources", failing_inspect),
+                patch.object(sync_apply.resources, "release_resources", failing_release),
+            ):
+                result = self.apply(repo, remote, base, target)
+
+            self.assertEqual("failed", result["receipt_status"])
+            self.assertEqual("outcome_unknown", result["state"])
+            self.assertFalse(result["effect_started"])
+            self.assertFalse(result["serialization_verified"])
+            self.assertFalse(result["fast_forward_verified"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertTrue(result["readback_required"])
+            self.assertTrue(result["lease_cleanup_required"])
+            self.assertEqual("failed", result["lease_release"]["status"])
+            self.assertEqual("RuntimeError", result["error_class"])
+            self.assertEqual(1, leases.release_calls)
+            self.assertIn(
+                "authoritative local and remote readback",
+                result["next_action"],
+            )
+            self.assertIn("inspect and clean", result["next_action"])
+            self.assertEqual(base, git_stdout(repo, "rev-parse", "HEAD"))
+            self.assertEqual("", git_stdout(repo, "status", "--porcelain"))
+
+    def test_post_lease_snapshot_exception_with_release_failure_is_fail_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            leases = LeaseHarness()
+            real_snapshot = sync_apply._snapshot
+            snapshot_calls = 0
+
+            def failing_locked_snapshot(*args: object, **kwargs: object) -> dict[str, object]:
+                nonlocal snapshot_calls
+                snapshot_calls += 1
+                if snapshot_calls >= 2:
+                    raise sync_apply.PostMergeSyncApplyError(
+                        "locked checkout readback unavailable"
+                    )
+                return real_snapshot(*args, **kwargs)
+
+            def failing_release(
+                owner_id: str,
+                resource_keys: list[str],
+                *,
+                expected_leases: list[dict[str, object]] | None = None,
+                force: bool = False,
+            ) -> dict[str, object]:
+                del owner_id, resource_keys, expected_leases, force
+                leases.release_calls += 1
+                raise RuntimeError("cleanup state unknown")
+
+            with (
+                patch.object(sync_apply.resources, "acquire_resources", leases.acquire),
+                patch.object(sync_apply.resources, "inspect_resources", leases.inspect),
+                patch.object(sync_apply.resources, "release_resources", failing_release),
+                patch.object(sync_apply, "_snapshot", failing_locked_snapshot),
+            ):
+                result = self.apply(repo, remote, base, target)
+
+            self.assertEqual("failed", result["receipt_status"])
+            self.assertEqual("outcome_unknown", result["state"])
+            self.assertFalse(result["effect_started"])
+            self.assertTrue(result["serialization_verified"])
+            self.assertFalse(result["fast_forward_verified"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertTrue(result["readback_required"])
+            self.assertTrue(result["lease_cleanup_required"])
+            self.assertEqual(
+                "PostMergeSyncApplyError",
+                result["readback"]["readback_error_type"],
+            )
+            self.assertEqual(1, leases.release_calls)
+            self.assertIn(
+                "authoritative local and remote readback",
+                result["next_action"],
+            )
+            self.assertIn("inspect and clean", result["next_action"])
             self.assertEqual(base, git_stdout(repo, "rev-parse", "HEAD"))
             self.assertEqual("", git_stdout(repo, "status", "--porcelain"))
 

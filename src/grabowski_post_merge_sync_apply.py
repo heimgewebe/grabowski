@@ -422,6 +422,8 @@ def apply(
     effect_started = False
     worktree_effect_started = False
     branch_cas_started = False
+    serialization_verified = False
+    fast_forward_verified = False
     release_error: Exception | None = None
     try:
         live = resources.inspect_resources(resource_keys)
@@ -438,9 +440,11 @@ def apply(
                 before=initial,
                 preimage_sha256=preimage_sha256,
                 resource_keys=resource_keys,
+                serialization_verified=False,
             )
 
         if output is None:
+            serialization_verified = True
             locked = _snapshot(
                 repo,
                 runner,
@@ -455,6 +459,7 @@ def apply(
                     locked=locked,
                     preimage_sha256=preimage_sha256,
                     resource_keys=resource_keys,
+                    serialization_verified=serialization_verified,
                 )
 
         if output is None:
@@ -466,6 +471,7 @@ def apply(
                     before=initial,
                     preimage_sha256=preimage_sha256,
                     resource_keys=resource_keys,
+                    serialization_verified=serialization_verified,
                     error_class=type(exc).__name__,
                 )
             else:
@@ -475,6 +481,7 @@ def apply(
                         before=initial,
                         preimage_sha256=preimage_sha256,
                         resource_keys=resource_keys,
+                        serialization_verified=serialization_verified,
                         actual_remote_head=remote_locked,
                     )
 
@@ -529,6 +536,7 @@ def apply(
                     raise PostMergeSyncNonFastForward(
                         "materialized remote head is not a fast-forward of the local head"
                     )
+                fast_forward_verified = True
 
                 tracking_ref = f"refs/remotes/{remote}/{target_branch}"
                 tracking_before = _ref_head(
@@ -681,6 +689,8 @@ def apply(
                     "effect_started": True,
                     "worktree_effect_started": True,
                     "branch_cas_started": True,
+                    "serialization_verified": serialization_verified,
+                    "fast_forward_verified": fast_forward_verified,
                     "retry_authorized": False,
                     "preimage_sha256": preimage_sha256,
                     "resource_keys": resource_keys,
@@ -777,6 +787,8 @@ def apply(
                     "effect_started": effect_started,
                     "worktree_effect_started": worktree_effect_started,
                     "branch_cas_started": branch_cas_started,
+                    "serialization_verified": serialization_verified,
+                    "fast_forward_verified": fast_forward_verified,
                     "retry_authorized": False,
                     "preimage_sha256": preimage_sha256,
                     "resource_keys": resource_keys,
@@ -802,6 +814,38 @@ def apply(
                         else "form a fresh apply intent from current authoritative state"
                     ),
                 }
+    except Exception as exc:
+        try:
+            readback = _snapshot(
+                repo,
+                runner,
+                target_branch=target_branch,
+                remote=remote,
+                sha_length=sha_length,
+            )
+        except Exception as read_exc:
+            readback = {"readback_error_type": type(read_exc).__name__}
+        output = {
+            "receipt_status": "failed",
+            "state": "outcome_unknown",
+            "effect_started": effect_started,
+            "worktree_effect_started": worktree_effect_started,
+            "branch_cas_started": branch_cas_started,
+            "serialization_verified": serialization_verified,
+            "fast_forward_verified": fast_forward_verified,
+            "retry_authorized": False,
+            "readback_required": True,
+            "preimage_sha256": preimage_sha256,
+            "resource_keys": resource_keys,
+            "error_class": type(exc).__name__,
+            "error": str(exc),
+            "readback": readback,
+            "local_post_state_verified": False,
+            "post_state_verified": False,
+            "next_action": (
+                "authoritative local and remote readback before any new intent"
+            ),
+        }
     finally:
         try:
             released = resources.release_resources(
@@ -825,6 +869,8 @@ def apply(
             "effect_started": effect_started,
             "worktree_effect_started": worktree_effect_started,
             "branch_cas_started": branch_cas_started,
+            "serialization_verified": serialization_verified,
+            "fast_forward_verified": fast_forward_verified,
             "retry_authorized": False,
             "readback_required": True,
             "preimage_sha256": preimage_sha256,
