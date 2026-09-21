@@ -60,6 +60,10 @@ DEFAULT_TASK_RECONCILE_CHECK_LIMIT = 50
 TASK_RECONCILE_CHECK_LIMIT = 200
 TASK_RECONCILE_CHECK_MAX_BYTES = 1024 * 1024
 TASK_RECONCILE_CHECK_CURSOR_SCOPE = "task-reconcile-check-v1"
+TASK_RECONCILE_CHECK_CURSOR_ALGORITHM = "sqlite-row-stream-v1"
+TASK_RECONCILE_CHECK_CURSOR_CURRENT_SCOPE = (
+    f"{TASK_RECONCILE_CHECK_CURSOR_SCOPE}:{TASK_RECONCILE_CHECK_CURSOR_ALGORITHM}"
+)
 TASK_RECONCILE_CURSOR_METADATA_KEY = "task_reconcile_refresh_cursor_v1"
 TASK_RECONCILE_CYCLE_VERSION = 2
 TASK_RECONCILE_CYCLE_PHASE = "scan_to_high_water"
@@ -10329,19 +10333,94 @@ def _reconcile_candidate_states() -> tuple[str, ...]:
     )
 
 
+def _update_sqlite_revision_digest(
+    digest: Any,
+    value: Any,
+) -> None:
+    if value is None:
+        tag = b"N"
+        payload = b""
+    elif isinstance(value, int):
+        tag = b"I"
+        payload = str(value).encode("ascii")
+    elif isinstance(value, float):
+        tag = b"F"
+        payload = value.hex().encode("ascii")
+    elif isinstance(value, str):
+        tag = b"T"
+        payload = value.encode("utf-8")
+    elif isinstance(value, bytes):
+        tag = b"B"
+        payload = value
+    else:
+        raise RuntimeError(
+            f"Unsupported SQLite revision value type: {type(value).__name__}"
+        )
+    digest.update(tag)
+    digest.update(len(payload).to_bytes(8, "big"))
+    digest.update(payload)
+
+
 def _sqlite_rows_revision(
     connection: sqlite3.Connection,
     query: str,
     parameters: tuple[Any, ...] = (),
 ) -> dict[str, Any]:
     digest = hashlib.sha256()
+    cursor = connection.execute(query, parameters)
+    description = cursor.description or ()
+    digest.update(TASK_RECONCILE_CHECK_CURSOR_ALGORITHM.encode("ascii"))
+    digest.update(len(description).to_bytes(4, "big"))
+    for column in description:
+        _update_sqlite_revision_digest(digest, str(column[0]))
     count = 0
-    for row in connection.execute(query, parameters):
-        encoded = _canonical_json(dict(row)).encode("utf-8")
-        digest.update(len(encoded).to_bytes(8, "big"))
-        digest.update(encoded)
+    for row in cursor:
+        digest.update(b"R")
+        digest.update(len(row).to_bytes(4, "big"))
+        for value in row:
+            _update_sqlite_revision_digest(digest, value)
         count += 1
-    return {"row_count": count, "rows_sha256": digest.hexdigest()}
+    return {
+        "algorithm": TASK_RECONCILE_CHECK_CURSOR_ALGORITHM,
+        "row_count": count,
+        "rows_sha256": digest.hexdigest(),
+    }
+
+
+def _sqlite_rows_revisions_for_legacy_cursor(
+    connection: sqlite3.Connection,
+    query: str,
+    parameters: tuple[Any, ...] = (),
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    current_digest = hashlib.sha256()
+    legacy_digest = hashlib.sha256()
+    cursor = connection.execute(query, parameters)
+    description = cursor.description or ()
+    current_digest.update(TASK_RECONCILE_CHECK_CURSOR_ALGORITHM.encode("ascii"))
+    current_digest.update(len(description).to_bytes(4, "big"))
+    for column in description:
+        _update_sqlite_revision_digest(current_digest, str(column[0]))
+    count = 0
+    for row in cursor:
+        current_digest.update(b"R")
+        current_digest.update(len(row).to_bytes(4, "big"))
+        for value in row:
+            _update_sqlite_revision_digest(current_digest, value)
+        legacy_encoded = _canonical_json(dict(row)).encode("utf-8")
+        legacy_digest.update(len(legacy_encoded).to_bytes(8, "big"))
+        legacy_digest.update(legacy_encoded)
+        count += 1
+    return (
+        {
+            "algorithm": TASK_RECONCILE_CHECK_CURSOR_ALGORITHM,
+            "row_count": count,
+            "rows_sha256": current_digest.hexdigest(),
+        },
+        {
+            "row_count": count,
+            "rows_sha256": legacy_digest.hexdigest(),
+        },
+    )
 
 
 def _reconcile_resource_store_revision() -> dict[str, Any]:
@@ -10382,6 +10461,59 @@ def _reconcile_resource_store_revision() -> dict[str, Any]:
     }
 
 
+def _reconcile_resource_store_revisions_for_legacy_cursor(
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    version = resources._preflight_resource_store()
+    if version is None:
+        current = {"present": False, "schema_version": None, "tables": {}}
+        legacy = {"present": False, "schema_version": None, "tables": {}}
+        return current, legacy
+    with resources._resource_readonly_sqlite(resources.RESOURCE_DB) as connection:
+        connection.execute("BEGIN")
+        table_names = {
+            str(row["name"])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        current_tables: dict[str, Any] = {}
+        legacy_tables: dict[str, Any] = {}
+        table_queries = {
+            "leases": (
+                "SELECT * FROM leases WHERE owner_id LIKE 'task:%' "
+                "ORDER BY resource_key"
+            ),
+            "task_terminalizations": (
+                "SELECT * FROM task_terminalizations ORDER BY task_id"
+            ),
+            "task_authority_adoptions": (
+                "SELECT * FROM task_authority_adoptions ORDER BY task_id"
+            ),
+        }
+        for table, query in table_queries.items():
+            if table not in table_names:
+                current_tables[table] = {"absent": True}
+                legacy_tables[table] = {"absent": True}
+                continue
+            current_revision, legacy_revision = (
+                _sqlite_rows_revisions_for_legacy_cursor(connection, query)
+            )
+            current_tables[table] = current_revision
+            legacy_tables[table] = legacy_revision
+    return (
+        {
+            "present": True,
+            "schema_version": version,
+            "tables": current_tables,
+        },
+        {
+            "present": True,
+            "schema_version": version,
+            "tables": legacy_tables,
+        },
+    )
+
+
 def _reconcile_check_store_snapshot(
     task_connection: sqlite3.Connection | None = None,
 ) -> dict[str, Any]:
@@ -10401,6 +10533,55 @@ def _reconcile_check_store_snapshot(
         "resource_store": _reconcile_resource_store_revision(),
     }
     return {**material, "snapshot_sha256": _sha256_json(material)}
+
+
+def _reconcile_check_store_snapshots_for_legacy_cursor(
+    task_connection: sqlite3.Connection,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    candidate_states = _reconcile_candidate_states()
+    placeholders = ",".join("?" for _ in candidate_states)
+    current_task_store, legacy_task_store = _sqlite_rows_revisions_for_legacy_cursor(
+        task_connection,
+        f"SELECT * FROM tasks WHERE state IN ({placeholders}) "
+        "ORDER BY task_id",
+        candidate_states,
+    )
+    current_resource_store, legacy_resource_store = (
+        _reconcile_resource_store_revisions_for_legacy_cursor()
+    )
+    current_material = {
+        "schema_version": 1,
+        "task_store": current_task_store,
+        "resource_store": current_resource_store,
+    }
+    legacy_material = {
+        "schema_version": 1,
+        "task_store": legacy_task_store,
+        "resource_store": legacy_resource_store,
+    }
+    return (
+        {
+            **current_material,
+            "snapshot_sha256": _sha256_json(current_material),
+        },
+        {
+            **legacy_material,
+            "snapshot_sha256": _sha256_json(legacy_material),
+        },
+    )
+
+
+def _is_legacy_reconcile_check_cursor_scope(scope: str | None) -> bool:
+    if not isinstance(scope, str):
+        return False
+    prefix = TASK_RECONCILE_CHECK_CURSOR_SCOPE + ":"
+    if not scope.startswith(prefix):
+        return False
+    snapshot_sha256 = scope[len(prefix) :]
+    return (
+        len(snapshot_sha256) == 64
+        and all(char in "0123456789abcdef" for char in snapshot_sha256)
+    )
 
 
 def _validate_reconcile_check_limit(limit: int) -> int:
@@ -10426,20 +10607,42 @@ def _reconcile_check_candidate_page(
     placeholders = ",".join("?" for _ in candidate_states)
     with _task_read_snapshot() as connection:
         connection.execute("SELECT 1 FROM tasks LIMIT 1").fetchone()
+        cursor_scope = consumer_surface.decode_cursor_scope(cursor)
+        legacy_cursor = _is_legacy_reconcile_check_cursor_scope(cursor_scope)
         snapshot_started_ns = time.perf_counter_ns()
-        snapshot = _reconcile_check_store_snapshot(connection)
+        legacy_snapshot: dict[str, Any] | None = None
+        if legacy_cursor:
+            snapshot, legacy_snapshot = (
+                _reconcile_check_store_snapshots_for_legacy_cursor(connection)
+            )
+        else:
+            snapshot = _reconcile_check_store_snapshot(connection)
         snapshot_ms = round(
             (time.perf_counter_ns() - snapshot_started_ns) / 1_000_000,
             3,
         )
         query_started_ns = time.perf_counter_ns()
         snapshot_scope = TASK_RECONCILE_CHECK_CURSOR_SCOPE
-        scope = f"{snapshot_scope}:{snapshot['snapshot_sha256']}"
-        position = consumer_surface.decode_cursor(
-            cursor,
-            scope,
-            snapshot_scope=snapshot_scope,
+        scope = (
+            f"{TASK_RECONCILE_CHECK_CURSOR_CURRENT_SCOPE}:"
+            f"{snapshot['snapshot_sha256']}"
         )
+        if legacy_cursor:
+            assert legacy_snapshot is not None
+            legacy_scope = (
+                f"{snapshot_scope}:{legacy_snapshot['snapshot_sha256']}"
+            )
+            position = consumer_surface.decode_cursor(
+                cursor,
+                legacy_scope,
+                snapshot_scope=snapshot_scope,
+            )
+        else:
+            position = consumer_surface.decode_cursor(
+                cursor,
+                scope,
+                snapshot_scope=snapshot_scope,
+            )
         cursor_created_at: int | None = None
         cursor_task_id: str | None = None
         if position is not None:
