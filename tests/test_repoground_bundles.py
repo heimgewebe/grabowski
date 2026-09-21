@@ -3016,6 +3016,59 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
         self.assertIn("patch_correctness", first["does_not_establish"])
         self.assertIn("merge_readiness", first["does_not_establish"])
 
+    def test_context_compose_prioritizes_diff_local_symbols_and_changed_tests(self) -> None:
+        base, target = self._composer_fixture()
+        impact = self._composer_impact()
+        impact["target_symbols"] = [
+            {
+                "id": "generic-symbol",
+                "kind": "function",
+                "name": "generic",
+                "qualified_name": "generic",
+                "path": "src/app.py",
+                "start_line": 99,
+                "end_line": 100,
+                "range_ref": "file:src/app.py#L99-L100",
+            }
+        ]
+        impact["related_tests"] = [
+            {"path": "tests/test_other.py", "evidence_type": "graph_edge"}
+        ]
+        with (
+            patch.object(
+                mcp,
+                "repoground_context_pack",
+                return_value=self._composer_context_pack(),
+            ),
+            patch.object(
+                mcp, "_repoground_agent_impact_context", return_value=impact
+            ),
+        ):
+            result = mcp.repoground_context_compose(
+                "demo-repo", base, target, context_budget_bytes=10_000
+            )
+
+        symbol = result["context"]["target_symbols"][0]
+        self.assertEqual(symbol["qualified_name"], "run")
+        self.assertEqual(symbol["path"], "src/app.py")
+        self.assertEqual(symbol["evidence_type"], "git_diff_target_overlap")
+        self.assertEqual(symbol["authority"], "target_git_tree_ast")
+        self.assertEqual(
+            result["context"]["related_tests"][0],
+            {
+                "path": "tests/test_app.py",
+                "evidence_type": "changed_test_path",
+                "change_status": "A",
+            },
+        )
+        locality = result["diff_locality"]
+        self.assertEqual(locality["status"], "available")
+        self.assertEqual(locality["target_symbol_count"], 1)
+        self.assertEqual(locality["changed_test_path_count"], 1)
+        self.assertIn("diff_locality", result["retrieval_lanes"]["used"])
+        self.assertNotIn("symbol_navigation", result["retrieval_lanes"]["used"])
+        self.assertIn("symbol_navigation", result["retrieval_lanes"]["skipped"])
+
     def test_context_compose_does_not_claim_call_graph_lane_for_architecture_relations(self) -> None:
         base, target = self._composer_fixture()
         impact = self._composer_impact()
@@ -3301,7 +3354,7 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
         self.assertGreater(len(result["context"]["related_tests"]), 0)
         self.assertGreater(len(result["context"]["gate_evidence"]), 0)
         self.assertEqual(
-            result["context_budget"]["lane_counts"]["target_symbols"]["available"], 40
+            result["context_budget"]["lane_counts"]["target_symbols"]["available"], 41
         )
         self.assertEqual(
             result["context_budget"]["lane_counts"]["target_symbols"]["considered"], 8

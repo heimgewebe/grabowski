@@ -8313,7 +8313,9 @@ def _repoground_registry_row_status(row: list[str]) -> dict[str, Any]:
     return status
 
 
-def _repoground_git(repo_path: Path, args: list[str]) -> tuple[int, str, str]:
+def _repoground_git(
+    repo_path: Path, args: list[str], *, preserve_stdout: bool = False
+) -> tuple[int, str, str]:
     completed = subprocess.run(
         ["git", "-C", str(repo_path), *args],
         check=False,
@@ -8327,7 +8329,8 @@ def _repoground_git(repo_path: Path, args: list[str]) -> tuple[int, str, str]:
             "PYTHONDONTWRITEBYTECODE": "1",
         },
     )
-    return completed.returncode, completed.stdout.strip(), completed.stderr.strip()
+    stdout = completed.stdout if preserve_stdout else completed.stdout.strip()
+    return completed.returncode, stdout, completed.stderr.strip()
 
 
 @mcp.tool(name="repoground_bundle_discover", annotations=READ_ANNOTATIONS)
@@ -11482,6 +11485,254 @@ def _repoground_revision_changes(
     return changes, hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
+_REPOGROUND_DIFF_HUNK_RE = re.compile(
+    r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@"
+)
+_REPOGROUND_DIFF_LOCALITY_MAX_PYTHON_PATHS = 32
+_REPOGROUND_DIFF_LOCALITY_MAX_SYMBOLS = 32
+
+
+def _repoground_path_looks_like_test(path: str) -> bool:
+    parts = [part.casefold() for part in path.split("/") if part]
+    if not parts:
+        return False
+    name = parts[-1]
+    return (
+        any(part in {"test", "tests", "__tests__"} for part in parts[:-1])
+        or name.startswith("test_")
+        or name.endswith("_test.py")
+        or any(marker in name for marker in (".test.", ".spec.", "_test."))
+    )
+
+
+def _repoground_target_hunk_ranges(
+    repo_path: Path,
+    base_commit: str,
+    target_commit: str,
+    changes: list[dict[str, Any]],
+) -> tuple[dict[str, list[tuple[int, int]]], dict[str, Any]]:
+    python_paths = [
+        str(item["path"])
+        for item in changes
+        if isinstance(item.get("path"), str)
+        and str(item["path"]).endswith(".py")
+        and not _repoground_path_looks_like_test(str(item["path"]))
+        and not str(item.get("status", "")).startswith("D")
+    ]
+    considered = python_paths[:_REPOGROUND_DIFF_LOCALITY_MAX_PYTHON_PATHS]
+    ranges_by_path: dict[str, list[tuple[int, int]]] = {}
+    errors: list[dict[str, str]] = []
+    for path in considered:
+        rc, patch, err = _repoground_git(
+            repo_path,
+            [
+                "diff",
+                "--unified=0",
+                "--no-color",
+                "--no-ext-diff",
+                base_commit,
+                target_commit,
+                "--",
+                path,
+            ],
+        )
+        if rc != 0:
+            errors.append({"path": path, "reason": err or f"git_diff_rc_{rc}"})
+            continue
+        ranges: list[tuple[int, int]] = []
+        for line in patch.splitlines():
+            match = _REPOGROUND_DIFF_HUNK_RE.match(line)
+            if match is None:
+                continue
+            start = int(match.group(1))
+            count = int(match.group(2) or "1")
+            if count:
+                ranges.append((start, start + count - 1))
+        if ranges:
+            ranges_by_path[path] = ranges
+    return ranges_by_path, {
+        "python_changed_path_count": len(python_paths),
+        "python_considered_path_count": len(considered),
+        "python_omitted_path_count": max(0, len(python_paths) - len(considered)),
+        "hunk_path_count": len(ranges_by_path),
+        "errors": errors,
+    }
+
+
+def _repoground_diff_local_symbols(
+    repo_path: Path,
+    base_commit: str,
+    target_commit: str,
+    changes: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    ranges_by_path, metadata = _repoground_target_hunk_ranges(
+        repo_path, base_commit, target_commit, changes
+    )
+    candidates_by_path: dict[str, list[dict[str, Any]]] = {}
+    errors = list(metadata["errors"])
+    for path, ranges in sorted(ranges_by_path.items()):
+        rc, source, err = _repoground_git(
+            repo_path,
+            ["show", f"{target_commit}:{path}"],
+            preserve_stdout=True,
+        )
+        if rc != 0:
+            errors.append({"path": path, "reason": err or f"git_show_rc_{rc}"})
+            continue
+        try:
+            tree = ast.parse(source, filename=path)
+        except (SyntaxError, ValueError, TypeError) as exc:
+            errors.append({"path": path, "reason": type(exc).__name__})
+            continue
+
+        matches: list[tuple[int, int, int, str, dict[str, Any]]] = []
+        for node in ast.walk(tree):
+            if not isinstance(
+                node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+            ):
+                continue
+            start = int(node.lineno)
+            if node.decorator_list:
+                start = min(
+                    start,
+                    *(
+                        int(decorator.lineno)
+                        for decorator in node.decorator_list
+                        if hasattr(decorator, "lineno")
+                    ),
+                )
+            end = int(getattr(node, "end_lineno", node.lineno))
+            overlaps = [
+                range_start
+                for range_start, range_end in ranges
+                if start <= range_end and end >= range_start
+            ]
+            if not overlaps:
+                continue
+            kind = (
+                "class"
+                if isinstance(node, ast.ClassDef)
+                else "async_function"
+                if isinstance(node, ast.AsyncFunctionDef)
+                else "function"
+            )
+            item = {
+                "kind": kind,
+                "name": node.name,
+                "qualified_name": node.name,
+                "path": path,
+                "start_line": start,
+                "end_line": end,
+                "range_ref": f"file:{path}#L{start}-L{end}",
+                "evidence_type": "git_diff_target_overlap",
+                "authority": "target_git_tree_ast",
+            }
+            matches.append(
+                (min(overlaps), end - start, start, str(node.name), item)
+            )
+        if matches:
+            matches.sort(key=lambda value: value[:4])
+            candidates_by_path[path] = [value[4] for value in matches]
+
+    selected: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, int, int]] = set()
+
+    def add(item: dict[str, Any]) -> None:
+        key = (
+            str(item["path"]),
+            str(item["qualified_name"]),
+            int(item["start_line"]),
+            int(item["end_line"]),
+        )
+        if (
+            key not in seen
+            and len(selected) < _REPOGROUND_DIFF_LOCALITY_MAX_SYMBOLS
+        ):
+            seen.add(key)
+            selected.append(item)
+
+    for path in sorted(candidates_by_path):
+        add(candidates_by_path[path][0])
+    for path in sorted(candidates_by_path):
+        for item in candidates_by_path[path][1:]:
+            add(item)
+
+    omitted = int(metadata["python_omitted_path_count"])
+    metadata.update(
+        {
+            "schema_version": 1,
+            "status": "partial" if errors or omitted else "available",
+            "authority": "target_git_tree_ast_and_name_status",
+            "language_scope": ["python"],
+            "target_commit": target_commit,
+            "target_symbol_count": len(selected),
+            "changed_test_path_count": len(
+                _repoground_changed_test_candidates(changes)
+            ),
+            "errors": errors[:8],
+            "does_not_establish": [
+                "non_python_symbol_locality",
+                "runtime_reachability",
+                "test_sufficiency",
+                "complete_change_impact",
+            ],
+        }
+    )
+    return selected, metadata
+
+
+def _repoground_changed_test_candidates(
+    changes: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "path": str(item["path"]),
+            "evidence_type": "changed_test_path",
+            "change_status": str(item.get("status", "")),
+        }
+        for item in changes
+        if isinstance(item.get("path"), str)
+        and _repoground_path_looks_like_test(str(item["path"]))
+    ]
+
+
+def _repoground_prioritize_related_tests(
+    changes: list[dict[str, Any]], impact_tests: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    ordered = _repoground_changed_test_candidates(changes)
+    changed_paths = {
+        str(item["path"]) for item in ordered if isinstance(item.get("path"), str)
+    }
+    return [
+        *ordered,
+        *[
+            item
+            for item in impact_tests
+            if not isinstance(item.get("path"), str)
+            or str(item["path"]) not in changed_paths
+        ],
+    ]
+
+
+def _repoground_merge_target_symbols(
+    diff_symbols: list[dict[str, Any]],
+    impact_symbols: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    ordered: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, int, int]] = set()
+    for item in [*diff_symbols, *impact_symbols]:
+        key = (
+            str(item.get("path", "")),
+            str(item.get("qualified_name") or item.get("name") or ""),
+            int(item.get("start_line", 0) or 0),
+            int(item.get("end_line", 0) or 0),
+        )
+        if key not in seen:
+            seen.add(key)
+            ordered.append(item)
+    return ordered
+
+
 def _repoground_dirty_overlay(repo_path: Path) -> dict[str, Any]:
     rc, status, err = _repoground_git(repo_path, ["status", "--porcelain=v1", "--untracked-files=normal"])
     entries = [line for line in status.splitlines() if line]
@@ -11859,6 +12110,9 @@ def repoground_context_compose(
         }
 
     changed_paths = [str(item["path"]) for item in changes]
+    diff_local_symbols, diff_locality = _repoground_diff_local_symbols(
+        repo_path, base_commit, target_commit, changes
+    )
     effective_query = query.strip() if isinstance(query, str) else " ".join(changed_paths[:8]) or None
     baseline = repoground_context_pack(
         repo,
@@ -11886,14 +12140,28 @@ def repoground_context_compose(
     causal_relations = _repoground_dict_items(impact.get("relations")) if isinstance(impact, dict) else []
 
     edit_context = impact.get("edit_context") if isinstance(impact, dict) and isinstance(impact.get("edit_context"), dict) else {}
+    impact_related_tests = (
+        _repoground_dict_items(impact.get("related_tests"))
+        if isinstance(impact, dict)
+        else []
+    )
+    impact_target_symbols = (
+        _repoground_dict_items(impact.get("target_symbols"))
+        if isinstance(impact, dict)
+        else []
+    )
+    related_tests = _repoground_prioritize_related_tests(changes, impact_related_tests)
+    target_symbols = _repoground_merge_target_symbols(
+        diff_local_symbols, impact_target_symbols
+    )
     lane_values: dict[str, list[Any]] = {
         "direct_changes": changes,
-        "related_tests": _repoground_dict_items(impact.get("related_tests")) if isinstance(impact, dict) else [],
+        "related_tests": related_tests,
         "gate_evidence": gate_evidence,
         "authority_ordered_rules": authority_rules,
         "entry_manifest": [surfaces["agent_entry_manifest"]] if "agent_entry_manifest" in surfaces else [],
         "pr_delta_cards": [surfaces["pr_delta_cards_jsonl"]] if "pr_delta_cards_jsonl" in surfaces else [],
-        "target_symbols": _repoground_dict_items(impact.get("target_symbols")) if isinstance(impact, dict) else [],
+        "target_symbols": target_symbols,
         "causal_relations": causal_relations,
         "live_ranges": _repoground_dict_items(evidence.get("ranges")),
         "citations": [{"citation_id": item} for item in evidence.get("citation_ids", []) if isinstance(item, str)] if isinstance(evidence.get("citation_ids"), list) else [],
@@ -11916,7 +12184,16 @@ def repoground_context_compose(
         used.append("agent_impact")
     if effective_query and baseline.get("available"):
         used.append("query_context")
-    if context.get("target_symbols"):
+    context_target_symbols = _repoground_dict_items(context.get("target_symbols"))
+    if any(
+        item.get("evidence_type") == "git_diff_target_overlap"
+        for item in context_target_symbols
+    ):
+        used.append("diff_locality")
+    if any(
+        item.get("evidence_type") != "git_diff_target_overlap"
+        for item in context_target_symbols
+    ):
         used.append("symbol_navigation")
     call_graph_used = any(
         _repoground_relation_uses_coherent_source(
@@ -11934,7 +12211,18 @@ def repoground_context_compose(
         used.append("entry_manifest")
     if context.get("pr_delta_cards"):
         used.append("pr_delta_cards")
-    all_lanes = ["direct_changes", "agent_impact", "query_context", "entry_manifest", "pr_delta_cards", "symbol_navigation", "call_graph", "citation", "live_evidence"]
+    all_lanes = [
+        "direct_changes",
+        "agent_impact",
+        "query_context",
+        "entry_manifest",
+        "pr_delta_cards",
+        "diff_locality",
+        "symbol_navigation",
+        "call_graph",
+        "citation",
+        "live_evidence",
+    ]
     skipped = [name for name in all_lanes if name not in used]
     triggered: list[str] = []
     if impact_status == "blocked":
@@ -11958,6 +12246,7 @@ def repoground_context_compose(
         "change_identity": change_identity,
         "dirty_overlay": dirty_overlay,
         "freshness": freshness,
+        "diff_locality": diff_locality,
         "context_budget": {
             "requested_bytes": context_budget_bytes,
             "effective_limit_bytes": effective_limit,
