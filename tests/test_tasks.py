@@ -7800,6 +7800,15 @@ class TaskTests(unittest.TestCase):
         ):
             tasks.resources.task_terminalization_records(too_many_terminal_ids)
 
+        max_page_terminal_ids = [
+            f"{index:024x}"
+            for index in range(tasks.TASK_RECONCILE_CHECK_LIMIT)
+        ]
+        self.assertEqual(
+            {},
+            tasks.resources.task_terminalization_records(max_page_terminal_ids),
+        )
+
         self.assertLessEqual(tasks.TASK_RECONCILE_CHECK_LIMIT, 500)
         with self.assertRaisesRegex(ValueError, "limit must be between 1 and 200"):
             tasks.reconcile_tasks_check(
