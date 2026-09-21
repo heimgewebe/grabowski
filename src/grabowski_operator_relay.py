@@ -25,6 +25,7 @@ def operator_relay_protocol() -> dict[str, Any]:
         ],
         "review_and_contrast_agent_priority": [
             "claude",
+            "grok",
             "codex",
             "antigravity",
             "opencode",
