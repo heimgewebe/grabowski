@@ -876,12 +876,16 @@ def default_local_blue_green_hooks(
 
 
 
-def _git_result(repository: Path, *arguments: str) -> dict[str, Any]:
+def _git_result(
+    repository: Path,
+    *arguments: str,
+    max_output_bytes: int = 65_536,
+) -> dict[str, Any]:
     return read_surface._run_read(
         read_surface._git_command(repository, *arguments),
         cwd=repository,
         timeout_seconds=30,
-        max_output_bytes=65_536,
+        max_output_bytes=max_output_bytes,
     )
 
 
@@ -2602,7 +2606,13 @@ def _mutating_git_result(repository: Path, *arguments: str) -> dict[str, Any]:
 
 def _worktree_registration_present(repository: Path, target: Path) -> bool:
     raw = _required_stdout(
-        _git_result(repository, "worktree", "list", "--porcelain"),
+        _git_result(
+            repository,
+            "worktree",
+            "list",
+            "--porcelain",
+            max_output_bytes=1_048_576,
+        ),
         "worktree inventory lookup",
     )
     try:
