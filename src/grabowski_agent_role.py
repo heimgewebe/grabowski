@@ -36,6 +36,8 @@ GROK_REVIEW_EVENT_TYPES = frozenset(
         "text",
         "thought",
         "usage",
+        "memory_flush_started",
+        "memory_flush_completed",
         "available_commands",
         "tool_call",
         "tool_call_update",
