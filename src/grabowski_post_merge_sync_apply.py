@@ -293,8 +293,19 @@ def apply(
         return _blocked("upstream_mismatch", before=initial)
 
     remote_head_verified = False
+
+    def read_remote_head(stage: str, effect_started: bool) -> str:
+        nonlocal remote_head_verified
+        try:
+            observed = remote_head_reader(stage, effect_started)
+        except Exception:
+            remote_head_verified = False
+            raise
+        remote_head_verified = observed == expected_remote_head
+        return observed
+
     try:
-        remote_before = remote_head_reader("before", False)
+        remote_before = read_remote_head("before", False)
     except Exception as exc:
         return _blocked(
             "remote_read_failed",
@@ -477,7 +488,7 @@ def apply(
 
         if output is None:
             try:
-                remote_locked = remote_head_reader("locked", False)
+                remote_locked = read_remote_head("locked", False)
             except Exception as exc:
                 output = _blocked(
                     "remote_read_failed_after_lease",
@@ -530,7 +541,7 @@ def apply(
                     ],
                 )
                 _commit_head(repo, runner, expected_remote_head)
-                if remote_head_reader("after_fetch", True) != expected_remote_head:
+                if read_remote_head("after_fetch", True) != expected_remote_head:
                     raise PostMergeSyncApplyError(
                         "remote branch advanced during exact-head materialization"
                     )
@@ -682,7 +693,7 @@ def apply(
                     remote=remote,
                     sha_length=sha_length,
                 )
-                remote_final = remote_head_reader("final", True)
+                remote_final = read_remote_head("final", True)
                 final_tree = _stdout(_run(repo, runner, ["write-tree"])).lower()
                 if (
                     not _final_exact(
@@ -745,7 +756,7 @@ def apply(
                 remote_readback_error_type: str | None = None
                 if local_final_exact:
                     try:
-                        remote_readback = remote_head_reader(
+                        remote_readback = read_remote_head(
                             "error_readback",
                             True,
                         )

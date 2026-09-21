@@ -1656,6 +1656,30 @@ class GripFoundationTests(unittest.TestCase):
                 },
                 "fail",
             ),
+            (
+                {
+                    "state": "effect_failed_before_branch_cas",
+                    "resource_keys": ["repo:/tmp/x"],
+                    "remote_head_verified": False,
+                },
+                "skip",
+            ),
+            (
+                {
+                    "state": "effect_confirmed_remote_drift",
+                    "resource_keys": ["repo:/tmp/x"],
+                    "remote_head_verified": False,
+                },
+                "fail",
+            ),
+            (
+                {
+                    "state": "effect_confirmed_remote_unreadable",
+                    "resource_keys": ["repo:/tmp/x"],
+                    "remote_head_verified": False,
+                },
+                "fail",
+            ),
         )
         for output_patch, expected_status in cases:
             with self.subTest(output_patch=output_patch):

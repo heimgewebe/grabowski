@@ -6761,6 +6761,8 @@ def _run_post_merge_sync_apply(
         "remote_head_mismatch",
         "remote_read_failed_after_lease",
         "remote_head_drift_after_lease",
+        "effect_confirmed_remote_drift",
+        "effect_confirmed_remote_unreadable",
     }
     remote_status = (
         "fail"

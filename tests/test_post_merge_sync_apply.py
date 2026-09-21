@@ -907,6 +907,33 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             self.assertEqual(base, git_stdout(repo, "rev-parse", "HEAD"))
             self.assertEqual(1, leases.release_calls)
 
+    def test_remote_drift_after_fetch_invalidates_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+
+            def drifting_remote(stage: str, _effect_started: bool) -> str:
+                return base if stage == "after_fetch" else target
+
+            leases = LeaseHarness()
+            with patched_leases(leases):
+                result = self.apply(
+                    repo,
+                    remote,
+                    base,
+                    target,
+                    remote_reader=drifting_remote,
+                )
+
+            self.assertEqual("blocked", result["receipt_status"])
+            self.assertEqual("effect_failed_before_branch_cas", result["state"])
+            self.assertTrue(result["effect_started"])
+            self.assertFalse(result["branch_cas_started"])
+            self.assertFalse(result["remote_head_verified"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertEqual(base, git_stdout(repo, "rev-parse", "HEAD"))
+            self.assertEqual("", git_stdout(repo, "status", "--porcelain"))
+            self.assertEqual(1, leases.release_calls)
+
     def test_tracking_ref_advance_before_branch_check_requires_readback(
         self,
     ) -> None:
@@ -984,7 +1011,39 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             self.assertFalse(result["post_state_verified"])
             self.assertTrue(result["readback_required"])
             self.assertFalse(result["retry_authorized"])
+            self.assertFalse(result["remote_head_verified"])
             self.assertEqual(base, result["remote_readback"])
+            self.assertEqual(target, git_stdout(repo, "rev-parse", "HEAD"))
+            self.assertEqual("", git_stdout(repo, "status", "--porcelain"))
+            self.assertEqual(1, leases.release_calls)
+
+    def test_final_remote_unreadable_invalidates_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+
+            def unreadable_remote(stage: str, _effect_started: bool) -> str:
+                if stage in {"final", "error_readback"}:
+                    raise RuntimeError("remote head unavailable")
+                return target
+
+            leases = LeaseHarness()
+            with patched_leases(leases):
+                result = self.apply(
+                    repo,
+                    remote,
+                    base,
+                    target,
+                    remote_reader=unreadable_remote,
+                )
+
+            self.assertEqual("blocked", result["receipt_status"])
+            self.assertEqual("effect_confirmed_remote_unreadable", result["state"])
+            self.assertTrue(result["local_post_state_verified"])
+            self.assertFalse(result["post_state_verified"])
+            self.assertFalse(result["remote_head_verified"])
+            self.assertTrue(result["readback_required"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertEqual("RuntimeError", result["remote_readback_error_type"])
             self.assertEqual(target, git_stdout(repo, "rev-parse", "HEAD"))
             self.assertEqual("", git_stdout(repo, "status", "--porcelain"))
             self.assertEqual(1, leases.release_calls)
