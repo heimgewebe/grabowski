@@ -217,6 +217,34 @@ class KleinerMaulwurfDeployTests(unittest.TestCase):
                 km._verify_pre_cutover_preimage(state)
         stack.assert_not_called()
 
+    def test_pre_cutover_fleet_drift_blocks_before_service_stop(self) -> None:
+        state = self._state()
+        with (
+            patch.object(km.core, "verify_apply_snapshot_unchanged"),
+            patch.object(
+                km, "_runtime_release", return_value=state.old_release_path
+            ),
+            patch.object(
+                km.ingress,
+                "read_routing_selector",
+                return_value=state.old_selector,
+            ),
+            patch.object(km, "_require_stack_active"),
+            patch.object(
+                km,
+                "_require_canonical_fleet_identity",
+                side_effect=km.KleinerMaulwurfDeployError("fleet drift"),
+            ) as fleet_check,
+            patch.object(km, "_stop_stack") as stop,
+        ):
+            with self.assertRaisesRegex(
+                km.KleinerMaulwurfDeployError,
+                "fleet drift",
+            ):
+                km._run_cutover(state, timeout_seconds=10)
+        fleet_check.assert_called_once_with()
+        stop.assert_not_called()
+
     def test_pre_cutover_failure_does_not_enter_rollback(self) -> None:
         state = self._state()
         with (

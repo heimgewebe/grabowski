@@ -234,6 +234,9 @@ def _verify_pre_cutover_preimage(state: CutoverState) -> None:
     ):
         _fail("routing selector no longer matches the serving preimage")
     _require_stack_active()
+    # Keep fleet identity as the last read-only pre-cutover gate so drift during
+    # release construction is rejected before any service-stop effect begins.
+    _require_canonical_fleet_identity()
 
 
 def _verify_pointer_before_activation(state: CutoverState) -> None:
