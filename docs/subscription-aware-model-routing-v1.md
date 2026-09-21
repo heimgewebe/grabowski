@@ -15,7 +15,7 @@ ChatGPT remains the controller and Grabowski remains the authoritative local exe
 - they may not apply patches, commit, push, merge, deploy, or alter lifecycle truth;
 - their availability does not authorize parallel work by itself.
 
-Codex is an explicit contrast surface only. Because ChatGPT and Codex are in the same OpenAI lineage, Codex is never counted as an independent external review of the controller.
+Codex has a dedicated `codex-sol-review-high` route in addition to its contrast routes. The review route is read-only and advisory. Because the ChatGPT/Grabowski controller and Codex share the OpenAI provider family, Codex is never counted as an independent external review of that controller; when the selected scoped writer is from a non-OpenAI provider family, the normal lineage and provider gates may select Codex as the independent reviewer.
 
 ## Verified subscription baselines
 
@@ -23,7 +23,7 @@ Baseline observations are from 2026-07-29; xAI model discovery was refreshed on 
 
 | Provider | Canonical local plan label | Live evidence | Included routing surface | Excluded cost surfaces |
 | --- | --- | --- | --- | --- |
-| OpenAI | ChatGPT Pro | owner assertion; `codex login status` reports ChatGPT login; `gpt-5.6-sol` xhigh smoke passed | Codex CLI contrast | OpenAI API, purchased Codex credits |
+| OpenAI | ChatGPT Pro | owner assertion; `codex login status` reports ChatGPT login; `gpt-5.6-sol` xhigh smoke passed | Codex CLI review and contrast | OpenAI API, purchased Codex credits |
 | Anthropic | Claude Pro | `claude auth status` reports `subscriptionType: pro`; Sonnet 5 and Opus 5 smokes passed | Claude Code review and contrast | Anthropic API, usage credits |
 | Google | Google AI subscription | owner assertion; Antigravity `gemini-3.1-pro-high` smoke passed | Antigravity and Jules baseline | Vertex AI API, Google AI Studio API, purchased AI credits |
 | xAI | SuperGrok | Grok authentication reports `subscription_tier: SuperGrok`; authenticated `grok models` readback exposes `grok-4.6` | Grok Build review and contrast | xAI API, extra usage credits, pay-as-you-go overage |
@@ -63,12 +63,13 @@ Provider diversity is used only when it improves independence or technical cover
 - `claude-opus-5-high`: judgment-heavy, security, architecture, and critical review through the Claude Pro baseline.
 - `antigravity-gemini-pro-review-high`: independent Google-family review through the Google AI baseline.
 - `grok-4.6-review-high`: independent xAI review through SuperGrok; one turn, no web search, no subagents, no memory, no tools, and schema-constrained structured output.
+- `codex-sol-review-high`: GPT-5.6 Sol review through the ChatGPT Pro Codex baseline; it is a real reviewer route, but same-OpenAI-provider work is excluded by the existing independence gate.
 
 All direct Claude Pro routes use the same `anthropic-claude-pro` independence group. Two Claude models therefore never satisfy a two-provider independence requirement.
 
 ### Contrast routes
 
-Codex routes are contrast-only. Legacy Gemini Pro and Grok high routes remain contrast-only; dedicated review routes carry review semantics separately.
+Codex implementation/competition routes remain contrast-only; `codex-sol-review-high` is the separate review-only route. Legacy Gemini Pro and Grok high routes remain contrast-only; dedicated review routes carry review semantics separately.
 
 ### Paid-only routes
 

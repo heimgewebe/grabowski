@@ -839,6 +839,52 @@ class SelfDeployToolTests(unittest.TestCase):
             max_output_bytes=65_536,
         )
 
+    def test_worktree_registration_present_uses_expanded_bounded_inventory_read(
+        self,
+    ) -> None:
+        repository = Path("/tmp/grabowski-auto-deploy-source")
+        target = repository / "deploy-source"
+        with patch.object(
+            SELF_DEPLOY,
+            "_git_result",
+            return_value=_result(f"worktree {target}\nHEAD {'a' * 40}\ndetached\n"),
+        ) as git_result:
+            self.assertTrue(
+                SELF_DEPLOY._worktree_registration_present(repository, target)
+            )
+        git_result.assert_called_once_with(
+            repository,
+            "worktree",
+            "list",
+            "--porcelain",
+            max_output_bytes=1_048_576,
+        )
+
+    def test_git_result_propagates_explicit_output_bound(self) -> None:
+        repository = Path("/tmp/grabowski-auto-deploy-source")
+        expected = _result("")
+        with patch.object(
+            SELF_DEPLOY.read_surface,
+            "_run_read",
+            return_value=expected,
+        ) as run_read:
+            observed = SELF_DEPLOY._git_result(
+                repository,
+                "worktree",
+                "list",
+                "--porcelain",
+                max_output_bytes=1_048_576,
+            )
+        self.assertEqual(observed, expected)
+        run_read.assert_called_once_with(
+            SELF_DEPLOY.read_surface._git_command(
+                repository, "worktree", "list", "--porcelain"
+            ),
+            cwd=repository,
+            timeout_seconds=30,
+            max_output_bytes=1_048_576,
+        )
+
     def test_canonical_stale_main_snapshot_accepts_clean_fast_forward_only(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary).resolve()

@@ -2875,6 +2875,152 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
             "does_not_establish": ["test_sufficiency", "runtime_behavior"],
         }
 
+    def test_working_repo_qualified_identity_uses_publication_source(self) -> None:
+        source_name = "heimgewebe__demo-repo__main--" + ("a" * 40)
+        publication_source = (
+            self.home / "repos" / ".repoground-sources" / source_name
+        )
+        publication_source.mkdir(parents=True)
+        manifest = self.merges / "qualified.bundle.manifest.json"
+        resolution = {
+            "selected": [
+                {
+                    "authority": "canonical_publication",
+                    "manifest_path": str(manifest),
+                    "stem": "qualified-stem",
+                }
+            ]
+        }
+        status = {
+            "publication_authority": "canonical_publication",
+            "publication_ref": "main",
+            "source_provenance": {"repository": {"name": source_name}},
+        }
+
+        for selector in ("heimgewebe/demo-repo", "heimgewebe__demo-repo"):
+            with self.subTest(selector=selector):
+                with (
+                    patch.object(
+                        mcp, "_repoground_catalog_resolution", return_value=resolution
+                    ) as catalog,
+                    patch.object(
+                        mcp, "_repoground_manifest_summary", return_value=status
+                    ),
+                ):
+                    resolved, pinned_stem = mcp._repoground_working_repo(selector)
+
+                self.assertEqual(resolved, publication_source)
+                self.assertEqual(pinned_stem, "qualified-stem")
+                catalog.assert_called_once_with(selector, None)
+
+    def test_working_repo_qualified_identity_does_not_fall_back_to_nested_checkout(
+        self,
+    ) -> None:
+        nested = self.home / "repos" / "heimgewebe" / "demo-repo"
+        nested.mkdir(parents=True)
+        manifest = self.merges / "qualified.bundle.manifest.json"
+        resolution = {
+            "selected": [
+                {
+                    "authority": "canonical_publication",
+                    "manifest_path": str(manifest),
+                    "stem": "qualified-stem",
+                }
+            ]
+        }
+        status = {
+            "publication_authority": "canonical_publication",
+            "publication_ref": "main",
+            "source_provenance": {
+                "repository": {
+                    "name": "heimgewebe__demo-repo__main--" + ("b" * 40)
+                }
+            },
+        }
+
+        with (
+            patch.object(mcp, "_repoground_catalog_resolution", return_value=resolution),
+            patch.object(mcp, "_repoground_manifest_summary", return_value=status),
+            self.assertRaisesRegex(
+                ValueError, "repository checkout is missing or invalid"
+            ),
+        ):
+            mcp._repoground_working_repo("heimgewebe/demo-repo")
+
+    def test_context_compose_qualified_repo_uses_publication_source_checkout(
+        self,
+    ) -> None:
+        base, target = self._composer_fixture()
+        conventional = self.home / "repos" / "demo-repo"
+        source_name = "heimgewebe__demo-repo__main--" + target
+        publication_source = (
+            self.home / "repos" / ".repoground-sources" / source_name
+        )
+        publication_source.parent.mkdir(parents=True)
+        subprocess.run(
+            ["git", "clone", "--quiet", str(conventional), str(publication_source)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        manifest = self.merges / "qualified.bundle.manifest.json"
+        resolution = {
+            "selected": [
+                {
+                    "authority": "canonical_publication",
+                    "manifest_path": str(manifest),
+                    "stem": "qualified-stem",
+                }
+            ]
+        }
+        status = {
+            "publication_authority": "canonical_publication",
+            "publication_ref": "main",
+            "source_provenance": {"repository": {"name": source_name}},
+        }
+
+        with (
+            patch.object(mcp, "_repoground_catalog_resolution", return_value=resolution),
+            patch.object(mcp, "_repoground_manifest_summary", return_value=status),
+            patch.object(
+                mcp,
+                "_repoground_selected_manifest_for_repo",
+                return_value=(
+                    {"freshness": "fresh_exact"},
+                    "qualified-stem",
+                    manifest,
+                    None,
+                ),
+            ) as select_manifest,
+            patch.object(
+                mcp,
+                "repoground_context_pack",
+                return_value=self._composer_context_pack(),
+            ),
+            patch.object(
+                mcp,
+                "_repoground_agent_impact_context",
+                return_value=self._composer_impact(),
+            ),
+            patch.object(mcp, "_repoground_manifest_surface_metadata", return_value={}),
+        ):
+            result = mcp.repoground_context_compose(
+                "heimgewebe/demo-repo",
+                base,
+                target,
+                context_budget_bytes=10_000,
+            )
+
+        select_manifest.assert_called_once_with(
+            "heimgewebe/demo-repo", "qualified-stem"
+        )
+        self.assertTrue(result["available"])
+        self.assertEqual(result["change_identity"]["base_commit"], base)
+        self.assertEqual(result["change_identity"]["target_commit"], target)
+        self.assertEqual(
+            result["context"]["target_symbols"][0]["qualified_name"], "run"
+        )
+
     def test_context_lane_policy_rejects_missing_or_unknown_configuration(self) -> None:
         lane_values = {name: [] for name in mcp._REPOGROUND_CONTEXT_LANE_CONFIG}
         lane_values["unconfigured_lane"] = []
@@ -3015,6 +3161,244 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
         )
         self.assertIn("patch_correctness", first["does_not_establish"])
         self.assertIn("merge_readiness", first["does_not_establish"])
+
+    def test_context_compose_prioritizes_diff_local_symbols_and_changed_tests(self) -> None:
+        base, target = self._composer_fixture()
+        impact = self._composer_impact()
+        impact["target_symbols"] = [
+            {
+                "id": "generic-symbol",
+                "kind": "function",
+                "name": "generic",
+                "qualified_name": "generic",
+                "path": "src/app.py",
+                "start_line": 99,
+                "end_line": 100,
+                "range_ref": "file:src/app.py#L99-L100",
+            }
+        ]
+        impact["related_tests"] = [
+            {"path": "tests/test_other.py", "evidence_type": "graph_edge"}
+        ]
+        with (
+            patch.object(
+                mcp,
+                "repoground_context_pack",
+                return_value=self._composer_context_pack(),
+            ),
+            patch.object(
+                mcp, "_repoground_agent_impact_context", return_value=impact
+            ),
+        ):
+            result = mcp.repoground_context_compose(
+                "demo-repo", base, target, context_budget_bytes=10_000
+            )
+
+        symbol = result["context"]["target_symbols"][0]
+        self.assertEqual(symbol["qualified_name"], "run")
+        self.assertEqual(symbol["path"], "src/app.py")
+        self.assertEqual(symbol["evidence_type"], "git_diff_target_overlap")
+        self.assertEqual(symbol["authority"], "target_git_tree_ast")
+        self.assertEqual(
+            result["context"]["related_tests"][0],
+            {
+                "path": "tests/test_app.py",
+                "evidence_type": "changed_test_path",
+                "change_status": "A",
+            },
+        )
+        locality = result["diff_locality"]
+        self.assertEqual(locality["status"], "available")
+        self.assertEqual(locality["target_symbol_count"], 1)
+        self.assertEqual(locality["changed_test_path_count"], 1)
+        self.assertIn("diff_locality", result["retrieval_lanes"]["used"])
+        self.assertNotIn("symbol_navigation", result["retrieval_lanes"]["used"])
+        self.assertIn("symbol_navigation", result["retrieval_lanes"]["skipped"])
+
+    def test_diff_local_symbols_do_not_treat_pure_rename_as_content_change(self) -> None:
+        self._write_bundle_and_repo("rename-repo")
+        repo = self.home / "repos" / "rename-repo"
+        old_path = repo / "old.py"
+        old_path.write_text(
+            "def alpha():\n    return 1\n\ndef beta():\n    return 2\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "old.py"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add python"],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        base = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+        ).strip()
+        subprocess.run(["git", "mv", "old.py", "new.py"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "rename python"],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        target = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+        ).strip()
+
+        changes, _diff_sha256 = mcp._repoground_revision_changes(repo, base, target)
+        symbols, locality = mcp._repoground_diff_local_symbols(
+            repo, base, target, changes
+        )
+
+        self.assertEqual(changes[0]["status"], "R100")
+        self.assertEqual(symbols, [])
+        self.assertEqual(locality["hunk_path_count"], 0)
+        self.assertEqual(locality["status"], "available")
+
+    def test_diff_local_symbols_mark_pure_deletion_locality_partial(self) -> None:
+        self._write_bundle_and_repo("deletion-repo")
+        repo = self.home / "repos" / "deletion-repo"
+        path = repo / "app.py"
+        path.write_text(
+            "def f():\n    x = 1\n    y = 2\n    return x\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "app.py"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add python"],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        base = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+        ).strip()
+        path.write_text(
+            "def f():\n    x = 1\n    return x\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "app.py"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "delete line"],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        target = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+        ).strip()
+
+        changes, _diff_sha256 = mcp._repoground_revision_changes(repo, base, target)
+        symbols, locality = mcp._repoground_diff_local_symbols(
+            repo, base, target, changes
+        )
+
+        self.assertEqual(symbols, [])
+        self.assertEqual(locality["targetless_hunk_count"], 1)
+        self.assertEqual(locality["status"], "partial")
+        self.assertIn(
+            "pure_deletion_symbol_locality", locality["does_not_establish"]
+        )
+
+    def test_diff_local_symbols_mark_deleted_python_path_partial(self) -> None:
+        self._write_bundle_and_repo("deleted-file-repo")
+        repo = self.home / "repos" / "deleted-file-repo"
+        path = repo / "gone.py"
+        path.write_text("def gone():\n    return 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "gone.py"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add python"],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        base = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+        ).strip()
+        path.unlink()
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "delete python"],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        target = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+        ).strip()
+
+        changes, _diff_sha256 = mcp._repoground_revision_changes(repo, base, target)
+        symbols, locality = mcp._repoground_diff_local_symbols(
+            repo, base, target, changes
+        )
+
+        self.assertEqual(symbols, [])
+        self.assertEqual(locality["python_changed_path_count"], 1)
+        self.assertEqual(locality["deleted_python_path_count"], 1)
+        self.assertEqual(locality["status"], "partial")
+        self.assertIn(
+            "deleted_python_symbol_locality", locality["does_not_establish"]
+        )
+
+    def test_diff_local_symbols_preserve_nested_identity_and_definition_range(self) -> None:
+        self._write_bundle_and_repo("nested-repo")
+        repo = self.home / "repos" / "nested-repo"
+        path = repo / "app.py"
+        path.write_text(
+            "@decorate\n"
+            "def outer():\n"
+            "    def inner():\n"
+            "        return 1\n"
+            "    return inner()\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "app.py"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add nested python"],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        base = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+        ).strip()
+        path.write_text(
+            "@decorate_changed\n"
+            "def outer():\n"
+            "    def inner():\n"
+            "        return 2\n"
+            "    return inner()\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "app.py"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "change nested python"],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        target = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+        ).strip()
+
+        changes, _diff_sha256 = mcp._repoground_revision_changes(repo, base, target)
+        symbols, locality = mcp._repoground_diff_local_symbols(
+            repo, base, target, changes
+        )
+
+        by_name = {item["qualified_name"]: item for item in symbols}
+        self.assertEqual(set(by_name), {"outer", "outer.inner"})
+        self.assertEqual(by_name["outer"]["start_line"], 2)
+        self.assertEqual(by_name["outer"]["range_ref"], "file:app.py#L2-L5")
+        self.assertEqual(by_name["outer.inner"]["start_line"], 3)
+        self.assertEqual(locality["status"], "available")
 
     def test_context_compose_does_not_claim_call_graph_lane_for_architecture_relations(self) -> None:
         base, target = self._composer_fixture()
@@ -3301,7 +3685,7 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
         self.assertGreater(len(result["context"]["related_tests"]), 0)
         self.assertGreater(len(result["context"]["gate_evidence"]), 0)
         self.assertEqual(
-            result["context_budget"]["lane_counts"]["target_symbols"]["available"], 40
+            result["context_budget"]["lane_counts"]["target_symbols"]["available"], 41
         )
         self.assertEqual(
             result["context_budget"]["lane_counts"]["target_symbols"]["considered"], 8
@@ -3329,6 +3713,7 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
         self.assertEqual(result["reason"], "diff_sha256_mismatch")
         self.assertIn("diff_sha256_mismatch", result["stop_criteria"]["triggered"])
         self.assertEqual(result["retrieval_lanes"]["used"], ["direct_changes"])
+        self.assertIn("diff_locality", result["retrieval_lanes"]["skipped"])
 
     def test_context_compose_keeps_dirty_overlay_separate_from_revision_diff(self) -> None:
         base, target = self._composer_fixture()

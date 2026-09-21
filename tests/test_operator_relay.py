@@ -41,6 +41,12 @@ class OperatorRelayTests(unittest.TestCase):
             "routing_preference_not_authority",
         )
 
+    def test_review_priority_includes_grok_and_codex(self) -> None:
+        review_priority = self.protocol["review_and_contrast_agent_priority"]
+        self.assertIn("grok", review_priority)
+        self.assertIn("codex", review_priority)
+        self.assertLess(review_priority.index("grok"), review_priority.index("codex"))
+
     def test_scoped_writer_and_controller_effects_are_separated(self) -> None:
         writer = self.protocol["authority_roles"]["scoped_writer"]
         self.assertEqual(

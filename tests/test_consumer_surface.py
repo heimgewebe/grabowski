@@ -74,6 +74,10 @@ class ConsumerSurfaceTests(unittest.TestCase):
             self.operator._decode_consumer_cursor(cursor, "surface:minimal:filter-a"),
             {"offset": 2},
         )
+        self.assertEqual(
+            self.operator.consumer_surface.decode_cursor_scope(cursor),
+            "surface:minimal:filter-a",
+        )
         with self.assertRaisesRegex(ValueError, "does not match"):
             self.operator._decode_consumer_cursor(cursor, "surface:evidence:filter-a")
         with self.assertRaisesRegex(ValueError, "does not match"):

@@ -292,8 +292,20 @@ def apply(
     if initial.get("upstream") != expected_upstream:
         return _blocked("upstream_mismatch", before=initial)
 
+    remote_head_verified = False
+
+    def read_remote_head(stage: str, effect_started: bool) -> str:
+        nonlocal remote_head_verified
+        try:
+            observed = remote_head_reader(stage, effect_started)
+        except Exception:
+            remote_head_verified = False
+            raise
+        remote_head_verified = observed == expected_remote_head
+        return observed
+
     try:
-        remote_before = remote_head_reader("before", False)
+        remote_before = read_remote_head("before", False)
     except Exception as exc:
         return _blocked(
             "remote_read_failed",
@@ -306,6 +318,7 @@ def apply(
             before=initial,
             actual_remote_head=remote_before,
         )
+    remote_head_verified = True
 
     try:
         _commit_head(repo, runner, expected_local_head)
@@ -313,6 +326,7 @@ def apply(
         return _blocked(
             "local_preimage_commit_unreadable",
             before=initial,
+            remote_head_verified=remote_head_verified,
             error=str(exc),
         )
 
@@ -321,11 +335,14 @@ def apply(
             return _blocked(
                 "tracking_ref_mismatch_on_replay",
                 before=initial,
+                remote_head_verified=remote_head_verified,
             )
         return {
             "receipt_status": "passed",
             "state": "already_synced",
             "effect_started": False,
+            "preimage_verified": True,
+            "remote_head_verified": remote_head_verified,
             "idempotent": True,
             "retry_authorized": False,
             "old_head": expected_remote_head,
@@ -375,9 +392,11 @@ def apply(
             preimage_sha256=preimage_sha256,
             lease_owner_id=owner_id,
             resource_keys=resource_keys,
+            remote_head_verified=remote_head_verified,
             error_class=type(exc).__name__,
         )
 
+    remote_head_verified = False
     lease_snapshots = acquisition.get("leases")
     if (
         not isinstance(lease_snapshots, list)
@@ -387,6 +406,7 @@ def apply(
             "receipt_status": "failed",
             "state": "lease_snapshot_invalid",
             "effect_started": False,
+            "remote_head_verified": remote_head_verified,
             "retry_authorized": False,
             "preimage_sha256": preimage_sha256,
             "lease_owner_id": owner_id,
@@ -422,6 +442,9 @@ def apply(
     effect_started = False
     worktree_effect_started = False
     branch_cas_started = False
+    serialization_verified = False
+    preimage_verified = False
+    fast_forward_verified = False
     release_error: Exception | None = None
     try:
         live = resources.inspect_resources(resource_keys)
@@ -438,9 +461,11 @@ def apply(
                 before=initial,
                 preimage_sha256=preimage_sha256,
                 resource_keys=resource_keys,
+                serialization_verified=False,
             )
 
         if output is None:
+            serialization_verified = True
             locked = _snapshot(
                 repo,
                 runner,
@@ -455,17 +480,22 @@ def apply(
                     locked=locked,
                     preimage_sha256=preimage_sha256,
                     resource_keys=resource_keys,
+                    serialization_verified=serialization_verified,
                 )
 
         if output is None:
+            preimage_verified = True
+
+        if output is None:
             try:
-                remote_locked = remote_head_reader("locked", False)
+                remote_locked = read_remote_head("locked", False)
             except Exception as exc:
                 output = _blocked(
                     "remote_read_failed_after_lease",
                     before=initial,
                     preimage_sha256=preimage_sha256,
                     resource_keys=resource_keys,
+                    serialization_verified=serialization_verified,
                     error_class=type(exc).__name__,
                 )
             else:
@@ -475,8 +505,11 @@ def apply(
                         before=initial,
                         preimage_sha256=preimage_sha256,
                         resource_keys=resource_keys,
+                        serialization_verified=serialization_verified,
                         actual_remote_head=remote_locked,
                     )
+                else:
+                    remote_head_verified = True
 
         if output is None:
             try:
@@ -508,7 +541,7 @@ def apply(
                     ],
                 )
                 _commit_head(repo, runner, expected_remote_head)
-                if remote_head_reader("after_fetch", True) != expected_remote_head:
+                if read_remote_head("after_fetch", True) != expected_remote_head:
                     raise PostMergeSyncApplyError(
                         "remote branch advanced during exact-head materialization"
                     )
@@ -529,6 +562,7 @@ def apply(
                     raise PostMergeSyncNonFastForward(
                         "materialized remote head is not a fast-forward of the local head"
                     )
+                fast_forward_verified = True
 
                 tracking_ref = f"refs/remotes/{remote}/{target_branch}"
                 tracking_before = _ref_head(
@@ -659,7 +693,7 @@ def apply(
                     remote=remote,
                     sha_length=sha_length,
                 )
-                remote_final = remote_head_reader("final", True)
+                remote_final = read_remote_head("final", True)
                 final_tree = _stdout(_run(repo, runner, ["write-tree"])).lower()
                 if (
                     not _final_exact(
@@ -681,6 +715,8 @@ def apply(
                     "effect_started": True,
                     "worktree_effect_started": True,
                     "branch_cas_started": True,
+                    "serialization_verified": serialization_verified,
+                    "fast_forward_verified": fast_forward_verified,
                     "retry_authorized": False,
                     "preimage_sha256": preimage_sha256,
                     "resource_keys": resource_keys,
@@ -720,7 +756,7 @@ def apply(
                 remote_readback_error_type: str | None = None
                 if local_final_exact:
                     try:
-                        remote_readback = remote_head_reader(
+                        remote_readback = read_remote_head(
                             "error_readback",
                             True,
                         )
@@ -777,6 +813,8 @@ def apply(
                     "effect_started": effect_started,
                     "worktree_effect_started": worktree_effect_started,
                     "branch_cas_started": branch_cas_started,
+                    "serialization_verified": serialization_verified,
+                    "fast_forward_verified": fast_forward_verified,
                     "retry_authorized": False,
                     "preimage_sha256": preimage_sha256,
                     "resource_keys": resource_keys,
@@ -802,6 +840,38 @@ def apply(
                         else "form a fresh apply intent from current authoritative state"
                     ),
                 }
+    except Exception as exc:
+        try:
+            readback = _snapshot(
+                repo,
+                runner,
+                target_branch=target_branch,
+                remote=remote,
+                sha_length=sha_length,
+            )
+        except Exception as read_exc:
+            readback = {"readback_error_type": type(read_exc).__name__}
+        output = {
+            "receipt_status": "failed",
+            "state": "outcome_unknown",
+            "effect_started": effect_started,
+            "worktree_effect_started": worktree_effect_started,
+            "branch_cas_started": branch_cas_started,
+            "serialization_verified": serialization_verified,
+            "fast_forward_verified": fast_forward_verified,
+            "retry_authorized": False,
+            "readback_required": True,
+            "preimage_sha256": preimage_sha256,
+            "resource_keys": resource_keys,
+            "error_class": type(exc).__name__,
+            "error": str(exc),
+            "readback": readback,
+            "local_post_state_verified": False,
+            "post_state_verified": False,
+            "next_action": (
+                "authoritative local and remote readback before any new intent"
+            ),
+        }
     finally:
         try:
             released = resources.release_resources(
@@ -825,11 +895,15 @@ def apply(
             "effect_started": effect_started,
             "worktree_effect_started": worktree_effect_started,
             "branch_cas_started": branch_cas_started,
+            "serialization_verified": serialization_verified,
+            "fast_forward_verified": fast_forward_verified,
             "retry_authorized": False,
             "readback_required": True,
             "preimage_sha256": preimage_sha256,
             "resource_keys": resource_keys,
         }
+    output.setdefault("remote_head_verified", remote_head_verified)
+    output.setdefault("preimage_verified", preimage_verified)
     output.setdefault("lease_owner_id", owner_id)
     if release_error is not None:
         cleanup_next_action = (
