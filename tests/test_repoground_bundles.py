@@ -2882,16 +2882,22 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
         )
         publication_source.mkdir(parents=True)
         manifest = self.merges / "qualified.bundle.manifest.json"
+        manifest_sha = "a" * 64
         resolution = {
             "selected": [
                 {
                     "authority": "canonical_publication",
                     "manifest_path": str(manifest),
+                    "manifest_sha256": manifest_sha,
                     "stem": "qualified-stem",
+                    "publication_run_id": "run-a",
                 }
             ]
         }
         status = {
+            "stem": "qualified-stem",
+            "manifest_sha256": manifest_sha,
+            "publication_run_id": "run-a",
             "publication_authority": "canonical_publication",
             "publication_ref": "main",
             "source_provenance": {"repository": {"name": source_name}},
@@ -2907,10 +2913,15 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
                         mcp, "_repoground_manifest_summary", return_value=status
                     ),
                 ):
-                    resolved, pinned_stem = mcp._repoground_working_repo(selector)
+                    resolved, pinned = mcp._repoground_working_repo(selector)
 
                 self.assertEqual(resolved, publication_source)
-                self.assertEqual(pinned_stem, "qualified-stem")
+                self.assertIsInstance(pinned, mcp._RepoGroundPinnedPublication)
+                assert pinned is not None
+                self.assertEqual(pinned.manifest_path, manifest)
+                self.assertEqual(pinned.manifest_sha256, manifest_sha)
+                self.assertEqual(pinned.stem, "qualified-stem")
+                self.assertEqual(pinned.publication_run_id, "run-a")
                 catalog.assert_called_once_with(selector, None)
 
     def test_working_repo_qualified_identity_does_not_fall_back_to_nested_checkout(
@@ -2964,16 +2975,22 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
             stderr=subprocess.PIPE,
         )
         manifest = self.merges / "qualified.bundle.manifest.json"
+        manifest_sha = "c" * 64
         resolution = {
             "selected": [
                 {
                     "authority": "canonical_publication",
                     "manifest_path": str(manifest),
+                    "manifest_sha256": manifest_sha,
                     "stem": "qualified-stem",
+                    "publication_run_id": "run-a",
                 }
             ]
         }
         status = {
+            "stem": "qualified-stem",
+            "manifest_sha256": manifest_sha,
+            "publication_run_id": "run-a",
             "publication_authority": "canonical_publication",
             "publication_ref": "main",
             "source_provenance": {"repository": {"name": source_name}},
@@ -3011,15 +3028,208 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
                 context_budget_bytes=10_000,
             )
 
-        select_manifest.assert_called_once_with(
-            "heimgewebe/demo-repo", "qualified-stem"
-        )
+        selection = select_manifest.call_args.args[1]
+        self.assertIsInstance(selection, mcp._RepoGroundPinnedPublication)
+        self.assertEqual(selection.manifest_path, manifest)
+        self.assertEqual(selection.manifest_sha256, manifest_sha)
+        self.assertEqual(selection.publication_run_id, "run-a")
         self.assertTrue(result["available"])
         self.assertEqual(result["change_identity"]["base_commit"], base)
         self.assertEqual(result["change_identity"]["target_commit"], target)
         self.assertEqual(
             result["context"]["target_symbols"][0]["qualified_name"], "run"
         )
+
+    def test_context_compose_keeps_exact_publication_when_stem_becomes_ambiguous(
+        self,
+    ) -> None:
+        base, target = self._composer_fixture()
+        conventional = self.home / "repos" / "demo-repo"
+        source_name = "heimgewebe__demo-repo__main--" + target
+        publication_source = (
+            self.home / "repos" / ".repoground-sources" / source_name
+        )
+        publication_source.parent.mkdir(parents=True)
+        subprocess.run(
+            ["git", "clone", "--quiet", str(conventional), str(publication_source)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        stem = "heimgewebe__demo-repo__main-max-260921-0700"
+        run_a = self.root / "publications" / "run-a"
+        run_b = self.root / "publications" / "run-b"
+        run_a.mkdir(parents=True)
+        run_b.mkdir(parents=True)
+        manifest_a = run_a / f"{stem}_merge.bundle.manifest.json"
+        manifest_b = run_b / f"{stem}_merge.bundle.manifest.json"
+        manifest_a.write_text('{"selected":"a"}\\n', encoding="utf-8")
+        manifest_b.write_text('{"selected":"b"}\\n', encoding="utf-8")
+        sha_a = hashlib.sha256(manifest_a.read_bytes()).hexdigest()
+        sha_b = hashlib.sha256(manifest_b.read_bytes()).hexdigest()
+        record_a = {
+            "authority": "canonical_publication",
+            "manifest_path": str(manifest_a),
+            "manifest_sha256": sha_a,
+            "stem": stem,
+            "publication_run_id": "run-a",
+        }
+        record_b = {
+            "authority": "canonical_publication",
+            "manifest_path": str(manifest_b),
+            "manifest_sha256": sha_b,
+            "stem": stem,
+            "publication_run_id": "run-b",
+        }
+        catalog_calls: list[object] = []
+
+        def resolve(_repo, selector):
+            catalog_calls.append(selector)
+            if selector is None:
+                return {"available": True, "selected": [record_a]}
+            return {
+                "available": False,
+                "reason": "ambiguous_stem",
+                "selected": [],
+                "ambiguous_candidates": [record_a, record_b],
+            }
+
+        status = {
+            "repo": "demo-repo",
+            "repo_id": "heimgewebe__demo-repo",
+            "stem": stem,
+            "manifest_path": str(manifest_a),
+            "manifest_sha256": sha_a,
+            "publication_run_id": "run-a",
+            "publication_authority": "canonical_publication",
+            "publication_ref": "main",
+            "git_commit": target,
+            "git_dirty": False,
+            "source_provenance": {"repository": {"name": source_name}},
+            "artifact_count": 1,
+            "artifact_roles": ["canonical_md"],
+            "post_emit_health": {"status": "pass"},
+            "output_health": {"verdict": "pass"},
+            "catalog_healthy": True,
+            "catalog_rejection_reason": None,
+        }
+        freshness = {
+            "kind": "grabowski.repoground_freshness_check",
+            "schema_version": 3,
+            "repo": "heimgewebe/demo-repo",
+            "stem": stem,
+            "freshness": "fresh_exact",
+            "freshness_status": "fresh",
+            "reason": "bundle_commit_matches_clean_live_head",
+            "bundle": {
+                "manifest_path": str(manifest_a),
+                "manifest_sha256": sha_a,
+                "git_commit": target,
+            },
+            "live_repo": {"head": target},
+        }
+        query_payload = {
+            "kind": "repobrief.query",
+            "status": "available",
+            "route": "text_retrieval",
+            "intent": {"kind": "text_retrieval"},
+            "retrieval": {
+                "raw_query": "src/app.py tests/test_app.py",
+                "fts_query": None,
+                "strategy": "exact",
+                "match_count": 0,
+            },
+            "query_result": {"count": 0, "results": []},
+            "snippets": [],
+            "ranges": [],
+            "evidence_resolution_used": False,
+            "mutation_boundary": {"writes": [], "read_paths_do_not_refresh": True},
+        }
+        preflight = {
+            "available": True,
+            "status": "pass",
+            "required_reading": {"required": [], "recommended": []},
+            "answer_compliance_template": {},
+            "does_not_establish": [],
+        }
+        bundle_status = {
+            "exists": True,
+            "artifact_count": 1,
+            "artifact_roles": ["canonical_md"],
+            "post_emit_health": {"status": "pass"},
+            "bundle_surface_validation": {"status": "pass"},
+            "output_health": {"verdict": "pass"},
+        }
+
+        with (
+            patch.object(mcp, "_repoground_catalog_resolution", side_effect=resolve),
+            patch.object(mcp, "_repoground_manifest_summary", return_value=status),
+            patch.object(
+                mcp, "_repoground_freshness_from_status", return_value=freshness
+            ),
+            patch.object(
+                mcp,
+                "_repoground_bundle_status_for_manifest",
+                return_value=bundle_status,
+            ),
+            patch.object(mcp, "_repoground_agent_preflight", return_value=preflight),
+            patch.object(mcp, "_repoground_agent_query", return_value=query_payload),
+            patch.object(
+                mcp,
+                "_repoground_agent_impact_context",
+                return_value=self._composer_impact(),
+            ),
+            patch.object(mcp, "_repoground_manifest_surface_metadata", return_value={}),
+        ):
+            result = mcp.repoground_context_compose(
+                "heimgewebe/demo-repo",
+                base,
+                target,
+                context_budget_bytes=10_000,
+            )
+
+        self.assertTrue(result["available"])
+        self.assertEqual(catalog_calls, [None])
+        self.assertEqual(result["freshness"]["bundle"]["manifest_path"], str(manifest_a))
+        self.assertEqual(
+            result["freshness"]["bundle"]["manifest_sha256"], sha_a
+        )
+
+
+    def test_pinned_publication_fails_closed_on_manifest_digest_drift(self) -> None:
+        manifest = self.merges / "pinned.bundle.manifest.json"
+        pinned = mcp._RepoGroundPinnedPublication(
+            manifest_path=manifest,
+            manifest_sha256="a" * 64,
+            stem="qualified-stem",
+            publication_run_id="run-a",
+        )
+        changed_status = {
+            "stem": "qualified-stem",
+            "manifest_sha256": "b" * 64,
+            "publication_run_id": "run-a",
+        }
+
+        with (
+            patch.object(
+                mcp, "_repoground_manifest_summary", return_value=changed_status
+            ),
+            patch.object(mcp, "_repoground_catalog_resolution") as catalog,
+        ):
+            freshness, selected_stem, selected_path, error = (
+                mcp._repoground_selected_manifest_for_repo(
+                    "heimgewebe/demo-repo", pinned
+                )
+            )
+
+        self.assertEqual(catalog.call_count, 0)
+        self.assertEqual(selected_stem, "qualified-stem")
+        self.assertIsNone(selected_path)
+        self.assertEqual(freshness["reason"], "catalog_selection_changed")
+        self.assertEqual(error["reason"], "catalog_selection_changed")
+        self.assertEqual(error["expected_manifest_sha256"], "a" * 64)
+        self.assertEqual(error["observed_manifest_sha256"], "b" * 64)
 
     def test_context_lane_policy_rejects_missing_or_unknown_configuration(self) -> None:
         lane_values = {name: [] for name in mcp._REPOGROUND_CONTEXT_LANE_CONFIG}

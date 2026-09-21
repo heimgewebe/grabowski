@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from fnmatch import fnmatch
 from pathlib import Path
@@ -7840,6 +7841,57 @@ _REPOGROUND_STEM_RE = re.compile(r"[A-Za-z0-9_.-]{1,160}\Z")
 _REPOGROUND_REPO_RE = re.compile(r"[A-Za-z0-9_.-]{1,120}\Z")
 
 
+@dataclass(frozen=True)
+class _RepoGroundPinnedPublication:
+    manifest_path: Path
+    manifest_sha256: str
+    stem: str
+    publication_run_id: str | None
+
+
+def _repoground_pin_publication_record(
+    record: dict[str, Any],
+) -> _RepoGroundPinnedPublication:
+    raw_path = record.get("manifest_path")
+    manifest_sha256 = record.get("manifest_sha256")
+    stem = record.get("stem")
+    publication_run_id = record.get("publication_run_id")
+    if (
+        not isinstance(raw_path, str)
+        or not raw_path
+        or not isinstance(manifest_sha256, str)
+        or re.fullmatch(r"[a-f0-9]{64}\Z", manifest_sha256) is None
+        or not isinstance(stem, str)
+    ):
+        raise ValueError("RepoGround publication record is incomplete")
+    if publication_run_id is not None and not isinstance(publication_run_id, str):
+        raise ValueError("RepoGround publication run identity is invalid")
+    return _RepoGroundPinnedPublication(
+        manifest_path=Path(raw_path),
+        manifest_sha256=manifest_sha256,
+        stem=_repoground_validate_stem(stem),
+        publication_run_id=publication_run_id,
+    )
+
+
+def _repoground_pin_publication_from_selection(
+    manifest_path: Path,
+    selected_stem: str,
+    freshness: dict[str, Any],
+) -> _RepoGroundPinnedPublication:
+    bundle = freshness.get("bundle")
+    if not isinstance(bundle, dict) or bundle.get("manifest_path") != str(manifest_path):
+        raise ValueError("RepoGround selected publication evidence is incomplete")
+    return _repoground_pin_publication_record(
+        {
+            "manifest_path": str(manifest_path),
+            "manifest_sha256": bundle.get("manifest_sha256"),
+            "stem": selected_stem,
+            "publication_run_id": bundle.get("publication_run_id"),
+        }
+    )
+
+
 def _repoground_json(path: Path, *, max_bytes: int = 2_000_000) -> dict[str, Any]:
     data = _ensure_regular_text_file(path, max_bytes)
     try:
@@ -8483,6 +8535,53 @@ def repoground_bundle_status(stem: str) -> dict[str, Any]:
     }
 
 
+
+def _repoground_bundle_status_for_manifest(
+    manifest_path: Path,
+) -> dict[str, Any]:
+    try:
+        summary = _repoground_manifest_summary(manifest_path)
+    except (OSError, ValueError, PermissionError) as exc:
+        return {
+            "kind": "grabowski.repoground_bundle_status",
+            "schema_version": 2,
+            "exists": manifest_path.exists(),
+            "manifest_path": str(manifest_path),
+            "catalog_healthy": False,
+            "catalog_rejection": None,
+            "reason": type(exc).__name__,
+        }
+    stem = str(summary["stem"])
+    surface = _repoground_sidecar_status(
+        _repoground_sidecar_path(
+            stem, _BUNDLE_SURFACE_SUFFIX, manifest_path=manifest_path
+        ),
+        keys=("status", "bundle_run_id"),
+    )
+    return {
+        "kind": "grabowski.repoground_bundle_status",
+        "schema_version": 2,
+        "exists": True,
+        **summary,
+        "catalog_healthy": summary.get("catalog_healthy") is True,
+        "catalog_rejection": (
+            {"reason": summary.get("catalog_rejection_reason")}
+            if summary.get("catalog_rejection_reason")
+            else None
+        ),
+        "bundle_surface_validation": surface,
+        "output_health": summary.get("output_health"),
+        "authority": "artifact_metadata_only",
+        "does_not_establish": [
+            "bundle_freshness_against_live_repo",
+            "repo_understood",
+            "claims_true",
+            "review_complete",
+            "runtime_correctness",
+        ],
+    }
+
+
 def _repoground_freshness_source(
     repo: str, status: dict[str, Any]
 ) -> tuple[Path, str, str | None]:
@@ -8568,42 +8667,10 @@ def _repoground_remote_branch_observation(
     }
 
 
-@mcp.tool(name="repoground_freshness_check", annotations=READ_ANNOTATIONS)
-def repoground_freshness_check(repo: str, stem: str | None = None) -> dict[str, Any]:
-    """Compare one healthy RepoGround publication with its local source identity."""
-    _require_capability("bundle_registry")
-    repo = _repoground_validate_repo(repo) or ""
-    if stem is not None and stem != "":
-        stem = _repoground_validate_stem(stem)
-    else:
-        stem = None
-    resolution = _repoground_catalog_resolution(repo, stem)
-    selected = resolution.get("selected")
-    if (
-        not resolution.get("available")
-        or not isinstance(selected, list)
-        or len(selected) != 1
-    ):
-        missing_reason = (
-            "no_bundle_found"
-            if stem is None and resolution.get("reason") == "publication_unavailable"
-            else str(resolution.get("reason") or "no_bundle_found")
-        )
-        return {
-            "kind": "grabowski.repoground_freshness_check",
-            "schema_version": 3,
-            "repo": repo,
-            "stem": stem,
-            "freshness": "unknown",
-            "freshness_status": "publication_unavailable",
-            "reason": missing_reason,
-            "rejected_candidates": resolution.get("rejected", []),
-            "ambiguous_candidates": resolution.get("ambiguous_candidates", []),
-        }
-    selected_record = selected[0]
-    selected_stem = str(selected_record["stem"])
-    manifest_path = Path(str(selected_record["manifest_path"]))
-    status = _repoground_manifest_summary(manifest_path)
+def _repoground_freshness_from_status(
+    repo: str, status: dict[str, Any]
+) -> dict[str, Any]:
+    selected_stem = str(status["stem"])
     bundle_commit = status.get("git_commit")
     bundle_dirty = status.get("git_dirty")
     source_repo = str(status.get("repo") or repo)
@@ -8700,6 +8767,7 @@ def repoground_freshness_check(repo: str, stem: str | None = None) -> dict[str, 
             "publication_authority": status.get("publication_authority"),
             "repo_id": status.get("repo_id"),
             "ref": status.get("publication_ref"),
+            "publication_run_id": status.get("publication_run_id"),
             "git_commit": bundle_commit,
             "git_dirty": bundle_dirty,
             "source_provenance": status.get("source_provenance"),
@@ -8719,6 +8787,68 @@ def repoground_freshness_check(repo: str, stem: str | None = None) -> dict[str, 
             "future_branch_freshness",
         ],
     }
+
+
+@mcp.tool(name="repoground_freshness_check", annotations=READ_ANNOTATIONS)
+def repoground_freshness_check(repo: str, stem: str | None = None) -> dict[str, Any]:
+    """Compare one healthy RepoGround publication with its local source identity."""
+    _require_capability("bundle_registry")
+    repo = _repoground_validate_repo(repo) or ""
+    if stem is not None and stem != "":
+        stem = _repoground_validate_stem(stem)
+    else:
+        stem = None
+    resolution = _repoground_catalog_resolution(repo, stem)
+    selected = resolution.get("selected")
+    if (
+        not resolution.get("available")
+        or not isinstance(selected, list)
+        or len(selected) != 1
+    ):
+        missing_reason = (
+            "no_bundle_found"
+            if stem is None and resolution.get("reason") == "publication_unavailable"
+            else str(resolution.get("reason") or "no_bundle_found")
+        )
+        return {
+            "kind": "grabowski.repoground_freshness_check",
+            "schema_version": 3,
+            "repo": repo,
+            "stem": stem,
+            "freshness": "unknown",
+            "freshness_status": "publication_unavailable",
+            "reason": missing_reason,
+            "rejected_candidates": resolution.get("rejected", []),
+            "ambiguous_candidates": resolution.get("ambiguous_candidates", []),
+        }
+    try:
+        pinned = _repoground_pin_publication_record(selected[0])
+        status = _repoground_manifest_summary(pinned.manifest_path)
+    except (OSError, PermissionError, ValueError):
+        return {
+            "kind": "grabowski.repoground_freshness_check",
+            "schema_version": 3,
+            "repo": repo,
+            "stem": stem,
+            "freshness": "unknown",
+            "freshness_status": "publication_unavailable",
+            "reason": "selected_publication_unavailable",
+        }
+    if (
+        status.get("manifest_sha256") != pinned.manifest_sha256
+        or status.get("stem") != pinned.stem
+        or status.get("publication_run_id") != pinned.publication_run_id
+    ):
+        return {
+            "kind": "grabowski.repoground_freshness_check",
+            "schema_version": 3,
+            "repo": repo,
+            "stem": pinned.stem,
+            "freshness": "unknown",
+            "freshness_status": "publication_unavailable",
+            "reason": "selected_publication_changed",
+        }
+    return _repoground_freshness_from_status(repo, status)
 
 
 _REPOGROUND_TASK_PROFILE_RE = re.compile(r"[A-Za-z0-9_.-]{1,80}\Z")
@@ -9524,98 +9654,147 @@ def _repoground_context_citation_ids(snippets: list[dict[str, Any]]) -> list[str
 
 def _repoground_selected_manifest_for_repo(
     repo: str,
-    stem: str | None,
+    stem: str | None | _RepoGroundPinnedPublication,
 ) -> tuple[dict[str, Any], str | None, Path | None, dict[str, Any] | None]:
-    resolution = _repoground_catalog_resolution(repo, stem)
-    selected = resolution.get("selected")
-    if (
-        not resolution.get("available")
-        or not isinstance(selected, list)
-        or len(selected) != 1
-    ):
-        error_reason = str(resolution.get("reason") or "no_bundle_available")
-        bundle_repo: str | None = None
-        if stem:
-            inspection = repoground_catalog.inspect_stem(
-                REPOGROUND_PUBLICATION_ROOT, MERGES_ROOT, stem
-            )
-            inspected = inspection.get("record")
-            if isinstance(inspected, dict):
-                candidate_repo = inspected.get("repo")
-                candidate_repo_id = inspected.get("repo_id")
-                repo_identity = repo.replace("/", "__", 1) if "/" in repo else repo
-                qualified = "__" in repo_identity
-                matches = (
-                    candidate_repo_id == repo_identity
-                    if qualified
-                    else candidate_repo == repo_identity
+    if isinstance(stem, _RepoGroundPinnedPublication):
+        pinned = stem
+    else:
+        resolution = _repoground_catalog_resolution(repo, stem)
+        selected = resolution.get("selected")
+        if (
+            not resolution.get("available")
+            or not isinstance(selected, list)
+            or len(selected) != 1
+        ):
+            error_reason = str(resolution.get("reason") or "no_bundle_available")
+            bundle_repo: str | None = None
+            if stem:
+                inspection = repoground_catalog.inspect_stem(
+                    REPOGROUND_PUBLICATION_ROOT, MERGES_ROOT, stem
                 )
-                if not matches:
-                    error_reason = "bundle_repo_mismatch"
-                    bundle_repo = (
-                        str(candidate_repo_id)
-                        if qualified and isinstance(candidate_repo_id, str)
-                        else str(candidate_repo)
-                        if isinstance(candidate_repo, str)
-                        else None
+                inspected = inspection.get("record")
+                if isinstance(inspected, dict):
+                    candidate_repo = inspected.get("repo")
+                    candidate_repo_id = inspected.get("repo_id")
+                    repo_identity = (
+                        repo.replace("/", "__", 1) if "/" in repo else repo
                     )
-        elif error_reason == "publication_unavailable":
-            error_reason = "no_bundle_available"
+                    qualified = "__" in repo_identity
+                    matches = (
+                        candidate_repo_id == repo_identity
+                        if qualified
+                        else candidate_repo == repo_identity
+                    )
+                    if not matches:
+                        error_reason = "bundle_repo_mismatch"
+                        bundle_repo = (
+                            str(candidate_repo_id)
+                            if qualified and isinstance(candidate_repo_id, str)
+                            else str(candidate_repo)
+                            if isinstance(candidate_repo, str)
+                            else None
+                        )
+            elif error_reason == "publication_unavailable":
+                error_reason = "no_bundle_available"
+            freshness = {
+                "kind": "grabowski.repoground_freshness_check",
+                "schema_version": 3,
+                "repo": repo,
+                "stem": stem,
+                "freshness": "unknown",
+                "freshness_status": "publication_unavailable",
+                "reason": error_reason,
+                "rejected_candidates": resolution.get("rejected", []),
+                "ambiguous_candidates": resolution.get("ambiguous_candidates", []),
+            }
+            return (
+                freshness,
+                stem,
+                None,
+                {
+                    "kind": "grabowski.repoground_selection",
+                    "schema_version": 2,
+                    "repo": repo,
+                    "stem": stem,
+                    "available": False,
+                    "freshness": freshness,
+                    "reason": error_reason,
+                    "bundle_repo": bundle_repo,
+                    "rejected_candidates": resolution.get("rejected", []),
+                    "ambiguous_candidates": resolution.get(
+                        "ambiguous_candidates", []
+                    ),
+                },
+            )
+        try:
+            pinned = _repoground_pin_publication_record(selected[0])
+        except ValueError:
+            freshness = {
+                "kind": "grabowski.repoground_freshness_check",
+                "schema_version": 3,
+                "repo": repo,
+                "stem": stem,
+                "freshness": "unknown",
+                "freshness_status": "publication_unavailable",
+                "reason": "catalog_selection_invalid",
+            }
+            return (
+                freshness,
+                stem,
+                None,
+                {
+                    "kind": "grabowski.repoground_selection",
+                    "schema_version": 2,
+                    "repo": repo,
+                    "stem": stem,
+                    "available": False,
+                    "freshness": freshness,
+                    "reason": "catalog_selection_invalid",
+                },
+            )
+
+    try:
+        status = _repoground_manifest_summary(pinned.manifest_path)
+    except (OSError, PermissionError, ValueError):
+        status = None
+    observed_sha = status.get("manifest_sha256") if isinstance(status, dict) else None
+    observed_stem = status.get("stem") if isinstance(status, dict) else None
+    observed_run_id = (
+        status.get("publication_run_id") if isinstance(status, dict) else None
+    )
+    if (
+        not isinstance(status, dict)
+        or observed_sha != pinned.manifest_sha256
+        or observed_stem != pinned.stem
+        or observed_run_id != pinned.publication_run_id
+    ):
         freshness = {
             "kind": "grabowski.repoground_freshness_check",
             "schema_version": 3,
             "repo": repo,
-            "stem": stem,
+            "stem": pinned.stem,
             "freshness": "unknown",
             "freshness_status": "publication_unavailable",
-            "reason": error_reason,
-            "rejected_candidates": resolution.get("rejected", []),
-            "ambiguous_candidates": resolution.get("ambiguous_candidates", []),
+            "reason": "catalog_selection_changed",
         }
         return (
             freshness,
-            stem,
+            pinned.stem,
             None,
             {
                 "kind": "grabowski.repoground_selection",
                 "schema_version": 2,
                 "repo": repo,
-                "stem": stem,
+                "stem": pinned.stem,
                 "available": False,
                 "freshness": freshness,
-                "reason": error_reason,
-                "bundle_repo": bundle_repo,
-                "rejected_candidates": resolution.get("rejected", []),
-                "ambiguous_candidates": resolution.get("ambiguous_candidates", []),
-            },
-        )
-    record = selected[0]
-    selected_stem = str(record["stem"])
-    manifest_path = Path(str(record["manifest_path"]))
-    freshness = repoground_freshness_check(repo, selected_stem)
-    freshness_bundle = freshness.get("bundle")
-    freshness_sha = (
-        freshness_bundle.get("manifest_sha256")
-        if isinstance(freshness_bundle, dict)
-        else None
-    )
-    if freshness_sha != record.get("manifest_sha256"):
-        return (
-            freshness,
-            selected_stem,
-            None,
-            {
-                "kind": "grabowski.repoground_selection",
-                "schema_version": 2,
-                "repo": repo,
-                "stem": selected_stem,
-                "available": False,
                 "reason": "catalog_selection_changed",
-                "expected_manifest_sha256": record.get("manifest_sha256"),
-                "observed_manifest_sha256": freshness_sha,
+                "expected_manifest_sha256": pinned.manifest_sha256,
+                "observed_manifest_sha256": observed_sha,
             },
         )
-    return freshness, selected_stem, manifest_path, None
+    freshness = _repoground_freshness_from_status(repo, status)
+    return freshness, pinned.stem, pinned.manifest_path, None
 
 
 @mcp.tool(name="repoground_preflight", annotations=READ_ANNOTATIONS)
@@ -11137,7 +11316,14 @@ def repoground_context_pack(
         }
     assert isinstance(manifest_path, Path)
     assert isinstance(selected_stem, str)
-    status = repoground_bundle_status(selected_stem)
+    pinned_publication = (
+        stem
+        if isinstance(stem, _RepoGroundPinnedPublication)
+        else _repoground_pin_publication_from_selection(
+            manifest_path, selected_stem, freshness
+        )
+    )
+    status = _repoground_bundle_status_for_manifest(manifest_path)
     manifest_sha = (
         _repoground_file_sha256(manifest_path) if manifest_path.is_file() else None
     )
@@ -11167,7 +11353,7 @@ def repoground_context_pack(
             repo,
             query,
             task_profile=task_profile,
-            stem=selected_stem,
+            stem=pinned_publication,
             k=k,
             max_snippets=max_snippets,
             max_context_tokens=max_context_tokens,
@@ -11426,7 +11612,7 @@ def _repoground_validate_revision(value: str, *, label: str) -> str:
 
 def _repoground_working_repo(
     repo: str, stem: str | None = None
-) -> tuple[Path, str | None]:
+) -> tuple[Path, _RepoGroundPinnedPublication | None]:
     root = (HOME / "repos").resolve(strict=False)
     if "/" in repo or "__" in repo:
         resolution = _repoground_catalog_resolution(repo, stem)
@@ -11438,12 +11624,15 @@ def _repoground_working_repo(
         ]
         if len(selected) != 1:
             raise ValueError("repository checkout is missing or invalid")
-        selected_stem = selected[0].get("stem")
-        if not isinstance(selected_stem, str):
-            raise ValueError("repository checkout is missing or invalid")
         try:
-            pinned_stem = _repoground_validate_stem(selected_stem)
-            status = _repoground_manifest_summary(Path(selected[0]["manifest_path"]))
+            pinned = _repoground_pin_publication_record(selected[0])
+            status = _repoground_manifest_summary(pinned.manifest_path)
+            if (
+                status.get("manifest_sha256") != pinned.manifest_sha256
+                or status.get("stem") != pinned.stem
+                or status.get("publication_run_id") != pinned.publication_run_id
+            ):
+                raise ValueError("selected RepoGround publication changed")
             candidate, source_kind, _source_ref = _repoground_freshness_source(
                 repo, status
             )
@@ -11451,7 +11640,7 @@ def _repoground_working_repo(
             raise ValueError("repository checkout is missing or invalid") from exc
         if source_kind != "publication_source_checkout":
             raise ValueError("repository checkout is missing or invalid")
-        return candidate, pinned_stem
+        return candidate, pinned
 
     candidate = root / repo
     resolved = candidate.resolve(strict=False)
@@ -11462,7 +11651,7 @@ def _repoground_working_repo(
         or candidate.is_symlink()
     ):
         raise ValueError("repository checkout is missing or invalid")
-    return candidate, stem
+    return candidate, None
 
 
 def _repoground_resolve_commit(repo_path: Path, revision: str) -> str:
@@ -12118,7 +12307,7 @@ def repoground_context_compose(
     if query is not None and (not isinstance(query, str) or not query.strip() or len(query) > 500):
         raise ValueError("query must be a non-empty string up to 500 characters when provided")
 
-    repo_path, pinned_stem = _repoground_working_repo(repo, stem)
+    repo_path, pinned_publication = _repoground_working_repo(repo, stem)
     base_commit = _repoground_resolve_commit(repo_path, base_revision)
     target_commit = _repoground_resolve_commit(repo_path, target_revision)
     changes, diff_sha256 = _repoground_revision_changes(repo_path, base_commit, target_commit)
@@ -12161,7 +12350,12 @@ def repoground_context_compose(
             "does_not_establish": ["truth", "completeness", "patch_correctness", "test_sufficiency", "merge_readiness", "runtime_behavior"],
         }
 
-    freshness, selected_stem, manifest_path, selection_error = _repoground_selected_manifest_for_repo(repo, pinned_stem)
+    selection_token = (
+        pinned_publication if pinned_publication is not None else stem
+    )
+    freshness, selected_stem, manifest_path, selection_error = (
+        _repoground_selected_manifest_for_repo(repo, selection_token)
+    )
     if selection_error is not None or manifest_path is None:
         return {
             "kind": "grabowski.repoground_context_compose",
@@ -12185,6 +12379,13 @@ def repoground_context_compose(
             "does_not_establish": ["truth", "completeness", "patch_correctness", "test_sufficiency", "merge_readiness", "runtime_behavior"],
         }
 
+    selected_publication = (
+        pinned_publication
+        if pinned_publication is not None
+        else _repoground_pin_publication_from_selection(
+            manifest_path, selected_stem, freshness
+        )
+    )
     changed_paths = [str(item["path"]) for item in changes]
     diff_local_symbols, diff_locality = _repoground_diff_local_symbols(
         repo_path, base_commit, target_commit, changes
@@ -12193,7 +12394,7 @@ def repoground_context_compose(
     baseline = repoground_context_pack(
         repo,
         task_profile=task_profile,
-        stem=selected_stem,
+        stem=selected_publication,
         query=effective_query,
         k=min(max(len(changed_paths), 1), 10),
         max_snippets=_REPOGROUND_CONTEXT_LANE_CONFIG["query_snippets"]["max_items"],
