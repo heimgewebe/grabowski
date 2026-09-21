@@ -11511,29 +11511,44 @@ def _repoground_target_hunk_ranges(
     target_commit: str,
     changes: list[dict[str, Any]],
 ) -> tuple[dict[str, list[tuple[int, int]]], dict[str, Any]]:
-    python_paths = [
-        str(item["path"])
+    all_python_changes = [
+        item
         for item in changes
         if isinstance(item.get("path"), str)
         and str(item["path"]).endswith(".py")
         and not _repoground_path_looks_like_test(str(item["path"]))
-        and not str(item.get("status", "")).startswith("D")
     ]
-    considered = python_paths[:_REPOGROUND_DIFF_LOCALITY_MAX_PYTHON_PATHS]
+    python_changes = [
+        item
+        for item in all_python_changes
+        if not str(item.get("status", "")).startswith("D")
+    ]
+    deleted_python_path_count = len(all_python_changes) - len(python_changes)
+    considered = python_changes[:_REPOGROUND_DIFF_LOCALITY_MAX_PYTHON_PATHS]
     ranges_by_path: dict[str, list[tuple[int, int]]] = {}
     errors: list[dict[str, str]] = []
-    for path in considered:
+    targetless_hunk_count = 0
+    for item in considered:
+        path = str(item["path"])
+        diff_paths = [path]
+        previous_path = item.get("previous_path")
+        if (
+            str(item.get("status", "")).startswith("R")
+            and isinstance(previous_path, str)
+        ):
+            diff_paths = [previous_path, path]
         rc, patch, err = _repoground_git(
             repo_path,
             [
                 "diff",
                 "--unified=0",
+                "--find-renames",
                 "--no-color",
                 "--no-ext-diff",
                 base_commit,
                 target_commit,
                 "--",
-                path,
+                *diff_paths,
             ],
         )
         if rc != 0:
@@ -11548,13 +11563,17 @@ def _repoground_target_hunk_ranges(
             count = int(match.group(2) or "1")
             if count:
                 ranges.append((start, start + count - 1))
+            else:
+                targetless_hunk_count += 1
         if ranges:
             ranges_by_path[path] = ranges
     return ranges_by_path, {
-        "python_changed_path_count": len(python_paths),
+        "python_changed_path_count": len(all_python_changes),
         "python_considered_path_count": len(considered),
-        "python_omitted_path_count": max(0, len(python_paths) - len(considered)),
+        "python_omitted_path_count": max(0, len(python_changes) - len(considered)),
+        "deleted_python_path_count": deleted_python_path_count,
         "hunk_path_count": len(ranges_by_path),
+        "targetless_hunk_count": targetless_hunk_count,
         "errors": errors,
     }
 
@@ -11571,7 +11590,7 @@ def _repoground_diff_local_symbols(
     candidates_by_path: dict[str, list[dict[str, Any]]] = {}
     errors = list(metadata["errors"])
     for path, ranges in sorted(ranges_by_path.items()):
-        rc, source, err = _repoground_git(
+        rc, source_text, err = _repoground_git(
             repo_path,
             ["show", f"{target_commit}:{path}"],
             preserve_stdout=True,
@@ -11580,10 +11599,15 @@ def _repoground_diff_local_symbols(
             errors.append({"path": path, "reason": err or f"git_show_rc_{rc}"})
             continue
         try:
-            tree = ast.parse(source, filename=path)
+            tree = ast.parse(source_text, filename=path)
         except (SyntaxError, ValueError, TypeError) as exc:
             errors.append({"path": path, "reason": type(exc).__name__})
             continue
+
+        parents: dict[ast.AST, ast.AST] = {}
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                parents[child] = parent
 
         matches: list[tuple[int, int, int, str, dict[str, Any]]] = []
         for node in ast.walk(tree):
@@ -11591,10 +11615,11 @@ def _repoground_diff_local_symbols(
                 node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
             ):
                 continue
-            start = int(node.lineno)
+            definition_start = int(node.lineno)
+            syntax_start = definition_start
             if node.decorator_list:
-                start = min(
-                    start,
+                syntax_start = min(
+                    syntax_start,
                     *(
                         int(decorator.lineno)
                         for decorator in node.decorator_list
@@ -11605,10 +11630,20 @@ def _repoground_diff_local_symbols(
             overlaps = [
                 range_start
                 for range_start, range_end in ranges
-                if start <= range_end and end >= range_start
+                if syntax_start <= range_end and end >= range_start
             ]
             if not overlaps:
                 continue
+
+            scope: list[str] = []
+            parent = parents.get(node)
+            while parent is not None:
+                if isinstance(
+                    parent, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+                ):
+                    scope.append(parent.name)
+                parent = parents.get(parent)
+            qualified_name = ".".join([*reversed(scope), node.name])
             kind = (
                 "class"
                 if isinstance(node, ast.ClassDef)
@@ -11619,16 +11654,22 @@ def _repoground_diff_local_symbols(
             item = {
                 "kind": kind,
                 "name": node.name,
-                "qualified_name": node.name,
+                "qualified_name": qualified_name,
                 "path": path,
-                "start_line": start,
+                "start_line": definition_start,
                 "end_line": end,
-                "range_ref": f"file:{path}#L{start}-L{end}",
+                "range_ref": f"file:{path}#L{definition_start}-L{end}",
                 "evidence_type": "git_diff_target_overlap",
                 "authority": "target_git_tree_ast",
             }
             matches.append(
-                (min(overlaps), end - start, start, str(node.name), item)
+                (
+                    min(overlaps),
+                    end - definition_start,
+                    definition_start,
+                    qualified_name,
+                    item,
+                )
             )
         if matches:
             matches.sort(key=lambda value: value[:4])
@@ -11658,10 +11699,16 @@ def _repoground_diff_local_symbols(
             add(item)
 
     omitted = int(metadata["python_omitted_path_count"])
+    deleted_paths = int(metadata["deleted_python_path_count"])
+    targetless_hunks = int(metadata["targetless_hunk_count"])
     metadata.update(
         {
             "schema_version": 1,
-            "status": "partial" if errors or omitted else "available",
+            "status": (
+                "partial"
+                if errors or omitted or deleted_paths or targetless_hunks
+                else "available"
+            ),
             "authority": "target_git_tree_ast_and_name_status",
             "language_scope": ["python"],
             "target_commit": target_commit,
@@ -11672,6 +11719,8 @@ def _repoground_diff_local_symbols(
             "errors": errors[:8],
             "does_not_establish": [
                 "non_python_symbol_locality",
+                "deleted_python_symbol_locality",
+                "pure_deletion_symbol_locality",
                 "runtime_reachability",
                 "test_sufficiency",
                 "complete_change_impact",
@@ -12080,7 +12129,7 @@ def repoground_context_compose(
                 "hard_limit_applies_to": "context",
                 "lane_counts": blocked_lane_counts,
             },
-            "retrieval_lanes": {"used": ["direct_changes"], "skipped": ["agent_impact", "query_context", "entry_manifest", "pr_delta_cards", "symbol_navigation", "call_graph", "citation", "live_evidence"]},
+            "retrieval_lanes": {"used": ["direct_changes"], "skipped": ["agent_impact", "query_context", "entry_manifest", "pr_delta_cards", "diff_locality", "symbol_navigation", "call_graph", "citation", "live_evidence"]},
             "stop_criteria": {"triggered": ["diff_sha256_mismatch"], "available": ["publication_unavailable", "impact_context_blocked", "budget_exhausted"]},
             "does_not_establish": ["truth", "completeness", "patch_correctness", "test_sufficiency", "merge_readiness", "runtime_behavior"],
         }
@@ -12104,7 +12153,7 @@ def repoground_context_compose(
                 "hard_limit_applies_to": "context",
                 "lane_counts": blocked_lane_counts,
             },
-            "retrieval_lanes": {"used": ["direct_changes"], "skipped": ["agent_impact", "query_context", "entry_manifest", "pr_delta_cards", "symbol_navigation", "call_graph", "citation", "live_evidence"]},
+            "retrieval_lanes": {"used": ["direct_changes"], "skipped": ["agent_impact", "query_context", "entry_manifest", "pr_delta_cards", "diff_locality", "symbol_navigation", "call_graph", "citation", "live_evidence"]},
             "stop_criteria": {"triggered": ["publication_unavailable"], "available": ["diff_sha256_mismatch", "impact_context_blocked", "budget_exhausted"]},
             "does_not_establish": ["truth", "completeness", "patch_correctness", "test_sufficiency", "merge_readiness", "runtime_behavior"],
         }

@@ -3069,6 +3069,191 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
         self.assertNotIn("symbol_navigation", result["retrieval_lanes"]["used"])
         self.assertIn("symbol_navigation", result["retrieval_lanes"]["skipped"])
 
+    def test_diff_local_symbols_do_not_treat_pure_rename_as_content_change(self) -> None:
+        self._write_bundle_and_repo("rename-repo")
+        repo = self.home / "repos" / "rename-repo"
+        old_path = repo / "old.py"
+        old_path.write_text(
+            "def alpha():\n    return 1\n\ndef beta():\n    return 2\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "old.py"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add python"],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        base = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+        ).strip()
+        subprocess.run(["git", "mv", "old.py", "new.py"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "rename python"],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        target = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+        ).strip()
+
+        changes, _diff_sha256 = mcp._repoground_revision_changes(repo, base, target)
+        symbols, locality = mcp._repoground_diff_local_symbols(
+            repo, base, target, changes
+        )
+
+        self.assertEqual(changes[0]["status"], "R100")
+        self.assertEqual(symbols, [])
+        self.assertEqual(locality["hunk_path_count"], 0)
+        self.assertEqual(locality["status"], "available")
+
+    def test_diff_local_symbols_mark_pure_deletion_locality_partial(self) -> None:
+        self._write_bundle_and_repo("deletion-repo")
+        repo = self.home / "repos" / "deletion-repo"
+        path = repo / "app.py"
+        path.write_text(
+            "def f():\n    x = 1\n    y = 2\n    return x\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "app.py"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add python"],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        base = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+        ).strip()
+        path.write_text(
+            "def f():\n    x = 1\n    return x\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "app.py"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "delete line"],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        target = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+        ).strip()
+
+        changes, _diff_sha256 = mcp._repoground_revision_changes(repo, base, target)
+        symbols, locality = mcp._repoground_diff_local_symbols(
+            repo, base, target, changes
+        )
+
+        self.assertEqual(symbols, [])
+        self.assertEqual(locality["targetless_hunk_count"], 1)
+        self.assertEqual(locality["status"], "partial")
+        self.assertIn(
+            "pure_deletion_symbol_locality", locality["does_not_establish"]
+        )
+
+    def test_diff_local_symbols_mark_deleted_python_path_partial(self) -> None:
+        self._write_bundle_and_repo("deleted-file-repo")
+        repo = self.home / "repos" / "deleted-file-repo"
+        path = repo / "gone.py"
+        path.write_text("def gone():\n    return 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "gone.py"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add python"],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        base = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+        ).strip()
+        path.unlink()
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "delete python"],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        target = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+        ).strip()
+
+        changes, _diff_sha256 = mcp._repoground_revision_changes(repo, base, target)
+        symbols, locality = mcp._repoground_diff_local_symbols(
+            repo, base, target, changes
+        )
+
+        self.assertEqual(symbols, [])
+        self.assertEqual(locality["python_changed_path_count"], 1)
+        self.assertEqual(locality["deleted_python_path_count"], 1)
+        self.assertEqual(locality["status"], "partial")
+        self.assertIn(
+            "deleted_python_symbol_locality", locality["does_not_establish"]
+        )
+
+    def test_diff_local_symbols_preserve_nested_identity_and_definition_range(self) -> None:
+        self._write_bundle_and_repo("nested-repo")
+        repo = self.home / "repos" / "nested-repo"
+        path = repo / "app.py"
+        path.write_text(
+            "@decorate\n"
+            "def outer():\n"
+            "    def inner():\n"
+            "        return 1\n"
+            "    return inner()\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "app.py"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add nested python"],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        base = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+        ).strip()
+        path.write_text(
+            "@decorate_changed\n"
+            "def outer():\n"
+            "    def inner():\n"
+            "        return 2\n"
+            "    return inner()\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "app.py"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "change nested python"],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        target = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+        ).strip()
+
+        changes, _diff_sha256 = mcp._repoground_revision_changes(repo, base, target)
+        symbols, locality = mcp._repoground_diff_local_symbols(
+            repo, base, target, changes
+        )
+
+        by_name = {item["qualified_name"]: item for item in symbols}
+        self.assertEqual(set(by_name), {"outer", "outer.inner"})
+        self.assertEqual(by_name["outer"]["start_line"], 2)
+        self.assertEqual(by_name["outer"]["range_ref"], "file:app.py#L2-L5")
+        self.assertEqual(by_name["outer.inner"]["start_line"], 3)
+        self.assertEqual(locality["status"], "available")
+
     def test_context_compose_does_not_claim_call_graph_lane_for_architecture_relations(self) -> None:
         base, target = self._composer_fixture()
         impact = self._composer_impact()
@@ -3382,6 +3567,7 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
         self.assertEqual(result["reason"], "diff_sha256_mismatch")
         self.assertIn("diff_sha256_mismatch", result["stop_criteria"]["triggered"])
         self.assertEqual(result["retrieval_lanes"]["used"], ["direct_changes"])
+        self.assertIn("diff_locality", result["retrieval_lanes"]["skipped"])
 
     def test_context_compose_keeps_dirty_overlay_separate_from_revision_diff(self) -> None:
         base, target = self._composer_fixture()
