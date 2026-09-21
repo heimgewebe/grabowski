@@ -1654,6 +1654,153 @@ class RepoGroundBundleToolTests(unittest.TestCase):
         self.assertNotIn("merger.lenskit", command[3])
         self.assertTrue(result["available"])
 
+    def test_core_manifest_binding_holds_snapshot_across_aba_rewrite(self) -> None:
+        repoground_repo = self.home / "repos" / "repoground"
+        core = repoground_repo / "merger" / "repoground" / "core"
+        core.mkdir(parents=True)
+        for package in (
+            repoground_repo / "merger",
+            repoground_repo / "merger" / "repoground",
+            core,
+        ):
+            (package / "__init__.py").write_text("", encoding="utf-8")
+
+        (core / "manifest_snapshot.py").write_text(
+            """
+from contextlib import contextmanager
+from dataclasses import dataclass
+import hashlib
+import json
+import os
+from pathlib import Path
+
+_ACTIVE = {}
+
+
+class ManifestBindingError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class ManifestBinding:
+    selected_path: str
+    resolved_path: str
+    sha256: str
+    run_id: str
+
+
+def manifest_path_identity(value):
+    return os.path.abspath(os.fspath(Path(value).expanduser()))
+
+
+def active_manifest_bytes(path):
+    return _ACTIVE.get(manifest_path_identity(path))
+
+
+@contextmanager
+def use_manifest_binding(binding):
+    data = Path(binding.selected_path).read_bytes()
+    if hashlib.sha256(data).hexdigest() != binding.sha256:
+        raise ManifestBindingError("digest mismatch")
+    if json.loads(data.decode("utf-8")).get("run_id") != binding.run_id:
+        raise ManifestBindingError("run id mismatch")
+    _ACTIVE[binding.selected_path] = data
+    try:
+        yield
+    finally:
+        _ACTIVE.pop(binding.selected_path, None)
+        final = Path(binding.selected_path).read_bytes()
+        if hashlib.sha256(final).hexdigest() != binding.sha256:
+            raise ManifestBindingError("final digest mismatch")
+""".lstrip(),
+            encoding="utf-8",
+        )
+        (core / "bundle_access.py").write_text(
+            """
+import hashlib
+import json
+from pathlib import Path
+from .manifest_snapshot import active_manifest_bytes
+
+
+def query_existing_index(
+    manifest,
+    query,
+    *,
+    k,
+    filters,
+    resolve_evidence,
+    project_sources,
+):
+    path = Path(manifest)
+    original = path.read_bytes()
+    changed = json.loads(original.decode("utf-8"))
+    changed["revision"] = "B"
+    path.write_text(json.dumps(changed, sort_keys=True), encoding="utf-8")
+    try:
+        bound = active_manifest_bytes(manifest)
+        observed = bound if bound is not None else path.read_bytes()
+        observed_sha256 = hashlib.sha256(observed).hexdigest()
+    finally:
+        path.write_bytes(original)
+    return {
+        "status": "available",
+        "structured_evidence": {
+            "observed_manifest_sha256": observed_sha256,
+        },
+        "mutation_boundary": {
+            "writes": [],
+            "read_paths_do_not_refresh": True,
+        },
+    }
+""".lstrip(),
+            encoding="utf-8",
+        )
+        (core / "mcp_tools.py").write_text("", encoding="utf-8")
+
+        manifest = self.merges / "aba_merge.bundle.manifest.json"
+        original = json.dumps(
+            {"run_id": "run-a", "revision": "A"},
+            sort_keys=True,
+        ).encode("utf-8")
+        manifest.write_bytes(original)
+        expected_sha256 = hashlib.sha256(original).hexdigest()
+        binding = {
+            "selected_path": str(manifest.absolute()),
+            "resolved_path": str(manifest.resolve()),
+            "sha256": expected_sha256,
+            "run_id": "run-a",
+        }
+
+        with (
+            patch.object(mcp, "_repoground_repo", return_value=(repoground_repo, None)),
+            patch.object(
+                mcp,
+                "_repoground_core_manifest_binding",
+                return_value=binding,
+            ),
+        ):
+            result = mcp._repoground_core_json(
+                "query_existing_index",
+                manifest,
+                {
+                    "query": "target",
+                    "k": 5,
+                    "filters": {},
+                    "resolve_evidence": True,
+                    "project_sources": True,
+                },
+                expected_manifest_sha256=expected_sha256,
+            )
+
+        self.assertEqual(result["status"], "available")
+        self.assertTrue(result["available"])
+        self.assertEqual(
+            result["structured_evidence"]["observed_manifest_sha256"],
+            expected_sha256,
+        )
+        self.assertEqual(hashlib.sha256(manifest.read_bytes()).hexdigest(), expected_sha256)
+
 
 class RepoGroundContextBridgeToolTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -1865,7 +2012,14 @@ class RepoGroundContextBridgeToolTests(unittest.TestCase):
         captured = {}
 
         def fake_query(
-            _manifest, _query, *, k, filters, resolve_evidence, project_sources
+            _manifest,
+            _query,
+            *,
+            k,
+            filters,
+            resolve_evidence,
+            project_sources,
+            expected_manifest_sha256=None,
         ):
             captured.update(
                 {
@@ -1873,6 +2027,7 @@ class RepoGroundContextBridgeToolTests(unittest.TestCase):
                     "filters": filters,
                     "resolve_evidence": resolve_evidence,
                     "project_sources": project_sources,
+                    "expected_manifest_sha256": expected_manifest_sha256,
                 }
             )
             return {"status": "available", "query_result": {"results": []}}
@@ -2543,6 +2698,36 @@ class RepoGroundContextBridgeToolTests(unittest.TestCase):
         ):
             package.write_text("", encoding="utf-8")
         (core / "mcp_tools.py").write_text("", encoding="utf-8")
+        (core / "manifest_snapshot.py").write_text(
+            """
+from contextlib import contextmanager
+from dataclasses import dataclass
+import os
+from pathlib import Path
+
+
+class ManifestBindingError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class ManifestBinding:
+    selected_path: str
+    resolved_path: str
+    sha256: str
+    run_id: str
+
+
+def manifest_path_identity(value):
+    return os.path.abspath(os.fspath(Path(value).expanduser()))
+
+
+@contextmanager
+def use_manifest_binding(_binding):
+    yield
+""".lstrip(),
+            encoding="utf-8",
+        )
         (core / "bundle_access.py").write_text(
             """
 def query_existing_index(manifest, query, *, k, filters, resolve_evidence, project_sources):
