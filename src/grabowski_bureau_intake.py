@@ -1720,8 +1720,6 @@ def _task_publication_apply_arguments(
             "--apply",
             "--lease-binding",
             str(binding_path),
-            "--resource-db",
-            str(resources.RESOURCE_DB),
             "--workspace-root",
             str(workspace_root),
             "--receipt",
