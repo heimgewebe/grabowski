@@ -1658,6 +1658,12 @@ def _task_publication_lease_metadata(
         return metadata
     if publication_mode != "state_store" or not isinstance(required, dict):
         raise ValueError("publication-lease-metadata-contract-invalid")
+    required_keys = set(required)
+    standard_keys = set(metadata)
+    if required_keys == standard_keys:
+        if required != metadata:
+            raise ValueError("publication-lease-metadata-contract-invalid")
+        return metadata
     expected_keys = {
         "authority_kind",
         "first_task_onboarding_sha256",
