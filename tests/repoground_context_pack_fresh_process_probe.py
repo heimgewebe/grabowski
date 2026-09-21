@@ -81,6 +81,7 @@ def main(argv: list[str]) -> int:
             task_profile,
             max_context_tokens,
             k,
+            expected_manifest_sha256=None,
         ):
             if query != expected_query or k != expected_k:
                 raise RuntimeError("fresh-process query binding mismatch")
