@@ -341,6 +341,86 @@ class DeploymentAdmissionGateTests(unittest.TestCase):
         self.assertNotEqual(caller_thread, result["thread_id"])
         self.assertEqual(0, operator._deployment_admission_active_tool_calls())
 
+    def test_gate_sync_repoground_consultation_logs_only_tool_name(self) -> None:
+        operator = _load_operator_module()
+        operator.mcp._tool_manager.get_tool = lambda _name: _sync_tool()
+        operator._configure_http_runtime()
+        arguments = {
+            "repo": "private-repository-name",
+            "query": "private query contents",
+        }
+
+        with self.assertLogs(operator.__name__, level="INFO") as captured:
+            result = asyncio.run(
+                operator.mcp._tool_manager.call_tool(
+                    "repoground_context_pack",
+                    arguments,
+                )
+            )
+
+        self.assertTrue(result["called"])
+        output = "\n".join(captured.output)
+        self.assertIn(
+            "repoground-consultation-dispatched "
+            "tool=repoground_context_pack "
+            "source=mcp-tool-boundary arguments_logged=false",
+            output,
+        )
+        self.assertNotIn("private-repository-name", output)
+        self.assertNotIn("private query contents", output)
+        self.assertEqual(0, operator._deployment_admission_active_tool_calls())
+
+    def test_gate_async_repoground_consultation_is_recorded_at_dispatch(self) -> None:
+        operator = _load_operator_module()
+
+        async def called(*args, **kwargs):
+            return {"called": True}
+
+        operator.mcp._tool_manager.call_tool = called
+        operator.mcp._tool_manager.get_tool = lambda _name: _async_tool()
+        operator._configure_http_runtime()
+
+        with self.assertLogs(operator.__name__, level="INFO") as captured:
+            result = asyncio.run(
+                operator.mcp._tool_manager.call_tool(
+                    "repoground_query",
+                    {"repo": "private", "query": "private"},
+                )
+            )
+
+        self.assertTrue(result["called"])
+        output = "\n".join(captured.output)
+        self.assertIn(
+            "repoground-consultation-dispatched "
+            "tool=repoground_query "
+            "source=mcp-tool-boundary arguments_logged=false",
+            output,
+        )
+        self.assertNotIn("repo=private", output)
+        self.assertNotIn("query=private", output)
+
+    def test_gate_rejected_repoground_call_is_not_recorded_as_consultation(
+        self,
+    ) -> None:
+        operator = _load_operator_module()
+        operator.mcp._tool_manager.get_tool = lambda _name: _sync_tool()
+        with patch.object(
+            operator.base,
+            "_transport_authorize_connector_tool",
+            side_effect=RuntimeError("connector rejected"),
+        ), patch.object(
+            operator, "_record_repoground_consultation"
+        ) as record:
+            operator._configure_http_runtime()
+            with self.assertRaisesRegex(RuntimeError, "connector rejected"):
+                asyncio.run(
+                    operator.mcp._tool_manager.call_tool(
+                        "repoground_context_pack",
+                        {"repo": "private"},
+                    )
+                )
+        record.assert_not_called()
+
     def test_gate_sync_tool_exception_releases_by_identity(self) -> None:
         operator = _load_operator_module()
 
