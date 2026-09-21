@@ -1640,13 +1640,13 @@ def _repoground_consultation_tool_name(tool_name: Any) -> str | None:
 
 
 def _record_repoground_consultation(tool_name: Any) -> None:
-    """Record dispatch-only RepoGround consultation without arguments or content."""
+    """Record one successfully completed RepoGround consultation without content."""
     name = _repoground_consultation_tool_name(tool_name)
     if name is None:
         return
     logging.getLogger(__name__).info(
-        "repoground-consultation-dispatched "
-        "tool=%s source=mcp-tool-boundary arguments_logged=false",
+        "repoground-consultation-completed "
+        "tool=%s source=mcp-tool-boundary arguments_logged=false outcome=success",
         name,
     )
 
@@ -1840,8 +1840,9 @@ def _run_sync_tool_call_observed(
     kwargs: dict[str, Any],
     tool_name: Any,
 ) -> Any:
+    result = _run_sync_tool_call(original, args, kwargs)
     _record_repoground_consultation(tool_name)
-    return _run_sync_tool_call(original, args, kwargs)
+    return result
 
 
 async def _begin_fence_enforcement_async(
@@ -2340,8 +2341,8 @@ def _install_deployment_admission_gate() -> None:
                         )
                     raise
             try:
-                _record_repoground_consultation(tool_name)
                 result = await original(*args, **kwargs)
+                _record_repoground_consultation(tool_name)
             except BaseException as error:
                 if effect_admission is not None:
                     if fence_token is not None:

@@ -361,9 +361,9 @@ class DeploymentAdmissionGateTests(unittest.TestCase):
         self.assertTrue(result["called"])
         output = "\n".join(captured.output)
         self.assertIn(
-            "repoground-consultation-dispatched "
+            "repoground-consultation-completed "
             "tool=repoground_context_pack "
-            "source=mcp-tool-boundary arguments_logged=false",
+            "source=mcp-tool-boundary arguments_logged=false outcome=success",
             output,
         )
         self.assertNotIn("private-repository-name", output)
@@ -391,9 +391,9 @@ class DeploymentAdmissionGateTests(unittest.TestCase):
         self.assertTrue(result["called"])
         output = "\n".join(captured.output)
         self.assertIn(
-            "repoground-consultation-dispatched "
+            "repoground-consultation-completed "
             "tool=repoground_query "
-            "source=mcp-tool-boundary arguments_logged=false",
+            "source=mcp-tool-boundary arguments_logged=false outcome=success",
             output,
         )
         self.assertNotIn("repo=private", output)
@@ -419,6 +419,42 @@ class DeploymentAdmissionGateTests(unittest.TestCase):
                         {"repo": "private"},
                     )
                 )
+        record.assert_not_called()
+
+    def test_gate_schema_rejected_repoground_call_is_not_recorded_as_consultation(
+        self,
+    ) -> None:
+        try:
+            from mcp.server.fastmcp import FastMCP as RealFastMCP
+            from mcp.types import ToolAnnotations as RealToolAnnotations
+        except ImportError:
+            self.skipTest("real FastMCP unavailable in dependency-free validation")
+
+        real_mcp = RealFastMCP("repoground-schema-rejection-probe")
+
+        @real_mcp.tool(
+            name="repoground_context_pack",
+            annotations=RealToolAnnotations(readOnlyHint=True),
+        )
+        def probe(repo: str) -> dict[str, str]:
+            return {"repo": repo}
+
+        operator = _load_operator_module()
+        operator.mcp._tool_manager.call_tool = real_mcp._tool_manager.call_tool
+        operator.mcp._tool_manager.get_tool = real_mcp._tool_manager.get_tool
+        operator._configure_http_runtime()
+
+        with patch.object(
+            operator, "_record_repoground_consultation"
+        ) as record:
+            with self.assertRaises(Exception):
+                asyncio.run(
+                    operator.mcp._tool_manager.call_tool(
+                        "repoground_context_pack",
+                        {"unexpected": "schema-rejected"},
+                    )
+                )
+
         record.assert_not_called()
 
     def test_gate_sync_tool_exception_releases_by_identity(self) -> None:
