@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
@@ -350,7 +351,9 @@ class DeploymentAdmissionGateTests(unittest.TestCase):
             "query": "private query contents",
         }
 
-        with self.assertLogs(operator.__name__, level="INFO") as captured:
+        with patch.object(operator.logging, "getLogger", side_effect=AssertionError(
+            "consultation telemetry must not depend on Python logger configuration"
+        )), patch.object(operator.sys, "stderr", io.StringIO()) as captured:
             result = asyncio.run(
                 operator.mcp._tool_manager.call_tool(
                     "repoground_context_pack",
@@ -359,7 +362,7 @@ class DeploymentAdmissionGateTests(unittest.TestCase):
             )
 
         self.assertTrue(result["called"])
-        output = "\n".join(captured.output)
+        output = captured.getvalue()
         self.assertIn(
             "repoground-consultation-completed "
             "tool=repoground_context_pack "
@@ -370,7 +373,7 @@ class DeploymentAdmissionGateTests(unittest.TestCase):
         self.assertNotIn("private query contents", output)
         self.assertEqual(0, operator._deployment_admission_active_tool_calls())
 
-    def test_gate_async_repoground_consultation_is_recorded_at_dispatch(self) -> None:
+    def test_gate_async_repoground_consultation_is_recorded_after_success(self) -> None:
         operator = _load_operator_module()
 
         async def called(*args, **kwargs):
@@ -380,7 +383,7 @@ class DeploymentAdmissionGateTests(unittest.TestCase):
         operator.mcp._tool_manager.get_tool = lambda _name: _async_tool()
         operator._configure_http_runtime()
 
-        with self.assertLogs(operator.__name__, level="INFO") as captured:
+        with patch.object(operator.sys, "stderr", io.StringIO()) as captured:
             result = asyncio.run(
                 operator.mcp._tool_manager.call_tool(
                     "repoground_query",
@@ -389,7 +392,7 @@ class DeploymentAdmissionGateTests(unittest.TestCase):
             )
 
         self.assertTrue(result["called"])
-        output = "\n".join(captured.output)
+        output = captured.getvalue()
         self.assertIn(
             "repoground-consultation-completed "
             "tool=repoground_query "
@@ -398,6 +401,25 @@ class DeploymentAdmissionGateTests(unittest.TestCase):
         )
         self.assertNotIn("repo=private", output)
         self.assertNotIn("query=private", output)
+
+    def test_repoground_consultation_telemetry_is_best_effort(self) -> None:
+        operator = _load_operator_module()
+
+        class BrokenStderr:
+            def write(self, _text):
+                raise OSError("journal unavailable")
+
+            def flush(self):
+                raise OSError("journal unavailable")
+
+        with patch.object(operator.sys, "stderr", BrokenStderr()):
+            operator._record_repoground_consultation("repoground_query")
+
+    def test_repoground_consultation_ignores_non_repoground_tools(self) -> None:
+        operator = _load_operator_module()
+        with patch.object(operator.sys, "stderr", io.StringIO()) as captured:
+            operator._record_repoground_consultation("grabowski_read_text")
+        self.assertEqual("", captured.getvalue())
 
     def test_gate_rejected_repoground_call_is_not_recorded_as_consultation(
         self,
