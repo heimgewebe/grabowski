@@ -5829,6 +5829,7 @@ class TaskTests(unittest.TestCase):
                 "snapshot",
                 "cursor_and_query",
                 "page_setup_total",
+                "terminal_evidence_filter",
                 "observation",
                 "serialization",
                 "total",
@@ -7746,6 +7747,122 @@ class TaskTests(unittest.TestCase):
             result = tasks.reconcile_tasks_check()
         self.assertEqual(result["scanned"], 0)
         observe.assert_not_called()
+
+    def test_reconcile_check_bulk_reads_terminal_evidence_once_per_page(self) -> None:
+        terminal_tasks = [self._start()["task"] for _ in range(3)]
+        for index, record in enumerate(terminal_tasks):
+            tasks._set_state(
+                str(record["task_id"]),
+                "failed",
+                observation={
+                    "state": "failed",
+                    "source": f"bulk-terminal-evidence-{index}",
+                },
+            )
+
+        with patch.object(
+            tasks.resources,
+            "task_terminalization_records",
+            wraps=tasks.resources.task_terminalization_records,
+        ) as bulk_read, patch.object(
+            tasks.resources,
+            "task_terminalization_record",
+            side_effect=AssertionError(
+                "global page filter must not perform per-task terminalization reads"
+            ),
+        ):
+            result = tasks.reconcile_tasks_check(limit=3)
+
+        self.assertEqual(0, result["scanned"])
+        bulk_read.assert_called_once()
+        requested_ids = bulk_read.call_args.args[0]
+        self.assertEqual(
+            {str(record["task_id"]) for record in terminal_tasks},
+            set(requested_ids),
+        )
+        self.assertTrue(bulk_read.call_args.kwargs["include_projection"])
+        self.assertIn(
+            "terminal_evidence_filter",
+            result["pagination"]["timings_ms"],
+        )
+        self.assertGreaterEqual(
+            result["pagination"]["timings_ms"]["terminal_evidence_filter"],
+            0.0,
+        )
+
+    def test_reconcile_check_limit_stays_within_bulk_terminalization_bound(
+        self,
+    ) -> None:
+        too_many_terminal_ids = [f"{index:024x}" for index in range(501)]
+        with self.assertRaisesRegex(
+            ValueError,
+            "task_ids must contain at most 500 unique task ids",
+        ):
+            tasks.resources.task_terminalization_records(too_many_terminal_ids)
+
+        max_page_terminal_ids = [
+            f"{index:024x}"
+            for index in range(tasks.TASK_RECONCILE_CHECK_LIMIT)
+        ]
+        self.assertEqual(
+            {},
+            tasks.resources.task_terminalization_records(max_page_terminal_ids),
+        )
+
+        self.assertLessEqual(tasks.TASK_RECONCILE_CHECK_LIMIT, 500)
+        with self.assertRaisesRegex(ValueError, "limit must be between 1 and 200"):
+            tasks.reconcile_tasks_check(
+                limit=tasks.TASK_RECONCILE_CHECK_LIMIT + 1,
+            )
+
+    def test_reconcile_check_bulk_missing_terminal_evidence_keeps_mixed_page(
+        self,
+    ) -> None:
+        terminal = self._start()["task"]
+        running = self._start()["task"]
+        terminal_id = str(terminal["task_id"])
+        running_id = str(running["task_id"])
+        tasks._set_state(
+            terminal_id,
+            "failed",
+            observation={"state": "failed", "source": "missing-bulk-evidence"},
+        )
+        with sqlite3.connect(self.resource_database) as connection:
+            connection.execute(
+                "DELETE FROM task_terminalizations WHERE task_id=?",
+                (terminal_id,),
+            )
+            connection.commit()
+
+        def observation(record: dict[str, object]) -> dict[str, object]:
+            return {
+                "state": record["state"],
+                "properties": {},
+                "probe": None,
+                "observer": {"kind": "test"},
+                "observed_at_unix": 204,
+            }
+
+        with patch.object(
+            tasks,
+            "_reconcile_observation",
+            side_effect=observation,
+        ), patch.object(
+            tasks.resources,
+            "task_terminalization_records",
+            wraps=tasks.resources.task_terminalization_records,
+        ) as bulk_read:
+            result = tasks.reconcile_tasks_check(limit=2)
+
+        self.assertEqual(2, result["scanned"])
+        self.assertEqual(2, result["pagination"]["returned"])
+        self.assertEqual(
+            {terminal_id, running_id},
+            {str(item["task_id"]) for item in result["observations"]},
+        )
+        bulk_read.assert_called_once()
+        self.assertEqual([terminal_id], bulk_read.call_args.args[0])
+        self.assertTrue(bulk_read.call_args.kwargs["include_projection"])
 
     def test_reconcile_resume_requires_reason(self) -> None:
         with self.assertRaisesRegex(ValueError, "reason is required"):

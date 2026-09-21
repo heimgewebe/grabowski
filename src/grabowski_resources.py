@@ -3611,6 +3611,35 @@ def task_terminalization_record(
     )
 
 
+def task_terminalization_records(
+    task_ids: Iterable[str], *, include_projection: bool = False
+) -> dict[str, dict[str, Any]]:
+    identifiers: list[str] = []
+    seen: set[str] = set()
+    for task_id in task_ids:
+        identifier = _task_identifier(task_id)
+        if identifier in seen:
+            continue
+        if len(identifiers) >= 500:
+            raise ValueError("task_ids must contain at most 500 unique task ids")
+        seen.add(identifier)
+        identifiers.append(identifier)
+    if not identifiers:
+        return {}
+    placeholders = ",".join("?" for _ in identifiers)
+    with _database() as connection:
+        rows = connection.execute(
+            f"SELECT * FROM task_terminalizations WHERE task_id IN ({placeholders})",
+            identifiers,
+        ).fetchall()
+    return {
+        str(row["task_id"]): _task_terminalization_public(
+            row, include_projection=include_projection
+        )
+        for row in rows
+    }
+
+
 def _task_terminalization_cursor(
     value: tuple[int, str] | None,
     *,
