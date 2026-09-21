@@ -1,0 +1,4 @@
+# Trusted local signer for Heim-PC recovery producer receipts.
+# The private key remains local-only and is never stored in GitHub Actions.
+# A dedicated namespace separates recovery-producer signatures from review evidence.
+grabowski-recovery-producer@heimgewebe namespaces="heim-pc-recovery-producer@grabowski.heimgewebe" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIDO9YQh2QG0AP+oeSCEg/phe+Ii6Yd90plweQpjcEhs
