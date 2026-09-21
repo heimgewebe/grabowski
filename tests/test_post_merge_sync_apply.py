@@ -410,6 +410,7 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             self.assertEqual("passed", result["receipt_status"])
             self.assertEqual("synced", result["state"])
             self.assertTrue(result["serialization_verified"])
+            self.assertTrue(result["remote_head_verified"])
             self.assertTrue(result["fast_forward_verified"])
             self.assertTrue(result["preimage_verified"])
             self.assertEqual(target, git_stdout(repo, "rev-parse", "HEAD"))
@@ -508,6 +509,7 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             self.assertFalse(result["worktree_effect_started"])
             self.assertFalse(result["branch_cas_started"])
             self.assertTrue(result["serialization_verified"])
+            self.assertTrue(result["remote_head_verified"])
             self.assertFalse(result["fast_forward_verified"])
             self.assertTrue(result["preimage_verified"])
             self.assertEqual(1, leases.acquire_calls)
@@ -566,6 +568,7 @@ class PostMergeSyncApplyTests(unittest.TestCase):
 
             self.assertEqual("passed", second["receipt_status"])
             self.assertEqual("already_synced", second["state"])
+            self.assertTrue(second["remote_head_verified"])
             self.assertTrue(second["idempotent"])
             self.assertEqual(0, second_leases.acquire_calls)
 
@@ -782,6 +785,7 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             self.assertEqual("outcome_unknown", result["state"])
             self.assertFalse(result["effect_started"])
             self.assertFalse(result["serialization_verified"])
+            self.assertFalse(result["remote_head_verified"])
             self.assertFalse(result["fast_forward_verified"])
             self.assertFalse(result["preimage_verified"])
             self.assertFalse(result["retry_authorized"])
@@ -839,6 +843,7 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             self.assertEqual("outcome_unknown", result["state"])
             self.assertFalse(result["effect_started"])
             self.assertTrue(result["serialization_verified"])
+            self.assertFalse(result["remote_head_verified"])
             self.assertFalse(result["fast_forward_verified"])
             self.assertFalse(result["preimage_verified"])
             self.assertFalse(result["retry_authorized"])
@@ -870,6 +875,7 @@ class PostMergeSyncApplyTests(unittest.TestCase):
 
             self.assertEqual("preimage_drift_after_lease", result["state"])
             self.assertFalse(result["effect_started"])
+            self.assertFalse(result["remote_head_verified"])
             self.assertEqual(base, git_stdout(repo, "rev-parse", "HEAD"))
             self.assertEqual(1, leases.release_calls)
             self.assertEqual({}, leases.live)
@@ -897,6 +903,7 @@ class PostMergeSyncApplyTests(unittest.TestCase):
 
             self.assertEqual("remote_head_drift_after_lease", result["state"])
             self.assertFalse(result["effect_started"])
+            self.assertFalse(result["remote_head_verified"])
             self.assertEqual(base, git_stdout(repo, "rev-parse", "HEAD"))
             self.assertEqual(1, leases.release_calls)
 
@@ -938,6 +945,7 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             self.assertTrue(result["effect_started"])
             self.assertFalse(result["worktree_effect_started"])
             self.assertFalse(result["branch_cas_started"])
+            self.assertTrue(result["remote_head_verified"])
             self.assertFalse(result["retry_authorized"])
             self.assertTrue(result["readback_required"])
             self.assertFalse(result["post_state_verified"])

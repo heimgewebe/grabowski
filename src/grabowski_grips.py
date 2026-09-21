@@ -6741,7 +6741,6 @@ def _run_post_merge_sync_apply(
         "preimage_drift_after_lease",
         "lease_preimage_drift",
     }
-    preimage_unverified = before_snapshot or state == "canonical_checkout_mismatch"
     preimage_status = (
         "fail"
         if blocked_preimage
@@ -6763,15 +6762,14 @@ def _run_post_merge_sync_apply(
         "remote_read_failed_after_lease",
         "remote_head_drift_after_lease",
     }
-    remote_unverified = preimage_unverified or state in {
-        "dirty_checkout",
-        "local_head_mismatch",
-        "upstream_mismatch",
-    }
     remote_status = (
         "fail"
         if remote_bad
-        else ("skip" if remote_unverified else "pass")
+        else (
+            "pass"
+            if output.get("remote_head_verified") is True
+            else "skip"
+        )
     )
     _check(
         receipt,

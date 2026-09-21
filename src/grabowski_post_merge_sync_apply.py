@@ -292,6 +292,7 @@ def apply(
     if initial.get("upstream") != expected_upstream:
         return _blocked("upstream_mismatch", before=initial)
 
+    remote_head_verified = False
     try:
         remote_before = remote_head_reader("before", False)
     except Exception as exc:
@@ -306,6 +307,7 @@ def apply(
             before=initial,
             actual_remote_head=remote_before,
         )
+    remote_head_verified = True
 
     try:
         _commit_head(repo, runner, expected_local_head)
@@ -313,6 +315,7 @@ def apply(
         return _blocked(
             "local_preimage_commit_unreadable",
             before=initial,
+            remote_head_verified=remote_head_verified,
             error=str(exc),
         )
 
@@ -321,12 +324,14 @@ def apply(
             return _blocked(
                 "tracking_ref_mismatch_on_replay",
                 before=initial,
+                remote_head_verified=remote_head_verified,
             )
         return {
             "receipt_status": "passed",
             "state": "already_synced",
             "effect_started": False,
             "preimage_verified": True,
+            "remote_head_verified": remote_head_verified,
             "idempotent": True,
             "retry_authorized": False,
             "old_head": expected_remote_head,
@@ -376,9 +381,11 @@ def apply(
             preimage_sha256=preimage_sha256,
             lease_owner_id=owner_id,
             resource_keys=resource_keys,
+            remote_head_verified=remote_head_verified,
             error_class=type(exc).__name__,
         )
 
+    remote_head_verified = False
     lease_snapshots = acquisition.get("leases")
     if (
         not isinstance(lease_snapshots, list)
@@ -388,6 +395,7 @@ def apply(
             "receipt_status": "failed",
             "state": "lease_snapshot_invalid",
             "effect_started": False,
+            "remote_head_verified": remote_head_verified,
             "retry_authorized": False,
             "preimage_sha256": preimage_sha256,
             "lease_owner_id": owner_id,
@@ -489,6 +497,8 @@ def apply(
                         serialization_verified=serialization_verified,
                         actual_remote_head=remote_locked,
                     )
+                else:
+                    remote_head_verified = True
 
         if output is None:
             try:
@@ -881,6 +891,7 @@ def apply(
             "preimage_sha256": preimage_sha256,
             "resource_keys": resource_keys,
         }
+    output.setdefault("remote_head_verified", remote_head_verified)
     output.setdefault("preimage_verified", preimage_verified)
     output.setdefault("lease_owner_id", owner_id)
     if release_error is not None:
