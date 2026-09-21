@@ -10078,12 +10078,22 @@ def _reconcile_candidate_batch(batch_size: int) -> dict[str, Any]:
     }
 
 
-def _terminal_convergence_evidence(record: dict[str, Any]) -> tuple[bool, bool]:
-    terminalization = resources.task_terminalization_record(
-        str(record["task_id"]), include_projection=True
-    )
+_TERMINALIZATION_UNSET = object()
+
+
+def _terminal_convergence_evidence(
+    record: dict[str, Any],
+    *,
+    terminalization: dict[str, Any] | None | object = _TERMINALIZATION_UNSET,
+) -> tuple[bool, bool]:
+    if terminalization is _TERMINALIZATION_UNSET:
+        terminalization = resources.task_terminalization_record(
+            str(record["task_id"]), include_projection=True
+        )
     if terminalization is None:
         return False, False
+    if not isinstance(terminalization, dict):
+        raise RuntimeError("terminalization evidence must be an object or null")
     projection = terminalization.get("task_projection")
     terminal_valid = bool(
         terminalization.get("phase") == "projected"
@@ -10108,6 +10118,24 @@ def _terminal_convergence_evidence(record: dict[str, Any]) -> tuple[bool, bool]:
         and set(requested) == set(revoked)
     )
     return terminal_valid, lease_valid
+
+
+def _terminal_convergence_evidence_batch(
+    records: list[dict[str, Any]],
+) -> dict[str, tuple[bool, bool]]:
+    if not records:
+        return {}
+    terminalizations = resources.task_terminalization_records(
+        [str(record["task_id"]) for record in records],
+        include_projection=True,
+    )
+    return {
+        str(record["task_id"]): _terminal_convergence_evidence(
+            record,
+            terminalization=terminalizations.get(str(record["task_id"])),
+        )
+        for record in records
+    }
 
 
 def _reconcile_observation(record: dict[str, Any]) -> dict[str, Any]:
@@ -10720,6 +10748,7 @@ def reconcile_tasks_check(
     check_started_ns = time.perf_counter_ns()
     if not isinstance(task_id, str):
         raise ValueError("task_id must be a string")
+    terminal_evidence_filter_ms = 0.0
     if task_id:
         _validate_task_id(task_id)
         if limit != DEFAULT_TASK_RECONCILE_CHECK_LIMIT or cursor is not None:
@@ -10731,13 +10760,29 @@ def reconcile_tasks_check(
         page = None
     else:
         page = _reconcile_check_candidate_page(limit=limit, cursor=cursor)
+        terminal_evidence_filter_started_ns = time.perf_counter_ns()
+        terminal_records = [
+            record
+            for record in page["rows"]
+            if _is_terminal_state(str(record["state"]))
+        ]
+        terminal_evidence_by_task_id = _terminal_convergence_evidence_batch(
+            terminal_records
+        )
         rows = []
         for record in page["rows"]:
             if _is_terminal_state(str(record["state"])):
-                terminal_valid, lease_valid = _terminal_convergence_evidence(record)
+                terminal_valid, lease_valid = terminal_evidence_by_task_id[
+                    str(record["task_id"])
+                ]
                 if terminal_valid and lease_valid:
                     continue
             rows.append(record)
+        terminal_evidence_filter_ms = round(
+            (time.perf_counter_ns() - terminal_evidence_filter_started_ns)
+            / 1_000_000,
+            3,
+        )
     observations: list[dict[str, Any]] = []
     would_refresh: list[dict[str, Any]] = []
     would_release: list[str] = []
@@ -10819,6 +10864,7 @@ def reconcile_tasks_check(
             "payload_bytes": 0,
             "timings_ms": {
                 **page["timings_ms"],
+                "terminal_evidence_filter": terminal_evidence_filter_ms,
                 "observation": observation_ms,
                 "serialization": 0.0,
                 "total": 0.0,
