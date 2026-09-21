@@ -15,11 +15,28 @@ from tools.heim_pc_recovery_attest import (
 
 
 SOURCE = "9" * 40
-CONTRACT = "8" * 64
 EVIDENCE_ID = "off-host-home-restore"
 SCOPE = "critical-user-data"
 PRODUCER = "heim_pc.external_recovery_producer.off_host_home_restore.v1"
 SCHEMA = "heim_pc.recovery.off_host_home_restore.v1"
+RECOVERY_CONTRACT = {
+    "schema_version": 1,
+    "kind": "heim_pc.nixos_recovery_readiness_contract",
+    "required_evidence": [
+        {
+            "id": EVIDENCE_ID,
+            "scope": SCOPE,
+            "requires_restore_test": True,
+            "producer": PRODUCER,
+            "evidence_schema": SCHEMA,
+            "restore_test_schema": SCHEMA + ".restore_test",
+        }
+    ],
+}
+RECOVERY_CONTRACT_BYTES = (
+    json.dumps(RECOVERY_CONTRACT, sort_keys=True) + "\n"
+).encode("utf-8")
+CONTRACT = hashlib.sha256(RECOVERY_CONTRACT_BYTES).hexdigest()
 
 
 def _write(path: Path, value: dict) -> None:
@@ -74,6 +91,8 @@ def _sign_receipt(
 
 def _fixture(tmp_path: Path):
     signing_key, allowed_signers = _signing_material(tmp_path)
+    contract_path = tmp_path / "recovery-contract-v1.json"
+    contract_path.write_bytes(RECOVERY_CONTRACT_BYTES)
     receipt = {
         "schema_version": 1,
         "kind": "heim_pc.grabowski_recovery_producer_receipt",
@@ -137,6 +156,7 @@ def _validate(
         receipt,
         signature,
         allowed_signers,
+        provenance.parent / "recovery-contract-v1.json",
         expected_source_revision=source_revision,
         expected_recovery_contract_sha256=CONTRACT,
     )
@@ -193,6 +213,28 @@ class RecoveryAttestationTest(unittest.TestCase):
             with self.assertRaisesRegex(
                 ValidationError,
                 "producer receipt signature is not authenticated",
+            ):
+                _validate(provenance, receipt, signature, allowed_signers)
+
+    def test_validate_rejects_evidence_not_required_by_bound_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            provenance, receipt, signature, allowed_signers, _ = _fixture(Path(tmp))
+            value = json.loads(provenance.read_text(encoding="utf-8"))
+            value["evidence_id"] = "not-required-by-contract"
+            _write(provenance, value)
+            with self.assertRaisesRegex(
+                ValidationError, "evidence_id is not required by recovery contract"
+            ):
+                _validate(provenance, receipt, signature, allowed_signers)
+
+    def test_validate_rejects_scope_not_bound_by_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            provenance, receipt, signature, allowed_signers, _ = _fixture(Path(tmp))
+            value = json.loads(provenance.read_text(encoding="utf-8"))
+            value["evidence_scope"] = "wrong-scope"
+            _write(provenance, value)
+            with self.assertRaisesRegex(
+                ValidationError, "provenance evidence scope mismatch"
             ):
                 _validate(provenance, receipt, signature, allowed_signers)
 

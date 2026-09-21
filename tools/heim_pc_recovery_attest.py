@@ -95,11 +95,47 @@ def _utc(value: Any, label: str) -> str:
     return value
 
 
-def _expected_schema(evidence_id: str, provenance_kind: str) -> str:
-    base = f"heim_pc.recovery.{evidence_id.replace('-', '_')}.v1"
+def _recovery_contract_requirement(
+    path: Path,
+    *,
+    expected_sha256: str,
+    evidence_id: str,
+    provenance_kind: str,
+) -> tuple[dict[str, Any], str]:
+    contract, payload = _read_json(path, "recovery contract")
+    if _sha256(payload) != expected_sha256:
+        raise ValidationError("recovery contract file digest mismatch")
+    if (
+        contract.get("schema_version") != 1
+        or contract.get("kind") != "heim_pc.nixos_recovery_readiness_contract"
+    ):
+        raise ValidationError("recovery contract identity mismatch")
+    required_evidence = contract.get("required_evidence")
+    if not isinstance(required_evidence, list):
+        raise ValidationError("recovery contract required_evidence is invalid")
+    matches = [
+        item
+        for item in required_evidence
+        if isinstance(item, dict) and item.get("id") == evidence_id
+    ]
+    if len(matches) != 1:
+        raise ValidationError("evidence_id is not required by recovery contract")
+    requirement = matches[0]
+    scope = requirement.get("scope")
+    producer = requirement.get("producer")
+    if not isinstance(scope, str) or not scope:
+        raise ValidationError("recovery contract evidence scope is invalid")
+    if not isinstance(producer, str) or not producer:
+        raise ValidationError("recovery contract evidence producer is invalid")
     if provenance_kind == "heim_pc.nixos_recovery_restore_test_provenance":
-        return base + ".restore_test"
-    return base
+        if requirement.get("requires_restore_test") is not True:
+            raise ValidationError("recovery contract does not require a restore test")
+        schema = requirement.get("restore_test_schema")
+    else:
+        schema = requirement.get("evidence_schema")
+    if not isinstance(schema, str) or not schema:
+        raise ValidationError("recovery contract evidence schema is invalid")
+    return requirement, schema
 
 
 def _verify_producer_receipt_signature(
@@ -151,6 +187,7 @@ def validate(
     producer_receipt_path: Path,
     producer_receipt_signature_path: Path,
     producer_allowed_signers_path: Path,
+    recovery_contract_path: Path,
     *,
     expected_source_revision: str,
     expected_recovery_contract_sha256: str,
@@ -201,13 +238,18 @@ def validate(
         raise ValidationError("provenance recovery contract digest mismatch")
     if provenance.get("status") != "passed":
         raise ValidationError("provenance status did not pass")
-    observed_at = _utc(provenance.get("observed_at"), "provenance observed_at")
-    expected_producer = (
-        f"heim_pc.external_recovery_producer.{evidence_id.replace('-', '_')}.v1"
+    requirement, expected_schema = _recovery_contract_requirement(
+        recovery_contract_path,
+        expected_sha256=expected_recovery_contract_sha256,
+        evidence_id=evidence_id,
+        provenance_kind=provenance["kind"],
     )
+    if evidence_scope != requirement["scope"]:
+        raise ValidationError("provenance evidence scope mismatch")
+    observed_at = _utc(provenance.get("observed_at"), "provenance observed_at")
+    expected_producer = requirement["producer"]
     if provenance.get("producer") != expected_producer:
         raise ValidationError("provenance producer mismatch")
-    expected_schema = _expected_schema(evidence_id, provenance["kind"])
     if provenance.get("evidence_schema") != expected_schema:
         raise ValidationError("provenance evidence schema mismatch")
     if provenance.get("production_effects_authorized") is not False:
@@ -303,6 +345,7 @@ def main() -> int:
         type=Path,
         default=DEFAULT_PRODUCER_ALLOWED_SIGNERS,
     )
+    parser.add_argument("--recovery-contract", type=Path, required=True)
     parser.add_argument("--expected-source-revision", required=True)
     parser.add_argument("--expected-recovery-contract-sha256", required=True)
     parser.add_argument("--predicate-out", type=Path, required=True)
@@ -313,6 +356,7 @@ def main() -> int:
         args.producer_receipt,
         args.producer_receipt_signature,
         args.producer_allowed_signers,
+        args.recovery_contract,
         expected_source_revision=args.expected_source_revision,
         expected_recovery_contract_sha256=args.expected_recovery_contract_sha256,
     )

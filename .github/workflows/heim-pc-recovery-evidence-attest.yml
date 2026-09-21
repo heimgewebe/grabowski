@@ -99,6 +99,7 @@ jobs:
             --producer-receipt "$PRODUCER_RECEIPT" \
             --producer-receipt-signature "$PRODUCER_RECEIPT_SIGNATURE" \
             --producer-allowed-signers "$PRODUCER_ALLOWED_SIGNERS" \
+            --recovery-contract "$RECOVERY_CONTRACT" \
             --expected-source-revision "$SOURCE_REVISION" \
             --expected-recovery-contract-sha256 "$RECOVERY_CONTRACT_SHA256" \
             --predicate-out "$PREDICATE"
