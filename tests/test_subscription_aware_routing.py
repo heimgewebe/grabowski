@@ -182,6 +182,7 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
         frontier = self.catalog["policy"]["frontier_model_policy"]
         self.assertEqual(frontier["escalation_route"], "codex-sol-xhigh")
         self.assertEqual(frontier["top_contrast_routes"], ["codex-sol-high"])
+        self.assertIn("codex-sol-review-high", frontier["upper_review_or_contrast_routes"])
         self.assertNotIn("claude-opus-5-writer-high", frontier["upper_review_or_contrast_routes"])
         grok_writer = self.routes["grok-4.6-high"]
         grok_reviewer = self.routes["grok-4.6-review-high"]
@@ -190,16 +191,42 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
         self.assertTrue(grok_reviewer["enabled"])
         self.assertTrue(grok_reviewer["review_only"])
 
-    def test_external_codex_routes_remain_contrast_only_except_attested_spark_writer(self) -> None:
+    def test_codex_has_separate_review_route_without_weakening_contrast_routes(self) -> None:
         routes = [route for route in self.catalog["routes"] if route.get("harness") == "codex"]
         self.assertTrue(routes)
+
         spark = self.routes["codex-spark-low"]
         self.assertFalse(spark.get("contrast_only", False))
+        self.assertFalse(spark.get("review_only", False))
         self.assertEqual(["openai-codex-spark"], spark["quota_pools"])
         self.assertEqual(["mechanical", "triage", "docs", "tests"], spark["task_classes"])
-        legacy_routes = [route for route in routes if route["id"] != "codex-spark-low"]
-        self.assertTrue(legacy_routes)
-        self.assertTrue(all(route.get("contrast_only") is True for route in legacy_routes))
+
+        reviewer = self.routes["codex-sol-review-high"]
+        self.assertTrue(reviewer["enabled"])
+        self.assertTrue(reviewer["review_only"])
+        self.assertFalse(reviewer.get("contrast_only", False))
+        self.assertTrue(reviewer["critical_eligible"])
+        self.assertEqual("gpt-5.6-sol", reviewer["model"])
+        self.assertEqual("openai-gpt-5.6", reviewer["independence_group"])
+        self.assertEqual(
+            ["--sandbox", "read-only", "--ask-for-approval", "never"],
+            reviewer["argv_prefix"][-4:],
+        )
+        self.assertEqual(["openai-agentic"], reviewer["quota_pools"])
+        self.assertEqual(
+            ["independent-review", "critical-review", "security-review"],
+            reviewer["task_classes"],
+        )
+
+        contrast_routes = [
+            route
+            for route in routes
+            if route["id"] not in {"codex-spark-low", "codex-sol-review-high"}
+        ]
+        self.assertTrue(contrast_routes)
+        self.assertTrue(
+            all(route.get("contrast_only") is True for route in contrast_routes)
+        )
 
     def test_contrast_only_route_cannot_be_automatic_authoritative_writer(self) -> None:
         contrast = {

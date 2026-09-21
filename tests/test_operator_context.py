@@ -493,7 +493,7 @@ print(json.dumps(runtime.resolve_host_capability({intent!r}), sort_keys=True))
         )
         self.assertEqual(
             protocol["review_and_contrast_agent_priority"],
-            ["claude", "codex", "antigravity", "opencode", "openhands", "cline"],
+            ["claude", "grok", "codex", "antigravity", "opencode", "openhands", "cline"],
         )
         self.assertEqual(
             protocol["coding_agent_priority_semantics"],

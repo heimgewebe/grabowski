@@ -11424,7 +11424,9 @@ def _repoground_validate_revision(value: str, *, label: str) -> str:
     return value
 
 
-def _repoground_working_repo(repo: str, stem: str | None = None) -> Path:
+def _repoground_working_repo(
+    repo: str, stem: str | None = None
+) -> tuple[Path, str | None]:
     root = (HOME / "repos").resolve(strict=False)
     if "/" in repo or "__" in repo:
         resolution = _repoground_catalog_resolution(repo, stem)
@@ -11436,7 +11438,11 @@ def _repoground_working_repo(repo: str, stem: str | None = None) -> Path:
         ]
         if len(selected) != 1:
             raise ValueError("repository checkout is missing or invalid")
+        selected_stem = selected[0].get("stem")
+        if not isinstance(selected_stem, str):
+            raise ValueError("repository checkout is missing or invalid")
         try:
+            pinned_stem = _repoground_validate_stem(selected_stem)
             status = _repoground_manifest_summary(Path(selected[0]["manifest_path"]))
             candidate, source_kind, _source_ref = _repoground_freshness_source(
                 repo, status
@@ -11445,7 +11451,7 @@ def _repoground_working_repo(repo: str, stem: str | None = None) -> Path:
             raise ValueError("repository checkout is missing or invalid") from exc
         if source_kind != "publication_source_checkout":
             raise ValueError("repository checkout is missing or invalid")
-        return candidate
+        return candidate, pinned_stem
 
     candidate = root / repo
     resolved = candidate.resolve(strict=False)
@@ -11456,7 +11462,7 @@ def _repoground_working_repo(repo: str, stem: str | None = None) -> Path:
         or candidate.is_symlink()
     ):
         raise ValueError("repository checkout is missing or invalid")
-    return candidate
+    return candidate, stem
 
 
 def _repoground_resolve_commit(repo_path: Path, revision: str) -> str:
@@ -12112,7 +12118,7 @@ def repoground_context_compose(
     if query is not None and (not isinstance(query, str) or not query.strip() or len(query) > 500):
         raise ValueError("query must be a non-empty string up to 500 characters when provided")
 
-    repo_path = _repoground_working_repo(repo, stem)
+    repo_path, pinned_stem = _repoground_working_repo(repo, stem)
     base_commit = _repoground_resolve_commit(repo_path, base_revision)
     target_commit = _repoground_resolve_commit(repo_path, target_revision)
     changes, diff_sha256 = _repoground_revision_changes(repo_path, base_commit, target_commit)
@@ -12155,7 +12161,7 @@ def repoground_context_compose(
             "does_not_establish": ["truth", "completeness", "patch_correctness", "test_sufficiency", "merge_readiness", "runtime_behavior"],
         }
 
-    freshness, selected_stem, manifest_path, selection_error = _repoground_selected_manifest_for_repo(repo, stem)
+    freshness, selected_stem, manifest_path, selection_error = _repoground_selected_manifest_for_repo(repo, pinned_stem)
     if selection_error is not None or manifest_path is None:
         return {
             "kind": "grabowski.repoground_context_compose",
