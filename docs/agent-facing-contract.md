@@ -76,10 +76,12 @@ The rendered contract requires the agent to:
     evidence, name a serious alternative and explicitly choose `CONTINUE`, `CHANGE`
     or `PARK/STOP`; one tool failure, expected red test or required recovery gate
     is not strategic evidence by itself;
-13. for nontrivial operator work, use the durable operator-obligation lifecycle to
-    resume matching unfinished work and end only with completed, explicitly blocked
-    or durably delegated evidence, or with an evidence-bound direct v2
-    `deferred`/`superseded` resolution that keeps `work_complete=false` and sets
+13. for nontrivial operator work, act as a bounded controller: keep synchronous
+    chains short; move long or uncertain work to an existing durable task, job or
+    workspace; read status once instead of polling; end with completed, explicitly
+    blocked or durably delegated evidence plus a locator/wait condition, while the
+    operator-obligation lifecycle preserves cross-turn state; direct v2
+    `deferred`/`superseded` keeps `work_complete=false` and
     `continuation_required=false`; resume parked work via a new obligation;
 14. bind and assess risk-adaptive convergence evidence before claiming systemic
     convergence when the convergence plan requires it; ordinary work completion is

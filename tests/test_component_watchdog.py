@@ -515,6 +515,87 @@ class ControlPlanePollProbeTests(unittest.TestCase):
         self.assertEqual("indeterminate", result.status)
         self.assertEqual(("readiness-failed",), result.reasons)
 
+    def test_healthy_tunnel_checks_selector_bound_operator_dependency(self) -> None:
+        probe = watchdog.ProbeResult(
+            "healthy",
+            pid=321,
+            age_seconds=120.0,
+            start_ticks=77,
+            boot_id=BOOT_ID,
+        )
+        seen_urls = []
+
+        def selected_operator_probe(url: str, _timeout: float) -> str:
+            seen_urls.append(url)
+            return "mcp-http-request-failed"
+
+        with (
+            patch.object(
+                watchdog,
+                "transport_ingress_selected_operator_url",
+                return_value=(
+                    "http://127.0.0.1:18182/_grabowski/mcp-liveness",
+                    None,
+                ),
+            ),
+            patch.object(
+                watchdog,
+                "mcp_http_probe",
+                side_effect=selected_operator_probe,
+            ),
+            patch.object(
+                watchdog,
+                "tunnel_service_process_identity",
+                return_value=(self.tunnel_identity(), None),
+            ),
+        ):
+            result, state = watchdog.classify_tunnel_readiness_dependency(
+                probe,
+                watchdog.WatchdogState(),
+                service=watchdog.DEFAULT_TUNNEL_SERVICE,
+                profile=watchdog.DEFAULT_PROFILE,
+                startup_grace=20,
+                mcp_url=watchdog.DEFAULT_MCP_URL,
+                timeout=2,
+                ingress_health_url="http://127.0.0.1:18180/_grabowski/transport-ingress",
+            )
+
+        self.assertEqual("dependency-unavailable", result.status)
+        self.assertEqual(("selected-operator-unavailable",), result.reasons)
+        self.assertEqual(
+            ["http://127.0.0.1:18182/_grabowski/mcp-liveness"],
+            seen_urls,
+        )
+        self.assertEqual(BOOT_ID, state.readiness_dependency_unavailable_boot_id)
+        self.assertEqual(321, state.readiness_dependency_unavailable_pid)
+        self.assertEqual(77, state.readiness_dependency_unavailable_start_ticks)
+
+    def test_invalid_selector_prevents_false_green_tunnel(self) -> None:
+        probe = watchdog.ProbeResult(
+            "healthy",
+            pid=321,
+            age_seconds=120.0,
+            start_ticks=77,
+            boot_id=BOOT_ID,
+        )
+        with patch.object(
+            watchdog,
+            "transport_ingress_selected_operator_url",
+            return_value=(None, "transport-ingress-route-invalid"),
+        ):
+            result, _state = watchdog.classify_tunnel_readiness_dependency(
+                probe,
+                watchdog.WatchdogState(),
+                service=watchdog.DEFAULT_TUNNEL_SERVICE,
+                profile=watchdog.DEFAULT_PROFILE,
+                startup_grace=20,
+                mcp_url=watchdog.DEFAULT_MCP_URL,
+                timeout=2,
+                ingress_health_url="http://127.0.0.1:18180/_grabowski/transport-ingress",
+            )
+        self.assertEqual("indeterminate", result.status)
+        self.assertEqual(("transport-ingress-route-invalid",), result.reasons)
+
     def test_missing_readiness_dependency_is_distinct_and_non_restartable(self) -> None:
         result, state = self.classify(
             self.readiness_probe(),
@@ -1528,9 +1609,25 @@ class ConnectorSnapshotRefreshTests(unittest.TestCase):
                     ["--component", "tunnel", "--state-dir", tmp]
                 )
             )
-            probe = watchdog.ProbeResult("healthy", pid=123, age_seconds=30.0, start_ticks=456)
+            probe = watchdog.ProbeResult("healthy", pid=123, age_seconds=30.0, start_ticks=456, boot_id=BOOT_ID)
             with (
                 patch.object(watchdog, "probe_component", return_value=probe),
+                patch.object(
+                    watchdog,
+                    "transport_ingress_selected_operator_url",
+                    return_value=(watchdog.DEFAULT_MCP_URL, None),
+                ),
+                patch.object(watchdog, "mcp_http_probe", return_value=None),
+                patch.object(
+                    watchdog,
+                    "tunnel_service_process_identity",
+                    return_value=(
+                        watchdog.TunnelProcessIdentity(
+                            BOOT_ID, 123, 456, 30.0
+                        ),
+                        None,
+                    ),
+                ),
                 patch.object(watchdog, "refresh_connector_snapshot_from_runtime", return_value={"state": "not_due"}) as refresh,
                 patch.object(watchdog, "emit"),
             ):
@@ -1544,6 +1641,22 @@ class ConnectorSnapshotRefreshTests(unittest.TestCase):
             )
             with (
                 patch.object(watchdog, "probe_component", return_value=probe),
+                patch.object(
+                    watchdog,
+                    "transport_ingress_selected_operator_url",
+                    return_value=(watchdog.DEFAULT_MCP_URL, None),
+                ),
+                patch.object(watchdog, "mcp_http_probe", return_value=None),
+                patch.object(
+                    watchdog,
+                    "tunnel_service_process_identity",
+                    return_value=(
+                        watchdog.TunnelProcessIdentity(
+                            BOOT_ID, 123, 456, 30.0
+                        ),
+                        None,
+                    ),
+                ),
                 patch.object(watchdog, "refresh_connector_snapshot_from_runtime") as refresh,
                 patch.object(watchdog, "emit"),
             ):
@@ -1558,10 +1671,26 @@ class ConnectorSnapshotRefreshTests(unittest.TestCase):
                 )
             )
             probe = watchdog.ProbeResult(
-                "healthy", pid=123, age_seconds=30.0, start_ticks=456
+                "healthy", pid=123, age_seconds=30.0, start_ticks=456, boot_id=BOOT_ID
             )
             with (
                 patch.object(watchdog, "probe_component", return_value=probe),
+                patch.object(
+                    watchdog,
+                    "transport_ingress_selected_operator_url",
+                    return_value=(watchdog.DEFAULT_MCP_URL, None),
+                ),
+                patch.object(watchdog, "mcp_http_probe", return_value=None),
+                patch.object(
+                    watchdog,
+                    "tunnel_service_process_identity",
+                    return_value=(
+                        watchdog.TunnelProcessIdentity(
+                            BOOT_ID, 123, 456, 30.0
+                        ),
+                        None,
+                    ),
+                ),
                 patch.object(
                     watchdog,
                     "refresh_connector_snapshot_from_runtime",
