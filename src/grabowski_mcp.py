@@ -8538,6 +8538,8 @@ def repoground_bundle_status(stem: str) -> dict[str, Any]:
 
 def _repoground_bundle_status_for_manifest(
     manifest_path: Path,
+    *,
+    expected_manifest_sha256: str | None = None,
 ) -> dict[str, Any]:
     try:
         summary = _repoground_manifest_summary(manifest_path)
@@ -8550,6 +8552,24 @@ def _repoground_bundle_status_for_manifest(
             "catalog_healthy": False,
             "catalog_rejection": None,
             "reason": type(exc).__name__,
+        }
+    if (
+        expected_manifest_sha256 is not None
+        and summary.get("manifest_sha256")
+        != _validate_sha256(
+            expected_manifest_sha256,
+            "expected_manifest_sha256",
+        )
+    ):
+        return {
+            "kind": "grabowski.repoground_bundle_status",
+            "schema_version": 2,
+            "exists": True,
+            "manifest_path": str(manifest_path),
+            "manifest_sha256": summary.get("manifest_sha256"),
+            "catalog_healthy": False,
+            "catalog_rejection": None,
+            "reason": "catalog_selection_changed",
         }
     stem = str(summary["stem"])
     surface = _repoground_sidecar_status(
@@ -8877,71 +8897,18 @@ def _repoground_file_sha256(path: Path) -> str:
 
 
 def _repoground_agent_preflight(
-    task_profile: str, manifest_path: Path
+    task_profile: str,
+    manifest_path: Path,
+    *,
+    expected_manifest_sha256: str | None = None,
 ) -> dict[str, Any]:
-    """Run RepoGround's agent-consumption preflight when the local CLI is available."""
-    repoground_repo = (HOME / "repos" / "repoground").resolve(strict=False)
-    if not repoground_repo.is_dir() or repoground_repo.is_symlink():
-        return {
-            "status": "unknown",
-            "available": False,
-            "reason": "repoground_repo_missing_or_invalid",
-        }
-    command = [
-        "python3",
-        "-B",
-        "-m",
-        "merger.repoground.cli.main",
-        "agent-consumption",
-        "preflight",
-        "--task-profile",
-        task_profile,
-        "--bundle-manifest",
-        str(manifest_path),
-    ]
-    completed = subprocess.run(
-        command,
-        cwd=repoground_repo,
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=30,
-        env={
-            **os.environ,
-            "GIT_TERMINAL_PROMPT": "0",
-            "PYTHONDONTWRITEBYTECODE": "1",
-        },
+    """Run RepoGround's agent-consumption preflight against one bound manifest."""
+    return _repoground_core_json(
+        "agent_preflight",
+        manifest_path,
+        {"task_profile": task_profile},
+        expected_manifest_sha256=expected_manifest_sha256,
     )
-    stdout = completed.stdout[:500_000]
-    stderr = completed.stderr[:20_000]
-    if completed.returncode not in {0, 1} or not stdout.strip():
-        return {
-            "status": "unknown",
-            "available": True,
-            "returncode": completed.returncode,
-            "stderr": _redact_sensitive_text(stderr)[0],
-            "reason": "repoground_preflight_failed",
-        }
-    try:
-        value = json.loads(stdout)
-    except json.JSONDecodeError:
-        return {
-            "status": "unknown",
-            "available": True,
-            "returncode": completed.returncode,
-            "reason": "repoground_preflight_invalid_json",
-        }
-    if not isinstance(value, dict):
-        return {
-            "status": "unknown",
-            "available": True,
-            "returncode": completed.returncode,
-            "reason": "repoground_preflight_non_object",
-        }
-    value["available"] = True
-    value["returncode"] = completed.returncode
-    return value
 
 
 def _repoground_repo() -> tuple[Path | None, dict[str, Any] | None]:
@@ -8956,36 +8923,158 @@ def _repoground_repo() -> tuple[Path | None, dict[str, Any] | None]:
     return repoground_repo, None
 
 
+def _repoground_expected_manifest_sha256(freshness: dict[str, Any]) -> str:
+    bundle = freshness.get("bundle")
+    manifest_sha256 = (
+        bundle.get("manifest_sha256") if isinstance(bundle, dict) else None
+    )
+    if (
+        not isinstance(manifest_sha256, str)
+        or _REPOGROUND_SHA256_RE.fullmatch(manifest_sha256) is None
+    ):
+        raise ValueError("selected RepoGround publication digest is unavailable")
+    return manifest_sha256
+
+
+def _repoground_core_manifest_binding(
+    manifest_path: Path,
+    expected_manifest_sha256: str,
+) -> dict[str, str]:
+    expected_manifest_sha256 = _validate_sha256(
+        expected_manifest_sha256,
+        "expected_manifest_sha256",
+    )
+    selected_path = Path(
+        os.path.abspath(os.fspath(manifest_path.expanduser()))
+    )
+    try:
+        status = _repoground_manifest_summary(selected_path)
+        resolved_path = selected_path.resolve(strict=True)
+    except (OSError, PermissionError, RuntimeError, ValueError) as exc:
+        raise ValueError("selected RepoGround publication is unavailable") from exc
+    if status.get("manifest_sha256") != expected_manifest_sha256:
+        raise ValueError("selected RepoGround publication changed before core binding")
+    run_id = status.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError("selected RepoGround publication run identity is unavailable")
+    return {
+        "selected_path": str(selected_path),
+        "resolved_path": str(resolved_path),
+        "sha256": expected_manifest_sha256,
+        "run_id": run_id,
+    }
+
+
 def _repoground_core_json(
     operation: str,
     manifest_path: Path,
     payload: dict[str, Any],
     *,
+    expected_manifest_sha256: str | None = None,
     timeout: int = 30,
 ) -> dict[str, Any]:
     repoground_repo, unavailable_result = _repoground_repo()
     if unavailable_result is not None:
         return unavailable_result
     assert repoground_repo is not None
+    binding_payload: dict[str, str] | None = None
+    if expected_manifest_sha256 is not None:
+        try:
+            binding_payload = _repoground_core_manifest_binding(
+                manifest_path,
+                expected_manifest_sha256,
+            )
+        except (TypeError, ValueError):
+            return {
+                "available": False,
+                "status": "blocked",
+                "reason": "manifest_binding_failed",
+                "error_code": "manifest_binding_failed",
+            }
     script = r"""
 import json
 import sys
+from pathlib import Path
+
 from merger.repoground.core import bundle_access, mcp_tools
+from merger.repoground.core.manifest_snapshot import (
+    ManifestBinding,
+    ManifestBindingError,
+    manifest_path_identity,
+    use_manifest_binding,
+)
 
 operation = sys.argv[1]
 manifest = sys.argv[2]
+binding_payload = json.loads(sys.argv[3]) if sys.argv[3] else None
 payload = json.loads(sys.stdin.read() or "{}")
 
-if operation == "agent_query":
-    if hasattr(mcp_tools, "query_existing_index"):
-        result = mcp_tools.query_existing_index(
-            bundle_manifest=manifest,
-            query=payload.get("query", ""),
-            task_profile=payload.get("task_profile", "basic_repo_question"),
-            max_context_tokens=payload.get("max_context_tokens", 2000),
-            k=payload.get("k", 5),
+
+def execute():
+    if operation == "agent_preflight":
+        from merger.repoground.core.agent_consumption_validate import DOES_NOT_ESTABLISH
+
+        task_profile = payload.get("task_profile", "basic_repo_question")
+        resolution = bundle_access.resolve_required_reading_for_bundle(
+            manifest,
+            task_profile,
         )
-    else:
+        required = resolution.get("required_reading")
+        if not isinstance(required, dict):
+            required = {}
+        available_roles = resolution.get("available_roles")
+        if not isinstance(available_roles, list):
+            available_roles = []
+        template_artifacts = sorted(
+            set(required.get("available_required") or [])
+            | set(required.get("available_recommended") or [])
+        )
+        if not template_artifacts:
+            template_artifacts = sorted(set(required.get("required") or []))
+        return {
+            "kind": "lenskit.agent_consumption_preflight",
+            "version": "1.0",
+            "task_profile": task_profile,
+            "status": required.get("status", "unknown"),
+            "available": True,
+            "available_roles": sorted(
+                role for role in available_roles if isinstance(role, str)
+            ),
+            "required_reading": required,
+            "answer_compliance_template": {
+                "task_profile": task_profile,
+                "declared_artifacts": template_artifacts,
+                "declared_citations": [],
+                "declared_ranges": [],
+                "epistemic_gaps": [],
+                "unread_required_artifacts": [],
+                "unread_recommended_artifacts": [],
+                "does_not_establish": list(DOES_NOT_ESTABLISH),
+            },
+            "agent_consumption_trace": None,
+            "does_not_establish": [
+                "actual_reading_proven",
+                "answer_correct",
+                "repo_understood",
+                "all_relevant_context_used",
+                "claims_true",
+                "test_sufficiency",
+                "regression_absence",
+                "runtime_behavior",
+                "forensic_ready",
+            ],
+        }
+    if operation == "agent_query":
+        if hasattr(mcp_tools, "query_existing_index"):
+            return mcp_tools.query_existing_index(
+                bundle_manifest=manifest,
+                query=payload.get("query", ""),
+                task_profile=payload.get(
+                    "task_profile", "basic_repo_question"
+                ),
+                max_context_tokens=payload.get("max_context_tokens", 2000),
+                k=payload.get("k", 5),
+            )
         result = bundle_access.query_existing_index(
             manifest,
             payload.get("query", ""),
@@ -8994,7 +9083,9 @@ if operation == "agent_query":
             resolve_evidence=True,
             project_sources=True,
         )
-        query_result = result.get("query_result") if isinstance(result, dict) else None
+        query_result = (
+            result.get("query_result") if isinstance(result, dict) else None
+        )
         match_count = None
         if isinstance(query_result, dict):
             if isinstance(query_result.get("count"), int):
@@ -9017,68 +9108,117 @@ if operation == "agent_query":
             }
             result["availability"] = {
                 "status": result.get("status", "unknown"),
-                "caveats": ["repoground_agent_frontdoor_unavailable_legacy_fallback"],
+                "caveats": [
+                    "repoground_agent_frontdoor_unavailable_legacy_fallback"
+                ],
             }
             result["legacy_fallback_used"] = True
-elif operation == "query_existing_index":
-    result = bundle_access.query_existing_index(
-        manifest,
-        payload.get("query", ""),
-        k=payload.get("k", 10),
-        filters=payload.get("filters") or {},
-        resolve_evidence=payload.get("resolve_evidence", False),
-        project_sources=payload.get("project_sources", False),
-    )
-elif operation == "range_get":
-    result = bundle_access.range_get(manifest, payload.get("range_ref"))
-elif operation == "find_symbol":
-    result = mcp_tools.find_symbol(
-        bundle_manifest=manifest,
-        name=payload.get("name"),
-        kind=payload.get("kind"),
-        path=payload.get("path"),
-        k=payload.get("k", 25),
-    )
-elif operation == "get_callers":
-    result = mcp_tools.get_callers(
-        bundle_manifest=manifest,
-        name=payload.get("name"),
-        path=payload.get("path"),
-        k=payload.get("k", 25),
-    )
-elif operation == "get_callees":
-    result = mcp_tools.get_callees(
-        bundle_manifest=manifest,
-        name=payload.get("name"),
-        path=payload.get("path"),
-        k=payload.get("k", 25),
-    )
-elif operation == "agent_impact_context":
-    from pathlib import Path
-    from merger.repoground.core.agent_impact_adapter import RepoGroundAgentImpactAdapter
-    from merger.repoground.core.readonly_adapter import SnapshotRegistration
-    manifest_path = Path(manifest).resolve()
-    adapter = RepoGroundAgentImpactAdapter(
-        config_path=manifest_path,
-        allowed_roots=(manifest_path.parent,),
-        snapshots=(SnapshotRegistration("selected", manifest_path),),
-    )
-    result = adapter.agent_impact_context(
-        "selected",
-        target_path=payload.get("target_path"),
-        target_symbol=payload.get("target_symbol"),
-        changed_paths=payload.get("changed_paths"),
-        mode=payload.get("mode", "impact"),
-        max_items=payload.get("max_items", 25),
-        include_query_context=payload.get("include_query_context", True),
-    )
-else:
+        return result
+    if operation == "query_existing_index":
+        return bundle_access.query_existing_index(
+            manifest,
+            payload.get("query", ""),
+            k=payload.get("k", 10),
+            filters=payload.get("filters") or {},
+            resolve_evidence=payload.get("resolve_evidence", False),
+            project_sources=payload.get("project_sources", False),
+        )
+    if operation == "range_get":
+        return bundle_access.range_get(manifest, payload.get("range_ref"))
+    if operation == "find_symbol":
+        return mcp_tools.find_symbol(
+            bundle_manifest=manifest,
+            name=payload.get("name"),
+            kind=payload.get("kind"),
+            path=payload.get("path"),
+            k=payload.get("k", 25),
+        )
+    if operation == "get_callers":
+        return mcp_tools.get_callers(
+            bundle_manifest=manifest,
+            name=payload.get("name"),
+            path=payload.get("path"),
+            k=payload.get("k", 25),
+        )
+    if operation == "get_callees":
+        return mcp_tools.get_callees(
+            bundle_manifest=manifest,
+            name=payload.get("name"),
+            path=payload.get("path"),
+            k=payload.get("k", 25),
+        )
+    if operation == "agent_impact_context":
+        from merger.repoground.core.agent_impact_adapter import (
+            RepoGroundAgentImpactAdapter,
+        )
+        from merger.repoground.core.readonly_adapter import (
+            SnapshotRegistration,
+        )
+
+        manifest_path = Path(manifest)
+        adapter = RepoGroundAgentImpactAdapter(
+            config_path=manifest_path,
+            allowed_roots=(manifest_path.parent,),
+            snapshots=(SnapshotRegistration("selected", manifest_path),),
+        )
+        return adapter.agent_impact_context(
+            "selected",
+            target_path=payload.get("target_path"),
+            target_symbol=payload.get("target_symbol"),
+            changed_paths=payload.get("changed_paths"),
+            mode=payload.get("mode", "impact"),
+            max_items=payload.get("max_items", 25),
+            include_query_context=payload.get(
+                "include_query_context", True
+            ),
+        )
     raise SystemExit(f"unknown operation: {operation}")
+
+
+if binding_payload is None:
+    result = execute()
+else:
+    binding = ManifestBinding(
+        selected_path=manifest_path_identity(
+            binding_payload["selected_path"]
+        ),
+        resolved_path=manifest_path_identity(
+            binding_payload["resolved_path"]
+        ),
+        sha256=binding_payload["sha256"],
+        run_id=binding_payload["run_id"],
+    )
+    try:
+        if manifest_path_identity(manifest) != binding.selected_path:
+            raise ManifestBindingError(
+                "manifest path does not match the selected binding"
+            )
+        with use_manifest_binding(binding):
+            result = execute()
+    except ManifestBindingError:
+        result = {
+            "available": False,
+            "status": "blocked",
+            "reason": "manifest_binding_failed",
+            "error_code": "manifest_binding_failed",
+        }
 
 print(json.dumps(result, sort_keys=True))
 """
     completed = subprocess.run(
-        ["python3", "-B", "-c", script, operation, str(manifest_path)],
+        [
+            "python3",
+            "-B",
+            "-c",
+            script,
+            operation,
+            str(manifest_path),
+            (
+                json.dumps(binding_payload, sort_keys=True)
+                if binding_payload is not None
+                else ""
+            ),
+        ],
         cwd=repoground_repo,
         check=False,
         input=json.dumps(payload, sort_keys=True),
@@ -9130,6 +9270,7 @@ def _repoground_agent_query(
     task_profile: str,
     max_context_tokens: int,
     k: int,
+    expected_manifest_sha256: str | None = None,
 ) -> dict[str, Any]:
     return _repoground_core_json(
         "agent_query",
@@ -9140,6 +9281,7 @@ def _repoground_agent_query(
             "max_context_tokens": max_context_tokens,
             "k": k,
         },
+        expected_manifest_sha256=expected_manifest_sha256,
     )
 
 
@@ -9151,6 +9293,7 @@ def _repoground_query_existing_index(
     filters: dict[str, Any] | None,
     resolve_evidence: bool,
     project_sources: bool,
+    expected_manifest_sha256: str | None = None,
 ) -> dict[str, Any]:
     return _repoground_core_json(
         "query_existing_index",
@@ -9162,16 +9305,21 @@ def _repoground_query_existing_index(
             "resolve_evidence": resolve_evidence,
             "project_sources": project_sources,
         },
+        expected_manifest_sha256=expected_manifest_sha256,
     )
 
 
 def _repoground_range_get(
-    manifest_path: Path, range_ref: dict[str, Any]
+    manifest_path: Path,
+    range_ref: dict[str, Any],
+    *,
+    expected_manifest_sha256: str | None = None,
 ) -> dict[str, Any]:
     return _repoground_core_json(
         "range_get",
         manifest_path,
         {"range_ref": range_ref},
+        expected_manifest_sha256=expected_manifest_sha256,
     )
 
 
@@ -9182,11 +9330,13 @@ def _repoground_find_symbol(
     kind: str | None,
     path: str | None,
     k: int,
+    expected_manifest_sha256: str | None = None,
 ) -> dict[str, Any]:
     return _repoground_core_json(
         "find_symbol",
         manifest_path,
         {"name": name, "kind": kind, "path": path, "k": k},
+        expected_manifest_sha256=expected_manifest_sha256,
     )
 
 
@@ -9196,11 +9346,13 @@ def _repoground_get_callers(
     name: str,
     path: str | None,
     k: int,
+    expected_manifest_sha256: str | None = None,
 ) -> dict[str, Any]:
     return _repoground_core_json(
         "get_callers",
         manifest_path,
         {"name": name, "path": path, "k": k},
+        expected_manifest_sha256=expected_manifest_sha256,
     )
 
 
@@ -9210,11 +9362,13 @@ def _repoground_get_callees(
     name: str,
     path: str | None,
     k: int,
+    expected_manifest_sha256: str | None = None,
 ) -> dict[str, Any]:
     return _repoground_core_json(
         "get_callees",
         manifest_path,
         {"name": name, "path": path, "k": k},
+        expected_manifest_sha256=expected_manifest_sha256,
     )
 
 
@@ -9831,7 +9985,12 @@ def repoground_preflight(
         }
     assert isinstance(manifest_path, Path)
     assert isinstance(selected_stem, str)
-    preflight = _repoground_agent_preflight(task_profile, manifest_path)
+    expected_manifest_sha256 = _repoground_expected_manifest_sha256(freshness)
+    preflight = _repoground_agent_preflight(
+        task_profile,
+        manifest_path,
+        expected_manifest_sha256=expected_manifest_sha256,
+    )
     preflight_status = (
         preflight.get("status")
         if isinstance(preflight.get("status"), str)
@@ -9939,6 +10098,7 @@ def repoground_query(
         }
     assert isinstance(manifest_path, Path)
     assert isinstance(selected_stem, str)
+    expected_manifest_sha256 = _repoground_expected_manifest_sha256(freshness)
 
     if filters:
         repoground_result = _repoground_query_existing_index(
@@ -9948,6 +10108,7 @@ def repoground_query(
             filters=filters,
             resolve_evidence=True,
             project_sources=True,
+            expected_manifest_sha256=expected_manifest_sha256,
         )
         filtered_available = repoground_result.get("status") == "available"
         route = str(repoground_result.get("route") or "filtered_text_retrieval")
@@ -9988,6 +10149,7 @@ def repoground_query(
             task_profile=task_profile,
             max_context_tokens=max_context_tokens,
             k=k,
+            expected_manifest_sha256=expected_manifest_sha256,
         )
         route = str(repoground_result.get("route") or "text_retrieval")
         intent = (
@@ -10167,6 +10329,7 @@ def repoground_query_existing_index(
         }
     assert isinstance(manifest_path, Path)
     assert isinstance(selected_stem, str)
+    expected_manifest_sha256 = _repoground_expected_manifest_sha256(freshness)
     repoground_result = _repoground_query_existing_index(
         manifest_path,
         query,
@@ -10174,6 +10337,7 @@ def repoground_query_existing_index(
         filters=filters or {},
         resolve_evidence=resolve_evidence,
         project_sources=project_sources,
+        expected_manifest_sha256=expected_manifest_sha256,
     )
     snippets = _repoground_query_snippets(repoground_result, max_snippets=k)
     query_result = (
@@ -10265,7 +10429,12 @@ def repoground_range_get(
         }
     assert isinstance(manifest_path, Path)
     assert isinstance(selected_stem, str)
-    repoground_result = _repoground_range_get(manifest_path, range_ref)
+    expected_manifest_sha256 = _repoground_expected_manifest_sha256(freshness)
+    repoground_result = _repoground_range_get(
+        manifest_path,
+        range_ref,
+        expected_manifest_sha256=expected_manifest_sha256,
+    )
     range_value = (
         repoground_result.get("range") if isinstance(repoground_result, dict) else None
     )
@@ -10771,7 +10940,13 @@ def _operational_guidance_runbook_from_result(
     range_ref = raw_result.get("range_ref")
     if not isinstance(range_ref, dict):
         return None, "runbook result has no RepoGround range_ref"
-    resolved = _repoground_range_get(manifest_path, range_ref)
+    resolved = _repoground_range_get(
+        manifest_path,
+        range_ref,
+        expected_manifest_sha256=_repoground_expected_manifest_sha256(
+            freshness
+        ),
+    )
     range_value = resolved.get("range") if isinstance(resolved, dict) else None
     text = range_value.get("text") if isinstance(range_value, dict) else None
     if not isinstance(text, str) or _OPERATIONAL_RUNBOOK_CONTRACT not in text:
@@ -10847,6 +11022,7 @@ def _operational_guidance_discover_repo(
             "examined_count": 0,
         }
     filters = {"path": exact_path} if exact_path else None
+    expected_manifest_sha256 = _repoground_expected_manifest_sha256(freshness)
     raw = _repoground_query_existing_index(
         manifest_path,
         _OPERATIONAL_RUNBOOK_CONTRACT,
@@ -10854,6 +11030,7 @@ def _operational_guidance_discover_repo(
         filters=filters,
         resolve_evidence=True,
         project_sources=True,
+        expected_manifest_sha256=expected_manifest_sha256,
     )
     if raw.get("status") != "available":
         return {
@@ -11323,9 +11500,16 @@ def repoground_context_pack(
             manifest_path, selected_stem, freshness
         )
     )
-    status = _repoground_bundle_status_for_manifest(manifest_path)
     manifest_sha = pinned_publication.manifest_sha256
-    preflight = _repoground_agent_preflight(task_profile, manifest_path)
+    status = _repoground_bundle_status_for_manifest(
+        manifest_path,
+        expected_manifest_sha256=manifest_sha,
+    )
+    preflight = _repoground_agent_preflight(
+        task_profile,
+        manifest_path,
+        expected_manifest_sha256=manifest_sha,
+    )
     preflight_status = (
         preflight.get("status")
         if isinstance(preflight.get("status"), str)
@@ -12054,7 +12238,11 @@ def _repoground_dirty_overlay(repo_path: Path) -> dict[str, Any]:
 
 
 def _repoground_agent_impact_context(
-    manifest_path: Path, *, changed_paths: list[str], max_items: int
+    manifest_path: Path,
+    *,
+    changed_paths: list[str],
+    max_items: int,
+    expected_manifest_sha256: str | None = None,
 ) -> dict[str, Any]:
     return _repoground_core_json(
         "agent_impact_context",
@@ -12065,11 +12253,36 @@ def _repoground_agent_impact_context(
             "max_items": max_items,
             "include_query_context": True,
         },
+        expected_manifest_sha256=expected_manifest_sha256,
     )
 
 
-def _repoground_manifest_surface_metadata(manifest_path: Path) -> dict[str, dict[str, Any]]:
-    manifest = _repoground_json(manifest_path)
+def _repoground_manifest_surface_metadata(
+    manifest_path: Path,
+    *,
+    expected_manifest_sha256: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    data = _ensure_regular_text_file(manifest_path, 2_000_000)
+    observed_sha256 = hashlib.sha256(data).hexdigest()
+    if (
+        expected_manifest_sha256 is not None
+        and observed_sha256
+        != _validate_sha256(
+            expected_manifest_sha256,
+            "expected_manifest_sha256",
+        )
+    ):
+        raise ValueError("selected RepoGround publication changed before surface read")
+    try:
+        manifest = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Invalid RepoGround JSON artifact: {manifest_path.name}"
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise ValueError(
+            f"RepoGround artifact must be a JSON object: {manifest_path.name}"
+        )
     roles = {
         "agent_entry_manifest",
         "pr_delta_cards_jsonl",
@@ -12086,7 +12299,15 @@ def _repoground_manifest_surface_metadata(manifest_path: Path) -> dict[str, dict
         role = str(artifact["role"])
         result[role] = {
             key: artifact.get(key)
-            for key in ("role", "path", "bytes", "sha256", "contract", "authority", "risk_class")
+            for key in (
+                "role",
+                "path",
+                "bytes",
+                "sha256",
+                "contract",
+                "authority",
+                "risk_class",
+            )
             if artifact.get(key) is not None
         }
     return dict(sorted(result.items()))
@@ -12501,8 +12722,12 @@ def repoground_context_compose(
         manifest_path,
         changed_paths=changed_paths,
         max_items=min(max(len(changed_paths) * 4, 8), 50),
+        expected_manifest_sha256=selected_publication.manifest_sha256,
     ) if changed_paths else {"status": "skipped", "gaps": []}
-    surfaces = _repoground_manifest_surface_metadata(manifest_path)
+    surfaces = _repoground_manifest_surface_metadata(
+        manifest_path,
+        expected_manifest_sha256=selected_publication.manifest_sha256,
+    )
     preflight = baseline.get("preflight") if isinstance(baseline.get("preflight"), dict) else {}
     bundle_status = baseline.get("bundle_status") if isinstance(baseline.get("bundle_status"), dict) else {}
     evidence = baseline.get("bounded_evidence") if isinstance(baseline.get("bounded_evidence"), dict) else {}
@@ -12929,12 +13154,14 @@ def repoground_find_symbol(
         )
     assert isinstance(manifest_path, Path)
     assert isinstance(selected_stem, str)
+    expected_manifest_sha256 = _repoground_expected_manifest_sha256(freshness)
     result = _repoground_find_symbol(
         manifest_path,
         name=name,
         kind=kind,
         path=path,
         k=k,
+        expected_manifest_sha256=expected_manifest_sha256,
     )
     return _repoground_navigation_response(
         tool="repoground_find_symbol",
@@ -12970,11 +13197,13 @@ def repoground_get_callers(
         )
     assert isinstance(manifest_path, Path)
     assert isinstance(selected_stem, str)
+    expected_manifest_sha256 = _repoground_expected_manifest_sha256(freshness)
     result = _repoground_get_callers(
         manifest_path,
         name=name,
         path=path,
         k=k,
+        expected_manifest_sha256=expected_manifest_sha256,
     )
     return _repoground_navigation_response(
         tool="repoground_get_callers",
@@ -13010,11 +13239,13 @@ def repoground_get_callees(
         )
     assert isinstance(manifest_path, Path)
     assert isinstance(selected_stem, str)
+    expected_manifest_sha256 = _repoground_expected_manifest_sha256(freshness)
     result = _repoground_get_callees(
         manifest_path,
         name=name,
         path=path,
         k=k,
+        expected_manifest_sha256=expected_manifest_sha256,
     )
     return _repoground_navigation_response(
         tool="repoground_get_callees",
