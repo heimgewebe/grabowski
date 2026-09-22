@@ -1664,6 +1664,11 @@ def _task_publication_lease_metadata(
         if required != metadata:
             raise ValueError("publication-lease-metadata-contract-invalid")
         return metadata
+    legacy_revision_keys = {"operation", "proposal_sha256", "task_id"}
+    if required_keys == legacy_revision_keys:
+        if any(required.get(key) != metadata[key] for key in legacy_revision_keys):
+            raise ValueError("publication-lease-metadata-contract-invalid")
+        return metadata
     expected_keys = {
         "authority_kind",
         "first_task_onboarding_sha256",
