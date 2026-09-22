@@ -6832,7 +6832,7 @@ def grabowski_status(
     else:
         recommended_next_action = "none"
     base_payload: dict[str, Any] = {
-        "schema_version": 2,
+        "schema_version": 3 if selected_view == "minimal" else 2,
         "view": selected_view,
         "service": "grabowski-mcp",
         "healthy": healthy,

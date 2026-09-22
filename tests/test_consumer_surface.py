@@ -292,6 +292,11 @@ class ConsumerSurfaceTests(unittest.TestCase):
             )
 
         self.assertEqual(minimal["view"], "minimal")
+        self.assertEqual(minimal["schema_version"], 3)
+        self.assertEqual(standard["schema_version"], 2)
+        self.assertEqual(evidence["schema_version"], 2)
+        self.assertEqual(concise["schema_version"], 3)
+        self.assertEqual(full["schema_version"], 2)
         self.assertNotIn("capabilities", minimal)
         self.assertEqual(
             minimal["agent_instructions"]["version"],
