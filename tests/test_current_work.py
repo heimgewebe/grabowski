@@ -1008,6 +1008,37 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertEqual(group["work_class"], "hygiene")
         self.assertIn("managed-active-retention-expired", group["action_reasons"])
 
+    def test_managed_active_checkout_with_running_worker_remains_active(self) -> None:
+        owner = "worker:w1"
+        result = project(
+            checkout_payloads=[
+                {
+                    "repository": REPOSITORY,
+                    "worktrees": [
+                        checkout(
+                            "managed-worker-live",
+                            "/home/alex/repos/.worktrees/managed-worker-live",
+                            lifecycle_state="managed_active_attention",
+                            binding_owner=owner,
+                            binding_phase="active",
+                            retention_active=False,
+                            retention_until_unix=1,
+                        )
+                    ],
+                }
+            ],
+            browser_payload={
+                "workers": [worker("w1", state="running")],
+                "has_more": False,
+            },
+            view="history",
+        )
+        group = next(item for item in result["work"] if item["work_id"] == owner)
+        self.assertEqual(group["worker_refs"][0]["state"], "running")
+        self.assertEqual(group["projection_state"], "active")
+        self.assertEqual(group["work_class"], "operational")
+        self.assertNotIn("managed-active-retention-expired", group["action_reasons"])
+
     def test_managed_active_checkout_with_process_remains_active(self) -> None:
         owner = "operator:managed-live"
         result = project(
