@@ -114,7 +114,7 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "goal-fidelity-before-continuation",
-        "At material direction boundaries keep original user outcome authoritative; strategy is disposable. Test a necessary assumption with fresh evidence, name a serious alternative, then choose CONTINUE, CHANGE, or PARK/STOP. A single tool failure is not strategic evidence.",
+        "At material choices, user outcome outranks strategy. Use the minimum sufficient mechanism; persistent complexity needs proof of benefit. Compare a simpler path with fresh evidence; choose CONTINUE/CHANGE/PARK-STOP. A tool failure is not strategic evidence.",
     ),
     (
         "operator-obligation-lifecycle",

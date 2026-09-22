@@ -172,8 +172,10 @@ class AgentInstructionsTests(unittest.TestCase):
             self.assertIn(phrase, github)
         direction = rules["goal-fidelity-before-continuation"].lower()
         for phrase in (
-            "original user outcome", "fresh evidence", "serious alternative",
-            "continue", "change", "park/stop", "single tool failure",
+            "user outcome", "minimum sufficient mechanism",
+            "persistent complexity", "proof of benefit", "simpler path",
+            "fresh evidence", "continue", "change", "park-stop",
+            "tool failure", "strategic evidence",
         ):
             self.assertIn(phrase, direction)
         obligation = rules["operator-obligation-lifecycle"].lower()
