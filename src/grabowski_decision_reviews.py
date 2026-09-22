@@ -91,6 +91,17 @@ def sha256_json(value: Any) -> str:
     return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
 
 
+def _agent_role_command_sha256(value: Any) -> str:
+    """Match grabowski_agent_role.digest for cross-module argv receipts."""
+    payload = json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _review_role_module_identity() -> tuple[str, str] | None:
     """Bind reviewer provenance to the server-installed role module bytes."""
     module_path = Path(__file__).with_name(f"{REVIEW_ROLE_MODULE}.py")
@@ -520,7 +531,7 @@ def review_role_provenance(
         "workspace_diff_sha256": workspace_diff,
         "expected_dirty": False,
         "role_receipt_path": str(output.resolve(strict=False)),
-        "reviewer_command_sha256": sha256_json(reviewer_command),
+        "reviewer_command_sha256": _agent_role_command_sha256(reviewer_command),
         "review_route": review_route,
         "binding_sha256": sha256_json(normalized),
     }
