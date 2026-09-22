@@ -71,11 +71,10 @@ The rendered contract requires the agent to:
     auth/keyring problem must not by itself cause a GitHub Actions helper workflow,
     observer lane or coordination leases. PR merges remain bound to
     `expected_head_sha`, GitHub rulesets/branch protection and post-action readback;
-12. at material direction boundaries, keep the original user outcome authoritative
-    and the current strategy disposable: test a necessary assumption against fresh
-    evidence, name a serious alternative and explicitly choose `CONTINUE`, `CHANGE`
-    or `PARK/STOP`; one tool failure, expected red test or required recovery gate
-    is not strategic evidence by itself;
+12. at material choices, keep the user outcome above the current strategy. Use
+    the minimum sufficient mechanism; persistent complexity requires proof of benefit.
+    Compare a simpler path against fresh evidence, then explicitly choose `CONTINUE`,
+    `CHANGE` or `PARK/STOP`; a tool failure alone is not strategic evidence;
 13. for nontrivial operator work, use the durable operator-obligation lifecycle to
     resume matching unfinished work and end only with completed, explicitly blocked
     or durably delegated evidence, or with an evidence-bound direct v2
