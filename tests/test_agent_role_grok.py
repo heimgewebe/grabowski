@@ -448,6 +448,46 @@ class GrokReviewRoleTests(unittest.TestCase):
 
         prepare.assert_called_once_with(declared)
 
+    def test_codex_review_sandbox_preserves_existing_noninteractive_subcommands(self) -> None:
+        repo = Path("/tmp/repo")
+        for subcommand in ("e", "review"):
+            with self.subTest(subcommand=subcommand):
+                declared = ["codex", subcommand, "review this"]
+                prepared = PreparedSandboxCommand(
+                    command=("/usr/bin/python3", "-I", "codex-launcher", subcommand, "review this")
+                )
+                with (
+                    mock.patch.object(
+                        role, "prepare_external_agent_command", return_value=prepared
+                    ) as prepare,
+                    mock.patch.object(role, "sandbox_argv", return_value=["sandbox"]),
+                ):
+                    role._review_sandbox_argv(
+                        repo,
+                        declared,
+                        expected_head="a" * 40,
+                        expected_base_head="b" * 40,
+                        review_diff=b"",
+                    )
+
+                prepare.assert_called_once_with(declared)
+
+    def test_codex_review_subcommand_detection_skips_global_option_values(self) -> None:
+        declared = ["codex", "--model", "review", "review this"]
+        self.assertIsNone(role._codex_declared_subcommand(declared))
+        self.assertEqual(
+            role._codex_review_command_for_headless_execution(declared),
+            ["codex", "--model", "review", "exec", "review this"],
+        )
+
+    def test_codex_review_subcommand_detection_preserves_exec_with_subcommand_options(self) -> None:
+        declared = ["codex", "exec", "--json", "review this"]
+        self.assertEqual(role._codex_declared_subcommand(declared), "exec")
+        self.assertEqual(
+            role._codex_review_command_for_headless_execution(declared),
+            declared,
+        )
+
     def test_review_sandbox_preserves_declared_command_for_provenance(self) -> None:
         repo = Path("/tmp/repo")
         declared = ["grok", "--model", "grok-4.6", "review this"]

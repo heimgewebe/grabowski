@@ -646,12 +646,90 @@ def _grok_streaming_review_command(
     return tuple(command), prompt
 
 
+_CODEX_NONINTERACTIVE_SUBCOMMANDS = frozenset({"exec", "e", "review"})
+_CODEX_GLOBAL_OPTIONS_WITH_VALUE = frozenset(
+    {
+        "-a",
+        "--add-dir",
+        "--ask-for-approval",
+        "-C",
+        "--cd",
+        "-c",
+        "--config",
+        "--disable",
+        "--enable",
+        "--local-provider",
+        "-m",
+        "--model",
+        "-p",
+        "--profile",
+        "--remote",
+        "--remote-auth-token-env",
+        "-s",
+        "--sandbox",
+    }
+)
+_CODEX_GLOBAL_FLAGS = frozenset(
+    {
+        "--approve-for-me",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--dangerously-bypass-hook-trust",
+        "-h",
+        "--help",
+        "--no-alt-screen",
+        "--oss",
+        "--search",
+        "--strict-config",
+        "-V",
+        "--version",
+        "--worktree",
+    }
+)
+
+
+def _codex_declared_subcommand(command: list[str]) -> str | None:
+    """Return the actual Codex subcommand before the final review prompt."""
+    arguments = command[1:-1]
+    long_options_with_value = tuple(
+        option
+        for option in _CODEX_GLOBAL_OPTIONS_WITH_VALUE
+        if option.startswith("--")
+    )
+    index = 0
+    while index < len(arguments):
+        token = arguments[index]
+        if token == "--":
+            return arguments[index + 1] if index + 1 < len(arguments) else None
+        if token in _CODEX_GLOBAL_OPTIONS_WITH_VALUE:
+            if index + 1 >= len(arguments):
+                raise RuntimeError(f"Codex global option {token} is missing its value")
+            index += 2
+            continue
+        if any(token.startswith(f"{option}=") for option in long_options_with_value):
+            index += 1
+            continue
+        if token in _CODEX_GLOBAL_FLAGS:
+            index += 1
+            continue
+        if token.startswith("-"):
+            raise RuntimeError(
+                f"unsupported Codex global option before review subcommand: {token}"
+            )
+        return token
+    return None
+
+
 def _codex_review_command_for_headless_execution(command: list[str]) -> list[str]:
     """Turn one direct Codex review command into its non-interactive form."""
     if len(command) < 2:
         raise RuntimeError("Codex review command must include a prompt")
-    if "exec" in command[1:-1]:
+    subcommand = _codex_declared_subcommand(command)
+    if subcommand in _CODEX_NONINTERACTIVE_SUBCOMMANDS:
         return list(command)
+    if subcommand is not None:
+        raise RuntimeError(
+            f"Codex review command declares unsupported subcommand: {subcommand}"
+        )
     return [*command[:-1], "exec", command[-1]]
 
 
