@@ -2366,8 +2366,8 @@ def classify_tunnel_readiness_dependency(
                 (
                     "selected-operator-unavailable"
                     if healthy_tunnel
-                    else "readiness-dependency-unavailable"
-                ,),
+                    else "readiness-dependency-unavailable",
+                ),
                 probe.pid,
                 probe.age_seconds,
                 probe.start_ticks,

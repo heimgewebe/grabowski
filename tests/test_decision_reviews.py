@@ -12,6 +12,7 @@ if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
 import grabowski_decision_reviews as reviews
+import grabowski_agent_role as agent_role
 import grabowski_job_origin as job_origin
 
 
@@ -223,6 +224,54 @@ def make_job(
 
 
 class DecisionReviewReconciliationTests(unittest.TestCase):
+    def test_review_role_provenance_uses_agent_role_command_hash_for_unicode_prompt(self) -> None:
+        role_command = [
+            "claude",
+            "--model",
+            "opus",
+            "--effort",
+            "high",
+            "--permission-mode",
+            "plan",
+            "Review transition → fail closed",
+        ]
+        role_receipt_path = Path("/tmp/review/role-receipt.json")
+        job_argv = [
+            reviews.REVIEW_ROLE_PYTHON,
+            "-I",
+            "-m",
+            reviews.REVIEW_ROLE_MODULE,
+            "--role",
+            "review",
+            "--repository",
+            "/tmp/review",
+            "--expected-head",
+            HEAD,
+            "--expected-base-head",
+            BASE,
+            "--expected-diff-sha256",
+            "e" * 64,
+            "--expected-dirty",
+            "false",
+            "--output",
+            str(role_receipt_path),
+            "--",
+            *role_command,
+        ]
+
+        provenance = reviews.review_role_provenance(
+            job_argv,
+            reviews.normalize_binding(binding("independent-reviewer")),
+            cwd=Path("/tmp/review"),
+        )
+
+        self.assertIsNotNone(provenance)
+        assert provenance is not None
+        self.assertEqual(
+            agent_role.digest(role_command),
+            provenance["reviewer_command_sha256"],
+        )
+
     def reconcile(self, jobs: Path) -> dict:
         return reviews.reconcile(
             repo=REPO,
