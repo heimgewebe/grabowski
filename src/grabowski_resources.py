@@ -463,6 +463,7 @@ def _resource_reconcile_revision_trigger_sql() -> dict[str, str]:
     bump = (
         "SELECT CASE WHEN (SELECT COUNT(*) FROM metadata "
         f"WHERE key='{RESOURCE_RECONCILE_REVISION_METADATA_KEY}' "
+        "AND typeof(value)='text' "
         "AND length(value)=64 "
         "AND value NOT GLOB '*[^0-9a-f]*')=1 "
         "THEN 1 ELSE RAISE(ABORT, 'resource reconcile revision token is invalid') END; "
@@ -472,8 +473,11 @@ def _resource_reconcile_revision_trigger_sql() -> dict[str, str]:
     return {
         "resource_reconcile_leases_insert_v1": (
             "CREATE TRIGGER resource_reconcile_leases_insert_v1 "
-            "AFTER INSERT ON leases "
+            "BEFORE INSERT ON leases "
             "WHEN NEW.owner_id LIKE 'task:%' "
+            "OR EXISTS (SELECT 1 FROM leases "
+            "WHERE resource_key=NEW.resource_key "
+            "AND owner_id LIKE 'task:%') "
             f"BEGIN {bump} END"
         ),
         "resource_reconcile_leases_update_v1": (
@@ -558,7 +562,10 @@ def _resource_reconcile_revision_contract(
             "Unsupported resource reconcile revision contract version; "
             "use a compatible runtime"
         )
-    revision_text = str(revision_rows[0][0])
+    revision_value = revision_rows[0][0]
+    if not isinstance(revision_value, str):
+        raise RuntimeError("Resource reconcile revision token is malformed")
+    revision_text = revision_value
     if (
         len(revision_text) != 64
         or revision_text != revision_text.lower()
@@ -736,6 +743,11 @@ def _resource_schema_inventory() -> dict[str, Any]:
             RESOURCE_LEASE_CONTRACT_SUPPORTED_VERSIONS
         ),
         "lease_contract_status": "uninitialized",
+        "reconcile_revision_contract_observed_version": None,
+        "reconcile_revision_contract_current_version": (
+            RESOURCE_RECONCILE_REVISION_CONTRACT_VERSION
+        ),
+        "reconcile_revision_contract_status": "uninitialized",
         "status": "uninitialized",
         "migration_required": False,
         "migration_path": [],
@@ -802,6 +814,27 @@ def _resource_schema_inventory() -> dict[str, Any]:
                 _validate_resource_schema_current(
                     connection, require_lease_contract=False
                 )
+                try:
+                    reconcile_contract = _resource_reconcile_revision_contract(
+                        connection,
+                        required=False,
+                    )
+                except RuntimeError as exc:
+                    result.update(
+                        status="blocked",
+                        reconcile_revision_contract_status="blocked",
+                        required_action="restore_or_inspect_store",
+                        recovery_instruction=RESOURCE_SCHEMA_RECOVERY_INSTRUCTION,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                    return result
+                if reconcile_contract is None:
+                    result["reconcile_revision_contract_status"] = "missing"
+                else:
+                    result["reconcile_revision_contract_observed_version"] = (
+                        reconcile_contract["contract_version"]
+                    )
+                    result["reconcile_revision_contract_status"] = "current"
             elif observed == "2":
                 _validate_resource_schema_v2(connection)
             else:
@@ -838,6 +871,29 @@ def _resource_schema_inventory() -> dict[str, Any]:
                         "to": RESOURCE_CURRENT_SCHEMA_VERSION,
                         "lease_contract_from": None,
                         "lease_contract_to": RESOURCE_LEASE_CONTRACT_CURRENT_VERSION,
+                        "lock": "exclusive_store_directory",
+                        "transaction": "immediate",
+                        "verified_backup_required": True,
+                    }
+                ],
+            )
+            return result
+        if reconcile_contract is None:
+            result.update(
+                status="reconcile_revision_contract_required",
+                lease_contract_status="current",
+                migration_required=True,
+                required_action=(
+                    "open_with_current_runtime_to_publish_reconcile_revision_contract"
+                ),
+                migration_path=[
+                    {
+                        "from": RESOURCE_CURRENT_SCHEMA_VERSION,
+                        "to": RESOURCE_CURRENT_SCHEMA_VERSION,
+                        "reconcile_revision_contract_from": None,
+                        "reconcile_revision_contract_to": (
+                            RESOURCE_RECONCILE_REVISION_CONTRACT_VERSION
+                        ),
                         "lock": "exclusive_store_directory",
                         "transaction": "immediate",
                         "verified_backup_required": True,

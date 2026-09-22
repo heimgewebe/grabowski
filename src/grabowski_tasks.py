@@ -1422,6 +1422,7 @@ def _task_reconcile_revision_trigger_sql() -> dict[str, str]:
     bump = (
         "SELECT CASE WHEN (SELECT COUNT(*) FROM metadata "
         f"WHERE key='{TASK_RECONCILE_REVISION_METADATA_KEY}' "
+        "AND typeof(value)='text' "
         "AND length(value)=64 "
         "AND value NOT GLOB '*[^0-9a-f]*')=1 "
         "THEN 1 ELSE RAISE(ABORT, 'task reconcile revision token is invalid') END; "
@@ -1431,8 +1432,11 @@ def _task_reconcile_revision_trigger_sql() -> dict[str, str]:
     return {
         "task_reconcile_revision_insert_v1": (
             "CREATE TRIGGER task_reconcile_revision_insert_v1 "
-            "AFTER INSERT ON tasks "
+            "BEFORE INSERT ON tasks "
             f"WHEN NEW.state IN ({states}) "
+            "OR EXISTS (SELECT 1 FROM tasks "
+            "WHERE task_id=NEW.task_id "
+            f"AND state IN ({states})) "
             f"BEGIN {bump} END"
         ),
         "task_reconcile_revision_update_v1": (
@@ -1487,7 +1491,10 @@ def _task_reconcile_revision_contract(
             "Unsupported task reconcile revision contract version; "
             "use a compatible runtime"
         )
-    revision_text = str(revision_rows[0][0])
+    revision_value = revision_rows[0][0]
+    if not isinstance(revision_value, str):
+        raise RuntimeError("Task reconcile revision token is malformed")
+    revision_text = revision_value
     if (
         len(revision_text) != 64
         or revision_text != revision_text.lower()
@@ -1599,6 +1606,11 @@ def _task_schema_inventory() -> dict[str, Any]:
         "observed_version": None,
         "current_version": TASK_CURRENT_SCHEMA_VERSION,
         "supported_versions": list(TASK_SUPPORTED_SCHEMA_VERSIONS),
+        "reconcile_revision_contract_observed_version": None,
+        "reconcile_revision_contract_current_version": (
+            TASK_RECONCILE_REVISION_CONTRACT_VERSION
+        ),
+        "reconcile_revision_contract_status": "uninitialized",
         "status": "uninitialized",
         "migration_required": False,
         "migration_path": [],
@@ -1639,6 +1651,27 @@ def _task_schema_inventory() -> dict[str, Any]:
                 return result
             if observed == TASK_CURRENT_SCHEMA_VERSION:
                 _validate_task_schema_current(connection)
+                try:
+                    reconcile_contract = _task_reconcile_revision_contract(
+                        connection,
+                        required=False,
+                    )
+                except RuntimeError as exc:
+                    result.update(
+                        status="blocked",
+                        reconcile_revision_contract_status="blocked",
+                        required_action="restore_or_inspect_store",
+                        recovery_instruction=TASK_SCHEMA_RECOVERY_INSTRUCTION,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                    return result
+                if reconcile_contract is None:
+                    result["reconcile_revision_contract_status"] = "missing"
+                else:
+                    result["reconcile_revision_contract_observed_version"] = (
+                        reconcile_contract["contract_version"]
+                    )
+                    result["reconcile_revision_contract_status"] = "current"
             else:
                 _validate_task_schema_legacy(connection, observed)
     except TaskSchemaInventoryChanged as exc:
@@ -1661,6 +1694,28 @@ def _task_schema_inventory() -> dict[str, Any]:
         )
         return result
     if observed == TASK_CURRENT_SCHEMA_VERSION:
+        if reconcile_contract is None:
+            result.update(
+                status="reconcile_revision_contract_required",
+                migration_required=True,
+                required_action=(
+                    "open_with_current_runtime_to_publish_reconcile_revision_contract"
+                ),
+                migration_path=[
+                    {
+                        "from": TASK_CURRENT_SCHEMA_VERSION,
+                        "to": TASK_CURRENT_SCHEMA_VERSION,
+                        "reconcile_revision_contract_from": None,
+                        "reconcile_revision_contract_to": (
+                            TASK_RECONCILE_REVISION_CONTRACT_VERSION
+                        ),
+                        "lock": "exclusive_store_directory",
+                        "transaction": "immediate",
+                        "verified_backup_required": True,
+                    }
+                ],
+            )
+            return result
         result.update(status="current", write_compatible=True, required_action="none")
         return result
     path = TASK_SCHEMA_MIGRATION_PATHS[observed]
