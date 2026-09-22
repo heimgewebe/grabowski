@@ -218,6 +218,53 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                 self.assertEqual(calls, 1)
                 self.assertEqual(audit.read_bytes(), active_before)
 
+    def test_append_retries_after_predecessor_change_then_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            audit, patches = self._patches(state)
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+                for index in range(25):
+                    grabowski_mcp._append_audit(
+                        {
+                            "operation": "predecessor-retry-setup",
+                            "index": index,
+                            "payload": "r" * 120,
+                        }
+                    )
+                before = grabowski_mcp._verify_audit_log(audit)
+                original_head = grabowski_mcp._read_audit_head_unlocked
+                head_reads = 0
+
+                def change_predecessor_once(path):
+                    nonlocal head_reads
+                    result = original_head(path)
+                    head_reads += 1
+                    if head_reads == 2:
+                        current_head, current_predecessor = result
+                        self.assertIsNotNone(current_predecessor)
+                        changed = dict(current_predecessor)
+                        changed["sha256"] = "f" * 64
+                        return current_head, changed
+                    return result
+
+                with patch.object(
+                    grabowski_mcp,
+                    "_read_audit_head_unlocked",
+                    side_effect=change_predecessor_once,
+                ):
+                    grabowski_mcp._append_audit(
+                        {"operation": "predecessor-retry-success"}
+                    )
+
+                self.assertGreaterEqual(head_reads, 4)
+                after = grabowski_mcp._verify_audit_log(audit)
+                self.assertTrue(after["valid"], after)
+                self.assertEqual(
+                    after["total_records"],
+                    before["total_records"] + 1,
+                )
+
     def test_failure_before_active_replace_keeps_previous_active_chain(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"
@@ -582,6 +629,94 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                 self.assertTrue(tampered)
                 self.assertEqual(audit.read_bytes(), active_before)
 
+    def test_preappend_snapshot_recheck_preserves_file_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            audit, patches = self._patches(state)
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+                for index in range(25):
+                    grabowski_mcp._append_audit(
+                        {
+                            "operation": "snapshot-contract-test",
+                            "index": index,
+                            "payload": "m" * 120,
+                        }
+                    )
+                first = json.loads(audit.read_text(encoding="utf-8").splitlines()[0])
+                segment = Path(first["archived_audit_path"])
+                original = grabowski_mcp._verify_audit_predecessor_snapshot
+                broadened = False
+
+                def broaden_then_verify(predecessor, snapshot):
+                    nonlocal broadened
+                    if not broadened:
+                        os.chmod(segment, 0o644)
+                        broadened = True
+                    return original(predecessor, snapshot)
+
+                active_before = audit.read_bytes()
+                with patch.object(
+                    grabowski_mcp,
+                    "_verify_audit_predecessor_snapshot",
+                    side_effect=broaden_then_verify,
+                ):
+                    with self.assertRaisesRegex(
+                        PermissionError,
+                        "file contract",
+                    ):
+                        grabowski_mcp._append_audit(
+                            {"operation": "must-not-append-broad-evidence"}
+                        )
+
+                self.assertTrue(broadened)
+                self.assertEqual(audit.read_bytes(), active_before)
+
+    def test_preappend_snapshot_recheck_rejects_symlink_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            audit, patches = self._patches(state)
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+                for index in range(25):
+                    grabowski_mcp._append_audit(
+                        {
+                            "operation": "snapshot-symlink-test",
+                            "index": index,
+                            "payload": "s" * 120,
+                        }
+                    )
+                first = json.loads(audit.read_text(encoding="utf-8").splitlines()[0])
+                segment = Path(first["archived_audit_path"])
+                original = grabowski_mcp._verify_audit_predecessor_snapshot
+                replaced = False
+
+                def replace_with_symlink_then_verify(predecessor, snapshot):
+                    nonlocal replaced
+                    if not replaced:
+                        preserved = segment.with_name(segment.name + ".preserved")
+                        segment.rename(preserved)
+                        segment.symlink_to(preserved)
+                        replaced = True
+                    return original(predecessor, snapshot)
+
+                active_before = audit.read_bytes()
+                with patch.object(
+                    grabowski_mcp,
+                    "_verify_audit_predecessor_snapshot",
+                    side_effect=replace_with_symlink_then_verify,
+                ):
+                    with self.assertRaisesRegex(
+                        PermissionError,
+                        "file contract",
+                    ):
+                        grabowski_mcp._append_audit(
+                            {"operation": "must-not-append-symlink-evidence"}
+                        )
+
+                self.assertTrue(replaced)
+                self.assertEqual(audit.read_bytes(), active_before)
+
     def test_postappend_predecessor_tamper_rolls_back_active_append(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"
@@ -868,31 +1003,48 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                 self.assertEqual(snapshot.archived_segment_count, 1)
 
 
-    def test_verify_retries_when_active_head_changes_after_history_scan(self) -> None:
+    def test_verify_reuses_history_when_only_active_head_changes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"
             state.mkdir(mode=0o700)
             audit, patches = self._patches(state)
             with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
-                for index in range(25):
+                index = 0
+                while True:
                     grabowski_mcp._append_audit(
-                        {"operation": "verify-race-before", "index": index, "payload": "r" * 120}
+                        {
+                            "operation": "verify-race-before",
+                            "index": index,
+                            "payload": "r" * 240,
+                        }
                     )
-                before = grabowski_mcp._verify_audit_log(audit)
+                    before = grabowski_mcp._verify_audit_log(audit)
+                    if before["archived_segment_count"] > 0:
+                        break
+                    index += 1
+
                 original = grabowski_mcp._read_audit_chain_unlocked
                 race_armed = True
+                writer_active = False
                 history_scans = 0
 
                 def scan_then_change_head(path, *args, **kwargs):
-                    nonlocal race_armed, history_scans
+                    nonlocal race_armed, writer_active, history_scans
                     result = original(path, *args, **kwargs)
-                    if kwargs.get("initial_expected") is not None:
+                    if (
+                        kwargs.get("initial_expected") is not None
+                        and not writer_active
+                    ):
                         history_scans += 1
                         if race_armed:
                             race_armed = False
-                            grabowski_mcp._append_audit(
-                                {"operation": "verify-race-after"}
-                            )
+                            writer_active = True
+                            try:
+                                grabowski_mcp._append_audit(
+                                    {"operation": "verify-race-after"}
+                                )
+                            finally:
+                                writer_active = False
                     return result
 
                 with patch.object(
@@ -903,9 +1055,12 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                     status = grabowski_mcp._verify_audit_log(audit)
 
                 self.assertFalse(race_armed)
-                self.assertGreaterEqual(history_scans, 2)
+                self.assertEqual(history_scans, 1)
                 self.assertTrue(status["valid"], status)
-                self.assertEqual(status["total_records"], before["total_records"] + 1)
+                self.assertEqual(
+                    status["total_records"],
+                    before["total_records"] + 1,
+                )
 
     def test_verify_scans_immutable_segments_outside_coordination_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -973,6 +1128,70 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                 self.assertTrue(all(lock_observations))
                 self.assertTrue(payload_sizes)
                 self.assertEqual(set(payload_sizes), {0})
+
+    def test_append_snapshot_recheck_avoids_evidence_reopens_under_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            audit, patches = self._patches(state)
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+                for index in range(25):
+                    grabowski_mcp._append_audit(
+                        {
+                            "operation": "snapshot-reopen-test",
+                            "index": index,
+                            "payload": "o" * 120,
+                        }
+                    )
+                warmed = grabowski_mcp._verify_audit_log(audit)
+                self.assertTrue(warmed["valid"], warmed)
+                original_full = grabowski_mcp._private_evidence_identity
+                original_path = grabowski_mcp._private_evidence_path_identity
+                full_checks = []
+                path_checks_under_lock = []
+                lock_path = grabowski_mcp._audit_storage_paths(audit)[
+                    "coordination_lock"
+                ]
+
+                def coordination_lock_is_free() -> bool:
+                    fd = os.open(lock_path, os.O_RDWR | os.O_CLOEXEC)
+                    try:
+                        try:
+                            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            return False
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                        return True
+                    finally:
+                        os.close(fd)
+
+                def observe_full(path, *, max_bytes):
+                    full_checks.append(str(path))
+                    return original_full(path, max_bytes=max_bytes)
+
+                def observe_path(path, *, max_bytes):
+                    if not coordination_lock_is_free():
+                        path_checks_under_lock.append(str(path))
+                    return original_path(path, max_bytes=max_bytes)
+
+                with (
+                    patch.object(
+                        grabowski_mcp,
+                        "_private_evidence_identity",
+                        side_effect=observe_full,
+                    ),
+                    patch.object(
+                        grabowski_mcp,
+                        "_private_evidence_path_identity",
+                        side_effect=observe_path,
+                    ),
+                ):
+                    grabowski_mcp._append_audit(
+                        {"operation": "snapshot-reopen-measure"}
+                    )
+
+                self.assertEqual(full_checks, [])
+                self.assertTrue(path_checks_under_lock)
 
     def test_append_snapshot_is_independent_of_global_cache_capacity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
