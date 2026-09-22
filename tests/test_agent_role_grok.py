@@ -378,6 +378,76 @@ class GrokReviewRoleTests(unittest.TestCase):
                             prepared, expected_head="a" * 40, expected_base_head="b" * 40, review_diff=b"diff"
                         )
 
+    def test_codex_review_sandbox_inserts_exec_without_changing_declared_command(self) -> None:
+        repo = Path("/tmp/repo")
+        declared = [
+            "codex",
+            "--model",
+            "gpt-5.6-sol",
+            "--sandbox",
+            "read-only",
+            "--ask-for-approval",
+            "never",
+            "review this",
+        ]
+        prepared = PreparedSandboxCommand(
+            command=("/usr/bin/python3", "-I", "codex-launcher", "exec", "review this")
+        )
+        with (
+            mock.patch.object(
+                role, "prepare_external_agent_command", return_value=prepared
+            ) as prepare,
+            mock.patch.object(role, "sandbox_argv", return_value=["sandbox"]) as sandbox_argv,
+        ):
+            argv, contract, prompt_bytes = role._review_sandbox_argv(
+                repo,
+                declared,
+                expected_head="a" * 40,
+                expected_base_head="b" * 40,
+                review_diff=b"",
+            )
+
+        self.assertEqual(argv, ["sandbox"])
+        self.assertIsNone(contract)
+        self.assertIsNone(prompt_bytes)
+        normalized = prepare.call_args.args[0]
+        self.assertEqual(normalized[-2:], ["exec", "review this"])
+        self.assertEqual(normalized[:-2], declared[:-1])
+        self.assertEqual(sandbox_argv.call_args.args[1], list(prepared.command))
+        self.assertEqual(sandbox_argv.call_args.kwargs["declared_command"], declared)
+
+    def test_codex_review_sandbox_preserves_existing_exec(self) -> None:
+        repo = Path("/tmp/repo")
+        declared = [
+            "codex",
+            "--model",
+            "gpt-5.6-sol",
+            "--sandbox",
+            "read-only",
+            "--ask-for-approval",
+            "never",
+            "exec",
+            "review this",
+        ]
+        prepared = PreparedSandboxCommand(
+            command=("/usr/bin/python3", "-I", "codex-launcher", "exec", "review this")
+        )
+        with (
+            mock.patch.object(
+                role, "prepare_external_agent_command", return_value=prepared
+            ) as prepare,
+            mock.patch.object(role, "sandbox_argv", return_value=["sandbox"]),
+        ):
+            role._review_sandbox_argv(
+                repo,
+                declared,
+                expected_head="a" * 40,
+                expected_base_head="b" * 40,
+                review_diff=b"",
+            )
+
+        prepare.assert_called_once_with(declared)
+
     def test_review_sandbox_preserves_declared_command_for_provenance(self) -> None:
         repo = Path("/tmp/repo")
         declared = ["grok", "--model", "grok-4.6", "review this"]

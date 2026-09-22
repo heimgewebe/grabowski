@@ -1079,9 +1079,8 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertIsNone(review["permission_mode"])
         self.assertEqual(
             ["--sandbox", "read-only", "--ask-for-approval", "never"],
-            review["argv_prefix"][-5:-1],
+            review["argv_prefix"][-4:],
         )
-        self.assertEqual(review["argv_prefix"][-1], "exec")
         self.assertEqual(1, review["argv_prefix"].count("--sandbox"))
 
     def test_task_specific_defaults_keep_controller_integration_authoritative(self) -> None:

@@ -646,6 +646,14 @@ def _grok_streaming_review_command(
     return tuple(command), prompt
 
 
+def _codex_review_command_for_headless_execution(command: list[str]) -> list[str]:
+    """Turn one direct Codex review command into its non-interactive form."""
+    if len(command) < 2:
+        raise RuntimeError("Codex review command must include a prompt")
+    if "exec" in command[1:-1]:
+        return list(command)
+    return [*command[:-1], "exec", command[-1]]
+
 
 def _review_sandbox_argv(
     repo: Path,
@@ -655,7 +663,20 @@ def _review_sandbox_argv(
     expected_base_head: str,
     review_diff: bytes,
 ) -> tuple[list[str], str | None, bytes | None]:
-    if Path(command[0]).name != "grok":
+    executable_name = Path(command[0]).name
+    if executable_name == "codex":
+        normalized = _codex_review_command_for_headless_execution(command)
+        prepared = prepare_external_agent_command(normalized)
+        return (
+            sandbox_argv(
+                repo,
+                list(prepared.command),
+                declared_command=command,
+            ),
+            None,
+            None,
+        )
+    if executable_name != "grok":
         return sandbox_argv(repo, command), None, None
     prepared = prepare_external_agent_command(command)
     actual, prompt_bytes = _grok_streaming_review_command(
