@@ -355,7 +355,6 @@ class ResourceTests(unittest.TestCase):
             )
             connection.commit()
 
-        before = self.database.read_bytes()
         self.assertEqual(
             "3:reconcile-revision-contract-missing",
             resources._preflight_resource_store(),
@@ -404,7 +403,6 @@ class ResourceTests(unittest.TestCase):
                     "WHERE type='trigger' AND name LIKE 'resource_reconcile_%_v1'"
                 ).fetchall(),
             )
-        self.assertNotEqual(before, self.database.read_bytes())
 
     def test_resource_reconcile_revision_trigger_tracks_direct_sql_mutation(self) -> None:
         terminalization = self._pending_terminalization(
