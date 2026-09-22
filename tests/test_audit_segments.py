@@ -672,6 +672,51 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                 self.assertTrue(broadened)
                 self.assertEqual(audit.read_bytes(), active_before)
 
+    def test_preappend_snapshot_recheck_rejects_symlink_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            audit, patches = self._patches(state)
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+                for index in range(25):
+                    grabowski_mcp._append_audit(
+                        {
+                            "operation": "snapshot-symlink-test",
+                            "index": index,
+                            "payload": "s" * 120,
+                        }
+                    )
+                first = json.loads(audit.read_text(encoding="utf-8").splitlines()[0])
+                segment = Path(first["archived_audit_path"])
+                original = grabowski_mcp._verify_audit_predecessor_snapshot
+                replaced = False
+
+                def replace_with_symlink_then_verify(predecessor, snapshot):
+                    nonlocal replaced
+                    if not replaced:
+                        preserved = segment.with_name(segment.name + ".preserved")
+                        segment.rename(preserved)
+                        segment.symlink_to(preserved)
+                        replaced = True
+                    return original(predecessor, snapshot)
+
+                active_before = audit.read_bytes()
+                with patch.object(
+                    grabowski_mcp,
+                    "_verify_audit_predecessor_snapshot",
+                    side_effect=replace_with_symlink_then_verify,
+                ):
+                    with self.assertRaisesRegex(
+                        PermissionError,
+                        "file contract",
+                    ):
+                        grabowski_mcp._append_audit(
+                            {"operation": "must-not-append-symlink-evidence"}
+                        )
+
+                self.assertTrue(replaced)
+                self.assertEqual(audit.read_bytes(), active_before)
+
     def test_postappend_predecessor_tamper_rolls_back_active_append(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"
