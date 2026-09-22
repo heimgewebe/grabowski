@@ -1,8 +1,8 @@
 # Untersuchung: Grabowski-Speicherwachstum und Hostausfall am 21. September 2026
 
 Erstellt am 22. September 2026. Untersuchungsstand: 21. September 2026,
-22:22 CEST (UTC+02:00). Ein gesonderter Nachtrag beschreibt die begrenzte
-Live-Prüfung bei der Berichtserstellung. Dieser Bericht ist historische Evidenz,
+22:22 CEST (UTC+02:00). Weitere zeitgebundene Nachträge beschreiben die begrenzten
+Live-Prüfungen bis zum 22. September, 06:31 CEST. Dieser Bericht ist historische Evidenz,
 keine aktuelle Betriebsfreigabe und kein ausgelieferter Fix.
 
 ## Ergebnis und Grenzen
@@ -258,3 +258,187 @@ Berichtserstellung hat weder diesen Start noch die Änderung der Startsperre
 ausgeführt oder deren Urheber bestimmt. Eine einzelne neue Messung beweist
 keinen RAM-Fix und keine sichere Wiederanlauffreigabe. Der PR dokumentiert
 die Untersuchung; er ändert weder Laufzeitcode noch Dienste oder Deployment.
+
+## Fortsetzung des Preflights am 22. September, 06:20–06:31 CEST
+
+Dieser Nachtrag hält weitere Beobachtungen vor einer eigenen Codeänderung fest.
+Er ersetzt die früheren Zeitpunkte nicht. Die Umsetzung in einer anderen Lane
+ist laufende Arbeit; die hier beobachteten uncommitteten Änderungen sind kein
+freigegebener oder getesteter Produktionsfix.
+
+### Erneuter Ausfall und Startsperren-Anomalie
+
+Um 06:20 war der primäre Connector nicht erreichbar. Status, Bootstrap und
+Kontext lieferten Transportfehler. Systemd und Adler bestätigten getrennt:
+
+- User-Unit: `failed/failed`, `MainPID=0`, `Result=oom-kill`,
+  `NRestarts=0`; weiterhin `MemoryMax=4G`, `MemorySwapMax=512M`,
+  `Restart=no`, Autostart deaktiviert, aber `RefuseManualStart=no`.
+- System-Unit: `failed/failed`, `MainPID=0`, weiterhin `enabled`,
+  `Restart=on-failure`, `MemoryMax=infinity` und `MemorySwapMax=infinity`.
+- Das User-Journal meldet um 06:16:04 einen OOM-Kill eines Prozesses innerhalb
+  der Unit und um 06:16:05 `Failed with result 'oom-kill'`. Der Main-Prozess
+  war beendet. Diese Beobachtung identifiziert noch nicht, welcher Prozess
+  der Unit unmittelbar das OOM-Opfer war.
+- Bereits um 06:07:37 und 06:12:54 erscheinen Audit-Lock-Timeouts. Der spätere
+  Stack betrifft den Audit-Abschluss eines bereits zugelassenen Werkzeugeffekts
+  (`record_success_best_effort` / `_append_audit_with_digest`).
+  Ein solcher Abschlussfehler beweist weder Effektfreiheit noch nachträgliche
+  Wiederherstellung der Audit-Evidenz.
+
+Die unmittelbare Konfigurationsursache der aufgehobenen Startsperre ist
+inzwischen sichtbar: Das flüchtige User-Drop-in
+`99-fallback-recovery.conf` setzt explizit `RefuseManualStart=no` und
+überschreibt damit den Incident-Drop-in. Sein beobachteter Änderungszeitpunkt
+ist der 21. September, 22:25:05 CEST; der Incident-Drop-in stammt von
+22:13:23 CEST. Dateizeit und Inhalt belegen den Override, aber nicht den
+verantwortlichen Menschen, Agenten oder Recovery-Auftrag. Der Override wurde
+in diesem Thread nicht verändert.
+
+Bei der Dokumentationsergänzung war der primäre Connector wieder erreichbar.
+Adler beobachtete um **06:31:10** einen User-Operator, gestartet um **06:23:02**,
+auf demselben Release `385a2ac7e881`. Er meldete 174.301.184 Byte
+Cgroup-Speicher, 177.832 KiB Prozess-RSS, vier Tasks und einen gebundenen
+Loopback-Listener. Systemd bestätigte weiterhin 4 GiB RAM-Limit, 512 MiB
+Swap-Limit, `Restart=no` und `RefuseManualStart=no`; die System-Unit blieb
+inaktiv/fehlgeschlagen, bootaktiviert und unbegrenzt.
+
+Cgroup-Verbrauch und RSS sind unterschiedliche, nicht atomar zusammen
+erhobene Größen. Der niedrige Einzelwert ist weder ein Peak- noch ein
+Stabilitätsbeweis. Dieser Thread hat den erneuten Start nicht ausgeführt
+und seinen Initiator nicht bestimmt. Ein installiertes Manifest allein
+beweist zudem keinen neuen gemergten Fix; Adler band den Prozess an das
+vorhandene Release, konnte den Quellcommit aber nicht unabhängig vollständig
+attestieren.
+
+### Aktueller Read-only-Messpunkt des bestehenden Snapshot-Pfads
+
+Um **06:24:33 CEST** wurde
+`capture_verified_audit_snapshot` aus dem installierten Release
+`385a2ac7e8812994d2aaeb03aa2d406deb2aa1af` in einem frischen, begrenzten
+Prozess aufgerufen. Grenzen: 2 GiB Adressraum, 40 Sekunden CPU-Zeit,
+45 Sekunden Wallclock. Die bestehende Lock-Datei war vor dem Aufruf vorhanden;
+der Test änderte keinen Quellcode und gab keine Audit-Inhalte aus.
+
+| Messgröße | Beobachtung |
+| --- | --- |
+| Vollständig verifizierte Records | 1.281.900 |
+| Archivsegmente | 76 |
+| Gesamte Kettengröße | 1.247.817.619 Byte |
+| Im Snapshot gehaltene Segmentdaten | 8.964.781 Byte |
+| Baseline / Peak RSS | 62.292 / 150.548 KiB (Peak etwa 147 MiB) |
+| Prozess-RSS nach dem Aufruf | `VmRSS=105364 kB` |
+| Prozess-Swap | `VmSwap=0 kB` |
+| Laufzeit | 22,325 Sekunden |
+| Instrumentierte Lock-Akquisitionen | 78 |
+| Summierte / maximale Akquisitionsdauer | 0,000431 / 0,000010 Sekunden |
+| Dem Test zuordenbarer Cgroup-Verbrauch | Nicht erhoben: keine isolierte Test-Cgroup |
+
+Der Snapshot lieferte den Chain-Content-Digest
+`19629735d8b53833bbf63d983883aec67b32c09af65f2ad3297d4e754df9a4fe`.
+Die Zeitmessung umschloss `_acquire_flock`; sie enthält Aufrufaufwand und
+misst **nicht** die anschließende Lock-Haltedauer. Die Probe zeigte keine
+Lock-Timeouts, beweist aber keine Freiheit von Lock-Starvation unter Last.
+
+Der später belegte Service-Start um 06:23 liegt vor dieser Probe.
+Hintergrundaktivität war daher nicht ausgeschlossen. Es gab in diesem Lauf
+keinen alten/neuen Vergleich auf identischem Snapshot, keinen wiederholten
+Health-Test und keinen kontrollierten Parallelitätstest. Der niedrigere
+RSS-Wert nach dem Aufruf beweist für sich keine stabile Baseline über viele
+Aufrufe. Die Probe bestätigt den vorhandenen sparsamen Mechanismus auf dem
+aktuellen Datenbestand, nicht einen neu implementierten Fix.
+
+### Code-Prüfung und Gegenprobe
+
+Die aktuelle Code-Prüfung bestätigte die bisherigen H1-/H2-Spuren:
+Statusverifikation benötigt Metadaten, hält im alten Pfad aber historische
+Segmentbytes; `_audit_records_snapshot` materialisiert zusätzlich vollständige
+Records für Projektionen. Auch der alte Audit-Append-Pfad ruft die vollständige
+Kettenverifikation unter dem exklusiven Koordinationslock auf. Damit ist nicht
+nur ein manuell ausgelöster Health-Read als Eintrittspunkt relevant. Die
+relative Bedeutung dieser Pfade im Produktionsverbrauch wurde noch nicht
+quantifiziert.
+
+Der bestehende Snapshot-Pfad und seine Primitiven waren im betrachteten
+Release weiterhin vorhanden. Vorhandene Tests behandeln unter anderem
+Segment-/Manifest-Integrität, Cache-Identität und eine Rotation nach der
+Kopferfassung. Ihr Vorhandensein ersetzt keinen Testlauf eines geänderten
+Health- oder Append-Pfads.
+
+Die frühe `gegner`-Gegenprobe wurde im selben Thread angewendet:
+
+- **Stärkste Gegenposition:** Geringere RSS könnte mit geänderter
+  Verifikationssemantik erkauft werden; außerdem könnten volle Projektionen
+  oder gleichzeitige Aufrufe den größeren Produktionspeak dominieren.
+- **Fragilste Annahme:** Ein unter Lock erfasster Kopf samt gebundenen
+  unveränderlichen Vorgängern genügt dem fachlichen Health-Vertrag auch bei
+  späteren Appends/Rotationen. Der konkrete Rückgabezeitpunkt muss definiert
+  bleiben, statt stillschweigend einen neueren Zustand zu behaupten.
+- **Billigste unterscheidende Evidenz:** Vergleich auf derselben Fixture,
+  Integritäts-/Übergangstests, definierte Concurrent-Append-Semantik und
+  begrenzte Kalt-, Wiederholungs- und Parallelitätsmessungen.
+- **Disposition:** **TEST** für die technische Hypothese; keine normale
+  Startfreigabe und kein vollständiger Root-Cause-Claim.
+
+### Aktive Fix-Lane und Zuständigkeitsgrenze
+
+Der frische Lease-Read und Adler identifizierten die aktive fremde Lane
+`9a427c0c442ed9911df2768f66654ff7`, Branch
+`fix/audit-hotpath-bounded-20260922`, Basis
+`385a2ac7e8812994d2aaeb03aa2d406deb2aa1af`.
+Sie hält seit etwa 06:12 Claims auf `src/grabowski_mcp.py`,
+`tests/test_audit_segments.py` und `tests/test_audit_interprocess_lock.py`
+sowie ihren eigenen Worktree und Branch.
+
+Um 06:26 bestätigte Adler uncommittete Änderungen an
+`src/grabowski_mcp.py` und `tests/test_audit_segments.py`.
+Eine vorläufige Read-only-Diffsicht zeigte die Umstellung der
+Statusverifikation und des Append-Pfads auf die vorhandenen
+Head-/Vorgänger-Primitiven mit Verifikation historischer Segmente außerhalb
+des Koordinationslocks. Dieser bewegliche Zwischenstand ist kein
+abgeschlossenes Review und kein Test-, Commit-, Merge- oder Deploymentbeleg.
+
+Entsprechend dem ausdrücklich gesetzten Stop-Gate wurde hier kein zweiter
+Implementierungs-Writer eröffnet. Die Frage nach Fortsetzung beim bestehenden
+Writer oder geordneter Übergabe wurde gestellt; fremde Claims wurden weder
+übernommen noch freigegeben. Die vorliegende Ergänzung schreibt ausschließlich
+in die getrennte Dokumentations-Lane von PR #1282.
+
+### PR-, Fallback- und Bureau-Stand dieses Preflights
+
+- Remote-`main` war weiterhin `385a2ac7e8812994d2aaeb03aa2d406deb2aa1af`.
+  Der kanonische lokale Checkout war sauber, lag aber auf `f25cb156` und
+  elf Commits hinter dem lokalen `origin/main`.
+- Für den damaligen Dokumentations-Head `17f50d543810410a16554d5c8b8af646e2aa1c55`
+  waren um 06:26 beide Validate-Versionen und CodeQL erfolgreich. Es lag ein
+  an diesen Head gebundenes Review ohne materielle Findings vor; dessen
+  historische Hostmesswerte waren ausdrücklich nicht unabhängig reproduziert.
+  GitHub meldete dennoch `mergeStateStatus=UNSTABLE`. Diese Belege gelten
+  nicht automatisch für einen später ergänzten Head.
+- Die offenen PRs #1280 (Fallback-Fleet-Identität) und #1281
+  (Watchdog-/Operatorbindung) wurden als verwandte laufende Arbeiten erkannt;
+  sie wurden hier nicht geändert oder als erledigt behandelt.
+- Maulwurf war als separater Fallback erreichbar, auf Release `9813496e234d`.
+  Seine Fleet-Liste deklarierte den primären Host als SSH-Ziel, doch der
+  versuchte Read-only-Git-Aufruf dorthin lieferte `INVALID_ARGUMENT`.
+  Daraus wurde keine funktionierende Host-Schreib- oder Recovery-Autorität
+  abgeleitet. Ein anschließender primärer Connector-Read war wieder möglich.
+- Bureau bestätigte weiterhin denselben RAM-Kandidaten, Event `17111`,
+  Status `observed`, Assessment `promote`. Ein veröffentlichter oder
+  abgeschlossener Folgetask ist damit weiterhin nicht belegt. In diesem
+  Fortsetzungs-Preflight wurde kein Bureau-Abschluss geschrieben.
+- Der Nutzer setzte #1282 anschließend auf **Draft** und beauftragte die
+  Dokumentation der weiteren Erkenntnisse. Die Ergänzung erhält diesen
+  Draft-Status und erteilt keine Merge- oder Wiederanlauffreigabe.
+
+**Weiterhin offen:** Integritäts- und Concurrency-Beweis des tatsächlichen
+Fixes, repräsentative Vorher-/Nachher-Messungen, vollständige
+Projektions-/Objektlebensdaueranalyse, Test/Review/CI des Fix-Heads,
+rebootfester Schutz einer eindeutigen Operator-Unit, autorisiertes Deployment,
+mehrere produktive Messpunkte sowie sauberer Bureau-Abschluss.
+
+Die im Zwischenbericht genannten Werte **Unsicherheit 0,6** (vollständige
+Produktionsursache) und **Interpolationsgrad 0,1** (überwiegend direkte Reads)
+waren qualitative Selbsteinschätzungen auf einer Skala von 0 bis 1, keine
+statistisch kalibrierten Wahrscheinlichkeiten. Weder Abschluss A noch
+vollständiger Abschluss B ist durch diesen Nachtrag belegt.
