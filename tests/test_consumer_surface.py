@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from contextlib import ExitStack
 import hashlib
+import json
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -150,8 +151,12 @@ class ConsumerSurfaceTests(unittest.TestCase):
                 "fresh": False,
                 "matched": False,
                 "verification_model": "client-declared-server-compared-v1",
+                "platform_snapshot": {"detail": "evidence-only"},
+                "schema_probe": {"matches": True},
+                "client_declaration_sha256": "d" * 64,
                 "recommended_next_action": "bind the current connector snapshot",
             },
+            "platform_schema_mismatches": [{"tool": "alpha"}],
             "refresh_required_when_client_count_or_hash_differs": True,
         }
         values = {
@@ -225,6 +230,28 @@ class ConsumerSurfaceTests(unittest.TestCase):
                 )
             )
             stack.enter_context(mock.patch.object(grabowski_mcp, "_kill_switch_state", return_value={"engaged": False}))
+            stack.enter_context(
+                mock.patch.object(
+                    grabowski_mcp,
+                    "_transport_roundtrip_status",
+                    return_value={
+                        "state": "ready",
+                        "normal_mutation_path": "signed_one_call",
+                        "normal_mutation_path_ready": True,
+                        "legacy_roundtrip_required": False,
+                        "last_consumption_receipt_sha256": "e" * 64,
+                        "recommended_next_action": "none",
+                        "signed_one_call": {
+                            "state": "ready",
+                            "observed": True,
+                            "ready": True,
+                            "assertion_version": "signed-one-call-v1",
+                            "client_scope_sha256": "f" * 64,
+                            "recommended_next_action": "none",
+                        },
+                    },
+                )
+            )
             stack.enter_context(mock.patch.object(grabowski_mcp, "_effective_capabilities", return_value={"file_read"}))
             stack.enter_context(
                 mock.patch.object(
@@ -292,6 +319,22 @@ class ConsumerSurfaceTests(unittest.TestCase):
         self.assertEqual(
             "client-declared-server-compared-v1",
             minimal["tool_contract"]["client_snapshot"]["verification_model"],
+        )
+        self.assertNotIn("platform_snapshot", minimal["tool_contract"]["client_snapshot"])
+        self.assertIn("platform_snapshot", standard["tool_contract"]["client_snapshot"])
+        self.assertNotIn("platform_schema_mismatches", minimal["tool_contract"])
+        self.assertIn("platform_schema_mismatches", standard["tool_contract"])
+        self.assertNotIn("last_consumption_receipt_sha256", minimal["transport_roundtrip"])
+        self.assertIn("last_consumption_receipt_sha256", standard["transport_roundtrip"])
+        self.assertNotIn("signed_one_call", minimal["transport_roundtrip"])
+        self.assertIn("signed_one_call", standard["transport_roundtrip"])
+        self.assertLess(
+            len(json.dumps(minimal["tool_contract"], sort_keys=True)),
+            len(json.dumps(standard["tool_contract"], sort_keys=True)) * 0.75,
+        )
+        self.assertLess(
+            len(json.dumps(minimal["transport_roundtrip"], sort_keys=True)),
+            len(json.dumps(standard["transport_roundtrip"], sort_keys=True)) * 0.75,
         )
         self.assertTrue(minimal["healthy"])
         self.assertEqual(projected["service"], "grabowski-mcp")

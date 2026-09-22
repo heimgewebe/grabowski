@@ -6923,6 +6923,53 @@ def grabowski_status(
             "future_action_authority",
         ],
     }
+    if selected_view == "minimal":
+        compact_tool_contract_keys = (
+            "expected_tool_count",
+            "registered_tool_count",
+            "runtime_matches_deployment_contract",
+            "client_snapshot_observable",
+            "platform_evidence_state",
+            "platform_publication_contract_matches",
+            "platform_publication_pending",
+            "platform_publication_state",
+        )
+        compact_snapshot_keys = (
+            "state",
+            "observable",
+            "fresh",
+            "matched",
+            "verification_model",
+            "schema_contract_matches",
+            "platform_evidence_state",
+            "platform_publication_contract_matches",
+            "platform_publication_pending",
+            "platform_publication_state",
+            "recommended_next_action",
+        )
+        base_payload["tool_contract"] = {
+            key: base_payload["tool_contract"].get(key)
+            for key in compact_tool_contract_keys
+            if key in base_payload["tool_contract"]
+        }
+        base_payload["tool_contract"]["client_snapshot"] = {
+            key: client_snapshot.get(key)
+            for key in compact_snapshot_keys
+            if key in client_snapshot
+        }
+        compact_transport_keys = (
+            "state",
+            "normal_mutation_path",
+            "normal_mutation_path_ready",
+            "legacy_roundtrip_required",
+            "recommended_next_action",
+        )
+        base_payload["transport_roundtrip"] = {
+            key: transport_roundtrip.get(key)
+            for key in compact_transport_keys
+            if key in transport_roundtrip
+        }
+
     if selected_view in {"standard", "evidence"}:
         assert system_overview is not None
         operating_protocol = _operator_relay_protocol()
