@@ -1526,7 +1526,8 @@
         "--sandbox",
         "read-only",
         "--ask-for-approval",
-        "never"
+        "never",
+        "exec"
       ],
       "base_quality_rank": 100,
       "burn_weight": 2.0,

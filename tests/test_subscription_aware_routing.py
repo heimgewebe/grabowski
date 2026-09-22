@@ -210,8 +210,9 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
         self.assertEqual("openai-gpt-5.6", reviewer["independence_group"])
         self.assertEqual(
             ["--sandbox", "read-only", "--ask-for-approval", "never"],
-            reviewer["argv_prefix"][-4:],
+            reviewer["argv_prefix"][-5:-1],
         )
+        self.assertEqual("exec", reviewer["argv_prefix"][-1])
         self.assertEqual(["openai-agentic"], reviewer["quota_pools"])
         self.assertEqual(
             ["independent-review", "critical-review", "security-review"],
