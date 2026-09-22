@@ -8447,6 +8447,8 @@ class TaskTests(unittest.TestCase):
     def test_current_task_schema_inventory_is_byte_stable(self) -> None:
         connection = tasks._database()
         connection.close()
+        verified = tasks._database()
+        verified.close()
         before = self.database.read_bytes()
         before_stat = self.database.stat()
         before_names = sorted(item.name for item in self.database.parent.iterdir())
@@ -8815,7 +8817,7 @@ class TaskTests(unittest.TestCase):
             first.close()
             second = tasks._database()
             second.close()
-        self.assertEqual(0, calls)
+        self.assertEqual(1, calls)
 
     def test_explicit_task_store_preflight_still_checks_integrity(self) -> None:
         connection = tasks._database()
@@ -8831,6 +8833,53 @@ class TaskTests(unittest.TestCase):
         with patch.object(tasks, "_sqlite_integrity", side_effect=tracking_integrity):
             self.assertEqual("5", tasks._preflight_task_store())
         self.assertEqual(1, calls)
+
+    def test_changed_current_task_store_invalidates_integrity_cache(self) -> None:
+        with patch.object(tasks, "_TASK_VERIFIED_PERSISTENCE_IDENTITY", None):
+            initial = tasks._database()
+            initial.close()
+            verified = tasks._database()
+            verified.close()
+            verified_identity = tasks._TASK_VERIFIED_PERSISTENCE_IDENTITY
+            self.assertIsNotNone(verified_identity)
+            real_integrity = tasks._sqlite_integrity
+            with patch.object(
+                tasks, "_sqlite_integrity", wraps=real_integrity
+            ) as integrity:
+                unchanged = tasks._database()
+                unchanged.close()
+                self.assertEqual(0, integrity.call_count)
+
+                with sqlite3.connect(self.database) as external:
+                    external.execute("PRAGMA user_version=1")
+
+                self.assertNotEqual(
+                    verified_identity, tasks._task_store_persistence_identity()
+                )
+                changed = tasks._database()
+                changed.close()
+                self.assertEqual(1, integrity.call_count)
+
+    def test_wal_identity_change_invalidates_integrity_cache(self) -> None:
+        with patch.object(tasks, "_TASK_VERIFIED_PERSISTENCE_IDENTITY", None):
+            initial = tasks._database()
+            initial.close()
+            real_integrity = tasks._sqlite_integrity
+            writer = sqlite3.connect(self.database)
+            try:
+                writer.execute("PRAGMA wal_autocheckpoint=0")
+                writer.execute("PRAGMA user_version=2")
+                writer.commit()
+                wal = Path(f"{self.database}-wal")
+                self.assertTrue(wal.exists())
+                with patch.object(
+                    tasks, "_sqlite_integrity", wraps=real_integrity
+                ) as integrity:
+                    changed = tasks._database()
+                    changed.close()
+                    self.assertEqual(1, integrity.call_count)
+            finally:
+                writer.close()
 
     def test_current_task_store_reopen_is_byte_stable(self) -> None:
         connection = tasks._database()

@@ -1349,6 +1349,41 @@ _sqlite_integrity = sqlite_store.sqlite_integrity
 _sqlite_fingerprint = sqlite_store.sqlite_fingerprint
 _database_tables = sqlite_store.database_tables
 
+TaskStorePersistenceIdentity = tuple[
+    str,
+    sqlite_store.FileIdentity,
+    sqlite_store.FileIdentity | None,
+]
+_TASK_INTEGRITY_CACHE_LOCK = threading.Lock()
+_TASK_VERIFIED_PERSISTENCE_IDENTITY: TaskStorePersistenceIdentity | None = None
+_TASK_INTEGRITY_MAX_IDENTITY_ATTEMPTS = 3
+
+
+def _task_store_persistence_identity() -> TaskStorePersistenceIdentity:
+    database_status = TASK_DB.lstat()
+    if not stat.S_ISREG(database_status.st_mode):
+        raise PermissionError(f"Task database must be a regular file: {TASK_DB}")
+    wal_path = Path(f"{TASK_DB}-wal")
+    try:
+        wal_status = wal_path.lstat()
+    except FileNotFoundError:
+        wal_identity = None
+    else:
+        if not stat.S_ISREG(wal_status.st_mode):
+            raise PermissionError(f"Task database WAL must be a regular file: {wal_path}")
+        # A WAL contains only its 32-byte header until the first frame exists.
+        # Empty/header-only WAL lifecycle churn carries no database content.
+        wal_identity = (
+            None
+            if wal_status.st_size <= 32
+            else sqlite_store.status_identity(wal_status)
+        )
+    return (
+        str(TASK_DB.absolute()),
+        sqlite_store.status_identity(database_status),
+        wal_identity,
+    )
+
 
 def _metadata_shape(connection: sqlite3.Connection) -> tuple[tuple[str, str, int, int], ...]:
     return tuple(
@@ -1618,35 +1653,56 @@ def _verified_task_migration_backup(
 
 
 def _preflight_task_store(*, verify_integrity: bool = True) -> str | None:
+    global _TASK_VERIFIED_PERSISTENCE_IDENTITY
+
     if not TASK_DB.exists():
         return None
     if TASK_DB.is_symlink() or not TASK_DB.is_file():
         raise PermissionError(f"Task database must be a regular file: {TASK_DB}")
     if TASK_DB.stat().st_size == 0:
         return None
-    with _readonly_sqlite(TASK_DB) as connection:
-        if verify_integrity:
-            _sqlite_integrity(connection, "Task database", quick=True)
-        try:
-            version = _task_schema_version(connection)
-            if version not in {"1", "2", "3", "4", "5"}:
-                raise RuntimeError(
-                    "Unsupported task database schema; use a runtime that explicitly supports it"
-                )
-            if version == "5":
-                _validate_task_schema_current(connection)
-            else:
-                _validate_task_schema_legacy(connection, version)
-            return version
-        except sqlite3.DatabaseError as exc:
-            detail = str(exc).lower()
-            if "locked" in detail or "busy" in detail:
-                raise RuntimeError(
-                    "Task database is busy; retry after the active writer completes"
-                ) from exc
-            raise RuntimeError(
-                "Task database is corrupt; restore a verified backup before retrying"
-            ) from exc
+
+    force_integrity = verify_integrity
+    with _TASK_INTEGRITY_CACHE_LOCK:
+        for _attempt in range(_TASK_INTEGRITY_MAX_IDENTITY_ATTEMPTS):
+            identity_before = _task_store_persistence_identity()
+            integrity_required = (
+                force_integrity
+                or _TASK_VERIFIED_PERSISTENCE_IDENTITY != identity_before
+            )
+            with _readonly_sqlite(TASK_DB) as connection:
+                if integrity_required:
+                    _sqlite_integrity(connection, "Task database", quick=True)
+                try:
+                    version = _task_schema_version(connection)
+                    if version not in {"1", "2", "3", "4", "5"}:
+                        raise RuntimeError(
+                            "Unsupported task database schema; use a runtime that explicitly supports it"
+                        )
+                    if version == "5":
+                        _validate_task_schema_current(connection)
+                    else:
+                        _validate_task_schema_legacy(connection, version)
+                except sqlite3.DatabaseError as exc:
+                    detail = str(exc).lower()
+                    if "locked" in detail or "busy" in detail:
+                        raise RuntimeError(
+                            "Task database is busy; retry after the active writer completes"
+                        ) from exc
+                    raise RuntimeError(
+                        "Task database is corrupt; restore a verified backup before retrying"
+                    ) from exc
+            identity_after = _task_store_persistence_identity()
+            if identity_after == identity_before:
+                if integrity_required:
+                    _TASK_VERIFIED_PERSISTENCE_IDENTITY = identity_after
+                return version
+            _TASK_VERIFIED_PERSISTENCE_IDENTITY = None
+            force_integrity = True
+
+    raise RuntimeError(
+        "Task database changed repeatedly during integrity preflight; retry after the active writer completes"
+    )
 
 
 def _create_task_schema_v5(connection: sqlite3.Connection) -> None:
