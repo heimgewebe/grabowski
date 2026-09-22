@@ -3742,10 +3742,50 @@ def _private_evidence_identity(path: Path, *, max_bytes: int) -> tuple[int, ...]
             or statmod.S_IMODE(opened.st_mode) != 0o600
             or opened.st_size > max_bytes
         ):
-            raise PermissionError("Audit evidence file violates its contract")
+            raise PermissionError("Audit evidence file violates its file contract")
         return _audit_file_identity(opened)
     finally:
         os.close(descriptor)
+
+
+def _private_evidence_path_identity(
+    path: Path,
+    *,
+    max_bytes: int,
+) -> tuple[int, ...]:
+    """Recheck one already-verified immutable evidence path without reopening it.
+
+    The full off-lock verification remains descriptor-bound and uses O_NOFOLLOW.
+    This metadata-only recheck intentionally relies on the documented boundary
+    that arbitrary hostile code running as the same Unix uid is out of scope.
+    Cooperative Grabowski writers serialize through the coordination lock.
+    """
+    linked = os.stat(path, follow_symlinks=False)
+    if (
+        not statmod.S_ISREG(linked.st_mode)
+        or linked.st_uid != os.getuid()
+        or linked.st_gid != os.getgid()
+        or linked.st_nlink != 1
+        or statmod.S_IMODE(linked.st_mode) != 0o600
+        or linked.st_size > max_bytes
+    ):
+        raise PermissionError("Audit evidence file violates its file contract")
+    return _audit_file_identity(linked)
+
+
+def _segment_binding_key(expected: dict[str, Any]) -> tuple[Any, ...]:
+    manifest_path = expected.get("manifest_path")
+    return (
+        expected.get("sha256"),
+        expected.get("bytes"),
+        expected.get("records"),
+        expected.get("legacy_records"),
+        expected.get("v2_records"),
+        expected.get("last_record_sha256"),
+        str(manifest_path) if manifest_path is not None else None,
+        expected.get("manifest_sha256"),
+        bool(expected.get("compatibility")),
+    )
 
 
 def _segment_cache_key(
@@ -3762,22 +3802,37 @@ def _segment_cache_key(
         if isinstance(manifest_path, Path)
         else None
     )
-    binding = (
-        expected.get("sha256"),
-        expected.get("bytes"),
-        expected.get("records"),
-        expected.get("legacy_records"),
-        expected.get("v2_records"),
-        expected.get("last_record_sha256"),
-        str(manifest_path) if manifest_path is not None else None,
-        expected.get("manifest_sha256"),
-        bool(expected.get("compatibility")),
+    return (
+        str(path),
+        segment_identity,
+        manifest_identity,
+        _segment_binding_key(expected),
+    )
+
+
+def _segment_snapshot_revalidation_key(
+    path: Path,
+    expected: dict[str, Any],
+) -> tuple[Any, ...]:
+    """Revalidate a fully verified snapshot through path metadata only."""
+    segment_identity = _private_evidence_path_identity(
+        path,
+        max_bytes=MAX_AUDIT_BYTES,
+    )
+    manifest_path = expected.get("manifest_path")
+    manifest_identity = (
+        _private_evidence_path_identity(
+            manifest_path,
+            max_bytes=MAX_AUDIT_EVIDENCE_BYTES,
+        )
+        if isinstance(manifest_path, Path)
+        else None
     )
     return (
         str(path),
         segment_identity,
         manifest_identity,
-        binding,
+        _segment_binding_key(expected),
     )
 
 
@@ -3831,7 +3886,7 @@ def _read_private_evidence(path: Path, *, max_bytes: int) -> bytes:
             or statmod.S_IMODE(opened.st_mode) != 0o600
             or opened.st_size > max_bytes
         ):
-            raise PermissionError("Audit evidence file violates its contract")
+            raise PermissionError("Audit evidence file violates its file contract")
         chunks: list[bytes] = []
         remaining = opened.st_size
         while remaining:
@@ -4030,12 +4085,14 @@ def _read_audit_chain_unlocked(
         if expected is not None and use_segment_cache:
             cache_key = _segment_cache_key(current, expected)
             cached = _segment_cache_get(cache_key)
-        if (
-            cached is not None
-            and cache_key is not None
-            and _segment_cache_key(current, expected) != cache_key
-        ):
-            cached = None
+        if cached is not None and cache_key is not None:
+            revalidation_key = (
+                _segment_snapshot_revalidation_key(current, expected)
+                if verification_snapshot is not None
+                else _segment_cache_key(current, expected)
+            )
+            if revalidation_key != cache_key:
+                cached = None
         if cached is not None:
             verification_key = cache_key
             data = b""
@@ -4044,7 +4101,10 @@ def _read_audit_chain_unlocked(
             first_record = cached.get("first_record")
         else:
             if expected is not None and verification_snapshot is not None:
-                verification_key = _segment_cache_key(current, expected)
+                verification_key = cache_key or _segment_cache_key(
+                    current,
+                    expected,
+                )
             data, status = _read_audit_file(current)
             if not status["valid"]:
                 if expected is None and current == path:
@@ -4090,15 +4150,21 @@ def _read_audit_chain_unlocked(
                 expected.get("compatibility")
             )
             if verification_snapshot is not None:
-                current_key = _segment_cache_key(current, expected)
+                current_key = _segment_snapshot_revalidation_key(
+                    current,
+                    expected,
+                )
                 if verification_key is None:
-                    verification_key = current_key
+                    verification_key = _segment_cache_key(
+                        current,
+                        expected,
+                    )
                 if current_key != verification_key:
                     raise RuntimeError(
                         "audit-segment-changed-after-verification"
                     )
                 verification_snapshot.append(
-                    (dict(expected), current_key)
+                    (dict(expected), verification_key)
                 )
         component_status = dict(status)
         component_status["segment_sha256"] = observed_sha
@@ -4228,14 +4294,18 @@ def _verify_audit_log_unlocked(path: Path = AUDIT_LOG) -> dict[str, Any]:
 
 
 def _read_audit_status_snapshot(path: Path = AUDIT_LOG) -> dict[str, Any]:
-    """Verify a coherent snapshot without pinning immutable history."""
+    """Verify one coherent head plus its bound immutable predecessor history."""
     lock_path = _audit_storage_paths(path)["coordination_lock"]
     if not path.exists() and not lock_path.exists():
         return _verify_audit_log_unlocked(path)
     for _snapshot_attempt in range(4):
         with _audit_coordination_lock(path, exclusive=False):
             head, predecessor = _read_audit_head_unlocked(path)
-        components = [(head[0], b"", head[2])]
+        head_path = head[0]
+        head_status = head[2]
+        del head
+
+        predecessors: list[tuple[Path, bytes, dict[str, Any]]] = []
         compatibility_evidence = False
         if predecessor is not None:
             predecessors, compatibility_evidence = _read_audit_chain_unlocked(
@@ -4244,21 +4314,32 @@ def _read_audit_status_snapshot(path: Path = AUDIT_LOG) -> dict[str, Any]:
                 retain_verified_segment_data=False,
                 initial_expected=predecessor,
             )
-            components.extend(predecessors)
+
         status = _audit_status_from_components(
             path,
-            components,
+            [(head_path, b"", head_status), *predecessors],
             compatibility_evidence,
         )
         with _audit_coordination_lock(path, exclusive=False):
             current_head, current_predecessor = _read_audit_head_unlocked(path)
+        current_head_path = current_head[0]
+        current_head_status = current_head[2]
+        del current_head
+
+        if current_predecessor != predecessor:
+            continue
         if (
-            current_predecessor == predecessor
-            and current_head[2].get("segment_sha256")
-            == head[2].get("segment_sha256")
+            current_head_status.get("segment_sha256")
+            == head_status.get("segment_sha256")
         ):
             return status
-    raise RuntimeError("Audit head changed repeatedly during verification")
+
+        return _audit_status_from_components(
+            path,
+            [(current_head_path, b"", current_head_status), *predecessors],
+            compatibility_evidence,
+        )
+    raise RuntimeError("audit-head-raced")
 
 
 def _verify_audit_log(path: Path = AUDIT_LOG) -> dict[str, Any]:
@@ -4522,11 +4603,9 @@ def _append_payload(descriptor: int, path: Path, payload: bytes) -> None:
 
 def _raise_audit_verification_failure(exc: BaseException) -> None:
     chain_error = str(exc)
-    if (
-        "file contract" in chain_error
-        or "parent directory" in chain_error
-        or "symlink" in chain_error
-    ):
+    if isinstance(exc, PermissionError):
+        raise PermissionError(chain_error) from exc
+    if "parent directory" in chain_error or "symlink" in chain_error:
         raise PermissionError(chain_error) from exc
     raise RuntimeError(
         f"Audit log verification failed: {chain_error}"
@@ -4602,7 +4681,10 @@ def _verify_audit_predecessor_snapshot(
                 raise ValueError(
                     "audit-predecessor-verification-path-invalid"
                 )
-            if _segment_cache_key(bound_path, binding) != verified_key:
+            if (
+                _segment_snapshot_revalidation_key(bound_path, binding)
+                != verified_key
+            ):
                 raise RuntimeError(
                     "audit-predecessor-verification-snapshot-drift"
                 )
