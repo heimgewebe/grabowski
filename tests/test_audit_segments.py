@@ -506,6 +506,42 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                         status["segment_sha256"],
                     )
 
+    def test_cached_segment_tamper_is_detected_even_when_mtime_is_restored(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            audit, patches = self._patches(state)
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+                for index in range(25):
+                    grabowski_mcp._append_audit(
+                        {"operation": "cache-tamper-test", "index": index, "payload": "c" * 120}
+                    )
+                grabowski_mcp.AUDIT_SEGMENT_VERIFICATION_CACHE.clear()
+                warmed = grabowski_mcp._verify_audit_log(audit)
+                self.assertTrue(warmed["valid"], warmed)
+                first = json.loads(audit.read_text(encoding="utf-8").splitlines()[0])
+                segment = Path(first["archived_audit_path"])
+                before = segment.stat()
+                data = segment.read_bytes()
+                segment.write_bytes(
+                    data[:-1] + (b"X" if data[-1:] != b"X" else b"Y")
+                )
+                os.chmod(segment, 0o600)
+                os.utime(
+                    segment,
+                    ns=(before.st_atime_ns, before.st_mtime_ns),
+                )
+                after = segment.stat()
+                self.assertEqual(after.st_size, before.st_size)
+                self.assertEqual(after.st_mtime_ns, before.st_mtime_ns)
+                self.assertNotEqual(after.st_ctime_ns, before.st_ctime_ns)
+                active_before = audit.read_bytes()
+                with self.assertRaisesRegex(RuntimeError, "verification failed"):
+                    grabowski_mcp._append_audit(
+                        {"operation": "must-not-trust-stale-cache"}
+                    )
+                self.assertEqual(audit.read_bytes(), active_before)
+
     def test_unchanged_sealed_segment_uses_identity_bound_cache(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"
@@ -526,8 +562,57 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                 ) as reader:
                     second = grabowski_mcp._verify_audit_log(audit)
                 self.assertTrue(second["valid"], second)
-                self.assertEqual(reader.call_count, 1)
-                self.assertEqual(reader.call_args.args[0], audit)
+                self.assertEqual(reader.call_count, 2)
+                self.assertTrue(
+                    all(call.args[0] == audit for call in reader.call_args_list)
+                )
+
+    def test_append_rejects_invalid_predecessor_status_return(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            audit, patches = self._patches(state)
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+                for index in range(25):
+                    grabowski_mcp._append_audit(
+                        {"operation": "invalid-success-test", "index": index, "payload": "i" * 120}
+                    )
+                original = grabowski_mcp._read_audit_chain_unlocked
+                injected = False
+
+                def invalid_success(path, *args, **kwargs):
+                    nonlocal injected
+                    components, compatibility = original(path, *args, **kwargs)
+                    if (
+                        not injected
+                        and kwargs.get("initial_expected") is not None
+                        and components
+                    ):
+                        injected = True
+                        segment_path, segment_data, segment_status = components[0]
+                        invalid_status = dict(segment_status)
+                        invalid_status["valid"] = False
+                        invalid_status["error"] = "injected-invalid-segment"
+                        components = list(components)
+                        components[0] = (
+                            segment_path,
+                            segment_data,
+                            invalid_status,
+                        )
+                    return components, compatibility
+
+                active_before = audit.read_bytes()
+                with patch.object(
+                    grabowski_mcp,
+                    "_read_audit_chain_unlocked",
+                    side_effect=invalid_success,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "verification failed"):
+                        grabowski_mcp._append_audit(
+                            {"operation": "must-not-append-invalid-success"}
+                        )
+                self.assertTrue(injected)
+                self.assertEqual(audit.read_bytes(), active_before)
 
     def test_manifest_tamper_invalidates_complete_chain(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -565,6 +650,61 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                 status = grabowski_mcp._verify_audit_log(audit)
                 self.assertFalse(status["valid"], status)
                 self.assertIn("contract", status["error"])
+
+    def test_rotation_close_error_is_not_masked_by_double_close(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            audit, patches = self._patches(state)
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+                index = 0
+                while not audit.exists() or audit.stat().st_size < 6900:
+                    grabowski_mcp._append_audit(
+                        {"operation": "close-error-prefill", "index": index, "payload": "x" * 220}
+                    )
+                    index += 1
+                real_rotate = grabowski_mcp._rotate_audit_segment
+                real_close = grabowski_mcp._close_audit_descriptor
+                after_rotation = False
+                post_rotation_close_calls = 0
+
+                def rotate_then_arm(*args, **kwargs):
+                    nonlocal after_rotation
+                    result = real_rotate(*args, **kwargs)
+                    after_rotation = True
+                    return result
+
+                def close_then_fail(descriptor):
+                    nonlocal after_rotation, post_rotation_close_calls
+                    if after_rotation:
+                        after_rotation = False
+                        post_rotation_close_calls += 1
+                        real_close(descriptor)
+                        raise RuntimeError("synthetic-close-error-after-real-close")
+                    return real_close(descriptor)
+
+                with (
+                    patch.object(
+                        grabowski_mcp,
+                        "_rotate_audit_segment",
+                        side_effect=rotate_then_arm,
+                    ),
+                    patch.object(
+                        grabowski_mcp,
+                        "_close_audit_descriptor",
+                        side_effect=close_then_fail,
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "synthetic-close-error-after-real-close",
+                    ):
+                        grabowski_mcp._append_audit(
+                            {"operation": "trigger-close-error", "payload": "y" * 500}
+                        )
+                self.assertEqual(post_rotation_close_calls, 1)
+                status = grabowski_mcp._verify_audit_log(audit)
+                self.assertTrue(status["valid"], status)
 
     def test_rotation_commit_without_followup_record_is_valid(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -646,6 +786,45 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                 self.assertTrue(snapshot.legacy_rotation_compatibility)
                 self.assertEqual(snapshot.archived_segment_count, 1)
 
+
+    def test_verify_retries_when_active_head_changes_after_history_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            audit, patches = self._patches(state)
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+                for index in range(25):
+                    grabowski_mcp._append_audit(
+                        {"operation": "verify-race-before", "index": index, "payload": "r" * 120}
+                    )
+                before = grabowski_mcp._verify_audit_log(audit)
+                original = grabowski_mcp._read_audit_chain_unlocked
+                race_armed = True
+                history_scans = 0
+
+                def scan_then_change_head(path, *args, **kwargs):
+                    nonlocal race_armed, history_scans
+                    result = original(path, *args, **kwargs)
+                    if kwargs.get("initial_expected") is not None:
+                        history_scans += 1
+                        if race_armed:
+                            race_armed = False
+                            grabowski_mcp._append_audit(
+                                {"operation": "verify-race-after"}
+                            )
+                    return result
+
+                with patch.object(
+                    grabowski_mcp,
+                    "_read_audit_chain_unlocked",
+                    side_effect=scan_then_change_head,
+                ):
+                    status = grabowski_mcp._verify_audit_log(audit)
+
+                self.assertFalse(race_armed)
+                self.assertGreaterEqual(history_scans, 2)
+                self.assertTrue(status["valid"], status)
+                self.assertEqual(status["total_records"], before["total_records"] + 1)
 
     def test_verify_scans_immutable_segments_outside_coordination_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

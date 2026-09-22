@@ -4208,23 +4208,33 @@ def _read_audit_status_snapshot(path: Path = AUDIT_LOG) -> dict[str, Any]:
     lock_path = _audit_storage_paths(path)["coordination_lock"]
     if not path.exists() and not lock_path.exists():
         return _verify_audit_log_unlocked(path)
-    with _audit_coordination_lock(path, exclusive=False):
-        head, predecessor = _read_audit_head_unlocked(path)
-    components = [(head[0], b"", head[2])]
-    compatibility_evidence = False
-    if predecessor is not None:
-        predecessors, compatibility_evidence = _read_audit_chain_unlocked(
+    for _snapshot_attempt in range(4):
+        with _audit_coordination_lock(path, exclusive=False):
+            head, predecessor = _read_audit_head_unlocked(path)
+        components = [(head[0], b"", head[2])]
+        compatibility_evidence = False
+        if predecessor is not None:
+            predecessors, compatibility_evidence = _read_audit_chain_unlocked(
+                path,
+                use_segment_cache=True,
+                retain_verified_segment_data=False,
+                initial_expected=predecessor,
+            )
+            components.extend(predecessors)
+        status = _audit_status_from_components(
             path,
-            use_segment_cache=True,
-            retain_verified_segment_data=False,
-            initial_expected=predecessor,
+            components,
+            compatibility_evidence,
         )
-        components.extend(predecessors)
-    return _audit_status_from_components(
-        path,
-        components,
-        compatibility_evidence,
-    )
+        with _audit_coordination_lock(path, exclusive=False):
+            current_head, current_predecessor = _read_audit_head_unlocked(path)
+        if (
+            current_predecessor == predecessor
+            and current_head[2].get("segment_sha256")
+            == head[2].get("segment_sha256")
+        ):
+            return status
+    raise RuntimeError("Audit head changed repeatedly during verification")
 
 
 def _verify_audit_log(path: Path = AUDIT_LOG) -> dict[str, Any]:
@@ -4502,12 +4512,17 @@ def _verify_bound_audit_predecessors(
     if predecessor is None:
         return
     try:
-        _read_audit_chain_unlocked(
+        components, _compatibility_evidence = _read_audit_chain_unlocked(
             path,
             use_segment_cache=True,
             retain_verified_segment_data=False,
             initial_expected=predecessor,
         )
+        for _segment_path, _segment_data, segment_status in components:
+            if not segment_status.get("valid"):
+                raise ValueError(
+                    f"audit-segment-invalid:{segment_status.get('error')}"
+                )
     except (OSError, PermissionError, RuntimeError, ValueError) as exc:
         _raise_audit_verification_failure(exc)
 
@@ -4578,8 +4593,9 @@ def _append_audit_with_digest(record: dict[str, Any]) -> str:
                             status,
                             next_record_bytes=len(payload),
                         )
-                        _close_audit_descriptor(descriptor)
+                        closing_descriptor = descriptor
                         descriptor = None
+                        _close_audit_descriptor(closing_descriptor)
                         descriptor, _created = _open_audit_append_target(AUDIT_LOG)
                         status = _verify_audit_descriptor(AUDIT_LOG, descriptor)
                         if not status["valid"]:
