@@ -4492,6 +4492,13 @@ def _verify_bound_audit_predecessors(
     path: Path,
     predecessor: dict[str, Any] | None,
 ) -> None:
+    """Fail closed unless every bound immutable predecessor verifies.
+
+    _read_audit_chain_unlocked has no invalid-success result: malformed segment
+    content, metadata, manifests, hashes, counts, cycles, and path contracts all
+    raise. A normal return therefore means the complete bound predecessor chain
+    verified successfully.
+    """
     if predecessor is None:
         return
     try:
@@ -4530,6 +4537,13 @@ def _append_audit_with_digest(record: dict[str, Any]) -> str:
 
                 if current_predecessor != predecessor:
                     continue
+
+                # The first predecessor walk happens outside the coordination
+                # lock and warms the immutable-segment cache. Re-run the same
+                # fail-closed verification here to close the TOCTOU window
+                # before append. On the normal path this is metadata/cache
+                # validation rather than rereading immutable segment payloads.
+                _verify_bound_audit_predecessors(AUDIT_LOG, predecessor)
 
                 descriptor: int | None = None
                 try:
