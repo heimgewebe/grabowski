@@ -2638,6 +2638,11 @@ class WatchdogPolicyTests(unittest.TestCase):
                 patch.object(watchdog, "probe_component", return_value=probe),
                 patch.object(
                     watchdog,
+                    "transport_ingress_selected_operator_url",
+                    return_value=(watchdog.DEFAULT_MCP_URL, None),
+                ),
+                patch.object(
+                    watchdog,
                     "mcp_http_probe",
                     return_value="mcp-http-request-failed",
                 ),
@@ -2716,6 +2721,11 @@ class WatchdogPolicyTests(unittest.TestCase):
                     watchdog,
                     "probe_component",
                     side_effect=[initial, recovered],
+                ),
+                patch.object(
+                    watchdog,
+                    "transport_ingress_selected_operator_url",
+                    return_value=(watchdog.DEFAULT_MCP_URL, None),
                 ),
                 patch.object(watchdog, "mcp_http_probe", return_value=None),
                 patch.object(
@@ -2803,6 +2813,11 @@ class WatchdogPolicyTests(unittest.TestCase):
             )
             with (
                 patch.object(watchdog, "probe_component", return_value=initial),
+                patch.object(
+                    watchdog,
+                    "transport_ingress_selected_operator_url",
+                    return_value=(watchdog.DEFAULT_MCP_URL, None),
+                ),
                 patch.object(watchdog, "mcp_http_probe", return_value=None),
                 patch.object(
                     watchdog,
