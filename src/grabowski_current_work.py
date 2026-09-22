@@ -1407,9 +1407,9 @@ def _add_checkouts(
                 if "closed-not-cleaned" not in group["action_reasons"]:
                     group["action_reasons"].append("closed-not-cleaned")
         elif item["binding_phase"] == "active" and item["binding_consistent"]:
-            # An active lifecycle binding remains operational authority until
-            # exact terminal evidence changes the binding phase. Lease/process
-            # absence alone never proves terminality.
+            # Active lifecycle bindings keep identity authority. Finalization may
+            # demote only the attention projection when expiry is proven and no
+            # independent live operational evidence exists.
             _set_projection_state(group, "active")
         elif item["coordination_blocking"]:
             _set_projection_state(group, "active")
@@ -1797,6 +1797,45 @@ def _finalize_groups(
         )
         if archived_attention and has_live_surface:
             _blocking(group, "archived-attention-with-live-surfaces")
+
+        active_lifecycle_checkouts = [
+            item
+            for item in group["checkout_refs"]
+            if item["binding_present"]
+            and item["binding_consistent"]
+            and item["binding_phase"] == "active"
+        ]
+        expired_coordination_free_active_only = bool(active_lifecycle_checkouts) and all(
+            item["retention_expiration_proven"]
+            and not item["retention_active"]
+            and not item["dirty"]
+            and not item["coordination_blocking"]
+            and not item["resource_leases"]
+            and not item["processes"]
+            for item in active_lifecycle_checkouts
+        )
+        independent_live_authority = bool(
+            (task_item and task_item["state"] in ACTIVE_TASK_STATES)
+            or group["lease_summary"]["count"]
+            or group["worker_refs"]
+            or group["physical_refs"]["tmux_sessions"]
+            or group["physical_refs"]["processes"]
+            or any(
+                ref.get("source") != "checkout-lifecycle-binding"
+                for ref in group["authority_refs"]
+            )
+        )
+        if (
+            group["projection_state"] == "active"
+            and expired_coordination_free_active_only
+            and not independent_live_authority
+        ):
+            group["projection_state"] = "hygiene"
+            group["work_class"] = "hygiene"
+            group["action_required"] = True
+            if "managed-active-retention-expired" not in group["action_reasons"]:
+                group["action_reasons"].append("managed-active-retention-expired")
+
         if view == "current" and group["projection_state"] == "terminal_archived" and not has_live_surface and not group["action_required"]:
             continue
 

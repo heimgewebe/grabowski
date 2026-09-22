@@ -950,6 +950,33 @@ class CurrentWorkProjectionTests(unittest.TestCase):
             "monitor active work execution",
         )
 
+    def test_managed_active_checkout_with_proven_expired_retention_is_hygiene(self) -> None:
+        owner = "operator:managed-expired-proven"
+        result = project(
+            checkout_payloads=[
+                {
+                    "repository": REPOSITORY,
+                    "worktrees": [
+                        checkout(
+                            "managed-expired-proven",
+                            "/home/alex/repos/.worktrees/managed-expired-proven",
+                            lifecycle_state="managed_active_attention",
+                            binding_owner=owner,
+                            binding_phase="active",
+                            retention_active=False,
+                            retention_until_unix=1,
+                        )
+                    ],
+                }
+            ]
+        )
+        group = result["work"][0]
+        self.assertTrue(group["checkout_refs"][0]["retention_expiration_proven"])
+        self.assertEqual(group["projection_state"], "hygiene")
+        self.assertEqual(group["work_class"], "hygiene")
+        self.assertTrue(group["action_required"])
+        self.assertIn("managed-active-retention-expired", group["action_reasons"])
+
     def test_managed_active_checkout_with_process_remains_active(self) -> None:
         owner = "operator:managed-live"
         result = project(
@@ -965,17 +992,19 @@ class CurrentWorkProjectionTests(unittest.TestCase):
                             binding_owner=owner,
                             binding_phase="active",
                             retention_active=False,
+                            retention_until_unix=1,
                         )
                     ],
                 }
             ]
         )
         group = result["work"][0]
+        self.assertTrue(group["checkout_refs"][0]["retention_expiration_proven"])
         self.assertEqual(group["projection_state"], "active")
         self.assertEqual(group["work_class"], "operational")
         self.assertFalse(group["action_required"])
         self.assertNotIn(
-            "managed-active-lifecycle-attention", group["action_reasons"]
+            "managed-active-retention-expired", group["action_reasons"]
         )
         self.assertEqual(
             group["next_convergence_action"],
@@ -991,6 +1020,7 @@ class CurrentWorkProjectionTests(unittest.TestCase):
             binding_owner=owner,
             binding_phase="active",
             retention_active=False,
+            retention_until_unix=1,
         )
         live = checkout(
             "managed-live",
