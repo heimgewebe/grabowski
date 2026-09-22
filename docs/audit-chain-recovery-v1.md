@@ -12,67 +12,94 @@ partial-write rollback and the deliberately narrow recovery boundary.
 
 ## Process-wide locking invariant
 
-Every read, verification and append of the canonical audit file uses an
-advisory `flock` on the opened audit-file descriptor:
+Canonical mutation coordination uses a separate private advisory flock file.
+The mutable active audit head is read under a shared coordination lock and
+re-read under an exclusive coordination lock before append. The active audit
+descriptor itself is also locked and remains descriptor/path-bound while it is
+verified and written.
 
-- readers take a shared lock;
-- appenders take an exclusive lock;
-- lock acquisition has a bounded timeout and fails closed;
-- the in-process re-entrant lock remains, but is not treated as sufficient;
-- verification and append occur while the same descriptor and exclusive lock
-  remain held.
+Immutable archived predecessors are deliberately different: their payloads,
+hash chain and manifests are fully verified outside the coordination lock.
+That off-lock verification produces a per-call snapshot binding each expected
+segment and manifest to its verified filesystem identity. Under the exclusive
+coordination lock, Grabowski revalidates those bound path identities without
+re-reading historical payloads. A predecessor-binding change restarts the
+append attempt.
 
-This prevents two cooperative Grabowski processes from reading the same tail
-and independently publishing sibling records with the same sequence and
-previous-record hash.
+The coordination and descriptor locks have bounded acquisition time and fail
+closed. The in-process re-entrant lock remains, but is not treated as
+sufficient. Together these rules prevent cooperative Grabowski processes from
+reading the same mutable tail and publishing sibling records while avoiding
+history-sized payload I/O in the exclusive coordination section.
 
-The lock is bound to the audit file itself rather than to a separate lock-file
-path. Grabowski opens it with `O_NOFOLLOW`, requires a regular single-link file
-owned by the effective user and group with mode `0600`, and checks that the
-opened descriptor still matches the visible path. The parent directory must be
-private, non-symlinked and owned by the same user and group.
+Active files and immutable evidence are private regular single-link files.
+Descriptor-bound verification uses O_NOFOLLOW, requires the effective user and
+group with mode 0600, and checks that the opened descriptor matches the visible
+path. Snapshot revalidation checks the already-verified path metadata (type,
+owner, group, mode, link count, size and filesystem identity) without reopening
+every immutable file.
 
 ## Append transaction
 
-An append follows this order while holding the exclusive descriptor lock:
+An append follows this order:
 
-1. verify the complete existing chain from the locked descriptor;
-2. derive the next sequence, previous hash and new record hash;
-3. enforce the audit byte limit;
-4. verify descriptor-to-path binding immediately before writing;
-5. write the complete payload, including retrying short writes;
-6. `fsync` the audit descriptor;
-7. recheck descriptor-to-path binding and the exact expected file size.
+1. under a shared coordination lock, verify the mutable head and capture its
+   predecessor binding;
+2. outside the coordination lock, fully verify the bound immutable predecessor
+   chain and build a per-call identity snapshot;
+3. take the exclusive coordination lock, re-read the mutable head and restart
+   if its predecessor binding changed;
+4. revalidate the verified immutable snapshot through metadata only;
+5. open and exclusively lock the active audit descriptor, verify it, derive the
+   next sequence/hash and enforce the byte limit;
+6. if needed, rotate the verified active bytes into create-only immutable
+   evidence and bind the new archived predecessor before replacing the active
+   head;
+7. write the complete payload, fsync, verify descriptor/path binding and the
+   exact expected size;
+8. revalidate the predecessor snapshot again; if it drifted after the append,
+   truncate the active descriptor back to its exact pre-append size and fsync
+   the rollback.
 
 If a write starts but does not complete, Grabowski truncates the same locked
-descriptor back to its exact previous size, calls `fsync` and verifies the
+descriptor back to its exact previous size, calls fsync and verifies the
 restored size before returning the original error. If rollback itself cannot be
 proved complete, Grabowski raises a separate rollback-failure error and remains
 fail-closed.
 
-A failed first append may leave a safe empty `0600` audit file. Grabowski does
+A failed first append may leave a safe empty 0600 audit file. Grabowski does
 not delete that path during error handling because a check-then-unlink sequence
 would introduce another path-replacement race. An empty valid file represents
 zero records and can be used by the next append.
 
 ## Read and verification behavior
 
-Canonical verification and record reads use a shared lock and the opened file
-descriptor. They enforce the same file contract and byte limit. A missing audit
-file is a valid empty chain and verification is read-only; verification does
-not create the file.
+Canonical status verification captures and verifies the mutable head under the
+shared coordination lock, verifies immutable history after releasing that lock,
+then re-reads the head. If only the head advanced while its predecessor binding
+stayed equal, the already-verified immutable history is reused with the fresh
+head instead of being scanned again. If the predecessor changed, verification
+retries the history binding; repeated predecessor churn terminates with the
+distinct audit-head-raced error.
 
-Readers and writers therefore observe either the state before a complete append
-or the state after it. They do not treat a cooperative in-progress append as a
-finished record.
+Record-oriented readers that need complete payloads keep their own stronger
+snapshot rules. A missing audit file is a valid empty chain and verification is
+read-only; verification does not create the file.
+
+Readers and writers therefore use only heads that were fully verified while
+cooperative writers were excluded by the appropriate shared/exclusive
+coordination state. Immutable history is accepted only when its binding matches
+the verified head.
 
 ## Fail-closed boundary
 
 The locking contract prevents the known cooperative multi-process sibling race.
 It does not claim isolation from arbitrary code with the same Unix user that
-ignores the lock and directly modifies the audit file. Same-UID hostile-code
-isolation would require a separate operating-system security domain or a
-privileged broker-owned log.
+ignores the lock and directly modifies audit evidence. In particular, the
+metadata-only in-lock snapshot recheck is an identity/drift check, not a second
+content-hash verification. Content hashes and manifests are verified off-lock
+before that identity is captured. Same-UID hostile-code isolation would require
+a separate operating-system security domain or a privileged broker-owned log.
 
 Grabowski must continue to block mutations when it observes any of the
 following:
@@ -119,6 +146,9 @@ The regression suite covers:
 - concurrent appends from multiple operating-system processes;
 - bounded lock timeout;
 - short writes and partial-write rollback;
+- predecessor-change append retry and predecessor-drift fail-closed behavior;
+- off-lock immutable-history verification and metadata-only in-lock rechecks;
+- head-only status races without redundant immutable-history rescans;
 - safe behavior after a failed first append;
 - symlink, hardlink, broad-mode and unsafe-parent rejection;
 - visible-path replacement during append;
