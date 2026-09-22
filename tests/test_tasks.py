@@ -8458,8 +8458,9 @@ class TaskTests(unittest.TestCase):
         ) as integrity:
             connection = tasks._database()
             connection.close()
-        self.assertEqual(1, integrity.call_count)
-        inventory = tasks.grabowski_task_list(schema_only=True)
+            self.assertEqual(0, integrity.call_count)
+            inventory = tasks.grabowski_task_list(schema_only=True)
+            self.assertEqual(1, integrity.call_count)
         self.assertEqual("5", inventory["observed_version"])
         self.assertEqual("current", inventory["status"])
         self.assertTrue(inventory["write_compatible"])
@@ -8797,6 +8798,39 @@ class TaskTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "busy; retry"):
             tasks._sqlite_integrity(BusyConnection(), "Task database")
+
+    def test_current_task_store_reopen_skips_redundant_integrity_scan(self) -> None:
+        connection = tasks._database()
+        connection.close()
+        calls = 0
+        real_integrity = tasks._sqlite_integrity
+
+        def tracking_integrity(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return real_integrity(*args, **kwargs)
+
+        with patch.object(tasks, "_sqlite_integrity", side_effect=tracking_integrity):
+            first = tasks._database()
+            first.close()
+            second = tasks._database()
+            second.close()
+        self.assertEqual(0, calls)
+
+    def test_explicit_task_store_preflight_still_checks_integrity(self) -> None:
+        connection = tasks._database()
+        connection.close()
+        calls = 0
+        real_integrity = tasks._sqlite_integrity
+
+        def tracking_integrity(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return real_integrity(*args, **kwargs)
+
+        with patch.object(tasks, "_sqlite_integrity", side_effect=tracking_integrity):
+            self.assertEqual("5", tasks._preflight_task_store())
+        self.assertEqual(1, calls)
 
     def test_current_task_store_reopen_is_byte_stable(self) -> None:
         connection = tasks._database()

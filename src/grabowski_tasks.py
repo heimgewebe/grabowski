@@ -1617,7 +1617,7 @@ def _verified_task_migration_backup(
                 pass
 
 
-def _preflight_task_store() -> str | None:
+def _preflight_task_store(*, verify_integrity: bool = True) -> str | None:
     if not TASK_DB.exists():
         return None
     if TASK_DB.is_symlink() or not TASK_DB.is_file():
@@ -1625,17 +1625,28 @@ def _preflight_task_store() -> str | None:
     if TASK_DB.stat().st_size == 0:
         return None
     with _readonly_sqlite(TASK_DB) as connection:
-        _sqlite_integrity(connection, "Task database", quick=True)
-        version = _task_schema_version(connection)
-        if version not in {"1", "2", "3", "4", "5"}:
+        if verify_integrity:
+            _sqlite_integrity(connection, "Task database", quick=True)
+        try:
+            version = _task_schema_version(connection)
+            if version not in {"1", "2", "3", "4", "5"}:
+                raise RuntimeError(
+                    "Unsupported task database schema; use a runtime that explicitly supports it"
+                )
+            if version == "5":
+                _validate_task_schema_current(connection)
+            else:
+                _validate_task_schema_legacy(connection, version)
+            return version
+        except sqlite3.DatabaseError as exc:
+            detail = str(exc).lower()
+            if "locked" in detail or "busy" in detail:
+                raise RuntimeError(
+                    "Task database is busy; retry after the active writer completes"
+                ) from exc
             raise RuntimeError(
-                "Unsupported task database schema; use a runtime that explicitly supports it"
-            )
-        if version == "5":
-            _validate_task_schema_current(connection)
-        else:
-            _validate_task_schema_legacy(connection, version)
-        return version
+                "Task database is corrupt; restore a verified backup before retrying"
+            ) from exc
 
 
 def _create_task_schema_v5(connection: sqlite3.Connection) -> None:
@@ -1774,12 +1785,12 @@ def _database() -> sqlite3.Connection:
     if TASK_DB.is_symlink():
         raise PermissionError(f"Task database may not be a symlink: {TASK_DB}")
 
-    observed = _preflight_task_store()
+    observed = _preflight_task_store(verify_integrity=False)
     if observed == "5":
         return _open_current_task_database()
 
     with _schema_directory_lock(parent):
-        observed = _preflight_task_store()
+        observed = _preflight_task_store(verify_integrity=False)
         if observed == "5":
             return _open_current_task_database()
         connection = (
