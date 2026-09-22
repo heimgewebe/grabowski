@@ -1814,14 +1814,18 @@ def _finalize_groups(
             and not item["processes"]
             for item in active_lifecycle_checkouts
         )
+        live_worker_authority = any(
+            item["state"] in ACTIVE_WORKER_STATES
+            for item in group["worker_refs"]
+        )
         independent_live_authority = bool(
             (task_item and task_item["state"] in ACTIVE_TASK_STATES)
             or group["lease_summary"]["count"]
-            or group["worker_refs"]
+            or live_worker_authority
             or group["physical_refs"]["tmux_sessions"]
             or group["physical_refs"]["processes"]
             or any(
-                ref.get("source") != "checkout-lifecycle-binding"
+                ref.get("source") not in {"checkout-lifecycle-binding", "worker-registry"}
                 for ref in group["authority_refs"]
             )
         )
@@ -2464,4 +2468,3 @@ def build_current_work_projection(
             "repository-filter-invariant aggregate values from globally sourced work groups",
         ],
     }
-
