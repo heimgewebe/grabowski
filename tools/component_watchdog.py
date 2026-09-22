@@ -2353,12 +2353,13 @@ def classify_tunnel_readiness_dependency(
             state,
         )
     if dependency_failure == "mcp-http-request-failed":
-        state = replace(
-            state,
-            readiness_dependency_unavailable_boot_id=identity.boot_id,
-            readiness_dependency_unavailable_pid=identity.pid,
-            readiness_dependency_unavailable_start_ticks=identity.start_ticks,
-        )
+        if readiness_failed:
+            state = replace(
+                state,
+                readiness_dependency_unavailable_boot_id=identity.boot_id,
+                readiness_dependency_unavailable_pid=identity.pid,
+                readiness_dependency_unavailable_start_ticks=identity.start_ticks,
+            )
         return (
             ProbeResult(
                 "dependency-unavailable",
