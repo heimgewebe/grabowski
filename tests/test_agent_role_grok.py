@@ -488,6 +488,69 @@ class GrokReviewRoleTests(unittest.TestCase):
             declared,
         )
 
+    def test_codex_review_root_image_options_are_normalized_before_exec(self) -> None:
+        declared = [
+            "codex",
+            "--image",
+            "shot.png",
+            "detail.png",
+            "--model",
+            "gpt-5.6-sol",
+            "review this",
+        ]
+        self.assertIsNone(role._codex_declared_subcommand(declared))
+        self.assertEqual(
+            role._codex_review_command_for_headless_execution(declared),
+            [
+                "codex",
+                "--image=shot.png",
+                "--image=detail.png",
+                "--model",
+                "gpt-5.6-sol",
+                "exec",
+                "review this",
+            ],
+        )
+
+    def test_codex_review_attached_short_option_values_are_supported(self) -> None:
+        for option in ("-mgpt-5.6-sol", "-sread-only", "-creview=true"):
+            with self.subTest(option=option):
+                declared = ["codex", option, "review this"]
+                self.assertIsNone(role._codex_declared_subcommand(declared))
+                self.assertEqual(
+                    role._codex_review_command_for_headless_execution(declared),
+                    ["codex", option, "exec", "review this"],
+                )
+
+    def test_codex_review_attached_image_value_is_normalized_before_exec(self) -> None:
+        declared = ["codex", "-ishot.png", "review this"]
+        self.assertIsNone(role._codex_declared_subcommand(declared))
+        self.assertEqual(
+            role._codex_review_command_for_headless_execution(declared),
+            ["codex", "--image=shot.png", "exec", "review this"],
+        )
+
+    def test_codex_review_prompt_separator_is_preserved_after_exec(self) -> None:
+        declared = ["codex", "--", "--version"]
+        self.assertIsNone(role._codex_declared_subcommand(declared))
+        self.assertEqual(
+            role._codex_review_command_for_headless_execution(declared),
+            ["codex", "exec", "--", "--version"],
+        )
+
+    def test_codex_review_prompt_separator_rejects_extra_positionals(self) -> None:
+        declared = ["codex", "--", "review", "review this"]
+        with self.assertRaisesRegex(RuntimeError, "extra positional arguments after --"):
+            role._codex_review_command_for_headless_execution(declared)
+
+    def test_codex_review_preserves_headless_subcommand_after_attached_global_option(self) -> None:
+        declared = ["codex", "-mgpt-5.6-sol", "review", "review this"]
+        self.assertEqual(role._codex_declared_subcommand(declared), "review")
+        self.assertEqual(
+            role._codex_review_command_for_headless_execution(declared),
+            declared,
+        )
+
     def test_review_sandbox_preserves_declared_command_for_provenance(self) -> None:
         repo = Path("/tmp/repo")
         declared = ["grok", "--model", "grok-4.6", "review this"]

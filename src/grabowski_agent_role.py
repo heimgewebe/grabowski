@@ -658,6 +658,8 @@ _CODEX_GLOBAL_OPTIONS_WITH_VALUE = frozenset(
         "--config",
         "--disable",
         "--enable",
+        "-i",
+        "--image",
         "--local-provider",
         "-m",
         "--model",
@@ -669,6 +671,7 @@ _CODEX_GLOBAL_OPTIONS_WITH_VALUE = frozenset(
         "--sandbox",
     }
 )
+_CODEX_VARIADIC_GLOBAL_OPTIONS = frozenset({"-i", "--image"})
 _CODEX_GLOBAL_FLAGS = frozenset(
     {
         "--approve-for-me",
@@ -685,52 +688,111 @@ _CODEX_GLOBAL_FLAGS = frozenset(
         "--worktree",
     }
 )
+_CODEX_LONG_OPTIONS_WITH_VALUE = tuple(
+    option
+    for option in _CODEX_GLOBAL_OPTIONS_WITH_VALUE
+    if option.startswith("--")
+)
+_CODEX_SHORT_OPTIONS_WITH_VALUE = tuple(
+    option
+    for option in _CODEX_GLOBAL_OPTIONS_WITH_VALUE
+    if option.startswith("-") and not option.startswith("--")
+)
 
 
-def _codex_declared_subcommand(command: list[str]) -> str | None:
-    """Return the actual Codex subcommand before the final review prompt."""
-    arguments = command[1:-1]
-    long_options_with_value = tuple(
-        option
-        for option in _CODEX_GLOBAL_OPTIONS_WITH_VALUE
-        if option.startswith("--")
+def _codex_attached_short_option(token: str) -> str | None:
+    return next(
+        (
+            option
+            for option in _CODEX_SHORT_OPTIONS_WITH_VALUE
+            if token != option and token.startswith(option)
+        ),
+        None,
     )
+
+
+def _codex_review_prefix(
+    command: list[str],
+) -> tuple[str | None, list[str], bool]:
+    """Classify root Codex argv and preserve a prompt-only separator."""
+    arguments = command[1:-1]
+    normalized: list[str] = []
     index = 0
     while index < len(arguments):
         token = arguments[index]
         if token == "--":
-            return arguments[index + 1] if index + 1 < len(arguments) else None
+            if index != len(arguments) - 1:
+                raise RuntimeError(
+                    "Codex review command has extra positional arguments after --"
+                )
+            return None, normalized, True
         if token in _CODEX_GLOBAL_OPTIONS_WITH_VALUE:
             if index + 1 >= len(arguments):
                 raise RuntimeError(f"Codex global option {token} is missing its value")
+            if token in _CODEX_VARIADIC_GLOBAL_OPTIONS:
+                index += 1
+                image_count = 0
+                while index < len(arguments) and not arguments[index].startswith("-"):
+                    normalized.append(f"--image={arguments[index]}")
+                    image_count += 1
+                    index += 1
+                if image_count == 0:
+                    raise RuntimeError(f"Codex global option {token} is missing its value")
+                continue
+            normalized.extend((token, arguments[index + 1]))
             index += 2
             continue
-        if any(token.startswith(f"{option}=") for option in long_options_with_value):
+        long_option = next(
+            (
+                option
+                for option in _CODEX_LONG_OPTIONS_WITH_VALUE
+                if token.startswith(f"{option}=")
+            ),
+            None,
+        )
+        if long_option is not None:
+            normalized.append(token)
+            index += 1
+            continue
+        short_option = _codex_attached_short_option(token)
+        if short_option is not None:
+            if short_option == "-i":
+                normalized.append(f"--image={token[len(short_option):]}")
+            else:
+                normalized.append(token)
             index += 1
             continue
         if token in _CODEX_GLOBAL_FLAGS:
+            normalized.append(token)
             index += 1
             continue
         if token.startswith("-"):
             raise RuntimeError(
                 f"unsupported Codex global option before review subcommand: {token}"
             )
-        return token
-    return None
+        return token, normalized, False
+    return None, normalized, False
+
+
+def _codex_declared_subcommand(command: list[str]) -> str | None:
+    """Return the actual Codex subcommand before the final review prompt."""
+    subcommand, _normalized, _prompt_separator = _codex_review_prefix(command)
+    return subcommand
 
 
 def _codex_review_command_for_headless_execution(command: list[str]) -> list[str]:
     """Turn one direct Codex review command into its non-interactive form."""
     if len(command) < 2:
         raise RuntimeError("Codex review command must include a prompt")
-    subcommand = _codex_declared_subcommand(command)
+    subcommand, normalized, prompt_separator = _codex_review_prefix(command)
     if subcommand in _CODEX_NONINTERACTIVE_SUBCOMMANDS:
         return list(command)
     if subcommand is not None:
         raise RuntimeError(
             f"Codex review command declares unsupported subcommand: {subcommand}"
         )
-    return [*command[:-1], "exec", command[-1]]
+    prompt = ["--", command[-1]] if prompt_separator else [command[-1]]
+    return [command[0], *normalized, "exec", *prompt]
 
 
 def _review_sandbox_argv(
