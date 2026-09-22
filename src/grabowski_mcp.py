@@ -4203,13 +4203,33 @@ def _verify_audit_log_unlocked(path: Path = AUDIT_LOG) -> dict[str, Any]:
         return status
 
 
+def _read_audit_status_snapshot(path: Path = AUDIT_LOG) -> dict[str, Any]:
+    """Verify a coherent snapshot without pinning immutable history."""
+    lock_path = _audit_storage_paths(path)["coordination_lock"]
+    if not path.exists() and not lock_path.exists():
+        return _verify_audit_log_unlocked(path)
+    with _audit_coordination_lock(path, exclusive=False):
+        head, predecessor = _read_audit_head_unlocked(path)
+    components = [(head[0], b"", head[2])]
+    compatibility_evidence = False
+    if predecessor is not None:
+        predecessors, compatibility_evidence = _read_audit_chain_unlocked(
+            path,
+            use_segment_cache=True,
+            retain_verified_segment_data=False,
+            initial_expected=predecessor,
+        )
+        components.extend(predecessors)
+    return _audit_status_from_components(
+        path,
+        components,
+        compatibility_evidence,
+    )
+
+
 def _verify_audit_log(path: Path = AUDIT_LOG) -> dict[str, Any]:
     try:
-        lock_path = _audit_storage_paths(path)["coordination_lock"]
-        if not path.exists() and not lock_path.exists():
-            return _verify_audit_log_unlocked(path)
-        with _audit_coordination_lock(path, exclusive=False):
-            return _verify_audit_log_unlocked(path)
+        return _read_audit_status_snapshot(path)
     except (OSError, PermissionError, RuntimeError, ValueError) as exc:
         status = {
             "valid": False,
@@ -4455,73 +4475,116 @@ def _append_payload(descriptor: int, path: Path, payload: bytes) -> None:
         raise
 
 
+def _raise_audit_verification_failure(exc: BaseException) -> None:
+    chain_error = str(exc)
+    if (
+        "file contract" in chain_error
+        or "parent directory" in chain_error
+        or "symlink" in chain_error
+    ):
+        raise PermissionError(chain_error) from exc
+    raise RuntimeError(
+        f"Audit log verification failed: {chain_error}"
+    ) from exc
+
+
+def _verify_bound_audit_predecessors(
+    path: Path,
+    predecessor: dict[str, Any] | None,
+) -> None:
+    if predecessor is None:
+        return
+    try:
+        _read_audit_chain_unlocked(
+            path,
+            use_segment_cache=True,
+            retain_verified_segment_data=False,
+            initial_expected=predecessor,
+        )
+    except (OSError, PermissionError, RuntimeError, ValueError) as exc:
+        _raise_audit_verification_failure(exc)
+
+
 def _append_audit_with_digest(record: dict[str, Any]) -> str:
     with AUDIT_APPEND_LOCK:
         if AUDIT_LOG.is_symlink():
             raise PermissionError(f"Audit log may not be a symlink: {AUDIT_LOG}")
-        with _audit_coordination_lock(AUDIT_LOG, exclusive=True):
-            descriptor: int | None = None
+        for _predecessor_attempt in range(4):
             try:
-                chain_status = _verify_audit_log_unlocked(AUDIT_LOG)
-                if not chain_status["valid"]:
-                    chain_error = str(chain_status["error"])
-                    if (
-                        "file contract" in chain_error
-                        or "parent directory" in chain_error
-                        or "symlink" in chain_error
-                    ):
-                        raise PermissionError(chain_error)
-                    raise RuntimeError(
-                        f"Audit log verification failed: {chain_error}"
+                with _audit_coordination_lock(AUDIT_LOG, exclusive=False):
+                    head, predecessor = _read_audit_head_unlocked(AUDIT_LOG)
+                del head
+            except (OSError, PermissionError, RuntimeError, ValueError) as exc:
+                _raise_audit_verification_failure(exc)
+
+            _verify_bound_audit_predecessors(AUDIT_LOG, predecessor)
+
+            with _audit_coordination_lock(AUDIT_LOG, exclusive=True):
+                try:
+                    current_head, current_predecessor = (
+                        _read_audit_head_unlocked(AUDIT_LOG)
                     )
-                descriptor, _created = _open_audit_append_target(AUDIT_LOG)
-                status = _verify_audit_descriptor(AUDIT_LOG, descriptor)
-                if not status["valid"]:
-                    raise RuntimeError(
-                        f"Audit log verification failed: {status['error']}"
-                    )
-                _enriched, payload = _enriched_audit_record(record, status)
-                current_size = os.fstat(descriptor).st_size
-                needs_rotation = (
-                    current_size > 0
-                    and current_size
-                    + len(payload)
-                    + AUDIT_ROTATION_RESERVE_BYTES
-                    > MAX_AUDIT_BYTES
-                )
-                if needs_rotation:
-                    if (
-                        MAX_AUDIT_BYTES
-                        <= AUDIT_ROTATION_RESERVE_BYTES
-                        + MAX_AUDIT_RECORD_BYTES
-                        + 4096
-                    ):
-                        raise ValueError("Audit log would exceed its byte limit")
-                    _rotate_audit_segment(
-                        AUDIT_LOG,
-                        descriptor,
-                        status,
-                        next_record_bytes=len(payload),
-                    )
-                    _close_audit_descriptor(descriptor)
-                    descriptor = None
+                    del current_head
+                except (OSError, PermissionError, RuntimeError, ValueError) as exc:
+                    _raise_audit_verification_failure(exc)
+
+                if current_predecessor != predecessor:
+                    continue
+
+                descriptor: int | None = None
+                try:
                     descriptor, _created = _open_audit_append_target(AUDIT_LOG)
                     status = _verify_audit_descriptor(AUDIT_LOG, descriptor)
                     if not status["valid"]:
                         raise RuntimeError(
-                            f"Audit rotation verification failed: {status['error']}"
+                            f"Audit log verification failed: {status['error']}"
                         )
                     _enriched, payload = _enriched_audit_record(record, status)
-                elif current_size + len(payload) > MAX_AUDIT_BYTES:
-                    raise ValueError("Audit log would exceed its byte limit")
-                _append_payload(descriptor, AUDIT_LOG, payload)
-                record_sha256 = _enriched.get("record_sha256")
-                if not isinstance(record_sha256, str):
-                    raise RuntimeError("Audit append digest unavailable")
-                return record_sha256
-            finally:
-                if descriptor is not None:
-                    _close_audit_descriptor(descriptor)
+                    current_size = os.fstat(descriptor).st_size
+                    needs_rotation = (
+                        current_size > 0
+                        and current_size
+                        + len(payload)
+                        + AUDIT_ROTATION_RESERVE_BYTES
+                        > MAX_AUDIT_BYTES
+                    )
+                    if needs_rotation:
+                        if (
+                            MAX_AUDIT_BYTES
+                            <= AUDIT_ROTATION_RESERVE_BYTES
+                            + MAX_AUDIT_RECORD_BYTES
+                            + 4096
+                        ):
+                            raise ValueError(
+                                "Audit log would exceed its byte limit"
+                            )
+                        _rotate_audit_segment(
+                            AUDIT_LOG,
+                            descriptor,
+                            status,
+                            next_record_bytes=len(payload),
+                        )
+                        _close_audit_descriptor(descriptor)
+                        descriptor = None
+                        descriptor, _created = _open_audit_append_target(AUDIT_LOG)
+                        status = _verify_audit_descriptor(AUDIT_LOG, descriptor)
+                        if not status["valid"]:
+                            raise RuntimeError(
+                                "Audit rotation verification failed: "
+                                f"{status['error']}"
+                            )
+                        _enriched, payload = _enriched_audit_record(record, status)
+                    elif current_size + len(payload) > MAX_AUDIT_BYTES:
+                        raise ValueError("Audit log would exceed its byte limit")
+                    _append_payload(descriptor, AUDIT_LOG, payload)
+                    record_sha256 = _enriched.get("record_sha256")
+                    if not isinstance(record_sha256, str):
+                        raise RuntimeError("Audit append digest unavailable")
+                    return record_sha256
+                finally:
+                    if descriptor is not None:
+                        _close_audit_descriptor(descriptor)
+        raise RuntimeError("Audit predecessor changed repeatedly during append")
 
 
 def _append_audit(record: dict[str, Any]) -> None:

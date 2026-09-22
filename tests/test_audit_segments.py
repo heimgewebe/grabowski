@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import fcntl
 import importlib.util
 import hashlib
 import json
@@ -603,6 +604,134 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                 self.assertTrue(snapshot.legacy_rotation_compatibility)
                 self.assertEqual(snapshot.archived_segment_count, 1)
 
+
+    def test_verify_scans_immutable_segments_outside_coordination_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            audit, patches = self._patches(state)
+            with (
+                patches[0],
+                patches[1],
+                patches[2],
+                patches[3],
+                patches[4],
+                patches[5],
+                patches[6],
+            ):
+                for index in range(25):
+                    grabowski_mcp._append_audit(
+                        {
+                            "operation": "snapshot-lock-test",
+                            "index": index,
+                            "payload": "v" * 120,
+                        }
+                    )
+                grabowski_mcp.AUDIT_SEGMENT_VERIFICATION_CACHE.clear()
+                original = grabowski_mcp._read_audit_chain_unlocked
+                lock_observations = []
+                payload_sizes = []
+                lock_path = grabowski_mcp._audit_storage_paths(audit)[
+                    "coordination_lock"
+                ]
+
+                def observe(path, *args, **kwargs):
+                    if kwargs.get("initial_expected") is not None:
+                        fd = os.open(lock_path, os.O_RDWR | os.O_CLOEXEC)
+                        try:
+                            try:
+                                fcntl.flock(
+                                    fd,
+                                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                                )
+                            except BlockingIOError:
+                                lock_observations.append(False)
+                            else:
+                                lock_observations.append(True)
+                                fcntl.flock(fd, fcntl.LOCK_UN)
+                        finally:
+                            os.close(fd)
+                    result = original(path, *args, **kwargs)
+                    if kwargs.get("initial_expected") is not None:
+                        payload_sizes.extend(
+                            len(data)
+                            for _segment, data, _status in result[0]
+                        )
+                    return result
+
+                with patch.object(
+                    grabowski_mcp,
+                    "_read_audit_chain_unlocked",
+                    side_effect=observe,
+                ):
+                    status = grabowski_mcp._verify_audit_log(audit)
+
+                self.assertTrue(status["valid"], status)
+                self.assertTrue(lock_observations)
+                self.assertTrue(all(lock_observations))
+                self.assertTrue(payload_sizes)
+                self.assertEqual(set(payload_sizes), {0})
+
+    def test_append_scans_immutable_segments_outside_coordination_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            audit, patches = self._patches(state)
+            with (
+                patches[0],
+                patches[1],
+                patches[2],
+                patches[3],
+                patches[4],
+                patches[5],
+                patches[6],
+            ):
+                for index in range(25):
+                    grabowski_mcp._append_audit(
+                        {
+                            "operation": "append-lock-test",
+                            "index": index,
+                            "payload": "a" * 120,
+                        }
+                    )
+                grabowski_mcp.AUDIT_SEGMENT_VERIFICATION_CACHE.clear()
+                original = grabowski_mcp._read_audit_chain_unlocked
+                lock_observations = []
+                lock_path = grabowski_mcp._audit_storage_paths(audit)[
+                    "coordination_lock"
+                ]
+
+                def observe(path, *args, **kwargs):
+                    if kwargs.get("initial_expected") is not None:
+                        fd = os.open(lock_path, os.O_RDWR | os.O_CLOEXEC)
+                        try:
+                            try:
+                                fcntl.flock(
+                                    fd,
+                                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                                )
+                            except BlockingIOError:
+                                lock_observations.append(False)
+                            else:
+                                lock_observations.append(True)
+                                fcntl.flock(fd, fcntl.LOCK_UN)
+                        finally:
+                            os.close(fd)
+                    return original(path, *args, **kwargs)
+
+                with patch.object(
+                    grabowski_mcp,
+                    "_read_audit_chain_unlocked",
+                    side_effect=observe,
+                ):
+                    grabowski_mcp._append_audit(
+                        {"operation": "append-after-unlocked-predecessor-scan"}
+                    )
+
+                self.assertTrue(lock_observations)
+                self.assertTrue(all(lock_observations))
+                status = grabowski_mcp._verify_audit_log(audit)
+                self.assertTrue(status["valid"], status)
 
 if __name__ == "__main__":
     unittest.main()
