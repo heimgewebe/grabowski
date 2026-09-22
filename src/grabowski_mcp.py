@@ -4026,6 +4026,12 @@ def _read_audit_chain_unlocked(
         if expected is not None and use_segment_cache:
             cache_key = _segment_cache_key(current, expected)
             cached = _segment_cache_get(cache_key)
+        if (
+            cached is not None
+            and cache_key is not None
+            and _segment_cache_key(current, expected) != cache_key
+        ):
+            cached = None
         if cached is not None:
             data = b""
             status = cached["status"]
@@ -4378,7 +4384,7 @@ def _rotate_audit_segment(
     status: dict[str, Any],
     *,
     next_record_bytes: int,
-) -> None:
+) -> dict[str, Any]:
     _require_audit_descriptor_bound(descriptor, path)
     data = _read_audit_descriptor(descriptor, path)
     if not data or status["records"] <= 0:
@@ -4461,6 +4467,10 @@ def _rotate_audit_segment(
                 _fsync_directory(path.parent)
             except FileNotFoundError:
                 pass
+    predecessor = _audit_predecessor_binding(path, genesis)
+    if predecessor is None:
+        raise RuntimeError("Audit rotation predecessor binding unavailable")
+    return predecessor
 
 
 def _append_payload(descriptor: int, path: Path, payload: bytes) -> None:
@@ -4577,6 +4587,7 @@ def _append_audit_with_digest(record: dict[str, Any]) -> str:
                         + AUDIT_ROTATION_RESERVE_BYTES
                         > MAX_AUDIT_BYTES
                     )
+                    postflight_predecessor = predecessor
                     if needs_rotation:
                         if (
                             MAX_AUDIT_BYTES
@@ -4587,7 +4598,7 @@ def _append_audit_with_digest(record: dict[str, Any]) -> str:
                             raise ValueError(
                                 "Audit log would exceed its byte limit"
                             )
-                        _rotate_audit_segment(
+                        postflight_predecessor = _rotate_audit_segment(
                             AUDIT_LOG,
                             descriptor,
                             status,
@@ -4606,7 +4617,25 @@ def _append_audit_with_digest(record: dict[str, Any]) -> str:
                         _enriched, payload = _enriched_audit_record(record, status)
                     elif current_size + len(payload) > MAX_AUDIT_BYTES:
                         raise ValueError("Audit log would exceed its byte limit")
+                    append_start_size = os.fstat(descriptor).st_size
                     _append_payload(descriptor, AUDIT_LOG, payload)
+                    try:
+                        _verify_bound_audit_predecessors(
+                            AUDIT_LOG,
+                            postflight_predecessor,
+                        )
+                    except BaseException:
+                        try:
+                            _rollback_audit_descriptor(
+                                descriptor,
+                                append_start_size,
+                            )
+                        except BaseException as rollback_error:
+                            raise RuntimeError(
+                                "Audit predecessor postflight failed and "
+                                "append rollback did not complete"
+                            ) from rollback_error
+                        raise
                     record_sha256 = _enriched.get("record_sha256")
                     if not isinstance(record_sha256, str):
                         raise RuntimeError("Audit append digest unavailable")
