@@ -4083,16 +4083,19 @@ def _read_audit_chain_unlocked(
         cache_key: tuple[Any, ...] | None = None
         verification_key: tuple[Any, ...] | None = None
         if expected is not None and use_segment_cache:
-            cache_key = _segment_cache_key(current, expected)
-            cached = _segment_cache_get(cache_key)
-        if cached is not None and cache_key is not None:
-            revalidation_key = (
+            cache_key = (
                 _segment_snapshot_revalidation_key(current, expected)
                 if verification_snapshot is not None
                 else _segment_cache_key(current, expected)
             )
-            if revalidation_key != cache_key:
-                cached = None
+            cached = _segment_cache_get(cache_key)
+        if (
+            cached is not None
+            and cache_key is not None
+            and verification_snapshot is None
+            and _segment_cache_key(current, expected) != cache_key
+        ):
+            cached = None
         if cached is not None:
             verification_key = cache_key
             data = b""

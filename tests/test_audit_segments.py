@@ -1143,9 +1143,11 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                             "payload": "o" * 120,
                         }
                     )
+                warmed = grabowski_mcp._verify_audit_log(audit)
+                self.assertTrue(warmed["valid"], warmed)
                 original_full = grabowski_mcp._private_evidence_identity
                 original_path = grabowski_mcp._private_evidence_path_identity
-                full_checks_under_lock = []
+                full_checks = []
                 path_checks_under_lock = []
                 lock_path = grabowski_mcp._audit_storage_paths(audit)[
                     "coordination_lock"
@@ -1164,8 +1166,7 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                         os.close(fd)
 
                 def observe_full(path, *, max_bytes):
-                    if not coordination_lock_is_free():
-                        full_checks_under_lock.append(str(path))
+                    full_checks.append(str(path))
                     return original_full(path, max_bytes=max_bytes)
 
                 def observe_path(path, *, max_bytes):
@@ -1189,7 +1190,7 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                         {"operation": "snapshot-reopen-measure"}
                     )
 
-                self.assertEqual(full_checks_under_lock, [])
+                self.assertEqual(full_checks, [])
                 self.assertTrue(path_checks_under_lock)
 
     def test_append_snapshot_is_independent_of_global_cache_capacity(self) -> None:
