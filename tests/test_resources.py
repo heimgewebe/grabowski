@@ -5360,6 +5360,78 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(assessor_calls, [])
         self.assertIsNone(resources.inspect_resource(f"repo:{self.root}"))
 
+    def test_internal_convergence_mode_accepts_converge_first(self) -> None:
+        (self.root / ".git").mkdir()
+        calls: list[dict[str, object]] = []
+
+        def assessor(**kwargs: object) -> dict[str, object]:
+            calls.append(dict(kwargs))
+            return {
+                "schema_version": 1,
+                "decision": "converge_first",
+                "assessment_sha256": "d" * 64,
+                "blocker_codes": ["worktree-convergence-required"],
+                "blockers": [
+                    {
+                        "code": "worktree-convergence-required",
+                        "path": str(self.root / "retained"),
+                    }
+                ],
+                "read_only": True,
+            }
+
+        result = resources.acquire_resources(
+            "owner-a",
+            [f"repo:{self.root}"],
+            purpose="internal convergence operation",
+            ttl_seconds=60,
+            admission_assessor=assessor,
+            _work_admission_mode="convergence",
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["mode"], "convergence")
+        self.assertEqual(result["work_admission"][0]["decision"], "converge_first")
+        self.assertIsNotNone(resources.inspect_resource(f"repo:{self.root}"))
+
+    def test_internal_convergence_mode_still_rejects_blocked(self) -> None:
+        (self.root / ".git").mkdir()
+        assessment = {
+            "schema_version": 1,
+            "decision": "blocked",
+            "assessment_sha256": "e" * 64,
+            "blocker_codes": ["dirty-worktree"],
+            "blockers": [{"code": "dirty-worktree", "path": str(self.root)}],
+            "read_only": True,
+        }
+
+        def assessor(**kwargs: object) -> dict[str, object]:
+            self.assertEqual(kwargs["mode"], "convergence")
+            raise work_admission.WorkAdmissionBlocked(assessment)
+
+        with self.assertRaises(work_admission.WorkAdmissionBlocked):
+            resources.acquire_resources(
+                "owner-a",
+                [f"repo:{self.root}"],
+                purpose="blocked convergence operation",
+                ttl_seconds=60,
+                admission_assessor=assessor,
+                _work_admission_mode="convergence",
+            )
+        self.assertIsNone(resources.inspect_resource(f"repo:{self.root}"))
+
+    def test_internal_work_admission_mode_rejects_unknown_value(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "_work_admission_mode must be normal or convergence"
+        ):
+            resources.acquire_resources(
+                "owner-a",
+                ["component:invalid-internal-admission-mode"],
+                purpose="invalid internal mode",
+                ttl_seconds=60,
+                _work_admission_mode="unsafe",
+            )
+
     def test_broad_repository_lease_without_scope_still_runs_admission(self) -> None:
         (self.root / ".git").mkdir()
         calls: list[dict[str, object]] = []
