@@ -3998,6 +3998,9 @@ def _read_audit_chain_unlocked(
     use_segment_cache: bool = True,
     retain_verified_segment_data: bool = True,
     initial_expected: dict[str, Any] | None = None,
+    verification_snapshot: (
+        list[tuple[dict[str, Any], tuple[Any, ...]]] | None
+    ) = None,
 ) -> tuple[list[tuple[Path, bytes, dict[str, Any]]], bool]:
     components: list[tuple[Path, bytes, dict[str, Any]]] = []
     expected = dict(initial_expected) if initial_expected is not None else None
@@ -4023,6 +4026,7 @@ def _read_audit_chain_unlocked(
         seen.add(resolved)
         cached: dict[str, Any] | None = None
         cache_key: tuple[Any, ...] | None = None
+        verification_key: tuple[Any, ...] | None = None
         if expected is not None and use_segment_cache:
             cache_key = _segment_cache_key(current, expected)
             cached = _segment_cache_get(cache_key)
@@ -4033,11 +4037,14 @@ def _read_audit_chain_unlocked(
         ):
             cached = None
         if cached is not None:
+            verification_key = cache_key
             data = b""
             status = cached["status"]
             observed_sha = str(cached["sha256"])
             first_record = cached.get("first_record")
         else:
+            if expected is not None and verification_snapshot is not None:
+                verification_key = _segment_cache_key(current, expected)
             data, status = _read_audit_file(current)
             if not status["valid"]:
                 if expected is None and current == path:
@@ -4082,6 +4089,17 @@ def _read_audit_chain_unlocked(
             compatibility_evidence = compatibility_evidence or bool(
                 expected.get("compatibility")
             )
+            if verification_snapshot is not None:
+                current_key = _segment_cache_key(current, expected)
+                if verification_key is None:
+                    verification_key = current_key
+                if current_key != verification_key:
+                    raise RuntimeError(
+                        "audit-segment-changed-after-verification"
+                    )
+                verification_snapshot.append(
+                    (dict(expected), current_key)
+                )
         component_status = dict(status)
         component_status["segment_sha256"] = observed_sha
         component_data = data
@@ -4384,7 +4402,10 @@ def _rotate_audit_segment(
     status: dict[str, Any],
     *,
     next_record_bytes: int,
-) -> dict[str, Any]:
+) -> tuple[
+    dict[str, Any],
+    tuple[dict[str, Any], tuple[Any, ...]],
+]:
     _require_audit_descriptor_bound(descriptor, path)
     data = _read_audit_descriptor(descriptor, path)
     if not data or status["records"] <= 0:
@@ -4443,6 +4464,13 @@ def _rotate_audit_segment(
         raise ValueError("Audit log would exceed its byte limit")
     _write_private_create_only(segment_path, data)
     _write_private_create_only(manifest_path, manifest_data)
+    predecessor = _audit_predecessor_binding(path, genesis)
+    if predecessor is None:
+        raise RuntimeError("Audit rotation predecessor binding unavailable")
+    rotation_snapshot_token = (
+        dict(predecessor),
+        _segment_cache_key(segment_path, predecessor),
+    )
     temporary_descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.rotation-",
         dir=path.parent,
@@ -4467,10 +4495,7 @@ def _rotate_audit_segment(
                 _fsync_directory(path.parent)
             except FileNotFoundError:
                 pass
-    predecessor = _audit_predecessor_binding(path, genesis)
-    if predecessor is None:
-        raise RuntimeError("Audit rotation predecessor binding unavailable")
-    return predecessor
+    return predecessor, rotation_snapshot_token
 
 
 def _append_payload(descriptor: int, path: Path, payload: bytes) -> None:
@@ -4511,7 +4536,7 @@ def _raise_audit_verification_failure(exc: BaseException) -> None:
 def _verify_bound_audit_predecessors(
     path: Path,
     predecessor: dict[str, Any] | None,
-) -> None:
+) -> list[tuple[dict[str, Any], tuple[Any, ...]]]:
     """Fail closed unless every bound immutable predecessor verifies.
 
     _read_audit_chain_unlocked has no invalid-success result: malformed segment
@@ -4520,18 +4545,66 @@ def _verify_bound_audit_predecessors(
     verified successfully.
     """
     if predecessor is None:
-        return
+        return []
+    verification_snapshot: list[
+        tuple[dict[str, Any], tuple[Any, ...]]
+    ] = []
     try:
         components, _compatibility_evidence = _read_audit_chain_unlocked(
             path,
             use_segment_cache=True,
             retain_verified_segment_data=False,
             initial_expected=predecessor,
+            verification_snapshot=verification_snapshot,
         )
         for _segment_path, _segment_data, segment_status in components:
             if not segment_status.get("valid"):
                 raise ValueError(
                     f"audit-segment-invalid:{segment_status.get('error')}"
+                )
+        if (
+            not verification_snapshot
+            or verification_snapshot[0][0] != predecessor
+            or len(verification_snapshot) != len(components)
+        ):
+            raise RuntimeError(
+                "audit-predecessor-verification-snapshot-incomplete"
+            )
+        return verification_snapshot
+    except (OSError, PermissionError, RuntimeError, ValueError) as exc:
+        _raise_audit_verification_failure(exc)
+
+
+def _verify_audit_predecessor_snapshot(
+    predecessor: dict[str, Any] | None,
+    verification_snapshot: list[
+        tuple[dict[str, Any], tuple[Any, ...]]
+    ],
+) -> None:
+    """Revalidate verified predecessor identities without reading payloads."""
+    try:
+        if predecessor is None:
+            if verification_snapshot:
+                raise RuntimeError(
+                    "audit-predecessor-verification-snapshot-unexpected"
+                )
+            return
+        if (
+            not verification_snapshot
+            or verification_snapshot[0][0] != predecessor
+        ):
+            raise RuntimeError(
+                "audit-predecessor-verification-snapshot-mismatch"
+            )
+        for binding, verified_key in verification_snapshot:
+            bound_path = binding.get("path")
+            if not isinstance(bound_path, Path):
+                raise ValueError(
+                    "audit-predecessor-verification-path-invalid"
+                )
+            if _segment_cache_key(bound_path, binding) != verified_key:
+                raise RuntimeError(
+                    "audit-predecessor-verification-snapshot-drift"
                 )
     except (OSError, PermissionError, RuntimeError, ValueError) as exc:
         _raise_audit_verification_failure(exc)
@@ -4549,7 +4622,10 @@ def _append_audit_with_digest(record: dict[str, Any]) -> str:
             except (OSError, PermissionError, RuntimeError, ValueError) as exc:
                 _raise_audit_verification_failure(exc)
 
-            _verify_bound_audit_predecessors(AUDIT_LOG, predecessor)
+            predecessor_snapshot = _verify_bound_audit_predecessors(
+                AUDIT_LOG,
+                predecessor,
+            )
 
             with _audit_coordination_lock(AUDIT_LOG, exclusive=True):
                 try:
@@ -4563,12 +4639,13 @@ def _append_audit_with_digest(record: dict[str, Any]) -> str:
                 if current_predecessor != predecessor:
                     continue
 
-                # The first predecessor walk happens outside the coordination
-                # lock and warms the immutable-segment cache. Re-run the same
-                # fail-closed verification here to close the TOCTOU window
-                # before append. On the normal path this is metadata/cache
-                # validation rather than rereading immutable segment payloads.
-                _verify_bound_audit_predecessors(AUDIT_LOG, predecessor)
+                # The full predecessor walk happened outside the coordination
+                # lock. Revalidate only the per-call verified identities here;
+                # correctness must not depend on the smaller global cache.
+                _verify_audit_predecessor_snapshot(
+                    predecessor,
+                    predecessor_snapshot,
+                )
 
                 descriptor: int | None = None
                 try:
@@ -4588,6 +4665,7 @@ def _append_audit_with_digest(record: dict[str, Any]) -> str:
                         > MAX_AUDIT_BYTES
                     )
                     postflight_predecessor = predecessor
+                    postflight_snapshot = predecessor_snapshot
                     if needs_rotation:
                         if (
                             MAX_AUDIT_BYTES
@@ -4598,12 +4676,19 @@ def _append_audit_with_digest(record: dict[str, Any]) -> str:
                             raise ValueError(
                                 "Audit log would exceed its byte limit"
                             )
-                        postflight_predecessor = _rotate_audit_segment(
+                        (
+                            postflight_predecessor,
+                            rotation_snapshot_token,
+                        ) = _rotate_audit_segment(
                             AUDIT_LOG,
                             descriptor,
                             status,
                             next_record_bytes=len(payload),
                         )
+                        postflight_snapshot = [
+                            rotation_snapshot_token,
+                            *predecessor_snapshot,
+                        ]
                         closing_descriptor = descriptor
                         descriptor = None
                         _close_audit_descriptor(closing_descriptor)
@@ -4620,9 +4705,9 @@ def _append_audit_with_digest(record: dict[str, Any]) -> str:
                     append_start_size = os.fstat(descriptor).st_size
                     _append_payload(descriptor, AUDIT_LOG, payload)
                     try:
-                        _verify_bound_audit_predecessors(
-                            AUDIT_LOG,
+                        _verify_audit_predecessor_snapshot(
                             postflight_predecessor,
+                            postflight_snapshot,
                         )
                     except BaseException:
                         try:

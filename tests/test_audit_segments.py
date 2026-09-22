@@ -196,13 +196,14 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                 def verify_then_tamper(path, predecessor):
                     nonlocal calls
                     calls += 1
-                    real_verify(path, predecessor)
+                    snapshot = real_verify(path, predecessor)
                     if calls == 1:
                         data = segment.read_bytes()
                         segment.write_bytes(
                             data[:-1] + (b"X" if data[-1:] != b"X" else b"Y")
                         )
                         os.chmod(segment, 0o600)
+                    return snapshot
 
                 with patch.object(
                     grabowski_mcp,
@@ -214,7 +215,7 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                             {"operation": "must-not-append-after-toctou-tamper"}
                         )
 
-                self.assertEqual(calls, 2)
+                self.assertEqual(calls, 1)
                 self.assertEqual(audit.read_bytes(), active_before)
 
     def test_failure_before_active_replace_keeps_previous_active_chain(self) -> None:
@@ -542,7 +543,7 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                     )
                 self.assertEqual(audit.read_bytes(), active_before)
 
-    def test_locked_cache_hit_tamper_is_detected_before_append(self) -> None:
+    def test_preappend_snapshot_drift_is_detected_before_append(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"
             state.mkdir(mode=0o700)
@@ -550,42 +551,35 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
             with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
                 for index in range(25):
                     grabowski_mcp._append_audit(
-                        {"operation": "locked-cache-race", "index": index, "payload": "l" * 120}
+                        {"operation": "snapshot-race", "index": index, "payload": "l" * 120}
                     )
-                grabowski_mcp.AUDIT_SEGMENT_VERIFICATION_CACHE.clear()
-                warmed = grabowski_mcp._verify_audit_log(audit)
-                self.assertTrue(warmed["valid"], warmed)
                 first = json.loads(audit.read_text(encoding="utf-8").splitlines()[0])
                 segment = Path(first["archived_audit_path"])
-                original_get = grabowski_mcp._segment_cache_get
-                hits = 0
+                original = grabowski_mcp._verify_audit_predecessor_snapshot
                 tampered = False
 
-                def tamper_on_second_cache_get(key):
-                    nonlocal hits, tampered
-                    if str(segment) == key[0]:
-                        hits += 1
-                        if hits == 2:
-                            data = segment.read_bytes()
-                            segment.write_bytes(
-                                data[:-1] + (b"X" if data[-1:] != b"X" else b"Y")
-                            )
-                            os.chmod(segment, 0o600)
-                            tampered = True
-                    return original_get(key)
+                def tamper_then_verify(predecessor, snapshot):
+                    nonlocal tampered
+                    if not tampered:
+                        data = segment.read_bytes()
+                        segment.write_bytes(
+                            data[:-1] + (b"X" if data[-1:] != b"X" else b"Y")
+                        )
+                        os.chmod(segment, 0o600)
+                        tampered = True
+                    return original(predecessor, snapshot)
 
                 active_before = audit.read_bytes()
                 with patch.object(
                     grabowski_mcp,
-                    "_segment_cache_get",
-                    side_effect=tamper_on_second_cache_get,
+                    "_verify_audit_predecessor_snapshot",
+                    side_effect=tamper_then_verify,
                 ):
                     with self.assertRaisesRegex(RuntimeError, "verification failed"):
                         grabowski_mcp._append_audit(
-                            {"operation": "must-not-append-locked-cache-race"}
+                            {"operation": "must-not-append-snapshot-race"}
                         )
                 self.assertTrue(tampered)
-                self.assertGreaterEqual(hits, 2)
                 self.assertEqual(audit.read_bytes(), active_before)
 
     def test_postappend_predecessor_tamper_rolls_back_active_append(self) -> None:
@@ -980,7 +974,76 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                 self.assertTrue(payload_sizes)
                 self.assertEqual(set(payload_sizes), {0})
 
-    def test_append_verifies_predecessors_outside_then_cached_inside_lock(self) -> None:
+    def test_append_snapshot_is_independent_of_global_cache_capacity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            audit, patches = self._patches(state)
+            with (
+                patches[0],
+                patches[1],
+                patches[2],
+                patches[3],
+                patches[4],
+                patches[5],
+                patches[6],
+                patch.object(
+                    grabowski_mcp,
+                    "MAX_AUDIT_SEGMENT_CACHE_ENTRIES",
+                    2,
+                ),
+            ):
+                for index in range(120):
+                    grabowski_mcp._append_audit(
+                        {
+                            "operation": "cache-capacity-lock-test",
+                            "index": index,
+                            "payload": "c" * 260,
+                        }
+                    )
+                status = grabowski_mcp._verify_audit_log(audit)
+                self.assertGreater(status["archived_segment_count"], 2)
+                grabowski_mcp.AUDIT_SEGMENT_VERIFICATION_CACHE.clear()
+                original_file = grabowski_mcp._read_audit_file
+                archived_reads_under_lock = []
+                lock_path = grabowski_mcp._audit_storage_paths(audit)[
+                    "coordination_lock"
+                ]
+
+                def coordination_lock_is_free() -> bool:
+                    fd = os.open(lock_path, os.O_RDWR | os.O_CLOEXEC)
+                    try:
+                        try:
+                            fcntl.flock(
+                                fd,
+                                fcntl.LOCK_EX | fcntl.LOCK_NB,
+                            )
+                        except BlockingIOError:
+                            return False
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                        return True
+                    finally:
+                        os.close(fd)
+
+                def observe_file(path):
+                    if path != audit and not coordination_lock_is_free():
+                        archived_reads_under_lock.append(str(path))
+                    return original_file(path)
+
+                with patch.object(
+                    grabowski_mcp,
+                    "_read_audit_file",
+                    side_effect=observe_file,
+                ):
+                    grabowski_mcp._append_audit(
+                        {"operation": "after-cache-capacity-overflow"}
+                    )
+
+                self.assertEqual(archived_reads_under_lock, [])
+                verified = grabowski_mcp._verify_audit_log(audit)
+                self.assertTrue(verified["valid"], verified)
+
+    def test_append_verifies_predecessors_outside_then_snapshot_inside_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"
             state.mkdir(mode=0o700)
@@ -1004,8 +1067,12 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                     )
                 grabowski_mcp.AUDIT_SEGMENT_VERIFICATION_CACHE.clear()
                 original_chain = grabowski_mcp._read_audit_chain_unlocked
+                original_snapshot = (
+                    grabowski_mcp._verify_audit_predecessor_snapshot
+                )
                 original_file = grabowski_mcp._read_audit_file
-                lock_observations = []
+                chain_lock_observations = []
+                snapshot_lock_observations = []
                 archived_reads_under_lock = []
                 lock_path = grabowski_mcp._audit_storage_paths(audit)[
                     "coordination_lock"
@@ -1025,8 +1092,16 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
 
                 def observe_chain(path, *args, **kwargs):
                     if kwargs.get("initial_expected") is not None:
-                        lock_observations.append(coordination_lock_is_free())
+                        chain_lock_observations.append(
+                            coordination_lock_is_free()
+                        )
                     return original_chain(path, *args, **kwargs)
+
+                def observe_snapshot(predecessor, snapshot):
+                    snapshot_lock_observations.append(
+                        coordination_lock_is_free()
+                    )
+                    return original_snapshot(predecessor, snapshot)
 
                 def observe_file(path):
                     if path != audit and not coordination_lock_is_free():
@@ -1041,6 +1116,11 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                     ),
                     patch.object(
                         grabowski_mcp,
+                        "_verify_audit_predecessor_snapshot",
+                        side_effect=observe_snapshot,
+                    ),
+                    patch.object(
+                        grabowski_mcp,
                         "_read_audit_file",
                         side_effect=observe_file,
                     ),
@@ -1049,7 +1129,8 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                         {"operation": "append-after-unlocked-predecessor-scan"}
                     )
 
-                self.assertEqual(lock_observations, [True, False, False])
+                self.assertEqual(chain_lock_observations, [True])
+                self.assertEqual(snapshot_lock_observations, [False, False])
                 self.assertEqual(archived_reads_under_lock, [])
                 status = grabowski_mcp._verify_audit_log(audit)
                 self.assertTrue(status["valid"], status)
