@@ -7701,6 +7701,72 @@ def grabowski_github(
     )
 
 
+def _user_service_fragment_path(name: str) -> Path | None:
+    result = _run(
+        [
+            "systemctl",
+            "--user",
+            "show",
+            name,
+            "--no-pager",
+            "--property=FragmentPath",
+            "--value",
+        ],
+        cwd=HOME,
+        timeout_seconds=30,
+        max_output_bytes=DEFAULT_OUTPUT_BYTES,
+    )
+    if result.get("returncode") != 0 or result.get("timed_out") is True:
+        raise RuntimeError(f"Unable to resolve FragmentPath for user service {name}")
+    stdout = result.get("stdout")
+    if not isinstance(stdout, str):
+        raise RuntimeError(f"Invalid FragmentPath observation for user service {name}")
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    if not lines:
+        return None
+    if len(lines) != 1:
+        raise RuntimeError(f"Ambiguous FragmentPath observation for user service {name}")
+    fragment = Path(lines[0]).expanduser()
+    if not fragment.is_absolute():
+        raise RuntimeError(f"FragmentPath for user service {name} is not absolute")
+    return Path(os.path.normpath(str(fragment)))
+
+
+def _run_mutating_user_service(name: str, action: str) -> dict[str, Any]:
+    import grabowski_resources as resources
+
+    fragment_before = _user_service_fragment_path(name)
+    resource_keys = ["component:user-systemd-manager"]
+    if fragment_before is not None:
+        resource_keys.append(f"path:{fragment_before}")
+    owner_id = f"operator:user-service-{uuid.uuid4().hex}"
+    lease = resources.acquire_resources(
+        owner_id,
+        resource_keys,
+        purpose=f"user systemd {action} {name}",
+        ttl_seconds=120,
+        metadata={"service": name, "action": action},
+    )
+    try:
+        fragment_after = _user_service_fragment_path(name)
+        if fragment_after != fragment_before:
+            raise RuntimeError(
+                f"FragmentPath changed after coordination lease acquisition for user service {name}"
+            )
+        return _run(
+            ["systemctl", "--user", action, name],
+            cwd=HOME,
+            timeout_seconds=120,
+            max_output_bytes=MAX_OUTPUT_BYTES,
+        )
+    finally:
+        resources.release_resources(
+            owner_id,
+            resource_keys,
+            expected_leases=list(lease["leases"]),
+        )
+
+
 @mcp.tool(name="grabowski_user_service", annotations=MUTATING)
 def grabowski_user_service(
     unit: str,
@@ -7723,6 +7789,7 @@ def grabowski_user_service(
         raise ValueError(f"action must be one of {sorted(allowed)}")
     if action not in {"status", "logs"}:
         _require_operator_mutation("user_service_control", service=name)
+        return _run_mutating_user_service(name, action)
 
     if action == "logs":
         if max_lines < 1 or max_lines > 2000:
@@ -7736,7 +7803,7 @@ def grabowski_user_service(
             "--lines",
             str(max_lines),
         ]
-    elif action == "status":
+    else:
         argv = [
             "systemctl",
             "--user",
@@ -7745,8 +7812,6 @@ def grabowski_user_service(
             "--no-pager",
             "--full",
         ]
-    else:
-        argv = ["systemctl", "--user", action, name]
 
     return _run(
         argv,
