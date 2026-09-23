@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import hashlib
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -3374,6 +3375,8 @@ class ResourceTests(unittest.TestCase):
     ) -> None:
         connection = resources._database()
         connection.close()
+        connection = resources._database()
+        connection.close()
         cached_identity = resources._resource_store_integrity_identity()
         replacement_identity = (
             cached_identity[0],
@@ -3400,30 +3403,33 @@ class ResourceTests(unittest.TestCase):
                 resources._preflight_resource_store()
         self.assertEqual(0, integrity.call_count)
 
-    def test_resource_store_integrity_rechecks_after_database_identity_change(
+    def test_resource_store_integrity_rechecks_after_atomic_database_replace(
         self,
     ) -> None:
         connection = resources._database()
         connection.close()
-        current_identity = resources._resource_store_integrity_identity()
-        changed_identity = (
-            current_identity[0],
-            current_identity[1],
-            current_identity[2] + 1,
-        )
-        original_integrity = resources._resource_sqlite_integrity
+        connection = resources._database()
+        connection.close()
+        cached_identity = resources._resource_store_integrity_identity()
+
+        replacement = self.database.with_name("replacement-resources.sqlite3")
         with (
-            patch.object(
-                resources,
-                "_resource_store_integrity_identity",
-                return_value=changed_identity,
-            ),
-            patch.object(
-                resources,
-                "_resource_sqlite_integrity",
-                wraps=original_integrity,
-            ) as integrity,
+            sqlite3.connect(self.database) as source,
+            sqlite3.connect(replacement) as target,
         ):
+            source.backup(target)
+        os.replace(replacement, self.database)
+        self.assertNotEqual(
+            cached_identity,
+            resources._resource_store_integrity_identity(),
+        )
+
+        original_integrity = resources._resource_sqlite_integrity
+        with patch.object(
+            resources,
+            "_resource_sqlite_integrity",
+            wraps=original_integrity,
+        ) as integrity:
             connection = resources._database()
             connection.close()
         self.assertEqual(1, integrity.call_count)
@@ -3478,6 +3484,8 @@ class ResourceTests(unittest.TestCase):
             resources.grabowski_resource_list(schema_only=True, owner_id="task:test")
 
     def test_current_resource_schema_inventory_is_byte_stable(self) -> None:
+        connection = resources._database()
+        connection.close()
         connection = resources._database()
         connection.close()
         before = self.database.read_bytes()

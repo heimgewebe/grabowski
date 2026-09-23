@@ -1859,13 +1859,6 @@ def _ensure_task_store_integrity(
         _TASK_STORE_INTEGRITY_IDENTITY = identity
 
 
-def _mark_task_store_integrity_validated() -> None:
-    global _TASK_STORE_INTEGRITY_IDENTITY
-    identity = _task_store_integrity_identity()
-    with _TASK_STORE_INTEGRITY_LOCK:
-        _TASK_STORE_INTEGRITY_IDENTITY = identity
-
-
 def _preflight_task_store() -> str | None:
     if not TASK_DB.exists():
         return None
@@ -2086,7 +2079,6 @@ def _database() -> sqlite3.Connection:
             _task_reconcile_revision_contract(connection)
             _sqlite_integrity(connection, "Migrated task database")
             connection.commit()
-            _mark_task_store_integrity_validated()
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA synchronous=FULL")
             connection.execute("PRAGMA foreign_keys=ON")

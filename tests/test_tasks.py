@@ -8899,6 +8899,8 @@ class TaskTests(unittest.TestCase):
     def test_current_task_schema_inventory_is_byte_stable(self) -> None:
         connection = tasks._database()
         connection.close()
+        connection = tasks._database()
+        connection.close()
         before = self.database.read_bytes()
         before_stat = self.database.stat()
         before_names = sorted(item.name for item in self.database.parent.iterdir())
@@ -8932,6 +8934,8 @@ class TaskTests(unittest.TestCase):
     ) -> None:
         connection = tasks._database()
         connection.close()
+        connection = tasks._database()
+        connection.close()
         cached_identity = tasks._task_store_integrity_identity()
         replacement_identity = (
             cached_identity[0],
@@ -8958,30 +8962,33 @@ class TaskTests(unittest.TestCase):
                 tasks._preflight_task_store()
         self.assertEqual(0, integrity.call_count)
 
-    def test_task_store_integrity_rechecks_after_database_identity_change(
+    def test_task_store_integrity_rechecks_after_atomic_database_replace(
         self,
     ) -> None:
         connection = tasks._database()
         connection.close()
-        current_identity = tasks._task_store_integrity_identity()
-        changed_identity = (
-            current_identity[0],
-            current_identity[1],
-            current_identity[2] + 1,
-        )
-        original_integrity = tasks._sqlite_integrity
+        connection = tasks._database()
+        connection.close()
+        cached_identity = tasks._task_store_integrity_identity()
+
+        replacement = self.database.with_name("replacement-tasks.sqlite3")
         with (
-            patch.object(
-                tasks,
-                "_task_store_integrity_identity",
-                return_value=changed_identity,
-            ),
-            patch.object(
-                tasks,
-                "_sqlite_integrity",
-                wraps=original_integrity,
-            ) as integrity,
+            sqlite3.connect(self.database) as source,
+            sqlite3.connect(replacement) as target,
         ):
+            source.backup(target)
+        os.replace(replacement, self.database)
+        self.assertNotEqual(
+            cached_identity,
+            tasks._task_store_integrity_identity(),
+        )
+
+        original_integrity = tasks._sqlite_integrity
+        with patch.object(
+            tasks,
+            "_sqlite_integrity",
+            wraps=original_integrity,
+        ) as integrity:
             connection = tasks._database()
             connection.close()
         self.assertEqual(1, integrity.call_count)

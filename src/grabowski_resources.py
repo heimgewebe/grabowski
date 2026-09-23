@@ -1062,13 +1062,6 @@ def _ensure_resource_store_integrity(
         _RESOURCE_STORE_INTEGRITY_IDENTITY = identity
 
 
-def _mark_resource_store_integrity_validated() -> None:
-    global _RESOURCE_STORE_INTEGRITY_IDENTITY
-    identity = _resource_store_integrity_identity()
-    with _RESOURCE_STORE_INTEGRITY_LOCK:
-        _RESOURCE_STORE_INTEGRITY_IDENTITY = identity
-
-
 def _preflight_resource_store() -> str | None:
     if not _resource_store_file_ready():
         return None
@@ -1318,7 +1311,6 @@ def _database() -> sqlite3.Connection:
             _resource_reconcile_revision_contract(connection)
             _resource_sqlite_integrity(connection, "Migrated resource database")
             connection.commit()
-            _mark_resource_store_integrity_validated()
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA synchronous=FULL")
             connection.execute("PRAGMA foreign_keys=ON")
