@@ -525,6 +525,117 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self._git("checkout", "--detach", merge_head, cwd=self.checkout)
         return topic_head, merge_head
 
+    def test_partial_terminal_detached_archive_reconciles_bound_transition(self) -> None:
+        binding = self._managed_binding()
+        topic_head, merge_head = self._detached_merged_topic()
+        expected_identity = checkouts.physical_checkout.capture_physical_checkout_identity(
+            self.checkout
+        )
+
+        with (
+            patch(
+                "grabowski_checkout_terminal_sources.source_terminal_evidence",
+                return_value=self._terminal_source_evidence(),
+            ),
+            patch.object(
+                checkouts,
+                "_mark_checkout_archived_in_connection",
+                side_effect=RuntimeError("simulated detached lifecycle failure"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "simulated detached lifecycle failure"),
+        ):
+            checkouts.grabowski_checkout_archive(
+                str(self.repo),
+                str(self.checkout),
+                "owner-a",
+                "partial terminal detached archive",
+                int(time.time()) + 3600,
+                merge_head,
+                None,
+                expected_physical_identity=expected_identity,
+            )
+
+        fence = checkouts._active_checkout_operation_uncertainties()[0]
+        transition = fence["evidence"].get("terminal_detached_transition")
+        self.assertIsInstance(transition, dict)
+        self.assertEqual(transition["expected_head"], binding["expected_head"])
+        self.assertEqual(transition["expected_branch"], "topic")
+        self.assertEqual(transition["branch_head"], topic_head)
+        self.assertEqual(transition["detached_head"], merge_head)
+
+        manifest_path = checkouts.ARCHIVE_ROOT / fence["operation_id"] / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(manifest["terminal_detached_transition"], transition)
+
+        unbound_evidence = dict(fence["evidence"])
+        unbound_evidence.pop("terminal_detached_transition")
+        self.assertEqual(
+            checkouts._partial_archive_manifest(unbound_evidence)["state"],
+            "invalid",
+        )
+
+        self._expire_uncertainty_lease(fence)
+        readback = checkouts._archive_uncertainty_readback(fence)
+        self.assertEqual(readback["state"], "recoverable_complete")
+
+        reconciliation = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+
+        self.assertEqual(reconciliation["state"], "reconciled")
+        self.assertEqual(reconciliation["outcome"], "reconciled_success")
+        lifecycle = checkouts._strict_lifecycle_binding(fence["checkout_key"])
+        self.assertIsNotNone(lifecycle)
+        self.assertEqual(lifecycle["phase"], "archived")
+        self.assertEqual(lifecycle["expected_head"], merge_head)
+        self.assertIsNone(lifecycle["expected_branch"])
+
+    def test_partial_terminal_detached_archive_branch_drift_stays_fenced(self) -> None:
+        self._managed_binding()
+        _topic_head, merge_head = self._detached_merged_topic()
+        expected_identity = checkouts.physical_checkout.capture_physical_checkout_identity(
+            self.checkout
+        )
+
+        with (
+            patch(
+                "grabowski_checkout_terminal_sources.source_terminal_evidence",
+                return_value=self._terminal_source_evidence(),
+            ),
+            patch.object(
+                checkouts,
+                "_mark_checkout_archived_in_connection",
+                side_effect=RuntimeError("simulated detached lifecycle failure"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "simulated detached lifecycle failure"),
+        ):
+            checkouts.grabowski_checkout_archive(
+                str(self.repo),
+                str(self.checkout),
+                "owner-a",
+                "partial detached branch drift",
+                int(time.time()) + 3600,
+                merge_head,
+                None,
+                expected_physical_identity=expected_identity,
+            )
+
+        fence = checkouts._active_checkout_operation_uncertainties()[0]
+        self._expire_uncertainty_lease(fence)
+        moved = self._git("commit", "--allow-empty", "-m", "move detached source branch").stdout
+        moved = self._git("rev-parse", "HEAD").stdout.strip()
+        self._git("update-ref", "refs/heads/topic", moved)
+
+        readback = checkouts._archive_uncertainty_readback(fence)
+
+        self.assertEqual(readback["state"], "still_fenced")
+        self.assertEqual(readback["partial_state"], "contradictory")
+        self.assertEqual(
+            readback["partial_reason"],
+            "archive-terminal-detached-branch-drift",
+        )
+
     def test_archive_allows_terminal_remote_secured_detached_merge_descendant(self) -> None:
         self._managed_binding()
         topic_head, merge_head = self._detached_merged_topic()

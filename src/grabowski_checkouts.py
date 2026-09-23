@@ -1746,12 +1746,81 @@ def _release_uncertainty_fence_resources(fence: dict[str, Any]) -> dict[str, Any
     )
 
 
+def _archive_uncertainty_terminal_transition(
+    evidence: dict[str, Any],
+) -> dict[str, Any] | None:
+    transition = evidence.get("terminal_detached_transition")
+    if transition is None:
+        return None
+    if not isinstance(transition, dict):
+        raise ValueError("terminal detached archive transition must be an object")
+    expected_keys = {
+        "schema_version",
+        "kind",
+        "source_evidence",
+        "expected_head",
+        "expected_branch",
+        "branch_head",
+        "detached_head",
+        "current_remote_secured_refs",
+        "branch_remote_secured_refs",
+        "evidence_sha256",
+    }
+    if set(transition) != expected_keys:
+        raise ValueError("terminal detached archive transition shape is invalid")
+    if (
+        transition.get("schema_version") != 1
+        or transition.get("kind")
+        != "checkout_terminal_detached_archive_transition"
+    ):
+        raise ValueError("terminal detached archive transition contract is invalid")
+    core = {
+        key: transition[key]
+        for key in expected_keys
+        if key != "evidence_sha256"
+    }
+    evidence_sha256 = transition.get("evidence_sha256")
+    if (
+        not isinstance(evidence_sha256, str)
+        or evidence_sha256 != _sha256_json(core)
+    ):
+        raise ValueError("terminal detached archive transition evidence hash is invalid")
+    _validate_git_object_id(
+        transition.get("expected_head"), "terminal transition expected_head"
+    )
+    _validate_git_object_id(
+        transition.get("branch_head"), "terminal transition branch_head"
+    )
+    detached_head = _validate_git_object_id(
+        transition.get("detached_head"), "terminal transition detached_head"
+    )
+    expected_branch = transition.get("expected_branch")
+    if not isinstance(expected_branch, str) or not expected_branch:
+        raise ValueError("terminal detached archive transition branch is invalid")
+    if evidence.get("expected_branch") is not None:
+        raise ValueError("terminal detached archive transition requires detached checkout")
+    if detached_head != evidence.get("expected_head"):
+        raise ValueError("terminal detached archive transition head binding is invalid")
+    if not isinstance(transition.get("source_evidence"), dict):
+        raise ValueError("terminal detached archive transition source evidence is invalid")
+    for field in ("current_remote_secured_refs", "branch_remote_secured_refs"):
+        refs = transition.get(field)
+        if not isinstance(refs, list) or any(
+            not isinstance(item, str) or not item for item in refs
+        ):
+            raise ValueError(
+                f"terminal detached archive transition {field} is invalid"
+            )
+    return transition
+
+
 def _archive_manifest_matches_uncertainty(
     archive: dict[str, Any], evidence: dict[str, Any]
 ) -> bool:
     "Verify manifest contents before durable archive uncertainty may clear."
     try:
         archive_id = _validate_archive_id(str(evidence["archive_id"]))
+        terminal_transition = _archive_uncertainty_terminal_transition(evidence)
         archive_root = ARCHIVE_ROOT.expanduser()
         if archive_root.is_symlink() or not archive_root.is_dir():
             return False
@@ -1807,6 +1876,7 @@ def _archive_manifest_matches_uncertainty(
         == evidence.get("owner_id")
         and manifest.get("purpose") == archive.get("purpose")
         and manifest.get("retention_until_unix") == archive.get("retention_until_unix")
+        and manifest.get("terminal_detached_transition") == terminal_transition
         and manifest.get("recovery_refs") == recovery_refs
         and normalized_refs == evidence.get("planned_recovery_refs")
     )
@@ -1902,6 +1972,13 @@ def _partial_archive_manifest(
         }
     if not isinstance(manifest, dict):
         return {"state": "invalid", "reason": "archive-manifest-not-object"}
+    try:
+        terminal_transition = _archive_uncertainty_terminal_transition(evidence)
+    except ValueError as exc:
+        return {
+            "state": "invalid",
+            "reason": f"archive-terminal-transition-invalid:{type(exc).__name__}",
+        }
     expected_keys = {
         "schema_version",
         "archive_id",
@@ -2014,7 +2091,7 @@ def _partial_archive_manifest(
         or manifest.get("branch") != expected_branch
         or manifest.get("branch_head") != branch_head
         or manifest.get("owner_id") != evidence.get("owner_id")
-        or manifest.get("terminal_detached_transition") is not None
+        or manifest.get("terminal_detached_transition") != terminal_transition
         or manifest.get("cleanup")
         != {"requires_dry_run": True, "tool": "grabowski_checkout_cleanup"}
     ):
@@ -2052,6 +2129,7 @@ def _partial_archive_manifest(
         "created_at_unix": created_at_unix,
         "purpose": purpose,
         "retention_until_unix": retention_until,
+        "terminal_detached_transition": terminal_transition,
     }
 
 
@@ -2104,6 +2182,30 @@ def _archive_partial_completion_assessment(
             "reason": str(manifest_info.get("reason", "archive-manifest-unproven")),
             "verified_recovery_refs": verified_refs,
         }
+    terminal_transition = manifest_info["terminal_detached_transition"]
+    preimage_expected_head = evidence.get("expected_head")
+    preimage_expected_branch = evidence.get("expected_branch")
+    if terminal_transition is not None:
+        preimage_expected_head = terminal_transition["expected_head"]
+        preimage_expected_branch = terminal_transition["expected_branch"]
+        branch_read = _git_read(
+            repo,
+            [
+                "rev-parse",
+                "--verify",
+                f"refs/heads/{preimage_expected_branch}^{{commit}}",
+            ],
+            check=False,
+        )
+        if (
+            branch_read.returncode != 0
+            or branch_read.stdout.strip() != terminal_transition["branch_head"]
+        ):
+            return {
+                "state": "contradictory",
+                "reason": "archive-terminal-detached-branch-drift",
+                "verified_recovery_refs": verified_refs,
+            }
     try:
         top_level, common_dir, record = _worktree_for_path(repo, checkout)
         status = _require_clean_linked(record)
@@ -2136,8 +2238,8 @@ def _archive_partial_completion_assessment(
             and lifecycle.get("checkout_path") == evidence.get("checkout_path")
             and lifecycle.get("owner_id") == evidence.get("owner_id")
             and lifecycle.get("phase") in {"active", "completed_retained"}
-            and lifecycle.get("expected_head") == evidence.get("expected_head")
-            and lifecycle.get("expected_branch") == evidence.get("expected_branch")
+            and lifecycle.get("expected_head") == preimage_expected_head
+            and lifecycle.get("expected_branch") == preimage_expected_branch
         )
         if not lifecycle_matches:
             return {
@@ -2154,8 +2256,8 @@ def _archive_partial_completion_assessment(
             and retention.get("repo_path") == evidence.get("repo")
             and retention.get("checkout_path") == evidence.get("checkout_path")
             and retention.get("owner_id") == evidence.get("owner_id")
-            and retention.get("expected_head") == evidence.get("expected_head")
-            and retention.get("expected_branch") == evidence.get("expected_branch")
+            and retention.get("expected_head") == preimage_expected_head
+            and retention.get("expected_branch") == preimage_expected_branch
         )
         if not retention_matches:
             return {
@@ -2167,7 +2269,7 @@ def _archive_partial_completion_assessment(
         checkout,
         top_level,
         common_dir,
-        branch=evidence.get("expected_branch"),
+        branch=preimage_expected_branch,
         owner_id=str(evidence["owner_id"]),
         include_processes=True,
         include_tasks=True,
@@ -5312,6 +5414,7 @@ def grabowski_checkout_archive(
                 "expected_head": expected_head,
                 "expected_branch": record.get("branch"),
                 "expected_physical_identity": archive_physical_identity,
+                "terminal_detached_transition": terminal_detached_transition,
                 "planned_recovery_refs": planned_refs,
             },
         )
