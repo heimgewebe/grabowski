@@ -14,7 +14,7 @@ One actual production audit projection took 84.177 s for 1,315,325 records. This
 
 - Measured source: `70d2810830cf08814e9bcb61cc46c93af960ced2`, fetched previously and verified against GitHub main immediately before work acquisition.
 - Isolated lane: `7d41a3b75189c8623a67398ecb034e61`.
-- Worktree: `/home/alex/repos/.grabowski-worktrees/operator-read-cost-p0-20260923`.
+- Worktree: `operator-read-cost-p0-20260923` (isolated worktree name).
 - Initial probe SHA-256: `b06219a0794b9bcf928a4e5e15fbf1b519ea341d62157ca4717dd880e60d8ba8`.
 - Strengthened warm/contender probe SHA-256: `520db81f00922079296797716edf5eb385252412fa1d5d35f18c8cd76ecfe207`.
 - Interpreter for the recorded warm run: `/usr/bin/python3`, Python 3.10.12. Initial task explicitly used system Python as well; no runtime virtualenv was used.
@@ -44,7 +44,7 @@ Metrics:
 
 - Wall time: `perf_counter_ns`; CPU: `process_time_ns`.
 - RSS: own `/proc/self/status`, before/after call and after collection.
-- Process lifetime peak: `ru_maxrss`; the strengthened runner also records its pre-call floor and `VmHWM`. These are **not isolated call peaks**, and peaks are never subtracted to fabricate one.
+- Process lifetime peak: `ru_maxrss`; the strengthened runner also records its pre-call floor and `VmHWM`. `VmHWM` is the resident-memory high-water mark, exposed as `rss_hwm_before_kib` / `rss_hwm_after_kib`. The recorded historical runner used the misleading `address_space_hwm_*` labels for these same RSS values; only the field names were corrected after review. These are **not isolated call peaks**, and peaks are never subtracted to fabricate one.
 - Logical audit bytes: values returned by `_read_audit_descriptor`, including repeated reads. These are not physical disk-I/O bytes.
 - Coordination hold: body of the real `_audit_coordination_lock`; acquisition timings aggregate real flock calls, including file locks. Separate file-lock hold times are not measured.
 - The contender uses the real exclusive coordination lock in a second thread. It writes no audit record. This proves lock acquisition contention, not whole-append latency, writer fairness, or rotation safety.

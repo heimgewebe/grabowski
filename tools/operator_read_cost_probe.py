@@ -272,7 +272,7 @@ def run_case(state, case, warm, decode, contend=False):
             "elapsed_ms": elapsed / 1e6, "cpu_ms": cpu / 1e6,
             "baseline_rss_kib": before, "rss_after_call_kib": after,
             "process_peak_rss_kib": peak, "process_peak_before_kib": peak_before,
-            "address_space_hwm_before_kib": hwm_before, "address_space_hwm_after_kib": rss("VmHWM"),
+            "rss_hwm_before_kib": hwm_before, "rss_hwm_after_kib": rss("VmHWM"),
             "rss_after_gc_kib": rss(), "synthetic_contention": contend,
             "counters": dict(counts), "semantics": semantics,
             "scope": "synthetic_library_call",
