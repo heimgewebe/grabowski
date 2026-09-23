@@ -75,7 +75,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `repoground_find_symbol` | knowledge | yes | low | Find bounded Python symbol definitions in an existing RepoGround bundle. |
 | `repoground_get_callers` | knowledge | yes | low | Read S1 callers while preserving unresolved references separately. |
 | `repoground_get_callees` | knowledge | yes | low | Read S1 callees while preserving S0 call sites separately. |
-| `grabowski_runtime_health` | context | yes | low | Read minimal deployment, audit and kill-switch health without path inventories. |
+| `grabowski_runtime_health` | context | yes | low | Read MCP tool-dispatch liveness without deployment, audit or kill-switch evaluation. |
 | `grabowski_audit_projection` | operations-observability | yes | low | Derive bounded source-bound operational trends from the verified audit chain. |
 | `grabowski_deployment_identity` | context | yes | low | Read bounded runtime identity and integrity flags without local paths. |
 | `grabowski_contract_drift` | context | yes | low | Read bounded runtime-contract and capability-catalog drift. |

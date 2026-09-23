@@ -192,9 +192,13 @@ eine systemd-Unit. Die konkreten Prozesse sind:
 - Runtime-Ziel: `heim-pc`
 - Deployment-Instanz: die jeweilige `release_id`
 
-`grabowski_runtime_health` und `grabowski_context` geben diese Ebenen getrennt
-als `service_model` aus. Das bisherige Feld `service: grabowski-mcp` bleibt aus
-Kompatibilitätsgründen erhalten.
+`grabowski_context` gibt diese Ebenen als `service_model` aus.
+`grabowski_runtime_health` meldet mit Antwortversion 2 ausschließlich die
+Ansprechbarkeit des MCP-Toolpfads und behält `service: grabowski-mcp` als
+logische Kennung. Der kleine Read ermittelt weder Deploymentidentität noch
+systemd-Scope. Für Integritätsdiagnose dient `grabowski_status(view="minimal")`,
+für die genaue Releasebindung `grabowski_deployment_identity`. Gleichnamige
+User- und System-Units sind getrennte Beobachtungsgegenstände.
 
 ## Job- und Failed-Unit-Retention
 

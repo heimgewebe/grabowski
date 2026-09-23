@@ -28,6 +28,23 @@ The typed read surface removes that ambiguity without removing operator capabili
 
 These replace broad context retrieval when only health, identity, drift or checkout state is required.
 
+`grabowski_runtime_health` response version 2 is a small MCP tool-dispatch
+liveness read. A returned `healthy: true` means this invocation was answered;
+it does not authorize mutations or establish deployment/audit integrity.
+`health_scope` is `mcp_tool_dispatch` and `integrity_evaluated` is false.
+The unevaluated deployment, audit and kill-switch flags are null, not false
+or fabricated positive observations. Release identity, `service_model` and
+historical audit counts are intentionally absent from this read.
+
+This changes the older, unversioned response's stronger meaning of `healthy`.
+Consumers that need integrity must explicitly request
+`grabowski_status(view="minimal")`; the operator optimization report does so.
+Use `grabowski_deployment_identity` for exact release/manifest binding. Health
+does not run historical verification, workspace cleanup or task reconciliation.
+Explicit task reconciliation is available through the existing reconciliation
+tools. Broader status and task-list recovery behavior is unchanged by this
+health contract.
+
 `grabowski_status` additionally returns a live tool-contract summary with expected and registered counts, name-set hashes and bounded missing/unexpected lists. The runtime cannot inspect ChatGPT's frozen connector snapshot, but a client can compare its loaded tool count or hash with this summary and detect that a refresh is required.
 
 ## Repository read tools

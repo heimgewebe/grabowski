@@ -68,9 +68,10 @@ Der Operator-Watchdog kombiniert zwei voneinander unabhängige Belege:
 3. Zusätzlich startet der Watchdog aus derselben Runtime einen isolierten,
    kurzlebigen stdio-Prozess. Dort läuft der vollständige MCP-Lebenszyklus mit
    `initialize`, `notifications/initialized` und exakt dem Read-Tool
-   `grabowski_runtime_health`. Dieser Pfad bleibt Diagnose des deployten
-   Artefakts; er darf einen über HTTP antwortenden Live-Operator nicht allein
-   restartfähig machen.
+   `grabowski_runtime_health`. Dessen Antwortversion 2 prüft ausschließlich
+   den MCP-Dispatch des importierten Artefakts, ohne historische Audit- oder
+   Deploymentintegritätsprüfung. Dieser isolierte Pfad darf einen über HTTP
+   antwortenden Live-Operator nicht allein restartfähig machen.
 4. Nur ein Fehler des gebundenen Live-Prozesses ist Restart-Autorität. Ein
    isolierter stdio-Timeout unter Hostlast wird als Diagnosegrund am gesunden
    Live-Probe sichtbar. Damit führt ein regulärer langer Read nicht mehr zu
