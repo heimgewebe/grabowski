@@ -1008,6 +1008,43 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertEqual(group["work_class"], "hygiene")
         self.assertIn("managed-active-retention-expired", group["action_reasons"])
 
+    def test_managed_active_checkout_with_interrupted_worker_is_resumable(self) -> None:
+        owner = "worker:w1"
+        result = project(
+            checkout_payloads=[
+                {
+                    "repository": REPOSITORY,
+                    "worktrees": [
+                        checkout(
+                            "managed-worker-interrupted",
+                            "/home/alex/repos/.worktrees/managed-worker-interrupted",
+                            lifecycle_state="managed_active_attention",
+                            binding_owner=owner,
+                            binding_phase="active",
+                            retention_active=False,
+                            retention_until_unix=1,
+                        )
+                    ],
+                }
+            ],
+            browser_payload={
+                "workers": [worker("w1", state="interrupted")],
+                "has_more": False,
+            },
+            gui_payload={"workers": [], "has_more": False},
+            view="history",
+        )
+        group = next(item for item in result["work"] if item["work_id"] == owner)
+        self.assertEqual(group["worker_refs"][0]["state"], "interrupted")
+        self.assertEqual(group["projection_state"], "resumable")
+        self.assertEqual(group["work_class"], "operational")
+        self.assertIn("worker-interrupted", group["action_reasons"])
+        self.assertNotIn("managed-active-retention-expired", group["action_reasons"])
+        self.assertEqual(
+            group["next_convergence_action"],
+            "inspect resumable work group and attention state",
+        )
+
     def test_managed_active_worker_checkout_with_truncated_registry_remains_active(self) -> None:
         owner = "worker:w1"
         result = project(

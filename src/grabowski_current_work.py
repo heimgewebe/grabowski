@@ -1823,6 +1823,10 @@ def _finalize_groups(
             item["state"] in ACTIVE_WORKER_STATES
             for item in group["worker_refs"]
         )
+        resumable_worker_authority = any(
+            item["state"] == "interrupted"
+            for item in group["worker_refs"]
+        )
         independent_live_authority = bool(
             (task_item and task_item["state"] in ACTIVE_TASK_STATES)
             or group["lease_summary"]["count"]
@@ -1859,11 +1863,15 @@ def _finalize_groups(
             and not independent_live_authority
             and live_authority_absence_proven
         ):
-            group["projection_state"] = "hygiene"
-            group["work_class"] = "hygiene"
-            group["action_required"] = True
-            if "managed-active-retention-expired" not in group["action_reasons"]:
-                group["action_reasons"].append("managed-active-retention-expired")
+            if resumable_worker_authority:
+                group["projection_state"] = "resumable"
+                group["work_class"] = "operational"
+            else:
+                group["projection_state"] = "hygiene"
+                group["work_class"] = "hygiene"
+                group["action_required"] = True
+                if "managed-active-retention-expired" not in group["action_reasons"]:
+                    group["action_reasons"].append("managed-active-retention-expired")
 
         if view == "current" and group["projection_state"] == "terminal_archived" and not has_live_surface and not group["action_required"]:
             continue
