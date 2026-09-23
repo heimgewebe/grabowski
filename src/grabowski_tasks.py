@@ -833,13 +833,16 @@ print(json.dumps({
 TASK_RECONCILE_LOCK = threading.RLock()
 _TASK_MUTATION_LOCK_STATE = threading.local()
 
-# PRAGMA quick_check scans the complete task store. Keep that integrity gate
-# process-local and inode-bound so a large, healthy current store is not scanned
-# again on every ordinary task connection. Schema and reconcile-contract checks
-# still run for every open; replacing the database file changes the identity and
-# forces a fresh integrity check.
-_TASK_STORE_INTEGRITY_LOCK = threading.Lock()
-_TASK_STORE_INTEGRITY_IDENTITY: tuple[str, int, int] | None = None
+# PRAGMA quick_check scans the complete task store. This is deliberately a
+# process-lifetime gate for one exact path/device/inode, not continuous content
+# monitoring. Ordinary SQLite writes mutate size/timestamps, so using those as
+# cache keys would put the full-store scan back on the hot path. Schema and
+# reconcile-contract checks still run for every open; replacing the database
+# file changes the inode identity and forces a fresh integrity check. Same-inode
+# in-place corruption remains outside this gate and is left to ordinary SQLite
+# errors plus explicit inventory/recovery integrity checks.
+_TASK_STORE_PROCESS_GATE_LOCK = threading.Lock()
+_TASK_STORE_PROCESS_VALIDATED_IDENTITY: tuple[str, int, int] | None = None
 
 
 def _task_mutation_lock_parent_identity(descriptor: int, parent: Path) -> None:
@@ -1839,13 +1842,13 @@ def _task_store_integrity_identity() -> tuple[str, int, int]:
     )
 
 
-def _ensure_task_store_integrity(
+def _ensure_task_store_process_integrity(
     connection: sqlite3.Connection,
     identity: tuple[str, int, int],
 ) -> None:
-    global _TASK_STORE_INTEGRITY_IDENTITY
-    with _TASK_STORE_INTEGRITY_LOCK:
-        if _TASK_STORE_INTEGRITY_IDENTITY == identity:
+    global _TASK_STORE_PROCESS_VALIDATED_IDENTITY
+    with _TASK_STORE_PROCESS_GATE_LOCK:
+        if _TASK_STORE_PROCESS_VALIDATED_IDENTITY == identity:
             if _task_store_integrity_identity() != identity:
                 raise RuntimeError(
                     "Task database identity changed during integrity preflight; retry"
@@ -1856,7 +1859,7 @@ def _ensure_task_store_integrity(
             raise RuntimeError(
                 "Task database identity changed during integrity preflight; retry"
             )
-        _TASK_STORE_INTEGRITY_IDENTITY = identity
+        _TASK_STORE_PROCESS_VALIDATED_IDENTITY = identity
 
 
 def _preflight_task_store() -> str | None:
@@ -1868,7 +1871,7 @@ def _preflight_task_store() -> str | None:
         return None
     identity = _task_store_integrity_identity()
     with _readonly_sqlite(TASK_DB) as connection:
-        _ensure_task_store_integrity(connection, identity)
+        _ensure_task_store_process_integrity(connection, identity)
         version = _task_schema_version(connection)
         if version not in {"1", "2", "3", "4", "5"}:
             raise RuntimeError(

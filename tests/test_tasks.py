@@ -8962,6 +8962,35 @@ class TaskTests(unittest.TestCase):
                 tasks._preflight_task_store()
         self.assertEqual(0, integrity.call_count)
 
+    def test_task_store_process_gate_intentionally_ignores_same_inode_content_change(
+        self,
+    ) -> None:
+        connection = tasks._database()
+        connection.close()
+        # The migration/new-store path does not pre-seed the process gate. Warm
+        # it with the first ordinary open before exercising same-inode semantics.
+        connection = tasks._database()
+        connection.close()
+        identity = tasks._task_store_integrity_identity()
+
+        with sqlite3.connect(self.database) as connection:
+            connection.execute("PRAGMA application_id = 4242")
+
+        self.assertEqual(identity, tasks._task_store_integrity_identity())
+        original_integrity = tasks._sqlite_integrity
+        with patch.object(
+            tasks,
+            "_sqlite_integrity",
+            wraps=original_integrity,
+        ) as integrity:
+            connection = tasks._database()
+            connection.close()
+        self.assertEqual(
+            0,
+            integrity.call_count,
+            "same-inode content changes are outside the process-lifetime integrity gate",
+        )
+
     def test_task_store_integrity_rechecks_after_atomic_database_replace(
         self,
     ) -> None:

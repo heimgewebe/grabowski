@@ -42,11 +42,16 @@ RESOURCE_DB = Path(
         str(operator.STATE_DIR / "resources.sqlite3"),
     )
 ).expanduser()
-# PRAGMA quick_check scans the complete resource store. Cache only the
-# successful process-local check for the exact database path/device/inode;
-# schema and lease/reconcile contracts remain validated on every open.
-_RESOURCE_STORE_INTEGRITY_LOCK = threading.Lock()
-_RESOURCE_STORE_INTEGRITY_IDENTITY: tuple[str, int, int] | None = None
+# PRAGMA quick_check scans the complete resource store. This is deliberately a
+# process-lifetime gate for one exact path/device/inode, not continuous content
+# monitoring. Ordinary SQLite writes mutate size/timestamps, so using those as
+# cache keys would put the full-store scan back on the hot path. Schema and
+# lease/reconcile contracts still run for every open; replacing the database
+# file changes the inode identity and forces a fresh integrity check. Same-inode
+# in-place corruption remains outside this gate and is left to ordinary SQLite
+# errors plus explicit inventory/recovery integrity checks.
+_RESOURCE_STORE_PROCESS_GATE_LOCK = threading.Lock()
+_RESOURCE_STORE_PROCESS_VALIDATED_IDENTITY: tuple[str, int, int] | None = None
 RESOURCE_KINDS = {
     "repo",
     "path",
@@ -1042,13 +1047,13 @@ def _resource_store_integrity_identity() -> tuple[str, int, int]:
     )
 
 
-def _ensure_resource_store_integrity(
+def _ensure_resource_store_process_integrity(
     connection: sqlite3.Connection,
     identity: tuple[str, int, int],
 ) -> None:
-    global _RESOURCE_STORE_INTEGRITY_IDENTITY
-    with _RESOURCE_STORE_INTEGRITY_LOCK:
-        if _RESOURCE_STORE_INTEGRITY_IDENTITY == identity:
+    global _RESOURCE_STORE_PROCESS_VALIDATED_IDENTITY
+    with _RESOURCE_STORE_PROCESS_GATE_LOCK:
+        if _RESOURCE_STORE_PROCESS_VALIDATED_IDENTITY == identity:
             if _resource_store_integrity_identity() != identity:
                 raise RuntimeError(
                     "Resource database identity changed during integrity preflight; retry"
@@ -1059,7 +1064,7 @@ def _ensure_resource_store_integrity(
             raise RuntimeError(
                 "Resource database identity changed during integrity preflight; retry"
             )
-        _RESOURCE_STORE_INTEGRITY_IDENTITY = identity
+        _RESOURCE_STORE_PROCESS_VALIDATED_IDENTITY = identity
 
 
 def _preflight_resource_store() -> str | None:
@@ -1067,7 +1072,7 @@ def _preflight_resource_store() -> str | None:
         return None
     identity = _resource_store_integrity_identity()
     with _resource_readonly_sqlite(RESOURCE_DB) as connection:
-        _ensure_resource_store_integrity(connection, identity)
+        _ensure_resource_store_process_integrity(connection, identity)
         version = _resource_schema_version(connection)
         if version not in {"1", "2", "3"}:
             raise RuntimeError(
