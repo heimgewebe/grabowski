@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import importlib
 from pathlib import Path
 import time
@@ -241,6 +242,23 @@ def _worker_payload(kind: str, view: str) -> dict[str, Any]:
     return workers.worker_list(kind, MAX_SOURCE_WORKERS, view=view)
 
 
+def _collect_independent_source(
+    source: str,
+    capability: str,
+    loader: Callable[[list[dict[str, Any]]], Any],
+    default: Any,
+) -> tuple[Any, list[dict[str, Any]]]:
+    errors: list[dict[str, Any]] = []
+    value = _attempt_source(
+        source,
+        capability,
+        lambda: loader(errors),
+        errors,
+        default,
+    )
+    return value, errors
+
+
 def grabowski_current_work(
     repositories: list[str],
     view: str = "current",
@@ -253,81 +271,137 @@ def grabowski_current_work(
         raise ValueError("view must be current or history")
 
     source_errors: list[dict[str, Any]] = []
-    resources_payload = _attempt_source(
-        "resources",
-        "resource_lease",
-        _resources_payload,
-        source_errors,
-        {"leases": [], "count": 0, "truncated": True},
-    )
-    lease_task_ids, lease_task_ids_truncated = _task_lease_ids(resources_payload)
-    tasks_payload = _attempt_source(
-        "tasks",
-        "durable_job",
-        lambda: _task_payload(
-            view,
-            lease_task_ids,
-            required_ids_truncated=lease_task_ids_truncated,
+    independent_sources = [
+        (
+            "checkouts",
+            "git_cli",
+            lambda errors: _checkout_payloads(repository_filters, errors),
+            [
+                {"repository": repository, "worktrees": [], "truncated": True}
+                for repository in repository_filters
+            ],
         ),
-        source_errors,
-        {"tasks": [], "pagination": {"has_more": True}},
-    )
-    attention_payload = _attempt_source(
+        (
+            "tmux",
+            "tmux_interaction",
+            lambda _errors: _tmux_payload(),
+            {"returncode": 1, "stdout": ""},
+        ),
+        (
+            "processes",
+            "process_inspect",
+            lambda _errors: _process_payload(),
+            {"returncode": 1, "lines": []},
+        ),
+        (
+            "browser_workers",
+            "browser_worker",
+            lambda _errors: _worker_payload("browser", view),
+            {"workers": [], "has_more": True},
+        ),
+        (
+            "gui_workers",
+            "gui_worker",
+            lambda _errors: _worker_payload("gui", view),
+            {"workers": [], "has_more": True},
+        ),
+    ]
+    source_order = [
         "attention",
-        "durable_job",
-        lambda: _attention_payload(view),
-        source_errors,
-        {"records": [], "pagination": {"has_more": True}},
-    )
-    checkout_payloads = _attempt_source(
         "checkouts",
-        "git_cli",
-        lambda: _checkout_payloads(repository_filters, source_errors),
-        source_errors,
-        [
-            {"repository": repository, "worktrees": [], "truncated": True}
-            for repository in repository_filters
-        ],
-    )
-    reconciliation_payload = _attempt_source(
         "checkout_binding_reconciliation",
-        "git_cli",
-        lambda: _reconciliation_payload(repository_filters),
-        source_errors,
-        {
-            "bindings": [],
-            "pagination": {"has_more": True},
-            "total_count": 0,
-        },
-    )
-    tmux_payload = _attempt_source(
         "tmux",
-        "tmux_interaction",
-        _tmux_payload,
-        source_errors,
-        {"returncode": 1, "stdout": ""},
-    )
-    process_payload = _attempt_source(
         "processes",
-        "process_inspect",
-        _process_payload,
-        source_errors,
-        {"returncode": 1, "lines": []},
-    )
-    browser_payload = _attempt_source(
         "browser_workers",
-        "browser_worker",
-        lambda: _worker_payload("browser", view),
-        source_errors,
-        {"workers": [], "has_more": True},
-    )
-    gui_payload = _attempt_source(
         "gui_workers",
-        "gui_worker",
-        lambda: _worker_payload("gui", view),
-        source_errors,
-        {"workers": [], "has_more": True},
-    )
+    ]
+
+    with ThreadPoolExecutor(
+        max_workers=len(independent_sources),
+        thread_name_prefix="grabowski-current-work",
+    ) as executor:
+        futures = {
+            source: executor.submit(
+                _collect_independent_source,
+                source,
+                capability,
+                loader,
+                default,
+            )
+            for source, capability, loader, default in independent_sources
+        }
+
+        # Resource leases determine which exact task lifecycles must be retained,
+        # so this dependency stays ordered while independent sources overlap it.
+        resources_payload = _attempt_source(
+            "resources",
+            "resource_lease",
+            _resources_payload,
+            source_errors,
+            {"leases": [], "count": 0, "truncated": True},
+        )
+        lease_task_ids, lease_task_ids_truncated = _task_lease_ids(resources_payload)
+        tasks_payload = _attempt_source(
+            "tasks",
+            "durable_job",
+            lambda: _task_payload(
+                view,
+                lease_task_ids,
+                required_ids_truncated=lease_task_ids_truncated,
+            ),
+            source_errors,
+            {"tasks": [], "pagination": {"has_more": True}},
+        )
+
+        # Attention derives from the same task store. Preserve the historical
+        # tasks -> attention ordering so an older attention generation cannot
+        # be joined onto a newer task snapshot.
+        attention_result = _collect_independent_source(
+            "attention",
+            "durable_job",
+            lambda _errors: _attention_payload(view),
+            {"records": [], "pagination": {"has_more": True}},
+        )
+
+        # Checkout inventory and binding reconciliation share checkout-binding
+        # storage. Keep that pair ordered while still overlapping it with the
+        # other independent read surfaces.
+        independent_results = {
+            "attention": attention_result,
+            "checkouts": futures["checkouts"].result(),
+        }
+        reconciliation_future = executor.submit(
+            _collect_independent_source,
+            "checkout_binding_reconciliation",
+            "git_cli",
+            lambda _errors: _reconciliation_payload(repository_filters),
+            {
+                "bindings": [],
+                "pagination": {"has_more": True},
+                "total_count": 0,
+            },
+        )
+        for source, future in futures.items():
+            if source == "checkouts":
+                continue
+            independent_results[source] = future.result()
+        independent_results["checkout_binding_reconciliation"] = (
+            reconciliation_future.result()
+        )
+
+    independent_payloads: dict[str, Any] = {}
+    for source in source_order:
+        payload, errors = independent_results[source]
+        independent_payloads[source] = payload
+        source_errors.extend(errors)
+
+    attention_payload = independent_payloads["attention"]
+    checkout_payloads = independent_payloads["checkouts"]
+    reconciliation_payload = independent_payloads["checkout_binding_reconciliation"]
+    tmux_payload = independent_payloads["tmux"]
+    process_payload = independent_payloads["processes"]
+    browser_payload = independent_payloads["browser_workers"]
+    gui_payload = independent_payloads["gui_workers"]
 
     return current_work.build_current_work_projection(
         tasks_payload=tasks_payload,
