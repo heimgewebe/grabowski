@@ -18,6 +18,8 @@ Der Transport-Roundtrip schützt mutierende MCP-Aufrufe vor Fremdverbrauch, Wied
 
 Damit benötigt der normale Owner-Pfad genau **einen** Agentenaufruf. Die Request-ID ist Idempotenz- und Replayanker, keine ChatGPT-Threadidentität. Eine bereits konsumierte Request-ID wird nicht erneut ausgeführt; nach Antwortverlust ist der Zielzustand zu reconciliieren.
 
+Der langlebige Replay-Filter trennt identische Bodies innerhalb eines stabilen Connector-Scopes zusätzlich nach der bereits signierten MCP-Session. Dadurch werden gleiche legitime `tools/call`-Bodies in späteren, von der Plattform neu erzeugten MCP-Sessions nicht dauerhaft miteinander verklebt. Innerhalb derselben Session bleibt der Body auch über Capability-Tokenrotation hinweg einmalig. `mcp-session-id` ist dabei weiterhin **keine Autorität**: Ausführungsautorität entsteht ausschließlich aus eingeschriebener Connector-Capability, gültiger Signatur, Runtimebindung und Frische. Fehlt eine Session-ID, bleibt aus Kompatibilitäts- und Fail-closed-Gründen die historische Body-weite Replay-Identität erhalten.
+
 ### Roundtrip-Fallback
 
 Wenn eine Anfrage nicht über den signierten Ingress kommt, bleibt der Roundtrip während der Migration fail-closed erhalten. Für `shared_unlabeled` gilt genau dieser Normalablauf:

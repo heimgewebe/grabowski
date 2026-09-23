@@ -524,11 +524,21 @@ def _replay_filter_positions(scope_sha256: str, request_id: str) -> tuple[int, .
     )
 
 
-def _stable_scope_replay_id(body_sha256: str) -> str:
+def _stable_scope_replay_id(body_sha256: str, session_id: str = "") -> str:
     body = bytes.fromhex(_sha256(body_sha256, "transport assertion body hash"))
-    return hashlib.sha256(
-        b"grabowski-stable-client-scope-body-replay-id-v1\x00" + body
-    ).hexdigest()[:32]
+    if session_id:
+        session = _text(session_id, "transport MCP session id", 512).encode("utf-8")
+        material = (
+            b"grabowski-stable-client-scope-session-body-replay-id-v2\x00"
+            + session
+            + b"\x00"
+            + body
+        )
+    else:
+        # Sessionless callers retain the historical fail-closed body identity.
+        # This also preserves all existing durable replay bits for that path.
+        material = b"grabowski-stable-client-scope-body-replay-id-v1\x00" + body
+    return hashlib.sha256(material).hexdigest()[:32]
 
 
 def _pread_exact(fd: int, size: int, offset: int, label: str) -> bytes:
@@ -1039,6 +1049,7 @@ def consume_assertion(
     arguments_sha256: str,
     body_sha256: str,
     mac_sha256: str,
+    session_id: str = "",
     now_unix: int | None = None,
 ) -> dict[str, Any]:
     scope_hash = _sha256(client_scope_sha256, "transport client scope hash")
@@ -1109,7 +1120,9 @@ def consume_assertion(
                 (legacy_replay_scope_hash, material["request_id"]),
                 (
                     scope_hash,
-                    _stable_scope_replay_id(material["body_sha256"]),
+                    _stable_scope_replay_id(
+                        material["body_sha256"], session_id=session_id
+                    ),
                 ),
             )
         )
