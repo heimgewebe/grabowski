@@ -51,6 +51,8 @@ TASK_DB = Path(
     )
 ).expanduser()
 TASK_OUTCOMES_DIR = TASK_DB.with_suffix(".outcomes")
+_TASK_STORE_PREFLIGHT_LOCK = threading.Lock()
+_TASK_STORE_PREFLIGHT_IDENTITY: tuple[str, int, int] | None = None
 TASK_LIST_SCAN_BATCH = 100
 TASK_RECONCILE_BATCH_LIMIT = 500
 DEFAULT_TASK_RECONCILE_BATCH_SIZE = 100
@@ -1820,7 +1822,7 @@ def _verified_task_migration_backup(
                 pass
 
 
-def _preflight_task_store() -> str | None:
+def _preflight_task_store(*, check_integrity: bool = True) -> str | None:
     if not TASK_DB.exists():
         return None
     if TASK_DB.is_symlink() or not TASK_DB.is_file():
@@ -1828,7 +1830,8 @@ def _preflight_task_store() -> str | None:
     if TASK_DB.stat().st_size == 0:
         return None
     with _readonly_sqlite(TASK_DB) as connection:
-        _sqlite_integrity(connection, "Task database", quick=True)
+        if check_integrity:
+            _sqlite_integrity(connection, "Task database", quick=True)
         version = _task_schema_version(connection)
         if version not in {"1", "2", "3", "4", "5"}:
             raise RuntimeError(
@@ -1844,6 +1847,44 @@ def _preflight_task_store() -> str | None:
         else:
             _validate_task_schema_legacy(connection, version)
         return version
+
+
+def _task_store_preflight_identity() -> tuple[str, int, int] | None:
+    try:
+        observed = TASK_DB.lstat()
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(observed.st_mode) or not stat.S_ISREG(observed.st_mode):
+        raise PermissionError(f"Task database must be a regular file: {TASK_DB}")
+    if observed.st_size == 0:
+        return None
+    return (str(TASK_DB.absolute()), int(observed.st_dev), int(observed.st_ino))
+
+
+def _remember_task_store_preflight_identity() -> None:
+    global _TASK_STORE_PREFLIGHT_IDENTITY
+    identity = _task_store_preflight_identity()
+    if identity is None:
+        raise RuntimeError("Task database disappeared after successful integrity validation")
+    with _TASK_STORE_PREFLIGHT_LOCK:
+        _TASK_STORE_PREFLIGHT_IDENTITY = identity
+
+
+def _preflight_task_store_for_open() -> str | None:
+    """Run the expensive quick_check once per process and database inode."""
+    global _TASK_STORE_PREFLIGHT_IDENTITY
+    identity = _task_store_preflight_identity()
+    with _TASK_STORE_PREFLIGHT_LOCK:
+        if identity is None:
+            _TASK_STORE_PREFLIGHT_IDENTITY = None
+            return _preflight_task_store(check_integrity=False)
+        check_integrity = _TASK_STORE_PREFLIGHT_IDENTITY != identity
+        observed = _preflight_task_store(check_integrity=check_integrity)
+        if observed == TASK_CURRENT_SCHEMA_VERSION:
+            _TASK_STORE_PREFLIGHT_IDENTITY = identity
+        else:
+            _TASK_STORE_PREFLIGHT_IDENTITY = None
+        return observed
 
 
 def _create_task_schema_v5(connection: sqlite3.Connection) -> None:
@@ -1983,12 +2024,12 @@ def _database() -> sqlite3.Connection:
     if TASK_DB.is_symlink():
         raise PermissionError(f"Task database may not be a symlink: {TASK_DB}")
 
-    observed = _preflight_task_store()
+    observed = _preflight_task_store_for_open()
     if observed == "5":
         return _open_current_task_database()
 
     with _schema_directory_lock(parent):
-        observed = _preflight_task_store()
+        observed = _preflight_task_store_for_open()
         if observed == "5":
             return _open_current_task_database()
         connection = (
@@ -2039,6 +2080,7 @@ def _database() -> sqlite3.Connection:
             _task_reconcile_revision_contract(connection)
             _sqlite_integrity(connection, "Migrated task database")
             connection.commit()
+            _remember_task_store_preflight_identity()
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA synchronous=FULL")
             connection.execute("PRAGMA foreign_keys=ON")

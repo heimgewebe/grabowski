@@ -8910,7 +8910,7 @@ class TaskTests(unittest.TestCase):
         ) as integrity:
             connection = tasks._database()
             connection.close()
-        self.assertEqual(1, integrity.call_count)
+        self.assertEqual(0, integrity.call_count)
         inventory = tasks.grabowski_task_list(schema_only=True)
         self.assertEqual("5", inventory["observed_version"])
         self.assertEqual("current", inventory["status"])
@@ -9330,6 +9330,19 @@ class TaskTests(unittest.TestCase):
                     "SELECT value FROM metadata WHERE key='schema_version'"
                 ).fetchone()[0],
             )
+
+    def test_task_store_replacement_rechecks_integrity(self) -> None:
+        connection = tasks._database()
+        connection.close()
+        replacement = self.database.with_name("tasks-replacement.sqlite3")
+        replacement.write_bytes(self.database.read_bytes())
+        replacement.chmod(0o600)
+        replacement.replace(self.database)
+        original_integrity = tasks._sqlite_integrity
+        with patch.object(tasks, "_sqlite_integrity", wraps=original_integrity) as integrity:
+            connection = tasks._database()
+            connection.close()
+        self.assertEqual(1, integrity.call_count)
 
     def test_task_integrity_check_reports_busy_separately_from_corruption(self) -> None:
         class BusyConnection:

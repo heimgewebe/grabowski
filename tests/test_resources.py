@@ -3432,7 +3432,7 @@ class ResourceTests(unittest.TestCase):
         ) as integrity:
             connection = resources._database()
             connection.close()
-        self.assertEqual(1, integrity.call_count)
+        self.assertEqual(0, integrity.call_count)
         inventory = resources.grabowski_resource_list(schema_only=True)
         self.assertEqual("3", inventory["observed_version"])
         self.assertEqual("1", inventory["lease_contract_observed_version"])
@@ -3445,6 +3445,23 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
         self.assertEqual(before_names, sorted(item.name for item in self.database.parent.iterdir()))
 
+
+    def test_resource_store_replacement_rechecks_integrity(self) -> None:
+        connection = resources._database()
+        connection.close()
+        replacement = self.database.with_name("resources-replacement.sqlite3")
+        replacement.write_bytes(self.database.read_bytes())
+        replacement.chmod(0o600)
+        replacement.replace(self.database)
+        original_integrity = resources._resource_sqlite_integrity
+        with patch.object(
+            resources,
+            "_resource_sqlite_integrity",
+            wraps=original_integrity,
+        ) as integrity:
+            connection = resources._database()
+            connection.close()
+        self.assertEqual(1, integrity.call_count)
 
     def test_resource_schema_inventory_requires_missing_reconcile_revision_contract(
         self,

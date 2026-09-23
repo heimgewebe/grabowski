@@ -11,6 +11,7 @@ import re
 import sqlite3
 import stat
 import tempfile
+import threading
 import time
 from typing import Any, Iterable, Mapping
 
@@ -41,6 +42,8 @@ RESOURCE_DB = Path(
         str(operator.STATE_DIR / "resources.sqlite3"),
     )
 ).expanduser()
+_RESOURCE_STORE_PREFLIGHT_LOCK = threading.Lock()
+_RESOURCE_STORE_PREFLIGHT_IDENTITY: tuple[str, int, int] | None = None
 RESOURCE_KINDS = {
     "repo",
     "path",
@@ -1025,11 +1028,12 @@ def _resource_store_file_ready() -> bool:
     return observed.st_size > 0
 
 
-def _preflight_resource_store() -> str | None:
+def _preflight_resource_store(*, check_integrity: bool = True) -> str | None:
     if not _resource_store_file_ready():
         return None
     with _resource_readonly_sqlite(RESOURCE_DB) as connection:
-        _resource_sqlite_integrity(connection, "Resource database", quick=True)
+        if check_integrity:
+            _resource_sqlite_integrity(connection, "Resource database", quick=True)
         version = _resource_schema_version(connection)
         if version not in {"1", "2", "3"}:
             raise RuntimeError(
@@ -1065,6 +1069,44 @@ def _preflight_resource_store() -> str | None:
         ):
             return f"{version}:reconcile-revision-contract-missing"
         return version
+
+
+def _resource_store_preflight_identity() -> tuple[str, int, int] | None:
+    try:
+        observed = RESOURCE_DB.lstat()
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(observed.st_mode) or not stat.S_ISREG(observed.st_mode):
+        raise PermissionError(f"Resource database must be a regular file: {RESOURCE_DB}")
+    if observed.st_size == 0:
+        return None
+    return (str(RESOURCE_DB.absolute()), int(observed.st_dev), int(observed.st_ino))
+
+
+def _remember_resource_store_preflight_identity() -> None:
+    global _RESOURCE_STORE_PREFLIGHT_IDENTITY
+    identity = _resource_store_preflight_identity()
+    if identity is None:
+        raise RuntimeError("Resource database disappeared after successful integrity validation")
+    with _RESOURCE_STORE_PREFLIGHT_LOCK:
+        _RESOURCE_STORE_PREFLIGHT_IDENTITY = identity
+
+
+def _preflight_resource_store_for_open() -> str | None:
+    """Run the expensive quick_check once per process and database inode."""
+    global _RESOURCE_STORE_PREFLIGHT_IDENTITY
+    identity = _resource_store_preflight_identity()
+    with _RESOURCE_STORE_PREFLIGHT_LOCK:
+        if identity is None:
+            _RESOURCE_STORE_PREFLIGHT_IDENTITY = None
+            return _preflight_resource_store(check_integrity=False)
+        check_integrity = _RESOURCE_STORE_PREFLIGHT_IDENTITY != identity
+        observed = _preflight_resource_store(check_integrity=check_integrity)
+        if observed == RESOURCE_CURRENT_SCHEMA_VERSION:
+            _RESOURCE_STORE_PREFLIGHT_IDENTITY = identity
+        else:
+            _RESOURCE_STORE_PREFLIGHT_IDENTITY = None
+        return observed
 
 
 def _create_resource_additive_tables(connection: sqlite3.Connection) -> None:
@@ -1209,12 +1251,12 @@ def _database() -> sqlite3.Connection:
     if RESOURCE_DB.is_symlink():
         raise PermissionError(f"Resource database may not be a symlink: {RESOURCE_DB}")
 
-    observed = _preflight_resource_store()
+    observed = _preflight_resource_store_for_open()
     if observed == "3":
         return _open_current_resource_database()
 
     with _resource_schema_directory_lock(parent):
-        observed = _preflight_resource_store()
+        observed = _preflight_resource_store_for_open()
         if observed == "3":
             return _open_current_resource_database()
         connection = (
@@ -1273,6 +1315,7 @@ def _database() -> sqlite3.Connection:
             _resource_reconcile_revision_contract(connection)
             _resource_sqlite_integrity(connection, "Migrated resource database")
             connection.commit()
+            _remember_resource_store_preflight_identity()
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA synchronous=FULL")
             connection.execute("PRAGMA foreign_keys=ON")
