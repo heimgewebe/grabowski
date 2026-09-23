@@ -75,12 +75,9 @@ The rendered contract requires the agent to:
     the minimum sufficient mechanism; persistent complexity requires proof of benefit.
     Compare a simpler path against fresh evidence, then explicitly choose `CONTINUE`,
     `CHANGE` or `PARK/STOP`; a tool failure alone is not strategic evidence;
-13. for nontrivial operator work, act as a bounded controller: keep synchronous
-    chains short; move long or uncertain work to an existing durable task, job or
-    workspace; read status once instead of polling; use the durable
-    operator-obligation lifecycle to resume matching unfinished work and end only
-    with completed, explicitly blocked or durably delegated evidence plus a
-    locator/wait condition, or with an evidence-bound direct v2
+13. for nontrivial operator work, use the durable operator-obligation lifecycle to
+    resume matching unfinished work and end only with completed, explicitly blocked
+    or durably delegated evidence, or with an evidence-bound direct v2
     `deferred`/`superseded` resolution that keeps `work_complete=false` and sets
     `continuation_required=false`; resume parked work via a new obligation;
 14. bind and assess risk-adaptive convergence evidence before claiming systemic

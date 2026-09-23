@@ -118,7 +118,7 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "operator-obligation-lifecycle",
-        "For nontrivial work act as bounded controller: short sync chains; long/uncertain work -> durable task/job/workspace, one status read, no polling. Use grip_run operator-obligation lifecycle; end only completed, explicitly blocked, or durably delegated with locator/wait, or deferred/superseded with work_complete=false and continuation_required=false. Resume with new obligation.",
+        "For nontrivial work use grip_run/operator-obligation-list, operator-obligation-open and before ending operator-obligation-status. End only when operator-obligation-close is completed, explicitly blocked or durably delegated, or operator-obligation-resolve defers/supersedes open work with continuation_required=false and work_complete=false. Resume with a new obligation.",
     ),
     (
         "convergence-before-high-risk-closure",
