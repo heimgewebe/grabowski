@@ -7701,6 +7701,27 @@ def grabowski_github(
     )
 
 
+_USER_SERVICE_FRAGMENT_LOOKUP_TIMEOUT_SECONDS = 30
+_USER_SERVICE_MUTATION_TIMEOUT_SECONDS = 120
+_USER_SERVICE_RECONCILIATION_TIMEOUT_SECONDS = 30
+_USER_SERVICE_LEASE_SAFETY_SECONDS = 60
+_USER_SERVICE_LEASE_TTL_SECONDS = (
+    _USER_SERVICE_FRAGMENT_LOOKUP_TIMEOUT_SECONDS
+    + _USER_SERVICE_MUTATION_TIMEOUT_SECONDS
+    + int(PROCESS_TERMINATION_GRACE_SECONDS * 3)
+    + _USER_SERVICE_LEASE_SAFETY_SECONDS
+)
+_USER_SERVICE_UNCERTAIN_LEASE_TTL_SECONDS = 60 * 60
+_USER_SERVICE_RECONCILIATION_PROPERTIES = (
+    "LoadState",
+    "ActiveState",
+    "SubState",
+    "UnitFileState",
+    "Job",
+    "FragmentPath",
+)
+
+
 def _user_service_fragment_path(name: str) -> Path | None:
     result = _run(
         [
@@ -7713,7 +7734,7 @@ def _user_service_fragment_path(name: str) -> Path | None:
             "--value",
         ],
         cwd=HOME,
-        timeout_seconds=30,
+        timeout_seconds=_USER_SERVICE_FRAGMENT_LOOKUP_TIMEOUT_SECONDS,
         max_output_bytes=DEFAULT_OUTPUT_BYTES,
     )
     if result.get("returncode") != 0 or result.get("timed_out") is True:
@@ -7732,11 +7753,52 @@ def _user_service_fragment_path(name: str) -> Path | None:
     return Path(os.path.normpath(str(fragment)))
 
 
+def _user_service_reconciliation_state(name: str) -> dict[str, str]:
+    result = _run(
+        [
+            "systemctl",
+            "--user",
+            "show",
+            name,
+            "--no-pager",
+            "--property=LoadState",
+            "--property=ActiveState",
+            "--property=SubState",
+            "--property=UnitFileState",
+            "--property=Job",
+            "--property=FragmentPath",
+        ],
+        cwd=HOME,
+        timeout_seconds=_USER_SERVICE_RECONCILIATION_TIMEOUT_SECONDS,
+        max_output_bytes=DEFAULT_OUTPUT_BYTES,
+    )
+    if result.get("returncode") != 0 or result.get("timed_out") is True:
+        raise RuntimeError(f"Unable to reconcile user service state for {name}")
+    stdout = result.get("stdout")
+    if not isinstance(stdout, str):
+        raise RuntimeError(f"Invalid user service reconciliation state for {name}")
+    properties = _parse_show(stdout)
+    missing = [
+        property_name
+        for property_name in _USER_SERVICE_RECONCILIATION_PROPERTIES
+        if property_name not in properties
+    ]
+    if missing:
+        raise RuntimeError(
+            f"Incomplete user service reconciliation state for {name}: "
+            + ", ".join(missing)
+        )
+    return {
+        property_name: properties[property_name]
+        for property_name in _USER_SERVICE_RECONCILIATION_PROPERTIES
+    }
+
+
 def _run_mutating_user_service(name: str, action: str) -> dict[str, Any]:
     import grabowski_resources as resources
 
     fragment_before = _user_service_fragment_path(name)
-    resource_keys = ["component:user-systemd-manager"]
+    resource_keys = [f"service:user-systemd:{name}"]
     if fragment_before is not None:
         resource_keys.append(f"path:{fragment_before}")
     owner_id = f"operator:user-service-{uuid.uuid4().hex}"
@@ -7744,27 +7806,120 @@ def _run_mutating_user_service(name: str, action: str) -> dict[str, Any]:
         owner_id,
         resource_keys,
         purpose=f"user systemd {action} {name}",
-        ttl_seconds=120,
+        ttl_seconds=_USER_SERVICE_LEASE_TTL_SECONDS,
         metadata={"service": name, "action": action},
     )
+    lease_snapshots = list(lease["leases"])
+    release_leases = True
     try:
         fragment_after = _user_service_fragment_path(name)
         if fragment_after != fragment_before:
             raise RuntimeError(
                 f"FragmentPath changed after coordination lease acquisition for user service {name}"
             )
-        return _run(
-            ["systemctl", "--user", action, name],
-            cwd=HOME,
-            timeout_seconds=120,
-            max_output_bytes=MAX_OUTPUT_BYTES,
+
+        action_result: dict[str, Any] | None = None
+        action_error: Exception | None = None
+        try:
+            action_result = _run(
+                ["systemctl", "--user", action, name],
+                cwd=HOME,
+                timeout_seconds=_USER_SERVICE_MUTATION_TIMEOUT_SECONDS,
+                max_output_bytes=MAX_OUTPUT_BYTES,
+            )
+        except Exception as exc:
+            action_error = exc
+
+        uncertain_transport = (
+            action_error is not None
+            or action_result is None
+            or action_result.get("timed_out") is True
         )
+        if not uncertain_transport:
+            assert action_result is not None
+            return action_result
+
+        # Once systemctl may have handed work to systemd, transport failure is not
+        # a proven failed mutation.  Renew the exact same authority before
+        # readback so the lease cannot expire during reconciliation.
+        release_leases = False
+        try:
+            renewal = resources.renew_resources(
+                owner_id,
+                resource_keys,
+                ttl_seconds=_USER_SERVICE_UNCERTAIN_LEASE_TTL_SECONDS,
+                expected_leases=lease_snapshots,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "user service mutation outcome is uncertain and the coordination "
+                "lease could not be renewed; reconcile the exact resources before retry"
+            ) from exc
+        lease_snapshots = list(renewal["leases"])
+
+        try:
+            reconciliation = _user_service_reconciliation_state(name)
+        except Exception as exc:
+            result = {} if action_result is None else dict(action_result)
+            result["user_service_coordination"] = {
+                "status": "outcome_unknown",
+                "retry_allowed": False,
+                "requires_readback_before_next_attempt": True,
+                "release_required_after_terminal_readback": True,
+                "lease_retained": True,
+                "lease_owner_id": owner_id,
+                "resource_keys": list(resource_keys),
+                "lease_expires_at_unix": renewal.get("expires_at_unix"),
+                "reconciliation_error_class": type(exc).__name__,
+                "transport_error_class": (
+                    type(action_error).__name__ if action_error is not None else None
+                ),
+            }
+            return result
+
+        pending_job = reconciliation["Job"].strip()
+        if pending_job:
+            result = {} if action_result is None else dict(action_result)
+            result["user_service_coordination"] = {
+                "status": "outcome_unknown",
+                "retry_allowed": False,
+                "requires_readback_before_next_attempt": True,
+                "release_required_after_terminal_readback": True,
+                "lease_retained": True,
+                "lease_owner_id": owner_id,
+                "resource_keys": list(resource_keys),
+                "lease_expires_at_unix": renewal.get("expires_at_unix"),
+                "reconciliation": reconciliation,
+                "transport_error_class": (
+                    type(action_error).__name__ if action_error is not None else None
+                ),
+            }
+            return result
+
+        release_leases = True
+        if action_error is not None:
+            raise RuntimeError(
+                "user service mutation transport failed after effect may have begun; "
+                "unit state was reconciled before coordination release"
+            ) from action_error
+        assert action_result is not None
+        result = dict(action_result)
+        result["user_service_coordination"] = {
+            "status": "reconciled_after_transport_uncertainty",
+            "retry_allowed": False,
+            "requires_readback_before_next_attempt": False,
+            "release_required_after_terminal_readback": False,
+            "lease_retained": False,
+            "reconciliation": reconciliation,
+        }
+        return result
     finally:
-        resources.release_resources(
-            owner_id,
-            resource_keys,
-            expected_leases=list(lease["leases"]),
-        )
+        if release_leases:
+            resources.release_resources(
+                owner_id,
+                resource_keys,
+                expected_leases=lease_snapshots,
+            )
 
 
 @mcp.tool(name="grabowski_user_service", annotations=MUTATING)
