@@ -1393,11 +1393,58 @@ class WorkAdmissionTests(unittest.TestCase):
                 reconciliation_loader=lambda _repo: self._reconciliation(),
             )
 
-    def test_convergence_mode_never_overrides_foreign_lifecycle_owner(self) -> None:
+    def test_convergence_mode_allows_foreign_terminal_lifecycle_owner(self) -> None:
+        for state in ("completed_retained", "archived_retained"):
+            with self.subTest(state=state):
+                worktrees = [
+                    self._main(),
+                    self._linked(
+                        state=state,
+                        owner="foreign-owner",
+                    ),
+                ]
+                result = self._assess(worktrees)
+                self.assertEqual(result["decision"], "converge_first")
+                self.assertIn("foreign-lifecycle-owner", result["blocker_codes"])
+                self.assertIn(
+                    "worktree-convergence-required", result["blocker_codes"]
+                )
+
+                def inventory(
+                    _repo: str,
+                    worktrees: list[dict[str, object]] = worktrees,
+                ) -> dict[str, object]:
+                    return {
+                        "worktrees": worktrees,
+                        "inventory_sha256": "a" * 64,
+                    }
+
+                def reconciliation(_repo: str) -> dict[str, object]:
+                    return self._reconciliation()
+                with self.assertRaises(admission.WorkAdmissionBlocked):
+                    admission.require_repository_admission(
+                        mode="normal",
+                        repo=str(self.repo),
+                        owner_id="owner-a",
+                        operation="broad_repository_lease",
+                        inventory_loader=inventory,
+                        reconciliation_loader=reconciliation,
+                    )
+                converging = admission.require_repository_admission(
+                    mode="convergence",
+                    repo=str(self.repo),
+                    owner_id="owner-a",
+                    operation="broad_repository_lease",
+                    inventory_loader=inventory,
+                    reconciliation_loader=reconciliation,
+                )
+                self.assertEqual(converging["decision"], "converge_first")
+
+    def test_convergence_mode_never_overrides_foreign_active_lifecycle_owner(self) -> None:
         worktrees = [
             self._main(),
             self._linked(
-                state="completed_retained",
+                state="managed_active_attention",
                 owner="foreign-owner",
             ),
         ]
@@ -1406,25 +1453,19 @@ class WorkAdmissionTests(unittest.TestCase):
         self.assertIn("foreign-lifecycle-owner", result["blocker_codes"])
         self.assertIn("worktree-convergence-required", result["blocker_codes"])
 
-        inventory = lambda _repo: {
-            "worktrees": worktrees,
-            "inventory_sha256": "a" * 64,
-        }
-        reconciliation = lambda _repo: self._reconciliation()
         with self.assertRaises(admission.WorkAdmissionBlocked) as raised:
             admission.require_repository_admission(
                 mode="convergence",
                 repo=str(self.repo),
                 owner_id="owner-a",
                 operation="broad_repository_lease",
-                inventory_loader=inventory,
-                reconciliation_loader=reconciliation,
+                inventory_loader=lambda _repo: {
+                    "worktrees": worktrees,
+                    "inventory_sha256": "a" * 64,
+                },
+                reconciliation_loader=lambda _repo: self._reconciliation(),
             )
         self.assertEqual(raised.exception.assessment["decision"], "blocked")
-        self.assertIn(
-            "foreign-lifecycle-owner",
-            raised.exception.assessment["blocker_codes"],
-        )
 
     def test_equivalent_source_binding_blocks_duplicate_lane(self) -> None:
         result = self._assess(

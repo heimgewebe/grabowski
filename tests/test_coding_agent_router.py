@@ -1765,6 +1765,42 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertFalse(available)
         self.assertIn("authentication", reason)
 
+    def test_claude_long_lived_oauth_token_route_is_available_without_plan_label(
+        self,
+    ) -> None:
+        route = next(
+            route
+            for route in self.catalog["routes"]
+            if route["id"] == "claude-sonnet-5-high"
+        )
+        state = self._fresh_state()
+        auth = state["catalog"]["providers"]["claude"]["auth"]
+
+        auth.update(
+            {
+                "logged_in": True,
+                "auth_method": "oauth_token",
+                "subscription_type": None,
+            }
+        )
+        available, reason = router._route_available(route, self.catalog, state)
+        self.assertTrue(available, reason)
+
+        auth["subscription_type"] = "unknown-plan"
+        available, reason = router._route_available(route, self.catalog, state)
+        self.assertFalse(available)
+        self.assertEqual(reason, "Claude plan authentication is unavailable")
+
+        auth.update(
+            {
+                "auth_method": "unknown",
+                "subscription_type": None,
+            }
+        )
+        available, reason = router._route_available(route, self.catalog, state)
+        self.assertFalse(available)
+        self.assertEqual(reason, "Claude plan authentication is unavailable")
+
     def test_stale_opencode_deepseek_free_route_remains_fail_closed(self) -> None:
         route = next(
             route
