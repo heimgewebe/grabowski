@@ -5421,6 +5421,7 @@ def acquire_resources(
     metadata: dict[str, Any] | None = None,
     nonconflict_proof: dict[str, Any] | None = None,
     admission_assessor: Any | None = None,
+    _work_admission_mode: str = "normal",
     _preserve_live_same_owner: bool = False,
     _commit_precondition: Any | None = None,
 ) -> dict[str, Any]:
@@ -5431,6 +5432,8 @@ def acquire_resources(
     ttl = _ttl(ttl_seconds)
     if metadata is not None and not isinstance(metadata, dict):
         raise ValueError("metadata must be an object")
+    if _work_admission_mode not in {"normal", "convergence"}:
+        raise ValueError("_work_admission_mode must be normal or convergence")
     if not isinstance(_preserve_live_same_owner, bool):
         raise ValueError("_preserve_live_same_owner must be boolean")
     if _commit_precondition is not None and not callable(_commit_precondition):
@@ -5498,7 +5501,7 @@ def acquire_resources(
         raise ValueError(
             "metadata.work_admission_mode is not a public authority surface"
         )
-    admission_mode = "normal"
+    admission_mode = _work_admission_mode
     scope = normalized_metadata.get("scope_manifest")
     broad_repository_keys = [
         key
@@ -5585,7 +5588,26 @@ def acquire_resources(
                 )
                 if not isinstance(assessment, dict):
                     raise RuntimeError("work admission assessor returned invalid evidence")
-                if assessment.get("decision") != "allow":
+                admission_decision = assessment.get("decision")
+                convergence_blockers = assessment.get("blockers")
+                terminal_convergence_only = (
+                    admission_mode == "convergence"
+                    and admission_decision == "converge_first"
+                    and isinstance(convergence_blockers, list)
+                    and bool(convergence_blockers)
+                    and all(
+                        isinstance(item, dict)
+                        and item.get("code")
+                        in {
+                            "foreign-lifecycle-owner",
+                            "worktree-convergence-required",
+                        }
+                        and item.get("state")
+                        in work_admission.FOREIGN_LIFECYCLE_OWNER_CONVERGENCE_STATES
+                        for item in convergence_blockers
+                    )
+                )
+                if admission_decision != "allow" and not terminal_convergence_only:
                     raise work_admission.WorkAdmissionBlocked(assessment)
                 if assessment.get("read_only") is not True:
                     raise RuntimeError(

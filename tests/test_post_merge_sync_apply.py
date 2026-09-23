@@ -71,6 +71,7 @@ class LeaseHarness:
         self.acquire_effect = acquire_effect
         self.live: dict[str, dict[str, object]] = {}
         self.acquire_calls = 0
+        self.work_admission_modes: list[str] = []
         self.release_calls = 0
         self.release_expected_leases: list[dict[str, object]] | None = None
 
@@ -81,8 +82,10 @@ class LeaseHarness:
         *,
         purpose: str,
         ttl_seconds: int,
+        _work_admission_mode: str = "normal",
     ) -> dict[str, object]:
         self.acquire_calls += 1
+        self.work_admission_modes.append(_work_admission_mode)
         if self.acquire_effect is not None:
             self.acquire_effect()
         leases = []
@@ -139,8 +142,10 @@ class ConcurrentLeaseHarness(LeaseHarness):
         *,
         purpose: str,
         ttl_seconds: int,
+        _work_admission_mode: str = "normal",
     ) -> dict[str, object]:
         self.acquire_calls += 1
+        self.work_admission_modes.append(_work_admission_mode)
         self.owner_ids.append(owner_id)
         if self.live:
             live_owners = {
@@ -418,6 +423,7 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             self.assertEqual("", git_stdout(repo, "status", "--porcelain"))
             self.assertEqual("remote\n", (repo / "state.txt").read_text(encoding="utf-8"))
             self.assertEqual(1, leases.acquire_calls)
+            self.assertEqual(["convergence"], leases.work_admission_modes)
             self.assertEqual(1, leases.release_calls)
             self.assertEqual({}, leases.live)
             self.assertIsNotNone(leases.release_expected_leases)
@@ -694,12 +700,14 @@ class PostMergeSyncApplyTests(unittest.TestCase):
                 *,
                 purpose: str,
                 ttl_seconds: int,
+                _work_admission_mode: str = "normal",
             ) -> dict[str, object]:
                 acquired = leases.acquire(
                     owner_id,
                     resource_keys,
                     purpose=purpose,
                     ttl_seconds=ttl_seconds,
+                    _work_admission_mode=_work_admission_mode,
                 )
                 snapshots = list(acquired["leases"])
                 return {"leases": snapshots[:-1]}
@@ -1116,7 +1124,9 @@ class PostMergeSyncApplyTests(unittest.TestCase):
                 *,
                 purpose: str,
                 ttl_seconds: int,
+                _work_admission_mode: str = "normal",
             ) -> dict[str, object]:
+                self.assertEqual("convergence", _work_admission_mode)
                 del owner_id, purpose, ttl_seconds
                 attempted_keys.extend(resource_keys)
                 raise RuntimeError("foreign broad repository lease")
