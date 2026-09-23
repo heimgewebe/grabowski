@@ -143,6 +143,48 @@ class UserServiceCoordinationTests(unittest.TestCase):
             set(resource_keys),
         )
 
+    def test_completed_action_preserves_result_when_release_is_uncertain(self) -> None:
+        fragment = "/home/alex/.config/systemd/user/demo.service"
+        resources = _fake_resources()
+        resources.release_resources.side_effect = OSError("release transport")
+        action_result = _result(stdout="started")
+        with (
+            patch.dict(sys.modules, {"grabowski_resources": resources}),
+            patch.object(operator, "_require_operator_capability"),
+            patch.object(operator, "_require_operator_mutation"),
+            patch.object(
+                operator,
+                "_run",
+                side_effect=[
+                    _result(stdout=fragment + "\n"),
+                    _result(stdout=fragment + "\n"),
+                    action_result,
+                ],
+            ),
+            patch.object(
+                operator.uuid,
+                "uuid4",
+                return_value=types.SimpleNamespace(hex="3" * 32),
+            ),
+        ):
+            result = operator.grabowski_user_service("demo.service", "restart")
+
+        self.assertEqual(result["stdout"], "started")
+        self.assertEqual(result["returncode"], 0)
+        self.assertFalse(result["timed_out"])
+        coordination = result["user_service_coordination"]
+        self.assertEqual(
+            coordination["status"], "lease_release_unknown_after_observed_action"
+        )
+        self.assertTrue(coordination["action_result_observed"])
+        self.assertFalse(coordination["retry_allowed"])
+        self.assertTrue(coordination["requires_readback_before_next_attempt"])
+        self.assertEqual(coordination["lease_release_state"], "unknown")
+        self.assertIsNone(coordination["lease_retained"])
+        self.assertEqual(coordination["release_error_class"], "OSError")
+        self.assertEqual(coordination["last_known_lease_expires_at_unix"], 400)
+        resources.release_resources.assert_called_once()
+
     def test_lease_budget_outlives_validation_action_and_process_termination(self) -> None:
         bounded_effect_window = (
             operator._USER_SERVICE_FRAGMENT_LOOKUP_TIMEOUT_SECONDS
@@ -275,6 +317,48 @@ class UserServiceCoordinationTests(unittest.TestCase):
         )
         self.assertFalse(coordination["lease_retained"])
         self.assertFalse(coordination["requires_readback_before_next_attempt"])
+
+    def test_reconciled_timeout_preserves_result_when_release_is_uncertain(self) -> None:
+        fragment = "/home/alex/.config/systemd/user/demo.service"
+        resources = _fake_resources()
+        resources.release_resources.side_effect = OSError("release transport")
+        timed_out = _result(stdout="timed out", timed_out=True)
+        with (
+            patch.dict(sys.modules, {"grabowski_resources": resources}),
+            patch.object(operator, "_require_operator_capability"),
+            patch.object(operator, "_require_operator_mutation"),
+            patch.object(
+                operator,
+                "_run",
+                side_effect=[
+                    _result(stdout=fragment + "\n"),
+                    _result(stdout=fragment + "\n"),
+                    timed_out,
+                    _result(stdout=_reconciliation(fragment=fragment)),
+                ],
+            ),
+        ):
+            result = operator.grabowski_user_service("demo.service", "restart")
+
+        self.assertTrue(result["timed_out"])
+        self.assertEqual(result["stdout"], "timed out")
+        coordination = result["user_service_coordination"]
+        self.assertEqual(
+            coordination["status"], "lease_release_unknown_after_observed_action"
+        )
+        self.assertEqual(
+            coordination["mutation_status"],
+            "reconciled_after_transport_uncertainty",
+        )
+        self.assertEqual(coordination["reconciliation"]["Job"], "")
+        self.assertTrue(coordination["requires_readback_before_next_attempt"])
+        self.assertEqual(coordination["lease_release_state"], "unknown")
+        self.assertIsNone(coordination["lease_retained"])
+        self.assertEqual(
+            coordination["last_known_lease_expires_at_unix"],
+            200 + operator._USER_SERVICE_UNCERTAIN_LEASE_TTL_SECONDS,
+        )
+        resources.release_resources.assert_called_once()
 
     def test_timeout_with_pending_job_retains_renewed_leases(self) -> None:
         fragment = "/home/alex/.config/systemd/user/demo.service"

@@ -7794,6 +7794,57 @@ def _user_service_reconciliation_state(name: str) -> dict[str, str]:
     }
 
 
+def _user_service_release_after_observed_action(
+    resources: Any,
+    *,
+    owner_id: str,
+    resource_keys: list[str],
+    lease_snapshots: list[dict[str, Any]],
+    result: dict[str, Any],
+    coordination: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    try:
+        resources.release_resources(
+            owner_id,
+            resource_keys,
+            expected_leases=lease_snapshots,
+        )
+    except Exception as exc:
+        finalized = dict(result)
+        release_coordination = {} if coordination is None else dict(coordination)
+        if "status" in release_coordination:
+            release_coordination["mutation_status"] = release_coordination["status"]
+        expiries = [
+            item.get("expires_at_unix")
+            for item in lease_snapshots
+            if isinstance(item, dict)
+            and isinstance(item.get("expires_at_unix"), int)
+            and not isinstance(item.get("expires_at_unix"), bool)
+        ]
+        release_coordination.update(
+            {
+                "status": "lease_release_unknown_after_observed_action",
+                "action_result_observed": True,
+                "retry_allowed": False,
+                "requires_readback_before_next_attempt": True,
+                "lease_release_state": "unknown",
+                "lease_retained": None,
+                "lease_owner_id": owner_id,
+                "resource_keys": list(resource_keys),
+                "last_known_lease_expires_at_unix": min(expiries) if expiries else None,
+                "release_error_class": type(exc).__name__,
+            }
+        )
+        finalized["user_service_coordination"] = release_coordination
+        return finalized
+
+    if coordination is None:
+        return result
+    finalized = dict(result)
+    finalized["user_service_coordination"] = coordination
+    return finalized
+
+
 def _run_mutating_user_service(name: str, action: str) -> dict[str, Any]:
     import grabowski_resources as resources
 
@@ -7837,7 +7888,14 @@ def _run_mutating_user_service(name: str, action: str) -> dict[str, Any]:
         )
         if not uncertain_transport:
             assert action_result is not None
-            return action_result
+            release_leases = False
+            return _user_service_release_after_observed_action(
+                resources,
+                owner_id=owner_id,
+                resource_keys=resource_keys,
+                lease_snapshots=lease_snapshots,
+                result=action_result,
+            )
 
         # Once systemctl may have handed work to systemd, transport failure is not
         # a proven failed mutation.  Renew the exact same authority before
@@ -7896,15 +7954,33 @@ def _run_mutating_user_service(name: str, action: str) -> dict[str, Any]:
             }
             return result
 
-        release_leases = True
         if action_error is not None:
+            release_uncertainty: dict[str, Any] | None = None
+            try:
+                resources.release_resources(
+                    owner_id,
+                    resource_keys,
+                    expected_leases=lease_snapshots,
+                )
+            except Exception as exc:
+                release_uncertainty = {
+                    "release_error_class": type(exc).__name__,
+                    "lease_owner_id": owner_id,
+                    "resource_keys": list(resource_keys),
+                }
+            if release_uncertainty is not None:
+                raise RuntimeError(
+                    "user service mutation transport failed after effect may have begun; "
+                    "unit state was reconciled but coordination release is uncertain, "
+                    "so resource readback is required before retry"
+                ) from action_error
             raise RuntimeError(
                 "user service mutation transport failed after effect may have begun; "
                 "unit state was reconciled before coordination release"
             ) from action_error
+
         assert action_result is not None
-        result = dict(action_result)
-        result["user_service_coordination"] = {
+        coordination = {
             "status": "reconciled_after_transport_uncertainty",
             "retry_allowed": False,
             "requires_readback_before_next_attempt": False,
@@ -7912,7 +7988,14 @@ def _run_mutating_user_service(name: str, action: str) -> dict[str, Any]:
             "lease_retained": False,
             "reconciliation": reconciliation,
         }
-        return result
+        return _user_service_release_after_observed_action(
+            resources,
+            owner_id=owner_id,
+            resource_keys=resource_keys,
+            lease_snapshots=lease_snapshots,
+            result=action_result,
+            coordination=coordination,
+        )
     finally:
         if release_leases:
             resources.release_resources(
