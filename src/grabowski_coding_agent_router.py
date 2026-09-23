@@ -1512,6 +1512,18 @@ def _configured_model_arg(route: dict[str, Any]) -> str | None:
     return None
 
 
+def _claude_subscription_route_authenticated(auth: dict[str, Any]) -> bool:
+    if auth.get("logged_in") is not True:
+        return False
+    auth_method = auth.get("auth_method")
+    subscription_type = auth.get("subscription_type")
+    if auth_method == "claude.ai":
+        return subscription_type in CLAUDE_PLAN_TYPES
+    if auth_method == "oauth_token":
+        return subscription_type is None or subscription_type in CLAUDE_PLAN_TYPES
+    return False
+
+
 def _route_available(
     route: dict[str, Any],
     catalog: dict[str, Any],
@@ -1531,11 +1543,7 @@ def _route_available(
         return False, "Codex model is absent"
     if harness == "claude":
         auth = providers.get("claude", {}).get("auth", {})
-        if not (
-            auth.get("logged_in") is True
-            and auth.get("auth_method") == "claude.ai"
-            and auth.get("subscription_type") in CLAUDE_PLAN_TYPES
-        ):
+        if not _claude_subscription_route_authenticated(auth):
             return False, "Claude plan authentication is unavailable"
     if harness == "antigravity":
         antigravity = providers.get("antigravity", providers.get("agy", {}))
