@@ -1049,6 +1049,10 @@ def _ensure_resource_store_integrity(
     global _RESOURCE_STORE_INTEGRITY_IDENTITY
     with _RESOURCE_STORE_INTEGRITY_LOCK:
         if _RESOURCE_STORE_INTEGRITY_IDENTITY == identity:
+            if _resource_store_integrity_identity() != identity:
+                raise RuntimeError(
+                    "Resource database identity changed during integrity preflight; retry"
+                )
             return
         _resource_sqlite_integrity(connection, "Resource database", quick=True)
         if _resource_store_integrity_identity() != identity:

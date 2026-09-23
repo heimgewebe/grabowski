@@ -1846,6 +1846,10 @@ def _ensure_task_store_integrity(
     global _TASK_STORE_INTEGRITY_IDENTITY
     with _TASK_STORE_INTEGRITY_LOCK:
         if _TASK_STORE_INTEGRITY_IDENTITY == identity:
+            if _task_store_integrity_identity() != identity:
+                raise RuntimeError(
+                    "Task database identity changed during integrity preflight; retry"
+                )
             return
         _sqlite_integrity(connection, "Task database", quick=True)
         if _task_store_integrity_identity() != identity:
