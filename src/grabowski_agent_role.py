@@ -757,7 +757,12 @@ def _codex_review_prefix(
         short_option = _codex_attached_short_option(token)
         if short_option is not None:
             if short_option == "-i":
-                normalized.append(f"--image={token[len(short_option):]}")
+                image_value = token[len(short_option):]
+                if image_value.startswith("="):
+                    image_value = image_value[1:]
+                if not image_value:
+                    raise RuntimeError("Codex global option -i is missing its value")
+                normalized.append(f"--image={image_value}")
             else:
                 normalized.append(token)
             index += 1

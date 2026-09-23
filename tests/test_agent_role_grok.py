@@ -530,6 +530,19 @@ class GrokReviewRoleTests(unittest.TestCase):
             ["codex", "--image=shot.png", "exec", "review this"],
         )
 
+    def test_codex_review_attached_image_equals_value_is_normalized_before_exec(self) -> None:
+        declared = ["codex", "-i=shot.png", "review this"]
+        self.assertIsNone(role._codex_declared_subcommand(declared))
+        self.assertEqual(
+            role._codex_review_command_for_headless_execution(declared),
+            ["codex", "--image=shot.png", "exec", "review this"],
+        )
+
+    def test_codex_review_attached_image_empty_equals_is_rejected(self) -> None:
+        declared = ["codex", "-i=", "review this"]
+        with self.assertRaisesRegex(RuntimeError, "Codex global option -i is missing its value"):
+            role._codex_review_command_for_headless_execution(declared)
+
     def test_codex_review_prompt_separator_is_preserved_after_exec(self) -> None:
         declared = ["codex", "--", "--version"]
         self.assertIsNone(role._codex_declared_subcommand(declared))
