@@ -31,7 +31,9 @@ from grabowski_privileged_broker import (
     publish_recovery_marker,
     resolve_execution,
     resolve_regular_execution,
+    LOCAL_BACKUP_STORAGE_ACTIONS,
     _require_kill_switch_clear,
+    _scoped_template_marker_allows_dispatch,
 )
 
 from grabowski_secret_pty import (
@@ -1617,7 +1619,10 @@ def _validate_secret_pty_peer(
     }
 
 
-def _require_execution_kill_switch_clear(execution: dict[str, object]) -> None:
+def _require_execution_kill_switch_clear(
+    reference: dict[str, object],
+    execution: dict[str, object],
+) -> None:
     kill_switch_value = execution.get("kill_switch_path")
     legacy_switch_value = execution.get("legacy_kill_switch_path")
     if kill_switch_value is None:
@@ -1628,7 +1633,20 @@ def _require_execution_kill_switch_clear(execution: dict[str, object]) -> None:
         return
     if not isinstance(kill_switch_value, str) or not kill_switch_value:
         raise PermissionError("power kill-switch path is invalid")
-    _require_kill_switch_clear(Path(kill_switch_value))
+    kill_switch = Path(kill_switch_value)
+    action = reference.get("action")
+    scoped_template_action = (
+        isinstance(action, str)
+        and (
+            action == ROOTBROKER_CUTOVER_ACTION
+            or action in LOCAL_BACKUP_STORAGE_ACTIONS
+        )
+    )
+    if scoped_template_action:
+        if not _scoped_template_marker_allows_dispatch(kill_switch, action=action):
+            raise PermissionError("power kill-switch is engaged")
+    else:
+        _require_kill_switch_clear(kill_switch)
     if legacy_switch_value is not None:
         if not isinstance(legacy_switch_value, str) or not legacy_switch_value:
             raise PermissionError("power legacy kill-switch path is invalid")
@@ -1682,7 +1700,7 @@ def _execute_broker_command(
                 )
         _assert_local_backup_smart_pre_spawn(reference=reference, argv=argv)
         started = time.monotonic()
-        _require_execution_kill_switch_clear(execution)
+        _require_execution_kill_switch_clear(reference, execution)
         process = subprocess.Popen(
             argv,
             cwd=str(cwd) if cwd is not None else None,
