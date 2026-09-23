@@ -1008,6 +1008,88 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertEqual(group["work_class"], "hygiene")
         self.assertIn("managed-active-retention-expired", group["action_reasons"])
 
+    def test_managed_active_worker_checkout_with_truncated_registry_remains_active(self) -> None:
+        owner = "worker:w1"
+        result = project(
+            checkout_payloads=[
+                {
+                    "repository": REPOSITORY,
+                    "worktrees": [
+                        checkout(
+                            "managed-worker-partial",
+                            "/home/alex/repos/.worktrees/managed-worker-partial",
+                            lifecycle_state="managed_active_attention",
+                            binding_owner=owner,
+                            binding_phase="active",
+                            retention_active=False,
+                            retention_until_unix=1,
+                        )
+                    ],
+                }
+            ],
+            browser_payload={"workers": [], "has_more": True},
+            gui_payload={"workers": [], "has_more": False},
+        )
+        group = next(item for item in result["work"] if item["work_id"] == owner)
+        self.assertTrue(result["source_truncation"]["browser_workers"])
+        self.assertEqual(group["projection_state"], "active")
+        self.assertEqual(group["work_class"], "operational")
+        self.assertNotIn("managed-active-retention-expired", group["action_reasons"])
+
+    def test_managed_active_task_checkout_with_truncated_task_ledger_remains_active(self) -> None:
+        owner = "task:t1"
+        result = project(
+            tasks_payload={"tasks": [], "pagination": {"has_more": True}},
+            checkout_payloads=[
+                {
+                    "repository": REPOSITORY,
+                    "worktrees": [
+                        checkout(
+                            "managed-task-partial",
+                            "/home/alex/repos/.worktrees/managed-task-partial",
+                            lifecycle_state="managed_active_attention",
+                            binding_owner=owner,
+                            binding_phase="active",
+                            retention_active=False,
+                            retention_until_unix=1,
+                        )
+                    ],
+                }
+            ],
+        )
+        group = next(item for item in result["work"] if item["work_id"] == owner)
+        self.assertTrue(result["source_truncation"]["tasks"])
+        self.assertEqual(group["projection_state"], "active")
+        self.assertEqual(group["work_class"], "operational")
+        self.assertNotIn("managed-active-retention-expired", group["action_reasons"])
+
+    def test_unrelated_worker_truncation_does_not_block_operator_hygiene(self) -> None:
+        owner = "operator:managed-expired-unrelated-partial"
+        result = project(
+            checkout_payloads=[
+                {
+                    "repository": REPOSITORY,
+                    "worktrees": [
+                        checkout(
+                            "managed-expired-unrelated-partial",
+                            "/home/alex/repos/.worktrees/managed-expired-unrelated-partial",
+                            lifecycle_state="managed_active_attention",
+                            binding_owner=owner,
+                            binding_phase="active",
+                            retention_active=False,
+                            retention_until_unix=1,
+                        )
+                    ],
+                }
+            ],
+            browser_payload={"workers": [], "has_more": True},
+        )
+        group = result["work"][0]
+        self.assertTrue(result["source_truncation"]["browser_workers"])
+        self.assertEqual(group["projection_state"], "hygiene")
+        self.assertEqual(group["work_class"], "hygiene")
+        self.assertIn("managed-active-retention-expired", group["action_reasons"])
+
     def test_managed_active_checkout_with_running_worker_remains_active(self) -> None:
         owner = "worker:w1"
         result = project(
