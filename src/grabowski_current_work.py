@@ -1407,9 +1407,9 @@ def _add_checkouts(
                 if "closed-not-cleaned" not in group["action_reasons"]:
                     group["action_reasons"].append("closed-not-cleaned")
         elif item["binding_phase"] == "active" and item["binding_consistent"]:
-            # An active lifecycle binding remains operational authority until
-            # exact terminal evidence changes the binding phase. Lease/process
-            # absence alone never proves terminality.
+            # Active lifecycle bindings keep identity authority. Finalization may
+            # demote only the attention projection when expiry is proven and no
+            # independent live operational evidence exists.
             _set_projection_state(group, "active")
         elif item["coordination_blocking"]:
             _set_projection_state(group, "active")
@@ -1772,8 +1772,13 @@ def _finalize_groups(
     tasks: dict[str, dict[str, Any]],
     *,
     view: str,
+    source_truncation: dict[str, bool],
+    source_errors: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     projected: list[dict[str, Any]] = []
+    source_error_sources = {
+        str(item.get("source", "unknown")) for item in source_errors
+    }
     for group in groups.values():
         task_item = tasks.get(group["binding"]["id"]) if group["binding"]["kind"] == "task" else None
         has_live_surface = bool(
@@ -1797,6 +1802,77 @@ def _finalize_groups(
         )
         if archived_attention and has_live_surface:
             _blocking(group, "archived-attention-with-live-surfaces")
+
+        active_lifecycle_checkouts = [
+            item
+            for item in group["checkout_refs"]
+            if item["binding_present"]
+            and item["binding_consistent"]
+            and item["binding_phase"] == "active"
+        ]
+        expired_coordination_free_active_only = bool(active_lifecycle_checkouts) and all(
+            item["retention_expiration_proven"]
+            and not item["retention_active"]
+            and not item["dirty"]
+            and not item["coordination_blocking"]
+            and not item["resource_leases"]
+            and not item["processes"]
+            for item in active_lifecycle_checkouts
+        )
+        live_worker_authority = any(
+            item["state"] in ACTIVE_WORKER_STATES
+            for item in group["worker_refs"]
+        )
+        resumable_worker_authority = any(
+            item["state"] == "interrupted"
+            for item in group["worker_refs"]
+        )
+        independent_live_authority = bool(
+            (task_item and task_item["state"] in ACTIVE_TASK_STATES)
+            or group["lease_summary"]["count"]
+            or live_worker_authority
+            or group["physical_refs"]["tmux_sessions"]
+            or group["physical_refs"]["processes"]
+            or any(
+                ref.get("source") not in {"checkout-lifecycle-binding", "worker-registry"}
+                for ref in group["authority_refs"]
+            )
+        )
+        negative_authority_sources = {
+            "checkouts",
+            "resources",
+            "tmux",
+            "processes",
+            "checkout_binding_reconciliation",
+        }
+        if group["binding"]["kind"] == "task":
+            negative_authority_sources.update({"tasks", "attention"})
+        elif group["binding"]["kind"] == "worker":
+            negative_authority_sources.update({"browser_workers", "gui_workers"})
+        live_authority_absence_proven = (
+            not source_truncation.get("source_errors", False)
+            and not any(
+                source_truncation.get(source, False)
+                for source in negative_authority_sources
+            )
+            and not (negative_authority_sources & source_error_sources)
+        )
+        if (
+            group["projection_state"] == "active"
+            and expired_coordination_free_active_only
+            and not independent_live_authority
+            and live_authority_absence_proven
+        ):
+            if resumable_worker_authority:
+                group["projection_state"] = "resumable"
+                group["work_class"] = "operational"
+            else:
+                group["projection_state"] = "hygiene"
+                group["work_class"] = "hygiene"
+                group["action_required"] = True
+                if "managed-active-retention-expired" not in group["action_reasons"]:
+                    group["action_reasons"].append("managed-active-retention-expired")
+
         if view == "current" and group["projection_state"] == "terminal_archived" and not has_live_surface and not group["action_required"]:
             continue
 
@@ -2165,18 +2241,6 @@ def build_current_work_projection(
     if processes["errors"]:
         errors.append({"source": "processes", "parse_errors": processes["errors"]})
 
-    groups: dict[str, dict[str, Any]] = {}
-    tasks, task_paths = _add_tasks(groups, task_rows)
-    _apply_attention(groups, tasks, attention_rows)
-    _add_leases(groups, lease_rows, set(tasks) | {item["task_id"] for item in attention_rows})
-    _add_workers(groups, browser_rows, gui_rows)
-    _add_checkouts(groups, checkouts, tasks, task_paths, view=view)
-    _add_binding_reconciliation(groups, reconciliation_rows)
-    unbound_tmux, unbound_tmux_total, unbound_processes, unbound_process_total = _add_physical_surfaces(
-        groups, tmux, processes
-    )
-    projected = _finalize_groups(groups, tasks, view=view)
-
     resource_count = _integer(
         resources_payload.get("count", len(lease_rows)) if resources_payload else 0,
         "resources.count",
@@ -2199,6 +2263,25 @@ def build_current_work_projection(
         ),
         "source_errors": source_errors_truncated,
     }
+
+    groups: dict[str, dict[str, Any]] = {}
+    tasks, task_paths = _add_tasks(groups, task_rows)
+    _apply_attention(groups, tasks, attention_rows)
+    _add_leases(groups, lease_rows, set(tasks) | {item["task_id"] for item in attention_rows})
+    _add_workers(groups, browser_rows, gui_rows)
+    _add_checkouts(groups, checkouts, tasks, task_paths, view=view)
+    _add_binding_reconciliation(groups, reconciliation_rows)
+    unbound_tmux, unbound_tmux_total, unbound_processes, unbound_process_total = _add_physical_surfaces(
+        groups, tmux, processes
+    )
+    projected = _finalize_groups(
+        groups,
+        tasks,
+        view=view,
+        source_truncation=source_truncation,
+        source_errors=errors,
+    )
+
     _annotate_groups(
         projected,
         generated_at_unix=generated_at_unix,
@@ -2425,4 +2508,3 @@ def build_current_work_projection(
             "repository-filter-invariant aggregate values from globally sourced work groups",
         ],
     }
-
