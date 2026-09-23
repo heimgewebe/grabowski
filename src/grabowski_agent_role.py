@@ -647,6 +647,35 @@ def _grok_streaming_review_command(
 
 
 _CODEX_NONINTERACTIVE_SUBCOMMANDS = frozenset({"exec", "e", "review"})
+_CODEX_ROOT_SUBCOMMANDS = _CODEX_NONINTERACTIVE_SUBCOMMANDS | frozenset(
+    {
+        "agents",
+        "login",
+        "logout",
+        "mcp",
+        "plugin",
+        "app-server",
+        "remote-control",
+        "completion",
+        "update",
+        "doctor",
+        "sandbox",
+        "debug",
+        "apply",
+        "a",
+        "resume",
+        "queue",
+        "archive",
+        "delete",
+        "migrate-rollouts",
+        "unarchive",
+        "fork",
+        "cloud",
+        "exec-server",
+        "features",
+        "help",
+    }
+)
 _CODEX_GLOBAL_OPTIONS_WITH_VALUE = frozenset(
     {
         "-a",
@@ -711,6 +740,22 @@ def _codex_attached_short_option(token: str) -> str | None:
     )
 
 
+def _codex_append_image_values(
+    arguments: list[str],
+    index: int,
+    normalized: list[str],
+) -> tuple[int, int]:
+    image_count = 0
+    while index < len(arguments):
+        value = arguments[index]
+        if value.startswith("-") or value in _CODEX_ROOT_SUBCOMMANDS:
+            break
+        normalized.append(f"--image={value}")
+        image_count += 1
+        index += 1
+    return index, image_count
+
+
 def _codex_review_prefix(
     command: list[str],
 ) -> tuple[str | None, list[str], bool]:
@@ -730,12 +775,9 @@ def _codex_review_prefix(
             if index + 1 >= len(arguments):
                 raise RuntimeError(f"Codex global option {token} is missing its value")
             if token in _CODEX_VARIADIC_GLOBAL_OPTIONS:
-                index += 1
-                image_count = 0
-                while index < len(arguments) and not arguments[index].startswith("-"):
-                    normalized.append(f"--image={arguments[index]}")
-                    image_count += 1
-                    index += 1
+                index, image_count = _codex_append_image_values(
+                    arguments, index + 1, normalized
+                )
                 if image_count == 0:
                     raise RuntimeError(f"Codex global option {token} is missing its value")
                 continue
@@ -751,6 +793,17 @@ def _codex_review_prefix(
             None,
         )
         if long_option is not None:
+            if long_option in _CODEX_VARIADIC_GLOBAL_OPTIONS:
+                image_value = token[len(long_option) + 1 :]
+                if not image_value:
+                    raise RuntimeError(
+                        f"Codex global option {long_option} is missing its value"
+                    )
+                normalized.append(f"--image={image_value}")
+                index, _image_count = _codex_append_image_values(
+                    arguments, index + 1, normalized
+                )
+                continue
             normalized.append(token)
             index += 1
             continue
@@ -763,8 +816,11 @@ def _codex_review_prefix(
                 if not image_value:
                     raise RuntimeError("Codex global option -i is missing its value")
                 normalized.append(f"--image={image_value}")
-            else:
-                normalized.append(token)
+                index, _image_count = _codex_append_image_values(
+                    arguments, index + 1, normalized
+                )
+                continue
+            normalized.append(token)
             index += 1
             continue
         if token in _CODEX_GLOBAL_FLAGS:

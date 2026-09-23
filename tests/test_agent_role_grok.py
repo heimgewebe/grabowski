@@ -538,6 +538,51 @@ class GrokReviewRoleTests(unittest.TestCase):
             ["codex", "--image=shot.png", "exec", "review this"],
         )
 
+    def test_codex_review_attached_image_values_preserve_variadic_group(self) -> None:
+        for first in ("-ishot.png", "--image=shot.png"):
+            with self.subTest(first=first):
+                declared = ["codex", first, "detail.png", "review this"]
+                self.assertIsNone(role._codex_declared_subcommand(declared))
+                self.assertEqual(
+                    role._codex_review_command_for_headless_execution(declared),
+                    [
+                        "codex",
+                        "--image=shot.png",
+                        "--image=detail.png",
+                        "exec",
+                        "review this",
+                    ],
+                )
+
+    def test_codex_review_variadic_images_stop_at_headless_subcommand(self) -> None:
+        declared = [
+            "codex",
+            "--image=shot.png",
+            "detail.png",
+            "exec",
+            "--json",
+            "review this",
+        ]
+        self.assertEqual(role._codex_declared_subcommand(declared), "exec")
+        self.assertEqual(
+            role._codex_review_command_for_headless_execution(declared),
+            declared,
+        )
+
+    def test_codex_review_variadic_images_stop_at_unsupported_root_subcommand(self) -> None:
+        declared = [
+            "codex",
+            "--image=shot.png",
+            "detail.png",
+            "login",
+            "review this",
+        ]
+        self.assertEqual(role._codex_declared_subcommand(declared), "login")
+        with self.assertRaisesRegex(
+            RuntimeError, "Codex review command declares unsupported subcommand: login"
+        ):
+            role._codex_review_command_for_headless_execution(declared)
+
     def test_codex_review_attached_image_empty_equals_is_rejected(self) -> None:
         declared = ["codex", "-i=", "review this"]
         with self.assertRaisesRegex(RuntimeError, "Codex global option -i is missing its value"):
