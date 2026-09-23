@@ -8908,9 +8908,14 @@ class TaskTests(unittest.TestCase):
             "_sqlite_integrity",
             wraps=original_integrity,
         ) as integrity:
-            connection = tasks._database()
-            connection.close()
-        self.assertEqual(1, integrity.call_count)
+            for _ in range(3):
+                connection = tasks._database()
+                connection.close()
+        self.assertEqual(
+            0,
+            integrity.call_count,
+            "current-schema hot connections must not repeat a full-store quick_check",
+        )
         inventory = tasks.grabowski_task_list(schema_only=True)
         self.assertEqual("5", inventory["observed_version"])
         self.assertEqual("current", inventory["status"])
@@ -8921,6 +8926,34 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
         self.assertEqual(before_names, sorted(item.name for item in self.database.parent.iterdir()))
 
+
+    def test_task_store_integrity_rechecks_after_database_identity_change(
+        self,
+    ) -> None:
+        connection = tasks._database()
+        connection.close()
+        current_identity = tasks._task_store_integrity_identity()
+        changed_identity = (
+            current_identity[0],
+            current_identity[1],
+            current_identity[2] + 1,
+        )
+        original_integrity = tasks._sqlite_integrity
+        with (
+            patch.object(
+                tasks,
+                "_task_store_integrity_identity",
+                return_value=changed_identity,
+            ),
+            patch.object(
+                tasks,
+                "_sqlite_integrity",
+                wraps=original_integrity,
+            ) as integrity,
+        ):
+            connection = tasks._database()
+            connection.close()
+        self.assertEqual(1, integrity.call_count)
 
     def test_task_schema_inventory_requires_missing_reconcile_revision_contract(
         self,

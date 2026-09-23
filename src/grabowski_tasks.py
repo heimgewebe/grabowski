@@ -833,6 +833,14 @@ print(json.dumps({
 TASK_RECONCILE_LOCK = threading.RLock()
 _TASK_MUTATION_LOCK_STATE = threading.local()
 
+# PRAGMA quick_check scans the complete task store. Keep that integrity gate
+# process-local and inode-bound so a large, healthy current store is not scanned
+# again on every ordinary task connection. Schema and reconcile-contract checks
+# still run for every open; replacing the database file changes the identity and
+# forces a fresh integrity check.
+_TASK_STORE_INTEGRITY_LOCK = threading.Lock()
+_TASK_STORE_INTEGRITY_IDENTITY: tuple[str, int, int] | None = None
+
 
 def _task_mutation_lock_parent_identity(descriptor: int, parent: Path) -> None:
     opened = os.fstat(descriptor)
@@ -1820,6 +1828,40 @@ def _verified_task_migration_backup(
                 pass
 
 
+def _task_store_integrity_identity() -> tuple[str, int, int]:
+    status = os.lstat(TASK_DB)
+    if not stat.S_ISREG(status.st_mode):
+        raise PermissionError(f"Task database must be a regular file: {TASK_DB}")
+    return (
+        str(TASK_DB.absolute()),
+        int(status.st_dev),
+        int(status.st_ino),
+    )
+
+
+def _ensure_task_store_integrity(
+    connection: sqlite3.Connection,
+    identity: tuple[str, int, int],
+) -> None:
+    global _TASK_STORE_INTEGRITY_IDENTITY
+    with _TASK_STORE_INTEGRITY_LOCK:
+        if _TASK_STORE_INTEGRITY_IDENTITY == identity:
+            return
+        _sqlite_integrity(connection, "Task database", quick=True)
+        if _task_store_integrity_identity() != identity:
+            raise RuntimeError(
+                "Task database identity changed during integrity preflight; retry"
+            )
+        _TASK_STORE_INTEGRITY_IDENTITY = identity
+
+
+def _mark_task_store_integrity_validated() -> None:
+    global _TASK_STORE_INTEGRITY_IDENTITY
+    identity = _task_store_integrity_identity()
+    with _TASK_STORE_INTEGRITY_LOCK:
+        _TASK_STORE_INTEGRITY_IDENTITY = identity
+
+
 def _preflight_task_store() -> str | None:
     if not TASK_DB.exists():
         return None
@@ -1827,8 +1869,9 @@ def _preflight_task_store() -> str | None:
         raise PermissionError(f"Task database must be a regular file: {TASK_DB}")
     if TASK_DB.stat().st_size == 0:
         return None
+    identity = _task_store_integrity_identity()
     with _readonly_sqlite(TASK_DB) as connection:
-        _sqlite_integrity(connection, "Task database", quick=True)
+        _ensure_task_store_integrity(connection, identity)
         version = _task_schema_version(connection)
         if version not in {"1", "2", "3", "4", "5"}:
             raise RuntimeError(
@@ -2039,6 +2082,7 @@ def _database() -> sqlite3.Connection:
             _task_reconcile_revision_contract(connection)
             _sqlite_integrity(connection, "Migrated task database")
             connection.commit()
+            _mark_task_store_integrity_validated()
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA synchronous=FULL")
             connection.execute("PRAGMA foreign_keys=ON")
