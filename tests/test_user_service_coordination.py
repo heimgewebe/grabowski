@@ -185,6 +185,22 @@ class UserServiceCoordinationTests(unittest.TestCase):
         self.assertEqual(coordination["last_known_lease_expires_at_unix"], 400)
         resources.release_resources.assert_called_once()
 
+    def test_mutation_requires_fully_qualified_service_name_before_observation(self) -> None:
+        resources = _fake_resources()
+        with (
+            patch.dict(sys.modules, {"grabowski_resources": resources}),
+            patch.object(operator, "_require_operator_capability"),
+            patch.object(operator, "_require_operator_mutation"),
+            patch.object(operator, "_run") as run,
+        ):
+            with self.assertRaisesRegex(ValueError, "fully qualified"):
+                operator.grabowski_user_service("demo", "start")
+
+        run.assert_not_called()
+        resources.acquire_resources.assert_not_called()
+        resources.renew_resources.assert_not_called()
+        resources.release_resources.assert_not_called()
+
     def test_lease_budget_outlives_validation_action_and_process_termination(self) -> None:
         bounded_effect_window = (
             operator._USER_SERVICE_FRAGMENT_LOOKUP_TIMEOUT_SECONDS
@@ -360,13 +376,63 @@ class UserServiceCoordinationTests(unittest.TestCase):
         )
         resources.release_resources.assert_called_once()
 
-    def test_timeout_with_pending_job_retains_renewed_leases(self) -> None:
+    def test_timeout_with_pending_job_renews_until_terminal_readback(self) -> None:
         fragment = "/home/alex/.config/systemd/user/demo.service"
         resources = _fake_resources()
         with (
             patch.dict(sys.modules, {"grabowski_resources": resources}),
             patch.object(operator, "_require_operator_capability"),
             patch.object(operator, "_require_operator_mutation"),
+            patch.object(operator.time, "sleep") as sleep,
+            patch.object(
+                operator,
+                "_run",
+                side_effect=[
+                    _result(stdout=fragment + "\n"),
+                    _result(stdout=fragment + "\n"),
+                    _result(timed_out=True),
+                    _result(stdout=_reconciliation(fragment=fragment, job="1234")),
+                    _result(stdout=_reconciliation(fragment=fragment)),
+                ],
+            ),
+        ):
+            result = operator.grabowski_user_service("demo.service", "start")
+
+        self.assertEqual(resources.renew_resources.call_count, 2)
+        sleep.assert_called_once_with(operator._USER_SERVICE_RECONCILIATION_POLL_SECONDS)
+        resources.release_resources.assert_called_once()
+        coordination = result["user_service_coordination"]
+        self.assertEqual(
+            coordination["status"], "reconciled_after_transport_uncertainty"
+        )
+        self.assertFalse(coordination["lease_retained"])
+        self.assertFalse(coordination["requires_readback_before_next_attempt"])
+        self.assertEqual(coordination["reconciliation"]["Job"], "")
+
+    def test_pending_job_renewal_failure_stays_fail_closed(self) -> None:
+        fragment = "/home/alex/.config/systemd/user/demo.service"
+        resources = _fake_resources()
+        normal_renew = resources.renew_resources.side_effect
+        renewal_calls = 0
+
+        def renew_then_fail(owner_id, resource_keys, *, ttl_seconds, expected_leases):
+            nonlocal renewal_calls
+            renewal_calls += 1
+            if renewal_calls == 2:
+                raise RuntimeError("renew failed")
+            return normal_renew(
+                owner_id,
+                resource_keys,
+                ttl_seconds=ttl_seconds,
+                expected_leases=expected_leases,
+            )
+
+        resources.renew_resources.side_effect = renew_then_fail
+        with (
+            patch.dict(sys.modules, {"grabowski_resources": resources}),
+            patch.object(operator, "_require_operator_capability"),
+            patch.object(operator, "_require_operator_mutation"),
+            patch.object(operator.time, "sleep"),
             patch.object(
                 operator,
                 "_run",
@@ -378,24 +444,22 @@ class UserServiceCoordinationTests(unittest.TestCase):
                 ],
             ),
         ):
-            result = operator.grabowski_user_service("demo.service", "start")
+            with self.assertRaisesRegex(
+                RuntimeError, "could not be renewed while awaiting terminal systemd state"
+            ):
+                operator.grabowski_user_service("demo.service", "start")
 
-        resources.renew_resources.assert_called_once()
+        self.assertEqual(resources.renew_resources.call_count, 2)
         resources.release_resources.assert_not_called()
-        coordination = result["user_service_coordination"]
-        self.assertEqual(coordination["status"], "outcome_unknown")
-        self.assertTrue(coordination["lease_retained"])
-        self.assertTrue(coordination["requires_readback_before_next_attempt"])
-        self.assertTrue(coordination["release_required_after_terminal_readback"])
-        self.assertEqual(coordination["reconciliation"]["Job"], "1234")
 
-    def test_timeout_with_failed_readback_retains_renewed_leases(self) -> None:
+    def test_timeout_with_failed_readback_renews_until_terminal_readback(self) -> None:
         fragment = "/home/alex/.config/systemd/user/demo.service"
         resources = _fake_resources()
         with (
             patch.dict(sys.modules, {"grabowski_resources": resources}),
             patch.object(operator, "_require_operator_capability"),
             patch.object(operator, "_require_operator_mutation"),
+            patch.object(operator.time, "sleep") as sleep,
             patch.object(
                 operator,
                 "_run",
@@ -404,19 +468,21 @@ class UserServiceCoordinationTests(unittest.TestCase):
                     _result(stdout=fragment + "\n"),
                     _result(timed_out=True),
                     _result(returncode=1),
+                    _result(stdout=_reconciliation(fragment=fragment)),
                 ],
             ),
         ):
             result = operator.grabowski_user_service("demo.service", "stop")
 
-        resources.renew_resources.assert_called_once()
-        resources.release_resources.assert_not_called()
+        self.assertEqual(resources.renew_resources.call_count, 2)
+        sleep.assert_called_once_with(operator._USER_SERVICE_RECONCILIATION_POLL_SECONDS)
+        resources.release_resources.assert_called_once()
         coordination = result["user_service_coordination"]
-        self.assertEqual(coordination["status"], "outcome_unknown")
-        self.assertTrue(coordination["lease_retained"])
         self.assertEqual(
-            coordination["reconciliation_error_class"], "RuntimeError"
+            coordination["status"], "reconciled_after_transport_uncertainty"
         )
+        self.assertFalse(coordination["lease_retained"])
+        self.assertEqual(coordination["reconciliation"]["Job"], "")
 
     def test_transport_exception_reconciles_before_release_and_error(self) -> None:
         fragment = "/home/alex/.config/systemd/user/demo.service"

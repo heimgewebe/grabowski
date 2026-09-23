@@ -7712,6 +7712,7 @@ _USER_SERVICE_LEASE_TTL_SECONDS = (
     + _USER_SERVICE_LEASE_SAFETY_SECONDS
 )
 _USER_SERVICE_UNCERTAIN_LEASE_TTL_SECONDS = 60 * 60
+_USER_SERVICE_RECONCILIATION_POLL_SECONDS = 5.0
 _USER_SERVICE_RECONCILIATION_PROPERTIES = (
     "LoadState",
     "ActiveState",
@@ -7720,6 +7721,14 @@ _USER_SERVICE_RECONCILIATION_PROPERTIES = (
     "Job",
     "FragmentPath",
 )
+
+
+def _require_fully_qualified_user_service_name(name: str) -> str:
+    if not name.endswith(".service"):
+        raise ValueError(
+            "mutating user service actions require a fully qualified .service unit name"
+        )
+    return name
 
 
 def _user_service_fragment_path(name: str) -> Path | None:
@@ -7848,6 +7857,7 @@ def _user_service_release_after_observed_action(
 def _run_mutating_user_service(name: str, action: str) -> dict[str, Any]:
     import grabowski_resources as resources
 
+    name = _require_fully_qualified_user_service_name(name)
     fragment_before = _user_service_fragment_path(name)
     resource_keys = [f"service:user-systemd:{name}"]
     if fragment_before is not None:
@@ -7898,61 +7908,37 @@ def _run_mutating_user_service(name: str, action: str) -> dict[str, Any]:
             )
 
         # Once systemctl may have handed work to systemd, transport failure is not
-        # a proven failed mutation.  Renew the exact same authority before
-        # readback so the lease cannot expire during reconciliation.
+        # a proven failed mutation. Keep renewing the exact same authority until
+        # systemd itself yields a terminal readback. A long or infinite manager
+        # job therefore cannot outlive a fixed retained-lease TTL.
         release_leases = False
-        try:
-            renewal = resources.renew_resources(
-                owner_id,
-                resource_keys,
-                ttl_seconds=_USER_SERVICE_UNCERTAIN_LEASE_TTL_SECONDS,
-                expected_leases=lease_snapshots,
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "user service mutation outcome is uncertain and the coordination "
-                "lease could not be renewed; reconcile the exact resources before retry"
-            ) from exc
-        lease_snapshots = list(renewal["leases"])
+        reconciliation: dict[str, str] | None = None
+        while True:
+            try:
+                renewal = resources.renew_resources(
+                    owner_id,
+                    resource_keys,
+                    ttl_seconds=_USER_SERVICE_UNCERTAIN_LEASE_TTL_SECONDS,
+                    expected_leases=lease_snapshots,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "user service mutation outcome is uncertain and the coordination "
+                    "lease could not be renewed while awaiting terminal systemd state; "
+                    "reconcile the exact resources before retry"
+                ) from exc
+            lease_snapshots = list(renewal["leases"])
 
-        try:
-            reconciliation = _user_service_reconciliation_state(name)
-        except Exception as exc:
-            result = {} if action_result is None else dict(action_result)
-            result["user_service_coordination"] = {
-                "status": "outcome_unknown",
-                "retry_allowed": False,
-                "requires_readback_before_next_attempt": True,
-                "release_required_after_terminal_readback": True,
-                "lease_retained": True,
-                "lease_owner_id": owner_id,
-                "resource_keys": list(resource_keys),
-                "lease_expires_at_unix": renewal.get("expires_at_unix"),
-                "reconciliation_error_class": type(exc).__name__,
-                "transport_error_class": (
-                    type(action_error).__name__ if action_error is not None else None
-                ),
-            }
-            return result
+            try:
+                reconciliation = _user_service_reconciliation_state(name)
+            except Exception:
+                time.sleep(_USER_SERVICE_RECONCILIATION_POLL_SECONDS)
+                continue
+            if not reconciliation["Job"].strip():
+                break
+            time.sleep(_USER_SERVICE_RECONCILIATION_POLL_SECONDS)
 
-        pending_job = reconciliation["Job"].strip()
-        if pending_job:
-            result = {} if action_result is None else dict(action_result)
-            result["user_service_coordination"] = {
-                "status": "outcome_unknown",
-                "retry_allowed": False,
-                "requires_readback_before_next_attempt": True,
-                "release_required_after_terminal_readback": True,
-                "lease_retained": True,
-                "lease_owner_id": owner_id,
-                "resource_keys": list(resource_keys),
-                "lease_expires_at_unix": renewal.get("expires_at_unix"),
-                "reconciliation": reconciliation,
-                "transport_error_class": (
-                    type(action_error).__name__ if action_error is not None else None
-                ),
-            }
-            return result
+        assert reconciliation is not None
 
         if action_error is not None:
             release_uncertainty: dict[str, Any] | None = None
