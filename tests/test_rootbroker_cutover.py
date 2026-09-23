@@ -352,6 +352,29 @@ class FakeRunner:
 
 
 class RootbrokerCutoverTests(unittest.TestCase):
+    def test_fatal_error_projection_is_bounded_stderr_and_preserves_stdout_json(self) -> None:
+        message = "first\nsecond " + ("x" * 2000)
+        failure = cutover.CutoverError(message)
+
+        with patch("builtins.print") as emit:
+            cutover._emit_fatal_error(failure)
+
+        self.assertEqual(emit.call_count, 2)
+        stderr_call, stdout_call = emit.call_args_list
+        self.assertIs(stderr_call.kwargs["file"], sys.stderr)
+        projected = stderr_call.args[0]
+        self.assertLessEqual(len(projected), cutover.MAX_FATAL_ERROR_STDERR_CHARS)
+        self.assertNotIn("\n", projected)
+        self.assertTrue(
+            projected.startswith(
+                "rootbroker-cutover-error: CutoverError: first second "
+            )
+        )
+        self.assertEqual(
+            json.loads(stdout_call.args[0]),
+            {"success": False, "error": message},
+        )
+
     def test_operator_username_is_runner_observed_and_fails_closed_on_drift(self) -> None:
         calls: list[list[str]] = []
 
