@@ -352,6 +352,51 @@ class FakeRunner:
 
 
 class RootbrokerCutoverTests(unittest.TestCase):
+    def test_fatal_error_projection_is_bounded_stderr_and_preserves_stdout_json(self) -> None:
+        message = "first\nsecond " + ("x" * 2000)
+        failure = cutover.CutoverError(message)
+
+        with patch("builtins.print") as emit:
+            cutover._emit_fatal_error(failure)
+
+        self.assertEqual(emit.call_count, 2)
+        stderr_call, stdout_call = emit.call_args_list
+        self.assertIs(stderr_call.kwargs["file"], sys.stderr)
+        projected = stderr_call.args[0]
+        self.assertLessEqual(len(projected), cutover.MAX_FATAL_ERROR_STDERR_CHARS)
+        self.assertNotIn("\n", projected)
+        self.assertTrue(
+            projected.startswith(
+                "rootbroker-cutover-error: CutoverError: first second "
+            )
+        )
+        self.assertEqual(
+            json.loads(stdout_call.args[0]),
+            {"success": False, "error": message},
+        )
+
+    def test_fatal_error_projection_preserves_stdout_when_stderr_write_fails(self) -> None:
+        failure = cutover.CutoverError("boom")
+
+        for stderr_error in (OSError("stderr unavailable"), ValueError("stderr closed")):
+            stdout_calls: list[str] = []
+
+            def emit(*args: object, **kwargs: object) -> None:
+                if kwargs.get("file") is sys.stderr:
+                    raise stderr_error
+                stdout_calls.append(str(args[0]))
+
+            with self.subTest(error_type=type(stderr_error).__name__), patch(
+                "builtins.print", side_effect=emit
+            ):
+                cutover._emit_fatal_error(failure)
+
+            self.assertEqual(len(stdout_calls), 1)
+            self.assertEqual(
+                json.loads(stdout_calls[0]),
+                {"success": False, "error": "boom"},
+            )
+
     def test_operator_username_is_runner_observed_and_fails_closed_on_drift(self) -> None:
         calls: list[list[str]] = []
 

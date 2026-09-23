@@ -384,6 +384,7 @@ def apply(
                 f"{target_branch}@{expected_remote_head[:12]}"
             ),
             ttl_seconds=LEASE_TTL_SECONDS,
+            _work_admission_mode="convergence",
         )
     except Exception as exc:
         return _blocked(

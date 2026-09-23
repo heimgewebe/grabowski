@@ -68,6 +68,9 @@ CONVERGENCE_STATES = frozenset(
     }
 )
 TERMINAL_NONBLOCKING_STATES = frozenset({"externally_terminal_missing"})
+FOREIGN_LIFECYCLE_OWNER_CONVERGENCE_STATES = frozenset(
+    {"completed_retained", "archived_retained"}
+)
 HARD_BLOCK_CODES = frozenset(
     {
         "dirty-worktree",
@@ -1297,7 +1300,19 @@ def assess_repository_admission(
             )
 
     blocker_codes = sorted({str(item["code"]) for item in blockers})
-    hard_blocked = any(code in HARD_BLOCK_CODES or code.startswith("foreign-") for code in blocker_codes)
+    foreign_lifecycle_owner_hard = any(
+        item.get("code") == "foreign-lifecycle-owner"
+        and item.get("state") not in FOREIGN_LIFECYCLE_OWNER_CONVERGENCE_STATES
+        for item in blockers
+    )
+    hard_blocked = foreign_lifecycle_owner_hard or any(
+        code in HARD_BLOCK_CODES
+        or (
+            code.startswith("foreign-")
+            and code != "foreign-lifecycle-owner"
+        )
+        for code in blocker_codes
+    )
     isolation_required = bool(
         not blockers
         and exact_checkout_scope is not None
