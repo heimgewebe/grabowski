@@ -653,6 +653,7 @@ _CODEX_ROOT_SUBCOMMANDS = _CODEX_NONINTERACTIVE_SUBCOMMANDS | frozenset(
         "login",
         "logout",
         "mcp",
+        "mcp-server",
         "plugin",
         "app-server",
         "remote-control",

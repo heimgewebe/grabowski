@@ -570,18 +570,21 @@ class GrokReviewRoleTests(unittest.TestCase):
         )
 
     def test_codex_review_variadic_images_stop_at_unsupported_root_subcommand(self) -> None:
-        declared = [
-            "codex",
-            "--image=shot.png",
-            "detail.png",
-            "login",
-            "review this",
-        ]
-        self.assertEqual(role._codex_declared_subcommand(declared), "login")
-        with self.assertRaisesRegex(
-            RuntimeError, "Codex review command declares unsupported subcommand: login"
-        ):
-            role._codex_review_command_for_headless_execution(declared)
+        for subcommand in ("login", "mcp-server"):
+            with self.subTest(subcommand=subcommand):
+                declared = [
+                    "codex",
+                    "--image=shot.png",
+                    "detail.png",
+                    subcommand,
+                    "review this",
+                ]
+                self.assertEqual(role._codex_declared_subcommand(declared), subcommand)
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    f"Codex review command declares unsupported subcommand: {subcommand}",
+                ):
+                    role._codex_review_command_for_headless_execution(declared)
 
     def test_codex_review_attached_image_empty_equals_is_rejected(self) -> None:
         declared = ["codex", "-i=", "review this"]
