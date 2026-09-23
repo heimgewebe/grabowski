@@ -1889,6 +1889,13 @@ class ReadSurfaceTests(unittest.TestCase):
         self.assertTrue(result["source_binding"]["scan_truncated"])
         self.assertFalse(result["all_time"]["coverage_complete"])
         self.assertTrue(all(not item["coverage_complete"] for item in result["windows"]))
+        by_id = {
+            item["id"]: item for item in result["signal_projection"]["signals"]
+        }
+        self.assertEqual(by_id["uncertain_outcome"]["status"], "indeterminate")
+        self.assertIsNone(by_id["uncertain_outcome"]["count"])
+        self.assertEqual(by_id["transition_gap"]["status"], "indeterminate")
+        self.assertIsNone(by_id["transition_gap"]["count"])
         self.assertEqual(result["warnings"][0]["code"], "audit_projection_scan_truncated")
         self.assertIn(
             "complete_all_time_counts",

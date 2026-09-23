@@ -1724,6 +1724,7 @@ def grabowski_audit_projection(
         prepared_records,
         as_of_unix=as_of_unix,
         audit_source_binding=binding,
+        audit_window_complete=not scan_truncated,
         runtime_status_provider=getattr(base, "grabowski_status", None),
         task_terminal_provider=task_terminal_provider,
     )
