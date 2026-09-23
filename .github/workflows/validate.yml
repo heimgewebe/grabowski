@@ -13,6 +13,9 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: grabowski
     strategy:
       fail-fast: false
       matrix:
@@ -21,13 +24,30 @@ jobs:
           - "3.12"
 
     steps:
-      - name: Checkout
+      - name: Checkout Grabowski
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: grabowski
+
+      - name: Checkout pinned convergence protocol
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: heimgewebe/konvergenzregelkreis
+          ref: c2f75946aa0f3f37646f3c93f1c176c683f341cc
+          path: konvergenzregelkreis
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
+
+      - name: Prepare pinned convergence evaluator
+        working-directory: konvergenzregelkreis
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -e .
 
       - name: Validate repository
         run: make validate
