@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -141,6 +142,166 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
         )
         self.assertEqual(set(seen_sources), declared)
         self.assertEqual(len(seen_sources), len(declared))
+
+    def test_independent_sources_overlap_without_dropping_evidence(self) -> None:
+        operator = SimpleNamespace(_require_operator_capability=lambda capability: None)
+        rendezvous = threading.Barrier(2)
+
+        def overlap(value: object) -> object:
+            rendezvous.wait(timeout=2)
+            return value
+
+        with patch.object(surface, "_operator", return_value=operator), patch.object(
+            surface, "_task_payload", return_value=task_payload()
+        ), patch.object(
+            surface,
+            "_attention_payload",
+            return_value={"records": [], "pagination": {"has_more": False}},
+        ), patch.object(
+            surface,
+            "_resources_payload",
+            return_value={"leases": [], "count": 0, "truncated": False},
+        ), patch.object(
+            surface,
+            "_checkout_payloads",
+            side_effect=lambda _repositories, _errors: overlap(
+                [{"repository": REPOSITORY, "worktrees": []}]
+            ),
+        ), patch.object(
+            surface,
+            "_reconciliation_payload",
+            return_value={
+                "bindings": [],
+                "pagination": {"has_more": False},
+                "total_count": 0,
+            },
+        ), patch.object(
+            surface,
+            "_tmux_payload",
+            side_effect=lambda: overlap({"returncode": 0, "stdout": ""}),
+        ), patch.object(
+            surface, "_process_payload", return_value={"returncode": 0, "lines": []}
+        ), patch.object(
+            surface,
+            "_worker_payload",
+            side_effect=lambda kind, view: {"workers": [], "has_more": False},
+        ):
+            result = surface.grabowski_current_work([REPOSITORY])
+
+        overlapping_errors = [
+            item
+            for item in result["source_errors"]
+            if item["source"] in {"checkouts", "tmux"}
+        ]
+        self.assertEqual(overlapping_errors, [])
+
+    def test_attention_reads_after_task_generation_advances(self) -> None:
+        operator = SimpleNamespace(_require_operator_capability=lambda capability: None)
+        generation = {"value": 1}
+        attention_generations: list[int] = []
+
+        def load_tasks(
+            _view: str,
+            _task_ids: list[str],
+            *,
+            required_ids_truncated: bool = False,
+        ) -> dict:
+            self.assertFalse(required_ids_truncated)
+            generation["value"] = 2
+            payload = task_payload()
+            payload["tasks"][0]["attempt"] = 2
+            return payload
+
+        def load_attention(_view: str) -> dict:
+            attention_generations.append(generation["value"])
+            return {"records": [], "pagination": {"has_more": False}}
+
+        with patch.object(surface, "_operator", return_value=operator), patch.object(
+            surface, "_task_payload", side_effect=load_tasks
+        ), patch.object(
+            surface, "_attention_payload", side_effect=load_attention
+        ), patch.object(
+            surface,
+            "_resources_payload",
+            return_value={"leases": [], "count": 0, "truncated": False},
+        ), patch.object(
+            surface,
+            "_checkout_payloads",
+            return_value=[{"repository": REPOSITORY, "worktrees": []}],
+        ), patch.object(
+            surface,
+            "_reconciliation_payload",
+            return_value={
+                "bindings": [],
+                "pagination": {"has_more": False},
+                "total_count": 0,
+            },
+        ), patch.object(
+            surface, "_tmux_payload", return_value={"returncode": 0, "stdout": ""}
+        ), patch.object(
+            surface, "_process_payload", return_value={"returncode": 0, "lines": []}
+        ), patch.object(
+            surface,
+            "_worker_payload",
+            side_effect=lambda kind, view: {"workers": [], "has_more": False},
+        ):
+            result = surface.grabowski_current_work([REPOSITORY])
+
+        self.assertEqual(attention_generations, [2])
+        self.assertEqual(result["work"][0]["work_id"], "task:abc123")
+        self.assertFalse(
+            any(item["source"] == "attention" for item in result["source_errors"])
+        )
+
+    def test_checkout_reconciliation_waits_for_checkout_inventory(self) -> None:
+        operator = SimpleNamespace(_require_operator_capability=lambda capability: None)
+        checkout_finished = threading.Event()
+        reconciliation_started = threading.Event()
+
+        def load_checkouts(
+            _repositories: list[str],
+            _errors: list[dict],
+        ) -> list[dict]:
+            self.assertFalse(reconciliation_started.is_set())
+            checkout_finished.set()
+            return [{"repository": REPOSITORY, "worktrees": []}]
+
+        def load_reconciliation(_repositories: list[str]) -> dict:
+            self.assertTrue(checkout_finished.is_set())
+            reconciliation_started.set()
+            return {
+                "bindings": [],
+                "pagination": {"has_more": False},
+                "total_count": 0,
+            }
+
+        with patch.object(surface, "_operator", return_value=operator), patch.object(
+            surface, "_task_payload", return_value=task_payload()
+        ), patch.object(
+            surface,
+            "_attention_payload",
+            return_value={"records": [], "pagination": {"has_more": False}},
+        ), patch.object(
+            surface,
+            "_resources_payload",
+            return_value={"leases": [], "count": 0, "truncated": False},
+        ), patch.object(
+            surface, "_checkout_payloads", side_effect=load_checkouts
+        ), patch.object(
+            surface, "_reconciliation_payload", side_effect=load_reconciliation
+        ), patch.object(
+            surface, "_tmux_payload", return_value={"returncode": 0, "stdout": ""}
+        ), patch.object(
+            surface, "_process_payload", return_value={"returncode": 0, "lines": []}
+        ), patch.object(
+            surface,
+            "_worker_payload",
+            side_effect=lambda kind, view: {"workers": [], "has_more": False},
+        ):
+            surface.grabowski_current_work([REPOSITORY])
+
+        self.assertTrue(checkout_finished.is_set())
+        self.assertTrue(reconciliation_started.is_set())
 
     def test_source_capability_failure_is_visible_as_partial_evidence(self) -> None:
         def gate(capability: str) -> None:
