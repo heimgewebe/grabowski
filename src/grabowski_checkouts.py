@@ -1886,7 +1886,8 @@ def _uncertainty_recovery_owner(fence: dict[str, Any]) -> str:
     fence_id = str(fence.get("fence_id", ""))
     if re.fullmatch(r"[0-9a-f]{32}", fence_id) is None:
         raise ValueError("Checkout uncertainty fence id is invalid")
-    return _owner(f"checkout-reconcile:{fence_id[:20]}")
+    attempt_id = uuid.uuid4().hex[:12]
+    return _owner(f"checkout-reconcile:{fence_id[:16]}:{attempt_id}")
 
 
 def _acquire_uncertainty_recovery_resources(
@@ -1913,6 +1914,7 @@ def _acquire_uncertainty_recovery_resources(
     purpose = f"reconcile checkout uncertainty {fence['fence_id']}"
     acquisitions: list[dict[str, Any]] = []
     acquired_keys: list[str] = []
+    acquired_leases: list[dict[str, Any]] = []
     try:
         for group in groups:
             acquired = resources.acquire_resources(
@@ -1926,17 +1928,20 @@ def _acquire_uncertainty_recovery_resources(
             acquired_keys.extend(
                 item["resource_key"] for item in acquired["leases"]
             )
+            acquired_leases.extend(
+                dict(item) for item in acquired["leases"]
+            )
     except Exception:
         if acquired_keys:
-            resources.release_resources(owner, acquired_keys)
+            resources.release_resources(
+                owner,
+                acquired_keys,
+                expected_leases=acquired_leases,
+            )
         raise
     return {
         "owner_id": owner,
-        "leases": [
-            item
-            for acquisition in acquisitions
-            for item in acquisition["leases"]
-        ],
+        "leases": acquired_leases,
         "acquisitions": acquisitions,
     }
 
@@ -2477,6 +2482,7 @@ def _complete_partial_archive(
             resources.release_resources(
                 str(lease["owner_id"]),
                 [item["resource_key"] for item in lease["leases"]],
+                expected_leases=list(lease["leases"]),
             )
 
 

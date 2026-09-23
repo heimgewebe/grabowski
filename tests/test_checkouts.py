@@ -2631,6 +2631,55 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual(retry["outcome"], "reconciled_success")
 
 
+    def test_partial_archive_concurrent_recovery_attempt_conflicts(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        first = checkouts._acquire_uncertainty_recovery_resources(fence)
+        try:
+            with self.assertRaises(checkouts.resources.ResourceConflict):
+                checkouts._acquire_uncertainty_recovery_resources(fence)
+        finally:
+            checkouts.resources.release_resources(
+                first["owner_id"],
+                [item["resource_key"] for item in first["leases"]],
+                expected_leases=list(first["leases"]),
+            )
+
+    def test_partial_archive_recovery_release_is_snapshot_guarded(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        real_release = checkouts.resources.release_resources
+        recovery_releases: list[list[dict[str, object]] | None] = []
+
+        def release(owner_id, resource_keys, **kwargs):
+            if str(owner_id).startswith("checkout-reconcile:"):
+                recovery_releases.append(kwargs.get("expected_leases"))
+            return real_release(owner_id, resource_keys, **kwargs)
+
+        with patch.object(
+            checkouts.resources,
+            "release_resources",
+            side_effect=release,
+        ):
+            reconciliation = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+
+        self.assertEqual(reconciliation["state"], "reconciled")
+        self.assertEqual(reconciliation["outcome"], "reconciled_success")
+        self.assertEqual(len(recovery_releases), 1)
+        snapshots = recovery_releases[0]
+        self.assertIsInstance(snapshots, list)
+        self.assertEqual(
+            {item["resource_key"] for item in snapshots},
+            set(fence["resource_keys"]),
+        )
+        self.assertTrue(
+            all(
+                item["owner_id"].startswith("checkout-reconcile:")
+                for item in snapshots
+            )
+        )
+
     def test_cleanup_unknown_outcome_remains_durably_fenced_after_lease_expiry(self) -> None:
         archive = self._archive()["archive"]
         expected_identity = checkouts.physical_checkout.capture_physical_checkout_identity(
