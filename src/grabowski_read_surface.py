@@ -19,6 +19,7 @@ from pydantic import Field
 import grabowski_capabilities as capabilities
 import grabowski_checkouts as checkouts
 import grabowski_mcp as base
+import grabowski_audit_query as audit_query
 import grabowski_audit_signal as audit_signal
 import grabowski_consumer_surface as consumer_surface
 import grabowski_git_preimage
@@ -424,6 +425,63 @@ def _audit_timestamp_unix(value: Any) -> int | None:
         return int(parsed.timestamp())
     except (OverflowError, OSError, ValueError):
         return None
+
+
+
+def _audit_projection_records_snapshot() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Return at most the newest verified audit scan window without full materialization."""
+    snapshot = audit_query.capture_verified_audit_snapshot()
+    newest_first: list[dict[str, Any]] = []
+    for segment in reversed(snapshot.segments):
+        data = audit_query._load_snapshot_segment(segment)
+        lines = data.splitlines()
+        if len(lines) != segment.records:
+            raise RuntimeError(
+                "verified audit segment record count changed during projection"
+            )
+        for raw_line in reversed(lines):
+            if len(newest_first) >= audit_query.MAX_SCAN_RECORDS:
+                break
+            try:
+                parsed = json.loads(raw_line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    "verified audit record decode invariant violated"
+                ) from exc
+            if not isinstance(parsed, dict):
+                raise RuntimeError("verified audit chain yielded a non-object record")
+            newest_first.append(parsed)
+        if len(newest_first) >= audit_query.MAX_SCAN_RECORDS:
+            break
+
+    records = list(reversed(newest_first))
+    active = snapshot.segments[-1] if snapshot.segments else None
+    capacity = base._audit_capacity_status(
+        snapshot.active_path,
+        {
+            "valid": True,
+            "exists": active is not None,
+            "active_bytes": 0 if active is None else active.bytes,
+        },
+    )
+    scanned_records = len(records)
+    return records, {
+        "valid": True,
+        "chain_valid": True,
+        "total_records": snapshot.total_records,
+        "total_legacy_records": sum(
+            segment.legacy_records for segment in snapshot.segments
+        ),
+        "total_v2_records": sum(segment.v2_records for segment in snapshot.segments),
+        "last_record_sha256": snapshot.last_record_sha256,
+        "archived_segment_count": snapshot.archived_segment_count,
+        "legacy_rotation_compatibility": snapshot.legacy_rotation_compatibility,
+        "scanned_records": scanned_records,
+        "scan_limit": audit_query.MAX_SCAN_RECORDS,
+        "scan_truncated": snapshot.total_records > scanned_records,
+        "scan_order": "latest_records",
+        **capacity,
+    }
 
 
 def _prepare_audit_records(
@@ -1584,12 +1642,17 @@ def grabowski_audit_projection(
     ):
         raise ValueError(f"top_limit must be between 1 and {MAX_AUDIT_PROJECTION_TOP}")
     try:
-        records, snapshot_status = base._audit_records_snapshot()
+        records, snapshot_status = _audit_projection_records_snapshot()
     except (OSError, PermissionError, RuntimeError, ValueError) as exc:
         raise RuntimeError(f"Audit log verification failed: {exc}") from exc
     binding = _audit_snapshot_binding(records)
+    scanned_records = int(snapshot_status.get("scanned_records", len(records)))
+    total_records = int(snapshot_status.get("total_records", scanned_records))
+    scan_truncated = bool(
+        snapshot_status.get("scan_truncated", total_records > scanned_records)
+    )
     if (
-        snapshot_status.get("total_records") != binding["record_count"]
+        scanned_records != binding["record_count"]
         or snapshot_status.get("last_record_sha256")
         != binding["last_record_sha256"]
     ):
@@ -1613,6 +1676,10 @@ def grabowski_audit_projection(
             top_limit=top_limit,
             view=selected_view,
         )
+        public["coverage_complete"] = not scan_truncated
+        public["coverage_scope"] = (
+            "full_audit_chain" if not scan_truncated else "latest_verified_records"
+        )
         windows.append(public)
         private_windows[label] = private
     all_time, all_time_private = _audit_window_projection(
@@ -1623,7 +1690,20 @@ def grabowski_audit_projection(
         top_limit=top_limit,
         view=selected_view,
     )
+    all_time["coverage_complete"] = not scan_truncated
+    all_time["coverage_scope"] = (
+        "full_audit_chain" if not scan_truncated else "latest_verified_records"
+    )
     candidates = _audit_projection_candidates(private_windows["7d"])
+    if scan_truncated:
+        candidates = [
+            {
+                **candidate,
+                "coverage_complete": False,
+                "coverage_scope": "latest_verified_records",
+            }
+            for candidate in candidates
+        ]
     def task_terminal_provider(task_id: str) -> dict[str, Any]:
         import grabowski_tasks as tasks
 
@@ -1649,9 +1729,22 @@ def grabowski_audit_projection(
     )
     advanced = (
         after.get("last_record_sha256") != binding["last_record_sha256"]
-        or after.get("total_records") != binding["record_count"]
+        or after.get("total_records") != total_records
     )
     warnings: list[dict[str, Any]] = []
+    if scan_truncated:
+        warnings.append(
+            {
+                "code": "audit_projection_scan_truncated",
+                "scanned_records": scanned_records,
+                "total_records": total_records,
+                "scan_limit": snapshot_status.get("scan_limit"),
+                "does_not_establish": [
+                    "absence_of_patterns_outside_the_latest_verified_scan",
+                    "complete_all_time_counts",
+                ],
+            }
+        )
     if advanced:
         warnings.append(
             {
@@ -1687,6 +1780,11 @@ def grabowski_audit_projection(
         "as_of_unix": as_of_unix,
         "source_binding": {
             **binding,
+            "total_record_count": total_records,
+            "scanned_record_count": scanned_records,
+            "scan_limit": snapshot_status.get("scan_limit"),
+            "scan_truncated": scan_truncated,
+            "scan_order": snapshot_status.get("scan_order", "latest_records"),
             "snapshot_chain_valid": True,
             "post_read_chain_valid": True,
             "post_read_total_records": after.get("total_records"),
@@ -1724,6 +1822,14 @@ def grabowski_audit_projection(
             "bureau_task_readiness",
             "automatic_task_creation_authority",
             "live_routing_promotion",
+            *(
+                [
+                    "absence_of_patterns_outside_the_latest_verified_scan",
+                    "complete_all_time_counts",
+                ]
+                if scan_truncated
+                else []
+            ),
         ],
     }
     payload["findings_sha256"] = _audit_findings_sha256(

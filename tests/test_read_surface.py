@@ -32,6 +32,7 @@ def _load_read_surface():
     fake_pydantic.Field = lambda **kwargs: kwargs
     operator = types.ModuleType("grabowski_operator_core")
     operator.mcp = _FakeFastMCP()
+    operator.READ_ONLY = {}
     operator.HOME = Path.home()
     operator._safe_environment = lambda: dict(os.environ)
     operator._terminate_process_group = lambda process: (b"", b"")
@@ -53,6 +54,10 @@ def _load_read_surface():
         {"valid": True, "total_records": 0, "last_record_sha256": None},
     )
     base._audit_records = lambda: []
+    base._audit_capacity_status = lambda path, audit: {
+        "audit_writable": bool(audit.get("valid")),
+        "audit_state": "ready",
+    }
     base._kill_switch_state = lambda: {"engaged": False}
     base._runtime_tool_contract_summary = lambda: {
         "client_snapshot_observable": False,
@@ -1273,8 +1278,8 @@ class ReadSurfaceTests(unittest.TestCase):
         }
         with (
             patch.object(
-                read_surface.base,
-                "_audit_records_snapshot",
+                read_surface,
+                "_audit_projection_records_snapshot",
                 return_value=(records, status),
             ),
             patch.object(read_surface.base, "_verify_audit_log", return_value=status),
@@ -1390,8 +1395,8 @@ class ReadSurfaceTests(unittest.TestCase):
         }
         with (
             patch.object(
-                read_surface.base,
-                "_audit_records_snapshot",
+                read_surface,
+                "_audit_projection_records_snapshot",
                 return_value=(records, status),
             ),
             patch.object(read_surface.base, "_verify_audit_log", return_value=status),
@@ -1434,8 +1439,8 @@ class ReadSurfaceTests(unittest.TestCase):
         }
         with (
             patch.object(
-                read_surface.base,
-                "_audit_records_snapshot",
+                read_surface,
+                "_audit_projection_records_snapshot",
                 return_value=(records, status),
             ),
             patch.object(read_surface.base, "_verify_audit_log", return_value=status),
@@ -1517,8 +1522,8 @@ class ReadSurfaceTests(unittest.TestCase):
         }
         with (
             patch.object(
-                read_surface.base,
-                "_audit_records_snapshot",
+                read_surface,
+                "_audit_projection_records_snapshot",
                 return_value=(records, status),
             ),
             patch.object(read_surface.base, "_verify_audit_log", return_value=status),
@@ -1560,8 +1565,8 @@ class ReadSurfaceTests(unittest.TestCase):
         }
         with (
             patch.object(
-                read_surface.base,
-                "_audit_records_snapshot",
+                read_surface,
+                "_audit_projection_records_snapshot",
                 return_value=([record], status),
             ),
             patch.object(read_surface.base, "_verify_audit_log", return_value=status),
@@ -1597,8 +1602,8 @@ class ReadSurfaceTests(unittest.TestCase):
         }
         with (
             patch.object(
-                read_surface.base,
-                "_audit_records_snapshot",
+                read_surface,
+                "_audit_projection_records_snapshot",
                 return_value=(records, status),
             ),
             patch.object(read_surface.base, "_verify_audit_log", return_value=status),
@@ -1615,8 +1620,8 @@ class ReadSurfaceTests(unittest.TestCase):
 
     def test_audit_projection_fails_closed_for_invalid_chain(self) -> None:
         with patch.object(
-            read_surface.base,
-            "_audit_records_snapshot",
+            read_surface,
+            "_audit_projection_records_snapshot",
             side_effect=ValueError("previous-hash-mismatch"),
         ):
             with self.assertRaisesRegex(RuntimeError, "previous-hash-mismatch"):
@@ -1653,8 +1658,8 @@ class ReadSurfaceTests(unittest.TestCase):
         }
         with (
             patch.object(
-                read_surface.base,
-                "_audit_records_snapshot",
+                read_surface,
+                "_audit_projection_records_snapshot",
                 return_value=(records, before),
             ),
             patch.object(read_surface.base, "_verify_audit_log", return_value=after),
@@ -1696,8 +1701,8 @@ class ReadSurfaceTests(unittest.TestCase):
         }
         with (
             patch.object(
-                read_surface.base,
-                "_audit_records_snapshot",
+                read_surface,
+                "_audit_projection_records_snapshot",
                 return_value=([record], status),
             ),
             patch.object(read_surface.base, "_verify_audit_log", return_value=status),
@@ -1747,8 +1752,8 @@ class ReadSurfaceTests(unittest.TestCase):
         original = read_surface._audit_timestamp_unix
         with (
             patch.object(
-                read_surface.base,
-                "_audit_records_snapshot",
+                read_surface,
+                "_audit_projection_records_snapshot",
                 return_value=(records, status),
             ),
             patch.object(read_surface.base, "_verify_audit_log", return_value=status),
@@ -1760,6 +1765,137 @@ class ReadSurfaceTests(unittest.TestCase):
             read_surface.grabowski_audit_projection()
         self.assertEqual(parser.call_count, len(records))
 
+
+    def test_audit_projection_snapshot_stops_after_latest_scan_limit(self) -> None:
+        active_records = [
+            {
+                "operation": "new-a",
+                "timestamp": "2026-09-23T09:00:00+00:00",
+                "record_sha256": "a" * 64,
+            },
+            {
+                "operation": "new-b",
+                "timestamp": "2026-09-23T09:01:00+00:00",
+                "record_sha256": "b" * 64,
+            },
+        ]
+        archived_records = [
+            {
+                "operation": "old",
+                "timestamp": "2026-09-01T09:00:00+00:00",
+                "record_sha256": "c" * 64,
+            }
+        ]
+        def encode(records):
+            return b"".join(
+                (
+                    json.dumps(record, sort_keys=True, separators=(",", ":"))
+                    + "\n"
+                ).encode("utf-8")
+                for record in records
+            )
+        archived = types.SimpleNamespace(
+            path=Path("/tmp/archive.jsonl"),
+            records=1,
+            legacy_records=0,
+            v2_records=1,
+            bytes=len(encode(archived_records)),
+            active=False,
+        )
+        active = types.SimpleNamespace(
+            path=Path("/tmp/write-audit.jsonl"),
+            records=2,
+            legacy_records=0,
+            v2_records=2,
+            bytes=len(encode(active_records)),
+            active=True,
+        )
+        snapshot = types.SimpleNamespace(
+            active_path=active.path,
+            segments=(archived, active),
+            total_records=3,
+            archived_segment_count=1,
+            legacy_rotation_compatibility=False,
+            last_record_sha256="b" * 64,
+        )
+
+        def load(segment):
+            if segment is active:
+                return encode(active_records)
+            self.fail("older segment must not load after the scan limit is reached")
+
+        with (
+            patch.object(
+                read_surface.audit_query,
+                "capture_verified_audit_snapshot",
+                return_value=snapshot,
+            ),
+            patch.object(read_surface.audit_query, "MAX_SCAN_RECORDS", 2),
+            patch.object(read_surface.audit_query, "_load_snapshot_segment", side_effect=load),
+            patch.object(
+                read_surface.base,
+                "_audit_capacity_status",
+                return_value={"audit_writable": True, "audit_state": "ready"},
+            ),
+        ):
+            records, status = read_surface._audit_projection_records_snapshot()
+
+        self.assertEqual([record["operation"] for record in records], ["new-a", "new-b"])
+        self.assertEqual(status["scanned_records"], 2)
+        self.assertEqual(status["total_records"], 3)
+        self.assertTrue(status["scan_truncated"])
+
+    def test_audit_projection_marks_truncated_scan_as_incomplete(self) -> None:
+        now = 1_800_000_000
+        records = [
+            {
+                "operation": "task-start",
+                "timestamp": datetime.fromtimestamp(
+                    now - offset, tz=timezone.utc
+                ).isoformat(),
+                "record_sha256": f"{index:064x}",
+            }
+            for index, offset in enumerate((120, 60), start=1)
+        ]
+        status = {
+            "valid": True,
+            "total_records": 10,
+            "total_legacy_records": 0,
+            "last_record_sha256": records[-1]["record_sha256"],
+            "archived_segment_count": 2,
+            "audit_writable": True,
+            "scanned_records": len(records),
+            "scan_limit": len(records),
+            "scan_truncated": True,
+            "scan_order": "latest_records",
+        }
+        after = {
+            **status,
+            "total_records": 10,
+        }
+        with (
+            patch.object(
+                read_surface,
+                "_audit_projection_records_snapshot",
+                return_value=(records, status),
+            ),
+            patch.object(read_surface.base, "_verify_audit_log", return_value=after),
+            patch.object(read_surface.time, "time", return_value=now),
+        ):
+            result = read_surface.grabowski_audit_projection()
+
+        self.assertEqual(result["source_binding"]["record_count"], 2)
+        self.assertEqual(result["source_binding"]["total_record_count"], 10)
+        self.assertTrue(result["source_binding"]["scan_truncated"])
+        self.assertFalse(result["all_time"]["coverage_complete"])
+        self.assertTrue(all(not item["coverage_complete"] for item in result["windows"]))
+        self.assertEqual(result["warnings"][0]["code"], "audit_projection_scan_truncated")
+        self.assertIn(
+            "complete_all_time_counts",
+            result["does_not_establish"],
+        )
+
+
     def test_audit_projection_rejects_snapshot_binding_mismatch(self) -> None:
         record = {
             "operation": "task-start",
@@ -1769,11 +1905,12 @@ class ReadSurfaceTests(unittest.TestCase):
         status = {
             "valid": True,
             "total_records": 2,
+            "scanned_records": 2,
             "last_record_sha256": "a" * 64,
         }
         with patch.object(
-            read_surface.base,
-            "_audit_records_snapshot",
+            read_surface,
+            "_audit_projection_records_snapshot",
             return_value=([record], status),
         ):
             with self.assertRaisesRegex(RuntimeError, "snapshot binding mismatch"):
@@ -1800,8 +1937,8 @@ class ReadSurfaceTests(unittest.TestCase):
         }
         with (
             patch.object(
-                read_surface.base,
-                "_audit_records_snapshot",
+                read_surface,
+                "_audit_projection_records_snapshot",
                 return_value=([record], status),
             ),
             patch.object(read_surface.base, "_verify_audit_log", return_value=status),
@@ -1967,8 +2104,8 @@ class BureauFailureIdentityProjectionTests(unittest.TestCase):
         }
         with (
             patch.object(
-                read_surface.base,
-                "_audit_records_snapshot",
+                read_surface,
+                "_audit_projection_records_snapshot",
                 return_value=(records, status),
             ),
             patch.object(read_surface.base, "_verify_audit_log", return_value=status),
