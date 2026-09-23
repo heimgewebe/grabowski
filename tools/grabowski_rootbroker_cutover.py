@@ -15,6 +15,7 @@ from pathlib import Path, PurePosixPath
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 from typing import Any, Callable
@@ -3291,9 +3292,28 @@ def main() -> int:
     return 0 if result.get("success", result.get("ready", False)) else 1
 
 
+MAX_FATAL_ERROR_STDERR_CHARS = 1000
+
+
+def _emit_fatal_error(exc: Exception) -> None:
+    detail = " ".join(str(exc).splitlines()).strip()
+    projected = f"rootbroker-cutover-error: {type(exc).__name__}: {detail}"
+    try:
+        print(projected[:MAX_FATAL_ERROR_STDERR_CHARS], file=sys.stderr)
+    except (OSError, ValueError):
+        pass
+    print(
+        json.dumps(
+            {"success": False, "error": str(exc)},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+
+
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Exception as exc:
-        print(json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False, sort_keys=True))
+        _emit_fatal_error(exc)
         raise SystemExit(2)
