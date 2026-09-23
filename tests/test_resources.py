@@ -5375,6 +5375,7 @@ class ResourceTests(unittest.TestCase):
                     {
                         "code": "worktree-convergence-required",
                         "path": str(self.root / "retained"),
+                        "state": "completed_retained",
                     }
                 ],
                 "read_only": True,
@@ -5393,6 +5394,68 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(calls[0]["mode"], "convergence")
         self.assertEqual(result["work_admission"][0]["decision"], "converge_first")
         self.assertIsNotNone(resources.inspect_resource(f"repo:{self.root}"))
+
+    def test_internal_convergence_mode_rejects_reconciliation_converge_first(self) -> None:
+        (self.root / ".git").mkdir()
+
+        def assessor(**kwargs: object) -> dict[str, object]:
+            self.assertEqual(kwargs["mode"], "convergence")
+            return {
+                "schema_version": 1,
+                "decision": "converge_first",
+                "assessment_sha256": "e" * 64,
+                "blocker_codes": ["binding-reconciliation-blocking"],
+                "blockers": [
+                    {
+                        "code": "binding-reconciliation-blocking",
+                        "checkout_key": "checkout-a",
+                        "state": "managed_lifecycle_drift",
+                    }
+                ],
+                "read_only": True,
+            }
+
+        with self.assertRaises(work_admission.WorkAdmissionBlocked):
+            resources.acquire_resources(
+                "owner-a",
+                [f"repo:{self.root}"],
+                purpose="reject reconciliation during convergence",
+                ttl_seconds=60,
+                admission_assessor=assessor,
+                _work_admission_mode="convergence",
+            )
+        self.assertIsNone(resources.inspect_resource(f"repo:{self.root}"))
+
+    def test_internal_convergence_mode_rejects_nonterminal_worktree(self) -> None:
+        (self.root / ".git").mkdir()
+
+        def assessor(**kwargs: object) -> dict[str, object]:
+            self.assertEqual(kwargs["mode"], "convergence")
+            return {
+                "schema_version": 1,
+                "decision": "converge_first",
+                "assessment_sha256": "f" * 64,
+                "blocker_codes": ["worktree-convergence-required"],
+                "blockers": [
+                    {
+                        "code": "worktree-convergence-required",
+                        "path": str(self.root / "active"),
+                        "state": "managed_active_attention",
+                    }
+                ],
+                "read_only": True,
+            }
+
+        with self.assertRaises(work_admission.WorkAdmissionBlocked):
+            resources.acquire_resources(
+                "owner-a",
+                [f"repo:{self.root}"],
+                purpose="reject nonterminal worktree during convergence",
+                ttl_seconds=60,
+                admission_assessor=assessor,
+                _work_admission_mode="convergence",
+            )
+        self.assertIsNone(resources.inspect_resource(f"repo:{self.root}"))
 
     def test_internal_convergence_mode_still_rejects_blocked(self) -> None:
         (self.root / ".git").mkdir()

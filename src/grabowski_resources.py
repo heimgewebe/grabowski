@@ -5589,10 +5589,25 @@ def acquire_resources(
                 if not isinstance(assessment, dict):
                     raise RuntimeError("work admission assessor returned invalid evidence")
                 admission_decision = assessment.get("decision")
-                if admission_decision != "allow" and not (
+                convergence_blockers = assessment.get("blockers")
+                terminal_convergence_only = (
                     admission_mode == "convergence"
                     and admission_decision == "converge_first"
-                ):
+                    and isinstance(convergence_blockers, list)
+                    and bool(convergence_blockers)
+                    and all(
+                        isinstance(item, dict)
+                        and item.get("code")
+                        in {
+                            "foreign-lifecycle-owner",
+                            "worktree-convergence-required",
+                        }
+                        and item.get("state")
+                        in work_admission.FOREIGN_LIFECYCLE_OWNER_CONVERGENCE_STATES
+                        for item in convergence_blockers
+                    )
+                )
+                if admission_decision != "allow" and not terminal_convergence_only:
                     raise work_admission.WorkAdmissionBlocked(assessment)
                 if assessment.get("read_only") is not True:
                     raise RuntimeError(
