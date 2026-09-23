@@ -329,6 +329,235 @@ class ResourceTests(unittest.TestCase):
                 ).fetchone()
             )
 
+    def test_schema_v3_missing_reconcile_revision_contract_is_backed_up_and_promoted(self) -> None:
+        resources.acquire_resources(
+            "owner-before-reconcile-contract",
+            ["component:reconcile-contract-fixture"],
+            purpose="preserve resource store before reconcile revision promotion",
+            ttl_seconds=120,
+        )
+        with sqlite3.connect(self.database) as connection:
+            trigger_names = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='trigger' AND name LIKE 'resource_reconcile_%_v1'"
+                )
+            ]
+            for trigger_name in trigger_names:
+                connection.execute(f'DROP TRIGGER "{trigger_name}"')
+            connection.execute(
+                "DELETE FROM metadata WHERE key IN (?, ?)",
+                (
+                    resources.RESOURCE_RECONCILE_REVISION_CONTRACT_METADATA_KEY,
+                    resources.RESOURCE_RECONCILE_REVISION_METADATA_KEY,
+                ),
+            )
+            connection.commit()
+
+        self.assertEqual(
+            "3:reconcile-revision-contract-missing",
+            resources._preflight_resource_store(),
+        )
+
+        self.assertEqual(1, resources.count_resources())
+
+        with sqlite3.connect(self.database) as connection:
+            metadata = dict(connection.execute("SELECT key, value FROM metadata"))
+            self.assertEqual(
+                resources.RESOURCE_RECONCILE_REVISION_CONTRACT_VERSION,
+                metadata[resources.RESOURCE_RECONCILE_REVISION_CONTRACT_METADATA_KEY],
+            )
+            revision_token = metadata[
+                resources.RESOURCE_RECONCILE_REVISION_METADATA_KEY
+            ]
+            self.assertRegex(revision_token, r"\A[0-9a-f]{64}\Z")
+            observed_triggers = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='trigger' AND name LIKE 'resource_reconcile_%_v1'"
+                )
+            }
+        self.assertEqual(
+            set(resources._resource_reconcile_revision_trigger_sql()),
+            observed_triggers,
+        )
+
+        backups = self._resource_migration_backups()
+        self.assertEqual(1, len(backups))
+        with sqlite3.connect(backups[0]) as backup:
+            backup_metadata = dict(backup.execute("SELECT key, value FROM metadata"))
+            self.assertNotIn(
+                resources.RESOURCE_RECONCILE_REVISION_CONTRACT_METADATA_KEY,
+                backup_metadata,
+            )
+            self.assertNotIn(
+                resources.RESOURCE_RECONCILE_REVISION_METADATA_KEY,
+                backup_metadata,
+            )
+            self.assertEqual(
+                [],
+                backup.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='trigger' AND name LIKE 'resource_reconcile_%_v1'"
+                ).fetchall(),
+            )
+
+    def test_resource_reconcile_revision_trigger_tracks_direct_sql_mutation(self) -> None:
+        terminalization = self._pending_terminalization(
+            "d" * 24,
+            prepared_at_unix=100,
+        )
+        before = resources._reconcile_revision_snapshot()
+        self.assertIsNotNone(before)
+        assert before is not None
+        before_revision = before["revision"]
+
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE task_terminalizations "
+                "SET recovery_status='recovered_legacy_row_first' "
+                "WHERE task_id=?",
+                (terminalization["task_id"],),
+            )
+            connection.commit()
+
+        after = resources._reconcile_revision_snapshot()
+        self.assertIsNotNone(after)
+        assert after is not None
+        self.assertRegex(before_revision, r"\A[0-9a-f]{64}\Z")
+        self.assertRegex(after["revision"], r"\A[0-9a-f]{64}\Z")
+        self.assertNotEqual(before_revision, after["revision"])
+
+    def test_resource_reconcile_revision_trigger_rejects_malformed_token(self) -> None:
+        terminalization = self._pending_terminalization(
+            "e" * 24,
+            prepared_at_unix=101,
+        )
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE metadata SET value='broken' WHERE key=?",
+                (resources.RESOURCE_RECONCILE_REVISION_METADATA_KEY,),
+            )
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "resource reconcile revision token is invalid",
+            ):
+                connection.execute(
+                    "UPDATE task_terminalizations "
+                    "SET recovery_status='recovered_legacy_row_first' "
+                    "WHERE task_id=?",
+                    (terminalization["task_id"],),
+                )
+            connection.rollback()
+
+        with sqlite3.connect(self.database) as connection:
+            recovery_status = connection.execute(
+                "SELECT recovery_status FROM task_terminalizations WHERE task_id=?",
+                (terminalization["task_id"],),
+            ).fetchone()[0]
+        self.assertNotEqual("recovered_legacy_row_first", recovery_status)
+
+
+    def test_resource_reconcile_revision_trigger_rejects_blob_token(self) -> None:
+        terminalization = self._pending_terminalization(
+            "f" * 24,
+            prepared_at_unix=102,
+        )
+        with sqlite3.connect(self.database) as connection:
+            before_status = connection.execute(
+                "SELECT recovery_status FROM task_terminalizations WHERE task_id=?",
+                (terminalization["task_id"],),
+            ).fetchone()[0]
+            connection.execute(
+                "UPDATE metadata SET value=zeroblob(64) WHERE key=?",
+                (resources.RESOURCE_RECONCILE_REVISION_METADATA_KEY,),
+            )
+            self.assertEqual(
+                ("blob", 64),
+                connection.execute(
+                    "SELECT typeof(value), length(value) FROM metadata WHERE key=?",
+                    (resources.RESOURCE_RECONCILE_REVISION_METADATA_KEY,),
+                ).fetchone(),
+            )
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "resource reconcile revision token is invalid",
+            ):
+                connection.execute(
+                    "UPDATE task_terminalizations "
+                    "SET recovery_status='recovered_legacy_row_first' "
+                    "WHERE task_id=?",
+                    (terminalization["task_id"],),
+                )
+            connection.rollback()
+
+        with sqlite3.connect(self.database) as connection:
+            after_status = connection.execute(
+                "SELECT recovery_status FROM task_terminalizations WHERE task_id=?",
+                (terminalization["task_id"],),
+            ).fetchone()[0]
+        self.assertEqual(before_status, after_status)
+
+    def test_resource_reconcile_revision_tracks_replace_task_lease_to_non_task(
+        self,
+    ) -> None:
+        resource_key = "service:reconcile-resource-replace.service"
+        resources.acquire_resources(
+            "task:replace-resource-owner",
+            [resource_key],
+            purpose="prove REPLACE cannot bypass reconcile revision tracking",
+            ttl_seconds=60,
+        )
+        before = resources._reconcile_revision_snapshot()
+        self.assertIsNotNone(before)
+        assert before is not None
+
+        with sqlite3.connect(self.database) as connection:
+            connection.execute("PRAGMA recursive_triggers=OFF")
+            self.assertEqual(
+                0, connection.execute("PRAGMA recursive_triggers").fetchone()[0]
+            )
+            columns = [
+                str(row[1]) for row in connection.execute("PRAGMA table_info(leases)")
+            ]
+            row = list(
+                connection.execute(
+                    "SELECT * FROM leases WHERE resource_key=?", (resource_key,)
+                ).fetchone()
+            )
+            row[columns.index("owner_id")] = "operator:replacement-proof"
+            names = ", ".join(f'"{name}"' for name in columns)
+            placeholders = ", ".join("?" for _ in columns)
+            connection.execute(
+                f"INSERT OR REPLACE INTO leases ({names}) VALUES ({placeholders})",
+                row,
+            )
+            connection.commit()
+
+        after = resources._reconcile_revision_snapshot()
+        self.assertIsNotNone(after)
+        assert after is not None
+        self.assertNotEqual(before["revision"], after["revision"])
+
+    def test_resource_reconcile_revision_ignores_unrelated_lease(self) -> None:
+        with resources._database():
+            pass
+        before = resources._reconcile_revision_snapshot()
+        self.assertIsNotNone(before)
+        assert before is not None
+        resources.acquire_resources(
+            "reconcile-non-task-owner",
+            ["component:reconcile-non-task-lease"],
+            purpose="prove unrelated leases do not churn reconcile cursors",
+            ttl_seconds=60,
+        )
+        after = resources._reconcile_revision_snapshot()
+        self.assertIsNotNone(after)
+        assert after is not None
+        self.assertEqual(before["revision"], after["revision"])
+
     def test_lease_projection_read_guard_pins_contract_and_rows_to_one_snapshot(self) -> None:
         key = "component:lease-snapshot-proof"
         resources.acquire_resources(
@@ -3215,6 +3444,97 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(before, self.database.read_bytes())
         self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
         self.assertEqual(before_names, sorted(item.name for item in self.database.parent.iterdir()))
+
+
+    def test_resource_schema_inventory_requires_missing_reconcile_revision_contract(
+        self,
+    ) -> None:
+        connection = resources._database()
+        connection.close()
+        with sqlite3.connect(self.database) as connection:
+            for trigger_name in resources._resource_reconcile_revision_trigger_sql():
+                connection.execute(f'DROP TRIGGER "{trigger_name}"')
+            connection.execute(
+                "DELETE FROM metadata WHERE key IN (?, ?)",
+                (
+                    resources.RESOURCE_RECONCILE_REVISION_CONTRACT_METADATA_KEY,
+                    resources.RESOURCE_RECONCILE_REVISION_METADATA_KEY,
+                ),
+            )
+            connection.commit()
+        before = self.database.read_bytes()
+
+        inventory = resources.grabowski_resource_list(schema_only=True)
+
+        self.assertEqual("3", inventory["observed_version"])
+        self.assertEqual("1", inventory["lease_contract_observed_version"])
+        self.assertEqual("current", inventory["lease_contract_status"])
+        self.assertIsNone(
+            inventory["reconcile_revision_contract_observed_version"]
+        )
+        self.assertEqual(
+            "1", inventory["reconcile_revision_contract_current_version"]
+        )
+        self.assertEqual(
+            "missing", inventory["reconcile_revision_contract_status"]
+        )
+        self.assertEqual(
+            "reconcile_revision_contract_required", inventory["status"]
+        )
+        self.assertTrue(inventory["migration_required"])
+        self.assertFalse(inventory["write_compatible"])
+        self.assertEqual(
+            "open_with_current_runtime_to_publish_reconcile_revision_contract",
+            inventory["required_action"],
+        )
+        self.assertEqual(before, self.database.read_bytes())
+
+    def test_resource_schema_inventory_blocks_missing_reconcile_revision_trigger(
+        self,
+    ) -> None:
+        connection = resources._database()
+        connection.close()
+        with sqlite3.connect(self.database) as connection:
+            connection.execute("DROP TRIGGER resource_reconcile_leases_update_v1")
+            connection.commit()
+
+        inventory = resources.grabowski_resource_list(schema_only=True)
+
+        self.assertEqual("blocked", inventory["status"])
+        self.assertEqual(
+            "blocked", inventory["reconcile_revision_contract_status"]
+        )
+        self.assertFalse(inventory["write_compatible"])
+        self.assertFalse(inventory["migration_required"])
+        self.assertIn(
+            "Resource reconcile revision triggers are incomplete or drifted",
+            inventory["error"],
+        )
+
+    def test_resource_schema_inventory_blocks_malformed_reconcile_revision_token(
+        self,
+    ) -> None:
+        connection = resources._database()
+        connection.close()
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE metadata SET value='broken' WHERE key=?",
+                (resources.RESOURCE_RECONCILE_REVISION_METADATA_KEY,),
+            )
+            connection.commit()
+
+        inventory = resources.grabowski_resource_list(schema_only=True)
+
+        self.assertEqual("blocked", inventory["status"])
+        self.assertEqual(
+            "blocked", inventory["reconcile_revision_contract_status"]
+        )
+        self.assertFalse(inventory["write_compatible"])
+        self.assertFalse(inventory["migration_required"])
+        self.assertIn(
+            "Resource reconcile revision token is malformed",
+            inventory["error"],
+        )
 
     def test_resource_schema_inventory_blocks_if_wal_appears_during_immutable_read(self) -> None:
         connection = resources._database()

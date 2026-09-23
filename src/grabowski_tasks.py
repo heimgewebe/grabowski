@@ -61,8 +61,27 @@ TASK_RECONCILE_CHECK_LIMIT = 200
 TASK_RECONCILE_CHECK_MAX_BYTES = 1024 * 1024
 TASK_RECONCILE_CHECK_CURSOR_SCOPE = "task-reconcile-check-v1"
 TASK_RECONCILE_CHECK_CURSOR_ALGORITHM = "sqlite-row-stream-v1"
-TASK_RECONCILE_CHECK_CURSOR_CURRENT_SCOPE = (
+TASK_RECONCILE_CHECK_CURSOR_REVISION_ALGORITHM = "sqlite-revision-v2"
+TASK_RECONCILE_CHECK_CURSOR_ROW_STREAM_SCOPE = (
     f"{TASK_RECONCILE_CHECK_CURSOR_SCOPE}:{TASK_RECONCILE_CHECK_CURSOR_ALGORITHM}"
+)
+TASK_RECONCILE_CHECK_CURSOR_CURRENT_SCOPE = (
+    f"{TASK_RECONCILE_CHECK_CURSOR_SCOPE}:"
+    f"{TASK_RECONCILE_CHECK_CURSOR_REVISION_ALGORITHM}"
+)
+TASK_RECONCILE_REVISION_CONTRACT_METADATA_KEY = (
+    "task_reconcile_snapshot_revision_contract_v1"
+)
+TASK_RECONCILE_REVISION_METADATA_KEY = "task_reconcile_snapshot_revision_v1"
+TASK_RECONCILE_REVISION_CONTRACT_VERSION = "1"
+TASK_RECONCILE_CANDIDATE_STATES = (
+    "failed",
+    "interrupted",
+    "launching",
+    "outcome_unknown",
+    "running",
+    "signalled",
+    "timed_out",
 )
 TASK_RECONCILE_CURSOR_METADATA_KEY = "task_reconcile_refresh_cursor_v1"
 TASK_RECONCILE_CYCLE_VERSION = 2
@@ -1394,6 +1413,139 @@ def _task_indexes(connection: sqlite3.Connection) -> set[str]:
     }
 
 
+def _normalize_reconcile_contract_sql(value: str) -> str:
+    return " ".join(value.split())
+
+
+def _task_reconcile_revision_trigger_sql() -> dict[str, str]:
+    states = ", ".join(f"'{state}'" for state in TASK_RECONCILE_CANDIDATE_STATES)
+    bump = (
+        "SELECT CASE WHEN (SELECT COUNT(*) FROM metadata "
+        f"WHERE key='{TASK_RECONCILE_REVISION_METADATA_KEY}' "
+        "AND typeof(value)='text' "
+        "AND length(value)=64 "
+        "AND value NOT GLOB '*[^0-9a-f]*')=1 "
+        "THEN 1 ELSE RAISE(ABORT, 'task reconcile revision token is invalid') END; "
+        "UPDATE metadata SET value=lower(hex(randomblob(32))) "
+        f"WHERE key='{TASK_RECONCILE_REVISION_METADATA_KEY}';"
+    )
+    return {
+        "task_reconcile_revision_insert_v1": (
+            "CREATE TRIGGER task_reconcile_revision_insert_v1 "
+            "BEFORE INSERT ON tasks "
+            f"WHEN NEW.state IN ({states}) "
+            "OR EXISTS (SELECT 1 FROM tasks "
+            "WHERE task_id=NEW.task_id "
+            f"AND state IN ({states})) "
+            f"BEGIN {bump} END"
+        ),
+        "task_reconcile_revision_update_v1": (
+            "CREATE TRIGGER task_reconcile_revision_update_v1 "
+            "AFTER UPDATE ON tasks "
+            f"WHEN OLD.state IN ({states}) OR NEW.state IN ({states}) "
+            f"BEGIN {bump} END"
+        ),
+        "task_reconcile_revision_delete_v1": (
+            "CREATE TRIGGER task_reconcile_revision_delete_v1 "
+            "AFTER DELETE ON tasks "
+            f"WHEN OLD.state IN ({states}) "
+            f"BEGIN {bump} END"
+        ),
+    }
+
+
+def _task_reconcile_revision_contract(
+    connection: sqlite3.Connection,
+    *,
+    required: bool = True,
+) -> dict[str, Any] | None:
+    contract_rows = connection.execute(
+        "SELECT value FROM metadata WHERE key=?",
+        (TASK_RECONCILE_REVISION_CONTRACT_METADATA_KEY,),
+    ).fetchall()
+    revision_rows = connection.execute(
+        "SELECT value FROM metadata WHERE key=?",
+        (TASK_RECONCILE_REVISION_METADATA_KEY,),
+    ).fetchall()
+    expected_triggers = _task_reconcile_revision_trigger_sql()
+    placeholders = ",".join("?" for _ in expected_triggers)
+    trigger_rows = connection.execute(
+        "SELECT name, tbl_name, sql FROM sqlite_master "
+        f"WHERE type='trigger' AND name IN ({placeholders})",
+        tuple(expected_triggers),
+    ).fetchall()
+    if not contract_rows and not revision_rows and not trigger_rows:
+        if required:
+            raise RuntimeError(
+                "Task reconcile revision contract is missing; open the store with "
+                "a compatible Grabowski writer before retrying"
+            )
+        return None
+    if len(contract_rows) != 1 or len(revision_rows) != 1:
+        raise RuntimeError(
+            "Task reconcile revision metadata is incomplete or ambiguous"
+        )
+    contract_version = str(contract_rows[0][0])
+    if contract_version != TASK_RECONCILE_REVISION_CONTRACT_VERSION:
+        raise RuntimeError(
+            "Unsupported task reconcile revision contract version; "
+            "use a compatible runtime"
+        )
+    revision_value = revision_rows[0][0]
+    if not isinstance(revision_value, str):
+        raise RuntimeError("Task reconcile revision token is malformed")
+    revision_text = revision_value
+    if (
+        len(revision_text) != 64
+        or revision_text != revision_text.lower()
+        or any(char not in "0123456789abcdef" for char in revision_text)
+    ):
+        raise RuntimeError("Task reconcile revision token is malformed")
+    observed = {}
+    for row in trigger_rows:
+        sql = row[2]
+        if not isinstance(sql, str):
+            raise RuntimeError("Task reconcile revision trigger SQL is missing")
+        observed[str(row[0])] = (
+            str(row[1]),
+            _normalize_reconcile_contract_sql(sql),
+        )
+    expected = {
+        name: ("tasks", _normalize_reconcile_contract_sql(sql))
+        for name, sql in expected_triggers.items()
+    }
+    if observed != expected:
+        raise RuntimeError("Task reconcile revision triggers are incomplete or drifted")
+    return {
+        "contract_version": contract_version,
+        "revision": revision_text,
+    }
+
+
+def _publish_task_reconcile_revision_contract(
+    connection: sqlite3.Connection,
+) -> dict[str, Any]:
+    existing = _task_reconcile_revision_contract(connection, required=False)
+    if existing is not None:
+        return existing
+    connection.execute(
+        "INSERT INTO metadata(key, value) VALUES(?, ?)",
+        (
+            TASK_RECONCILE_REVISION_CONTRACT_METADATA_KEY,
+            TASK_RECONCILE_REVISION_CONTRACT_VERSION,
+        ),
+    )
+    connection.execute(
+        "INSERT INTO metadata(key, value) VALUES(?, lower(hex(randomblob(32))))",
+        (TASK_RECONCILE_REVISION_METADATA_KEY,),
+    )
+    for sql in _task_reconcile_revision_trigger_sql().values():
+        connection.execute(sql)
+    published = _task_reconcile_revision_contract(connection)
+    assert published is not None
+    return published
+
+
 def _validate_task_schema_legacy(
     connection: sqlite3.Connection,
     version: str,
@@ -1454,6 +1606,11 @@ def _task_schema_inventory() -> dict[str, Any]:
         "observed_version": None,
         "current_version": TASK_CURRENT_SCHEMA_VERSION,
         "supported_versions": list(TASK_SUPPORTED_SCHEMA_VERSIONS),
+        "reconcile_revision_contract_observed_version": None,
+        "reconcile_revision_contract_current_version": (
+            TASK_RECONCILE_REVISION_CONTRACT_VERSION
+        ),
+        "reconcile_revision_contract_status": "uninitialized",
         "status": "uninitialized",
         "migration_required": False,
         "migration_path": [],
@@ -1494,6 +1651,27 @@ def _task_schema_inventory() -> dict[str, Any]:
                 return result
             if observed == TASK_CURRENT_SCHEMA_VERSION:
                 _validate_task_schema_current(connection)
+                try:
+                    reconcile_contract = _task_reconcile_revision_contract(
+                        connection,
+                        required=False,
+                    )
+                except RuntimeError as exc:
+                    result.update(
+                        status="blocked",
+                        reconcile_revision_contract_status="blocked",
+                        required_action="restore_or_inspect_store",
+                        recovery_instruction=TASK_SCHEMA_RECOVERY_INSTRUCTION,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                    return result
+                if reconcile_contract is None:
+                    result["reconcile_revision_contract_status"] = "missing"
+                else:
+                    result["reconcile_revision_contract_observed_version"] = (
+                        reconcile_contract["contract_version"]
+                    )
+                    result["reconcile_revision_contract_status"] = "current"
             else:
                 _validate_task_schema_legacy(connection, observed)
     except TaskSchemaInventoryChanged as exc:
@@ -1516,6 +1694,28 @@ def _task_schema_inventory() -> dict[str, Any]:
         )
         return result
     if observed == TASK_CURRENT_SCHEMA_VERSION:
+        if reconcile_contract is None:
+            result.update(
+                status="reconcile_revision_contract_required",
+                migration_required=True,
+                required_action=(
+                    "open_with_current_runtime_to_publish_reconcile_revision_contract"
+                ),
+                migration_path=[
+                    {
+                        "from": TASK_CURRENT_SCHEMA_VERSION,
+                        "to": TASK_CURRENT_SCHEMA_VERSION,
+                        "reconcile_revision_contract_from": None,
+                        "reconcile_revision_contract_to": (
+                            TASK_RECONCILE_REVISION_CONTRACT_VERSION
+                        ),
+                        "lock": "exclusive_store_directory",
+                        "transaction": "immediate",
+                        "verified_backup_required": True,
+                    }
+                ],
+            )
+            return result
         result.update(status="current", write_compatible=True, required_action="none")
         return result
     path = TASK_SCHEMA_MIGRATION_PATHS[observed]
@@ -1556,7 +1756,10 @@ def _validate_task_backup(
         _sqlite_integrity(backup, "Task migration backup")
         if _task_schema_version(backup) != version:
             raise RuntimeError("Task migration backup schema version does not match")
-        _validate_task_schema_legacy(backup, version)
+        if version == TASK_CURRENT_SCHEMA_VERSION:
+            _validate_task_schema_current(backup)
+        else:
+            _validate_task_schema_legacy(backup, version)
         if _sqlite_fingerprint(backup) != fingerprint:
             raise RuntimeError("Task migration backup fingerprint does not match")
 
@@ -1633,6 +1836,11 @@ def _preflight_task_store() -> str | None:
             )
         if version == "5":
             _validate_task_schema_current(connection)
+            if _task_reconcile_revision_contract(
+                connection,
+                required=False,
+            ) is None:
+                return "5:reconcile-revision-contract-missing"
         else:
             _validate_task_schema_legacy(connection, version)
         return version
@@ -1755,6 +1963,7 @@ def _open_current_task_database() -> sqlite3.Connection:
                 "Task database schema changed while opening; retry with a compatible runtime"
             )
         _validate_task_schema_current(connection)
+        _task_reconcile_revision_contract(connection)
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=FULL")
         connection.execute("PRAGMA foreign_keys=ON")
@@ -1803,6 +2012,12 @@ def _database() -> sqlite3.Connection:
                 _create_task_schema_v5(connection)
             elif version == "5":
                 _validate_task_schema_current(connection)
+                if _task_reconcile_revision_contract(
+                    connection, required=False
+                ) is None:
+                    _sqlite_integrity(connection, "Task database")
+                    fingerprint = _sqlite_fingerprint(connection)
+                    _verified_task_migration_backup(version, fingerprint)
             else:
                 _validate_task_schema_legacy(connection, version)
                 _sqlite_integrity(connection, "Task database")
@@ -1817,9 +2032,11 @@ def _database() -> sqlite3.Connection:
                 "CREATE INDEX IF NOT EXISTS tasks_created_task_idx "
                 "ON tasks(created_at_unix DESC, task_id DESC)"
             )
+            _publish_task_reconcile_revision_contract(connection)
             if _task_schema_version(connection) != "5":
                 raise RuntimeError("Task database migration did not reach schema 5")
             _validate_task_schema_current(connection)
+            _task_reconcile_revision_contract(connection)
             _sqlite_integrity(connection, "Migrated task database")
             connection.commit()
             connection.execute("PRAGMA journal_mode=WAL")
@@ -10346,19 +10563,7 @@ def _reconcile_observe_denial(record: dict[str, Any], exc: PermissionError) -> d
 
 
 def _reconcile_candidate_states() -> tuple[str, ...]:
-    return tuple(
-        sorted(
-            {
-                "launching",
-                "running",
-                "outcome_unknown",
-                "interrupted",
-                "failed",
-                "timed_out",
-                "signalled",
-            }
-        )
-    )
+    return TASK_RECONCILE_CANDIDATE_STATES
 
 
 def _update_sqlite_revision_digest(
@@ -10453,6 +10658,11 @@ def _sqlite_rows_revisions_for_legacy_cursor(
 
 def _reconcile_resource_store_revision() -> dict[str, Any]:
     version = resources._preflight_resource_store()
+    if version == (
+        f"{resources.RESOURCE_CURRENT_SCHEMA_VERSION}:"
+        "reconcile-revision-contract-missing"
+    ):
+        version = resources.RESOURCE_CURRENT_SCHEMA_VERSION
     if version is None:
         return {"present": False, "schema_version": None, "tables": {}}
     with resources._resource_readonly_sqlite(resources.RESOURCE_DB) as connection:
@@ -10492,6 +10702,11 @@ def _reconcile_resource_store_revision() -> dict[str, Any]:
 def _reconcile_resource_store_revisions_for_legacy_cursor(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     version = resources._preflight_resource_store()
+    if version == (
+        f"{resources.RESOURCE_CURRENT_SCHEMA_VERSION}:"
+        "reconcile-revision-contract-missing"
+    ):
+        version = resources.RESOURCE_CURRENT_SCHEMA_VERSION
     if version is None:
         current = {"present": False, "schema_version": None, "tables": {}}
         legacy = {"present": False, "schema_version": None, "tables": {}}
@@ -10563,6 +10778,31 @@ def _reconcile_check_store_snapshot(
     return {**material, "snapshot_sha256": _sha256_json(material)}
 
 
+def _reconcile_check_revision_snapshot(
+    task_connection: sqlite3.Connection,
+) -> dict[str, Any] | None:
+    task_revision = _task_reconcile_revision_contract(
+        task_connection,
+        required=False,
+    )
+    if task_revision is None:
+        return None
+    resource_revision = resources._reconcile_revision_snapshot()
+    if resource_revision is None:
+        return None
+    material = {
+        "schema_version": 2,
+        "algorithm": TASK_RECONCILE_CHECK_CURSOR_REVISION_ALGORITHM,
+        "task_store": {
+            "present": True,
+            "schema_version": _task_schema_version(task_connection),
+            **task_revision,
+        },
+        "resource_store": resource_revision,
+    }
+    return {**material, "snapshot_sha256": _sha256_json(material)}
+
+
 def _reconcile_check_store_snapshots_for_legacy_cursor(
     task_connection: sqlite3.Connection,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -10612,6 +10852,19 @@ def _is_legacy_reconcile_check_cursor_scope(scope: str | None) -> bool:
     )
 
 
+def _is_row_stream_reconcile_check_cursor_scope(scope: str | None) -> bool:
+    if not isinstance(scope, str):
+        return False
+    prefix = TASK_RECONCILE_CHECK_CURSOR_ROW_STREAM_SCOPE + ":"
+    if not scope.startswith(prefix):
+        return False
+    snapshot_sha256 = scope[len(prefix) :]
+    return (
+        len(snapshot_sha256) == 64
+        and all(char in "0123456789abcdef" for char in snapshot_sha256)
+    )
+
+
 def _validate_reconcile_check_limit(limit: int) -> int:
     if (
         isinstance(limit, bool)
@@ -10637,40 +10890,78 @@ def _reconcile_check_candidate_page(
         connection.execute("SELECT 1 FROM tasks LIMIT 1").fetchone()
         cursor_scope = consumer_surface.decode_cursor_scope(cursor)
         legacy_cursor = _is_legacy_reconcile_check_cursor_scope(cursor_scope)
+        row_stream_cursor = _is_row_stream_reconcile_check_cursor_scope(
+            cursor_scope
+        )
         snapshot_started_ns = time.perf_counter_ns()
         legacy_snapshot: dict[str, Any] | None = None
         if legacy_cursor:
-            snapshot, legacy_snapshot = (
+            row_stream_snapshot, legacy_snapshot = (
                 _reconcile_check_store_snapshots_for_legacy_cursor(connection)
             )
+            legacy_scope = (
+                f"{TASK_RECONCILE_CHECK_CURSOR_SCOPE}:"
+                f"{legacy_snapshot['snapshot_sha256']}"
+            )
+            position = consumer_surface.decode_cursor(
+                cursor,
+                legacy_scope,
+                snapshot_scope=TASK_RECONCILE_CHECK_CURSOR_SCOPE,
+            )
+            snapshot = (
+                _reconcile_check_revision_snapshot(connection)
+                or row_stream_snapshot
+            )
+        elif row_stream_cursor:
+            row_stream_snapshot = _reconcile_check_store_snapshot(connection)
+            row_stream_scope = (
+                f"{TASK_RECONCILE_CHECK_CURSOR_ROW_STREAM_SCOPE}:"
+                f"{row_stream_snapshot['snapshot_sha256']}"
+            )
+            position = consumer_surface.decode_cursor(
+                cursor,
+                row_stream_scope,
+                snapshot_scope=TASK_RECONCILE_CHECK_CURSOR_ROW_STREAM_SCOPE,
+            )
+            snapshot = (
+                _reconcile_check_revision_snapshot(connection)
+                or row_stream_snapshot
+            )
         else:
-            snapshot = _reconcile_check_store_snapshot(connection)
+            snapshot = _reconcile_check_revision_snapshot(connection)
+            if snapshot is None:
+                if (
+                    isinstance(cursor_scope, str)
+                    and cursor_scope.startswith(
+                        TASK_RECONCILE_CHECK_CURSOR_CURRENT_SCOPE + ":"
+                    )
+                ):
+                    raise ValueError("cursor_snapshot_changed")
+                snapshot = _reconcile_check_store_snapshot(connection)
+            scope_for_decode = (
+                TASK_RECONCILE_CHECK_CURSOR_CURRENT_SCOPE
+                if snapshot.get("algorithm")
+                == TASK_RECONCILE_CHECK_CURSOR_REVISION_ALGORITHM
+                else TASK_RECONCILE_CHECK_CURSOR_ROW_STREAM_SCOPE
+            )
+            scope_value = f"{scope_for_decode}:{snapshot['snapshot_sha256']}"
+            position = consumer_surface.decode_cursor(
+                cursor,
+                scope_value,
+                snapshot_scope=scope_for_decode,
+            )
         snapshot_ms = round(
             (time.perf_counter_ns() - snapshot_started_ns) / 1_000_000,
             3,
         )
         query_started_ns = time.perf_counter_ns()
-        snapshot_scope = TASK_RECONCILE_CHECK_CURSOR_SCOPE
-        scope = (
-            f"{TASK_RECONCILE_CHECK_CURSOR_CURRENT_SCOPE}:"
-            f"{snapshot['snapshot_sha256']}"
+        output_scope = (
+            TASK_RECONCILE_CHECK_CURSOR_CURRENT_SCOPE
+            if snapshot.get("algorithm")
+            == TASK_RECONCILE_CHECK_CURSOR_REVISION_ALGORITHM
+            else TASK_RECONCILE_CHECK_CURSOR_ROW_STREAM_SCOPE
         )
-        if legacy_cursor:
-            assert legacy_snapshot is not None
-            legacy_scope = (
-                f"{snapshot_scope}:{legacy_snapshot['snapshot_sha256']}"
-            )
-            position = consumer_surface.decode_cursor(
-                cursor,
-                legacy_scope,
-                snapshot_scope=snapshot_scope,
-            )
-        else:
-            position = consumer_surface.decode_cursor(
-                cursor,
-                scope,
-                snapshot_scope=snapshot_scope,
-            )
+        scope = f"{output_scope}:{snapshot['snapshot_sha256']}"
         cursor_created_at: int | None = None
         cursor_task_id: str | None = None
         if position is not None:
