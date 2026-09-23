@@ -7770,6 +7770,7 @@ def _user_service_reconciliation_state(name: str) -> dict[str, str]:
             "show",
             name,
             "--no-pager",
+            "--all",
             "--property=LoadState",
             "--property=ActiveState",
             "--property=SubState",

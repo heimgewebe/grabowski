@@ -143,6 +143,24 @@ class UserServiceCoordinationTests(unittest.TestCase):
             set(resource_keys),
         )
 
+    def test_reconciliation_requests_empty_properties_explicitly(self) -> None:
+        fragment = ""
+        with patch.object(
+            operator,
+            "_run",
+            return_value=_result(stdout=_reconciliation(fragment=fragment)),
+        ) as run:
+            state = operator._user_service_reconciliation_state("demo.service")
+
+        self.assertEqual(state["Job"], "")
+        self.assertEqual(state["FragmentPath"], "")
+        argv = run.call_args.args[0]
+        self.assertIn("--all", argv)
+        self.assertEqual(
+            run.call_args.kwargs["timeout_seconds"],
+            operator._USER_SERVICE_RECONCILIATION_TIMEOUT_SECONDS,
+        )
+
     def test_completed_action_preserves_result_when_release_is_uncertain(self) -> None:
         fragment = "/home/alex/.config/systemd/user/demo.service"
         resources = _fake_resources()
