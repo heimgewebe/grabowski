@@ -55,12 +55,13 @@ SENSITIVE_PROBE_FIELD_TOKENS = (
     "apikey",
 )
 ALLOWED_SENSITIVE_METADATA_FIELDS = frozenset({"api_key_environment_scrubbed"})
-CLAUDE_AUTH_METHOD_BY_CODE = {1: "claude.ai"}
+CLAUDE_AUTH_METHOD_BY_CODE = {1: "claude.ai", 2: "oauth_token"}
 CLAUDE_SUBSCRIPTION_BY_CODE = {
     1: "pro",
     2: "max",
     3: "team",
     4: "enterprise",
+    5: "unknown",
 }
 
 
@@ -267,7 +268,12 @@ def _claude_auth_status_codes(value: Any) -> tuple[bool, int, int]:
     if not isinstance(value, dict):
         return False, 0, 0
     logged_in = value.get("loggedIn") is True
-    auth_method_code = 1 if value.get("authMethod") == "claude.ai" else 0
+    raw_auth_method = value.get("authMethod")
+    auth_method_code = 0
+    if raw_auth_method == "claude.ai":
+        auth_method_code = 1
+    elif raw_auth_method == "oauth_token":
+        auth_method_code = 2
     raw_subscription = value.get("subscriptionType")
     subscription_code = 0
     if raw_subscription == "pro":
@@ -278,6 +284,8 @@ def _claude_auth_status_codes(value: Any) -> tuple[bool, int, int]:
         subscription_code = 3
     elif raw_subscription == "enterprise":
         subscription_code = 4
+    elif raw_subscription not in (None, ""):
+        subscription_code = 5
     return logged_in, auth_method_code, subscription_code
 
 
