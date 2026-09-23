@@ -646,6 +646,216 @@ def _grok_streaming_review_command(
     return tuple(command), prompt
 
 
+_CODEX_NONINTERACTIVE_SUBCOMMANDS = frozenset({"exec", "e", "review"})
+_CODEX_ROOT_SUBCOMMANDS = _CODEX_NONINTERACTIVE_SUBCOMMANDS | frozenset(
+    {
+        "agents",
+        "login",
+        "logout",
+        "mcp",
+        "mcp-server",
+        "plugin",
+        "app-server",
+        "remote-control",
+        "completion",
+        "update",
+        "doctor",
+        "sandbox",
+        "debug",
+        "apply",
+        "a",
+        "resume",
+        "queue",
+        "archive",
+        "delete",
+        "migrate-rollouts",
+        "unarchive",
+        "fork",
+        "cloud",
+        "exec-server",
+        "features",
+        "help",
+    }
+)
+_CODEX_GLOBAL_OPTIONS_WITH_VALUE = frozenset(
+    {
+        "-a",
+        "--add-dir",
+        "--ask-for-approval",
+        "-C",
+        "--cd",
+        "-c",
+        "--config",
+        "--disable",
+        "--enable",
+        "-i",
+        "--image",
+        "--local-provider",
+        "-m",
+        "--model",
+        "-p",
+        "--profile",
+        "--remote",
+        "--remote-auth-token-env",
+        "-s",
+        "--sandbox",
+    }
+)
+_CODEX_VARIADIC_GLOBAL_OPTIONS = frozenset({"-i", "--image"})
+_CODEX_GLOBAL_FLAGS = frozenset(
+    {
+        "--approve-for-me",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--dangerously-bypass-hook-trust",
+        "-h",
+        "--help",
+        "--no-alt-screen",
+        "--oss",
+        "--search",
+        "--strict-config",
+        "-V",
+        "--version",
+        "--worktree",
+    }
+)
+_CODEX_LONG_OPTIONS_WITH_VALUE = tuple(
+    option
+    for option in _CODEX_GLOBAL_OPTIONS_WITH_VALUE
+    if option.startswith("--")
+)
+_CODEX_SHORT_OPTIONS_WITH_VALUE = tuple(
+    option
+    for option in _CODEX_GLOBAL_OPTIONS_WITH_VALUE
+    if option.startswith("-") and not option.startswith("--")
+)
+
+
+def _codex_attached_short_option(token: str) -> str | None:
+    return next(
+        (
+            option
+            for option in _CODEX_SHORT_OPTIONS_WITH_VALUE
+            if token != option and token.startswith(option)
+        ),
+        None,
+    )
+
+
+def _codex_append_image_values(
+    arguments: list[str],
+    index: int,
+    normalized: list[str],
+) -> tuple[int, int]:
+    image_count = 0
+    while index < len(arguments):
+        value = arguments[index]
+        if value.startswith("-") or value in _CODEX_ROOT_SUBCOMMANDS:
+            break
+        normalized.append(f"--image={value}")
+        image_count += 1
+        index += 1
+    return index, image_count
+
+
+def _codex_review_prefix(
+    command: list[str],
+) -> tuple[str | None, list[str], bool]:
+    """Classify root Codex argv and preserve a prompt-only separator."""
+    arguments = command[1:-1]
+    normalized: list[str] = []
+    index = 0
+    while index < len(arguments):
+        token = arguments[index]
+        if token == "--":
+            if index != len(arguments) - 1:
+                raise RuntimeError(
+                    "Codex review command has extra positional arguments after --"
+                )
+            return None, normalized, True
+        if token in _CODEX_GLOBAL_OPTIONS_WITH_VALUE:
+            if index + 1 >= len(arguments):
+                raise RuntimeError(f"Codex global option {token} is missing its value")
+            if token in _CODEX_VARIADIC_GLOBAL_OPTIONS:
+                index, image_count = _codex_append_image_values(
+                    arguments, index + 1, normalized
+                )
+                if image_count == 0:
+                    raise RuntimeError(f"Codex global option {token} is missing its value")
+                continue
+            normalized.extend((token, arguments[index + 1]))
+            index += 2
+            continue
+        long_option = next(
+            (
+                option
+                for option in _CODEX_LONG_OPTIONS_WITH_VALUE
+                if token.startswith(f"{option}=")
+            ),
+            None,
+        )
+        if long_option is not None:
+            if long_option in _CODEX_VARIADIC_GLOBAL_OPTIONS:
+                image_value = token[len(long_option) + 1 :]
+                if not image_value:
+                    raise RuntimeError(
+                        f"Codex global option {long_option} is missing its value"
+                    )
+                normalized.append(f"--image={image_value}")
+                index, _image_count = _codex_append_image_values(
+                    arguments, index + 1, normalized
+                )
+                continue
+            normalized.append(token)
+            index += 1
+            continue
+        short_option = _codex_attached_short_option(token)
+        if short_option is not None:
+            if short_option == "-i":
+                image_value = token[len(short_option):]
+                if image_value.startswith("="):
+                    image_value = image_value[1:]
+                if not image_value:
+                    raise RuntimeError("Codex global option -i is missing its value")
+                normalized.append(f"--image={image_value}")
+                index, _image_count = _codex_append_image_values(
+                    arguments, index + 1, normalized
+                )
+                continue
+            normalized.append(token)
+            index += 1
+            continue
+        if token in _CODEX_GLOBAL_FLAGS:
+            normalized.append(token)
+            index += 1
+            continue
+        if token.startswith("-"):
+            raise RuntimeError(
+                f"unsupported Codex global option before review subcommand: {token}"
+            )
+        return token, normalized, False
+    return None, normalized, False
+
+
+def _codex_declared_subcommand(command: list[str]) -> str | None:
+    """Return the actual Codex subcommand before the final review prompt."""
+    subcommand, _normalized, _prompt_separator = _codex_review_prefix(command)
+    return subcommand
+
+
+def _codex_review_command_for_headless_execution(command: list[str]) -> list[str]:
+    """Turn one direct Codex review command into its non-interactive form."""
+    if len(command) < 2:
+        raise RuntimeError("Codex review command must include a prompt")
+    subcommand, normalized, prompt_separator = _codex_review_prefix(command)
+    if subcommand in _CODEX_NONINTERACTIVE_SUBCOMMANDS:
+        return list(command)
+    if subcommand is not None:
+        raise RuntimeError(
+            f"Codex review command declares unsupported subcommand: {subcommand}"
+        )
+    prompt = ["--", command[-1]] if prompt_separator else [command[-1]]
+    return [command[0], *normalized, "exec", *prompt]
+
 
 def _review_sandbox_argv(
     repo: Path,
@@ -655,7 +865,20 @@ def _review_sandbox_argv(
     expected_base_head: str,
     review_diff: bytes,
 ) -> tuple[list[str], str | None, bytes | None]:
-    if Path(command[0]).name != "grok":
+    executable_name = Path(command[0]).name
+    if executable_name == "codex":
+        normalized = _codex_review_command_for_headless_execution(command)
+        prepared = prepare_external_agent_command(normalized)
+        return (
+            sandbox_argv(
+                repo,
+                list(prepared.command),
+                declared_command=command,
+            ),
+            None,
+            None,
+        )
+    if executable_name != "grok":
         return sandbox_argv(repo, command), None, None
     prepared = prepare_external_agent_command(command)
     actual, prompt_bytes = _grok_streaming_review_command(
