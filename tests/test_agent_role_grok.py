@@ -378,6 +378,240 @@ class GrokReviewRoleTests(unittest.TestCase):
                             prepared, expected_head="a" * 40, expected_base_head="b" * 40, review_diff=b"diff"
                         )
 
+    def test_codex_review_sandbox_inserts_exec_without_changing_declared_command(self) -> None:
+        repo = Path("/tmp/repo")
+        declared = [
+            "codex",
+            "--model",
+            "gpt-5.6-sol",
+            "--sandbox",
+            "read-only",
+            "--ask-for-approval",
+            "never",
+            "review this",
+        ]
+        prepared = PreparedSandboxCommand(
+            command=("/usr/bin/python3", "-I", "codex-launcher", "exec", "review this")
+        )
+        with (
+            mock.patch.object(
+                role, "prepare_external_agent_command", return_value=prepared
+            ) as prepare,
+            mock.patch.object(role, "sandbox_argv", return_value=["sandbox"]) as sandbox_argv,
+        ):
+            argv, contract, prompt_bytes = role._review_sandbox_argv(
+                repo,
+                declared,
+                expected_head="a" * 40,
+                expected_base_head="b" * 40,
+                review_diff=b"",
+            )
+
+        self.assertEqual(argv, ["sandbox"])
+        self.assertIsNone(contract)
+        self.assertIsNone(prompt_bytes)
+        normalized = prepare.call_args.args[0]
+        self.assertEqual(normalized[-2:], ["exec", "review this"])
+        self.assertEqual(normalized[:-2], declared[:-1])
+        self.assertEqual(sandbox_argv.call_args.args[1], list(prepared.command))
+        self.assertEqual(sandbox_argv.call_args.kwargs["declared_command"], declared)
+
+    def test_codex_review_sandbox_preserves_existing_exec(self) -> None:
+        repo = Path("/tmp/repo")
+        declared = [
+            "codex",
+            "--model",
+            "gpt-5.6-sol",
+            "--sandbox",
+            "read-only",
+            "--ask-for-approval",
+            "never",
+            "exec",
+            "review this",
+        ]
+        prepared = PreparedSandboxCommand(
+            command=("/usr/bin/python3", "-I", "codex-launcher", "exec", "review this")
+        )
+        with (
+            mock.patch.object(
+                role, "prepare_external_agent_command", return_value=prepared
+            ) as prepare,
+            mock.patch.object(role, "sandbox_argv", return_value=["sandbox"]),
+        ):
+            role._review_sandbox_argv(
+                repo,
+                declared,
+                expected_head="a" * 40,
+                expected_base_head="b" * 40,
+                review_diff=b"",
+            )
+
+        prepare.assert_called_once_with(declared)
+
+    def test_codex_review_sandbox_preserves_existing_noninteractive_subcommands(self) -> None:
+        repo = Path("/tmp/repo")
+        for subcommand in ("e", "review"):
+            with self.subTest(subcommand=subcommand):
+                declared = ["codex", subcommand, "review this"]
+                prepared = PreparedSandboxCommand(
+                    command=("/usr/bin/python3", "-I", "codex-launcher", subcommand, "review this")
+                )
+                with (
+                    mock.patch.object(
+                        role, "prepare_external_agent_command", return_value=prepared
+                    ) as prepare,
+                    mock.patch.object(role, "sandbox_argv", return_value=["sandbox"]),
+                ):
+                    role._review_sandbox_argv(
+                        repo,
+                        declared,
+                        expected_head="a" * 40,
+                        expected_base_head="b" * 40,
+                        review_diff=b"",
+                    )
+
+                prepare.assert_called_once_with(declared)
+
+    def test_codex_review_subcommand_detection_skips_global_option_values(self) -> None:
+        declared = ["codex", "--model", "review", "review this"]
+        self.assertIsNone(role._codex_declared_subcommand(declared))
+        self.assertEqual(
+            role._codex_review_command_for_headless_execution(declared),
+            ["codex", "--model", "review", "exec", "review this"],
+        )
+
+    def test_codex_review_subcommand_detection_preserves_exec_with_subcommand_options(self) -> None:
+        declared = ["codex", "exec", "--json", "review this"]
+        self.assertEqual(role._codex_declared_subcommand(declared), "exec")
+        self.assertEqual(
+            role._codex_review_command_for_headless_execution(declared),
+            declared,
+        )
+
+    def test_codex_review_root_image_options_are_normalized_before_exec(self) -> None:
+        declared = [
+            "codex",
+            "--image",
+            "shot.png",
+            "detail.png",
+            "--model",
+            "gpt-5.6-sol",
+            "review this",
+        ]
+        self.assertIsNone(role._codex_declared_subcommand(declared))
+        self.assertEqual(
+            role._codex_review_command_for_headless_execution(declared),
+            [
+                "codex",
+                "--image=shot.png",
+                "--image=detail.png",
+                "--model",
+                "gpt-5.6-sol",
+                "exec",
+                "review this",
+            ],
+        )
+
+    def test_codex_review_attached_short_option_values_are_supported(self) -> None:
+        for option in ("-mgpt-5.6-sol", "-sread-only", "-creview=true"):
+            with self.subTest(option=option):
+                declared = ["codex", option, "review this"]
+                self.assertIsNone(role._codex_declared_subcommand(declared))
+                self.assertEqual(
+                    role._codex_review_command_for_headless_execution(declared),
+                    ["codex", option, "exec", "review this"],
+                )
+
+    def test_codex_review_attached_image_value_is_normalized_before_exec(self) -> None:
+        declared = ["codex", "-ishot.png", "review this"]
+        self.assertIsNone(role._codex_declared_subcommand(declared))
+        self.assertEqual(
+            role._codex_review_command_for_headless_execution(declared),
+            ["codex", "--image=shot.png", "exec", "review this"],
+        )
+
+    def test_codex_review_attached_image_equals_value_is_normalized_before_exec(self) -> None:
+        declared = ["codex", "-i=shot.png", "review this"]
+        self.assertIsNone(role._codex_declared_subcommand(declared))
+        self.assertEqual(
+            role._codex_review_command_for_headless_execution(declared),
+            ["codex", "--image=shot.png", "exec", "review this"],
+        )
+
+    def test_codex_review_attached_image_values_preserve_variadic_group(self) -> None:
+        for first in ("-ishot.png", "--image=shot.png"):
+            with self.subTest(first=first):
+                declared = ["codex", first, "detail.png", "review this"]
+                self.assertIsNone(role._codex_declared_subcommand(declared))
+                self.assertEqual(
+                    role._codex_review_command_for_headless_execution(declared),
+                    [
+                        "codex",
+                        "--image=shot.png",
+                        "--image=detail.png",
+                        "exec",
+                        "review this",
+                    ],
+                )
+
+    def test_codex_review_variadic_images_stop_at_headless_subcommand(self) -> None:
+        declared = [
+            "codex",
+            "--image=shot.png",
+            "detail.png",
+            "exec",
+            "--json",
+            "review this",
+        ]
+        self.assertEqual(role._codex_declared_subcommand(declared), "exec")
+        self.assertEqual(
+            role._codex_review_command_for_headless_execution(declared),
+            declared,
+        )
+
+    def test_codex_review_variadic_images_stop_at_unsupported_root_subcommand(self) -> None:
+        for subcommand in ("login", "mcp-server"):
+            with self.subTest(subcommand=subcommand):
+                declared = [
+                    "codex",
+                    "--image=shot.png",
+                    "detail.png",
+                    subcommand,
+                    "review this",
+                ]
+                self.assertEqual(role._codex_declared_subcommand(declared), subcommand)
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    f"Codex review command declares unsupported subcommand: {subcommand}",
+                ):
+                    role._codex_review_command_for_headless_execution(declared)
+
+    def test_codex_review_attached_image_empty_equals_is_rejected(self) -> None:
+        declared = ["codex", "-i=", "review this"]
+        with self.assertRaisesRegex(RuntimeError, "Codex global option -i is missing its value"):
+            role._codex_review_command_for_headless_execution(declared)
+
+    def test_codex_review_prompt_separator_is_preserved_after_exec(self) -> None:
+        declared = ["codex", "--", "--version"]
+        self.assertIsNone(role._codex_declared_subcommand(declared))
+        self.assertEqual(
+            role._codex_review_command_for_headless_execution(declared),
+            ["codex", "exec", "--", "--version"],
+        )
+
+    def test_codex_review_prompt_separator_rejects_extra_positionals(self) -> None:
+        declared = ["codex", "--", "review", "review this"]
+        with self.assertRaisesRegex(RuntimeError, "extra positional arguments after --"):
+            role._codex_review_command_for_headless_execution(declared)
+
+    def test_codex_review_preserves_headless_subcommand_after_attached_global_option(self) -> None:
+        declared = ["codex", "-mgpt-5.6-sol", "review", "review this"]
+        self.assertEqual(role._codex_declared_subcommand(declared), "review")
+        self.assertEqual(
+            role._codex_review_command_for_headless_execution(declared),
+            declared,
+        )
+
     def test_review_sandbox_preserves_declared_command_for_provenance(self) -> None:
         repo = Path("/tmp/repo")
         declared = ["grok", "--model", "grok-4.6", "review this"]
