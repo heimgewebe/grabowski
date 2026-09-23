@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -2206,6 +2207,41 @@ class CheckoutLifecycleTests(unittest.TestCase):
             len(checkouts._active_checkout_operation_uncertainties()), 1
         )
 
+    def test_archive_confirmed_success_requires_exact_archived_lifecycle_identity(self) -> None:
+        self._managed_binding(owner="owner-a")
+        expected_identity = checkouts.physical_checkout.capture_physical_checkout_identity(
+            self.checkout
+        )
+
+        def fail_archive_audit(record):
+            if record.get("operation") == "checkout-archive":
+                raise RuntimeError("simulated archive audit failure")
+
+        with patch.object(checkouts.base, "_append_audit", side_effect=fail_archive_audit):
+            with self.assertRaisesRegex(RuntimeError, "archive audit failure"):
+                checkouts.grabowski_checkout_archive(
+                    str(self.repo),
+                    str(self.checkout),
+                    "owner-a",
+                    "lifecycle exact-success binding",
+                    int(time.time()) + 3600,
+                    self.head,
+                    "topic",
+                    expected_physical_identity=expected_identity,
+                )
+        fence = checkouts._active_checkout_operation_uncertainties()[0]
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE lifecycle_bindings SET repo_path=? WHERE checkout_key=?",
+                (str(self.checkout.resolve()), fence["checkout_key"]),
+            )
+            connection.commit()
+
+        readback = checkouts._archive_uncertainty_readback(fence)
+
+        self.assertEqual(readback["state"], "still_fenced")
+        self.assertEqual(readback["reason"], "archive-readback-mismatch")
+
     def test_partial_archive_manifest_and_refs_complete_atomically(self) -> None:
         fence = self._partial_archive_after_manifest_without_db()
 
@@ -2225,6 +2261,50 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertIsNotNone(lifecycle)
         self.assertEqual(lifecycle["phase"], "archived")
         self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+
+    def test_partial_archive_manifest_timestamp_may_cross_archive_id_second(self) -> None:
+        base = datetime.now(timezone.utc).replace(microsecond=0)
+        archive_id = f"{base.strftime('%Y%m%dT%H%M%SZ')}-abcdef123456"
+        manifest_time = (base + timedelta(seconds=1)).isoformat()
+        with (
+            patch.object(checkouts, "_new_archive_id", return_value=archive_id),
+            patch.object(checkouts, "_utc_timestamp", return_value=manifest_time),
+        ):
+            fence = self._partial_archive_after_manifest_without_db()
+
+        readback = checkouts._archive_uncertainty_readback(fence)
+
+        self.assertEqual(readback["state"], "recoverable_complete")
+
+    def test_partial_archive_completion_records_recovery_time(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        manifest_path = checkouts.ARCHIVE_ROOT / fence["operation_id"] / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest_created = int(
+            datetime.fromisoformat(manifest["created_at"]).timestamp()
+        )
+        recovered_at = manifest_created + 120
+
+        with patch.object(checkouts, "_now", return_value=recovered_at):
+            reconciliation = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+
+        self.assertEqual(reconciliation["outcome"], "reconciled_success")
+        self.assertEqual(
+            reconciliation["readback"]["manifest_created_at_unix"],
+            manifest_created,
+        )
+        self.assertEqual(
+            reconciliation["readback"]["completed_at_unix"],
+            recovered_at,
+        )
+        archive = checkouts._load_archive(fence["operation_id"])
+        self.assertEqual(archive["created_at_unix"], recovered_at)
+        lifecycle = checkouts._strict_lifecycle_binding(fence["checkout_key"])
+        self.assertIsNotNone(lifecycle)
+        self.assertEqual(lifecycle["archived_at_unix"], recovered_at)
 
     def test_partial_archive_all_refs_without_manifest_is_rollback_candidate(self) -> None:
         expected_identity = checkouts.physical_checkout.capture_physical_checkout_identity(

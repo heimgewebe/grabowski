@@ -1972,11 +1972,16 @@ def _partial_archive_manifest(
             archive_id.split("-", 1)[0], "%Y%m%dT%H%M%SZ"
         ).replace(tzinfo=timezone.utc)
         created_at_unix = int(created_utc.timestamp())
-        if int(archive_stamp.timestamp()) != created_at_unix:
-            raise ValueError("archive id timestamp does not bind manifest timestamp")
+        archive_started_at_unix = int(archive_stamp.timestamp())
         if (
-            retention_until < created_at_unix
-            or retention_until - created_at_unix > MAX_RETENTION_SECONDS
+            created_at_unix < archive_started_at_unix
+            or created_at_unix - archive_started_at_unix
+            > OPERATION_LEASE_TTL_SECONDS
+        ):
+            raise ValueError("manifest timestamp is outside the archive operation window")
+        if (
+            retention_until < archive_started_at_unix
+            or retention_until - archive_started_at_unix > MAX_RETENTION_SECONDS
         ):
             raise ValueError("manifest retention is outside the original archive window")
     except (KeyError, TypeError, ValueError) as exc:
@@ -2015,8 +2020,15 @@ def _partial_archive_manifest(
     ):
         return {"state": "invalid", "reason": "archive-manifest-identity-mismatch"}
     head_ref = next(
-        item["ref"] for item in normalized_planned if item["ref"].endswith("/head")
+        (
+            item["ref"]
+            for item in normalized_planned
+            if item["ref"].endswith("/head")
+        ),
+        None,
     )
+    if head_ref is None:
+        return {"state": "invalid", "reason": "archive-head-ref-missing"}
     expected_rollback = {
         "available": True,
         "command": [
@@ -2225,7 +2237,8 @@ def _complete_partial_archive(
             }
         evidence = fence["evidence"]
         manifest = assessment["manifest"]
-        created = int(assessment["created_at_unix"])
+        manifest_created = int(assessment["created_at_unix"])
+        completed = _now()
         checkout_key = str(evidence["checkout_key"])
         with _operation_lock():
             with _database() as connection:
@@ -2272,7 +2285,7 @@ def _complete_partial_archive(
                         "Archive retention state changed during atomic completion"
                     )
                 retention_created = (
-                    created
+                    completed
                     if retention_row is None
                     else int(retention_row["created_at_unix"])
                 )
@@ -2305,7 +2318,7 @@ def _complete_partial_archive(
                         str(evidence["expected_head"]),
                         evidence.get("expected_branch"),
                         retention_created,
-                        created,
+                        completed,
                     ),
                 )
                 connection.execute(
@@ -2330,14 +2343,14 @@ def _complete_partial_archive(
                         int(assessment["retention_until_unix"]),
                         _canonical_json(manifest["recovery_refs"]),
                         str(assessment["manifest_path"]),
-                        created,
+                        completed,
                     ),
                 )
                 _mark_checkout_archived_in_connection(
                     connection,
                     checkout_key,
                     str(evidence["owner_id"]),
-                    created,
+                    completed,
                     str(evidence["expected_head"]),
                     evidence.get("expected_branch"),
                 )
@@ -2353,6 +2366,8 @@ def _complete_partial_archive(
             "state": "reconciled_success",
             "archive_id": str(evidence["archive_id"]),
             "assessment_sha256": expected_assessment_sha256,
+            "manifest_created_at_unix": manifest_created,
+            "completed_at_unix": completed,
             "verified_recovery_refs": confirmed["verified_recovery_refs"],
         }
     finally:
@@ -2392,8 +2407,14 @@ def _archive_uncertainty_readback(fence: dict[str, Any]) -> dict[str, Any]:
                 lifecycle is None
                 or (
                     isinstance(lifecycle, dict)
+                    and lifecycle.get("checkout_key") == evidence["checkout_key"]
+                    and lifecycle.get("repo_common_dir") == evidence["git_common_dir"]
+                    and lifecycle.get("repo_path") == evidence["repo"]
+                    and lifecycle.get("checkout_path") == evidence["checkout_path"]
                     and lifecycle.get("phase") == "archived"
                     and lifecycle.get("owner_id") == evidence["owner_id"]
+                    and lifecycle.get("expected_head") == evidence["expected_head"]
+                    and lifecycle.get("expected_branch") == evidence["expected_branch"]
                 )
             )
         ):
