@@ -11,6 +11,7 @@ import re
 import sqlite3
 import stat
 import tempfile
+import threading
 import time
 from typing import Any, Iterable, Mapping
 
@@ -41,6 +42,11 @@ RESOURCE_DB = Path(
         str(operator.STATE_DIR / "resources.sqlite3"),
     )
 ).expanduser()
+# PRAGMA quick_check scans the complete resource store. Cache only the
+# successful process-local check for the exact database path/device/inode;
+# schema and lease/reconcile contracts remain validated on every open.
+_RESOURCE_STORE_INTEGRITY_LOCK = threading.Lock()
+_RESOURCE_STORE_INTEGRITY_IDENTITY: tuple[str, int, int] | None = None
 RESOURCE_KINDS = {
     "repo",
     "path",
@@ -1025,11 +1031,46 @@ def _resource_store_file_ready() -> bool:
     return observed.st_size > 0
 
 
+def _resource_store_integrity_identity() -> tuple[str, int, int]:
+    status = os.lstat(RESOURCE_DB)
+    if not stat.S_ISREG(status.st_mode):
+        raise PermissionError(f"Resource database must be a regular file: {RESOURCE_DB}")
+    return (
+        str(RESOURCE_DB.absolute()),
+        int(status.st_dev),
+        int(status.st_ino),
+    )
+
+
+def _ensure_resource_store_integrity(
+    connection: sqlite3.Connection,
+    identity: tuple[str, int, int],
+) -> None:
+    global _RESOURCE_STORE_INTEGRITY_IDENTITY
+    with _RESOURCE_STORE_INTEGRITY_LOCK:
+        if _RESOURCE_STORE_INTEGRITY_IDENTITY == identity:
+            return
+        _resource_sqlite_integrity(connection, "Resource database", quick=True)
+        if _resource_store_integrity_identity() != identity:
+            raise RuntimeError(
+                "Resource database identity changed during integrity preflight; retry"
+            )
+        _RESOURCE_STORE_INTEGRITY_IDENTITY = identity
+
+
+def _mark_resource_store_integrity_validated() -> None:
+    global _RESOURCE_STORE_INTEGRITY_IDENTITY
+    identity = _resource_store_integrity_identity()
+    with _RESOURCE_STORE_INTEGRITY_LOCK:
+        _RESOURCE_STORE_INTEGRITY_IDENTITY = identity
+
+
 def _preflight_resource_store() -> str | None:
     if not _resource_store_file_ready():
         return None
+    identity = _resource_store_integrity_identity()
     with _resource_readonly_sqlite(RESOURCE_DB) as connection:
-        _resource_sqlite_integrity(connection, "Resource database", quick=True)
+        _ensure_resource_store_integrity(connection, identity)
         version = _resource_schema_version(connection)
         if version not in {"1", "2", "3"}:
             raise RuntimeError(
@@ -1273,6 +1314,7 @@ def _database() -> sqlite3.Connection:
             _resource_reconcile_revision_contract(connection)
             _resource_sqlite_integrity(connection, "Migrated resource database")
             connection.commit()
+            _mark_resource_store_integrity_validated()
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA synchronous=FULL")
             connection.execute("PRAGMA foreign_keys=ON")

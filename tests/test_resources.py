@@ -3369,6 +3369,34 @@ class ResourceTests(unittest.TestCase):
         )
         self.assertEqual([], self._resource_migration_backups())
 
+    def test_resource_store_integrity_rechecks_after_database_identity_change(
+        self,
+    ) -> None:
+        connection = resources._database()
+        connection.close()
+        current_identity = resources._resource_store_integrity_identity()
+        changed_identity = (
+            current_identity[0],
+            current_identity[1],
+            current_identity[2] + 1,
+        )
+        original_integrity = resources._resource_sqlite_integrity
+        with (
+            patch.object(
+                resources,
+                "_resource_store_integrity_identity",
+                return_value=changed_identity,
+            ),
+            patch.object(
+                resources,
+                "_resource_sqlite_integrity",
+                wraps=original_integrity,
+            ) as integrity,
+        ):
+            connection = resources._database()
+            connection.close()
+        self.assertEqual(1, integrity.call_count)
+
     def test_resource_schema_only_inventory_reports_migration_without_mutation(self) -> None:
         self._create_resource_schema_v1()
         before = self.database.read_bytes()
@@ -3430,9 +3458,14 @@ class ResourceTests(unittest.TestCase):
             "_resource_sqlite_integrity",
             wraps=original_integrity,
         ) as integrity:
-            connection = resources._database()
-            connection.close()
-        self.assertEqual(1, integrity.call_count)
+            for _ in range(3):
+                connection = resources._database()
+                connection.close()
+        self.assertEqual(
+            0,
+            integrity.call_count,
+            "current-schema hot connections must not repeat a full-store quick_check",
+        )
         inventory = resources.grabowski_resource_list(schema_only=True)
         self.assertEqual("3", inventory["observed_version"])
         self.assertEqual("1", inventory["lease_contract_observed_version"])
