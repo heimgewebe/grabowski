@@ -55,8 +55,10 @@ class ResourceTests(unittest.TestCase):
         self.database = self.root / "state" / "resources.sqlite3"
         self.patch = patch.object(resources, "RESOURCE_DB", self.database)
         self.patch.start()
+        resources._RESOURCE_STORE_PROCESS_VALIDATED_IDENTITY = None
 
     def tearDown(self) -> None:
+        resources._RESOURCE_STORE_PROCESS_VALIDATED_IDENTITY = None
         self.patch.stop()
         self.temporary.cleanup()
 
@@ -3369,39 +3371,6 @@ class ResourceTests(unittest.TestCase):
             sorted(item.name for item in self.database.parent.iterdir()),
         )
         self.assertEqual([], self._resource_migration_backups())
-
-    def test_resource_store_cached_integrity_rejects_atomic_replacement_race(
-        self,
-    ) -> None:
-        connection = resources._database()
-        connection.close()
-        connection = resources._database()
-        connection.close()
-        cached_identity = resources._resource_store_integrity_identity()
-        replacement_identity = (
-            cached_identity[0],
-            cached_identity[1],
-            cached_identity[2] + 1,
-        )
-        original_integrity = resources._resource_sqlite_integrity
-        with (
-            patch.object(
-                resources,
-                "_resource_store_integrity_identity",
-                side_effect=[cached_identity, replacement_identity],
-            ),
-            patch.object(
-                resources,
-                "_resource_sqlite_integrity",
-                wraps=original_integrity,
-            ) as integrity,
-        ):
-            with self.assertRaisesRegex(
-                RuntimeError,
-                "identity changed during integrity preflight",
-            ):
-                resources._preflight_resource_store()
-        self.assertEqual(0, integrity.call_count)
 
     def test_resource_store_process_gate_intentionally_ignores_same_inode_content_change(
         self,

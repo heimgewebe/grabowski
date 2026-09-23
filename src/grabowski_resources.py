@@ -1070,10 +1070,18 @@ def _ensure_resource_store_process_integrity(
 def _preflight_resource_store() -> str | None:
     if not _resource_store_file_ready():
         return None
-    identity = _resource_store_integrity_identity()
     with _resource_readonly_sqlite(RESOURCE_DB) as connection:
-        _ensure_resource_store_process_integrity(connection, identity)
-        version = _resource_schema_version(connection)
+        try:
+            version = _resource_schema_version(connection)
+        except sqlite3.DatabaseError as exc:
+            detail = str(exc).lower()
+            if "locked" in detail or "busy" in detail:
+                raise RuntimeError(
+                    "Resource database is busy; retry after the active writer completes"
+                ) from exc
+            raise RuntimeError(
+                "Resource database is corrupt; restore a verified backup before retrying"
+            ) from exc
         if version not in {"1", "2", "3"}:
             raise RuntimeError(
                 "Unsupported resource database schema; use a compatible runtime"
@@ -1208,25 +1216,30 @@ def _migrate_resource_schema_v2(connection: sqlite3.Connection) -> None:
     _publish_resource_lease_contract(connection)
 
 
-def _connect_existing_resource_database() -> sqlite3.Connection:
+def _connect_existing_resource_database(
+) -> tuple[sqlite3.Connection, tuple[str, int, int]]:
     if RESOURCE_DB.is_symlink():
         raise PermissionError(f"Resource database may not be a symlink: {RESOURCE_DB}")
-    connection = sqlite3.connect(
-        RESOURCE_DB.absolute().as_uri() + "?mode=rw",
-        uri=True,
+    connection, pinned_identity = sqlite_store.connect_pinned_sqlite(
+        RESOURCE_DB,
+        mode="rw",
         timeout=10,
         isolation_level=None,
+        label="Resource database",
     )
-    if RESOURCE_DB.is_symlink():
-        connection.close()
-        raise PermissionError(f"Resource database may not be a symlink: {RESOURCE_DB}")
-    return connection
+    identity = (
+        str(RESOURCE_DB.absolute()),
+        pinned_identity[0],
+        pinned_identity[1],
+    )
+    return connection, identity
 
 
 def _open_current_resource_database() -> sqlite3.Connection:
-    connection = _connect_existing_resource_database()
+    connection, identity = _connect_existing_resource_database()
     connection.row_factory = sqlite3.Row
     try:
+        _ensure_resource_store_process_integrity(connection, identity)
         if _resource_schema_version(connection) != "3":
             raise RuntimeError(
                 "Resource database schema changed while opening; retry with a compatible runtime"
@@ -1263,7 +1276,7 @@ def _database() -> sqlite3.Connection:
         connection = (
             sqlite3.connect(RESOURCE_DB, timeout=10, isolation_level=None)
             if observed is None
-            else _connect_existing_resource_database()
+            else _connect_existing_resource_database()[0]
         )
         connection.row_factory = sqlite3.Row
         try:

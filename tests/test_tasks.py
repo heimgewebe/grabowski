@@ -193,9 +193,11 @@ class TaskTests(unittest.TestCase):
         self.capture_script_root_patch.start()
         self.resource_patch.start()
         self.admission_patch.start()
+        tasks._TASK_STORE_PROCESS_VALIDATED_IDENTITY = None
         self.start_counter = 0
 
     def tearDown(self) -> None:
+        tasks._TASK_STORE_PROCESS_VALIDATED_IDENTITY = None
         self.admission_patch.stop()
         self.resource_patch.stop()
         self.capture_script_root_patch.stop()
@@ -8928,39 +8930,6 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
         self.assertEqual(before_names, sorted(item.name for item in self.database.parent.iterdir()))
 
-
-    def test_task_store_cached_integrity_rejects_atomic_replacement_race(
-        self,
-    ) -> None:
-        connection = tasks._database()
-        connection.close()
-        connection = tasks._database()
-        connection.close()
-        cached_identity = tasks._task_store_integrity_identity()
-        replacement_identity = (
-            cached_identity[0],
-            cached_identity[1],
-            cached_identity[2] + 1,
-        )
-        original_integrity = tasks._sqlite_integrity
-        with (
-            patch.object(
-                tasks,
-                "_task_store_integrity_identity",
-                side_effect=[cached_identity, replacement_identity],
-            ),
-            patch.object(
-                tasks,
-                "_sqlite_integrity",
-                wraps=original_integrity,
-            ) as integrity,
-        ):
-            with self.assertRaisesRegex(
-                RuntimeError,
-                "identity changed during integrity preflight",
-            ):
-                tasks._preflight_task_store()
-        self.assertEqual(0, integrity.call_count)
 
     def test_task_store_process_gate_intentionally_ignores_same_inode_content_change(
         self,

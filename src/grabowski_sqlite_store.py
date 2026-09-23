@@ -115,6 +115,72 @@ def schema_directory_lock(parent: Path) -> Iterator[None]:
         os.close(descriptor)
 
 
+PinnedFileIdentity = tuple[int, int]
+
+
+def pinned_file_identity(status: os.stat_result) -> PinnedFileIdentity:
+    return (int(status.st_dev), int(status.st_ino))
+
+
+def connect_pinned_sqlite(
+    path: Path,
+    *,
+    mode: str,
+    timeout: float,
+    isolation_level: str | None = "",
+    label: str = "SQLite database",
+) -> tuple[sqlite3.Connection, PinnedFileIdentity]:
+    """Open SQLite through a descriptor-pinned inode, then return its identity."""
+    if mode not in {"ro", "rw"}:
+        raise ValueError("pinned SQLite mode must be ro or rw")
+    flags = os.O_RDONLY if mode == "ro" else os.O_RDWR
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError as exc:
+        raise sqlite3.OperationalError("unable to open database file") from exc
+    except OSError as exc:
+        raise PermissionError(f"{label} could not be opened without following links") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise PermissionError(f"{label} must be a regular file")
+        identity = pinned_file_identity(opened)
+        try:
+            linked = os.lstat(path)
+        except OSError as exc:
+            raise RuntimeError(f"{label} changed while opening; retry") from exc
+        if (
+            not stat.S_ISREG(linked.st_mode)
+            or pinned_file_identity(linked) != identity
+        ):
+            raise RuntimeError(f"{label} changed while opening; retry")
+        proc_path = Path(f"/proc/self/fd/{descriptor}")
+        connection = sqlite3.connect(
+            proc_path.as_uri() + f"?mode={mode}",
+            uri=True,
+            timeout=timeout,
+            isolation_level=isolation_level,
+        )
+        try:
+            linked_after = os.lstat(path)
+        except OSError as exc:
+            connection.close()
+            raise RuntimeError(f"{label} changed while opening; retry") from exc
+        if (
+            not stat.S_ISREG(linked_after.st_mode)
+            or pinned_file_identity(linked_after) != identity
+        ):
+            connection.close()
+            raise RuntimeError(f"{label} changed while opening; retry")
+        return connection, identity
+    finally:
+        os.close(descriptor)
+
+
 @contextmanager
 def readonly_sqlite(path: Path) -> Iterator[sqlite3.Connection]:
     connection = sqlite3.connect(

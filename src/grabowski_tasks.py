@@ -1869,10 +1869,18 @@ def _preflight_task_store() -> str | None:
         raise PermissionError(f"Task database must be a regular file: {TASK_DB}")
     if TASK_DB.stat().st_size == 0:
         return None
-    identity = _task_store_integrity_identity()
     with _readonly_sqlite(TASK_DB) as connection:
-        _ensure_task_store_process_integrity(connection, identity)
-        version = _task_schema_version(connection)
+        try:
+            version = _task_schema_version(connection)
+        except sqlite3.DatabaseError as exc:
+            detail = str(exc).lower()
+            if "locked" in detail or "busy" in detail:
+                raise RuntimeError(
+                    "Task database is busy; retry after the active writer completes"
+                ) from exc
+            raise RuntimeError(
+                "Task database is corrupt; restore a verified backup before retrying"
+            ) from exc
         if version not in {"1", "2", "3", "4", "5"}:
             raise RuntimeError(
                 "Unsupported task database schema; use a runtime that explicitly supports it"
@@ -1983,24 +1991,29 @@ def _migrate_task_schema(connection: sqlite3.Connection, version: str) -> None:
     )
 
 
-def _connect_existing_task_database() -> sqlite3.Connection:
+def _connect_existing_task_database(
+) -> tuple[sqlite3.Connection, tuple[str, int, int]]:
     if TASK_DB.is_symlink():
         raise PermissionError(f"Task database may not be a symlink: {TASK_DB}")
-    connection = sqlite3.connect(
-        TASK_DB.absolute().as_uri() + "?mode=rw",
-        uri=True,
+    connection, pinned_identity = sqlite_store.connect_pinned_sqlite(
+        TASK_DB,
+        mode="rw",
         timeout=10,
+        label="Task database",
     )
-    if TASK_DB.is_symlink():
-        connection.close()
-        raise PermissionError(f"Task database may not be a symlink: {TASK_DB}")
-    return connection
+    identity = (
+        str(TASK_DB.absolute()),
+        pinned_identity[0],
+        pinned_identity[1],
+    )
+    return connection, identity
 
 
 def _open_current_task_database() -> sqlite3.Connection:
-    connection = _connect_existing_task_database()
+    connection, identity = _connect_existing_task_database()
     connection.row_factory = sqlite3.Row
     try:
+        _ensure_task_store_process_integrity(connection, identity)
         if _task_schema_version(connection) != "5":
             raise RuntimeError(
                 "Task database schema changed while opening; retry with a compatible runtime"
@@ -2037,7 +2050,7 @@ def _database() -> sqlite3.Connection:
         connection = (
             sqlite3.connect(TASK_DB, timeout=10)
             if observed is None
-            else _connect_existing_task_database()
+            else _connect_existing_task_database()[0]
         )
         connection.row_factory = sqlite3.Row
         try:
