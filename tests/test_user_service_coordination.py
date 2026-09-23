@@ -100,7 +100,7 @@ class UserServiceCoordinationTests(unittest.TestCase):
                 "_run",
                 side_effect=[
                     _result(stdout=fragment + "\n"),
-                    _result(stdout=fragment + "\n"),
+                    _result(stdout=_reconciliation(fragment=fragment)),
                     action_result,
                 ],
             ) as run,
@@ -175,7 +175,7 @@ class UserServiceCoordinationTests(unittest.TestCase):
                 "_run",
                 side_effect=[
                     _result(stdout=fragment + "\n"),
-                    _result(stdout=fragment + "\n"),
+                    _result(stdout=_reconciliation(fragment=fragment)),
                     action_result,
                 ],
             ),
@@ -261,7 +261,7 @@ class UserServiceCoordinationTests(unittest.TestCase):
                 "_run",
                 side_effect=[
                     _result(stdout=first + "\n"),
-                    _result(stdout=second + "\n"),
+                    _result(stdout=_reconciliation(fragment=second)),
                 ],
             ) as run,
         ):
@@ -283,7 +283,7 @@ class UserServiceCoordinationTests(unittest.TestCase):
                 "_run",
                 side_effect=[
                     _result(stdout="\n"),
-                    _result(stdout="\n"),
+                    _result(stdout=_reconciliation(fragment="")),
                     _result(stdout="ok"),
                 ],
             ),
@@ -309,7 +309,7 @@ class UserServiceCoordinationTests(unittest.TestCase):
                 "_run",
                 side_effect=[
                     _result(stdout=fragment + "\n"),
-                    _result(stdout=fragment + "\n"),
+                    _result(stdout=_reconciliation(fragment=fragment)),
                     timed_out,
                     _result(stdout=_reconciliation(fragment=fragment)),
                 ],
@@ -366,7 +366,7 @@ class UserServiceCoordinationTests(unittest.TestCase):
                 "_run",
                 side_effect=[
                     _result(stdout=fragment + "\n"),
-                    _result(stdout=fragment + "\n"),
+                    _result(stdout=_reconciliation(fragment=fragment)),
                     timed_out,
                     _result(stdout=_reconciliation(fragment=fragment)),
                 ],
@@ -407,7 +407,7 @@ class UserServiceCoordinationTests(unittest.TestCase):
                 "_run",
                 side_effect=[
                     _result(stdout=fragment + "\n"),
-                    _result(stdout=fragment + "\n"),
+                    _result(stdout=_reconciliation(fragment=fragment)),
                     _result(timed_out=True),
                     _result(stdout=_reconciliation(fragment=fragment, job="1234")),
                     _result(stdout=_reconciliation(fragment=fragment)),
@@ -426,6 +426,109 @@ class UserServiceCoordinationTests(unittest.TestCase):
         self.assertFalse(coordination["lease_retained"])
         self.assertFalse(coordination["requires_readback_before_next_attempt"])
         self.assertEqual(coordination["reconciliation"]["Job"], "")
+
+    def test_existing_job_blocks_before_service_effect_and_releases(self) -> None:
+        fragment = "/home/alex/.config/systemd/user/demo.service"
+        resources = _fake_resources()
+        with (
+            patch.dict(sys.modules, {"grabowski_resources": resources}),
+            patch.object(operator, "_require_operator_capability"),
+            patch.object(operator, "_require_operator_mutation"),
+            patch.object(
+                operator,
+                "_run",
+                side_effect=[
+                    _result(stdout=fragment + "\n"),
+                    _result(stdout=_reconciliation(fragment=fragment, job="77")),
+                ],
+            ) as run,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "active systemd job"):
+                operator.grabowski_user_service("demo.service", "restart")
+
+        self.assertEqual(run.call_count, 2)
+        resources.renew_resources.assert_not_called()
+        resources.release_resources.assert_called_once()
+
+    def test_pending_job_hands_off_after_bounded_reconciliation(self) -> None:
+        fragment = "/home/alex/.config/systemd/user/demo.service"
+        resources = _fake_resources()
+        with (
+            patch.dict(sys.modules, {"grabowski_resources": resources}),
+            patch.object(operator, "_require_operator_capability"),
+            patch.object(operator, "_require_operator_mutation"),
+            patch.object(operator.time, "sleep") as sleep,
+            patch.object(
+                operator,
+                "_run",
+                side_effect=[
+                    _result(stdout=fragment + "\n"),
+                    _result(stdout=_reconciliation(fragment=fragment)),
+                    _result(timed_out=True),
+                    _result(stdout=_reconciliation(fragment=fragment, job="1234")),
+                    _result(stdout=_reconciliation(fragment=fragment, job="1234")),
+                ],
+            ),
+        ):
+            result = operator.grabowski_user_service("demo.service", "start")
+
+        self.assertEqual(
+            resources.renew_resources.call_count,
+            operator._USER_SERVICE_RECONCILIATION_MAX_ATTEMPTS,
+        )
+        sleep.assert_called_once_with(operator._USER_SERVICE_RECONCILIATION_POLL_SECONDS)
+        resources.release_resources.assert_not_called()
+        coordination = result["user_service_coordination"]
+        self.assertEqual(coordination["status"], "outcome_unknown")
+        self.assertFalse(coordination["retry_allowed"])
+        self.assertTrue(coordination["requires_readback_before_next_attempt"])
+        self.assertTrue(coordination["lease_retained"])
+        self.assertEqual(coordination["lease_release_state"], "retained")
+        self.assertEqual(
+            coordination["handoff"], "retained_lease_requires_terminal_readback"
+        )
+        self.assertEqual(
+            coordination["reconciliation_attempts"],
+            operator._USER_SERVICE_RECONCILIATION_MAX_ATTEMPTS,
+        )
+        self.assertEqual(coordination["reconciliation"]["Job"], "1234")
+        self.assertIsNone(coordination["reconciliation_error_class"])
+
+    def test_failed_readback_hands_off_after_bounded_reconciliation(self) -> None:
+        fragment = "/home/alex/.config/systemd/user/demo.service"
+        resources = _fake_resources()
+        with (
+            patch.dict(sys.modules, {"grabowski_resources": resources}),
+            patch.object(operator, "_require_operator_capability"),
+            patch.object(operator, "_require_operator_mutation"),
+            patch.object(operator.time, "sleep") as sleep,
+            patch.object(
+                operator,
+                "_run",
+                side_effect=[
+                    _result(stdout=fragment + "\n"),
+                    _result(stdout=_reconciliation(fragment=fragment)),
+                    _result(timed_out=True),
+                    _result(returncode=1),
+                    _result(returncode=1),
+                ],
+            ),
+        ):
+            result = operator.grabowski_user_service("demo.service", "stop")
+
+        self.assertEqual(
+            resources.renew_resources.call_count,
+            operator._USER_SERVICE_RECONCILIATION_MAX_ATTEMPTS,
+        )
+        sleep.assert_called_once_with(operator._USER_SERVICE_RECONCILIATION_POLL_SECONDS)
+        resources.release_resources.assert_not_called()
+        coordination = result["user_service_coordination"]
+        self.assertEqual(coordination["status"], "outcome_unknown")
+        self.assertFalse(coordination["retry_allowed"])
+        self.assertTrue(coordination["requires_readback_before_next_attempt"])
+        self.assertTrue(coordination["lease_retained"])
+        self.assertIsNone(coordination["reconciliation"])
+        self.assertEqual(coordination["reconciliation_error_class"], "RuntimeError")
 
     def test_pending_job_renewal_failure_stays_fail_closed(self) -> None:
         fragment = "/home/alex/.config/systemd/user/demo.service"
@@ -456,7 +559,7 @@ class UserServiceCoordinationTests(unittest.TestCase):
                 "_run",
                 side_effect=[
                     _result(stdout=fragment + "\n"),
-                    _result(stdout=fragment + "\n"),
+                    _result(stdout=_reconciliation(fragment=fragment)),
                     _result(timed_out=True),
                     _result(stdout=_reconciliation(fragment=fragment, job="1234")),
                 ],
@@ -483,7 +586,7 @@ class UserServiceCoordinationTests(unittest.TestCase):
                 "_run",
                 side_effect=[
                     _result(stdout=fragment + "\n"),
-                    _result(stdout=fragment + "\n"),
+                    _result(stdout=_reconciliation(fragment=fragment)),
                     _result(timed_out=True),
                     _result(returncode=1),
                     _result(stdout=_reconciliation(fragment=fragment)),
@@ -514,7 +617,7 @@ class UserServiceCoordinationTests(unittest.TestCase):
                 "_run",
                 side_effect=[
                     _result(stdout=fragment + "\n"),
-                    _result(stdout=fragment + "\n"),
+                    _result(stdout=_reconciliation(fragment=fragment)),
                     OSError("transport"),
                     _result(stdout=_reconciliation(fragment=fragment)),
                 ],

@@ -7713,6 +7713,7 @@ _USER_SERVICE_LEASE_TTL_SECONDS = (
 )
 _USER_SERVICE_UNCERTAIN_LEASE_TTL_SECONDS = 60 * 60
 _USER_SERVICE_RECONCILIATION_POLL_SECONDS = 5.0
+_USER_SERVICE_RECONCILIATION_MAX_ATTEMPTS = 2
 _USER_SERVICE_RECONCILIATION_PROPERTIES = (
     "LoadState",
     "ActiveState",
@@ -7729,6 +7730,18 @@ def _require_fully_qualified_user_service_name(name: str) -> str:
             "mutating user service actions require a fully qualified .service unit name"
         )
     return name
+
+
+def _normalize_user_service_fragment_path(name: str, value: str) -> Path | None:
+    lines = [line.strip() for line in value.splitlines() if line.strip()]
+    if not lines:
+        return None
+    if len(lines) != 1:
+        raise RuntimeError(f"Ambiguous FragmentPath observation for user service {name}")
+    fragment = Path(lines[0]).expanduser()
+    if not fragment.is_absolute():
+        raise RuntimeError(f"FragmentPath for user service {name} is not absolute")
+    return Path(os.path.normpath(str(fragment)))
 
 
 def _user_service_fragment_path(name: str) -> Path | None:
@@ -7751,15 +7764,7 @@ def _user_service_fragment_path(name: str) -> Path | None:
     stdout = result.get("stdout")
     if not isinstance(stdout, str):
         raise RuntimeError(f"Invalid FragmentPath observation for user service {name}")
-    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
-    if not lines:
-        return None
-    if len(lines) != 1:
-        raise RuntimeError(f"Ambiguous FragmentPath observation for user service {name}")
-    fragment = Path(lines[0]).expanduser()
-    if not fragment.is_absolute():
-        raise RuntimeError(f"FragmentPath for user service {name} is not absolute")
-    return Path(os.path.normpath(str(fragment)))
+    return _normalize_user_service_fragment_path(name, stdout)
 
 
 def _user_service_reconciliation_state(name: str) -> dict[str, str]:
@@ -7874,10 +7879,17 @@ def _run_mutating_user_service(name: str, action: str) -> dict[str, Any]:
     lease_snapshots = list(lease["leases"])
     release_leases = True
     try:
-        fragment_after = _user_service_fragment_path(name)
+        pre_action_state = _user_service_reconciliation_state(name)
+        fragment_after = _normalize_user_service_fragment_path(
+            name, pre_action_state["FragmentPath"]
+        )
         if fragment_after != fragment_before:
             raise RuntimeError(
                 f"FragmentPath changed after coordination lease acquisition for user service {name}"
+            )
+        if pre_action_state["Job"].strip():
+            raise RuntimeError(
+                f"user service {name} has an active systemd job before mutation"
             )
 
         action_result: dict[str, Any] | None = None
@@ -7909,12 +7921,15 @@ def _run_mutating_user_service(name: str, action: str) -> dict[str, Any]:
             )
 
         # Once systemctl may have handed work to systemd, transport failure is not
-        # a proven failed mutation. Keep renewing the exact same authority until
-        # systemd itself yields a terminal readback. A long or infinite manager
-        # job therefore cannot outlive a fixed retained-lease TTL.
+        # a proven failed mutation. Reconcile only for a bounded synchronous window.
+        # If systemd is still busy (or unreadable), retain the renewed authority and
+        # return an explicit handoff instead of occupying a shared sync worker forever.
         release_leases = False
         reconciliation: dict[str, str] | None = None
-        while True:
+        reconciliation_error_class: str | None = None
+        reconciliation_attempts = 0
+        for attempt in range(_USER_SERVICE_RECONCILIATION_MAX_ATTEMPTS):
+            reconciliation_attempts = attempt + 1
             try:
                 renewal = resources.renew_resources(
                     owner_id,
@@ -7932,12 +7947,44 @@ def _run_mutating_user_service(name: str, action: str) -> dict[str, Any]:
 
             try:
                 reconciliation = _user_service_reconciliation_state(name)
-            except Exception:
+                reconciliation_error_class = None
+            except Exception as exc:
+                reconciliation_error_class = type(exc).__name__
+            else:
+                if not reconciliation["Job"].strip():
+                    break
+
+            if attempt + 1 < _USER_SERVICE_RECONCILIATION_MAX_ATTEMPTS:
                 time.sleep(_USER_SERVICE_RECONCILIATION_POLL_SECONDS)
-                continue
-            if not reconciliation["Job"].strip():
-                break
-            time.sleep(_USER_SERVICE_RECONCILIATION_POLL_SECONDS)
+
+        if reconciliation is None or reconciliation["Job"].strip():
+            expiries = [
+                item.get("expires_at_unix")
+                for item in lease_snapshots
+                if isinstance(item, dict)
+                and isinstance(item.get("expires_at_unix"), int)
+                and not isinstance(item.get("expires_at_unix"), bool)
+            ]
+            handoff_result = {} if action_result is None else dict(action_result)
+            handoff_result["user_service_coordination"] = {
+                "status": "outcome_unknown",
+                "retry_allowed": False,
+                "requires_readback_before_next_attempt": True,
+                "release_required_after_terminal_readback": True,
+                "lease_retained": True,
+                "lease_release_state": "retained",
+                "lease_owner_id": owner_id,
+                "resource_keys": list(resource_keys),
+                "last_known_lease_expires_at_unix": min(expiries) if expiries else None,
+                "reconciliation_attempts": reconciliation_attempts,
+                "reconciliation": reconciliation,
+                "reconciliation_error_class": reconciliation_error_class,
+                "action_error_class": (
+                    type(action_error).__name__ if action_error is not None else None
+                ),
+                "handoff": "retained_lease_requires_terminal_readback",
+            }
+            return handoff_result
 
         assert reconciliation is not None
 
