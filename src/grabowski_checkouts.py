@@ -16,10 +16,12 @@ import urllib.parse
 import uuid
 from typing import Any, Iterable, Mapping
 
+import grabowski_audit_query as audit_query
 import grabowski_mcp as base
 import grabowski_physical_checkout as physical_checkout
 import grabowski_resources as resources
 import grabowski_tasks as tasks
+import grabowski_transport_roundtrip as transport_roundtrip
 try:
     import grabowski_operator_core as operator
 except ModuleNotFoundError:
@@ -1946,8 +1948,370 @@ def _acquire_uncertainty_recovery_resources(
     }
 
 
+def _uncertainty_resource_lease_rows(
+    fence: dict[str, Any],
+) -> list[dict[str, Any]]:
+    keys = sorted(
+        {
+            resources.normalize_resource_key(str(item))
+            for item in fence.get("resource_keys", [])
+        }
+    )
+    if not keys:
+        raise RuntimeError("Checkout uncertainty fence has no resource keys")
+    connection = _readonly_connection(resources.RESOURCE_DB)
+    if connection is None:
+        return []
+    try:
+        resources._begin_resource_lease_projection_read(connection)
+        placeholders = ",".join("?" for _ in keys)
+        rows = connection.execute(
+            f"SELECT * FROM leases WHERE resource_key IN ({placeholders}) "
+            "ORDER BY resource_key",
+            keys,
+        ).fetchall()
+        return [
+            {
+                "lease": resources._public(row),
+                "metadata": resources._row_metadata(row),
+            }
+            for row in rows
+        ]
+    except sqlite3.OperationalError as exc:
+        raise RuntimeError(
+            "Resource lease projection is unavailable during uncertainty release"
+        ) from exc
+    finally:
+        connection.close()
+
+
+def _prepare_uncertainty_fence_release(
+    fence: dict[str, Any],
+) -> dict[str, Any]:
+    fence_id = str(fence.get("fence_id", ""))
+    if re.fullmatch(r"[0-9a-f]{32}", fence_id) is None:
+        raise ValueError("Checkout uncertainty fence id is invalid")
+    recovery_owner_re = re.compile(
+        rf"checkout-reconcile:{re.escape(fence_id[:16])}:[0-9a-f]{{12}}\Z"
+    )
+    expected_metadata = {
+        "kind": "grabowski.checkout_uncertainty_recovery",
+        "fence_id": fence_id,
+        "evidence_sha256": str(fence["evidence_sha256"]),
+        "effect_operation": str(fence["operation"]),
+        "effect_operation_id": str(fence["operation_id"]),
+    }
+    now = _now()
+    live_recovery: list[dict[str, Any]] = []
+    conflicts: list[dict[str, Any]] = []
+    expired_by_owner: dict[str, list[dict[str, Any]]] = {}
+    for item in _uncertainty_resource_lease_rows(fence):
+        lease = item["lease"]
+        metadata = item["metadata"]
+        owner = str(lease["owner_id"])
+        if owner == str(fence["lease_owner_id"]):
+            continue
+        owned_recovery = (
+            recovery_owner_re.fullmatch(owner) is not None
+            and metadata == expected_metadata
+        )
+        if not owned_recovery:
+            conflicts.append(
+                {
+                    "resource_key": lease["resource_key"],
+                    "owner_id": owner,
+                    "expires_at_unix": lease["expires_at_unix"],
+                }
+            )
+            continue
+        if int(lease["expires_at_unix"]) > now:
+            live_recovery.append(
+                {
+                    "resource_key": lease["resource_key"],
+                    "owner_id": owner,
+                    "expires_at_unix": lease["expires_at_unix"],
+                }
+            )
+            continue
+        expired_by_owner.setdefault(owner, []).append(dict(lease))
+    if live_recovery:
+        return {
+            "state": "blocked",
+            "reason": "recovery-lease-still-live",
+            "leases": live_recovery,
+        }
+    if conflicts:
+        return {
+            "state": "blocked",
+            "reason": "resource-lease-residue-conflict",
+            "leases": conflicts,
+        }
+    reclaimed: list[dict[str, Any]] = []
+    for owner in sorted(expired_by_owner):
+        snapshots = sorted(
+            expired_by_owner[owner],
+            key=lambda item: item["resource_key"],
+        )
+        release = resources.release_resources(
+            owner,
+            [item["resource_key"] for item in snapshots],
+            expected_leases=snapshots,
+        )
+        reclaimed.extend(release["released"])
+    return {
+        "state": "ready",
+        "reclaimed_recovery_leases": reclaimed,
+    }
+
+
+def _legacy_archive_argument_candidates(
+    evidence: dict[str, Any],
+    *,
+    purpose: str,
+    retention_until_unix: int,
+) -> dict[str, dict[str, Any]]:
+    base_arguments = {
+        "checkout_path": str(evidence["checkout_path"]),
+        "owner_id": str(evidence["owner_id"]),
+        "purpose": purpose,
+        "retention_until_unix": retention_until_unix,
+        "expected_head": str(evidence["expected_head"]),
+    }
+    repo_values = [str(evidence["repo"])]
+    checkout_repo = str(evidence["checkout_path"])
+    if checkout_repo not in repo_values:
+        repo_values.append(checkout_repo)
+    omitted = object()
+    branch = evidence.get("expected_branch")
+    branch_values: list[Any] = [omitted, None]
+    if isinstance(branch, str):
+        branch_values.append(branch)
+    physical = evidence.get("expected_physical_identity")
+    physical_values: list[Any] = [omitted, None]
+    if isinstance(physical, dict):
+        physical_values.append(physical)
+    candidates: dict[str, dict[str, Any]] = {}
+    for repo_value in repo_values:
+        for branch_value in branch_values:
+            for physical_value in physical_values:
+                arguments = {**base_arguments, "repo": repo_value}
+                if branch_value is not omitted:
+                    arguments["expected_branch"] = branch_value
+                if physical_value is not omitted:
+                    arguments["expected_physical_identity"] = physical_value
+                digest = transport_roundtrip.canonical_arguments_sha256(arguments)
+                candidates.setdefault(digest, arguments)
+    return candidates
+
+
+def _legacy_archive_audit_records(
+    *,
+    start_unix: int,
+    end_unix: int,
+) -> list[dict[str, Any]]:
+    if start_unix > end_unix:
+        raise ValueError("Legacy archive audit window is invalid")
+    snapshot = audit_query.capture_verified_audit_snapshot()
+    records: list[dict[str, Any]] = []
+    for segment in reversed(snapshot.segments):
+        data = audit_query._load_snapshot_segment(segment)
+        lines = data.splitlines()
+        if not lines:
+            continue
+        parsed_bounds: list[dict[str, Any]] = []
+        for raw_line in (lines[0], lines[-1]):
+            try:
+                value = json.loads(raw_line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("Verified audit segment could not be decoded") from exc
+            if not isinstance(value, dict):
+                raise RuntimeError("Verified audit segment yielded a non-object record")
+            parsed_bounds.append(value)
+        first_timestamp = parsed_bounds[0].get("timestamp_unix")
+        last_timestamp = parsed_bounds[-1].get("timestamp_unix")
+        if type(first_timestamp) is int and first_timestamp > end_unix:
+            continue
+        if type(last_timestamp) is int and last_timestamp < start_unix:
+            break
+        for raw_line in reversed(lines):
+            try:
+                record = json.loads(raw_line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("Verified audit record could not be decoded") from exc
+            if not isinstance(record, dict):
+                raise RuntimeError("Verified audit chain yielded a non-object record")
+            timestamp = record.get("timestamp_unix")
+            if type(timestamp) is not int:
+                continue
+            if timestamp > end_unix:
+                continue
+            if timestamp < start_unix:
+                break
+            if record.get("operation") in {"effect-admission", "effect-completion"}:
+                records.append(record)
+    return records
+
+
+def _legacy_archive_metadata_proof(
+    evidence: dict[str, Any],
+    *,
+    purpose: str,
+    retention_until_unix: int,
+    fence_created_at_unix: int,
+) -> dict[str, Any]:
+    if type(fence_created_at_unix) is not int:
+        return {"state": "invalid", "reason": "legacy-archive-fence-time-invalid"}
+    candidates = _legacy_archive_argument_candidates(
+        evidence,
+        purpose=purpose,
+        retention_until_unix=retention_until_unix,
+    )
+    window_start = fence_created_at_unix - OPERATION_LEASE_TTL_SECONDS
+    window_end = fence_created_at_unix + OPERATION_LEASE_TTL_SECONDS
+    try:
+        records = _legacy_archive_audit_records(
+            start_unix=window_start,
+            end_unix=window_end,
+        )
+    except Exception as exc:
+        return {
+            "state": "invalid",
+            "reason": f"legacy-archive-audit-unavailable:{type(exc).__name__}",
+        }
+    admissions = [
+        record
+        for record in records
+        if record.get("operation") == "effect-admission"
+        and record.get("tool") == "grabowski_checkout_archive"
+        and record.get("effect_class") == "mutating"
+        and record.get("arguments_sha256") in candidates
+        and isinstance(record.get("admission_sha256"), str)
+        and SHA256_RE.fullmatch(str(record["admission_sha256"])) is not None
+    ]
+    pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for admission in admissions:
+        admission_sha256 = str(admission["admission_sha256"])
+        completions = [
+            record
+            for record in records
+            if record.get("operation") == "effect-completion"
+            and record.get("admission_sha256") == admission_sha256
+            and record.get("completion_class") == "outcome_unknown"
+            and type(record.get("completed_at_unix")) is int
+        ]
+        for completion in completions:
+            admitted_at = admission.get("admitted_at_unix")
+            completed_at = completion.get("completed_at_unix")
+            if (
+                type(admitted_at) is int
+                and admitted_at <= fence_created_at_unix
+                and completed_at >= admitted_at
+                and abs(completed_at - fence_created_at_unix)
+                <= OPERATION_LEASE_TTL_SECONDS
+            ):
+                pairs.append((admission, completion))
+    if len(pairs) != 1:
+        return {
+            "state": "invalid",
+            "reason": "legacy-archive-audit-proof-not-unique",
+            "match_count": len(pairs),
+        }
+    admission, completion = pairs[0]
+    admission_record_sha256 = admission.get("record_sha256")
+    completion_record_sha256 = completion.get("record_sha256")
+    if (
+        not isinstance(admission_record_sha256, str)
+        or SHA256_RE.fullmatch(admission_record_sha256) is None
+        or not isinstance(completion_record_sha256, str)
+        or SHA256_RE.fullmatch(completion_record_sha256) is None
+    ):
+        return {
+            "state": "invalid",
+            "reason": "legacy-archive-audit-record-binding-invalid",
+        }
+    return {
+        "state": "proven",
+        "source": "verified-audit-effect-admission",
+        "arguments_sha256": str(admission["arguments_sha256"]),
+        "admission_sha256": str(admission["admission_sha256"]),
+        "admission_record_sha256": admission_record_sha256,
+        "completion_record_sha256": completion_record_sha256,
+    }
+
+
+def _archive_uncertainty_metadata_binding(
+    evidence: dict[str, Any],
+    *,
+    purpose: str,
+    retention_until_unix: int,
+    fence_created_at_unix: int | None,
+) -> dict[str, Any]:
+    has_purpose = "archive_purpose" in evidence
+    has_retention = "archive_retention_until_unix" in evidence
+    if has_purpose != has_retention:
+        return {
+            "state": "invalid",
+            "reason": "archive-fence-metadata-binding-incomplete",
+        }
+    if has_purpose:
+        try:
+            expected_purpose = _purpose(str(evidence["archive_purpose"]))
+            expected_retention = evidence["archive_retention_until_unix"]
+            if (
+                not isinstance(expected_retention, int)
+                or isinstance(expected_retention, bool)
+            ):
+                raise ValueError("archive retention binding is not an integer")
+        except (KeyError, TypeError, ValueError) as exc:
+            return {
+                "state": "invalid",
+                "reason": f"archive-fence-metadata-binding-invalid:{type(exc).__name__}",
+            }
+        if (
+            purpose != expected_purpose
+            or retention_until_unix != expected_retention
+        ):
+            return {
+                "state": "invalid",
+                "reason": "archive-manifest-metadata-binding-mismatch",
+            }
+        return {
+            "state": "valid",
+            "binding": {
+                "source": "fence-evidence",
+                "purpose_sha256": hashlib.sha256(
+                    expected_purpose.encode("utf-8")
+                ).hexdigest(),
+                "retention_until_unix": expected_retention,
+            },
+        }
+    if fence_created_at_unix is None:
+        return {
+            "state": "invalid",
+            "reason": "legacy-archive-audit-proof-time-missing",
+        }
+    proof = _legacy_archive_metadata_proof(
+        evidence,
+        purpose=purpose,
+        retention_until_unix=retention_until_unix,
+        fence_created_at_unix=fence_created_at_unix,
+    )
+    if proof.get("state") != "proven":
+        return proof
+    return {
+        "state": "valid",
+        "binding": {
+            key: value
+            for key, value in proof.items()
+            if key != "state"
+        },
+    }
+
+
 def _partial_archive_manifest(
     evidence: dict[str, Any],
+    *,
+    fence_created_at_unix: int | None = None,
 ) -> dict[str, Any]:
     try:
         archive_id = _validate_archive_id(str(evidence["archive_id"]))
@@ -2071,6 +2435,22 @@ def _partial_archive_manifest(
             "state": "invalid",
             "reason": f"archive-manifest-value-invalid:{type(exc).__name__}",
         }
+    metadata_binding = _archive_uncertainty_metadata_binding(
+        evidence,
+        purpose=purpose,
+        retention_until_unix=retention_until,
+        fence_created_at_unix=fence_created_at_unix,
+    )
+    if metadata_binding.get("state") != "valid":
+        return {
+            "state": "invalid",
+            "reason": str(
+                metadata_binding.get(
+                    "reason",
+                    "archive-metadata-binding-unproven",
+                )
+            ),
+        }
     expected_branch = evidence.get("expected_branch")
     branch_head = None
     if isinstance(expected_branch, str):
@@ -2135,6 +2515,7 @@ def _partial_archive_manifest(
         "purpose": purpose,
         "retention_until_unix": retention_until,
         "terminal_detached_transition": terminal_transition,
+        "metadata_binding": metadata_binding["binding"],
     }
 
 
@@ -2180,7 +2561,10 @@ def _archive_partial_completion_assessment(
             "reason": "archive-directory-with-incomplete-recovery-refs",
             "verified_recovery_refs": verified_refs,
         }
-    manifest_info = _partial_archive_manifest(evidence)
+    manifest_info = _partial_archive_manifest(
+        evidence,
+        fence_created_at_unix=int(fence["created_at_unix"]),
+    )
     if manifest_info.get("state") != "valid":
         return {
             "state": "foreign_or_ambiguous",
@@ -2295,6 +2679,9 @@ def _archive_partial_completion_assessment(
         "archive_id": archive_id,
         "manifest_sha256": manifest_info["manifest_sha256"],
         "created_at_unix": manifest_info["created_at_unix"],
+        "metadata_binding_sha256": _sha256_json(
+            manifest_info["metadata_binding"]
+        ),
         "verified_recovery_refs": verified_refs,
         "checkout_status": status,
         "physical_identity_sha256": (
@@ -2316,6 +2703,7 @@ def _archive_partial_completion_assessment(
         "manifest_path": manifest_info["manifest_path"],
         "purpose": manifest_info["purpose"],
         "retention_until_unix": manifest_info["retention_until_unix"],
+        "metadata_binding": manifest_info["metadata_binding"],
         "lifecycle_preimage": lifecycle,
         "retention_preimage": retention,
     }
@@ -2742,6 +3130,15 @@ def grabowski_checkout_uncertainty_reconcile(
         return {"state": "still_fenced", "fence": fence, "readback": readback}
     if outcome not in {"confirmed_success", "confirmed_no_effect", "reconciled_success"}:
         raise RuntimeError("Checkout uncertainty readback returned an invalid state")
+    lease_preparation = _prepare_uncertainty_fence_release(fence)
+    if lease_preparation["state"] != "ready":
+        return {
+            "state": "still_fenced",
+            "reason": lease_preparation["reason"],
+            "fence": fence,
+            "readback": readback,
+            "lease_preparation": lease_preparation,
+        }
     audit = {
         "timestamp_unix": _now(),
         "operation": "checkout-operation-uncertainty-reconcile",
@@ -2752,6 +3149,7 @@ def grabowski_checkout_uncertainty_reconcile(
         "effect_operation_id": fence["operation_id"],
         "outcome": outcome,
         "readback": readback,
+        "lease_preparation": lease_preparation,
     }
     base._append_audit(audit)
     lease_release = _release_uncertainty_fence_resources(fence)
@@ -2765,6 +3163,7 @@ def grabowski_checkout_uncertainty_reconcile(
         "outcome": outcome,
         "fence": cleared,
         "lease_release": lease_release,
+        "lease_preparation": lease_preparation,
         "readback": readback,
         "audit": audit,
     }
@@ -5421,6 +5820,8 @@ def grabowski_checkout_archive(
                 "expected_branch": record.get("branch"),
                 "expected_physical_identity": archive_physical_identity,
                 "terminal_detached_transition": terminal_detached_transition,
+                "archive_purpose": archive_purpose,
+                "archive_retention_until_unix": until,
                 "planned_recovery_refs": planned_refs,
             },
         )

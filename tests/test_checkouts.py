@@ -211,6 +211,48 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self._expire_uncertainty_lease(fence)
         return fence
 
+    def _strand_recovery_lease_after_archive_commit(
+        self,
+    ) -> tuple[dict[str, object], str]:
+        fence = self._partial_archive_after_manifest_without_db()
+        real_release = checkouts.resources.release_resources
+        stranded_owner = [None]
+
+        def fail_recovery_release(owner_id, resource_keys, **kwargs):
+            if str(owner_id).startswith("checkout-reconcile:"):
+                stranded_owner[0] = str(owner_id)
+                raise RuntimeError("simulated recovery release crash")
+            return real_release(owner_id, resource_keys, **kwargs)
+
+        with patch.object(
+            checkouts.resources,
+            "release_resources",
+            side_effect=fail_recovery_release,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "simulated recovery release crash",
+            ):
+                checkouts.grabowski_checkout_uncertainty_reconcile(
+                    fence["fence_id"],
+                    "reconcile-checkout-operation-outcome",
+                )
+        owner = stranded_owner[0]
+        self.assertIsInstance(owner, str)
+        archive = checkouts._load_archive(fence["operation_id"])
+        self.assertEqual(archive["head"], self.head)
+        self.assertEqual(len(checkouts._active_checkout_operation_uncertainties()), 1)
+        with checkouts.resources._database() as connection:
+            rows = connection.execute(
+                "SELECT * FROM leases WHERE owner_id=? ORDER BY resource_key",
+                (owner,),
+            ).fetchall()
+        self.assertEqual(
+            {row["resource_key"] for row in rows},
+            set(fence["resource_keys"]),
+        )
+        return fence, owner
+
 
     def _insert_running_task(
         self, *, marker: str, cwd: Path, resource_keys: list[str]
@@ -2417,6 +2459,178 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertIsNotNone(lifecycle)
         self.assertEqual(lifecycle["archived_at_unix"], recovered_at)
 
+    def test_partial_archive_fence_binds_purpose_and_retention(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        manifest_path = checkouts.ARCHIVE_ROOT / fence["operation_id"] / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            fence["evidence"]["archive_purpose"],
+            manifest["purpose"],
+        )
+        self.assertEqual(
+            fence["evidence"]["archive_retention_until_unix"],
+            manifest["retention_until_unix"],
+        )
+
+    def test_partial_archive_manifest_purpose_tamper_stays_fenced(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        manifest_path = checkouts.ARCHIVE_ROOT / fence["operation_id"] / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["purpose"] = manifest["purpose"] + " tampered"
+        manifest_path.write_text(
+            json.dumps(manifest, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        readback = checkouts._archive_uncertainty_readback(fence)
+
+        self.assertEqual(readback["state"], "still_fenced")
+        self.assertEqual(readback["partial_state"], "foreign_or_ambiguous")
+        self.assertEqual(
+            readback["partial_reason"],
+            "archive-manifest-metadata-binding-mismatch",
+        )
+
+    def test_partial_archive_manifest_retention_tamper_stays_fenced(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        manifest_path = checkouts.ARCHIVE_ROOT / fence["operation_id"] / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["retention_until_unix"] += 60
+        manifest_path.write_text(
+            json.dumps(manifest, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        readback = checkouts._archive_uncertainty_readback(fence)
+
+        self.assertEqual(readback["state"], "still_fenced")
+        self.assertEqual(readback["partial_state"], "foreign_or_ambiguous")
+        self.assertEqual(
+            readback["partial_reason"],
+            "archive-manifest-metadata-binding-mismatch",
+        )
+
+    def test_partial_archive_legacy_metadata_uses_exact_audit_proof(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        manifest_path = checkouts.ARCHIVE_ROOT / fence["operation_id"] / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        legacy_evidence = dict(fence["evidence"])
+        legacy_evidence.pop("archive_purpose")
+        legacy_evidence.pop("archive_retention_until_unix")
+        arguments = {
+            "repo": str(self.repo),
+            "checkout_path": str(self.checkout),
+            "owner_id": "owner-a",
+            "purpose": manifest["purpose"],
+            "retention_until_unix": manifest["retention_until_unix"],
+            "expected_head": self.head,
+            "expected_branch": "topic",
+            "expected_physical_identity": legacy_evidence[
+                "expected_physical_identity"
+            ],
+        }
+        arguments_sha256 = (
+            checkouts.transport_roundtrip.canonical_arguments_sha256(arguments)
+        )
+        admitted = int(fence["created_at_unix"]) - 1
+        admission_sha256 = "a" * 64
+        records = [
+            {
+                "operation": "effect-admission",
+                "tool": "grabowski_checkout_archive",
+                "effect_class": "mutating",
+                "arguments_sha256": arguments_sha256,
+                "admission_sha256": admission_sha256,
+                "admitted_at_unix": admitted,
+                "timestamp_unix": admitted,
+                "record_sha256": "b" * 64,
+            },
+            {
+                "operation": "effect-completion",
+                "admission_sha256": admission_sha256,
+                "completion_class": "outcome_unknown",
+                "completed_at_unix": int(fence["created_at_unix"]),
+                "timestamp_unix": int(fence["created_at_unix"]),
+                "record_sha256": "c" * 64,
+            },
+        ]
+
+        with patch.object(
+            checkouts,
+            "_legacy_archive_audit_records",
+            return_value=records,
+        ):
+            observed = checkouts._partial_archive_manifest(
+                legacy_evidence,
+                fence_created_at_unix=int(fence["created_at_unix"]),
+            )
+
+        self.assertEqual(observed["state"], "valid")
+        self.assertEqual(
+            observed["metadata_binding"]["source"],
+            "verified-audit-effect-admission",
+        )
+        self.assertEqual(
+            observed["metadata_binding"]["arguments_sha256"],
+            arguments_sha256,
+        )
+
+    def test_partial_archive_legacy_metadata_ambiguous_audit_proof_fails_closed(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        manifest_path = checkouts.ARCHIVE_ROOT / fence["operation_id"] / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        legacy_evidence = dict(fence["evidence"])
+        legacy_evidence.pop("archive_purpose")
+        legacy_evidence.pop("archive_retention_until_unix")
+        candidates = checkouts._legacy_archive_argument_candidates(
+            legacy_evidence,
+            purpose=manifest["purpose"],
+            retention_until_unix=manifest["retention_until_unix"],
+        )
+        arguments_sha256 = next(iter(candidates))
+        created = int(fence["created_at_unix"])
+        records = []
+        for admission_sha256, marker in (("a" * 64, "b"), ("d" * 64, "e")):
+            records.extend(
+                [
+                    {
+                        "operation": "effect-admission",
+                        "tool": "grabowski_checkout_archive",
+                        "effect_class": "mutating",
+                        "arguments_sha256": arguments_sha256,
+                        "admission_sha256": admission_sha256,
+                        "admitted_at_unix": created - 1,
+                        "timestamp_unix": created - 1,
+                        "record_sha256": marker * 64,
+                    },
+                    {
+                        "operation": "effect-completion",
+                        "admission_sha256": admission_sha256,
+                        "completion_class": "outcome_unknown",
+                        "completed_at_unix": created,
+                        "timestamp_unix": created,
+                        "record_sha256": ("c" if marker == "b" else "f") * 64,
+                    },
+                ]
+            )
+
+        with patch.object(
+            checkouts,
+            "_legacy_archive_audit_records",
+            return_value=records,
+        ):
+            observed = checkouts._partial_archive_manifest(
+                legacy_evidence,
+                fence_created_at_unix=created,
+            )
+
+        self.assertEqual(observed["state"], "invalid")
+        self.assertEqual(
+            observed["reason"],
+            "legacy-archive-audit-proof-not-unique",
+        )
+
     def test_partial_archive_all_refs_without_manifest_is_rollback_candidate(self) -> None:
         expected_identity = checkouts.physical_checkout.capture_physical_checkout_identity(
             self.checkout
@@ -2679,6 +2893,84 @@ class CheckoutLifecycleTests(unittest.TestCase):
                 for item in snapshots
             )
         )
+
+    def test_partial_archive_retry_reclaims_expired_owned_recovery_residue(self) -> None:
+        fence, recovery_owner = self._strand_recovery_lease_after_archive_commit()
+        with checkouts.resources._database() as connection:
+            row = connection.execute(
+                "SELECT MAX(expires_at_unix) AS expires_at_unix "
+                "FROM leases WHERE owner_id=?",
+                (recovery_owner,),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        expired_now = int(row["expires_at_unix"]) + 1
+
+        with patch.object(checkouts, "_now", return_value=expired_now):
+            retry = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+
+        self.assertEqual(retry["state"], "reconciled")
+        self.assertEqual(retry["outcome"], "confirmed_success")
+        reclaimed = retry["lease_preparation"]["reclaimed_recovery_leases"]
+        self.assertEqual(
+            {item["resource_key"] for item in reclaimed},
+            set(fence["resource_keys"]),
+        )
+        with checkouts.resources._database() as connection:
+            remaining = connection.execute(
+                "SELECT 1 FROM leases WHERE owner_id=?",
+                (recovery_owner,),
+            ).fetchall()
+        self.assertEqual(remaining, [])
+
+    def test_partial_archive_retry_blocks_live_recovery_residue(self) -> None:
+        fence, recovery_owner = self._strand_recovery_lease_after_archive_commit()
+
+        retry = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+
+        self.assertEqual(retry["state"], "still_fenced")
+        self.assertEqual(retry["reason"], "recovery-lease-still-live")
+        self.assertEqual(
+            {item["owner_id"] for item in retry["lease_preparation"]["leases"]},
+            {recovery_owner},
+        )
+        self.assertEqual(len(checkouts._active_checkout_operation_uncertainties()), 1)
+
+    def test_partial_archive_retry_keeps_expired_foreign_residue_fenced(self) -> None:
+        fence, recovery_owner = self._strand_recovery_lease_after_archive_commit()
+        foreign_owner = "foreign-recovery-residue"
+        with checkouts.resources._database() as connection:
+            connection.execute(
+                "UPDATE leases SET owner_id=? WHERE owner_id=?",
+                (foreign_owner, recovery_owner),
+            )
+            row = connection.execute(
+                "SELECT MAX(expires_at_unix) AS expires_at_unix "
+                "FROM leases WHERE owner_id=?",
+                (foreign_owner,),
+            ).fetchone()
+            connection.commit()
+        self.assertIsNotNone(row)
+        expired_now = int(row["expires_at_unix"]) + 1
+
+        with patch.object(checkouts, "_now", return_value=expired_now):
+            retry = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+
+        self.assertEqual(retry["state"], "still_fenced")
+        self.assertEqual(retry["reason"], "resource-lease-residue-conflict")
+        self.assertEqual(
+            {item["owner_id"] for item in retry["lease_preparation"]["leases"]},
+            {foreign_owner},
+        )
+        self.assertEqual(len(checkouts._active_checkout_operation_uncertainties()), 1)
 
     def test_cleanup_unknown_outcome_remains_durably_fenced_after_lease_expiry(self) -> None:
         archive = self._archive()["archive"]
