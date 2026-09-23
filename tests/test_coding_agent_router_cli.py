@@ -188,6 +188,21 @@ class CodingAgentRouterCliTests(unittest.TestCase):
                 "subscription_type": "pro",
             },
         )
+        long_lived = cli._claude_auth_summary(
+            {
+                "loggedIn": True,
+                "authMethod": "oauth_token",
+            }
+        )
+        self.assertEqual(
+            long_lived,
+            {
+                "logged_in": True,
+                "auth_method": "oauth_token",
+                "subscription_type": None,
+            },
+        )
+
         encoded = json.dumps(summary, sort_keys=True)
         self.assertNotIn("secret-provider-value", encoded)
         self.assertNotIn("must-not-propagate", encoded)
