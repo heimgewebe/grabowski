@@ -3298,7 +3298,10 @@ MAX_FATAL_ERROR_STDERR_CHARS = 1000
 def _emit_fatal_error(exc: Exception) -> None:
     detail = " ".join(str(exc).splitlines()).strip()
     projected = f"rootbroker-cutover-error: {type(exc).__name__}: {detail}"
-    print(projected[:MAX_FATAL_ERROR_STDERR_CHARS], file=sys.stderr)
+    try:
+        print(projected[:MAX_FATAL_ERROR_STDERR_CHARS], file=sys.stderr)
+    except (OSError, ValueError):
+        pass
     print(
         json.dumps(
             {"success": False, "error": str(exc)},

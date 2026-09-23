@@ -375,6 +375,28 @@ class RootbrokerCutoverTests(unittest.TestCase):
             {"success": False, "error": message},
         )
 
+    def test_fatal_error_projection_preserves_stdout_when_stderr_write_fails(self) -> None:
+        failure = cutover.CutoverError("boom")
+
+        for stderr_error in (OSError("stderr unavailable"), ValueError("stderr closed")):
+            stdout_calls: list[str] = []
+
+            def emit(*args: object, **kwargs: object) -> None:
+                if kwargs.get("file") is sys.stderr:
+                    raise stderr_error
+                stdout_calls.append(str(args[0]))
+
+            with self.subTest(error_type=type(stderr_error).__name__), patch(
+                "builtins.print", side_effect=emit
+            ):
+                cutover._emit_fatal_error(failure)
+
+            self.assertEqual(len(stdout_calls), 1)
+            self.assertEqual(
+                json.loads(stdout_calls[0]),
+                {"success": False, "error": "boom"},
+            )
+
     def test_operator_username_is_runner_observed_and_fails_closed_on_drift(self) -> None:
         calls: list[list[str]] = []
 
