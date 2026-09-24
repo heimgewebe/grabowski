@@ -226,7 +226,7 @@ BASE_PATH = Path(__file__).with_name("repobrief_agent_benchmark_runner.py")
 base = _load_captured_module("repobrief_agent_benchmark_base", BASE_PATH)
 
 PROVIDER = "openai-codex-cli"
-MODEL = "gpt-5.3-codex-spark"
+MODEL = "gpt-6-astra"
 EXECUTION_CONTRACT = "grabowski-codex-cli-live-v1"
 SAMPLING = {"reasoning_effort": "medium"}
 STDERR_POLICY_VERSION = "codex-stderr-v1"
