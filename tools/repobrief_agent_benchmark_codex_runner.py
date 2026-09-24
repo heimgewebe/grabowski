@@ -3844,10 +3844,45 @@ def run_mcp_proxy(
     return returncode
 
 
+_CODEX_OUTPUT_SCHEMA_UNIQUE_ITEM_FIELDS = (
+    "reported_paths",
+    "reported_symbols",
+    "citations",
+    "claims",
+)
+
+
+def _schema_contains_unique_items(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        if "uniqueItems" in value:
+            return True
+        return any(_schema_contains_unique_items(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_schema_contains_unique_items(item) for item in value)
+    return False
+
+
+def _codex_output_schema() -> dict[str, Any]:
+    """Project the canonical answer contract into Codex Structured Outputs."""
+
+    schema = json.loads(json.dumps(base.ANSWER_SCHEMA))
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        raise RunnerError("Codex output schema properties contract drift")
+    for field in _CODEX_OUTPUT_SCHEMA_UNIQUE_ITEM_FIELDS:
+        node = properties.get(field)
+        if not isinstance(node, dict) or node.get("uniqueItems") is not True:
+            raise RunnerError("Codex output schema uniqueness contract drift")
+        del node["uniqueItems"]
+    if _schema_contains_unique_items(schema):
+        raise RunnerError("Codex output schema contains unsupported uniqueItems")
+    return schema
+
+
 def write_schema(path: Path) -> None:
     base._write_private_exclusive(
         path,
-        (json.dumps(base.ANSWER_SCHEMA, sort_keys=True, indent=2) + "\n").encode("utf-8"),
+        (json.dumps(_codex_output_schema(), sort_keys=True, indent=2) + "\n").encode("utf-8"),
     )
 
 
