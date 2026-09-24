@@ -1597,11 +1597,16 @@ def _continuation_preimage(
 
     status = runner(target, ["status", "--short", "--branch", "--untracked-files=normal"])
     head = runner(target, ["rev-parse", "--verify", "HEAD^{commit}"])
-    tracked = runner(target, ["diff", "--no-ext-diff", "--binary", "HEAD"])
+    tracked_index = runner(target, ["diff-index", "--quiet", "HEAD", "--"])
+    tracked_files = runner(target, ["diff-files", "--quiet", "--"])
+    tracked_tree = runner(target, ["write-tree"])
     untracked = runner(target, ["ls-files", "--others", "--exclude-standard", "-z"])
-    preimage_reads = (status, head, tracked, untracked)
+    index_flags = runner(target, ["ls-files", "-v", "-z"])
+    preimage_reads = (status, head, tracked_tree, untracked, index_flags)
     if any(result.get("returncode") != 0 for result in preimage_reads):
         raise RuntimeError("managed worktree continuation Git readback failed")
+    if tracked_index.get("returncode") not in (0, 1) or tracked_files.get("returncode") not in (0, 1):
+        raise RuntimeError("managed worktree continuation tracked state readback failed")
     if any(
         result.get("stdout_truncated") is True
         or result.get("stderr_truncated") is True
@@ -1613,6 +1618,17 @@ def _continuation_preimage(
     head_sha = str(head.get("stdout") or "").strip().lower()
     if SHA40_RE.fullmatch(head_sha) is None:
         raise RuntimeError("managed worktree continuation HEAD is invalid")
+    tree_sha = str(tracked_tree.get("stdout") or "").strip().lower()
+    if SHA40_RE.fullmatch(tree_sha) is None:
+        raise RuntimeError("managed worktree continuation index tree is invalid")
+    index_entries = [
+        entry for entry in str(index_flags.get("stdout") or "").split("\0") if entry
+    ]
+    tags = [entry[0] for entry in index_entries]
+    if any(tag.islower() for tag in tags):
+        raise RuntimeError("managed worktree continuation has assume-unchanged index entries")
+    if any(tag.upper() == "S" for tag in tags):
+        raise RuntimeError("managed worktree continuation has skip-worktree index entries")
     prior_head = live_lifecycle.get("expected_head")
     if not isinstance(prior_head, str) or SHA40_RE.fullmatch(prior_head) is None:
         raise RuntimeError("managed worktree continuation prior HEAD evidence is invalid")
@@ -1659,9 +1675,9 @@ def _continuation_preimage(
         "dirty": bool(status_entries),
         "status_header": status_lines[0] if status_lines else "",
         "status_entries": status_entries[:100],
-        "tracked_diff_sha256": hashlib.sha256(
-            str(tracked.get("stdout") or "").encode("utf-8")
-        ).hexdigest(),
+        "index_tree": tree_sha,
+        "tracked_index_dirty": tracked_index.get("returncode") == 1,
+        "tracked_worktree_dirty": tracked_files.get("returncode") == 1,
         "untracked": untracked_hashes,
         "prior_worktree_receipt_sha256": prior.get("durable_receipt_sha256"),
         "lifecycle_updated_at_unix": live_lifecycle.get("updated_at_unix"),

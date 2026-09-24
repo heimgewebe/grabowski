@@ -1212,8 +1212,12 @@ class WorkAcquireTests(unittest.TestCase):
                 }
             if argv[0] == "rev-parse":
                 return {"returncode": 0, "stdout": SHA + "\n"}
-            if argv[0] == "diff":
-                return {"returncode": 0, "stdout": "diff --git a/src/example.py b/src/example.py\n"}
+            if argv[0] == "diff-index":
+                return {"returncode": 0, "stdout": ""}
+            if argv[0] == "diff-files":
+                return {"returncode": 1, "stdout": ""}
+            if argv[0] == "write-tree":
+                return {"returncode": 0, "stdout": SHA + "\n"}
             if argv[0] == "ls-files":
                 return {"returncode": 0, "stdout": ""}
             if argv[0] == "merge-base":
@@ -1288,10 +1292,16 @@ class WorkAcquireTests(unittest.TestCase):
                 return {"returncode": 0, "stdout": "## feat/authority-p0\n M src/example.py\n"}
             if argv[0] == "rev-parse":
                 return {"returncode": 0, "stdout": SHA + "\n"}
-            if argv[0] == "diff":
+            if argv[0] == "diff-index":
+                return {"returncode": 0, "stdout": ""}
+            if argv[0] == "diff-files":
+                return {"returncode": 1, "stdout": ""}
+            if argv[0] == "write-tree":
+                return {"returncode": 0, "stdout": SHA + "\n"}
+            if argv[0] == "ls-files" and "-v" in argv:
                 return {
                     "returncode": 0,
-                    "stdout": "truncated-prefix",
+                    "stdout": "H src/example.py\0",
                     "stdout_truncated": True,
                 }
             if argv[0] == "ls-files":
@@ -1320,6 +1330,69 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertEqual(blocked["state"], "blocked")
         self.assertEqual(blocked["error_class"], "WORKTREE_CONTINUATION_CONFLICT")
         self.assertIn("readback was truncated", blocked["error"])
+        self.assertEqual(ensure.call_count, 1)
+
+    def test_dirty_lane_continuation_rejects_hidden_index_entries(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        checkout_key = "a" * 64
+        ensure = Mock(return_value={
+            "result_state": "CREATED",
+            "durable_receipt_sha256": "b" * 64,
+            "post_state": {"target_registered": True, "target_path_exists": True},
+            "lifecycle": {
+                "checkout_key": checkout_key,
+                "checkout_path": str(self.target),
+                "owner_id": inputs["lease_owner_id"],
+                "source": lifecycle_source,
+                "artifact_class": inputs["artifact_class"],
+                "expected_branch": inputs["branch"],
+            },
+        })
+        kwargs = {
+            "acquire_resources_fn": self.acquire,
+            "release_resources_fn": Mock(),
+            "inspect_resource_fn": Mock(),
+            "ensure_worktree_fn": ensure,
+        }
+        work_acquire.acquire_work(params, runner=Mock(), **kwargs)
+
+        def runner(_cwd: Path, argv: list[str]) -> dict[str, object]:
+            if argv[0] == "status":
+                return {"returncode": 0, "stdout": "## feat/authority-p0\n"}
+            if argv[0] == "rev-parse":
+                return {"returncode": 0, "stdout": SHA + "\n"}
+            if argv[0] in ("diff-index", "diff-files"):
+                return {"returncode": 0, "stdout": ""}
+            if argv[0] == "write-tree":
+                return {"returncode": 0, "stdout": SHA + "\n"}
+            if argv[0] == "ls-files" and "-v" in argv:
+                return {"returncode": 0, "stdout": "h src/example.py\0"}
+            if argv[0] == "ls-files":
+                return {"returncode": 0, "stdout": ""}
+            raise AssertionError(argv)
+
+        record = {"checkout_key": checkout_key, "branch": inputs["branch"], "detached": False}
+        lifecycle = {
+            "checkout_key": checkout_key,
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "source": lifecycle_source,
+            "artifact_class": inputs["artifact_class"],
+            "phase": "active",
+            "expected_branch": inputs["branch"],
+            "expected_head": SHA,
+            "updated_at_unix": 123,
+        }
+        with (
+            patch.object(work_acquire.checkouts, "_worktree_for_path", return_value=(self.repo, self.repo / ".git", record)),
+            patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(work_acquire.checkouts, "_strict_lifecycle_binding", return_value=lifecycle),
+        ):
+            blocked = work_acquire.acquire_work(params, runner=runner, **kwargs)
+        self.assertEqual(blocked["state"], "blocked")
+        self.assertIn("assume-unchanged", blocked["error"])
         self.assertEqual(ensure.call_count, 1)
 
     def test_dirty_lane_continuation_fails_closed_on_lifecycle_drift(self) -> None:
