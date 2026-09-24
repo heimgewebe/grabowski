@@ -1628,6 +1628,7 @@ def _continuation_preimage(
             stderr=subprocess.PIPE,
             check=False,
             timeout=30,
+            env=operator._git_environment(),
         )
 
     try:

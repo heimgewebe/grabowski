@@ -1265,6 +1265,62 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertEqual(second["continuation_preimage"]["checkout_key"], checkout_key)
         self.assertEqual(ensure.call_count, 1)
 
+    def test_continuation_raw_probe_uses_sanitized_git_environment(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        checkout_key = "a" * 64
+        prior = {
+            "state": "ready",
+            "worktree_receipt": {
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "lifecycle": {"checkout_key": checkout_key},
+            },
+        }
+        record = {"checkout_key": checkout_key, "branch": inputs["branch"], "detached": False}
+        lifecycle = {
+            "checkout_key": checkout_key,
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "source": lifecycle_source,
+            "artifact_class": inputs["artifact_class"],
+            "phase": "active",
+            "expected_branch": inputs["branch"],
+            "expected_head": SHA,
+            "updated_at_unix": 123,
+        }
+
+        def runner(_cwd: Path, argv: list[str]) -> dict[str, object]:
+            if argv[0] == "status":
+                return {"returncode": 0, "stdout": "## feat/authority-p0\n"}
+            if argv[0] == "rev-parse":
+                return {"returncode": 0, "stdout": SHA + "\n"}
+            if argv[0] in ("diff-index", "diff-files"):
+                return {"returncode": 0, "stdout": ""}
+            if argv[0] == "ls-files":
+                return {"returncode": 0, "stdout": ""}
+            if argv[0] == "merge-base":
+                return {"returncode": 0, "stdout": ""}
+            raise AssertionError(argv)
+
+        sanitized = {"PATH": "/usr/bin", "GIT_TERMINAL_PROMPT": "0"}
+        completed = __import__("subprocess").CompletedProcess([], 0, b"", b"")
+        with (
+            patch.object(work_acquire.checkouts, "_worktree_for_path", return_value=(self.repo, self.repo / ".git", record)),
+            patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(work_acquire.checkouts, "_strict_lifecycle_binding", return_value=lifecycle),
+            patch.object(work_acquire.operator, "_git_environment", return_value=sanitized),
+            patch.object(work_acquire.subprocess, "run", return_value=completed) as run,
+            patch.object(work_acquire.git_preimage, "capture_branch_preimage", return_value={"branch": inputs["branch"], "head": SHA, "operation_refs": {}, "preimage_sha256": "c" * 64, "index_sha256": "d" * 64, "worktree_sha256": "e" * 64}) as capture,
+        ):
+            work_acquire._continuation_preimage(prior, inputs, lifecycle_source, runner)
+            raw_probe = capture.call_args.args[1]
+            raw_probe(self.target, ["ls-files", "--stage", "-z"])
+
+        self.assertEqual(run.call_args.kwargs["env"], sanitized)
+        self.assertNotIn("GIT_INDEX_FILE", run.call_args.kwargs["env"])
+
     def test_continuation_preimage_changes_with_raw_tracked_worktree_hash(self) -> None:
         params = self.parameters()
         inputs = work_acquire._normalize(params)
