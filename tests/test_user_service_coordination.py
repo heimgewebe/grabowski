@@ -145,6 +145,7 @@ def _fake_resources() -> types.ModuleType:
         return cleared
 
     module.acquire_resources = MagicMock(side_effect=acquire)
+    module.inspect_resources = MagicMock(return_value={})
     module.renew_resources = MagicMock(side_effect=renew)
     module.release_resources = MagicMock(
         return_value={
@@ -238,6 +239,47 @@ class UserServiceCoordinationTests(unittest.TestCase):
         self.assertEqual(
             run.call_args.kwargs["timeout_seconds"],
             operator._USER_SYSTEMD_RECONCILIATION_TIMEOUT_SECONDS,
+        )
+
+    def test_job_pending_normalizes_systemd_zero_sentinel(self) -> None:
+        self.assertFalse(operator._user_systemd_job_pending(""))
+        self.assertFalse(operator._user_systemd_job_pending("0"))
+        self.assertFalse(
+            operator._user_systemd_job_pending(
+                "0 /org/freedesktop/systemd1/job/0"
+            )
+        )
+        self.assertTrue(operator._user_systemd_job_pending("77"))
+        self.assertTrue(
+            operator._user_systemd_job_pending(
+                "77 /org/freedesktop/systemd1/job/77"
+            )
+        )
+
+    def test_zero_job_pre_action_dispatches_mutation(self) -> None:
+        fragment = "/home/alex/.config/systemd/user/demo.service"
+        resources = _fake_resources()
+        action_result = _result(stdout="started")
+        with (
+            patch.dict(sys.modules, {"grabowski_resources": resources}),
+            patch.object(operator, "_require_operator_capability"),
+            patch.object(operator, "_require_operator_mutation"),
+            patch.object(
+                operator,
+                "_run",
+                side_effect=[
+                    _result(stdout=fragment + "\n"),
+                    _result(stdout=_reconciliation(fragment=fragment, job="0")),
+                    action_result,
+                ],
+            ) as run,
+        ):
+            result = operator.grabowski_user_service("demo.service", "restart")
+
+        self.assertIs(result, action_result)
+        self.assertEqual(
+            run.call_args_list[-1].args[0],
+            ["systemctl", "--user", "restart", "demo.service"],
         )
 
     def test_non_service_unit_remains_mutable(self) -> None:
@@ -407,11 +449,108 @@ class UserServiceCoordinationTests(unittest.TestCase):
 
         message = str(caught.exception)
         self.assertIn("FragmentPath changed", message)
-        self.assertIn("coordination release is uncertain", message)
+        self.assertIn("pre-effect coordination recovery is uncertain", message)
         self.assertIn("primary_error_class=RuntimeError", message)
         self.assertIn("release_error_class=OSError", message)
         self.assertIn("lease_owner_id=", message)
         self.assertIn("service:user-systemd:demo.service", message)
+
+    def test_pre_action_readback_failure_clears_own_fence_before_release(self) -> None:
+        fragment = "/home/alex/.config/systemd/user/demo.service"
+        resources = _fake_resources()
+        with (
+            patch.dict(sys.modules, {"grabowski_resources": resources}),
+            patch.object(operator, "_require_operator_capability"),
+            patch.object(operator, "_require_operator_mutation"),
+            patch.object(
+                operator,
+                "_run",
+                side_effect=[
+                    _result(stdout=fragment + "\n"),
+                    OSError("pre-action readback"),
+                ],
+            ),
+        ):
+            with self.assertRaisesRegex(OSError, "pre-action readback"):
+                operator.grabowski_user_service("demo.service", "restart")
+
+        self.assertIsNone(resources._fence_state["active"])
+        resources.clear_user_systemd_uncertainty_fence.assert_called_once()
+        self.assertEqual(
+            resources.clear_user_systemd_uncertainty_fence.call_args.kwargs[
+                "outcome"
+            ],
+            "pre_effect_abort",
+        )
+        resources.release_resources.assert_called_once()
+
+    def test_pre_action_clearance_failure_exposes_exact_fence_identity(self) -> None:
+        fragment = "/home/alex/.config/systemd/user/demo.service"
+        resources = _fake_resources()
+        resources.clear_user_systemd_uncertainty_fence.side_effect = OSError(
+            "clear failed"
+        )
+        with (
+            patch.dict(sys.modules, {"grabowski_resources": resources}),
+            patch.object(operator, "_require_operator_capability"),
+            patch.object(operator, "_require_operator_mutation"),
+            patch.object(
+                operator,
+                "_run",
+                side_effect=[
+                    _result(stdout=fragment + "\n"),
+                    OSError("pre-action readback"),
+                ],
+            ),
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                operator.grabowski_user_service("demo.service", "restart")
+
+        message = str(caught.exception)
+        self.assertIn("pre-action readback", message)
+        self.assertIn("pre-effect coordination recovery is uncertain", message)
+        self.assertIn("fence_clearance_error_class=OSError", message)
+        self.assertIn("uncertainty_fence_id=" + "f" * 32, message)
+        self.assertIn("service:user-systemd:demo.service", message)
+        resources.release_resources.assert_called_once()
+        self.assertIsNotNone(resources._fence_state["active"])
+
+    def test_dispatching_phase_failure_clears_fence_before_effect(self) -> None:
+        fragment = "/home/alex/.config/systemd/user/demo.service"
+        resources = _fake_resources()
+        original_update = resources.update_user_systemd_uncertainty_fence.side_effect
+
+        def fail_dispatching(fence_id, *, phase):
+            if phase == "dispatching":
+                raise RuntimeError("dispatching journal failed")
+            return original_update(fence_id, phase=phase)
+
+        resources.update_user_systemd_uncertainty_fence.side_effect = fail_dispatching
+        with (
+            patch.dict(sys.modules, {"grabowski_resources": resources}),
+            patch.object(operator, "_require_operator_capability"),
+            patch.object(operator, "_require_operator_mutation"),
+            patch.object(
+                operator,
+                "_run",
+                side_effect=[
+                    _result(stdout=fragment + "\n"),
+                    _result(stdout=_reconciliation(fragment=fragment)),
+                ],
+            ) as run,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "dispatching journal failed"):
+                operator.grabowski_user_service("demo.service", "restart")
+
+        self.assertEqual(run.call_count, 2)
+        self.assertIsNone(resources._fence_state["active"])
+        self.assertEqual(
+            resources.clear_user_systemd_uncertainty_fence.call_args.kwargs[
+                "outcome"
+            ],
+            "pre_effect_abort",
+        )
+        resources.release_resources.assert_called_once()
 
     def test_completed_action_preserves_result_when_release_is_uncertain(self) -> None:
         fragment = "/home/alex/.config/systemd/user/demo.service"
@@ -775,7 +914,7 @@ class UserServiceCoordinationTests(unittest.TestCase):
             "grabowski_resource_release",
         )
 
-    def test_unreadable_fence_clears_when_manager_has_no_unit_job(self) -> None:
+    def test_unreadable_fence_stays_blocked_when_manager_has_no_unit_job(self) -> None:
         resources = _fake_resources()
         service_key = "service:user-systemd:demo.service"
         resources._fence_state["active"] = {
@@ -798,17 +937,42 @@ class UserServiceCoordinationTests(unittest.TestCase):
             )
 
         self.assertIsNotNone(prior)
-        self.assertFalse(prior["blocked"])
+        self.assertTrue(prior["blocked"])
         self.assertEqual(prior["reconciliation_error_class"], "OSError")
         self.assertFalse(prior["manager_job_readback"]["job_present"])
-        self.assertIsNone(resources._fence_state["active"])
-        resources.clear_user_systemd_uncertainty_fence.assert_called_once()
-        self.assertEqual(
-            resources.clear_user_systemd_uncertainty_fence.call_args.kwargs[
-                "outcome"
-            ],
-            "terminal_readback",
-        )
+        self.assertIsNotNone(resources._fence_state["active"])
+        resources.clear_user_systemd_uncertainty_fence.assert_not_called()
+
+    def test_live_fence_lease_blocks_reconciliation_before_systemd_readback(self) -> None:
+        resources = _fake_resources()
+        service_key = "service:user-systemd:demo.service"
+        resources._fence_state["active"] = {
+            "fence_id": "f" * 32,
+            "owner_id": "operator:user-systemd-live",
+            "unit": "demo.service",
+            "action": "restart",
+            "phase": "dispatching",
+            "resource_keys": [service_key],
+            "lease_snapshots": [],
+            "cleared_at_unix": None,
+        }
+        resources.inspect_resources.return_value = {
+            service_key: {
+                "resource_key": service_key,
+                "owner_id": "operator:user-systemd-live",
+            }
+        }
+        with patch.object(operator, "_run") as run:
+            prior = operator._user_systemd_reconcile_durable_uncertainty(
+                resources, [service_key]
+            )
+
+        self.assertIsNotNone(prior)
+        self.assertTrue(prior["blocked"])
+        self.assertEqual(prior["live_lease_resource_keys"], [service_key])
+        self.assertEqual(prior["lease_readback_error_class"], None)
+        run.assert_not_called()
+        resources.clear_user_systemd_uncertainty_fence.assert_not_called()
 
     def test_unreadable_fence_stays_blocked_when_manager_lists_unit_job(self) -> None:
         resources = _fake_resources()
@@ -1037,6 +1201,67 @@ class UserServiceCoordinationTests(unittest.TestCase):
                     fence_b["fence_id"],
                     outcome="terminal_readback",
                     evidence_sha256="b" * 64,
+                )
+
+    def test_real_resource_live_lease_prevents_fence_clearance_until_release(self) -> None:
+        unit = "grabowski-live-fence-reconcile.service"
+        service_key = f"service:user-systemd:{unit}"
+        owner = "operator:user-systemd-live-fence-reconcile"
+        reconciliation = {
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "UnitFileState": "enabled",
+            "Job": "",
+            "FragmentPath": "",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "resources.sqlite3"
+            with patch.object(real_resources, "RESOURCE_DB", database):
+                lease = real_resources.acquire_resources(
+                    owner,
+                    [service_key],
+                    purpose="prove live lease blocks fence clearance",
+                    ttl_seconds=120,
+                    metadata={"unit": unit, "action": "restart"},
+                )
+                fence = real_resources.prepare_user_systemd_uncertainty_fence(
+                    owner,
+                    [service_key],
+                    expected_leases=lease["leases"],
+                    unit=unit,
+                    action="restart",
+                )
+                with patch.object(
+                    operator,
+                    "_user_systemd_reconciliation_state",
+                    return_value=reconciliation,
+                ) as readback:
+                    blocked = operator._user_systemd_reconcile_durable_uncertainty(
+                        real_resources, [service_key]
+                    )
+                    self.assertTrue(blocked["blocked"])
+                    self.assertEqual(
+                        blocked["live_lease_resource_keys"], [service_key]
+                    )
+                    readback.assert_not_called()
+                    self.assertIsNotNone(
+                        real_resources.user_systemd_uncertainty_status([service_key])
+                    )
+
+                    real_resources.release_resources(
+                        owner,
+                        [service_key],
+                        expected_leases=lease["leases"],
+                    )
+                    cleared = operator._user_systemd_reconcile_durable_uncertainty(
+                        real_resources, [service_key]
+                    )
+
+                self.assertFalse(cleared["blocked"])
+                self.assertEqual(cleared["fence"]["fence_id"], fence["fence_id"])
+                self.assertIsNone(
+                    real_resources.user_systemd_uncertainty_status([service_key])
                 )
 
     def test_second_mutation_is_blocked_by_durable_pending_job_before_effect(self) -> None:
