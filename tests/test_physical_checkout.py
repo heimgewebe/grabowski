@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import grabowski_git_preimage as git_preimage
 import grabowski_physical_checkout as physical_checkout
@@ -233,6 +234,50 @@ class PhysicalCheckoutIdentityTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 physical_checkout.PhysicalCheckoutIdentityError,
                 "missing or ambiguous",
+            ):
+                physical_checkout.capture_registered_linked_worktree_git_dir(
+                    identity["common_dir"]["path"], worktree
+                )
+
+    def test_registered_gitdir_backlink_drift_is_detected_before_return(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            worktree = root / "worktree"
+            self._init_committed_repo(repo, branch="main")
+            self._run(
+                "git",
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked",
+                str(worktree),
+                "HEAD",
+                cwd=repo,
+            )
+            identity = physical_checkout.capture_physical_checkout_identity(worktree)
+            backlink = Path(identity["git_dir"]["path"]) / "gitdir"
+            original_open = physical_checkout._open_absolute_directory
+
+            def drift_before_final_open(path: Path, *, label: str):
+                if label == "registered worktree git directory":
+                    backlink.write_text(
+                        str(root / "replacement" / ".git") + "\n",
+                        encoding="utf-8",
+                    )
+                return original_open(path, label=label)
+
+            with (
+                patch.object(
+                    physical_checkout,
+                    "_open_absolute_directory",
+                    side_effect=drift_before_final_open,
+                ),
+                self.assertRaisesRegex(
+                    physical_checkout.PhysicalCheckoutIdentityError,
+                    "git worktree backlink changed during capture",
+                ),
             ):
                 physical_checkout.capture_registered_linked_worktree_git_dir(
                     identity["common_dir"]["path"], worktree

@@ -649,7 +649,7 @@ def capture_registered_linked_worktree_git_dir(
             common_descriptor, "worktrees", label="git worktrees directory"
         )
         before = os.fstat(worktrees_descriptor)
-        matches: list[dict[str, Any]] = []
+        matches: list[tuple[dict[str, Any], os.stat_result]] = []
         entry_count = 0
         with os.scandir(worktrees_descriptor) as entries:
             for entry in entries:
@@ -679,7 +679,7 @@ def capture_registered_linked_worktree_git_dir(
                 )
                 try:
                     try:
-                        payload, _ = _read_relative_regular(
+                        payload, backlink_snapshot = _read_relative_regular(
                             admin_descriptor,
                             "gitdir",
                             label="git worktree backlink",
@@ -696,7 +696,9 @@ def capture_registered_linked_worktree_git_dir(
                         target if Path(target).is_absolute() else admin_path / target
                     )
                     if pointer_path == expected_pointer:
-                        matches.append(_identity(admin_path, admin_metadata))
+                        matches.append(
+                            (_identity(admin_path, admin_metadata), backlink_snapshot)
+                        )
                 finally:
                     os.close(admin_descriptor)
 
@@ -709,7 +711,7 @@ def capture_registered_linked_worktree_git_dir(
             raise PhysicalCheckoutIdentityError(
                 "registered linked worktree git directory is missing or ambiguous"
             )
-        registered = matches[0]
+        registered, backlink_snapshot = matches[0]
         registered_path = Path(registered["path"])
         descriptor, metadata = _open_absolute_directory(
             registered_path, label="registered worktree git directory"
@@ -720,6 +722,12 @@ def capture_registered_linked_worktree_git_dir(
                 raise PhysicalCheckoutIdentityError(
                     "registered worktree git directory changed during capture"
                 )
+            _assert_relative_file_snapshot(
+                descriptor,
+                "gitdir",
+                backlink_snapshot,
+                label="git worktree backlink",
+            )
         finally:
             os.close(descriptor)
         return registered
