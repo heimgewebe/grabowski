@@ -1639,6 +1639,11 @@ def _continuation_preimage(
     prior_lifecycle = prior.get("lifecycle")
     if not isinstance(prior_lifecycle, dict):
         return None
+    prior_physical = prior_lifecycle.get("physical_checkout")
+    if not isinstance(prior_physical, dict):
+        raise RuntimeError(
+            "managed worktree continuation lacks ensure-time physical identity"
+        )
 
     target = Path(inputs["target_path"])
     repo = Path(inputs["repo"])
@@ -1648,10 +1653,12 @@ def _continuation_preimage(
     if not isinstance(checkout_key, str) or checkout_key != prior_lifecycle.get("checkout_key"):
         raise RuntimeError("managed worktree continuation checkout identity drifted")
     try:
-        expected_physical = physical_checkout.capture_physical_checkout_identity(target)
+        expected_physical = physical_checkout.verify_physical_checkout_identity(
+            prior_physical
+        )
     except Exception as exc:
         raise RuntimeError(
-            "managed worktree continuation physical identity capture failed"
+            "managed worktree continuation differs from ensure-time physical identity"
         ) from exc
     physical_common = expected_physical.get("common_dir")
     if (
@@ -1659,7 +1666,7 @@ def _continuation_preimage(
         or physical_common.get("path") != str(registered_common_dir)
     ):
         raise RuntimeError(
-            "managed worktree continuation is not bound to the registered Git common directory"
+            "managed worktree continuation ensure-time identity is not bound to the registered Git common directory"
         )
 
     live_lifecycle = checkouts._strict_lifecycle_binding(checkout_key)
@@ -1806,7 +1813,7 @@ def _continuation_preimage(
             "managed worktree continuation untracked preimage capture failed"
         ) from exc
     try:
-        physical_checkout.verify_physical_checkout_identity(expected_physical)
+        physical_checkout.verify_physical_checkout_identity(prior_physical)
     except Exception as exc:
         raise RuntimeError(
             "managed worktree continuation physical identity changed during preimage capture"

@@ -14,6 +14,7 @@ import uuid
 from typing import Any, Callable, Iterator
 
 import grabowski_checkout_identity as checkout_identity
+import grabowski_physical_checkout as physical_checkout
 import grabowski_work_admission as work_admission
 
 CommandRunner = Callable[[Path, list[str]], dict[str, Any]]
@@ -994,6 +995,19 @@ def _bind_checkout_lifecycle(
         str(post_state["actual_head"]),
         str(inputs["branch"]),
     )
+    try:
+        physical = physical_checkout.capture_physical_checkout_identity(checkout)
+    except Exception as exc:
+        raise WorktreeEnsureAction(
+            "worktree lifecycle physical checkout identity could not be captured"
+        ) from exc
+    if (
+        physical.get("root", {}).get("path") != str(checkout)
+        or physical.get("common_dir", {}).get("path") != str(common_dir)
+    ):
+        raise WorktreeEnsureAction(
+            "worktree lifecycle physical checkout identity disagrees with registered checkout"
+        )
     owner_id = checkouts._owner(str(inputs["lease_owner_id"]))
     task_id = f"worktree-ensure:{inputs['idempotency_key']}"
     purpose = str(inputs["purpose"])
@@ -1030,6 +1044,7 @@ def _bind_checkout_lifecycle(
         "expected_head": retention["expected_head"],
         "expected_branch": retention["expected_branch"],
         "identity": identity,
+        "physical_checkout": physical,
         "terminal_decision": "retain",
         "terminal_reason": "external GitHub and Bureau truth require later reconciliation",
         "automatic_cleanup_authorized": False,

@@ -1189,6 +1189,7 @@ class WorkAcquireTests(unittest.TestCase):
             "post_state": {"target_registered": True, "target_path_exists": True},
             "lifecycle": {
                 "checkout_key": checkout_key,
+                "physical_checkout": PHYSICAL,
                 "checkout_path": str(self.target),
                 "owner_id": inputs["lease_owner_id"],
                 "source": lifecycle_source,
@@ -1229,11 +1230,13 @@ class WorkAcquireTests(unittest.TestCase):
 
         record = {
             "checkout_key": checkout_key,
+            "physical_checkout": PHYSICAL,
             "branch": inputs["branch"],
             "detached": False,
         }
         lifecycle = {
             "checkout_key": checkout_key,
+            "physical_checkout": PHYSICAL,
             "checkout_path": str(self.target),
             "owner_id": inputs["lease_owner_id"],
             "source": lifecycle_source,
@@ -1279,12 +1282,13 @@ class WorkAcquireTests(unittest.TestCase):
             "worktree_receipt": {
                 "result_state": "CREATED",
                 "durable_receipt_sha256": "b" * 64,
-                "lifecycle": {"checkout_key": checkout_key},
+                "lifecycle": {"checkout_key": checkout_key, "physical_checkout": PHYSICAL},
             },
         }
         record = {"checkout_key": checkout_key, "branch": inputs["branch"], "detached": False}
         lifecycle = {
             "checkout_key": checkout_key,
+            "physical_checkout": PHYSICAL,
             "checkout_path": str(self.target),
             "owner_id": inputs["lease_owner_id"],
             "source": lifecycle_source,
@@ -1372,12 +1376,13 @@ class WorkAcquireTests(unittest.TestCase):
             "worktree_receipt": {
                 "result_state": "CREATED",
                 "durable_receipt_sha256": "b" * 64,
-                "lifecycle": {"checkout_key": checkout_key},
+                "lifecycle": {"checkout_key": checkout_key, "physical_checkout": PHYSICAL},
             },
         }
         record = {"checkout_key": checkout_key, "branch": inputs["branch"], "detached": False}
         lifecycle = {
             "checkout_key": checkout_key,
+            "physical_checkout": PHYSICAL,
             "checkout_path": str(self.target),
             "owner_id": inputs["lease_owner_id"],
             "source": lifecycle_source,
@@ -1434,6 +1439,7 @@ class WorkAcquireTests(unittest.TestCase):
             "post_state": {"target_registered": True, "target_path_exists": True},
             "lifecycle": {
                 "checkout_key": checkout_key,
+                "physical_checkout": PHYSICAL,
                 "checkout_path": str(self.target),
                 "owner_id": inputs["lease_owner_id"],
                 "source": lifecycle_source,
@@ -1475,6 +1481,7 @@ class WorkAcquireTests(unittest.TestCase):
         record = {"checkout_key": checkout_key, "branch": inputs["branch"], "detached": False}
         lifecycle = {
             "checkout_key": checkout_key,
+            "physical_checkout": PHYSICAL,
             "checkout_path": str(self.target),
             "owner_id": inputs["lease_owner_id"],
             "source": lifecycle_source,
@@ -1512,6 +1519,7 @@ class WorkAcquireTests(unittest.TestCase):
             "post_state": {"target_registered": True, "target_path_exists": True},
             "lifecycle": {
                 "checkout_key": checkout_key,
+                "physical_checkout": PHYSICAL,
                 "checkout_path": str(self.target),
                 "owner_id": inputs["lease_owner_id"],
                 "source": lifecycle_source,
@@ -1547,6 +1555,7 @@ class WorkAcquireTests(unittest.TestCase):
         record = {"checkout_key": checkout_key, "branch": inputs["branch"], "detached": False}
         lifecycle = {
             "checkout_key": checkout_key,
+            "physical_checkout": PHYSICAL,
             "checkout_path": str(self.target),
             "owner_id": inputs["lease_owner_id"],
             "source": lifecycle_source,
@@ -1581,14 +1590,10 @@ class WorkAcquireTests(unittest.TestCase):
             "worktree_receipt": {
                 "result_state": "CREATED",
                 "durable_receipt_sha256": "b" * 64,
-                "lifecycle": {"checkout_key": checkout_key},
+                "lifecycle": {"checkout_key": checkout_key, "physical_checkout": PHYSICAL},
             },
         }
         record = {"checkout_key": checkout_key, "branch": inputs["branch"], "detached": False}
-        replacement = {
-            "physical_identity_sha256": "e" * 64,
-            "common_dir": {"path": "/replacement/common"},
-        }
         with (
             patch.object(
                 work_acquire.checkouts,
@@ -1598,11 +1603,30 @@ class WorkAcquireTests(unittest.TestCase):
             patch.object(work_acquire.checkouts, "_require_linked"),
             patch.object(
                 work_acquire.physical_checkout,
-                "capture_physical_checkout_identity",
-                return_value=replacement,
+                "verify_physical_checkout_identity",
+                side_effect=work_acquire.physical_checkout.PhysicalCheckoutIdentityError(
+                    "git_dir changed"
+                ),
             ),
-            self.assertRaisesRegex(RuntimeError, "registered Git common directory"),
+            self.assertRaisesRegex(RuntimeError, "ensure-time physical identity"),
         ):
+            work_acquire._continuation_preimage(
+                prior, inputs, lifecycle_source, Mock()
+            )
+
+    def test_continuation_rejects_legacy_receipt_without_physical_identity(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        prior = {
+            "state": "ready",
+            "worktree_receipt": {
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "lifecycle": {"checkout_key": "a" * 64},
+            },
+        }
+        with self.assertRaisesRegex(RuntimeError, "lacks ensure-time physical identity"):
             work_acquire._continuation_preimage(
                 prior, inputs, lifecycle_source, Mock()
             )
@@ -1652,12 +1676,13 @@ class WorkAcquireTests(unittest.TestCase):
             "worktree_receipt": {
                 "result_state": "CREATED",
                 "durable_receipt_sha256": "b" * 64,
-                "lifecycle": {"checkout_key": checkout_key},
+                "lifecycle": {"checkout_key": checkout_key, "physical_checkout": PHYSICAL},
             },
         }
         record = {"checkout_key": checkout_key, "branch": inputs["branch"], "detached": False}
         lifecycle = {
             "checkout_key": checkout_key,
+            "physical_checkout": PHYSICAL,
             "checkout_path": str(self.target),
             "owner_id": inputs["lease_owner_id"],
             "source": lifecycle_source,
@@ -1688,7 +1713,7 @@ class WorkAcquireTests(unittest.TestCase):
             patch.object(
                 work_acquire.physical_checkout,
                 "verify_physical_checkout_identity",
-                side_effect=RuntimeError("checkout replaced"),
+                side_effect=[PHYSICAL, RuntimeError("checkout replaced")],
             ),
             patch.object(work_acquire.checkouts, "_strict_lifecycle_binding", return_value=lifecycle),
             patch.object(work_acquire.git_preimage, "capture_branch_preimage", return_value={
@@ -1721,6 +1746,7 @@ class WorkAcquireTests(unittest.TestCase):
             "post_state": {"target_registered": True, "target_path_exists": True},
             "lifecycle": {
                 "checkout_key": checkout_key,
+                "physical_checkout": PHYSICAL,
                 "checkout_path": str(self.target),
                 "owner_id": inputs["lease_owner_id"],
                 "source": lifecycle_source,
@@ -1738,11 +1764,13 @@ class WorkAcquireTests(unittest.TestCase):
         work_acquire.acquire_work(params, **kwargs)
         record = {
             "checkout_key": checkout_key,
+            "physical_checkout": PHYSICAL,
             "branch": inputs["branch"],
             "detached": False,
         }
         drifted = {
             "checkout_key": checkout_key,
+            "physical_checkout": PHYSICAL,
             "checkout_path": str(self.target),
             "owner_id": "lane:" + "f" * 32,
             "source": lifecycle_source,
