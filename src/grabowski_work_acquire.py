@@ -1685,27 +1685,10 @@ def _continuation_preimage(
     if record.get("branch") != inputs["branch"] or record.get("detached"):
         raise RuntimeError("managed worktree continuation branch identity drifted")
 
-    status = runner(target, ["status", "--short", "--branch", "--untracked-files=normal"])
-    head = runner(target, ["rev-parse", "--verify", "HEAD^{commit}"])
-    tracked_index = runner(target, ["diff-index", "--quiet", "HEAD", "--"])
-    tracked_files = runner(target, ["diff-files", "--quiet", "--"])
-    index_flags = runner(target, ["ls-files", "-v", "-z"])
-    preimage_reads = (status, head, index_flags)
-    if any(result.get("returncode") != 0 for result in preimage_reads):
-        raise RuntimeError("managed worktree continuation Git readback failed")
-    if tracked_index.get("returncode") not in (0, 1) or tracked_files.get("returncode") not in (0, 1):
-        raise RuntimeError("managed worktree continuation tracked state readback failed")
-    if any(
-        result.get("stdout_truncated") is True
-        or result.get("stderr_truncated") is True
-        for result in preimage_reads
-    ):
-        raise RuntimeError("managed worktree continuation Git readback was truncated")
-    status_lines = [line for line in str(status.get("stdout") or "").splitlines() if line]
-    status_entries = status_lines[1:] if status_lines else []
-    head_sha = str(head.get("stdout") or "").strip().lower()
-    if SHA40_RE.fullmatch(head_sha) is None:
-        raise RuntimeError("managed worktree continuation HEAD is invalid")
+    prior_head = live_lifecycle.get("expected_head")
+    if not isinstance(prior_head, str) or SHA40_RE.fullmatch(prior_head) is None:
+        raise RuntimeError("managed worktree continuation prior HEAD evidence is invalid")
+
     snapshot_deadline = time.monotonic() + 30.0
 
     def remaining_snapshot_seconds() -> float:
@@ -1748,76 +1731,146 @@ def _continuation_preimage(
             timeout_seconds=remaining_snapshot_seconds(),
         )
 
-    try:
-        branch_preimage = git_preimage.capture_branch_preimage(
-            target,
-            raw_probe,
-            require_attached=True,
-            index_probe=bounded_tracked_index_probe,
-            max_tracked_paths=25_000,
-            max_tracked_bytes=1024 * 1024 * 1024,
-            deadline_monotonic=snapshot_deadline,
-            reject_gitlinks=True,
+    def capture_snapshot() -> dict[str, Any]:
+        status = runner(
+            target, ["status", "--short", "--branch", "--untracked-files=normal"]
         )
-    except Exception as exc:
-        raise RuntimeError(
-            "managed worktree continuation raw Git preimage capture failed"
-        ) from exc
-    branch_physical = branch_preimage.get("physical_checkout")
-    if (
-        not isinstance(branch_physical, dict)
-        or branch_physical.get("physical_identity_sha256")
-        != expected_physical.get("physical_identity_sha256")
-    ):
-        raise RuntimeError("managed worktree continuation physical identity drifted")
-    if branch_preimage.get("branch") != inputs["branch"]:
-        raise RuntimeError("managed worktree continuation raw branch identity drifted")
-    if branch_preimage.get("head") != head_sha:
-        raise RuntimeError("managed worktree continuation raw HEAD identity drifted")
-    if branch_preimage.get("operation_refs"):
-        raise RuntimeError("managed worktree continuation has in-progress Git operation")
+        head = runner(target, ["rev-parse", "--verify", "HEAD^{commit}"])
+        tracked_index = runner(target, ["diff-index", "--quiet", "HEAD", "--"])
+        tracked_files = runner(target, ["diff-files", "--quiet", "--"])
+        index_flags = runner(target, ["ls-files", "-v", "-z"])
+        preimage_reads = (status, head, index_flags)
+        if any(result.get("returncode") != 0 for result in preimage_reads):
+            raise RuntimeError("managed worktree continuation Git readback failed")
+        if (
+            tracked_index.get("returncode") not in (0, 1)
+            or tracked_files.get("returncode") not in (0, 1)
+        ):
+            raise RuntimeError("managed worktree continuation tracked state readback failed")
+        if any(
+            result.get("stdout_truncated") is True
+            or result.get("stderr_truncated") is True
+            for result in preimage_reads
+        ):
+            raise RuntimeError("managed worktree continuation Git readback was truncated")
 
-    index_entries = [
-        entry for entry in str(index_flags.get("stdout") or "").split("\0") if entry
-    ]
-    tags = [entry[0] for entry in index_entries]
-    if any(tag.islower() for tag in tags):
-        raise RuntimeError("managed worktree continuation has assume-unchanged index entries")
-    if any(tag.upper() == "S" for tag in tags):
-        raise RuntimeError("managed worktree continuation has skip-worktree index entries")
-    prior_head = live_lifecycle.get("expected_head")
-    if not isinstance(prior_head, str) or SHA40_RE.fullmatch(prior_head) is None:
-        raise RuntimeError("managed worktree continuation prior HEAD evidence is invalid")
-    ancestry = raw_probe(
-        target,
-        [
-            "--no-replace-objects",
-            "merge-base",
-            "--is-ancestor",
-            prior_head,
-            head_sha,
-        ],
-    )
-    if ancestry.returncode != 0:
-        raise RuntimeError("managed worktree continuation HEAD is not a descendant of ensure")
-    try:
-        untracked_preimage = git_preimage.capture_untracked_preimage(
+        status_lines = [
+            line for line in str(status.get("stdout") or "").splitlines() if line
+        ]
+        status_entries = status_lines[1:] if status_lines else []
+        head_sha = str(head.get("stdout") or "").strip().lower()
+        if SHA40_RE.fullmatch(head_sha) is None:
+            raise RuntimeError("managed worktree continuation HEAD is invalid")
+
+        try:
+            branch_preimage = git_preimage.capture_branch_preimage(
+                target,
+                raw_probe,
+                require_attached=True,
+                index_probe=bounded_tracked_index_probe,
+                max_tracked_paths=25_000,
+                max_tracked_bytes=1024 * 1024 * 1024,
+                deadline_monotonic=snapshot_deadline,
+                reject_gitlinks=True,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "managed worktree continuation raw Git preimage capture failed"
+            ) from exc
+        branch_physical = branch_preimage.get("physical_checkout")
+        if (
+            not isinstance(branch_physical, dict)
+            or branch_physical.get("physical_identity_sha256")
+            != expected_physical.get("physical_identity_sha256")
+        ):
+            raise RuntimeError("managed worktree continuation physical identity drifted")
+        if branch_preimage.get("branch") != inputs["branch"]:
+            raise RuntimeError("managed worktree continuation raw branch identity drifted")
+        if branch_preimage.get("head") != head_sha:
+            raise RuntimeError("managed worktree continuation raw HEAD identity drifted")
+        if branch_preimage.get("operation_refs"):
+            raise RuntimeError("managed worktree continuation has in-progress Git operation")
+
+        index_entries = [
+            entry for entry in str(index_flags.get("stdout") or "").split("\0") if entry
+        ]
+        tags = [entry[0] for entry in index_entries]
+        if any(tag.islower() for tag in tags):
+            raise RuntimeError(
+                "managed worktree continuation has assume-unchanged index entries"
+            )
+        if any(tag.upper() == "S" for tag in tags):
+            raise RuntimeError(
+                "managed worktree continuation has skip-worktree index entries"
+            )
+
+        ancestry = raw_probe(
             target,
-            bounded_untracked_probe,
-            max_paths=100,
-            max_total_bytes=256 * 1024 * 1024,
-            deadline_monotonic=snapshot_deadline,
+            [
+                "--no-replace-objects",
+                "merge-base",
+                "--is-ancestor",
+                prior_head,
+                head_sha,
+            ],
         )
-    except Exception as exc:
+        if ancestry.returncode != 0:
+            raise RuntimeError(
+                "managed worktree continuation HEAD is not a descendant of ensure"
+            )
+        try:
+            untracked_preimage = git_preimage.capture_untracked_preimage(
+                target,
+                bounded_untracked_probe,
+                max_paths=100,
+                max_total_bytes=256 * 1024 * 1024,
+                deadline_monotonic=snapshot_deadline,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "managed worktree continuation untracked preimage capture failed"
+            ) from exc
+        try:
+            physical_checkout.verify_physical_checkout_identity(prior_physical)
+        except Exception as exc:
+            raise RuntimeError(
+                "managed worktree continuation physical identity changed during preimage capture"
+            ) from exc
+
+        return {
+            "head": head_sha,
+            "status_header": status_lines[0] if status_lines else "",
+            "status_entries": status_entries[:100],
+            "branch_preimage_sha256": branch_preimage["preimage_sha256"],
+            "index_sha256": branch_preimage["index_sha256"],
+            "tracked_worktree_sha256": branch_preimage["worktree_sha256"],
+            "tracked_index_dirty": tracked_index.get("returncode") == 1,
+            "tracked_worktree_dirty": tracked_files.get("returncode") == 1,
+            "untracked_preimage_sha256": untracked_preimage["preimage_sha256"],
+            "untracked_worktree_sha256": untracked_preimage["worktree_sha256"],
+            "untracked_count": untracked_preimage["count"],
+        }
+
+    first_snapshot = capture_snapshot()
+    stable_snapshot = capture_snapshot()
+    authority_fields = (
+        "head",
+        "branch_preimage_sha256",
+        "index_sha256",
+        "tracked_worktree_sha256",
+        "tracked_index_dirty",
+        "tracked_worktree_dirty",
+        "untracked_preimage_sha256",
+        "untracked_worktree_sha256",
+        "untracked_count",
+    )
+    if any(
+        first_snapshot[field] != stable_snapshot[field]
+        for field in authority_fields
+    ):
         raise RuntimeError(
-            "managed worktree continuation untracked preimage capture failed"
-        ) from exc
-    try:
-        physical_checkout.verify_physical_checkout_identity(prior_physical)
-    except Exception as exc:
-        raise RuntimeError(
-            "managed worktree continuation physical identity changed during preimage capture"
-        ) from exc
+            "managed worktree continuation Git state changed during stable readback"
+        )
 
     material = {
         "schema_version": 1,
@@ -1827,19 +1880,19 @@ def _continuation_preimage(
         "checkout_path": str(target),
         "physical_identity_sha256": expected_physical["physical_identity_sha256"],
         "branch": inputs["branch"],
-        "head": head_sha,
+        "head": stable_snapshot["head"],
         "ensure_head": prior_head,
-        "dirty": bool(status_entries),
-        "status_header": status_lines[0] if status_lines else "",
-        "status_entries": status_entries[:100],
-        "branch_preimage_sha256": branch_preimage["preimage_sha256"],
-        "index_sha256": branch_preimage["index_sha256"],
-        "tracked_worktree_sha256": branch_preimage["worktree_sha256"],
-        "tracked_index_dirty": tracked_index.get("returncode") == 1,
-        "tracked_worktree_dirty": tracked_files.get("returncode") == 1,
-        "untracked_preimage_sha256": untracked_preimage["preimage_sha256"],
-        "untracked_worktree_sha256": untracked_preimage["worktree_sha256"],
-        "untracked_count": untracked_preimage["count"],
+        "dirty": bool(stable_snapshot["status_entries"]),
+        "status_header": stable_snapshot["status_header"],
+        "status_entries": stable_snapshot["status_entries"],
+        "branch_preimage_sha256": stable_snapshot["branch_preimage_sha256"],
+        "index_sha256": stable_snapshot["index_sha256"],
+        "tracked_worktree_sha256": stable_snapshot["tracked_worktree_sha256"],
+        "tracked_index_dirty": stable_snapshot["tracked_index_dirty"],
+        "tracked_worktree_dirty": stable_snapshot["tracked_worktree_dirty"],
+        "untracked_preimage_sha256": stable_snapshot["untracked_preimage_sha256"],
+        "untracked_worktree_sha256": stable_snapshot["untracked_worktree_sha256"],
+        "untracked_count": stable_snapshot["untracked_count"],
         "prior_worktree_receipt_sha256": prior.get("durable_receipt_sha256"),
         "lifecycle_updated_at_unix": live_lifecycle.get("updated_at_unix"),
     }

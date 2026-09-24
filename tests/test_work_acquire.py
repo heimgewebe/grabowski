@@ -1366,7 +1366,7 @@ class WorkAcquireTests(unittest.TestCase):
                 deadline_monotonic=time.monotonic() - 1,
             )
 
-    def test_continuation_preimage_changes_with_raw_tracked_worktree_hash(self) -> None:
+    def test_continuation_rejects_raw_tracked_drift_between_readbacks(self) -> None:
         params = self.parameters()
         inputs = work_acquire._normalize(params)
         lifecycle_source = work_acquire._lifecycle_source(inputs)
@@ -1421,12 +1421,11 @@ class WorkAcquireTests(unittest.TestCase):
             patch.object(work_acquire.git_preimage, "capture_branch_preimage", side_effect=[{"branch": inputs["branch"], "head": SHA, "operation_refs": {}, "physical_checkout": PHYSICAL, "preimage_sha256": "c" * 64, "index_sha256": "d" * 64, "worktree_sha256": "e" * 64}, {"branch": inputs["branch"], "head": SHA, "operation_refs": {}, "physical_checkout": PHYSICAL, "preimage_sha256": "f" * 64, "index_sha256": "d" * 64, "worktree_sha256": "a" * 64}]),
             patch.object(work_acquire.subprocess, "run", return_value=__import__("subprocess").CompletedProcess([], 0, b"", b"")),
             patch.object(work_acquire.git_preimage, "capture_untracked_preimage", return_value={"count": 0, "worktree_sha256": "1" * 64, "preimage_sha256": "2" * 64}),
+            self.assertRaisesRegex(RuntimeError, "changed during stable readback"),
         ):
-            first = work_acquire._continuation_preimage(prior, inputs, lifecycle_source, runner)
-            second = work_acquire._continuation_preimage(prior, inputs, lifecycle_source, runner)
-
-        self.assertNotEqual(first["tracked_worktree_sha256"], second["tracked_worktree_sha256"])
-        self.assertNotEqual(first["preimage_sha256"], second["preimage_sha256"])
+            work_acquire._continuation_preimage(
+                prior, inputs, lifecycle_source, runner
+            )
 
     def test_dirty_lane_continuation_rejects_truncated_preimage(self) -> None:
         params = self.parameters()
