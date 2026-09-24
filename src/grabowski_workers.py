@@ -1257,10 +1257,10 @@ def _reset_failed_unit(
             return {"status": "not-required", "probe": probe}
     if not failed_evidence:
         return {"status": "not-required"}
-    result = operator._run(
-        ["systemctl", "--user", "reset-failed", record["unit"]],
-        cwd=operator.HOME,
-        timeout_seconds=30,
+    result = operator._run_mutating_user_systemd_unit(
+        record["unit"],
+        "reset-failed",
+        mutation_timeout_seconds=30,
         max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
     )
     outcome: dict[str, Any] = {
@@ -6426,13 +6426,17 @@ def worker_stop(worker_id: str, *, expected_kind: str | None = None) -> dict[str
     record = _row(worker_id)
     if expected_kind is not None and record["kind"] != expected_kind:
         raise ValueError(f"Worker is not a {expected_kind} worker")
-    result = operator._run(
-        ["systemctl", "--user", "stop", record["unit"]],
-        cwd=operator.HOME,
-        timeout_seconds=60,
+    result = operator._run_mutating_user_systemd_unit(
+        record["unit"],
+        "stop",
+        mutation_timeout_seconds=60,
         max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
     )
-    state = "stopped" if result["returncode"] == 0 else record["state"]
+    state = (
+        record["state"]
+        if result.get("outcome_unknown")
+        else ("stopped" if result["returncode"] == 0 else record["state"])
+    )
     observation: dict[str, Any] = {
         "state": state,
         "stop": result,
@@ -6442,7 +6446,7 @@ def worker_stop(worker_id: str, *, expected_kind: str | None = None) -> dict[str
     if prior_observation is not None:
         observation["prior_observation"] = prior_observation
     stored = _update(worker_id, state, observation=observation)
-    if result["returncode"] == 0:
+    if result.get("outcome_unknown") is not True and result["returncode"] == 0:
         terminalization = {
             "release": _release(stored),
             "cleanup": _cleanup(stored),
