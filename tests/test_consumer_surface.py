@@ -165,6 +165,23 @@ class ConsumerSurfaceTests(unittest.TestCase):
             "write_excluded_roots": [],
             "max_risk_level": "high",
         }
+        transport_status = {
+            "state": "ready",
+            "mutation_gate_open": True,
+            "normal_mutation_path": "signed_one_call",
+            "normal_mutation_path_ready": True,
+            "legacy_roundtrip_required": False,
+            "last_consumption_receipt_sha256": "e" * 64,
+            "recommended_next_action": "none",
+            "signed_one_call": {
+                "state": "ready",
+                "observed": True,
+                "ready": True,
+                "assertion_version": "signed-one-call-v1",
+                "client_scope_sha256": "f" * 64,
+                "recommended_next_action": "none",
+            },
+        }
         with ExitStack() as stack:
             stack.enter_context(mock.patch.object(grabowski_mcp, "_load_policy", return_value=policy))
             stack.enter_context(
@@ -234,22 +251,7 @@ class ConsumerSurfaceTests(unittest.TestCase):
                 mock.patch.object(
                     grabowski_mcp,
                     "_transport_roundtrip_status",
-                    return_value={
-                        "state": "ready",
-                        "normal_mutation_path": "signed_one_call",
-                        "normal_mutation_path_ready": True,
-                        "legacy_roundtrip_required": False,
-                        "last_consumption_receipt_sha256": "e" * 64,
-                        "recommended_next_action": "none",
-                        "signed_one_call": {
-                            "state": "ready",
-                            "observed": True,
-                            "ready": True,
-                            "assertion_version": "signed-one-call-v1",
-                            "client_scope_sha256": "f" * 64,
-                            "recommended_next_action": "none",
-                        },
-                    },
+                    side_effect=lambda _ctx=None: dict(transport_status),
                 )
             )
             stack.enter_context(mock.patch.object(grabowski_mcp, "_effective_capabilities", return_value={"file_read"}))
@@ -290,6 +292,26 @@ class ConsumerSurfaceTests(unittest.TestCase):
                 view="minimal",
                 fields=["service"],
             )
+            transport_status.clear()
+            transport_status.update(
+                {
+                    "schema_version": 1,
+                    "state": "connector_identity_required",
+                    "mutation_gate_open": False,
+                    "recommended_next_action": "use an enrolled tunnel connector capability before mutation",
+                }
+            )
+            degraded_minimal = grabowski_mcp.grabowski_status(view="minimal")
+            transport_status.clear()
+            transport_status.update(
+                {
+                    "schema_version": 1,
+                    "state": "runtime_invalid",
+                    "mutation_gate_open": False,
+                    "recommended_next_action": "repair runtime integrity before transport verification",
+                }
+            )
+            runtime_invalid_minimal = grabowski_mcp.grabowski_status(view="minimal")
 
         self.assertEqual(minimal["view"], "minimal")
         self.assertEqual(minimal["schema_version"], 3)
@@ -333,6 +355,17 @@ class ConsumerSurfaceTests(unittest.TestCase):
         self.assertIn("platform_snapshot", standard["tool_contract"]["client_snapshot"])
         self.assertNotIn("platform_schema_mismatches", minimal["tool_contract"])
         self.assertIn("platform_schema_mismatches", standard["tool_contract"])
+        self.assertTrue(minimal["transport_roundtrip"]["mutation_gate_open"])
+        self.assertFalse(degraded_minimal["transport_roundtrip"]["mutation_gate_open"])
+        self.assertEqual(
+            degraded_minimal["transport_roundtrip"]["state"],
+            "connector_identity_required",
+        )
+        self.assertFalse(runtime_invalid_minimal["transport_roundtrip"]["mutation_gate_open"])
+        self.assertEqual(
+            runtime_invalid_minimal["transport_roundtrip"]["state"],
+            "runtime_invalid",
+        )
         self.assertNotIn("last_consumption_receipt_sha256", minimal["transport_roundtrip"])
         self.assertIn("last_consumption_receipt_sha256", standard["transport_roundtrip"])
         self.assertNotIn("signed_one_call", minimal["transport_roundtrip"])

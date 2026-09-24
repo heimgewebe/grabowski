@@ -25,6 +25,8 @@ Neue Clients sollen die kanonischen Namen senden und das zurückgegebene Feld `v
 
 `schema_version` versioniert die konkrete Antwortform einer Oberfläche, nicht das gesamte Grabowski-Protokoll. Ein Client muss deshalb pro Werkzeug und Antwortobjekt auf die angegebene Schemaversion reagieren.
 
+`grabowski_status` ist absichtlich gemischt versioniert: `minimal` und der Alias `concise` liefern Schema 3; `standard`, `evidence` und der Alias `full` bleiben Schema 2. Schema 3 der Minimalansicht ergänzt keinen zweiten Statusvertrag, sondern hält im kompakten `transport_roundtrip` den expliziten Bool `mutation_gate_open` auch bei degradierten Zuständen sichtbar.
+
 Für Consumer-Antworten mit Schema 2 gilt:
 
 - Warnungen, nächste Aktion und Top-Level-Nichtaussagen bleiben bei Feldprojektion erhalten;
@@ -88,7 +90,7 @@ Für bereits vorhandene Schema-1-Leser bleibt der Lesepfad kompatibel. Neue oder
 
 ## Client-Snapshot
 
-Ein Server-Deploy aktualisiert keinen bereits eingefrorenen clientseitigen Werkzeug-Snapshot. Nach einer Änderung des serverseitigen Werkzeugvertrags muss der Client seinen Snapshot über den jeweiligen Plattformmechanismus erneuern. Der Server kann diese Aktualisierung nur als nicht beobachtbar kennzeichnen.
+Ein Server-Deploy aktualisiert keinen bereits eingefrorenen clientseitigen Werkzeug-Snapshot. Nach einer Änderung des serverseitigen Werkzeugvertrags muss der Client seinen Snapshot über den jeweiligen Plattformmechanismus erneuern. Count und Werkzeugnamen-Hash dienen nur zum Erkennen und Binden der Abweichung; weder ein neu berechneter Hash noch ein serverseitiges Receipt aktualisiert den eingefrorenen Clientkatalog. Der Server kann diese Aktualisierung nur als nicht beobachtbar kennzeichnen.
 
 ## Umstellungsreihenfolge
 

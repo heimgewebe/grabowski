@@ -56,7 +56,7 @@ The generated repository documents describe the intended contract:
 
 A mismatch must remain visible. Do not silently treat an older checkout or connector snapshot as current.
 
-`grabowski_status` exposes the live registered/expected tool counts and name hashes. A client-side count or hash mismatch requires a connector refresh; the runtime cannot refresh ChatGPT's frozen snapshot itself.
+`grabowski_status` exposes the live registered/expected tool counts and name hashes. A client-side count or hash mismatch requires a connector refresh; the runtime cannot refresh ChatGPT's frozen snapshot itself. The `minimal`/`concise` status projection is schema 3; `standard`/`evidence` remain schema 2. Minimal transport status deliberately preserves `mutation_gate_open` even in degraded states so compaction cannot hide a closed mutation gate.
 
 ## Operating rule
 

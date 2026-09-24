@@ -36,7 +36,7 @@ A matched declaration is stored as a private mode-0600, owner-bound, self-hashed
 - `mismatch`: the declaration does not match the current server contract;
 - `matched`: the receipt is fresh and all bound values match.
 
-`client_snapshot_observable=true` means only that a fresh client declaration was compared with and matched the current server contract. It does not mean the platform independently attested the client process.
+`client_snapshot_observable=true` means only that a fresh client declaration was compared with and matched the current server contract. It does not mean the platform independently attested the client process. `grabowski_status(view="minimal")` uses response schema 3 and retains the explicit transport `mutation_gate_open` boolean, including `false` in degraded states; callers must not infer gate state from omitted detail fields.
 
 ## Consolidated operator overview
 
@@ -78,7 +78,7 @@ A future platform-attested connector identity can strengthen this boundary witho
 
 The tunnel semantic watchdog runs every two minutes, deliberately offset by 30 seconds from the operator watchdog so both do not contend for the shared watchdog lock. When the tunnel is healthy, it asks the release-bound `grabowski_client_snapshot` module to decide whether renewal is due. Renewal is triggered when the local tunnel process lifetime changes, the bound runtime release changes, the snapshot is missing or invalid, or the receipt enters a 15-minute pre-expiry window. The local refresh receives a bounded 20-second observation budget so a healthy but briefly loaded loopback MCP session does not lose its renewal opportunity.
 
-Renewal does not copy server contract values into a fresh receipt. A real loopback MCP client session performs `tools/list`, computes the canonical tool-name hash from the returned names, reads `grabowski_status`, obtains or reuses a fresh `transport-roundtrip` verification through the same MCP session, and only then submits that client-observed declaration through the existing `connector-snapshot-bind` grip. The grip performs the independent server-side comparison and persists only its receipt. A mismatch, failed roundtrip, changed client-declared scope, consumed verification, or expired verification remains fail-closed.
+The tool-name hash is a comparison binding, not a refresh mechanism: a server-side hash change can prove that the frozen client snapshot differs, but only the connector/platform refresh path can update that client snapshot. Renewal does not copy server contract values into a fresh receipt. A real loopback MCP client session performs `tools/list`, computes the canonical tool-name hash from the returned names, reads `grabowski_status`, obtains or reuses a fresh `transport-roundtrip` verification through the same MCP session, and only then submits that client-observed declaration through the existing `connector-snapshot-bind` grip. The grip performs the independent server-side comparison and persists only its receipt. A mismatch, failed roundtrip, changed client-declared scope, consumed verification, or expired verification remains fail-closed.
 
 The transport gate is described in `docs/transport-roundtrip-gate-v1.md`. It proves challenge-response possession before the single snapshot mutation but does not strengthen the connector snapshot into platform-attested identity.
 

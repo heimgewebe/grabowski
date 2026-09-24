@@ -6963,6 +6963,7 @@ def grabowski_status(
         }
         compact_transport_keys = (
             "state",
+            "mutation_gate_open",
             "normal_mutation_path",
             "normal_mutation_path_ready",
             "legacy_roundtrip_required",
