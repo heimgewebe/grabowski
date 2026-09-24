@@ -1601,9 +1601,8 @@ def _continuation_preimage(
     head = runner(target, ["rev-parse", "--verify", "HEAD^{commit}"])
     tracked_index = runner(target, ["diff-index", "--quiet", "HEAD", "--"])
     tracked_files = runner(target, ["diff-files", "--quiet", "--"])
-    untracked = runner(target, ["ls-files", "--others", "--exclude-standard", "-z"])
     index_flags = runner(target, ["ls-files", "-v", "-z"])
-    preimage_reads = (status, head, untracked, index_flags)
+    preimage_reads = (status, head, index_flags)
     if any(result.get("returncode") != 0 for result in preimage_reads):
         raise RuntimeError("managed worktree continuation Git readback failed")
     if tracked_index.get("returncode") not in (0, 1) or tracked_files.get("returncode") not in (0, 1):
@@ -1672,31 +1671,14 @@ def _continuation_preimage(
     )
     if ancestry.get("returncode") != 0:
         raise RuntimeError("managed worktree continuation HEAD is not a descendant of ensure")
-    untracked_paths = [
-        path for path in str(untracked.get("stdout") or "").split("\0") if path
-    ]
-    if len(untracked_paths) > 100:
-        raise RuntimeError("managed worktree continuation has too many untracked paths")
-    untracked_hashes: list[dict[str, str]] = []
-    if untracked_paths:
-        hashed = runner(target, ["hash-object", "--no-filters", "--", *untracked_paths])
-        if hashed.get("returncode") != 0:
-            raise RuntimeError("managed worktree continuation untracked hash readback failed")
-        if hashed.get("stdout_truncated") is True or hashed.get("stderr_truncated") is True:
-            raise RuntimeError("managed worktree continuation untracked hash readback was truncated")
-        object_ids = [
-            line.strip().lower()
-            for line in str(hashed.get("stdout") or "").splitlines()
-            if line.strip()
-        ]
-        if len(object_ids) != len(untracked_paths) or any(
-            SHA40_RE.fullmatch(object_id) is None for object_id in object_ids
-        ):
-            raise RuntimeError("managed worktree continuation untracked hash evidence is invalid")
-        untracked_hashes = [
-            {"path": path, "blob": object_id}
-            for path, object_id in zip(untracked_paths, object_ids, strict=True)
-        ]
+    try:
+        untracked_preimage = git_preimage.capture_untracked_preimage(
+            target, raw_probe, max_paths=100
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "managed worktree continuation untracked preimage capture failed"
+        ) from exc
 
     material = {
         "schema_version": 1,
@@ -1715,7 +1697,9 @@ def _continuation_preimage(
         "tracked_worktree_sha256": branch_preimage["worktree_sha256"],
         "tracked_index_dirty": tracked_index.get("returncode") == 1,
         "tracked_worktree_dirty": tracked_files.get("returncode") == 1,
-        "untracked": untracked_hashes,
+        "untracked_preimage_sha256": untracked_preimage["preimage_sha256"],
+        "untracked_worktree_sha256": untracked_preimage["worktree_sha256"],
+        "untracked_count": untracked_preimage["count"],
         "prior_worktree_receipt_sha256": prior.get("durable_receipt_sha256"),
         "lifecycle_updated_at_unix": live_lifecycle.get("updated_at_unix"),
     }

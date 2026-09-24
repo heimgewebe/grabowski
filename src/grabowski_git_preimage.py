@@ -36,6 +36,85 @@ def _tracked_index_paths(index_bytes: bytes) -> list[bytes]:
     return sorted(paths)
 
 
+def _safe_worktree_paths_sha256(repo: Path, paths: list[bytes], *, max_paths: int) -> str:
+    if len(paths) > max_paths:
+        raise RuntimeError("Git worktree path set exceeds continuation bound")
+    digest = hashlib.sha256()
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        file_flags |= os.O_NOFOLLOW
+    root_fd = os.open(repo, directory_flags)
+    try:
+        for path in sorted(paths):
+            components = path.split(b"/")
+            if path.startswith(b"/") or any(c in {b"", b".", b".."} for c in components):
+                raise RuntimeError("Git worktree observation contains an unsafe path")
+            _frame(digest, b"path", path)
+            directory_fd = os.dup(root_fd)
+            try:
+                for component in components[:-1]:
+                    next_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+                    os.close(directory_fd)
+                    directory_fd = next_fd
+                leaf = components[-1]
+                linked = os.stat(leaf, dir_fd=directory_fd, follow_symlinks=False)
+                mode_bytes = linked.st_mode.to_bytes(8, "big", signed=False)
+                if stat.S_ISREG(linked.st_mode):
+                    descriptor = os.open(leaf, file_flags, dir_fd=directory_fd)
+                    try:
+                        before = os.fstat(descriptor)
+                        content = hashlib.sha256()
+                        size = 0
+                        while True:
+                            chunk = os.read(descriptor, 1024 * 1024)
+                            if not chunk:
+                                break
+                            size += len(chunk)
+                            content.update(chunk)
+                        after = os.fstat(descriptor)
+                        if not _same_open_file(before, after):
+                            raise RuntimeError("Worktree file changed during preimage capture")
+                    finally:
+                        os.close(descriptor)
+                    _frame(digest, b"regular-mode", mode_bytes)
+                    _frame(digest, b"regular-size", size.to_bytes(8, "big"))
+                    _frame(digest, b"regular-content-sha256", content.digest())
+                elif stat.S_ISLNK(linked.st_mode):
+                    target = os.readlink(leaf, dir_fd=directory_fd)
+                    _frame(digest, b"symlink-mode", mode_bytes)
+                    _frame(digest, b"symlink-target", target if isinstance(target, bytes) else os.fsencode(target))
+                else:
+                    raise RuntimeError("Unsupported untracked worktree entry type")
+            finally:
+                os.close(directory_fd)
+    finally:
+        os.close(root_fd)
+    return digest.hexdigest()
+
+
+def capture_untracked_preimage(
+    repo: Path,
+    probe: Callable[[Path, list[str]], subprocess.CompletedProcess[bytes]],
+    *,
+    max_paths: int = 100,
+) -> dict[str, Any]:
+    completed = probe(repo, ["ls-files", "--others", "--exclude-standard", "-z"])
+    if completed.returncode != 0:
+        raise RuntimeError("Git untracked observation failed")
+    paths = [path for path in completed.stdout.split(b"\0") if path]
+    digest = _safe_worktree_paths_sha256(repo, paths, max_paths=max_paths)
+    material = {"schema_version": 1, "count": len(paths), "worktree_sha256": digest}
+    return {
+        **material,
+        "preimage_sha256": hashlib.sha256(
+            consumer_surface.canonical_json_bytes(material)
+        ).hexdigest(),
+    }
+
+
 def _same_open_file(before: os.stat_result, after: os.stat_result) -> bool:
     return (
         before.st_dev,
