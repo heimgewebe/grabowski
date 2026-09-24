@@ -1863,7 +1863,25 @@ def _continuation_preimage(
                 "managed worktree continuation untracked preimage capture failed"
             ) from exc
         try:
-            physical_checkout.verify_physical_checkout_identity(prior_physical)
+            snapshot_registered_git_dir = (
+                physical_checkout.capture_registered_linked_worktree_git_dir(
+                    registered_common_dir, target
+                )
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "managed worktree continuation registered Git directory changed during snapshot"
+            ) from exc
+        if snapshot_registered_git_dir != expected_physical.get("git_dir"):
+            raise RuntimeError(
+                "managed worktree continuation registered Git directory changed during snapshot"
+            )
+        try:
+            snapshot_physical = (
+                physical_checkout.verify_physical_checkout_identity(
+                    prior_physical
+                )
+            )
         except Exception as exc:
             raise RuntimeError(
                 "managed worktree continuation physical identity changed during preimage capture"
@@ -1881,6 +1899,10 @@ def _continuation_preimage(
             "untracked_preimage_sha256": untracked_preimage["preimage_sha256"],
             "untracked_worktree_sha256": untracked_preimage["worktree_sha256"],
             "untracked_count": untracked_preimage["count"],
+            "registered_git_dir": snapshot_registered_git_dir,
+            "physical_identity_sha256": snapshot_physical[
+                "physical_identity_sha256"
+            ],
         }
 
     first_snapshot = capture_snapshot()
@@ -1895,6 +1917,8 @@ def _continuation_preimage(
         "untracked_preimage_sha256",
         "untracked_worktree_sha256",
         "untracked_count",
+        "registered_git_dir",
+        "physical_identity_sha256",
     )
     if any(
         first_snapshot[field] != stable_snapshot[field]
@@ -1903,27 +1927,6 @@ def _continuation_preimage(
         raise RuntimeError(
             "managed worktree continuation Git state changed during stable readback"
         )
-    try:
-        final_registered_git_dir = (
-            physical_checkout.capture_registered_linked_worktree_git_dir(
-                registered_common_dir, target
-            )
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            "managed worktree continuation registered Git directory changed during snapshot"
-        ) from exc
-    if final_registered_git_dir != expected_physical.get("git_dir"):
-        raise RuntimeError(
-            "managed worktree continuation registered Git directory changed during snapshot"
-        )
-    try:
-        physical_checkout.verify_physical_checkout_identity(prior_physical)
-    except Exception as exc:
-        raise RuntimeError(
-            "managed worktree continuation physical identity changed after registration readback"
-        ) from exc
-
     material = {
         "schema_version": 1,
         "kind": "grabowski.work_lane_continuation_preimage",

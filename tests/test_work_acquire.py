@@ -1923,7 +1923,7 @@ class WorkAcquireTests(unittest.TestCase):
                 prior, inputs, lifecycle_source, runner
             )
 
-    def test_continuation_rejects_physical_drift_after_final_registration_read(self) -> None:
+    def test_continuation_rejects_physical_drift_in_second_snapshot(self) -> None:
         params = self.parameters()
         inputs = work_acquire._normalize(params)
         lifecycle_source = work_acquire._lifecycle_source(inputs)
@@ -1987,7 +1987,6 @@ class WorkAcquireTests(unittest.TestCase):
                 side_effect=[
                     PHYSICAL,
                     PHYSICAL,
-                    PHYSICAL,
                     RuntimeError("checkout replaced"),
                 ],
             ),
@@ -2019,7 +2018,7 @@ class WorkAcquireTests(unittest.TestCase):
                     "preimage_sha256": "2" * 64,
                 },
             ),
-            self.assertRaisesRegex(RuntimeError, "after registration readback"),
+            self.assertRaisesRegex(RuntimeError, "physical identity changed during preimage capture"),
         ):
             work_acquire._continuation_preimage(
                 prior, inputs, lifecycle_source, runner
