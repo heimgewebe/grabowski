@@ -225,6 +225,13 @@ class PhysicalCheckoutIdentityTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(
                 physical_checkout.PhysicalCheckoutIdentityError,
+                "entry bound",
+            ):
+                physical_checkout.capture_registered_linked_worktree_git_dir(
+                    identity["common_dir"]["path"], worktree, max_entries=1
+                )
+            with self.assertRaisesRegex(
+                physical_checkout.PhysicalCheckoutIdentityError,
                 "missing or ambiguous",
             ):
                 physical_checkout.capture_registered_linked_worktree_git_dir(

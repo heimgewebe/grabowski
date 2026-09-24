@@ -649,53 +649,56 @@ def capture_registered_linked_worktree_git_dir(
             common_descriptor, "worktrees", label="git worktrees directory"
         )
         before = os.fstat(worktrees_descriptor)
-        names = os.listdir(worktrees_descriptor)
-        if len(names) > max_entries:
-            raise PhysicalCheckoutIdentityError(
-                "git worktrees directory exceeds its entry bound"
-            )
         matches: list[dict[str, Any]] = []
-        for name in names:
-            _validate_component(name, label="git worktree admin entry")
-            try:
-                linked = os.stat(
-                    name,
-                    dir_fd=worktrees_descriptor,
-                    follow_symlinks=False,
-                )
-            except OSError as exc:
-                raise PhysicalCheckoutIdentityError(
-                    "git worktree admin entry could not be inspected safely"
-                ) from exc
-            if not stat.S_ISDIR(linked.st_mode) or stat.S_ISLNK(linked.st_mode):
-                continue
-            admin_descriptor, admin_metadata = _open_relative_directory(
-                worktrees_descriptor,
-                name,
-                label="git worktree admin directory",
-            )
-            try:
+        entry_count = 0
+        with os.scandir(worktrees_descriptor) as entries:
+            for entry in entries:
+                entry_count += 1
+                if entry_count > max_entries:
+                    raise PhysicalCheckoutIdentityError(
+                        "git worktrees directory exceeds its entry bound"
+                    )
+                name = entry.name
+                _validate_component(name, label="git worktree admin entry")
                 try:
-                    payload, _ = _read_relative_regular(
-                        admin_descriptor,
-                        "gitdir",
-                        label="git worktree backlink",
+                    linked = os.stat(
+                        name,
+                        dir_fd=worktrees_descriptor,
+                        follow_symlinks=False,
                     )
-                    target = _single_line_pointer(
-                        payload,
-                        prefix="",
-                        label="git worktree backlink",
-                    )
-                except PhysicalCheckoutIdentityError:
+                except OSError as exc:
+                    raise PhysicalCheckoutIdentityError(
+                        "git worktree admin entry could not be inspected safely"
+                    ) from exc
+                if not stat.S_ISDIR(linked.st_mode) or stat.S_ISLNK(linked.st_mode):
                     continue
-                admin_path = common_path / "worktrees" / name
-                pointer_path = _absolute_lexical(
-                    target if Path(target).is_absolute() else admin_path / target
+                admin_descriptor, admin_metadata = _open_relative_directory(
+                    worktrees_descriptor,
+                    name,
+                    label="git worktree admin directory",
                 )
-                if pointer_path == expected_pointer:
-                    matches.append(_identity(admin_path, admin_metadata))
-            finally:
-                os.close(admin_descriptor)
+                try:
+                    try:
+                        payload, _ = _read_relative_regular(
+                            admin_descriptor,
+                            "gitdir",
+                            label="git worktree backlink",
+                        )
+                        target = _single_line_pointer(
+                            payload,
+                            prefix="",
+                            label="git worktree backlink",
+                        )
+                    except PhysicalCheckoutIdentityError:
+                        continue
+                    admin_path = common_path / "worktrees" / name
+                    pointer_path = _absolute_lexical(
+                        target if Path(target).is_absolute() else admin_path / target
+                    )
+                    if pointer_path == expected_pointer:
+                        matches.append(_identity(admin_path, admin_metadata))
+                finally:
+                    os.close(admin_descriptor)
 
         after = os.fstat(worktrees_descriptor)
         if not _same_file_snapshot(before, after):

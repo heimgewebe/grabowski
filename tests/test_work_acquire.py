@@ -19,7 +19,18 @@ import grabowski_lane_closeout as closeout
 import grabowski_work_acquire as work_acquire
 
 SHA = "a" * 40
-PHYSICAL = {"physical_identity_sha256": "f" * 64, "common_dir": {"path": "/registered/common"}}
+PHYSICAL = {
+    "schema_version": 1,
+    "kind": "grabowski.physical_checkout_identity",
+    "root": {"path": "/registered/root", "device": 1, "inode": 1},
+    "git_dir": {
+        "path": "/registered/common/worktrees/lane",
+        "device": 1,
+        "inode": 2,
+    },
+    "common_dir": {"path": "/registered/common", "device": 1, "inode": 3},
+    "physical_identity_sha256": "f" * 64,
+}
 
 
 class WorkAcquireTests(unittest.TestCase):
@@ -1253,6 +1264,11 @@ class WorkAcquireTests(unittest.TestCase):
                 return_value=(self.repo, Path(PHYSICAL["common_dir"]["path"]), record),
             ),
             patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                return_value=PHYSICAL["git_dir"],
+            ),
             patch.object(work_acquire.physical_checkout, "capture_physical_checkout_identity", return_value=PHYSICAL),
             patch.object(work_acquire.physical_checkout, "verify_physical_checkout_identity", return_value=PHYSICAL),
             patch.object(work_acquire.git_preimage, "capture_branch_preimage", return_value={"branch": inputs["branch"], "head": SHA, "operation_refs": {}, "physical_checkout": PHYSICAL, "preimage_sha256": "c" * 64, "index_sha256": "d" * 64, "worktree_sha256": "e" * 64}),
@@ -1317,6 +1333,11 @@ class WorkAcquireTests(unittest.TestCase):
         with (
             patch.object(work_acquire.checkouts, "_worktree_for_path", return_value=(self.repo, Path(PHYSICAL["common_dir"]["path"]), record)),
             patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                return_value=PHYSICAL["git_dir"],
+            ),
             patch.object(work_acquire.physical_checkout, "capture_physical_checkout_identity", return_value=PHYSICAL),
             patch.object(work_acquire.physical_checkout, "verify_physical_checkout_identity", return_value=PHYSICAL),
             patch.object(work_acquire.checkouts, "_strict_lifecycle_binding", return_value=lifecycle),
@@ -1397,6 +1418,11 @@ class WorkAcquireTests(unittest.TestCase):
                 return_value=(self.repo, Path(PHYSICAL["common_dir"]["path"]), record),
             ),
             patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                return_value=PHYSICAL["git_dir"],
+            ),
             patch.object(
                 work_acquire.checkouts,
                 "_strict_lifecycle_binding",
@@ -1528,6 +1554,11 @@ class WorkAcquireTests(unittest.TestCase):
         with (
             patch.object(work_acquire.checkouts, "_worktree_for_path", return_value=(self.repo, Path(PHYSICAL["common_dir"]["path"]), record)),
             patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                return_value=PHYSICAL["git_dir"],
+            ),
             patch.object(work_acquire.physical_checkout, "capture_physical_checkout_identity", return_value=PHYSICAL),
             patch.object(work_acquire.physical_checkout, "verify_physical_checkout_identity", return_value=PHYSICAL),
             patch.object(work_acquire.checkouts, "_strict_lifecycle_binding", return_value=lifecycle),
@@ -1606,6 +1637,11 @@ class WorkAcquireTests(unittest.TestCase):
         with (
             patch.object(work_acquire.checkouts, "_worktree_for_path", return_value=(self.repo, Path(PHYSICAL["common_dir"]["path"]), record)),
             patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                return_value=PHYSICAL["git_dir"],
+            ),
             patch.object(work_acquire.physical_checkout, "capture_physical_checkout_identity", return_value=PHYSICAL),
             patch.object(work_acquire.physical_checkout, "verify_physical_checkout_identity", return_value=PHYSICAL),
             patch.object(work_acquire.git_preimage, "capture_branch_preimage", return_value={"branch": inputs["branch"], "head": SHA, "operation_refs": {}, "physical_checkout": PHYSICAL, "preimage_sha256": "c" * 64, "index_sha256": "d" * 64, "worktree_sha256": "e" * 64}),
@@ -1680,6 +1716,11 @@ class WorkAcquireTests(unittest.TestCase):
         with (
             patch.object(work_acquire.checkouts, "_worktree_for_path", return_value=(self.repo, Path(PHYSICAL["common_dir"]["path"]), record)),
             patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                return_value=PHYSICAL["git_dir"],
+            ),
             patch.object(work_acquire.physical_checkout, "capture_physical_checkout_identity", return_value=PHYSICAL),
             patch.object(work_acquire.physical_checkout, "verify_physical_checkout_identity", return_value=PHYSICAL),
             patch.object(work_acquire.git_preimage, "capture_branch_preimage", return_value={"branch": inputs["branch"], "head": SHA, "operation_refs": {}, "physical_checkout": PHYSICAL, "preimage_sha256": "c" * 64, "index_sha256": "d" * 64, "worktree_sha256": "e" * 64}),
@@ -1715,12 +1756,66 @@ class WorkAcquireTests(unittest.TestCase):
             patch.object(work_acquire.checkouts, "_require_linked"),
             patch.object(
                 work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                return_value=PHYSICAL["git_dir"],
+            ),
+            patch.object(
+                work_acquire.physical_checkout,
                 "verify_physical_checkout_identity",
                 side_effect=work_acquire.physical_checkout.PhysicalCheckoutIdentityError(
                     "git_dir changed"
                 ),
             ),
             self.assertRaisesRegex(RuntimeError, "ensure-time physical identity"),
+        ):
+            work_acquire._continuation_preimage(
+                prior, inputs, lifecycle_source, Mock()
+            )
+
+    def test_continuation_rejects_current_registered_git_dir_drift(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        checkout_key = "a" * 64
+        prior = {
+            "state": "ready",
+            "worktree_receipt": {
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "lifecycle": {
+                    "checkout_key": checkout_key,
+                    "physical_checkout": PHYSICAL,
+                },
+            },
+        }
+        record = {
+            "checkout_key": checkout_key,
+            "branch": inputs["branch"],
+            "detached": False,
+        }
+        replacement_git_dir = {
+            "path": "/registered/common/worktrees/replacement",
+            "device": 1,
+            "inode": 99,
+        }
+        with (
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                return_value=(self.repo, Path(PHYSICAL["common_dir"]["path"]), record),
+            ),
+            patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.physical_checkout,
+                "verify_physical_checkout_identity",
+                return_value=PHYSICAL,
+            ),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                return_value=replacement_git_dir,
+            ),
+            self.assertRaisesRegex(RuntimeError, "registered Git directory drifted"),
         ):
             work_acquire._continuation_preimage(
                 prior, inputs, lifecycle_source, Mock()
@@ -1821,6 +1916,11 @@ class WorkAcquireTests(unittest.TestCase):
         with (
             patch.object(work_acquire.checkouts, "_worktree_for_path", return_value=(self.repo, Path(PHYSICAL["common_dir"]["path"]), record)),
             patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                return_value=PHYSICAL["git_dir"],
+            ),
             patch.object(work_acquire.physical_checkout, "capture_physical_checkout_identity", return_value=PHYSICAL),
             patch.object(
                 work_acquire.physical_checkout,
@@ -1897,6 +1997,11 @@ class WorkAcquireTests(unittest.TestCase):
                 return_value=(self.repo, Path(PHYSICAL["common_dir"]["path"]), record),
             ),
             patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                return_value=PHYSICAL["git_dir"],
+            ),
             patch.object(work_acquire.physical_checkout, "capture_physical_checkout_identity", return_value=PHYSICAL),
             patch.object(work_acquire.physical_checkout, "verify_physical_checkout_identity", return_value=PHYSICAL),
             patch.object(work_acquire.git_preimage, "capture_branch_preimage", return_value={"branch": inputs["branch"], "head": SHA, "operation_refs": {}, "physical_checkout": PHYSICAL, "preimage_sha256": "c" * 64, "index_sha256": "d" * 64, "worktree_sha256": "e" * 64}),

@@ -1673,6 +1673,20 @@ def _continuation_preimage(
         raise RuntimeError(
             "managed worktree continuation ensure-time identity is not bound to the registered Git common directory"
         )
+    try:
+        current_registered_git_dir = (
+            physical_checkout.capture_registered_linked_worktree_git_dir(
+                registered_common_dir, target
+            )
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "managed worktree continuation registered Git directory could not be resolved"
+        ) from exc
+    if current_registered_git_dir != expected_physical.get("git_dir"):
+        raise RuntimeError(
+            "managed worktree continuation registered Git directory drifted"
+        )
 
     live_lifecycle = checkouts._strict_lifecycle_binding(checkout_key)
     expected_lifecycle = {
