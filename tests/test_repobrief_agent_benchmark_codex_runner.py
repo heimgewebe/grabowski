@@ -575,6 +575,67 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 with self.assertRaisesRegex(runner.RunnerError, "ChatGPT subscription"):
                     runner.validate_chatgpt_subscription("/opt/codex")
 
+    def test_chatgpt_subscription_gate_qualifies_only_its_exact_tempdir_warning(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary) / "home"
+            auth_dir = home / ".codex"
+            auth_dir.mkdir(parents=True, mode=0o700)
+            auth = auth_dir / "auth.json"
+            auth.write_bytes(b"opaque-chatgpt-auth")
+            auth.chmod(0o600)
+
+            def status(argv, **kwargs):
+                snapshot_home = Path(kwargs["env"]["CODEX_HOME"])
+                temporary_dir = snapshot_home.parents[2]
+                warning = (
+                    "WARNING: proceeding, even though we could not create PATH aliases: "
+                    "Refusing to create helper binaries under temporary dir "
+                    f'"{temporary_dir}" '
+                    f'(codex_home: AbsolutePathBuf("{snapshot_home}"))\n'
+                )
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    stdout=b"",
+                    stderr=(warning + "Logged in using ChatGPT\n").encode(),
+                )
+
+            with (
+                patch.dict(os.environ, {"HOME": str(home)}, clear=True),
+                patch.object(runner, "validate_toolchain", return_value="/usr/bin:/bin"),
+                patch.object(runner.subprocess, "run", side_effect=status),
+            ):
+                self.assertEqual(
+                    runner.validate_chatgpt_subscription("/opt/codex"),
+                    b"opaque-chatgpt-auth",
+                )
+
+            def foreign_status(argv, **kwargs):
+                snapshot_home = Path(kwargs["env"]["CODEX_HOME"])
+                temporary_dir = snapshot_home.parents[2]
+                warning = (
+                    "WARNING: proceeding, even though we could not create PATH aliases: "
+                    "Refusing to create helper binaries under temporary dir "
+                    f'"{temporary_dir}" '
+                    f'(codex_home: AbsolutePathBuf("{snapshot_home}-foreign"))\n'
+                )
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    stdout=b"",
+                    stderr=(warning + "Logged in using ChatGPT\n").encode(),
+                )
+
+            with (
+                patch.dict(os.environ, {"HOME": str(home)}, clear=True),
+                patch.object(runner, "validate_toolchain", return_value="/usr/bin:/bin"),
+                patch.object(runner.subprocess, "run", side_effect=foreign_status),
+            ):
+                with self.assertRaisesRegex(runner.RunnerError, "ChatGPT subscription"):
+                    runner.validate_chatgpt_subscription("/opt/codex")
+
     def test_chatgpt_subscription_status_uses_exact_staged_auth_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary) / "home"
@@ -651,6 +712,15 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertEqual(qualified["classification"], "qualified_benign_text")
         self.assertEqual(qualified["meaningful_line_count"], 1)
         self.assertEqual(len(runner.QUALIFIED_BENIGN_STDERR_PATTERNS), 1)
+
+        login_only = runner.classify_stderr(
+            b"WARNING: proceeding, even though we could not create PATH aliases: "
+            b"Refusing to create helper binaries under temporary dir \"/tmp\" "
+            b"(codex_home: AbsolutePathBuf("
+            b"\"/tmp/grabowski-codex-auth-example/codex-runtime/session-example\"))\n"
+        )
+        self.assertFalse(login_only["allowed"])
+        self.assertEqual(login_only["classification"], "text_unqualified")
 
         near_match = runner.classify_stderr(
             b"WARNING: proceeding, even though we could not create PATH aliases: "
