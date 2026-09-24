@@ -1903,6 +1903,20 @@ def _continuation_preimage(
         raise RuntimeError(
             "managed worktree continuation Git state changed during stable readback"
         )
+    try:
+        final_registered_git_dir = (
+            physical_checkout.capture_registered_linked_worktree_git_dir(
+                registered_common_dir, target
+            )
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "managed worktree continuation registered Git directory changed during snapshot"
+        ) from exc
+    if final_registered_git_dir != expected_physical.get("git_dir"):
+        raise RuntimeError(
+            "managed worktree continuation registered Git directory changed during snapshot"
+        )
 
     material = {
         "schema_version": 1,
