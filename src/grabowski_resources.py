@@ -117,6 +117,7 @@ TASK_TERMINALIZATION_KIND = "grabowski_task_terminalization"
 TASK_AUTHORITY_ADOPTION_KIND = "grabowski_task_authority_adoption"
 NONRENEWABLE_CRITICAL_RESOURCE_PREFIXES = ("gate:github-merge:",)
 USER_SYSTEMD_UNCERTAINTY_METADATA_PREFIX = "user_systemd_uncertainty_fence_v1:"
+USER_SYSTEMD_UNCERTAINTY_HISTORY_METADATA_PREFIX = "user_systemd_uncertainty_history_v1:"
 USER_SYSTEMD_UNCERTAINTY_KIND = "grabowski_user_systemd_uncertainty_fence"
 USER_SYSTEMD_UNCERTAINTY_PHASES = frozenset(
     {"prepared", "dispatching", "outcome_unknown", "preexisting_job"}
@@ -5576,6 +5577,38 @@ def _user_systemd_uncertainty_by_id(
     return matches[0] if matches else None
 
 
+def _user_systemd_uncertainty_history_metadata_key(fence_id: str) -> str:
+    if (
+        not isinstance(fence_id, str)
+        or re.fullmatch(r"[0-9a-f]{32}", fence_id) is None
+    ):
+        raise ValueError("user-systemd uncertainty fence id is invalid")
+    return f"{USER_SYSTEMD_UNCERTAINTY_HISTORY_METADATA_PREFIX}{fence_id}"
+
+
+def _user_systemd_uncertainty_history_by_id(
+    connection: sqlite3.Connection,
+    fence_id: str,
+) -> dict[str, Any] | None:
+    metadata_key = _user_systemd_uncertainty_history_metadata_key(fence_id)
+    row = connection.execute(
+        "SELECT value FROM metadata WHERE key=?",
+        (metadata_key,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        decoded = json.loads(str(row[0]))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "user-systemd uncertainty history metadata is not JSON"
+        ) from exc
+    fence = _validate_user_systemd_uncertainty_fence(decoded)
+    if fence["fence_id"] != fence_id or fence["cleared_at_unix"] is None:
+        raise RuntimeError("user-systemd uncertainty history binding is invalid")
+    return fence
+
+
 def user_systemd_uncertainty_status(
     resource_keys: Iterable[str] = (),
 ) -> dict[str, Any] | None:
@@ -5764,30 +5797,61 @@ def clear_user_systemd_uncertainty_fence(
         try:
             found = _user_systemd_uncertainty_by_id(connection, fence_id)
             if found is None:
-                raise RuntimeError("user-systemd uncertainty fence changed")
+                historical = _user_systemd_uncertainty_history_by_id(
+                    connection, fence_id
+                )
+                if historical is None:
+                    raise RuntimeError("user-systemd uncertainty fence changed")
+                connection.commit()
+                return historical
             metadata_key, fence = found
-            if fence["cleared_at_unix"] is not None:
-                return fence
-            now = _now()
-            updated = {
-                **fence,
-                "updated_at_unix": now,
-                "cleared_at_unix": now,
-                "clearance": {
-                    "outcome": outcome,
-                    "evidence_sha256": evidence_sha256,
+            if fence["cleared_at_unix"] is None:
+                now = _now()
+                updated = {
+                    **fence,
+                    "updated_at_unix": now,
                     "cleared_at_unix": now,
-                },
-            }
+                    "clearance": {
+                        "outcome": outcome,
+                        "evidence_sha256": evidence_sha256,
+                        "cleared_at_unix": now,
+                    },
+                }
+            else:
+                updated = fence
+            updated = _validate_user_systemd_uncertainty_fence(updated)
+            history_key = _user_systemd_uncertainty_history_metadata_key(fence_id)
+            existing_history = connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (history_key,),
+            ).fetchone()
+            if existing_history is None:
+                connection.execute(
+                    "INSERT INTO metadata(key, value) VALUES(?, ?)",
+                    (history_key, _canonical_json(updated)),
+                )
+            else:
+                try:
+                    historical = _validate_user_systemd_uncertainty_fence(
+                        json.loads(str(existing_history[0]))
+                    )
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        "user-systemd uncertainty history metadata is not JSON"
+                    ) from exc
+                if historical != updated:
+                    raise RuntimeError(
+                        "user-systemd uncertainty history binding changed"
+                    )
             connection.execute(
-                "UPDATE metadata SET value=? WHERE key=?",
-                (_canonical_json(updated), metadata_key),
+                "DELETE FROM metadata WHERE key=?",
+                (metadata_key,),
             )
             connection.commit()
         except Exception:
             connection.rollback()
             raise
-    return _validate_user_systemd_uncertainty_fence(updated)
+    return updated
 
 def acquire_resources(
     owner_id: str,

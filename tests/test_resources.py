@@ -1042,6 +1042,72 @@ class ResourceTests(unittest.TestCase):
         self.assertIsNotNone(active)
         self.assertEqual(fence["fence_id"], active["fence_id"])
 
+    def test_cleared_user_systemd_fence_moves_out_of_active_scan(self) -> None:
+        unit = "grabowski-cleared-fence-history.service"
+        service_key = f"service:user-systemd:{unit}"
+        owner = "operator:user-systemd-cleared-history"
+        lease = resources.acquire_resources(
+            owner,
+            [service_key],
+            purpose="cleared fence history fixture",
+            ttl_seconds=120,
+            metadata={"unit": unit, "action": "restart"},
+        )
+        fence = resources.prepare_user_systemd_uncertainty_fence(
+            owner,
+            [service_key],
+            expected_leases=lease["leases"],
+            unit=unit,
+            action="restart",
+        )
+        resources.release_resources(
+            owner,
+            [service_key],
+            expected_leases=lease["leases"],
+        )
+
+        cleared = resources.clear_user_systemd_uncertainty_fence(
+            fence["fence_id"],
+            outcome="terminal_readback",
+            evidence_sha256="c" * 64,
+        )
+
+        self.assertIsNone(
+            resources.user_systemd_uncertainty_status([service_key])
+        )
+        with resources._database() as connection:
+            active = connection.execute(
+                "SELECT key FROM metadata WHERE key GLOB ?",
+                (f"{resources.USER_SYSTEMD_UNCERTAINTY_METADATA_PREFIX}*",),
+            ).fetchall()
+            history = connection.execute(
+                "SELECT key FROM metadata WHERE key GLOB ?",
+                (f"{resources.USER_SYSTEMD_UNCERTAINTY_HISTORY_METADATA_PREFIX}*",),
+            ).fetchall()
+        self.assertEqual(active, [])
+        self.assertEqual(
+            [resources._user_systemd_uncertainty_history_metadata_key(fence["fence_id"])],
+            [str(row[0]) for row in history],
+        )
+        replay = resources.clear_user_systemd_uncertainty_fence(
+            fence["fence_id"],
+            outcome="terminal_readback",
+            evidence_sha256="c" * 64,
+        )
+        self.assertEqual(cleared, replay)
+
+        replacement = resources.acquire_resources(
+            "operator:user-systemd-after-clear",
+            [service_key],
+            purpose="active scan ignores cleared history",
+            ttl_seconds=60,
+        )
+        resources.release_resources(
+            replacement["owner_id"],
+            [service_key],
+            expected_leases=replacement["leases"],
+        )
+
     def test_user_systemd_fence_does_not_redefine_exact_path_identity(self) -> None:
         repository = self.root / "repo"
         unit = "demo.service"

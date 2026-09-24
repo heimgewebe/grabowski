@@ -7817,6 +7817,61 @@ def _user_systemd_reconciliation_state(name: str) -> dict[str, str]:
     }
 
 
+def _user_systemd_manager_job_readback(name: str) -> dict[str, Any]:
+    result = _run(
+        [
+            "systemctl",
+            "--user",
+            "list-jobs",
+            "--no-legend",
+            "--plain",
+            "--no-pager",
+        ],
+        cwd=HOME,
+        timeout_seconds=_USER_SYSTEMD_RECONCILIATION_TIMEOUT_SECONDS,
+        max_output_bytes=DEFAULT_OUTPUT_BYTES,
+    )
+    if (
+        result.get("returncode") != 0
+        or result.get("timed_out") is True
+        or result.get("stdout_truncated") is True
+    ):
+        raise RuntimeError(
+            f"Unable to read user systemd manager jobs while reconciling {name}"
+        )
+    stdout = result.get("stdout")
+    if not isinstance(stdout, str):
+        raise RuntimeError(
+            f"Invalid user systemd manager job readback while reconciling {name}"
+        )
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    matching_jobs: list[dict[str, str]] = []
+    for line in lines:
+        fields = line.split()
+        if len(fields) != 4:
+            raise RuntimeError(
+                f"Malformed user systemd manager job readback while reconciling {name}"
+            )
+        job_id, unit, job_type, state = fields
+        if unit == name:
+            matching_jobs.append(
+                {
+                    "job_id": job_id,
+                    "unit": unit,
+                    "type": job_type,
+                    "state": state,
+                }
+            )
+    return {
+        "schema_version": 1,
+        "kind": "user_systemd_manager_job_readback",
+        "unit": name,
+        "job_present": bool(matching_jobs),
+        "matching_jobs": matching_jobs,
+        "observed_job_line_count": len(lines),
+    }
+
+
 def _user_systemd_lease_expiry(
     lease_snapshots: list[dict[str, Any]],
 ) -> int | None:
@@ -7978,43 +8033,78 @@ def _user_systemd_reconcile_durable_uncertainty(
     fence = resources.user_systemd_uncertainty_status(resource_keys)
     if fence is None:
         return None
+    reconciliation: dict[str, str] | None = None
+    reconciliation_error_class: str | None = None
+    manager_job_readback: dict[str, Any] | None = None
+    manager_job_readback_error_class: str | None = None
+    clearance_evidence: dict[str, Any]
     try:
         reconciliation = _user_systemd_reconciliation_state(fence["unit"])
     except Exception as exc:
-        return {
-            "blocked": True,
-            "fence": fence,
-            "reconciliation": None,
-            "reconciliation_error_class": type(exc).__name__,
-            "clearance_error_class": None,
-        }
-    if reconciliation["Job"].strip():
-        return {
-            "blocked": True,
-            "fence": fence,
-            "reconciliation": reconciliation,
-            "reconciliation_error_class": None,
-            "clearance_error_class": None,
-        }
+        reconciliation_error_class = type(exc).__name__
+        try:
+            manager_job_readback = _user_systemd_manager_job_readback(
+                fence["unit"]
+            )
+        except Exception as manager_exc:
+            manager_job_readback_error_class = type(manager_exc).__name__
+            return {
+                "blocked": True,
+                "fence": fence,
+                "reconciliation": None,
+                "reconciliation_error_class": reconciliation_error_class,
+                "manager_job_readback": None,
+                "manager_job_readback_error_class": (
+                    manager_job_readback_error_class
+                ),
+                "clearance_error_class": None,
+            }
+        if manager_job_readback["job_present"]:
+            return {
+                "blocked": True,
+                "fence": fence,
+                "reconciliation": None,
+                "reconciliation_error_class": reconciliation_error_class,
+                "manager_job_readback": manager_job_readback,
+                "manager_job_readback_error_class": None,
+                "clearance_error_class": None,
+            }
+        clearance_evidence = manager_job_readback
+    else:
+        if reconciliation["Job"].strip():
+            return {
+                "blocked": True,
+                "fence": fence,
+                "reconciliation": reconciliation,
+                "reconciliation_error_class": None,
+                "manager_job_readback": None,
+                "manager_job_readback_error_class": None,
+                "clearance_error_class": None,
+            }
+        clearance_evidence = reconciliation
     try:
         cleared = resources.clear_user_systemd_uncertainty_fence(
             fence["fence_id"],
             outcome="terminal_readback",
-            evidence_sha256=_user_systemd_evidence_sha256(reconciliation),
+            evidence_sha256=_user_systemd_evidence_sha256(clearance_evidence),
         )
     except Exception as exc:
         return {
             "blocked": True,
             "fence": fence,
             "reconciliation": reconciliation,
-            "reconciliation_error_class": None,
+            "reconciliation_error_class": reconciliation_error_class,
+            "manager_job_readback": manager_job_readback,
+            "manager_job_readback_error_class": manager_job_readback_error_class,
             "clearance_error_class": type(exc).__name__,
         }
     return {
         "blocked": False,
         "fence": cleared,
         "reconciliation": reconciliation,
-        "reconciliation_error_class": None,
+        "reconciliation_error_class": reconciliation_error_class,
+        "manager_job_readback": manager_job_readback,
+        "manager_job_readback_error_class": manager_job_readback_error_class,
         "clearance_error_class": None,
     }
 
@@ -8038,6 +8128,10 @@ def _user_systemd_durable_fence_block_result(
         "resource_keys": list(fence["resource_keys"]),
         "reconciliation": prior["reconciliation"],
         "reconciliation_error_class": prior["reconciliation_error_class"],
+        "manager_job_readback": prior.get("manager_job_readback"),
+        "manager_job_readback_error_class": prior.get(
+            "manager_job_readback_error_class"
+        ),
         "fence_clearance_error_class": prior["clearance_error_class"],
         "handoff": "durable_fence_requires_terminal_systemd_readback",
     }
@@ -8214,6 +8308,7 @@ def _run_mutating_user_systemd_unit(
         action_error is not None
         or action_result is None
         or action_result.get("timed_out") is True
+        or action_result.get("returncode") != 0
     )
     if not uncertain_transport:
         assert action_result is not None
