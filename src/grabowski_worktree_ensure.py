@@ -1001,9 +1001,20 @@ def _bind_checkout_lifecycle(
         raise WorktreeEnsureAction(
             "worktree lifecycle physical checkout identity could not be captured"
         ) from exc
+    try:
+        registered_git_dir = (
+            physical_checkout.capture_registered_linked_worktree_git_dir(
+                common_dir, checkout
+            )
+        )
+    except Exception as exc:
+        raise WorktreeEnsureAction(
+            "worktree lifecycle registered git directory could not be resolved"
+        ) from exc
     if (
         physical.get("root", {}).get("path") != str(checkout)
         or physical.get("common_dir", {}).get("path") != str(common_dir)
+        or physical.get("git_dir") != registered_git_dir
     ):
         raise WorktreeEnsureAction(
             "worktree lifecycle physical checkout identity disagrees with registered checkout"

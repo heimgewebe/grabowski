@@ -627,6 +627,105 @@ def capture_physical_checkout_identity(
         os.close(root_descriptor)
 
 
+def capture_registered_linked_worktree_git_dir(
+    common_dir: str | os.PathLike[str],
+    worktree_root: str | os.PathLike[str],
+    *,
+    max_entries: int = 10_000,
+) -> dict[str, Any]:
+    """Resolve the one registered per-worktree admin dir bound to checkout/.git."""
+
+    if max_entries < 1:
+        raise ValueError("max_entries must be positive")
+    common_path = _absolute_lexical(common_dir)
+    checkout_path = _absolute_lexical(worktree_root)
+    expected_pointer = checkout_path / ".git"
+    common_descriptor, _ = _open_absolute_directory(
+        common_path, label="git common directory"
+    )
+    worktrees_descriptor: int | None = None
+    try:
+        worktrees_descriptor, _ = _open_relative_directory(
+            common_descriptor, "worktrees", label="git worktrees directory"
+        )
+        before = os.fstat(worktrees_descriptor)
+        names = os.listdir(worktrees_descriptor)
+        if len(names) > max_entries:
+            raise PhysicalCheckoutIdentityError(
+                "git worktrees directory exceeds its entry bound"
+            )
+        matches: list[dict[str, Any]] = []
+        for name in names:
+            _validate_component(name, label="git worktree admin entry")
+            try:
+                linked = os.stat(
+                    name,
+                    dir_fd=worktrees_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise PhysicalCheckoutIdentityError(
+                    "git worktree admin entry could not be inspected safely"
+                ) from exc
+            if not stat.S_ISDIR(linked.st_mode) or stat.S_ISLNK(linked.st_mode):
+                continue
+            admin_descriptor, admin_metadata = _open_relative_directory(
+                worktrees_descriptor,
+                name,
+                label="git worktree admin directory",
+            )
+            try:
+                try:
+                    payload, _ = _read_relative_regular(
+                        admin_descriptor,
+                        "gitdir",
+                        label="git worktree backlink",
+                    )
+                    target = _single_line_pointer(
+                        payload,
+                        prefix="",
+                        label="git worktree backlink",
+                    )
+                except PhysicalCheckoutIdentityError:
+                    continue
+                admin_path = common_path / "worktrees" / name
+                pointer_path = _absolute_lexical(
+                    target if Path(target).is_absolute() else admin_path / target
+                )
+                if pointer_path == expected_pointer:
+                    matches.append(_identity(admin_path, admin_metadata))
+            finally:
+                os.close(admin_descriptor)
+
+        after = os.fstat(worktrees_descriptor)
+        if not _same_file_snapshot(before, after):
+            raise PhysicalCheckoutIdentityError(
+                "git worktrees directory changed during registered identity capture"
+            )
+        if len(matches) != 1:
+            raise PhysicalCheckoutIdentityError(
+                "registered linked worktree git directory is missing or ambiguous"
+            )
+        registered = matches[0]
+        registered_path = Path(registered["path"])
+        descriptor, metadata = _open_absolute_directory(
+            registered_path, label="registered worktree git directory"
+        )
+        try:
+            observed = _identity(registered_path, metadata)
+            if observed != registered:
+                raise PhysicalCheckoutIdentityError(
+                    "registered worktree git directory changed during capture"
+                )
+        finally:
+            os.close(descriptor)
+        return registered
+    finally:
+        if worktrees_descriptor is not None:
+            os.close(worktrees_descriptor)
+        os.close(common_descriptor)
+
+
 def verify_physical_checkout_identity(expected: dict[str, Any]) -> dict[str, Any]:
     required_fields = {
         "schema_version",

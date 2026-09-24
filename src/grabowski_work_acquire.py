@@ -1527,13 +1527,18 @@ def _lifecycle_source(inputs: dict[str, Any]) -> dict[str, str]:
     return {"kind": kind, "id": source_id}
 
 
-def _git_runner(cwd: Path, arguments: list[str]) -> dict[str, Any]:
+def _git_runner(
+    cwd: Path,
+    arguments: list[str],
+    *,
+    timeout_seconds: int | float = 60,
+) -> dict[str, Any]:
     command = ["git", "-C", str(cwd), *arguments]
     command = operator._validate_argv(command, cwd=cwd)
     return operator._run(
         command,
         cwd=cwd,
-        timeout_seconds=60,
+        timeout_seconds=timeout_seconds,
         max_output_bytes=250_000,
         environment=operator._git_environment(),
     )
@@ -1731,14 +1736,27 @@ def _continuation_preimage(
             timeout_seconds=remaining_snapshot_seconds(),
         )
 
+    def snapshot_runner(arguments: list[str]) -> dict[str, Any]:
+        timeout_seconds = remaining_snapshot_seconds()
+        if runner is _git_runner:
+            result = _git_runner(
+                target,
+                arguments,
+                timeout_seconds=timeout_seconds,
+            )
+        else:
+            result = runner(target, arguments)
+        remaining_snapshot_seconds()
+        return result
+
     def capture_snapshot() -> dict[str, Any]:
-        status = runner(
-            target, ["status", "--short", "--branch", "--untracked-files=normal"]
+        status = snapshot_runner(
+            ["status", "--short", "--branch", "--untracked-files=normal"]
         )
-        head = runner(target, ["rev-parse", "--verify", "HEAD^{commit}"])
-        tracked_index = runner(target, ["diff-index", "--quiet", "HEAD", "--"])
-        tracked_files = runner(target, ["diff-files", "--quiet", "--"])
-        index_flags = runner(target, ["ls-files", "-v", "-z"])
+        head = snapshot_runner(["rev-parse", "--verify", "HEAD^{commit}"])
+        tracked_index = snapshot_runner(["diff-index", "--quiet", "HEAD", "--"])
+        tracked_files = snapshot_runner(["diff-files", "--quiet", "--"])
+        index_flags = snapshot_runner(["ls-files", "-v", "-z"])
         preimage_reads = (status, head, index_flags)
         if any(result.get("returncode") != 0 for result in preimage_reads):
             raise RuntimeError("managed worktree continuation Git readback failed")

@@ -193,6 +193,44 @@ class PhysicalCheckoutIdentityTests(unittest.TestCase):
             )
             physical_checkout.verify_physical_checkout_identity(identity)
 
+    def test_registered_linked_worktree_git_dir_is_exact_and_ambiguity_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            worktree = root / "worktree"
+            self._init_committed_repo(repo, branch="main")
+            self._run(
+                "git",
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked",
+                str(worktree),
+                "HEAD",
+                cwd=repo,
+            )
+
+            identity = physical_checkout.capture_physical_checkout_identity(worktree)
+            registered = physical_checkout.capture_registered_linked_worktree_git_dir(
+                identity["common_dir"]["path"], worktree
+            )
+            self.assertEqual(identity["git_dir"], registered)
+
+            fake = Path(identity["common_dir"]["path"]) / "worktrees" / "fake"
+            fake.mkdir()
+            (fake / "gitdir").write_text(
+                str(worktree / ".git") + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                physical_checkout.PhysicalCheckoutIdentityError,
+                "missing or ambiguous",
+            ):
+                physical_checkout.capture_registered_linked_worktree_git_dir(
+                    identity["common_dir"]["path"], worktree
+                )
+
     def test_gitdir_pointer_preserves_whitespace_as_path_material(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

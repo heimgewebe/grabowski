@@ -1341,6 +1341,119 @@ class WorkAcquireTests(unittest.TestCase):
         )
         self.assertTrue(capture.call_args.kwargs["reject_gitlinks"])
 
+    def test_default_snapshot_git_reads_share_remaining_deadline(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        checkout_key = "a" * 64
+        prior = {
+            "state": "ready",
+            "worktree_receipt": {
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "lifecycle": {
+                    "checkout_key": checkout_key,
+                    "physical_checkout": PHYSICAL,
+                },
+            },
+        }
+        record = {
+            "checkout_key": checkout_key,
+            "branch": inputs["branch"],
+            "detached": False,
+        }
+        lifecycle = {
+            "checkout_key": checkout_key,
+            "physical_checkout": PHYSICAL,
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "source": lifecycle_source,
+            "artifact_class": inputs["artifact_class"],
+            "phase": "active",
+            "expected_branch": inputs["branch"],
+            "expected_head": SHA,
+            "updated_at_unix": 123,
+        }
+        timeouts: list[float] = []
+
+        def operator_run(command: list[str], **kwargs: object) -> dict[str, object]:
+            timeouts.append(float(kwargs["timeout_seconds"]))
+            args = command[3:]
+            if args[0] == "status":
+                return {"returncode": 0, "stdout": "## feat/authority-p0\n"}
+            if args[0] == "rev-parse":
+                return {"returncode": 0, "stdout": SHA + "\n"}
+            if args[0] in ("diff-index", "diff-files"):
+                return {"returncode": 0, "stdout": ""}
+            if args[0] == "ls-files":
+                return {"returncode": 0, "stdout": ""}
+            raise AssertionError(args)
+
+        completed = __import__("subprocess").CompletedProcess([], 0, b"", b"")
+        with (
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                return_value=(self.repo, Path(PHYSICAL["common_dir"]["path"]), record),
+            ),
+            patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.checkouts,
+                "_strict_lifecycle_binding",
+                return_value=lifecycle,
+            ),
+            patch.object(
+                work_acquire.physical_checkout,
+                "verify_physical_checkout_identity",
+                return_value=PHYSICAL,
+            ),
+            patch.object(
+                work_acquire.operator,
+                "_validate_argv",
+                side_effect=lambda command, cwd: command,
+            ),
+            patch.object(
+                work_acquire.operator,
+                "_git_environment",
+                return_value={"PATH": "/usr/bin"},
+            ),
+            patch.object(work_acquire.operator, "_run", side_effect=operator_run),
+            patch.object(work_acquire.subprocess, "run", return_value=completed),
+            patch.object(
+                work_acquire.git_preimage,
+                "capture_branch_preimage",
+                return_value={
+                    "branch": inputs["branch"],
+                    "head": SHA,
+                    "operation_refs": {},
+                    "physical_checkout": PHYSICAL,
+                    "preimage_sha256": "c" * 64,
+                    "index_sha256": "d" * 64,
+                    "worktree_sha256": "e" * 64,
+                },
+            ),
+            patch.object(
+                work_acquire.git_preimage,
+                "capture_untracked_preimage",
+                return_value={
+                    "count": 0,
+                    "worktree_sha256": "1" * 64,
+                    "preimage_sha256": "2" * 64,
+                },
+            ),
+        ):
+            result = work_acquire._continuation_preimage(
+                prior,
+                inputs,
+                lifecycle_source,
+                work_acquire._git_runner,
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(len(timeouts), 10)
+        self.assertTrue(all(0 < timeout <= 30 for timeout in timeouts))
+        self.assertEqual(timeouts, sorted(timeouts, reverse=True))
+
     def test_tracked_worktree_hash_enforces_path_byte_and_deadline_bounds(self) -> None:
         first = b"100644 " + (b"a" * 40) + b" 0\tfirst.txt\0"
         second = b"100644 " + (b"b" * 40) + b" 0\tsecond.txt\0"
