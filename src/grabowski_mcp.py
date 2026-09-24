@@ -6964,7 +6964,6 @@ def grabowski_status(
         compact_transport_keys = (
             "state",
             "normal_mutation_path",
-            "normal_mutation_path_ready",
             "legacy_roundtrip_required",
             "recommended_next_action",
         )

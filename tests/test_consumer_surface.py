@@ -381,8 +381,11 @@ class ConsumerSurfaceTests(unittest.TestCase):
             "runtime_invalid",
         )
         self.assertFalse(broken_signed_minimal["transport_roundtrip"]["mutation_gate_open"])
-        self.assertFalse(
-            broken_signed_minimal["transport_roundtrip"]["normal_mutation_path_ready"]
+        self.assertNotIn(
+            "normal_mutation_path_ready", broken_signed_minimal["transport_roundtrip"]
+        )
+        self.assertNotIn(
+            "normal_mutation_path_ready", minimal["transport_roundtrip"]
         )
         self.assertNotIn("last_consumption_receipt_sha256", minimal["transport_roundtrip"])
         self.assertIn("last_consumption_receipt_sha256", standard["transport_roundtrip"])
