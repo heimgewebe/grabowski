@@ -1548,6 +1548,121 @@ def _effect_observed(output: dict[str, Any]) -> bool:
     )
 
 
+def _continuation_preimage(
+    existing: dict[str, Any] | None,
+    inputs: dict[str, Any],
+    lifecycle_source: dict[str, str],
+    runner: Callable[[Path, list[str]], dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Bind live Git state when resuming an already prepared managed work lane."""
+
+    if not isinstance(existing, dict):
+        return None
+    resumable_continuation = existing.get("state") == "ready" or (
+        existing.get("state") == "blocked"
+        and existing.get("error_class") == "WORKTREE_CONTINUATION_CONFLICT"
+    )
+    if not resumable_continuation:
+        return None
+    prior = existing.get("worktree_receipt")
+    if not isinstance(prior, dict) or prior.get("result_state") not in SUCCESS_STATES:
+        return None
+    prior_lifecycle = prior.get("lifecycle")
+    if not isinstance(prior_lifecycle, dict):
+        return None
+
+    target = Path(inputs["target_path"])
+    repo = Path(inputs["repo"])
+    _top_level, _common_dir, record = checkouts._worktree_for_path(repo, target)
+    checkouts._require_linked(record)
+    checkout_key = record.get("checkout_key")
+    if not isinstance(checkout_key, str) or checkout_key != prior_lifecycle.get("checkout_key"):
+        raise RuntimeError("managed worktree continuation checkout identity drifted")
+
+    live_lifecycle = checkouts._strict_lifecycle_binding(checkout_key)
+    expected_lifecycle = {
+        "checkout_path": str(target),
+        "owner_id": inputs["lease_owner_id"],
+        "source": lifecycle_source,
+        "artifact_class": inputs["artifact_class"],
+        "phase": "active",
+        "expected_branch": inputs["branch"],
+    }
+    if not isinstance(live_lifecycle, dict) or any(
+        live_lifecycle.get(field) != value for field, value in expected_lifecycle.items()
+    ):
+        raise RuntimeError("managed worktree continuation lifecycle authority drifted")
+    if record.get("branch") != inputs["branch"] or record.get("detached"):
+        raise RuntimeError("managed worktree continuation branch identity drifted")
+
+    status = runner(target, ["status", "--short", "--branch", "--untracked-files=normal"])
+    head = runner(target, ["rev-parse", "--verify", "HEAD^{commit}"])
+    tracked = runner(target, ["diff", "--no-ext-diff", "--binary", "HEAD"])
+    untracked = runner(target, ["ls-files", "--others", "--exclude-standard", "-z"])
+    if any(
+        result.get("returncode") != 0
+        for result in (status, head, tracked, untracked)
+    ):
+        raise RuntimeError("managed worktree continuation Git readback failed")
+    status_lines = [line for line in str(status.get("stdout") or "").splitlines() if line]
+    status_entries = status_lines[1:] if status_lines else []
+    head_sha = str(head.get("stdout") or "").strip().lower()
+    if SHA40_RE.fullmatch(head_sha) is None:
+        raise RuntimeError("managed worktree continuation HEAD is invalid")
+    prior_head = live_lifecycle.get("expected_head")
+    if not isinstance(prior_head, str) or SHA40_RE.fullmatch(prior_head) is None:
+        raise RuntimeError("managed worktree continuation prior HEAD evidence is invalid")
+    ancestry = runner(
+        target, ["merge-base", "--is-ancestor", prior_head, head_sha]
+    )
+    if ancestry.get("returncode") != 0:
+        raise RuntimeError("managed worktree continuation HEAD is not a descendant of ensure")
+    untracked_paths = [
+        path for path in str(untracked.get("stdout") or "").split("\0") if path
+    ]
+    if len(untracked_paths) > 100:
+        raise RuntimeError("managed worktree continuation has too many untracked paths")
+    untracked_hashes: list[dict[str, str]] = []
+    if untracked_paths:
+        hashed = runner(target, ["hash-object", "--no-filters", "--", *untracked_paths])
+        if hashed.get("returncode") != 0:
+            raise RuntimeError("managed worktree continuation untracked hash readback failed")
+        object_ids = [
+            line.strip().lower()
+            for line in str(hashed.get("stdout") or "").splitlines()
+            if line.strip()
+        ]
+        if len(object_ids) != len(untracked_paths) or any(
+            SHA40_RE.fullmatch(object_id) is None for object_id in object_ids
+        ):
+            raise RuntimeError("managed worktree continuation untracked hash evidence is invalid")
+        untracked_hashes = [
+            {"path": path, "blob": object_id}
+            for path, object_id in zip(untracked_paths, object_ids, strict=True)
+        ]
+
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski.work_lane_continuation_preimage",
+        "lane_id": inputs["lane_id"],
+        "checkout_key": checkout_key,
+        "checkout_path": str(target),
+        "branch": inputs["branch"],
+        "head": head_sha,
+        "ensure_head": prior_head,
+        "dirty": bool(status_entries),
+        "status_header": status_lines[0] if status_lines else "",
+        "status_entries": status_entries[:100],
+        "tracked_diff_sha256": hashlib.sha256(
+            str(tracked.get("stdout") or "").encode("utf-8")
+        ).hexdigest(),
+        "untracked": untracked_hashes,
+        "prior_worktree_receipt_sha256": prior.get("durable_receipt_sha256"),
+        "lifecycle_updated_at_unix": live_lifecycle.get("updated_at_unix"),
+    }
+    return {**material, "preimage_sha256": _sha(material)}
+
+
 def _resource_acquisition_plan(resource_keys: list[str]) -> list[dict[str, Any]]:
     keys = resources.normalize_resource_keys(resource_keys)
     bureau_keys = resources.bureau_leases.bureau_resource_keys(keys)
@@ -2127,6 +2242,42 @@ def acquire_work(
         )
         group_evidence = _group_evidence_fields(acquisition_plan, acquisitions)
 
+        try:
+            continuation_preimage = _continuation_preimage(
+                existing, inputs, lifecycle_source, runner
+            )
+        except Exception as exc:
+            record = _write_state(
+                receipt_path,
+                {
+                    **base_record,
+                    "state": "blocked",
+                    "decision": "HARD_BLOCK",
+                    "lease_receipt": acquired,
+                    **group_evidence,
+                    "worktree_receipt": existing.get("worktree_receipt"),
+                    "error_class": "WORKTREE_CONTINUATION_CONFLICT",
+                    "error": str(exc)[:2048],
+                    "effect_observed": False,
+                    "next_action": "reconcile_managed_worktree_continuation",
+                },
+            )
+            if audit_fn is not None:
+                audit_fn(
+                    {
+                        "operation": "work-acquire",
+                        "lane_id": lane_id,
+                        "state": "blocked",
+                        "decision": "HARD_BLOCK",
+                        "inputs_sha256": inputs_sha256,
+                        "effect_observed": False,
+                    }
+                )
+            return {
+                **record,
+                "durable_receipt_path": str(receipt_path),
+                "replayed": existing is not None,
+            }
         ensure_parameters = {
             "repo": inputs["repo"],
             "target_path": inputs["target_path"],
@@ -2145,11 +2296,14 @@ def acquire_work(
             ],
         }
         try:
-            output = ensure_worktree_fn(
-                ensure_parameters,
-                runner,
-                inspect_resource_fn,
-            )
+            if continuation_preimage is not None:
+                output = existing["worktree_receipt"]
+            else:
+                output = ensure_worktree_fn(
+                    ensure_parameters,
+                    runner,
+                    inspect_resource_fn,
+                )
         except worktree_ensure.WorktreeEnsurePreflight as exc:
             compensation, compensation_complete = _compensate_acquisitions(
                 owner_id=inputs["lease_owner_id"],
@@ -2246,7 +2400,9 @@ def acquire_work(
         if result_state in SUCCESS_STATES:
             admission = output.get("work_admission")
             decision = (
-                "ISOLATE_AND_EXECUTE"
+                "CONTINUE_EXISTING"
+                if continuation_preimage is not None
+                else "ISOLATE_AND_EXECUTE"
                 if work_admission.has_verified_isolation_evidence(admission)
                 else "AUTO_PREPARE_AND_EXECUTE"
                 if result_state == "CREATED"
@@ -2289,6 +2445,7 @@ def acquire_work(
                         "lease_receipt": acquired,
                         **group_evidence,
                         "worktree_receipt": output,
+                        **({"continuation_preimage": continuation_preimage} if continuation_preimage is not None else {}),
                         "authority": authority,
                         "writer_start": {"state": "starting"},
                         "next_action": "start_scoped_writer",
@@ -2312,6 +2469,7 @@ def acquire_work(
                             "lease_receipt": acquired,
                             **group_evidence,
                             "worktree_receipt": output,
+                            **({"continuation_preimage": continuation_preimage} if continuation_preimage is not None else {}),
                             "authority": authority,
                             "writer_start": {
                                 "state": "preflight_failed",
@@ -2336,6 +2494,7 @@ def acquire_work(
                             "lease_receipt": acquired,
                             **group_evidence,
                             "worktree_receipt": output,
+                            **({"continuation_preimage": continuation_preimage} if continuation_preimage is not None else {}),
                             "authority": authority,
                             "writer_start": {
                                 "state": "outcome_unknown",
@@ -2360,6 +2519,7 @@ def acquire_work(
                             "lease_receipt": acquired,
                             **group_evidence,
                             "worktree_receipt": output,
+                            **({"continuation_preimage": continuation_preimage} if continuation_preimage is not None else {}),
                             "authority": authority,
                             "writer_start": {
                                 "state": "outcome_unknown",
@@ -2386,6 +2546,7 @@ def acquire_work(
                             "lease_receipt": acquired,
                             **group_evidence,
                             "worktree_receipt": output,
+                            **({"continuation_preimage": continuation_preimage} if continuation_preimage is not None else {}),
                             "authority": authority,
                             "writer_start": {
                                 "state": "outcome_unknown",
@@ -2413,6 +2574,7 @@ def acquire_work(
                     "lease_receipt": acquired,
                     **group_evidence,
                     "worktree_receipt": output,
+                    **({"continuation_preimage": continuation_preimage} if continuation_preimage is not None else {}),
                     "authority": authority,
                     **({"writer_job": writer_job} if writer_job is not None else {}),
                     **({"writer_start": writer_start} if writer_start is not None else {}),

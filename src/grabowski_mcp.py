@@ -78,7 +78,7 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "host-capability-resolution",
-        "Native typed first. Host-local/no native: grabowski_host_capability_resolve. Host not_found/non-host: declared route; host blocked: stop. Follow selected authority; reread live policy/readiness at execution; not-ready!=not-found. Reuse before new infra. No execution/setup authority or provider/model pinning.",
+        "Native typed first. Host-local/no native: grabowski_host_capability_resolve. Host not_found/non-host: declared route; host blocked: stop. Follow selected authority; reread live policy/readiness at execution; not-ready!=not-found. Reuse before new infra. Discovery grants no execution/setup authority or provider/model pinning.",
     ),
     (
         "mutation-preconditions",
@@ -114,7 +114,7 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "goal-fidelity-before-continuation",
-        "At material choices, user outcome outranks strategy. Use the minimum sufficient mechanism; persistent complexity needs proof of benefit. Compare a simpler path with fresh evidence; choose CONTINUE/CHANGE/PARK-STOP. A tool failure is not strategic evidence.",
+        "User outcome outranks strategy. Use the minimum sufficient mechanism; persistent complexity needs proof of benefit. Compare a simpler path with fresh evidence; choose CONTINUE/CHANGE/PARK-STOP. A tool failure alone is not strategic evidence. Managed dirty checkout after ensure: continue only from exact lane/lifecycle/checkout evidence with fresh Git preimage; never reset/clean/stash merely to satisfy ensure.",
     ),
     (
         "operator-obligation-lifecycle",
@@ -122,7 +122,7 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "convergence-before-high-risk-closure",
-        "At admission bind risk-adaptive system_convergence_plan when classification evidence exists. Work/delivery closeout is not systemic convergence. Before claiming it, resolve criticality if classification_required; if systemic_closure_gate=hard, grip_run convergence-assess a hash-bound request, require terminally_closed, and bind its receipt into completion evidence. A nonterminal assessment blocks only that claim and grants no mutation authority.",
+        "Bind risk-adaptive system_convergence_plan at admission when classified. Completion != systemic convergence. Before claim resolve required criticality; hard gate: hash-bound grip_run convergence-assess must be terminally_closed and receipt-bound. Nonterminal blocks only claim; no mutation authority.",
     ),
     (
         "no-authority-escalation",

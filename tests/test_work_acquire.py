@@ -1177,6 +1177,151 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertEqual(acquire.call_count, 2)
         self.assertEqual(ensure.call_count, 2)
 
+    def test_identical_dirty_lane_continues_without_rerunning_ensure(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        checkout_key = "a" * 64
+        ensure = Mock(return_value={
+            "result_state": "CREATED",
+            "durable_receipt_sha256": "b" * 64,
+            "post_state": {"target_registered": True, "target_path_exists": True},
+            "lifecycle": {
+                "checkout_key": checkout_key,
+                "checkout_path": str(self.target),
+                "owner_id": inputs["lease_owner_id"],
+                "source": lifecycle_source,
+                "artifact_class": inputs["artifact_class"],
+                "expected_branch": inputs["branch"],
+            },
+        })
+        kwargs = {
+            "acquire_resources_fn": self.acquire,
+            "release_resources_fn": Mock(),
+            "inspect_resource_fn": Mock(),
+            "ensure_worktree_fn": ensure,
+        }
+        first = work_acquire.acquire_work(params, runner=Mock(), **kwargs)
+        self.assertEqual(first["state"], "ready")
+
+        def runner(_cwd: Path, argv: list[str]) -> dict[str, object]:
+            if argv[0] == "status":
+                return {
+                    "returncode": 0,
+                    "stdout": "## feat/authority-p0\n M src/example.py\n",
+                }
+            if argv[0] == "rev-parse":
+                return {"returncode": 0, "stdout": SHA + "\n"}
+            if argv[0] == "diff":
+                return {"returncode": 0, "stdout": "diff --git a/src/example.py b/src/example.py\n"}
+            if argv[0] == "ls-files":
+                return {"returncode": 0, "stdout": ""}
+            if argv[0] == "merge-base":
+                return {"returncode": 0, "stdout": ""}
+            raise AssertionError(argv)
+
+        record = {
+            "checkout_key": checkout_key,
+            "branch": inputs["branch"],
+            "detached": False,
+        }
+        lifecycle = {
+            "checkout_key": checkout_key,
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "source": lifecycle_source,
+            "artifact_class": inputs["artifact_class"],
+            "phase": "active",
+            "expected_branch": inputs["branch"],
+            "expected_head": SHA,
+            "updated_at_unix": 123,
+        }
+        with (
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                return_value=(self.repo, self.repo / ".git", record),
+            ),
+            patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.checkouts,
+                "_strict_lifecycle_binding",
+                return_value=lifecycle,
+            ),
+        ):
+            second = work_acquire.acquire_work(params, runner=runner, **kwargs)
+
+        self.assertEqual(second["decision"], "CONTINUE_EXISTING")
+        self.assertTrue(second["continuation_preimage"]["dirty"])
+        self.assertEqual(second["continuation_preimage"]["head"], SHA)
+        self.assertEqual(second["continuation_preimage"]["checkout_key"], checkout_key)
+        self.assertEqual(ensure.call_count, 1)
+
+    def test_dirty_lane_continuation_fails_closed_on_lifecycle_drift(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        checkout_key = "a" * 64
+        ensure = Mock(return_value={
+            "result_state": "CREATED",
+            "durable_receipt_sha256": "b" * 64,
+            "post_state": {"target_registered": True, "target_path_exists": True},
+            "lifecycle": {
+                "checkout_key": checkout_key,
+                "checkout_path": str(self.target),
+                "owner_id": inputs["lease_owner_id"],
+                "source": lifecycle_source,
+                "artifact_class": inputs["artifact_class"],
+                "expected_branch": inputs["branch"],
+            },
+        })
+        kwargs = {
+            "acquire_resources_fn": self.acquire,
+            "release_resources_fn": Mock(),
+            "inspect_resource_fn": Mock(),
+            "ensure_worktree_fn": ensure,
+            "runner": Mock(),
+        }
+        work_acquire.acquire_work(params, **kwargs)
+        record = {
+            "checkout_key": checkout_key,
+            "branch": inputs["branch"],
+            "detached": False,
+        }
+        drifted = {
+            "checkout_key": checkout_key,
+            "checkout_path": str(self.target),
+            "owner_id": "lane:" + "f" * 32,
+            "source": lifecycle_source,
+            "artifact_class": inputs["artifact_class"],
+            "phase": "active",
+            "expected_branch": inputs["branch"],
+        }
+        with (
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                return_value=(self.repo, self.repo / ".git", record),
+            ),
+            patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.checkouts,
+                "_strict_lifecycle_binding",
+                return_value=drifted,
+            ),
+        ):
+            blocked = work_acquire.acquire_work(params, **kwargs)
+        self.assertEqual(blocked["state"], "blocked")
+        self.assertEqual(blocked["decision"], "HARD_BLOCK")
+        self.assertEqual(
+            blocked["error_class"], "WORKTREE_CONTINUATION_CONFLICT"
+        )
+        self.assertIn("lifecycle authority drifted", blocked["error"])
+        self.assertEqual(
+            blocked["next_action"], "reconcile_managed_worktree_continuation"
+        )
+        self.assertEqual(ensure.call_count, 1)
+
     def test_writer_binding_survives_reacquire_block(self) -> None:
         params = self.parameters()
         params["scoped_writer_argv"] = ["writer", "--once"]
