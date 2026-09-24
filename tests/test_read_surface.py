@@ -2034,6 +2034,97 @@ class ReadSurfaceTests(unittest.TestCase):
         )
 
 
+    def test_audit_projection_binds_legacy_only_head_by_derived_identity(self) -> None:
+        now = 1_800_000_000
+        legacy_digest = "a" * 64
+        record = {
+            "operation": "task-start",
+            "timestamp": datetime.fromtimestamp(now - 60, tz=timezone.utc).isoformat(),
+            read_surface.audit_signal.AUDIT_EVIDENCE_RECORD_SHA256_FIELD: legacy_digest,
+        }
+        status = {
+            "valid": True,
+            "total_records": 1,
+            "total_legacy_records": 1,
+            "total_v2_records": 0,
+            "last_record_sha256": legacy_digest,
+            "archived_segment_count": 0,
+            "legacy_rotation_compatibility": False,
+            "audit_writable": True,
+            "scanned_records": 1,
+            "scan_limit": 100_000,
+            "scan_truncated": False,
+            "scan_order": "latest_records",
+        }
+        with (
+            patch.object(
+                read_surface,
+                "_audit_projection_records_snapshot",
+                return_value=([record], status),
+            ),
+            patch.object(
+                read_surface.base,
+                "_verify_audit_log",
+                return_value=status,
+            ),
+            patch.object(read_surface.time, "time", return_value=now),
+        ):
+            result = read_surface.grabowski_audit_projection()
+
+        self.assertEqual(result["source_binding"]["last_record_sha256"], legacy_digest)
+        self.assertEqual(result["source_binding"]["record_count"], 1)
+
+    def test_truncated_scan_does_not_infer_event_time_completeness_from_timestamps(
+        self,
+    ) -> None:
+        now = 1_800_000_000
+        records = [
+            {
+                "operation": "task-start",
+                "timestamp": datetime.fromtimestamp(
+                    now - read_surface.audit_signal.AUDIT_SIGNAL_WINDOW_SECONDS - 60,
+                    tz=timezone.utc,
+                ).isoformat(),
+                "record_sha256": "a" * 64,
+            },
+            {
+                "operation": "task-start",
+                "timestamp": datetime.fromtimestamp(now - 60, tz=timezone.utc).isoformat(),
+                "record_sha256": "b" * 64,
+            },
+        ]
+        status = {
+            "valid": True,
+            "total_records": 10,
+            "total_legacy_records": 0,
+            "total_v2_records": 10,
+            "last_record_sha256": records[-1]["record_sha256"],
+            "archived_segment_count": 1,
+            "legacy_rotation_compatibility": False,
+            "audit_writable": True,
+            "scanned_records": len(records),
+            "scan_limit": len(records),
+            "scan_truncated": True,
+            "scan_order": "latest_records",
+        }
+        with (
+            patch.object(
+                read_surface,
+                "_audit_projection_records_snapshot",
+                return_value=(records, status),
+            ),
+            patch.object(read_surface.base, "_verify_audit_log", return_value=status),
+            patch.object(read_surface.time, "time", return_value=now),
+        ):
+            result = read_surface.grabowski_audit_projection()
+
+        by_id = {
+            item["id"]: item for item in result["signal_projection"]["signals"]
+        }
+        self.assertTrue(result["source_binding"]["scan_truncated"])
+        self.assertEqual(by_id["uncertain_outcome"]["status"], "indeterminate")
+        self.assertEqual(by_id["transition_gap"]["status"], "indeterminate")
+
     def test_audit_projection_rejects_snapshot_binding_mismatch(self) -> None:
         record = {
             "operation": "task-start",

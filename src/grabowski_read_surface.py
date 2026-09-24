@@ -1276,13 +1276,10 @@ def _audit_snapshot_binding(records: list[dict[str, Any]]) -> dict[str, Any]:
         ),
         None,
     )
-    last_record_sha256 = next(
-        (
-            record.get("record_sha256")
-            for record in reversed(records)
-            if isinstance(record.get("record_sha256"), str)
-        ),
-        None,
+    last_record_sha256 = (
+        audit_signal._audit_record_evidence_sha256(records[-1])
+        if records
+        else None
     )
     identity = {
         "record_count": len(records),
@@ -1723,11 +1720,17 @@ def grabowski_audit_projection(
             "terminal_evidence_valid": terminal_evidence_valid,
         }
 
+    # Audit record timestamps are not an append-order invariant: the append
+    # contract preserves a caller-supplied timestamp via setdefault().  A newest-N
+    # suffix therefore cannot prove seven-day event-time completeness merely
+    # because its oldest visible timestamp predates the window boundary.  Keep
+    # absence/clear claims fail-closed whenever the verified chain was truncated.
+    signal_window_complete = not scan_truncated
     signal_projection = audit_signal.build_projection(
         prepared_records,
         as_of_unix=as_of_unix,
         audit_source_binding=binding,
-        audit_window_complete=not scan_truncated,
+        audit_window_complete=signal_window_complete,
         runtime_status_provider=getattr(base, "grabowski_status", None),
         task_terminal_provider=task_terminal_provider,
     )
