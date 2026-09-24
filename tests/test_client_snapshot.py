@@ -858,6 +858,7 @@ class ClientSnapshotTests(unittest.TestCase):
 
         declarations: list[dict[str, object]] = []
         request_metas: list[dict[str, object] | None] = []
+        tool_calls: list[tuple[str, dict[str, object]]] = []
         transport_headers: list[dict[str, str] | None] = []
         connector_capability = "C" * 43
 
@@ -877,6 +878,7 @@ class ClientSnapshotTests(unittest.TestCase):
                 *,
                 meta: dict[str, object] | None = None,
             ) -> object:
+                tool_calls.append((name, arguments))
                 request_metas.append(meta)
                 if name == "grip_run":
                     declarations.append(arguments)
@@ -981,6 +983,10 @@ class ClientSnapshotTests(unittest.TestCase):
             )
             self.assertEqual(len(declarations), 2)
             self.assertEqual(
+                tool_calls[0],
+                ("grabowski_status", {"view": "standard"}),
+            )
+            self.assertEqual(
                 [entry["name"] for entry in declarations],
                 ["transport-roundtrip", "transport-roundtrip"],
             )
@@ -1056,6 +1062,144 @@ class ClientSnapshotTests(unittest.TestCase):
                 snapshot.ClientSnapshotError, "bound loopback endpoint"
             ):
                 snapshot._validate_runtime_probe_mcp_url(url, auth_mode=auth_mode)
+
+    def test_runtime_readiness_requests_standard_status_contract(self) -> None:
+        import sys
+        import types
+
+        class AsyncContext:
+            def __init__(self, value: object) -> None:
+                self.value = value
+
+            async def __aenter__(self) -> object:
+                return self.value
+
+            async def __aexit__(self, *_args: object) -> bool:
+                return False
+
+        status_calls: list[
+            tuple[str, dict[str, object], dict[str, object] | None]
+        ] = []
+
+        class Client:
+            async def initialize(self) -> None:
+                return None
+
+            async def call_tool(
+                self,
+                name: str,
+                arguments: dict[str, object],
+                *,
+                meta: dict[str, object] | None = None,
+            ) -> object:
+                status_calls.append((name, arguments, meta))
+                return object()
+
+        client = Client()
+        mcp_module = types.ModuleType("mcp")
+        mcp_module.__path__ = []
+        mcp_module.ClientSession = lambda _read, _write: AsyncContext(client)
+        client_module = types.ModuleType("mcp.client")
+        client_module.__path__ = []
+        streamable_http_module = types.ModuleType("mcp.client.streamable_http")
+        streamable_http_module.streamablehttp_client = (
+            lambda _url, *, headers=None: AsyncContext(
+                (object(), object(), None)
+            )
+        )
+        metadata = {
+            "names_sha256": TOOL_HASH,
+            "artifact_sha256": "d" * 64,
+            "schema_coverage_count": 0,
+            "schema_sha256_by_tool": {},
+            "complete_schema_count": 1,
+            "complete_schema_sha256": "e" * 64,
+        }
+        status = {
+            "runtime": {
+                "release_id": RELEASE_ID,
+                "repo_head": REPO_HEAD,
+            },
+            "agent_instructions": {"sha256": INSTRUCTIONS_HASH},
+            "tool_contract": {
+                "registered_tool_count": 1,
+                "registered_names_sha256": TOOL_HASH,
+                "runtime_matches_deployment_contract": True,
+            },
+        }
+        runtime_binding = {
+            "release_id": RELEASE_ID,
+            "repo_head": REPO_HEAD,
+            "agent_instructions_sha256": INSTRUCTIONS_HASH,
+        }
+
+        with (
+            mock.patch.dict(
+                sys.modules,
+                {
+                    "mcp": mcp_module,
+                    "mcp.client": client_module,
+                    "mcp.client.streamable_http": streamable_http_module,
+                },
+            ),
+            mock.patch.object(
+                snapshot,
+                "_read_transport_connector_capability",
+                return_value="C" * 43,
+            ),
+            mock.patch.object(
+                snapshot,
+                "_runtime_platform_binding",
+                return_value=(runtime_binding, ["alpha"]),
+            ),
+            mock.patch.object(
+                snapshot,
+                "_list_all_tools",
+                new=mock.AsyncMock(return_value=[object()]),
+            ),
+            mock.patch.object(
+                snapshot,
+                "_mixed_observed_tool_artifact",
+                return_value={},
+            ),
+            mock.patch.object(
+                connector_contract,
+                "parse_observed_artifact",
+                return_value=(["alpha"], {}, metadata),
+            ),
+            mock.patch.object(
+                snapshot,
+                "_mcp_tool_payload",
+                return_value=status,
+            ),
+            mock.patch.object(
+                connector_contract,
+                "evaluate_green_readiness",
+                return_value={"ready": True},
+            ),
+        ):
+            result = snapshot.probe_runtime_readiness(
+                runtime_root=Path(self.temporary.name),
+                mcp_url="http://127.0.0.1:18182/mcp",
+                connector_token_path=Path(self.temporary.name) / "token",
+                auth_mode="connector",
+                expected_release_id=RELEASE_ID,
+                expected_repo_head=REPO_HEAD,
+                expected_agent_instructions_sha256=INSTRUCTIONS_HASH,
+                timeout_seconds=1.0,
+            )
+
+        self.assertTrue(result["ready"])
+        self.assertEqual(
+            status_calls,
+            [
+                (
+                    "grabowski_status",
+                    {"view": "standard"},
+                    {"client_id": snapshot.AUTO_REFRESH_CLIENT_ID},
+                )
+            ],
+        )
 
     def test_auto_refresh_connector_capability_reader_is_private_and_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

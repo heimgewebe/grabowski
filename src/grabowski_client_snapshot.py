@@ -6098,7 +6098,7 @@ def probe_runtime_readiness(
                 )
                 status_result = await client.call_tool(
                     "grabowski_status",
-                    {"view": "minimal"},
+                    {"view": "standard"},
                     meta={"client_id": AUTO_REFRESH_CLIENT_ID},
                 )
                 status = _mcp_tool_payload(
@@ -6228,7 +6228,7 @@ async def _observe_and_bind_snapshot(
                 request_meta = {"client_id": AUTO_REFRESH_CLIENT_ID}
                 status_result = await client.call_tool(
                     "grabowski_status",
-                    {"view": "minimal"},
+                    {"view": "standard"},
                     meta=request_meta,
                 )
                 status = _mcp_tool_payload(status_result, label="grabowski_status")
