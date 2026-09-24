@@ -435,6 +435,57 @@ class PhysicalCheckoutIdentityTests(unittest.TestCase):
                     max_paths=10,
                 )
 
+    def test_tracked_hash_revalidates_missing_parent_before_accepting_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            index = b"100644 " + (b"a" * 40) + b" 0\tdir/file.txt\0"
+            original_stat = git_preimage.os.stat
+            created = False
+
+            def create_after_missing_parent(path, *args, **kwargs):
+                nonlocal created
+                try:
+                    return original_stat(path, *args, **kwargs)
+                except FileNotFoundError:
+                    if path == b"dir" and not created:
+                        (root / "dir").mkdir()
+                        (root / "dir" / "file.txt").write_bytes(b"late-bytes")
+                        created = True
+                    raise
+
+            with (
+                patch.object(
+                    git_preimage.os,
+                    "stat",
+                    side_effect=create_after_missing_parent,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "Tracked worktree blocked parent path changed during preimage capture",
+                ),
+            ):
+                git_preimage._tracked_worktree_sha256(
+                    root,
+                    index,
+                    max_paths=10,
+                )
+
+    def test_branch_preimage_detects_rebase_apply_operation_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            self._init_committed_repo(repo, branch="main")
+            (repo / ".git" / "rebase-apply").mkdir()
+
+            preimage = git_preimage.capture_branch_preimage(
+                repo,
+                self._probe(repo),
+            )
+
+            self.assertEqual(
+                "present",
+                preimage["operation_refs"]["STATE:rebase-apply"],
+            )
+
     def test_gitdir_pointer_preserves_whitespace_as_path_material(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

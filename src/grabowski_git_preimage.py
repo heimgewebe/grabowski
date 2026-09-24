@@ -338,6 +338,9 @@ def _tracked_worktree_sha256(
             parent_snapshots: list[tuple[bytes, os.stat_result]] = []
             try:
                 blocked = False
+                blocked_components: list[bytes] | None = None
+                blocked_snapshot: os.stat_result | None = None
+                blocked_symlink_target: bytes | None = None
                 for component in components[:-1]:
                     _deadline_guard(deadline_monotonic, "tracked worktree hashing")
                     try:
@@ -347,6 +350,9 @@ def _tracked_worktree_sha256(
                     except FileNotFoundError:
                         _frame(digest, b"missing-parent", component)
                         blocked = True
+                        blocked_components = [
+                            name for name, _snapshot in parent_snapshots
+                        ] + [component]
                         break
                     if not stat.S_ISDIR(linked.st_mode):
                         _frame(
@@ -356,14 +362,21 @@ def _tracked_worktree_sha256(
                         )
                         if stat.S_ISLNK(linked.st_mode):
                             target = os.readlink(component, dir_fd=directory_fd)
+                            blocked_symlink_target = (
+                                target
+                                if isinstance(target, bytes)
+                                else os.fsencode(target)
+                            )
                             _frame(
                                 digest,
                                 b"blocked-parent-link",
-                                target
-                                if isinstance(target, bytes)
-                                else os.fsencode(target),
+                                blocked_symlink_target,
                             )
                         blocked = True
+                        blocked_snapshot = linked
+                        blocked_components = [
+                            name for name, _snapshot in parent_snapshots
+                        ] + [component]
                         break
                     next_fd = os.open(component, directory_flags, dir_fd=directory_fd)
                     opened = os.fstat(next_fd)
@@ -380,6 +393,15 @@ def _tracked_worktree_sha256(
                     os.close(directory_fd)
                     directory_fd = next_fd
                 if blocked:
+                    assert blocked_components is not None
+                    _revalidate_worktree_path(
+                        root_fd,
+                        blocked_components,
+                        parent_snapshots,
+                        blocked_snapshot,
+                        label="Tracked worktree blocked parent",
+                        symlink_target=blocked_symlink_target,
+                    )
                     continue
 
                 leaf = components[-1]
@@ -497,6 +519,56 @@ def _tracked_worktree_sha256(
     return digest.hexdigest()
 
 
+def _git_operation_state_markers(
+    git_dir: Path,
+    *,
+    deadline_monotonic: float | None = None,
+) -> dict[str, str]:
+    """Observe administrative Git operation state without following path aliases."""
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(git_dir, directory_flags)
+    except OSError as exc:
+        raise RuntimeError("Git operation-state directory could not be opened safely") from exc
+    try:
+        before = os.fstat(descriptor)
+        markers: dict[str, str] = {}
+        for name, expected_kind in (
+            ("rebase-apply", "directory"),
+            ("rebase-merge", "directory"),
+            ("sequencer", "directory"),
+        ):
+            _deadline_guard(deadline_monotonic, "Git operation-state observation")
+            try:
+                observed = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Git operation-state observation failed: {name}"
+                ) from exc
+            if stat.S_ISLNK(observed.st_mode):
+                raise RuntimeError(
+                    f"Git operation-state marker is a symlink: {name}"
+                )
+            if expected_kind == "directory" and not stat.S_ISDIR(observed.st_mode):
+                raise RuntimeError(
+                    f"Git operation-state marker has unexpected type: {name}"
+                )
+            markers[f"STATE:{name}"] = "present"
+        after = os.fstat(descriptor)
+        if not _same_open_file(before, after):
+            raise RuntimeError(
+                "Git operation-state directory changed during preimage capture"
+            )
+        return markers
+    finally:
+        os.close(descriptor)
+
+
 def capture_branch_preimage(
     repo: Path,
     probe: Callable[[Path, list[str]], subprocess.CompletedProcess[bytes]],
@@ -563,7 +635,10 @@ def capture_branch_preimage(
         deadline_monotonic=deadline_monotonic,
     )
 
-    operation_refs: dict[str, str] = {}
+    operation_refs: dict[str, str] = _git_operation_state_markers(
+        Path(physical_before["git_dir"]["path"]),
+        deadline_monotonic=deadline_monotonic,
+    )
     for name in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD"):
         _deadline_guard(deadline_monotonic, "branch preimage capture")
         ref_probe = probe(repo, ["rev-parse", "--verify", "--quiet", name])
