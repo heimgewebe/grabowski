@@ -226,7 +226,7 @@ BASE_PATH = Path(__file__).with_name("repobrief_agent_benchmark_runner.py")
 base = _load_captured_module("repobrief_agent_benchmark_base", BASE_PATH)
 
 PROVIDER = "openai-codex-cli"
-MODEL = "gpt-5.3-codex-spark"
+MODEL = "gpt-6-astra"
 EXECUTION_CONTRACT = "grabowski-codex-cli-live-v1"
 SAMPLING = {"reasoning_effort": "medium"}
 STDERR_POLICY_VERSION = "codex-stderr-v1"
@@ -381,6 +381,24 @@ QUALIFIED_BENIGN_STDERR_PATTERNS: tuple[re.Pattern[str], ...] = (
         r"Read-only file system \(os error 30\)"
     ),
 )
+
+
+# Codex 0.156.1 additionally warns when login status uses a temporary
+# CODEX_HOME. Qualify only the exact temp root and snapshot home created by
+# this invocation; the live-provider stderr policy remains unchanged.
+def _login_status_line_is_qualified(
+    line: str, *, snapshot_root: Path, snapshot_home: Path
+) -> bool:
+    if any(pattern.fullmatch(line) for pattern in QUALIFIED_BENIGN_STDERR_PATTERNS):
+        return True
+    expected = (
+        "WARNING: proceeding, even though we could not create PATH aliases: "
+        "Refusing to create helper binaries under temporary dir "
+        f'"{snapshot_root.parent}" '
+        f'(codex_home: AbsolutePathBuf("{snapshot_home}"))'
+    )
+    return hmac.compare_digest(line, expected)
+
 
 RunnerError = base.RunnerError
 
@@ -819,9 +837,13 @@ def validate_chatgpt_subscription(codex: str) -> bytes:
             except UnicodeDecodeError as exc:
                 raise RunnerError("Codex ChatGPT login status was not UTF-8") from exc
             lines = [line.strip() for line in text.splitlines() if line.strip()]
-            status_lines = [line for line in lines if not any(
-                pattern.fullmatch(line) for pattern in QUALIFIED_BENIGN_STDERR_PATTERNS
-            )]
+            status_lines = [
+                line
+                for line in lines
+                if not _login_status_line_is_qualified(
+                    line, snapshot_root=snapshot_root, snapshot_home=snapshot_home
+                )
+            ]
             if completed.returncode != 0 or status_lines != [CHATGPT_LOGIN_LINE]:
                 raise RunnerError("Codex must be logged in using the ChatGPT subscription")
             staged = _read_bound_regular_file(
