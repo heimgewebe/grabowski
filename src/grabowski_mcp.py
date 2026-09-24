@@ -6964,7 +6964,6 @@ def grabowski_status(
         compact_transport_keys = (
             "state",
             "normal_mutation_path",
-            "normal_mutation_path_ready",
             "legacy_roundtrip_required",
             "recommended_next_action",
         )
@@ -6973,11 +6972,14 @@ def grabowski_status(
             for key in compact_transport_keys
             if key in transport_roundtrip
         }
-        # Schema 3 preserves normal_mutation_path_ready for compatibility and
-        # also projects the explicit effective gate for the selected normal
-        # mutation path. Schema-2 standard/evidence retain the raw legacy gate.
+        # Schema 3 binds both compatibility names to the same effective
+        # readiness used by warnings and recommended_next_action. Schema-2
+        # standard/evidence retain the raw legacy roundtrip gate.
+        base_payload["transport_roundtrip"]["normal_mutation_path_ready"] = (
+            normal_mutation_path_ready
+        )
         base_payload["transport_roundtrip"]["mutation_gate_open"] = (
-            transport_roundtrip.get("normal_mutation_path_ready") is True
+            normal_mutation_path_ready
         )
 
     if selected_view in {"standard", "evidence"}:

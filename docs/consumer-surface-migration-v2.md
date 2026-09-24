@@ -25,7 +25,7 @@ Neue Clients sollen die kanonischen Namen senden und das zurückgegebene Feld `v
 
 `schema_version` versioniert die konkrete Antwortform einer Oberfläche, nicht das gesamte Grabowski-Protokoll. Ein Client muss deshalb pro Werkzeug und Antwortobjekt auf die angegebene Schemaversion reagieren.
 
-`grabowski_status` ist absichtlich gemischt versioniert: `minimal` und der Alias `concise` liefern Schema 3; `standard`, `evidence` und der Alias `full` bleiben Schema 2. Schema 3 der Minimalansicht behält `normal_mutation_path_ready` kompatibel bei und ergänzt `mutation_gate_open` als expliziten effektiven Gate-Wert des ausgewählten Normalpfads; beide Werte sind in Schema 3 äquivalent. Neue Consumer sollen `mutation_gate_open` verwenden. Schema 2 behält den rohen Legacy-Gate als Diagnosewert neben `normal_mutation_path_ready`.
+`grabowski_status` ist absichtlich gemischt versioniert: `minimal` und der Alias `concise` liefern Schema 3; `standard`, `evidence` und der Alias `full` bleiben Schema 2. Schema 3 liefert `normal_mutation_path_ready` und `mutation_gate_open` immer gemeinsam als denselben effektiven Bereitschaftswert des ausgewählten Normalpfads; Warnungen und `recommended_next_action` verwenden dieselbe Definition. In den degradierten Zuständen `connector_identity_required` und `runtime_invalid` sind beide Werte `false`. Schema 2 bleibt diagnostisch: Dort bezeichnet `mutation_gate_open` weiterhin den rohen Legacy-Roundtrip-Gate, während `normal_mutation_path_ready` die Bereitschaft des ausgewählten Normalpfads beschreibt, sofern das Feld vorhanden ist. Consumer müssen deshalb nach `schema_version` verzweigen und dürfen die Schema-2-Bedeutung von `mutation_gate_open` nicht auf Schema 3 übertragen.
 
 Für Consumer-Antworten mit Schema 2 gilt:
 

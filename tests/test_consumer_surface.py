@@ -292,6 +292,10 @@ class ConsumerSurfaceTests(unittest.TestCase):
                 view="minimal",
                 fields=["service"],
             )
+            transport_projected = grabowski_mcp.grabowski_status(
+                view="minimal",
+                fields=["transport_roundtrip"],
+            )
             transport_status.clear()
             transport_status.update(
                 {
@@ -312,6 +316,27 @@ class ConsumerSurfaceTests(unittest.TestCase):
                 }
             )
             runtime_invalid_minimal = grabowski_mcp.grabowski_status(view="minimal")
+            transport_status.clear()
+            transport_status.update(
+                {
+                    "state": "unavailable",
+                    "mutation_gate_open": False,
+                    "recommended_next_action": "none",
+                }
+            )
+            unavailable_minimal = grabowski_mcp.grabowski_status(view="minimal")
+            transport_status.clear()
+            transport_status.update(
+                {
+                    "state": "verified",
+                    "mutation_gate_open": True,
+                    "normal_mutation_path": "legacy_roundtrip",
+                    "normal_mutation_path_ready": True,
+                    "legacy_roundtrip_required": True,
+                    "recommended_next_action": "invoke exactly one bound mutating tool",
+                }
+            )
+            legacy_minimal = grabowski_mcp.grabowski_status(view="minimal")
             transport_status.clear()
             transport_status.update(
                 {
@@ -378,14 +403,41 @@ class ConsumerSurfaceTests(unittest.TestCase):
         self.assertFalse(standard["transport_roundtrip"]["mutation_gate_open"])
         self.assertTrue(standard["transport_roundtrip"]["normal_mutation_path_ready"])
         self.assertFalse(degraded_minimal["transport_roundtrip"]["mutation_gate_open"])
+        self.assertFalse(
+            degraded_minimal["transport_roundtrip"]["normal_mutation_path_ready"]
+        )
         self.assertEqual(
             degraded_minimal["transport_roundtrip"]["state"],
             "connector_identity_required",
         )
         self.assertFalse(runtime_invalid_minimal["transport_roundtrip"]["mutation_gate_open"])
+        self.assertFalse(
+            runtime_invalid_minimal["transport_roundtrip"]["normal_mutation_path_ready"]
+        )
         self.assertEqual(
             runtime_invalid_minimal["transport_roundtrip"]["state"],
             "runtime_invalid",
+        )
+        self.assertTrue(unavailable_minimal["transport_roundtrip"]["mutation_gate_open"])
+        self.assertTrue(
+            unavailable_minimal["transport_roundtrip"]["normal_mutation_path_ready"]
+        )
+        self.assertTrue(legacy_minimal["transport_roundtrip"]["mutation_gate_open"])
+        self.assertTrue(
+            legacy_minimal["transport_roundtrip"]["normal_mutation_path_ready"]
+        )
+        self.assertEqual(
+            legacy_minimal["transport_roundtrip"]["normal_mutation_path"],
+            "legacy_roundtrip",
+        )
+        self.assertTrue(
+            legacy_minimal["transport_roundtrip"]["legacy_roundtrip_required"]
+        )
+        self.assertTrue(
+            transport_projected["transport_roundtrip"]["mutation_gate_open"]
+        )
+        self.assertTrue(
+            transport_projected["transport_roundtrip"]["normal_mutation_path_ready"]
         )
         self.assertFalse(broken_signed_minimal["transport_roundtrip"]["mutation_gate_open"])
         self.assertFalse(

@@ -56,7 +56,7 @@ The generated repository documents describe the intended contract:
 
 A mismatch must remain visible. Do not silently treat an older checkout or connector snapshot as current.
 
-`grabowski_status` exposes the live registered/expected tool counts and name hashes. A client-side count or hash mismatch requires a connector refresh; the runtime cannot refresh ChatGPT's frozen snapshot itself. The `minimal`/`concise` status projection is schema 3; `standard`/`evidence` remain schema 2. Schema 3 preserves `transport_roundtrip.normal_mutation_path_ready` for compatibility and additionally exposes `transport_roundtrip.mutation_gate_open` as the explicit effective readiness of the selected normal mutation path. New consumers should use `mutation_gate_open` as the gate; the retained readiness field remains equivalent on schema 3.
+`grabowski_status` exposes the live registered/expected tool counts and name hashes. A client-side count or hash mismatch requires a connector refresh; the runtime cannot refresh ChatGPT's frozen snapshot itself. The `minimal`/`concise` status projection is schema 3; `standard`/`evidence` remain schema 2. In schema 3, `transport_roundtrip.normal_mutation_path_ready` and `transport_roundtrip.mutation_gate_open` are always present and carry the same effective readiness used by warnings and `recommended_next_action`; degraded connector/runtime states therefore expose both as `false`. In schema 2, `mutation_gate_open` remains the raw legacy roundtrip gate while `normal_mutation_path_ready` describes the selected normal path when present. Consumers must branch on `schema_version`; the schema-2 meaning of `mutation_gate_open` does not carry into schema 3. New schema-3 consumers should use `mutation_gate_open`.
 
 ## Operating rule
 

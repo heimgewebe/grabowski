@@ -26,7 +26,7 @@ Optionale Feldprojektion erhält zwingend:
 - empfohlene nächste Aktion;
 - `does_not_establish`.
 
-Unbekannte Felder werden abgewiesen. `grabowski_status` verwendet für `minimal`/`concise` Schema 3 und für `standard`/`evidence` weiterhin Schema 2. Der kompakte Schema-3-Transportblock behält `normal_mutation_path_ready` kompatibel bei und ergänzt `mutation_gate_open` als expliziten effektiven Gate-Wert; beide sind dort äquivalent, neue Consumer sollen `mutation_gate_open` verwenden. Die detaillierten Schema-2-Sichten behalten dagegen den rohen Legacy-Roundtrip-Gate und `normal_mutation_path_ready` getrennt.
+Unbekannte Felder werden abgewiesen. `grabowski_status` verwendet für `minimal`/`concise` Schema 3 und für `standard`/`evidence` weiterhin Schema 2. Der kompakte Schema-3-Transportblock enthält `normal_mutation_path_ready` und `mutation_gate_open` immer gemeinsam als denselben effektiven Normalpfad-Gate; degradierte Connector-/Runtime-Zustände setzen beide auf `false`. Die detaillierten Schema-2-Sichten behalten dagegen die diagnostische Rohsemantik: `mutation_gate_open` ist dort der Legacy-Roundtrip-Gate und `normal_mutation_path_ready` die Bereitschaft des ausgewählten Normalpfads, sofern vorhanden. Consumer müssen die Felder daher anhand von `schema_version` interpretieren.
 
 ## Pagination
 
