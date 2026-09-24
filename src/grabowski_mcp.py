@@ -499,7 +499,7 @@ AUDIT_SEGMENT_CACHE_LOCK = threading.RLock()
 AUDIT_SEGMENT_VERIFICATION_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 AUDIT_LOCK_TIMEOUT_SECONDS = 5.0
 AUDIT_LOCK_POLL_SECONDS = 0.02
-AUDIT_APPEND_CAS_ATTEMPTS = 16
+AUDIT_APPEND_CONTENTION_TIMEOUT_SECONDS = 10.0
 CAPTAIN_AUDIT_LOCK_TIMEOUT_ERROR = "Audit lock acquisition timed out"
 CAPTAIN_AUDIT_COMPLETION_LOCK_RETRY_DELAYS = (0.05, 0.20)
 BASE_CAPABILITIES = (
@@ -4738,7 +4738,24 @@ def _append_audit_with_digest(record: dict[str, Any]) -> str:
     with AUDIT_APPEND_LOCK:
         if AUDIT_LOG.is_symlink():
             raise PermissionError(f"Audit log may not be a symlink: {AUDIT_LOG}")
-        for _predecessor_attempt in range(AUDIT_APPEND_CAS_ATTEMPTS):
+        contention_deadline = (
+            time.monotonic() + AUDIT_APPEND_CONTENTION_TIMEOUT_SECONDS
+        )
+        contention_attempt = 0
+        while True:
+            if contention_attempt:
+                remaining = contention_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        "Audit append contention retry timed out"
+                    )
+                delay = min(
+                    AUDIT_LOCK_POLL_SECONDS
+                    * (2 ** min(contention_attempt - 1, 2)),
+                    remaining,
+                )
+                time.sleep(delay)
+            contention_attempt += 1
             try:
                 head, predecessor, head_identity = _capture_verified_audit_head(
                     AUDIT_LOG
@@ -4852,7 +4869,6 @@ def _append_audit_with_digest(record: dict[str, Any]) -> str:
                 finally:
                     if descriptor is not None:
                         _close_audit_descriptor(descriptor)
-        raise RuntimeError("Audit predecessor changed repeatedly during append")
 
 def _append_audit(record: dict[str, Any]) -> None:
     _append_audit_with_digest(record)

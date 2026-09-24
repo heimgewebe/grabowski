@@ -262,6 +262,47 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                     before["total_records"] + 1,
                 )
 
+    def test_append_contention_retries_beyond_legacy_attempt_ceiling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            audit, patches = self._patches(state)
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+                grabowski_mcp._append_audit(
+                    {"operation": "contention-retry-setup"}
+                )
+                before = grabowski_mcp._verify_audit_log(audit)
+                real_capture = grabowski_mcp._capture_verified_audit_head
+                captures = 0
+
+                def stale_capture(path):
+                    nonlocal captures
+                    captures += 1
+                    head, predecessor, identity = real_capture(path)
+                    if captures <= 20 and identity is not None:
+                        identity = (*identity[:-1], identity[-1] + captures)
+                    return head, predecessor, identity
+
+                with (
+                    patch.object(
+                        grabowski_mcp,
+                        "_capture_verified_audit_head",
+                        side_effect=stale_capture,
+                    ),
+                    patch.object(grabowski_mcp.time, "sleep", return_value=None),
+                ):
+                    grabowski_mcp._append_audit(
+                        {"operation": "contention-retry-success"}
+                    )
+
+                self.assertEqual(captures, 21)
+                after = grabowski_mcp._verify_audit_log(audit)
+                self.assertTrue(after["valid"], after)
+                self.assertEqual(
+                    after["total_records"],
+                    before["total_records"] + 1,
+                )
+
     def test_failure_before_active_replace_keeps_previous_active_chain(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"
