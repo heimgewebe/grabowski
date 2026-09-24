@@ -721,6 +721,60 @@ class OperatorSignedTransportTests(unittest.TestCase):
                 runtime_binding=BINDING,
             )
 
+    def test_mcp_allows_same_body_in_new_mcp_session(self) -> None:
+        arguments = {"argv": ["true"]}
+        body = _tool_body(arguments)
+        arguments_sha256 = roundtrip.canonical_arguments_sha256(arguments)
+
+        def headers_for(session_id: str) -> dict[str, str]:
+            signed = ingress.signed_tool_headers(
+                token=SECRET,
+                body=body,
+                session_id=session_id,
+                runtime_binding_sha256=_runtime_sha256(),
+                now_unix=int(__import__("time").time()),
+            )
+            return {
+                base._TRANSPORT_CONNECTOR_CAPABILITY_HEADER: SECRET,
+                base._TRANSPORT_MCP_SESSION_ID_HEADER: session_id,
+                base._TRANSPORT_INGRESS_VERSION_HEADER: assertion.ASSERTION_VERSION,
+                base._TRANSPORT_REQUEST_ID_HEADER: signed[ingress.REQUEST_ID_HEADER],
+                base._TRANSPORT_REQUEST_TIMESTAMP_HEADER: signed[
+                    ingress.REQUEST_TIMESTAMP_HEADER
+                ],
+                base._TRANSPORT_REQUEST_AUDIENCE_HEADER: signed[
+                    ingress.REQUEST_AUDIENCE_HEADER
+                ],
+                base._TRANSPORT_REQUEST_BODY_SHA256_HEADER: signed[
+                    ingress.REQUEST_BODY_SHA256_HEADER
+                ],
+                base._TRANSPORT_RUNTIME_BINDING_SHA256_HEADER: signed[
+                    ingress.RUNTIME_BINDING_SHA256_HEADER
+                ],
+                base._TRANSPORT_REQUEST_MAC_HEADER: signed[ingress.REQUEST_MAC_HEADER],
+            }
+
+        first_headers = headers_for("session-a")
+        second_headers = headers_for("session-b")
+        self.assertNotEqual(
+            first_headers[base._TRANSPORT_REQUEST_ID_HEADER],
+            second_headers[base._TRANSPORT_REQUEST_ID_HEADER],
+        )
+        first = base._transport_signed_one_call_evidence(
+            _ctx(first_headers),
+            tool_name="grabowski_terminal_run",
+            arguments_sha256=arguments_sha256,
+            runtime_binding=BINDING,
+        )
+        second = base._transport_signed_one_call_evidence(
+            _ctx(second_headers),
+            tool_name="grabowski_terminal_run",
+            arguments_sha256=arguments_sha256,
+            runtime_binding=BINDING,
+        )
+        self.assertEqual(first["transport_mode"], assertion.ASSERTION_VERSION)
+        self.assertEqual(second["transport_mode"], assertion.ASSERTION_VERSION)
+
     def test_publisher_replay_recovery_preflight_requires_safe_state_store_preview(
         self,
     ) -> None:
