@@ -175,6 +175,7 @@ _RETAINED_TRANSPORT_TARGET_LOCK = threading.Lock()
 _RETAINED_TRANSPORT_TARGETS: dict[str, dict[str, Any]] = {}
 
 _TRANSPORT_CONNECTOR_CAPABILITY_HEADER = "x-grabowski-connector-capability"
+_TRANSPORT_MCP_SESSION_ID_HEADER = "mcp-session-id"
 _TRANSPORT_INGRESS_VERSION_HEADER = "x-grabowski-ingress-version"
 _TRANSPORT_REQUEST_ID_HEADER = "x-grabowski-request-id"
 _TRANSPORT_REQUEST_TIMESTAMP_HEADER = "x-grabowski-request-timestamp"
@@ -5797,6 +5798,7 @@ def _transport_signed_one_call_evidence(
     issued_raw = _transport_context_header(ctx, _TRANSPORT_REQUEST_TIMESTAMP_HEADER)
     audience = _transport_context_header(ctx, _TRANSPORT_REQUEST_AUDIENCE_HEADER)
     body_sha256 = _transport_context_header(ctx, _TRANSPORT_REQUEST_BODY_SHA256_HEADER)
+    session_id = _transport_context_header(ctx, _TRANSPORT_MCP_SESSION_ID_HEADER) or ""
     asserted_runtime_binding_sha256 = _transport_context_header(
         ctx, _TRANSPORT_RUNTIME_BINDING_SHA256_HEADER
     )
@@ -5830,6 +5832,7 @@ def _transport_signed_one_call_evidence(
             arguments_sha256=arguments_sha256,
             body_sha256=str(body_sha256),
             mac_sha256=str(mac_sha256),
+            session_id=session_id,
         )
     except grabowski_transport_assertion.TransportAssertionReplay:
         # A durable replay is materially different from a malformed or invalid
@@ -6927,6 +6930,7 @@ def grabowski_status(
         compact_tool_contract_keys = (
             "expected_tool_count",
             "registered_tool_count",
+            "registered_names_sha256",
             "runtime_matches_deployment_contract",
             "client_snapshot_observable",
             "platform_evidence_state",
