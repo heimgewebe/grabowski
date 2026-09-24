@@ -5604,8 +5604,15 @@ def _check_user_systemd_uncertainty_conflicts(
     connection: sqlite3.Connection,
     *,
     keys: list[str],
+    owner: str | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> None:
     requested = set(keys)
+    requested_scope = (
+        _work_lane_path_scope(keys, metadata, owner_id=owner)
+        if owner is not None and metadata is not None
+        else None
+    )
     for _, fence in _user_systemd_uncertainties_from_connection(connection):
         if fence["cleared_at_unix"] is not None:
             continue
@@ -5614,6 +5621,22 @@ def _check_user_systemd_uncertainty_conflicts(
             raise ResourceUncertaintyConflict(
                 overlap[0], fence["fence_id"], fence["unit"], fence["phase"]
             )
+        if requested_scope is None or not requested_scope["paths"]:
+            continue
+        fence_paths = [
+            key.removeprefix("path:")
+            for key in fence["resource_keys"]
+            if key.startswith("path:")
+        ]
+        for scope_path in requested_scope["paths"]:
+            for fence_path in fence_paths:
+                if _path_scope_contains(scope_path, fence_path):
+                    raise ResourceUncertaintyConflict(
+                        f"path:{fence_path}",
+                        fence["fence_id"],
+                        fence["unit"],
+                        fence["phase"],
+                    )
 
 
 def prepare_user_systemd_uncertainty_fence(
@@ -5988,6 +6011,8 @@ def acquire_resources(
             _check_user_systemd_uncertainty_conflicts(
                 connection,
                 keys=keys,
+                owner=owner,
+                metadata=sanitized_metadata,
             )
             merge_guard_nonconflicts = _check_active_merge_guard_conflicts(
                 connection, keys=keys, metadata=sanitized_metadata, now=now

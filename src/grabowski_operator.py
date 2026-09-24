@@ -8044,6 +8044,17 @@ def _user_systemd_durable_fence_block_result(
     return result
 
 
+def _require_fully_qualified_user_systemd_unit(name: str) -> str:
+    name = _validate_unit(name)
+    stem, separator, unit_type = name.rpartition(".")
+    if not separator or not stem or not unit_type:
+        raise ValueError(
+            "mutating user systemd actions require a fully qualified unit name "
+            "with an explicit unit-type suffix"
+        )
+    return name
+
+
 def _run_mutating_user_systemd_unit(
     name: str,
     action: str,
@@ -8053,7 +8064,7 @@ def _run_mutating_user_systemd_unit(
 ) -> dict[str, Any]:
     import grabowski_resources as resources
 
-    name = _validate_unit(name)
+    name = _require_fully_qualified_user_systemd_unit(name)
     unit_resource_key = f"service:user-systemd:{name}"
     prior = _user_systemd_reconcile_durable_uncertainty(
         resources, [unit_resource_key]

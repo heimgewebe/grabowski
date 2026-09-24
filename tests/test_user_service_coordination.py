@@ -709,6 +709,21 @@ class UserServiceCoordinationTests(unittest.TestCase):
             "grabowski_resource_release",
         )
 
+    def test_mutation_requires_fully_qualified_unit_before_observation(self) -> None:
+        resources = _fake_resources()
+        with (
+            patch.dict(sys.modules, {"grabowski_resources": resources}),
+            patch.object(operator, "_require_operator_capability"),
+            patch.object(operator, "_require_operator_mutation"),
+            patch.object(operator, "_run") as run,
+        ):
+            with self.assertRaisesRegex(ValueError, "fully qualified"):
+                operator.grabowski_user_service("demo", "restart")
+
+        run.assert_not_called()
+        resources.user_systemd_uncertainty_status.assert_not_called()
+        resources.acquire_resources.assert_not_called()
+
     def test_fragment_path_nonzero_is_rejected(self) -> None:
         with patch.object(
             operator,
