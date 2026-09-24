@@ -1862,6 +1862,7 @@ def _continuation_preimage(
             raise RuntimeError(
                 "managed worktree continuation untracked preimage capture failed"
             ) from exc
+        remaining_snapshot_seconds()
         try:
             snapshot_registered_git_dir = (
                 physical_checkout.capture_registered_linked_worktree_git_dir(
@@ -1872,10 +1873,12 @@ def _continuation_preimage(
             raise RuntimeError(
                 "managed worktree continuation registered Git directory changed during snapshot"
             ) from exc
+        remaining_snapshot_seconds()
         if snapshot_registered_git_dir != expected_physical.get("git_dir"):
             raise RuntimeError(
                 "managed worktree continuation registered Git directory changed during snapshot"
             )
+        remaining_snapshot_seconds()
         try:
             snapshot_physical = (
                 physical_checkout.verify_physical_checkout_identity(
@@ -1886,6 +1889,7 @@ def _continuation_preimage(
             raise RuntimeError(
                 "managed worktree continuation physical identity changed during preimage capture"
             ) from exc
+        remaining_snapshot_seconds()
 
         return {
             "head": head_sha,
@@ -1927,6 +1931,15 @@ def _continuation_preimage(
         raise RuntimeError(
             "managed worktree continuation Git state changed during stable readback"
         )
+
+    remaining_snapshot_seconds()
+    final_lifecycle = checkouts._strict_lifecycle_binding(checkout_key)
+    remaining_snapshot_seconds()
+    if final_lifecycle != live_lifecycle:
+        raise RuntimeError(
+            "managed worktree continuation lifecycle authority changed during stable readback"
+        )
+
     material = {
         "schema_version": 1,
         "kind": "grabowski.work_lane_continuation_preimage",
@@ -1949,7 +1962,7 @@ def _continuation_preimage(
         "untracked_worktree_sha256": stable_snapshot["untracked_worktree_sha256"],
         "untracked_count": stable_snapshot["untracked_count"],
         "prior_worktree_receipt_sha256": prior.get("durable_receipt_sha256"),
-        "lifecycle_updated_at_unix": live_lifecycle.get("updated_at_unix"),
+        "lifecycle_updated_at_unix": final_lifecycle.get("updated_at_unix"),
     }
     return {**material, "preimage_sha256": _sha(material)}
 
