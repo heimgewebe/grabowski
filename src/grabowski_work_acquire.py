@@ -1580,6 +1580,12 @@ def _continuation_preimage(
     checkout_key = record.get("checkout_key")
     if not isinstance(checkout_key, str) or checkout_key != prior_lifecycle.get("checkout_key"):
         raise RuntimeError("managed worktree continuation checkout identity drifted")
+    try:
+        expected_physical = physical_checkout.capture_physical_checkout_identity(target)
+    except Exception as exc:
+        raise RuntimeError(
+            "managed worktree continuation physical identity capture failed"
+        ) from exc
 
     live_lifecycle = checkouts._strict_lifecycle_binding(checkout_key)
     expected_lifecycle = {
@@ -1638,6 +1644,13 @@ def _continuation_preimage(
         raise RuntimeError(
             "managed worktree continuation raw Git preimage capture failed"
         ) from exc
+    branch_physical = branch_preimage.get("physical_checkout")
+    if (
+        not isinstance(branch_physical, dict)
+        or branch_physical.get("physical_identity_sha256")
+        != expected_physical.get("physical_identity_sha256")
+    ):
+        raise RuntimeError("managed worktree continuation physical identity drifted")
     if branch_preimage.get("branch") != inputs["branch"]:
         raise RuntimeError("managed worktree continuation raw branch identity drifted")
     if branch_preimage.get("head") != head_sha:
@@ -1679,6 +1692,12 @@ def _continuation_preimage(
         raise RuntimeError(
             "managed worktree continuation untracked preimage capture failed"
         ) from exc
+    try:
+        physical_checkout.verify_physical_checkout_identity(expected_physical)
+    except Exception as exc:
+        raise RuntimeError(
+            "managed worktree continuation physical identity changed during preimage capture"
+        ) from exc
 
     material = {
         "schema_version": 1,
@@ -1686,6 +1705,7 @@ def _continuation_preimage(
         "lane_id": inputs["lane_id"],
         "checkout_key": checkout_key,
         "checkout_path": str(target),
+        "physical_identity_sha256": expected_physical["physical_identity_sha256"],
         "branch": inputs["branch"],
         "head": head_sha,
         "ensure_head": prior_head,
