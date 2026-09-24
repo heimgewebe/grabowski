@@ -360,6 +360,81 @@ class PhysicalCheckoutIdentityTests(unittest.TestCase):
                     identity["common_dir"]["path"], worktree
                 )
 
+    def test_untracked_hash_rejects_atomic_leaf_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "file.txt"
+            replacement = root / "replacement.tmp"
+            target.write_bytes(b"old-bytes")
+            replacement.write_bytes(b"new-bytes")
+            original_read = git_preimage.os.read
+            replaced = False
+
+            def replace_after_first_read(fd: int, size: int) -> bytes:
+                nonlocal replaced
+                chunk = original_read(fd, size)
+                if chunk and not replaced:
+                    os.replace(replacement, target)
+                    replaced = True
+                return chunk
+
+            with (
+                patch.object(
+                    git_preimage.os,
+                    "read",
+                    side_effect=replace_after_first_read,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "(?:Worktree file changed|Untracked worktree file path changed) during preimage capture",
+                ),
+            ):
+                git_preimage._safe_worktree_paths_sha256(
+                    root,
+                    [b"file.txt"],
+                    max_paths=10,
+                )
+
+    def test_tracked_hash_rejects_parent_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            parent = root / "sub"
+            replacement_parent = root / "replacement-sub"
+            retired_parent = root / "retired-sub"
+            parent.mkdir()
+            replacement_parent.mkdir()
+            (parent / "file.txt").write_bytes(b"old-bytes")
+            (replacement_parent / "file.txt").write_bytes(b"new-bytes")
+            index = b"100644 " + (b"a" * 40) + b" 0\tsub/file.txt\0"
+            original_read = git_preimage.os.read
+            replaced = False
+
+            def replace_parent_after_first_read(fd: int, size: int) -> bytes:
+                nonlocal replaced
+                chunk = original_read(fd, size)
+                if chunk and not replaced:
+                    parent.rename(retired_parent)
+                    replacement_parent.rename(parent)
+                    replaced = True
+                return chunk
+
+            with (
+                patch.object(
+                    git_preimage.os,
+                    "read",
+                    side_effect=replace_parent_after_first_read,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "Tracked worktree file parent changed during preimage capture",
+                ),
+            ):
+                git_preimage._tracked_worktree_sha256(
+                    root,
+                    index,
+                    max_paths=10,
+                )
+
     def test_gitdir_pointer_preserves_whitespace_as_path_material(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

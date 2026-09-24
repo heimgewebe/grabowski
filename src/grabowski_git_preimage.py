@@ -75,10 +75,25 @@ def _safe_worktree_paths_sha256(
                 raise RuntimeError("Git worktree observation contains an unsafe path")
             _frame(digest, b"path", path)
             directory_fd = os.dup(root_fd)
+            parent_snapshots: list[tuple[bytes, os.stat_result]] = []
             try:
                 for component in components[:-1]:
                     _deadline_guard(deadline_monotonic, "untracked worktree hashing")
+                    linked_parent = os.stat(
+                        component, dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    if not stat.S_ISDIR(linked_parent.st_mode):
+                        raise RuntimeError(
+                            "Untracked worktree parent changed during preimage capture"
+                        )
                     next_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+                    opened_parent = os.fstat(next_fd)
+                    if not _same_open_file(linked_parent, opened_parent):
+                        os.close(next_fd)
+                        raise RuntimeError(
+                            "Untracked worktree parent changed during preimage capture"
+                        )
+                    parent_snapshots.append((component, opened_parent))
                     os.close(directory_fd)
                     directory_fd = next_fd
                 leaf = components[-1]
@@ -88,6 +103,10 @@ def _safe_worktree_paths_sha256(
                     descriptor = os.open(leaf, file_flags, dir_fd=directory_fd)
                     try:
                         before = os.fstat(descriptor)
+                        if not _same_open_file(linked, before):
+                            raise RuntimeError(
+                                "Untracked worktree file changed during preimage capture"
+                            )
                         content = hashlib.sha256()
                         size = 0
                         while True:
@@ -114,6 +133,13 @@ def _safe_worktree_paths_sha256(
                             )
                     finally:
                         os.close(descriptor)
+                    _revalidate_worktree_path(
+                        root_fd,
+                        components,
+                        parent_snapshots,
+                        after,
+                        label="Untracked worktree file",
+                    )
                     _frame(digest, b"regular-mode", mode_bytes)
                     _frame(digest, b"regular-size", size.to_bytes(8, "big"))
                     _frame(digest, b"regular-content-sha256", content.digest())
@@ -128,6 +154,14 @@ def _safe_worktree_paths_sha256(
                         and total_bytes > max_total_bytes
                     ):
                         raise RuntimeError("untracked worktree byte limit exceeded")
+                    _revalidate_worktree_path(
+                        root_fd,
+                        components,
+                        parent_snapshots,
+                        linked,
+                        label="Untracked worktree symlink",
+                        symlink_target=target_bytes,
+                    )
                     _frame(digest, b"symlink-mode", mode_bytes)
                     _frame(digest, b"symlink-target", target_bytes)
                 else:
@@ -186,6 +220,88 @@ def _same_open_file(before: os.stat_result, after: os.stat_result) -> bool:
     )
 
 
+def _revalidate_worktree_path(
+    root_fd: int,
+    components: list[bytes],
+    parent_snapshots: list[tuple[bytes, os.stat_result]],
+    leaf_snapshot: os.stat_result | None,
+    *,
+    label: str,
+    symlink_target: bytes | None = None,
+) -> None:
+    """Prove the live pathname still resolves to the entry that was hashed."""
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+    directory_fd = os.dup(root_fd)
+    try:
+        for component, expected in parent_snapshots:
+            try:
+                linked = os.stat(
+                    component, dir_fd=directory_fd, follow_symlinks=False
+                )
+            except OSError as exc:
+                raise RuntimeError(
+                    f"{label} parent changed during preimage capture"
+                ) from exc
+            if not stat.S_ISDIR(linked.st_mode) or not _same_open_file(
+                expected, linked
+            ):
+                raise RuntimeError(
+                    f"{label} parent changed during preimage capture"
+                )
+            next_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+            try:
+                opened = os.fstat(next_fd)
+                if not _same_open_file(expected, opened):
+                    raise RuntimeError(
+                        f"{label} parent changed during preimage capture"
+                    )
+            except BaseException:
+                os.close(next_fd)
+                raise
+            os.close(directory_fd)
+            directory_fd = next_fd
+
+        leaf = components[-1]
+        if leaf_snapshot is None:
+            try:
+                os.stat(leaf, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return
+            except OSError as exc:
+                raise RuntimeError(
+                    f"{label} path changed during preimage capture"
+                ) from exc
+            raise RuntimeError(f"{label} path changed during preimage capture")
+
+        try:
+            linked_leaf = os.stat(
+                leaf, dir_fd=directory_fd, follow_symlinks=False
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                f"{label} path changed during preimage capture"
+            ) from exc
+        if not _same_open_file(leaf_snapshot, linked_leaf):
+            raise RuntimeError(f"{label} path changed during preimage capture")
+
+        if symlink_target is not None:
+            current_target = os.readlink(leaf, dir_fd=directory_fd)
+            current_target_bytes = (
+                current_target
+                if isinstance(current_target, bytes)
+                else os.fsencode(current_target)
+            )
+            if current_target_bytes != symlink_target:
+                raise RuntimeError(
+                    f"{label} path changed during preimage capture"
+                )
+    finally:
+        os.close(directory_fd)
+
+
 def _tracked_worktree_sha256(
     repo: Path,
     index_bytes: bytes,
@@ -219,6 +335,7 @@ def _tracked_worktree_sha256(
             _frame(digest, b"path", path)
             components = path.split(b"/")
             directory_fd = os.dup(root_fd)
+            parent_snapshots: list[tuple[bytes, os.stat_result]] = []
             try:
                 blocked = False
                 for component in components[:-1]:
@@ -259,6 +376,7 @@ def _tracked_worktree_sha256(
                         raise RuntimeError(
                             "Tracked worktree parent changed during preimage capture"
                         )
+                    parent_snapshots.append((component, opened))
                     os.close(directory_fd)
                     directory_fd = next_fd
                 if blocked:
@@ -268,6 +386,13 @@ def _tracked_worktree_sha256(
                 try:
                     linked = os.stat(leaf, dir_fd=directory_fd, follow_symlinks=False)
                 except FileNotFoundError:
+                    _revalidate_worktree_path(
+                        root_fd,
+                        components,
+                        parent_snapshots,
+                        None,
+                        label="Tracked worktree file",
+                    )
                     _frame(digest, b"missing")
                     continue
 
@@ -310,6 +435,13 @@ def _tracked_worktree_sha256(
                             )
                     finally:
                         os.close(descriptor)
+                    _revalidate_worktree_path(
+                        root_fd,
+                        components,
+                        parent_snapshots,
+                        opened_after,
+                        label="Tracked worktree file",
+                    )
                     _frame(digest, b"regular-mode", mode_bytes)
                     _frame(digest, b"regular-size", size.to_bytes(8, "big"))
                     _frame(digest, b"regular-content-sha256", content.digest())
@@ -324,12 +456,34 @@ def _tracked_worktree_sha256(
                         and total_bytes > max_total_bytes
                     ):
                         raise RuntimeError("tracked worktree byte limit exceeded")
+                    _revalidate_worktree_path(
+                        root_fd,
+                        components,
+                        parent_snapshots,
+                        linked,
+                        label="Tracked worktree symlink",
+                        symlink_target=target_bytes,
+                    )
                     _frame(digest, b"symlink-mode", mode_bytes)
                     _frame(digest, b"symlink-target", target_bytes)
                 elif stat.S_ISDIR(linked.st_mode):
+                    _revalidate_worktree_path(
+                        root_fd,
+                        components,
+                        parent_snapshots,
+                        linked,
+                        label="Tracked worktree directory",
+                    )
                     _frame(digest, b"directory-mode", mode_bytes)
                     _frame(digest, b"directory-inode", linked.st_ino.to_bytes(8, "big"))
                 else:
+                    _revalidate_worktree_path(
+                        root_fd,
+                        components,
+                        parent_snapshots,
+                        linked,
+                        label="Tracked worktree special entry",
+                    )
                     _frame(digest, b"special-mode", mode_bytes)
                     _frame(
                         digest,
