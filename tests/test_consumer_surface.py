@@ -166,6 +166,7 @@ class ConsumerSurfaceTests(unittest.TestCase):
             "max_risk_level": "high",
         }
         transport_status = {
+            "schema_version": 1,
             "state": "ready",
             "mutation_gate_open": False,
             "normal_mutation_path": "signed_one_call",
@@ -349,6 +350,20 @@ class ConsumerSurfaceTests(unittest.TestCase):
                 }
             )
             broken_signed_minimal = grabowski_mcp.grabowski_status(view="minimal")
+            contract["client_snapshot_observable"] = True
+            contract["client_snapshot"]["observable"] = True
+            contract["client_snapshot"]["fresh"] = True
+            contract["client_snapshot"]["matched"] = True
+            transport_status.clear()
+            transport_status.update(
+                {
+                    "schema_version": 1,
+                    "state": "unavailable",
+                    "mutation_gate_open": False,
+                    "recommended_next_action": "repair transport before mutation",
+                }
+            )
+            transport_blocked_minimal = grabowski_mcp.grabowski_status(view="minimal")
 
         self.assertEqual(minimal["view"], "minimal")
         self.assertEqual(minimal["schema_version"], 3)
@@ -402,7 +417,10 @@ class ConsumerSurfaceTests(unittest.TestCase):
         )
         self.assertFalse(standard["transport_roundtrip"]["mutation_gate_open"])
         self.assertTrue(standard["transport_roundtrip"]["normal_mutation_path_ready"])
+        self.assertEqual(standard["transport_roundtrip"]["schema_version"], 1)
+        self.assertNotIn("schema_version", minimal["transport_roundtrip"])
         self.assertFalse(degraded_minimal["transport_roundtrip"]["mutation_gate_open"])
+        self.assertNotIn("schema_version", degraded_minimal["transport_roundtrip"])
         self.assertNotIn(
             "normal_mutation_path_ready", degraded_minimal["transport_roundtrip"]
         )
@@ -414,7 +432,12 @@ class ConsumerSurfaceTests(unittest.TestCase):
             degraded_minimal["transport_roundtrip"]["state"],
             "connector_identity_required",
         )
+        degraded_warning_codes = {
+            item["code"] for item in degraded_minimal["warnings"]
+        }
+        self.assertIn("transport_roundtrip_required", degraded_warning_codes)
         self.assertFalse(runtime_invalid_minimal["transport_roundtrip"]["mutation_gate_open"])
+        self.assertNotIn("schema_version", runtime_invalid_minimal["transport_roundtrip"])
         self.assertNotIn(
             "normal_mutation_path_ready", runtime_invalid_minimal["transport_roundtrip"]
         )
@@ -429,6 +452,11 @@ class ConsumerSurfaceTests(unittest.TestCase):
             "runtime_invalid",
         )
         self.assertFalse(unavailable_minimal["transport_roundtrip"]["mutation_gate_open"])
+        self.assertNotIn("schema_version", unavailable_minimal["transport_roundtrip"])
+        unavailable_warning_codes = {
+            item["code"] for item in unavailable_minimal["warnings"]
+        }
+        self.assertIn("transport_roundtrip_required", unavailable_warning_codes)
         self.assertNotIn(
             "normal_mutation_path_ready", unavailable_minimal["transport_roundtrip"]
         )
@@ -452,6 +480,17 @@ class ConsumerSurfaceTests(unittest.TestCase):
         )
         self.assertTrue(
             transport_projected["transport_roundtrip"]["normal_mutation_path_ready"]
+        )
+        transport_blocked_warning_codes = {
+            item["code"] for item in transport_blocked_minimal["warnings"]
+        }
+        self.assertIn("transport_roundtrip_required", transport_blocked_warning_codes)
+        self.assertEqual(
+            transport_blocked_minimal["recommended_next_action"],
+            "repair transport before mutation",
+        )
+        self.assertFalse(
+            transport_blocked_minimal["transport_roundtrip"]["mutation_gate_open"]
         )
         self.assertFalse(broken_signed_minimal["transport_roundtrip"]["mutation_gate_open"])
         self.assertFalse(
