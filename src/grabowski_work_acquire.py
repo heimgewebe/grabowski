@@ -1917,6 +1917,12 @@ def _continuation_preimage(
         raise RuntimeError(
             "managed worktree continuation registered Git directory changed during snapshot"
         )
+    try:
+        physical_checkout.verify_physical_checkout_identity(prior_physical)
+    except Exception as exc:
+        raise RuntimeError(
+            "managed worktree continuation physical identity changed after registration readback"
+        ) from exc
 
     material = {
         "schema_version": 1,
