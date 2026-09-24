@@ -1249,7 +1249,8 @@ class WorkAcquireTests(unittest.TestCase):
                 return_value=(self.repo, self.repo / ".git", record),
             ),
             patch.object(work_acquire.checkouts, "_require_linked"),
-            patch.object(work_acquire.git_preimage, "_tracked_worktree_sha256", return_value="c" * 64),
+            patch.object(work_acquire.git_preimage, "capture_branch_preimage", return_value={"branch": inputs["branch"], "head": SHA, "operation_refs": {}, "preimage_sha256": "c" * 64, "index_sha256": "d" * 64, "worktree_sha256": "e" * 64}),
+            patch.object(work_acquire.subprocess, "run", return_value=__import__("subprocess").CompletedProcess([], 0, b"", b"")),
             patch.object(
                 work_acquire.checkouts,
                 "_strict_lifecycle_binding",
@@ -1313,7 +1314,8 @@ class WorkAcquireTests(unittest.TestCase):
             patch.object(work_acquire.checkouts, "_worktree_for_path", return_value=(self.repo, self.repo / ".git", record)),
             patch.object(work_acquire.checkouts, "_require_linked"),
             patch.object(work_acquire.checkouts, "_strict_lifecycle_binding", return_value=lifecycle),
-            patch.object(work_acquire.git_preimage, "_tracked_worktree_sha256", side_effect=["c" * 64, "d" * 64]),
+            patch.object(work_acquire.git_preimage, "capture_branch_preimage", side_effect=[{"branch": inputs["branch"], "head": SHA, "operation_refs": {}, "preimage_sha256": "c" * 64, "index_sha256": "d" * 64, "worktree_sha256": "e" * 64}, {"branch": inputs["branch"], "head": SHA, "operation_refs": {}, "preimage_sha256": "f" * 64, "index_sha256": "d" * 64, "worktree_sha256": "a" * 64}]),
+            patch.object(work_acquire.subprocess, "run", return_value=__import__("subprocess").CompletedProcess([], 0, b"", b"")),
         ):
             first = work_acquire._continuation_preimage(prior, inputs, lifecycle_source, runner)
             second = work_acquire._continuation_preimage(prior, inputs, lifecycle_source, runner)
@@ -1385,7 +1387,8 @@ class WorkAcquireTests(unittest.TestCase):
         with (
             patch.object(work_acquire.checkouts, "_worktree_for_path", return_value=(self.repo, self.repo / ".git", record)),
             patch.object(work_acquire.checkouts, "_require_linked"),
-            patch.object(work_acquire.git_preimage, "_tracked_worktree_sha256", return_value="c" * 64),
+            patch.object(work_acquire.git_preimage, "capture_branch_preimage", return_value={"branch": inputs["branch"], "head": SHA, "operation_refs": {}, "preimage_sha256": "c" * 64, "index_sha256": "d" * 64, "worktree_sha256": "e" * 64}),
+            patch.object(work_acquire.subprocess, "run", return_value=__import__("subprocess").CompletedProcess([], 0, b"", b"")),
             patch.object(work_acquire.checkouts, "_strict_lifecycle_binding", return_value=lifecycle),
         ):
             blocked = work_acquire.acquire_work(params, runner=runner, **kwargs)
@@ -1453,7 +1456,8 @@ class WorkAcquireTests(unittest.TestCase):
         with (
             patch.object(work_acquire.checkouts, "_worktree_for_path", return_value=(self.repo, self.repo / ".git", record)),
             patch.object(work_acquire.checkouts, "_require_linked"),
-            patch.object(work_acquire.git_preimage, "_tracked_worktree_sha256", return_value="c" * 64),
+            patch.object(work_acquire.git_preimage, "capture_branch_preimage", return_value={"branch": inputs["branch"], "head": SHA, "operation_refs": {}, "preimage_sha256": "c" * 64, "index_sha256": "d" * 64, "worktree_sha256": "e" * 64}),
+            patch.object(work_acquire.subprocess, "run", return_value=__import__("subprocess").CompletedProcess([], 0, b"", b"")),
             patch.object(work_acquire.checkouts, "_strict_lifecycle_binding", return_value=lifecycle),
         ):
             blocked = work_acquire.acquire_work(params, runner=runner, **kwargs)
@@ -1508,7 +1512,8 @@ class WorkAcquireTests(unittest.TestCase):
                 return_value=(self.repo, self.repo / ".git", record),
             ),
             patch.object(work_acquire.checkouts, "_require_linked"),
-            patch.object(work_acquire.git_preimage, "_tracked_worktree_sha256", return_value="c" * 64),
+            patch.object(work_acquire.git_preimage, "capture_branch_preimage", return_value={"branch": inputs["branch"], "head": SHA, "operation_refs": {}, "preimage_sha256": "c" * 64, "index_sha256": "d" * 64, "worktree_sha256": "e" * 64}),
+            patch.object(work_acquire.subprocess, "run", return_value=__import__("subprocess").CompletedProcess([], 0, b"", b"")),
             patch.object(
                 work_acquire.checkouts,
                 "_strict_lifecycle_binding",

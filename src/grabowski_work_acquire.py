@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import subprocess
 import time
 import uuid
 from typing import Any, Callable, Iterator
@@ -1600,11 +1601,9 @@ def _continuation_preimage(
     head = runner(target, ["rev-parse", "--verify", "HEAD^{commit}"])
     tracked_index = runner(target, ["diff-index", "--quiet", "HEAD", "--"])
     tracked_files = runner(target, ["diff-files", "--quiet", "--"])
-    tracked_tree = runner(target, ["write-tree"])
-    index_stage = runner(target, ["ls-files", "--stage", "-z"])
     untracked = runner(target, ["ls-files", "--others", "--exclude-standard", "-z"])
     index_flags = runner(target, ["ls-files", "-v", "-z"])
-    preimage_reads = (status, head, tracked_tree, index_stage, untracked, index_flags)
+    preimage_reads = (status, head, untracked, index_flags)
     if any(result.get("returncode") != 0 for result in preimage_reads):
         raise RuntimeError("managed worktree continuation Git readback failed")
     if tracked_index.get("returncode") not in (0, 1) or tracked_files.get("returncode") not in (0, 1):
@@ -1620,20 +1619,42 @@ def _continuation_preimage(
     head_sha = str(head.get("stdout") or "").strip().lower()
     if SHA40_RE.fullmatch(head_sha) is None:
         raise RuntimeError("managed worktree continuation HEAD is invalid")
-    tree_sha = str(tracked_tree.get("stdout") or "").strip().lower()
-    if SHA40_RE.fullmatch(tree_sha) is None:
-        raise RuntimeError("managed worktree continuation index tree is invalid")
-    try:
-        index_bytes = str(index_stage.get("stdout") or "").encode(
-            "utf-8", errors="surrogateescape"
+    def raw_probe(cwd: Path, argv: list[str]) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *argv],
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=30,
         )
-        tracked_worktree_sha256 = git_preimage._tracked_worktree_sha256(
-            target, index_bytes
+
+    try:
+        branch_preimage = git_preimage.capture_branch_preimage(
+            target, raw_probe, require_attached=True
         )
     except Exception as exc:
         raise RuntimeError(
-            "managed worktree continuation tracked worktree hashing failed"
+            "managed worktree continuation raw Git preimage capture failed"
         ) from exc
+    if branch_preimage.get("branch") != inputs["branch"]:
+        raise RuntimeError("managed worktree continuation raw branch identity drifted")
+    if branch_preimage.get("head") != head_sha:
+        raise RuntimeError("managed worktree continuation raw HEAD identity drifted")
+    if branch_preimage.get("operation_refs"):
+        raise RuntimeError("managed worktree continuation has in-progress Git operation")
+
+    raw_index = raw_probe(target, ["ls-files", "--stage", "-z"])
+    if raw_index.returncode != 0:
+        raise RuntimeError("managed worktree continuation raw index readback failed")
+    if any(
+        record.startswith(b"160000 ")
+        for record in raw_index.stdout.split(b"\0")
+        if record
+    ):
+        raise RuntimeError("managed worktree continuation has tracked submodule")
+
     index_entries = [
         entry for entry in str(index_flags.get("stdout") or "").split("\0") if entry
     ]
@@ -1688,10 +1709,11 @@ def _continuation_preimage(
         "dirty": bool(status_entries),
         "status_header": status_lines[0] if status_lines else "",
         "status_entries": status_entries[:100],
-        "index_tree": tree_sha,
+        "branch_preimage_sha256": branch_preimage["preimage_sha256"],
+        "index_sha256": branch_preimage["index_sha256"],
+        "tracked_worktree_sha256": branch_preimage["worktree_sha256"],
         "tracked_index_dirty": tracked_index.get("returncode") == 1,
         "tracked_worktree_dirty": tracked_files.get("returncode") == 1,
-        "tracked_worktree_sha256": tracked_worktree_sha256,
         "untracked": untracked_hashes,
         "prior_worktree_receipt_sha256": prior.get("durable_receipt_sha256"),
         "lifecycle_updated_at_unix": live_lifecycle.get("updated_at_unix"),
