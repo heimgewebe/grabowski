@@ -133,6 +133,55 @@ class ReplayFilterTests(unittest.TestCase):
         )
         self.assertEqual(consumed["state"], "consumed")
 
+    def test_long_mcp_session_id_preserves_replay_semantics(self) -> None:
+        body = hashlib.sha256(b"long-mcp-session-replay").hexdigest()
+        session_id = "session-" + "x" * 600
+
+        first = _evidence(33)
+        first["body_sha256"] = body
+        first["request_id"] = assertion.derive_request_id(
+            secret=SECRET,
+            session_id=session_id,
+            rpc_request_id="1",
+            body_sha256=body,
+        )
+        first["mac_sha256"] = assertion.assertion_mac(
+            secret=SECRET,
+            request_id=str(first["request_id"]),
+            issued_at_unix=int(first["issued_at_unix"]),
+            audience=assertion.ASSERTION_AUDIENCE,
+            tool_name=str(first["tool_name"]),
+            arguments_sha256=str(first["arguments_sha256"]),
+            body_sha256=body,
+            runtime_binding_sha256=RUNTIME,
+        )
+        consumed = assertion.consume_assertion(
+            **first, session_id=session_id, now_unix=101
+        )
+        self.assertEqual(consumed["state"], "consumed")
+
+        replay = dict(first)
+        replay["request_id"] = assertion.derive_request_id(
+            secret=SECRET,
+            session_id=session_id,
+            rpc_request_id="2",
+            body_sha256=body,
+        )
+        replay["mac_sha256"] = assertion.assertion_mac(
+            secret=SECRET,
+            request_id=str(replay["request_id"]),
+            issued_at_unix=int(replay["issued_at_unix"]),
+            audience=assertion.ASSERTION_AUDIENCE,
+            tool_name=str(replay["tool_name"]),
+            arguments_sha256=str(replay["arguments_sha256"]),
+            body_sha256=body,
+            runtime_binding_sha256=RUNTIME,
+        )
+        with self.assertRaises(assertion.TransportAssertionReplay):
+            assertion.consume_assertion(
+                **replay, session_id=session_id, now_unix=101
+            )
+
     def test_same_session_replay_survives_secret_rotation(self) -> None:
         body = hashlib.sha256(b"same-session-rotated-secret").hexdigest()
         session_id = "stable-mcp-session"

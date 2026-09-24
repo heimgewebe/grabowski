@@ -527,7 +527,14 @@ def _replay_filter_positions(scope_sha256: str, request_id: str) -> tuple[int, .
 def _stable_scope_replay_id(body_sha256: str, session_id: str = "") -> str:
     body = bytes.fromhex(_sha256(body_sha256, "transport assertion body hash"))
     if session_id:
-        session = _text(session_id, "transport MCP session id", 512).encode("utf-8")
+        if not isinstance(session_id, str):
+            raise TransportAssertionError("transport MCP session id is invalid")
+        try:
+            session = session_id.encode("utf-8", errors="strict")
+        except UnicodeEncodeError as exc:
+            raise TransportAssertionError(
+                "transport MCP session id is invalid"
+            ) from exc
         material = (
             b"grabowski-stable-client-scope-session-body-replay-id-v2\x00"
             + session
