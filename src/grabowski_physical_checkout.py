@@ -650,6 +650,9 @@ def capture_registered_linked_worktree_git_dir(
         )
         before = os.fstat(worktrees_descriptor)
         matches: list[tuple[dict[str, Any], os.stat_result]] = []
+        observed_entries: list[
+            tuple[str, os.stat_result, os.stat_result | None]
+        ] = []
         entry_count = 0
         with os.scandir(worktrees_descriptor) as entries:
             for entry in entries:
@@ -677,36 +680,125 @@ def capture_registered_linked_worktree_git_dir(
                     name,
                     label="git worktree admin directory",
                 )
+                backlink_snapshot: os.stat_result | None = None
                 try:
                     try:
-                        payload, backlink_snapshot = _read_relative_regular(
+                        observed_backlink = os.stat(
+                            "gitdir",
+                            dir_fd=admin_descriptor,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        pass
+                    except OSError as exc:
+                        raise PhysicalCheckoutIdentityError(
+                            "git worktree backlink could not be inspected safely"
+                        ) from exc
+                    else:
+                        if stat.S_ISREG(
+                            observed_backlink.st_mode
+                        ) and not stat.S_ISLNK(observed_backlink.st_mode):
+                            backlink_snapshot = observed_backlink
+
+                    try:
+                        payload, read_snapshot = _read_relative_regular(
                             admin_descriptor,
                             "gitdir",
                             label="git worktree backlink",
                         )
-                        target = _single_line_pointer(
-                            payload,
-                            prefix="",
-                            label="git worktree backlink",
-                        )
                     except PhysicalCheckoutIdentityError:
-                        continue
-                    admin_path = common_path / "worktrees" / name
-                    pointer_path = _absolute_lexical(
-                        target if Path(target).is_absolute() else admin_path / target
-                    )
-                    if pointer_path == expected_pointer:
-                        matches.append(
-                            (_identity(admin_path, admin_metadata), backlink_snapshot)
-                        )
+                        pass
+                    else:
+                        backlink_snapshot = read_snapshot
+                        try:
+                            target = _single_line_pointer(
+                                payload,
+                                prefix="",
+                                label="git worktree backlink",
+                            )
+                        except PhysicalCheckoutIdentityError:
+                            target = None
+                        if target is not None:
+                            admin_path = common_path / "worktrees" / name
+                            pointer_path = _absolute_lexical(
+                                target
+                                if Path(target).is_absolute()
+                                else admin_path / target
+                            )
+                            if pointer_path == expected_pointer:
+                                matches.append(
+                                    (
+                                        _identity(admin_path, admin_metadata),
+                                        read_snapshot,
+                                    )
+                                )
                 finally:
                     os.close(admin_descriptor)
+                observed_entries.append(
+                    (name, admin_metadata, backlink_snapshot)
+                )
 
         after = os.fstat(worktrees_descriptor)
         if not _same_file_snapshot(before, after):
             raise PhysicalCheckoutIdentityError(
                 "git worktrees directory changed during registered identity capture"
             )
+
+        for name, admin_snapshot, backlink_snapshot in observed_entries:
+            try:
+                current_admin = os.stat(
+                    name,
+                    dir_fd=worktrees_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise PhysicalCheckoutIdentityError(
+                    "git worktree admin entry changed during registered identity capture"
+                ) from exc
+            if (
+                not stat.S_ISDIR(current_admin.st_mode)
+                or stat.S_ISLNK(current_admin.st_mode)
+                or not _same_file_snapshot(admin_snapshot, current_admin)
+            ):
+                raise PhysicalCheckoutIdentityError(
+                    "git worktree admin entry changed during registered identity capture"
+                )
+            admin_descriptor, _ = _open_relative_directory(
+                worktrees_descriptor,
+                name,
+                label="git worktree admin directory",
+            )
+            try:
+                if backlink_snapshot is None:
+                    try:
+                        current_backlink = os.stat(
+                            "gitdir",
+                            dir_fd=admin_descriptor,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        pass
+                    except OSError as exc:
+                        raise PhysicalCheckoutIdentityError(
+                            "git worktree backlink changed during registered identity capture"
+                        ) from exc
+                    else:
+                        if stat.S_ISREG(
+                            current_backlink.st_mode
+                        ) and not stat.S_ISLNK(current_backlink.st_mode):
+                            raise PhysicalCheckoutIdentityError(
+                                "git worktree backlink changed during registered identity capture"
+                            )
+                else:
+                    _assert_relative_file_snapshot(
+                        admin_descriptor,
+                        "gitdir",
+                        backlink_snapshot,
+                        label="git worktree backlink",
+                    )
+            finally:
+                os.close(admin_descriptor)
+
         if len(matches) != 1:
             raise PhysicalCheckoutIdentityError(
                 "registered linked worktree git directory is missing or ambiguous"

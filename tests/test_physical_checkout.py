@@ -283,6 +283,83 @@ class PhysicalCheckoutIdentityTests(unittest.TestCase):
                     identity["common_dir"]["path"], worktree
                 )
 
+    def test_nonmatching_backlink_drift_is_detected_before_return(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            worktree = root / "worktree"
+            other = root / "other"
+            self._init_committed_repo(repo, branch="main")
+            self._run(
+                "git",
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked-target",
+                str(worktree),
+                "HEAD",
+                cwd=repo,
+            )
+            self._run(
+                "git",
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked-other",
+                str(other),
+                "HEAD",
+                cwd=repo,
+            )
+
+            identity = physical_checkout.capture_physical_checkout_identity(worktree)
+            other_identity = physical_checkout.capture_physical_checkout_identity(other)
+            other_backlink = Path(other_identity["git_dir"]["path"]) / "gitdir"
+            original_scandir = physical_checkout.os.scandir
+
+            class DriftAfterScan:
+                def __init__(self, iterator):
+                    self.iterator = iterator
+                    self.drifted = False
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    self.iterator.close()
+                    return False
+
+                def __iter__(self):
+                    return self
+
+                def __next__(self):
+                    try:
+                        return next(self.iterator)
+                    except StopIteration:
+                        if not self.drifted:
+                            other_backlink.write_text(
+                                str(worktree / ".git") + "\n",
+                                encoding="utf-8",
+                            )
+                            self.drifted = True
+                        raise
+
+            with (
+                patch.object(
+                    physical_checkout.os,
+                    "scandir",
+                    side_effect=lambda fd: DriftAfterScan(original_scandir(fd)),
+                ),
+                self.assertRaisesRegex(
+                    physical_checkout.PhysicalCheckoutIdentityError,
+                    "git worktree backlink changed during capture",
+                ),
+            ):
+                physical_checkout.capture_registered_linked_worktree_git_dir(
+                    identity["common_dir"]["path"], worktree
+                )
+
     def test_gitdir_pointer_preserves_whitespace_as_path_material(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
