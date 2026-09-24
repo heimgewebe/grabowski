@@ -233,15 +233,20 @@ def _lifecycle_phase(value: str) -> str:
     return value
 
 
-def _retention_until(value: int) -> int:
+def _retention_until_at(value: int, validated_at_unix: int) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
         raise ValueError("retention_until_unix must be an integer timestamp")
-    now = _now()
-    if value <= now:
+    if not isinstance(validated_at_unix, int) or isinstance(validated_at_unix, bool):
+        raise ValueError("retention validation timestamp must be an integer")
+    if value <= validated_at_unix:
         raise ValueError("retention_until_unix must be in the future")
-    if value - now > MAX_RETENTION_SECONDS:
+    if value - validated_at_unix > MAX_RETENTION_SECONDS:
         raise ValueError("retention_until_unix is too far in the future")
     return value
+
+
+def _retention_until(value: int) -> int:
+    return _retention_until_at(value, _now())
 
 
 def _validate_archive_id(value: str) -> str:
@@ -2206,6 +2211,8 @@ def _legacy_archive_metadata_proof(
                 type(admitted_at) is int
                 and admitted_at <= fence_created_at_unix
                 and completed_at >= admitted_at
+                and retention_until_unix > admitted_at
+                and retention_until_unix - admitted_at <= MAX_RETENTION_SECONDS
                 and abs(completed_at - fence_created_at_unix)
                 <= OPERATION_LEASE_TTL_SECONDS
             ):
@@ -2236,6 +2243,7 @@ def _legacy_archive_metadata_proof(
         "admission_sha256": str(admission["admission_sha256"]),
         "admission_record_sha256": admission_record_sha256,
         "completion_record_sha256": completion_record_sha256,
+        "intent_validated_at_unix": int(admission["admitted_at_unix"]),
     }
 
 
@@ -2254,6 +2262,15 @@ def _archive_uncertainty_metadata_binding(
             "reason": "archive-fence-metadata-binding-incomplete",
         }
     if has_purpose:
+        intent_validated_at = evidence.get("archive_intent_validated_at_unix")
+        if (
+            not isinstance(intent_validated_at, int)
+            or isinstance(intent_validated_at, bool)
+        ):
+            return {
+                "state": "invalid",
+                "reason": "archive-fence-intent-time-missing-or-invalid",
+            }
         try:
             expected_purpose = _purpose(str(evidence["archive_purpose"]))
             expected_retention = evidence["archive_retention_until_unix"]
@@ -2283,6 +2300,7 @@ def _archive_uncertainty_metadata_binding(
                     expected_purpose.encode("utf-8")
                 ).hexdigest(),
                 "retention_until_unix": expected_retention,
+                "intent_validated_at_unix": intent_validated_at,
             },
         }
     if fence_created_at_unix is None:
@@ -2425,11 +2443,6 @@ def _partial_archive_manifest(
             > OPERATION_LEASE_TTL_SECONDS
         ):
             raise ValueError("manifest timestamp is outside the archive operation window")
-        if (
-            retention_until < archive_started_at_unix
-            or retention_until - archive_started_at_unix > MAX_RETENTION_SECONDS
-        ):
-            raise ValueError("manifest retention is outside the original archive window")
     except (KeyError, TypeError, ValueError) as exc:
         return {
             "state": "invalid",
@@ -2450,6 +2463,22 @@ def _partial_archive_manifest(
                     "archive-metadata-binding-unproven",
                 )
             ),
+        }
+    metadata = metadata_binding.get("binding")
+    intent_validated_at = (
+        metadata.get("intent_validated_at_unix")
+        if isinstance(metadata, dict)
+        else None
+    )
+    if (
+        not isinstance(intent_validated_at, int)
+        or isinstance(intent_validated_at, bool)
+        or retention_until <= intent_validated_at
+        or retention_until - intent_validated_at > MAX_RETENTION_SECONDS
+    ):
+        return {
+            "state": "invalid",
+            "reason": "archive-manifest-retention-outside-validated-intent-window",
         }
     expected_branch = evidence.get("expected_branch")
     branch_head = None
@@ -4589,6 +4618,12 @@ def _verify_recovery_refs(repo: Path, recovery_refs: list[dict[str, str]]) -> li
     for item in recovery_refs:
         ref = item["ref"]
         target = item["target"]
+        symbolic = _git_read(
+            repo,
+            ["symbolic-ref", "-q", ref],
+            check=False,
+        )
+        direct = symbolic.returncode != 0
         raw = _git_read(
             repo,
             ["rev-parse", "--verify", ref],
@@ -4607,8 +4642,11 @@ def _verify_recovery_refs(repo: Path, recovery_refs: list[dict[str, str]]) -> li
                 "target": target,
                 "exists": exists,
                 "observed_target": observed_target,
+                "direct": direct,
+                "symbolic_target": symbolic.stdout.strip() if not direct else None,
                 "present": (
-                    exists
+                    direct
+                    and exists
                     and observed_target == target
                     and current.returncode == 0
                     and current.stdout.strip() == target
@@ -5731,7 +5769,10 @@ def grabowski_checkout_archive(
     status = _require_clean_linked(record)
     _require_expected(record, expected_head, expected_branch)
     owner = _owner(owner_id)
-    until = _retention_until(retention_until_unix)
+    archive_intent_validated_at_unix = _now()
+    until = _retention_until_at(
+        retention_until_unix, archive_intent_validated_at_unix
+    )
     archive_purpose = _purpose(purpose)
     _require_retention_owner(record["checkout_key"], owner)
     if expected_physical_identity is None:
@@ -5822,6 +5863,7 @@ def grabowski_checkout_archive(
                 "terminal_detached_transition": terminal_detached_transition,
                 "archive_purpose": archive_purpose,
                 "archive_retention_until_unix": until,
+                "archive_intent_validated_at_unix": archive_intent_validated_at_unix,
                 "planned_recovery_refs": planned_refs,
             },
         )

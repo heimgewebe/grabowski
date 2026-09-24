@@ -166,6 +166,7 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self,
         *,
         managed: bool = True,
+        retention_until_unix: int | None = None,
     ) -> dict[str, object]:
         if managed:
             self._managed_binding(owner="owner-a")
@@ -200,7 +201,11 @@ class CheckoutLifecycleTests(unittest.TestCase):
                     str(self.checkout),
                     "owner-a",
                     "partial archive completion fixture",
-                    int(time.time()) + 3600,
+                    (
+                        int(time.time()) + 3600
+                        if retention_until_unix is None
+                        else retention_until_unix
+                    ),
                     self.head,
                     "topic",
                     expected_physical_identity=expected_identity,
@@ -2429,6 +2434,57 @@ class CheckoutLifecycleTests(unittest.TestCase):
 
         self.assertEqual(readback["state"], "recoverable_complete")
 
+    def test_partial_archive_retention_may_expire_during_setup(self) -> None:
+        base = int(time.time())
+        retention_until = base + 5
+        archive_started = datetime.fromtimestamp(base + 10, timezone.utc)
+        archive_id = (
+            f"{archive_started.strftime('%Y%m%dT%H%M%SZ')}-abcdef123456"
+        )
+        manifest_time = datetime.fromtimestamp(
+            base + 11, timezone.utc
+        ).isoformat()
+        with (
+            patch.object(checkouts, "_now", return_value=base),
+            patch.object(checkouts, "_new_archive_id", return_value=archive_id),
+            patch.object(checkouts, "_utc_timestamp", return_value=manifest_time),
+        ):
+            fence = self._partial_archive_after_manifest_without_db(
+                retention_until_unix=retention_until
+            )
+
+        self.assertEqual(
+            fence["evidence"]["archive_intent_validated_at_unix"],
+            base,
+        )
+        self.assertLess(
+            fence["evidence"]["archive_retention_until_unix"],
+            int(archive_started.timestamp()),
+        )
+        readback = checkouts._archive_uncertainty_readback(fence)
+        self.assertEqual(readback["state"], "recoverable_complete")
+
+    def test_symbolic_recovery_ref_is_never_accepted_as_durable_pin(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        ref = fence["evidence"]["planned_recovery_refs"][0]["ref"]
+        self._git("update-ref", "-d", ref)
+        self._git("symbolic-ref", ref, "refs/heads/topic")
+
+        verified = checkouts._verify_recovery_refs(
+            self.repo,
+            fence["evidence"]["planned_recovery_refs"],
+        )
+        symbolic = next(item for item in verified if item["ref"] == ref)
+        self.assertTrue(symbolic["exists"])
+        self.assertFalse(symbolic["direct"])
+        self.assertFalse(symbolic["present"])
+
+        reconciliation = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+        self.assertEqual(reconciliation["state"], "still_fenced")
+
     def test_partial_archive_completion_records_recovery_time(self) -> None:
         fence = self._partial_archive_after_manifest_without_db()
         manifest_path = checkouts.ARCHIVE_ROOT / fence["operation_id"] / "manifest.json"
@@ -2574,6 +2630,69 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual(
             observed["metadata_binding"]["arguments_sha256"],
             arguments_sha256,
+        )
+
+    def test_partial_archive_legacy_repo_alias_without_raw_arguments_fails_closed(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        manifest_path = (
+            checkouts.ARCHIVE_ROOT / fence["operation_id"] / "manifest.json"
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        legacy_evidence = dict(fence["evidence"])
+        legacy_evidence.pop("archive_purpose")
+        legacy_evidence.pop("archive_retention_until_unix")
+        legacy_evidence.pop("archive_intent_validated_at_unix")
+        alias_arguments = {
+            "repo": str(self.repo / ".git" / ".."),
+            "checkout_path": str(self.checkout),
+            "owner_id": "owner-a",
+            "purpose": manifest["purpose"],
+            "retention_until_unix": manifest["retention_until_unix"],
+            "expected_head": self.head,
+            "expected_branch": "topic",
+            "expected_physical_identity": legacy_evidence[
+                "expected_physical_identity"
+            ],
+        }
+        alias_sha = checkouts.transport_roundtrip.canonical_arguments_sha256(
+            alias_arguments
+        )
+        created = int(fence["created_at_unix"])
+        records = [
+            {
+                "operation": "effect-admission",
+                "tool": "grabowski_checkout_archive",
+                "effect_class": "mutating",
+                "arguments_sha256": alias_sha,
+                "admission_sha256": "a" * 64,
+                "admitted_at_unix": created - 1,
+                "timestamp_unix": created - 1,
+                "record_sha256": "b" * 64,
+            },
+            {
+                "operation": "effect-completion",
+                "admission_sha256": "a" * 64,
+                "completion_class": "outcome_unknown",
+                "completed_at_unix": created,
+                "timestamp_unix": created,
+                "record_sha256": "c" * 64,
+            },
+        ]
+
+        with patch.object(
+            checkouts,
+            "_legacy_archive_audit_records",
+            return_value=records,
+        ):
+            observed = checkouts._partial_archive_manifest(
+                legacy_evidence,
+                fence_created_at_unix=created,
+            )
+
+        self.assertEqual(observed["state"], "invalid")
+        self.assertEqual(
+            observed["reason"],
+            "legacy-archive-audit-proof-not-unique",
         )
 
     def test_partial_archive_legacy_metadata_ambiguous_audit_proof_fails_closed(self) -> None:
