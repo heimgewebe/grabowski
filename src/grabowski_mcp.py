@@ -6927,6 +6927,7 @@ def grabowski_status(
         compact_tool_contract_keys = (
             "expected_tool_count",
             "registered_tool_count",
+            "registered_names_sha256",
             "runtime_matches_deployment_contract",
             "client_snapshot_observable",
             "platform_evidence_state",
