@@ -368,6 +368,13 @@ class ConsumerSurfaceTests(unittest.TestCase):
         self.assertNotIn("platform_schema_mismatches", minimal["tool_contract"])
         self.assertIn("platform_schema_mismatches", standard["tool_contract"])
         self.assertTrue(minimal["transport_roundtrip"]["mutation_gate_open"])
+        self.assertTrue(
+            minimal["transport_roundtrip"]["normal_mutation_path_ready"]
+        )
+        self.assertEqual(
+            minimal["transport_roundtrip"]["normal_mutation_path_ready"],
+            minimal["transport_roundtrip"]["mutation_gate_open"],
+        )
         self.assertFalse(standard["transport_roundtrip"]["mutation_gate_open"])
         self.assertTrue(standard["transport_roundtrip"]["normal_mutation_path_ready"])
         self.assertFalse(degraded_minimal["transport_roundtrip"]["mutation_gate_open"])
@@ -381,11 +388,12 @@ class ConsumerSurfaceTests(unittest.TestCase):
             "runtime_invalid",
         )
         self.assertFalse(broken_signed_minimal["transport_roundtrip"]["mutation_gate_open"])
-        self.assertNotIn(
-            "normal_mutation_path_ready", broken_signed_minimal["transport_roundtrip"]
+        self.assertFalse(
+            broken_signed_minimal["transport_roundtrip"]["normal_mutation_path_ready"]
         )
-        self.assertNotIn(
-            "normal_mutation_path_ready", minimal["transport_roundtrip"]
+        self.assertEqual(
+            broken_signed_minimal["transport_roundtrip"]["normal_mutation_path_ready"],
+            broken_signed_minimal["transport_roundtrip"]["mutation_gate_open"],
         )
         self.assertNotIn("last_consumption_receipt_sha256", minimal["transport_roundtrip"])
         self.assertIn("last_consumption_receipt_sha256", standard["transport_roundtrip"])
