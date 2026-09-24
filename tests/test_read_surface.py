@@ -13,6 +13,8 @@ from typing import get_args
 import unittest
 from unittest.mock import Mock, patch
 
+from test_operator_v2_runtime import grabowski_mcp as audit_base
+
 ROOT = Path(__file__).resolve().parents[1]
 
 class _FakeFastMCP:
@@ -54,6 +56,7 @@ def _load_read_surface():
         {"valid": True, "total_records": 0, "last_record_sha256": None},
     )
     base._audit_records = lambda: []
+    base._audit_records_from_components = audit_base._audit_records_from_components
     base._audit_capacity_status = lambda path, audit: {
         "audit_writable": bool(audit.get("valid")),
         "audit_state": "ready",
@@ -1765,6 +1768,134 @@ class ReadSurfaceTests(unittest.TestCase):
             read_surface.grabowski_audit_projection()
         self.assertEqual(parser.call_count, len(records))
 
+
+
+    def _audit_records_from_raw_projection(self, raw_lines: list[bytes]) -> list[dict]:
+        """Exercise the bounded reader after the verified-segment boundary."""
+        segment = types.SimpleNamespace(
+            path=Path("/tmp/raw-projection-audit.jsonl"),
+            records=len(raw_lines),
+            legacy_records=1,
+            v2_records=len(raw_lines) - 1,
+            bytes=sum(len(line) + 1 for line in raw_lines),
+            active=True,
+        )
+        snapshot = types.SimpleNamespace(
+            active_path=segment.path,
+            segments=(segment,),
+            total_records=len(raw_lines),
+            archived_segment_count=0,
+            legacy_rotation_compatibility=False,
+            last_record_sha256="b" * 64 if len(raw_lines) > 1 else None,
+        )
+        with (
+            patch.object(
+                read_surface.audit_query,
+                "capture_verified_audit_snapshot",
+                return_value=snapshot,
+            ),
+            patch.object(
+                read_surface.audit_query,
+                "_load_snapshot_segment",
+                return_value=b"\n".join(raw_lines) + b"\n",
+            ),
+            patch.object(read_surface.audit_query, "MAX_SCAN_RECORDS", len(raw_lines)),
+            patch.object(
+                read_surface.base,
+                "_audit_records_snapshot",
+                side_effect=AssertionError("full history snapshot"),
+            ),
+            patch.object(audit_base.json, "loads", wraps=audit_base.json.loads) as decoder,
+        ):
+            records, status = read_surface._audit_projection_records_snapshot()
+        self.assertEqual(decoder.call_count, len(raw_lines))
+        self.assertEqual(status["scanned_records"], len(raw_lines))
+        self.assertFalse(status["scan_truncated"])
+        return records
+
+    def test_raw_projection_preserves_legacy_evidence_and_transition_matching(self) -> None:
+        now = 1_800_000_000
+        signal = read_surface.audit_signal
+        reserved = signal.AUDIT_EVIDENCE_RECORD_SHA256_FIELD
+        for scenario in (
+            "open", "completion", "reconciliation",
+            "wrong-reconciliation-target", "identityless-intent",
+        ):
+            with self.subTest(scenario=scenario):
+                intent = {
+                    "operation": "runtime-state-retention-intent",
+                    "timestamp": datetime.fromtimestamp(now - 1_000, tz=timezone.utc).isoformat(),
+                    "plan_sha256": "a" * 64,
+                    "attempt": 1,
+                    reserved: "f" * 64,
+                }
+                if scenario == "identityless-intent":
+                    del intent["plan_sha256"]
+                    del intent["attempt"]
+                raw_intent = json.dumps(intent, ensure_ascii=False).encode("utf-8")
+                intent_digest = hashlib.sha256(raw_intent).hexdigest()
+                transition = {
+                    "operation": "runtime-state-retention-complete",
+                    "timestamp": datetime.fromtimestamp(now - 900, tz=timezone.utc).isoformat(),
+                    "record_sha256": "b" * 64,
+                    "plan_sha256": "a" * 64,
+                    "attempt": 1,
+                    "receipt_sha256": "c" * 64,
+                    reserved: "d" * 64,
+                }
+                if scenario in {"reconciliation", "wrong-reconciliation-target"}:
+                    transition.update({
+                        "operation": signal.RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION,
+                        "reconciliation_kind": "completion_audit_gap",
+                        "intent_record_sha256": (
+                            intent_digest if scenario == "reconciliation" else intent[reserved]
+                        ),
+                        "completed": True,
+                        "retention_effect_retried": False,
+                    })
+                raw_lines = [raw_intent]
+                if scenario != "open":
+                    raw_lines.append(json.dumps(transition).encode("utf-8"))
+                records = self._audit_records_from_raw_projection(raw_lines)
+                self.assertNotIn("record_sha256", records[0])
+                self.assertEqual(records[0][reserved], intent_digest)
+                if len(records) > 1:
+                    self.assertEqual(records[1]["record_sha256"], "b" * 64)
+                    self.assertNotIn(reserved, records[1])
+                gap = signal._audit_transition_gap_signal(
+                    read_surface._prepare_audit_records(records),
+                    start_unix=now - signal.AUDIT_SIGNAL_WINDOW_SECONDS,
+                    end_unix=now,
+                )
+                if scenario == "completion":
+                    expected = ("clear", "none", 0, 0)
+                    expected_refs = []
+                elif scenario == "reconciliation":
+                    expected = ("observed", "medium", 0, 1)
+                    expected_refs = ["audit-record-sha256:" + "b" * 64]
+                else:
+                    expected = ("observed", "high", 1, 0)
+                    expected_refs = ["audit-record-sha256:" + intent_digest]
+                self.assertEqual(
+                    (
+                        gap["status"], gap["severity"],
+                        gap["details"]["execution_gap_count"],
+                        gap["details"]["completion_audit_gap_count"],
+                    ),
+                    expected,
+                )
+                self.assertEqual(gap["evidence_refs"], expected_refs)
+
+    def test_raw_projection_preserves_decode_and_object_failures(self) -> None:
+        for raw_line, error in (
+            (b"", "decode invariant"),
+            (b"\xff", "decode invariant"),
+            (b"{", "decode invariant"),
+            (b"[]", "non-object"),
+        ):
+            with self.subTest(raw_line=raw_line):
+                with self.assertRaisesRegex(RuntimeError, error):
+                    self._audit_records_from_raw_projection([raw_line])
 
     def test_audit_projection_snapshot_stops_after_latest_scan_limit(self) -> None:
         active_records = [

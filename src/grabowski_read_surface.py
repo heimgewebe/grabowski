@@ -443,14 +443,17 @@ def _audit_projection_records_snapshot() -> tuple[list[dict[str, Any]], dict[str
             if len(newest_first) >= audit_query.MAX_SCAN_RECORDS:
                 break
             try:
-                parsed = json.loads(raw_line.decode("utf-8"))
+                # Preserve empty-line failures while sharing verified-byte normalization.
+                parsed_records = base._audit_records_from_components(
+                    [(segment.path, raw_line + b"\n", {})]
+                )
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                 raise RuntimeError(
                     "verified audit record decode invariant violated"
                 ) from exc
-            if not isinstance(parsed, dict):
+            if len(parsed_records) != 1:
                 raise RuntimeError("verified audit chain yielded a non-object record")
-            newest_first.append(parsed)
+            newest_first.append(parsed_records[0])
         if len(newest_first) >= audit_query.MAX_SCAN_RECORDS:
             break
 
