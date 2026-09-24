@@ -1599,11 +1599,15 @@ def _continuation_preimage(
     head = runner(target, ["rev-parse", "--verify", "HEAD^{commit}"])
     tracked = runner(target, ["diff", "--no-ext-diff", "--binary", "HEAD"])
     untracked = runner(target, ["ls-files", "--others", "--exclude-standard", "-z"])
-    if any(
-        result.get("returncode") != 0
-        for result in (status, head, tracked, untracked)
-    ):
+    preimage_reads = (status, head, tracked, untracked)
+    if any(result.get("returncode") != 0 for result in preimage_reads):
         raise RuntimeError("managed worktree continuation Git readback failed")
+    if any(
+        result.get("stdout_truncated") is True
+        or result.get("stderr_truncated") is True
+        for result in preimage_reads
+    ):
+        raise RuntimeError("managed worktree continuation Git readback was truncated")
     status_lines = [line for line in str(status.get("stdout") or "").splitlines() if line]
     status_entries = status_lines[1:] if status_lines else []
     head_sha = str(head.get("stdout") or "").strip().lower()
@@ -1627,6 +1631,8 @@ def _continuation_preimage(
         hashed = runner(target, ["hash-object", "--no-filters", "--", *untracked_paths])
         if hashed.get("returncode") != 0:
             raise RuntimeError("managed worktree continuation untracked hash readback failed")
+        if hashed.get("stdout_truncated") is True or hashed.get("stderr_truncated") is True:
+            raise RuntimeError("managed worktree continuation untracked hash readback was truncated")
         object_ids = [
             line.strip().lower()
             for line in str(hashed.get("stdout") or "").splitlines()
