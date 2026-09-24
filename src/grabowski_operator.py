@@ -7865,7 +7865,10 @@ def _run_mutating_user_service(name: str, action: str) -> dict[str, Any]:
 
     name = _require_fully_qualified_user_service_name(name)
     fragment_before = _user_service_fragment_path(name)
-    resource_keys = [f"service:user-systemd:{name}"]
+    resource_keys = [
+        "component:user-systemd-manager",
+        f"service:user-systemd:{name}",
+    ]
     if fragment_before is not None:
         resource_keys.append(f"path:{fragment_before}")
     owner_id = f"operator:user-service-{uuid.uuid4().hex}"

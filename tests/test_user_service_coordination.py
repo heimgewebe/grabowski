@@ -87,7 +87,7 @@ def _fake_resources() -> types.ModuleType:
 
 
 class UserServiceCoordinationTests(unittest.TestCase):
-    def test_mutation_acquires_unit_and_fragment_leases_before_systemctl(self) -> None:
+    def test_mutation_acquires_manager_unit_and_fragment_leases_before_systemctl(self) -> None:
         fragment = "/home/alex/.config/systemd/user/demo.service"
         resources = _fake_resources()
         action_result = _result(stdout="started")
@@ -115,6 +115,7 @@ class UserServiceCoordinationTests(unittest.TestCase):
         self.assertIs(result, action_result)
         owner = "operator:user-service-" + "1" * 32
         resource_keys = [
+            "component:user-systemd-manager",
             "service:user-systemd:demo.service",
             f"path:{fragment}",
         ]
@@ -248,6 +249,35 @@ class UserServiceCoordinationTests(unittest.TestCase):
         resources.renew_resources.assert_not_called()
         resources.release_resources.assert_not_called()
 
+    def test_foreign_manager_lease_blocks_before_service_effect(self) -> None:
+        fragment = "/home/alex/.config/systemd/user/demo.service"
+        resources = _fake_resources()
+        resources.acquire_resources.side_effect = RuntimeError(
+            "Resource is leased: component:user-systemd-manager"
+        )
+        with (
+            patch.dict(sys.modules, {"grabowski_resources": resources}),
+            patch.object(operator, "_require_operator_capability"),
+            patch.object(operator, "_require_operator_mutation"),
+            patch.object(
+                operator,
+                "_run",
+                return_value=_result(stdout=fragment + "\n"),
+            ) as run,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "component:user-systemd-manager"
+            ):
+                operator.grabowski_user_service("demo.service", "start")
+
+        self.assertEqual(run.call_count, 1)
+        self.assertIn(
+            "component:user-systemd-manager",
+            resources.acquire_resources.call_args.args[1],
+        )
+        resources.renew_resources.assert_not_called()
+        resources.release_resources.assert_not_called()
+
     def test_fragment_path_drift_blocks_before_service_effect_and_releases(self) -> None:
         resources = _fake_resources()
         first = "/home/alex/.config/systemd/user/demo.service"
@@ -272,7 +302,7 @@ class UserServiceCoordinationTests(unittest.TestCase):
         resources.renew_resources.assert_not_called()
         resources.release_resources.assert_called_once()
 
-    def test_pathless_unit_uses_per_unit_coordination(self) -> None:
+    def test_pathless_unit_uses_manager_and_per_unit_coordination(self) -> None:
         resources = _fake_resources()
         with (
             patch.dict(sys.modules, {"grabowski_resources": resources}),
@@ -292,7 +322,10 @@ class UserServiceCoordinationTests(unittest.TestCase):
 
         self.assertEqual(
             resources.acquire_resources.call_args.args[1],
-            ["service:user-systemd:transient.service"],
+            [
+                "component:user-systemd-manager",
+                "service:user-systemd:transient.service",
+            ],
         )
         resources.release_resources.assert_called_once()
 
@@ -324,6 +357,7 @@ class UserServiceCoordinationTests(unittest.TestCase):
 
         owner = "operator:user-service-" + "2" * 32
         resource_keys = [
+            "component:user-systemd-manager",
             "service:user-systemd:demo.service",
             f"path:{fragment}",
         ]
