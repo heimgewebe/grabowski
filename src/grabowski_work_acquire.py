@@ -14,6 +14,7 @@ from typing import Any, Callable, Iterator
 
 import grabowski_checkouts as checkouts
 import grabowski_execution_plan as execution_plan_contract
+import grabowski_git_preimage as git_preimage
 import grabowski_lane_closeout as lane_closeout
 import grabowski_operator_obligation as operator_obligation
 import grabowski_operator_core as operator
@@ -1600,9 +1601,10 @@ def _continuation_preimage(
     tracked_index = runner(target, ["diff-index", "--quiet", "HEAD", "--"])
     tracked_files = runner(target, ["diff-files", "--quiet", "--"])
     tracked_tree = runner(target, ["write-tree"])
+    index_stage = runner(target, ["ls-files", "--stage", "-z"])
     untracked = runner(target, ["ls-files", "--others", "--exclude-standard", "-z"])
     index_flags = runner(target, ["ls-files", "-v", "-z"])
-    preimage_reads = (status, head, tracked_tree, untracked, index_flags)
+    preimage_reads = (status, head, tracked_tree, index_stage, untracked, index_flags)
     if any(result.get("returncode") != 0 for result in preimage_reads):
         raise RuntimeError("managed worktree continuation Git readback failed")
     if tracked_index.get("returncode") not in (0, 1) or tracked_files.get("returncode") not in (0, 1):
@@ -1621,6 +1623,17 @@ def _continuation_preimage(
     tree_sha = str(tracked_tree.get("stdout") or "").strip().lower()
     if SHA40_RE.fullmatch(tree_sha) is None:
         raise RuntimeError("managed worktree continuation index tree is invalid")
+    try:
+        index_bytes = str(index_stage.get("stdout") or "").encode(
+            "utf-8", errors="surrogateescape"
+        )
+        tracked_worktree_sha256 = git_preimage._tracked_worktree_sha256(
+            target, index_bytes
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "managed worktree continuation tracked worktree hashing failed"
+        ) from exc
     index_entries = [
         entry for entry in str(index_flags.get("stdout") or "").split("\0") if entry
     ]
@@ -1678,6 +1691,7 @@ def _continuation_preimage(
         "index_tree": tree_sha,
         "tracked_index_dirty": tracked_index.get("returncode") == 1,
         "tracked_worktree_dirty": tracked_files.get("returncode") == 1,
+        "tracked_worktree_sha256": tracked_worktree_sha256,
         "untracked": untracked_hashes,
         "prior_worktree_receipt_sha256": prior.get("durable_receipt_sha256"),
         "lifecycle_updated_at_unix": live_lifecycle.get("updated_at_unix"),

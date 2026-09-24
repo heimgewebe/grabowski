@@ -1218,6 +1218,8 @@ class WorkAcquireTests(unittest.TestCase):
                 return {"returncode": 1, "stdout": ""}
             if argv[0] == "write-tree":
                 return {"returncode": 0, "stdout": SHA + "\n"}
+            if argv[0] == "ls-files" and "--stage" in argv:
+                return {"returncode": 0, "stdout": ""}
             if argv[0] == "ls-files":
                 return {"returncode": 0, "stdout": ""}
             if argv[0] == "merge-base":
@@ -1247,6 +1249,7 @@ class WorkAcquireTests(unittest.TestCase):
                 return_value=(self.repo, self.repo / ".git", record),
             ),
             patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(work_acquire.git_preimage, "_tracked_worktree_sha256", return_value="c" * 64),
             patch.object(
                 work_acquire.checkouts,
                 "_strict_lifecycle_binding",
@@ -1260,6 +1263,63 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertEqual(second["continuation_preimage"]["head"], SHA)
         self.assertEqual(second["continuation_preimage"]["checkout_key"], checkout_key)
         self.assertEqual(ensure.call_count, 1)
+
+    def test_continuation_preimage_changes_with_raw_tracked_worktree_hash(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        checkout_key = "a" * 64
+        prior = {
+            "state": "ready",
+            "worktree_receipt": {
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "lifecycle": {"checkout_key": checkout_key},
+            },
+        }
+        record = {"checkout_key": checkout_key, "branch": inputs["branch"], "detached": False}
+        lifecycle = {
+            "checkout_key": checkout_key,
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "source": lifecycle_source,
+            "artifact_class": inputs["artifact_class"],
+            "phase": "active",
+            "expected_branch": inputs["branch"],
+            "expected_head": SHA,
+            "updated_at_unix": 123,
+        }
+
+        def runner(_cwd: Path, argv: list[str]) -> dict[str, object]:
+            if argv[0] == "status":
+                return {"returncode": 0, "stdout": "## feat/authority-p0\n M src/example.py\n"}
+            if argv[0] == "rev-parse":
+                return {"returncode": 0, "stdout": SHA + "\n"}
+            if argv[0] == "diff-index":
+                return {"returncode": 0, "stdout": ""}
+            if argv[0] == "diff-files":
+                return {"returncode": 1, "stdout": ""}
+            if argv[0] == "write-tree":
+                return {"returncode": 0, "stdout": SHA + "\n"}
+            if argv[0] == "ls-files" and "--stage" in argv:
+                return {"returncode": 0, "stdout": ""}
+            if argv[0] == "ls-files":
+                return {"returncode": 0, "stdout": ""}
+            if argv[0] == "merge-base":
+                return {"returncode": 0, "stdout": ""}
+            raise AssertionError(argv)
+
+        with (
+            patch.object(work_acquire.checkouts, "_worktree_for_path", return_value=(self.repo, self.repo / ".git", record)),
+            patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(work_acquire.checkouts, "_strict_lifecycle_binding", return_value=lifecycle),
+            patch.object(work_acquire.git_preimage, "_tracked_worktree_sha256", side_effect=["c" * 64, "d" * 64]),
+        ):
+            first = work_acquire._continuation_preimage(prior, inputs, lifecycle_source, runner)
+            second = work_acquire._continuation_preimage(prior, inputs, lifecycle_source, runner)
+
+        self.assertNotEqual(first["tracked_worktree_sha256"], second["tracked_worktree_sha256"])
+        self.assertNotEqual(first["preimage_sha256"], second["preimage_sha256"])
 
     def test_dirty_lane_continuation_rejects_truncated_preimage(self) -> None:
         params = self.parameters()
@@ -1304,6 +1364,8 @@ class WorkAcquireTests(unittest.TestCase):
                     "stdout": "H src/example.py\0",
                     "stdout_truncated": True,
                 }
+            if argv[0] == "ls-files" and "--stage" in argv:
+                return {"returncode": 0, "stdout": ""}
             if argv[0] == "ls-files":
                 return {"returncode": 0, "stdout": ""}
             raise AssertionError(argv)
@@ -1323,6 +1385,7 @@ class WorkAcquireTests(unittest.TestCase):
         with (
             patch.object(work_acquire.checkouts, "_worktree_for_path", return_value=(self.repo, self.repo / ".git", record)),
             patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(work_acquire.git_preimage, "_tracked_worktree_sha256", return_value="c" * 64),
             patch.object(work_acquire.checkouts, "_strict_lifecycle_binding", return_value=lifecycle),
         ):
             blocked = work_acquire.acquire_work(params, runner=runner, **kwargs)
@@ -1369,6 +1432,8 @@ class WorkAcquireTests(unittest.TestCase):
                 return {"returncode": 0, "stdout": SHA + "\n"}
             if argv[0] == "ls-files" and "-v" in argv:
                 return {"returncode": 0, "stdout": "h src/example.py\0"}
+            if argv[0] == "ls-files" and "--stage" in argv:
+                return {"returncode": 0, "stdout": ""}
             if argv[0] == "ls-files":
                 return {"returncode": 0, "stdout": ""}
             raise AssertionError(argv)
@@ -1388,6 +1453,7 @@ class WorkAcquireTests(unittest.TestCase):
         with (
             patch.object(work_acquire.checkouts, "_worktree_for_path", return_value=(self.repo, self.repo / ".git", record)),
             patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(work_acquire.git_preimage, "_tracked_worktree_sha256", return_value="c" * 64),
             patch.object(work_acquire.checkouts, "_strict_lifecycle_binding", return_value=lifecycle),
         ):
             blocked = work_acquire.acquire_work(params, runner=runner, **kwargs)
@@ -1442,6 +1508,7 @@ class WorkAcquireTests(unittest.TestCase):
                 return_value=(self.repo, self.repo / ".git", record),
             ),
             patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(work_acquire.git_preimage, "_tracked_worktree_sha256", return_value="c" * 64),
             patch.object(
                 work_acquire.checkouts,
                 "_strict_lifecycle_binding",
