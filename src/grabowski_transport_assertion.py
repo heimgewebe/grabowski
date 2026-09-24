@@ -961,6 +961,38 @@ def _open_replay_filter() -> tuple[int, int, int]:
         raise
 
 
+def _replay_filter_contains(scope_sha256: str, replay_id: str) -> bool:
+    masks: dict[tuple[int, int], int] = {}
+    for bit in _replay_filter_positions(scope_sha256, replay_id):
+        byte_index = bit // 8
+        page_index = byte_index // REPLAY_FILTER_PAGE_BYTES
+        page_byte_index = byte_index % REPLAY_FILTER_PAGE_BYTES
+        key = (page_index, page_byte_index)
+        mask = 1 << (bit % 8)
+        masks[key] = masks.get(key, 0) | mask
+
+    fd, integrity_fd, integrity_root_fd = _open_replay_filter()
+    try:
+        pages = {
+            page_index: bytearray(
+                _validate_replay_page(fd, integrity_fd, page_index)
+            )
+            for page_index in sorted({key[0] for key in masks})
+        }
+        return all(
+            pages[page_index][page_byte_index] & mask == mask
+            for (page_index, page_byte_index), mask in masks.items()
+        )
+    finally:
+        try:
+            os.close(integrity_root_fd)
+        finally:
+            try:
+                os.close(integrity_fd)
+            finally:
+                os.close(fd)
+
+
 def _consume_replay_filter(
     scope_replay_ids: tuple[tuple[str, str], ...],
 ) -> None:
@@ -1115,6 +1147,16 @@ def consume_assertion(
                 raise TransportAssertionReplay(
                     "signed one-call transport request was already consumed; do not repeat the mutation; reconcile target state"
                 )
+        if session_id and _replay_filter_contains(
+            scope_hash,
+            _stable_scope_replay_id(material["body_sha256"]),
+        ):
+            # Pre-upgrade sessionful requests wrote only the v1 stable body key.
+            # Check that historical evidence without writing it for new sessions;
+            # otherwise the v2 migration would reintroduce body-wide coupling.
+            raise TransportAssertionReplay(
+                "signed one-call transport request was already consumed or conservatively rejected by the durable replay filter; do not repeat the mutation; reconcile target state"
+            )
         _consume_replay_filter(
             (
                 (legacy_replay_scope_hash, material["request_id"]),

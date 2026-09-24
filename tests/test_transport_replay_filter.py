@@ -184,6 +184,69 @@ class ReplayFilterTests(unittest.TestCase):
                 **rotated, session_id=session_id, now_unix=101
             )
 
+    def test_pre_upgrade_v1_replay_survives_secret_rotation(self) -> None:
+        body = hashlib.sha256(b"pre-upgrade-v1-session-replay").hexdigest()
+        session_id = "stable-pre-upgrade-session"
+        rpc_request_id = "rpc-pre-upgrade"
+
+        first = _evidence(32)
+        first["body_sha256"] = body
+        first["request_id"] = assertion.derive_request_id(
+            secret=SECRET,
+            session_id=session_id,
+            rpc_request_id=rpc_request_id,
+            body_sha256=body,
+        )
+        first["mac_sha256"] = assertion.assertion_mac(
+            secret=SECRET,
+            request_id=str(first["request_id"]),
+            issued_at_unix=int(first["issued_at_unix"]),
+            audience=assertion.ASSERTION_AUDIENCE,
+            tool_name=str(first["tool_name"]),
+            arguments_sha256=str(first["arguments_sha256"]),
+            body_sha256=body,
+            runtime_binding_sha256=RUNTIME,
+        )
+
+        # Exact pre-upgrade key set: the token-dependent request-id key plus
+        # the stable v1 body key. No v2 session/body key existed yet.
+        assertion.STATE_ROOT.mkdir(mode=0o700)
+        assertion._consume_replay_filter(
+            (
+                (
+                    assertion._replay_scope_sha256(SECRET),
+                    str(first["request_id"]),
+                ),
+                (SCOPE, assertion._stable_scope_replay_id(body)),
+            )
+        )
+
+        rotated_secret = "B" * 43
+        rotated = dict(first)
+        rotated["secret"] = rotated_secret
+        rotated["request_id"] = assertion.derive_request_id(
+            secret=rotated_secret,
+            session_id=session_id,
+            rpc_request_id=rpc_request_id,
+            body_sha256=body,
+        )
+        self.assertNotEqual(first["request_id"], rotated["request_id"])
+        rotated["mac_sha256"] = assertion.assertion_mac(
+            secret=rotated_secret,
+            request_id=str(rotated["request_id"]),
+            issued_at_unix=int(rotated["issued_at_unix"]),
+            audience=assertion.ASSERTION_AUDIENCE,
+            tool_name=str(rotated["tool_name"]),
+            arguments_sha256=str(rotated["arguments_sha256"]),
+            body_sha256=body,
+            runtime_binding_sha256=RUNTIME,
+        )
+
+        with self.assertRaises(assertion.TransportAssertionReplay):
+            assertion.consume_assertion(
+                **rotated, session_id=session_id, now_unix=101
+            )
+
     def test_legacy_tombstone_remains_authoritative(self) -> None:
         item = _evidence(2)
         assertion.STATE_ROOT.mkdir(mode=0o700)
