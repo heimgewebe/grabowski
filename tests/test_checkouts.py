@@ -2933,6 +2933,44 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual(retry["outcome"], "confirmed_success")
         self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
 
+    def test_partial_archive_recovery_audits_committed_completion_before_blocked_release(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        blocked = {
+            "state": "blocked",
+            "reason": "resource-lease-residue-conflict",
+            "leases": [
+                {
+                    "resource_key": fence["resource_keys"][0],
+                    "owner_id": "foreign-owner",
+                    "expires_at_unix": int(time.time()) + 600,
+                }
+            ],
+        }
+        checkouts.base._append_audit.reset_mock()
+
+        with patch.object(
+            checkouts,
+            "_prepare_uncertainty_fence_release",
+            return_value=blocked,
+        ):
+            reconciliation = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+
+        self.assertEqual(reconciliation["state"], "still_fenced")
+        self.assertEqual(reconciliation["reason"], "resource-lease-residue-conflict")
+        self.assertEqual(reconciliation["readback"]["state"], "reconciled_success")
+        archive = checkouts._load_archive(fence["operation_id"])
+        self.assertEqual(archive["head"], self.head)
+        self.assertEqual(len(checkouts._active_checkout_operation_uncertainties()), 1)
+        checkouts.base._append_audit.assert_called_once()
+        audit = checkouts.base._append_audit.call_args.args[0]
+        self.assertEqual(audit["operation"], "checkout-operation-uncertainty-reconcile")
+        self.assertEqual(audit["outcome"], "reconciled_success")
+        self.assertEqual(audit["lease_preparation"], blocked)
+        self.assertEqual(reconciliation["audit"], audit)
+
     def test_partial_archive_recovery_database_failure_rolls_back_and_retries(self) -> None:
         fence = self._partial_archive_after_manifest_without_db()
         real_mark = checkouts._mark_checkout_archived_in_connection
@@ -2963,6 +3001,63 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual(retry["state"], "reconciled")
         self.assertEqual(retry["outcome"], "reconciled_success")
 
+
+    def test_partial_archive_readback_can_ignore_exact_recovery_owner(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        recovery = checkouts._acquire_uncertainty_recovery_resources(fence)
+        try:
+            blocked = checkouts._archive_uncertainty_readback(fence)
+            self.assertEqual(blocked["state"], "still_fenced")
+            self.assertEqual(blocked["partial_state"], "foreign_or_ambiguous")
+            self.assertEqual(
+                blocked["partial_reason"],
+                "archive-recovery-coordination-blocked",
+            )
+
+            ignored = checkouts._archive_uncertainty_readback(
+                fence,
+                ignored_lease_owner_ids=(str(recovery["owner_id"]),),
+            )
+            self.assertEqual(ignored["state"], "recoverable_complete")
+        finally:
+            checkouts.resources.release_resources(
+                recovery["owner_id"],
+                [item["resource_key"] for item in recovery["leases"]],
+                expected_leases=list(recovery["leases"]),
+            )
+
+    def test_partial_archive_completion_postcommit_readback_ignores_recovery_owner(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        assessment = checkouts._archive_partial_completion_assessment(fence)
+        self.assertEqual(assessment["state"], "recoverable_complete")
+        observed_owner_ids: list[tuple[str, ...]] = []
+
+        def confirmed_readback(bound_fence, *, ignored_lease_owner_ids=()):
+            self.assertEqual(bound_fence["fence_id"], fence["fence_id"])
+            observed_owner_ids.append(tuple(ignored_lease_owner_ids))
+            return {
+                "state": "confirmed_success",
+                "verified_recovery_refs": assessment["verified_recovery_refs"],
+            }
+
+        with patch.object(
+            checkouts,
+            "_archive_uncertainty_readback",
+            side_effect=confirmed_readback,
+        ):
+            completed = checkouts._complete_partial_archive(
+                fence,
+                expected_assessment_sha256=assessment["assessment_sha256"],
+            )
+
+        self.assertEqual(completed["state"], "reconciled_success")
+        self.assertEqual(len(observed_owner_ids), 1)
+        self.assertEqual(len(observed_owner_ids[0]), 1)
+        self.assertTrue(
+            observed_owner_ids[0][0].startswith(
+                f"checkout-reconcile:{fence['fence_id'][:16]}:"
+            )
+        )
 
     def test_partial_archive_concurrent_recovery_attempt_conflicts(self) -> None:
         fence = self._partial_archive_after_manifest_without_db()

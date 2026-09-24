@@ -2879,7 +2879,10 @@ def _complete_partial_archive(
                     evidence.get("expected_branch"),
                 )
                 connection.commit()
-        confirmed = _archive_uncertainty_readback(fence)
+        confirmed = _archive_uncertainty_readback(
+            fence,
+            ignored_lease_owner_ids=(str(lease["owner_id"]),),
+        )
         if confirmed.get("state") != "confirmed_success":
             return {
                 "state": "still_fenced",
@@ -2904,7 +2907,11 @@ def _complete_partial_archive(
 
 
 
-def _archive_uncertainty_readback(fence: dict[str, Any]) -> dict[str, Any]:
+def _archive_uncertainty_readback(
+    fence: dict[str, Any],
+    *,
+    ignored_lease_owner_ids: Iterable[str] = (),
+) -> dict[str, Any]:
     evidence = fence["evidence"]
     repo = _resolve_repo(str(evidence["repo"]))
     checkout = Path(str(evidence["checkout_path"]))
@@ -2954,7 +2961,10 @@ def _archive_uncertainty_readback(fence: dict[str, Any]) -> dict[str, Any]:
             "verified_recovery_refs": verified_refs,
         }
     if any(bool(item.get("exists")) for item in verified_refs) or archive_dir.exists() or archive_dir.is_symlink():
-        partial = _archive_partial_completion_assessment(fence)
+        partial = _archive_partial_completion_assessment(
+            fence,
+            ignored_lease_owner_ids=ignored_lease_owner_ids,
+        )
         if partial.get("state") == "recoverable_complete":
             return partial
         return {
@@ -3160,14 +3170,6 @@ def grabowski_checkout_uncertainty_reconcile(
     if outcome not in {"confirmed_success", "confirmed_no_effect", "reconciled_success"}:
         raise RuntimeError("Checkout uncertainty readback returned an invalid state")
     lease_preparation = _prepare_uncertainty_fence_release(fence)
-    if lease_preparation["state"] != "ready":
-        return {
-            "state": "still_fenced",
-            "reason": lease_preparation["reason"],
-            "fence": fence,
-            "readback": readback,
-            "lease_preparation": lease_preparation,
-        }
     audit = {
         "timestamp_unix": _now(),
         "operation": "checkout-operation-uncertainty-reconcile",
@@ -3180,6 +3182,17 @@ def grabowski_checkout_uncertainty_reconcile(
         "readback": readback,
         "lease_preparation": lease_preparation,
     }
+    if lease_preparation["state"] != "ready":
+        if outcome == "reconciled_success":
+            base._append_audit(audit)
+        return {
+            "state": "still_fenced",
+            "reason": lease_preparation["reason"],
+            "fence": fence,
+            "readback": readback,
+            "lease_preparation": lease_preparation,
+            **({"audit": audit} if outcome == "reconciled_success" else {}),
+        }
     base._append_audit(audit)
     lease_release = _release_uncertainty_fence_resources(fence)
     cleared = _clear_checkout_operation_uncertainty(
