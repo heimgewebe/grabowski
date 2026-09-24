@@ -325,6 +325,10 @@ class ConsumerSurfaceTests(unittest.TestCase):
             "client-declared-server-compared-v1",
             minimal["tool_contract"]["client_snapshot"]["verification_model"],
         )
+        self.assertEqual(
+            minimal["tool_contract"]["registered_names_sha256"],
+            "c" * 64,
+        )
         self.assertNotIn("platform_snapshot", minimal["tool_contract"]["client_snapshot"])
         self.assertIn("platform_snapshot", standard["tool_contract"]["client_snapshot"])
         self.assertNotIn("platform_schema_mismatches", minimal["tool_contract"])
