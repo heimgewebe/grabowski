@@ -19,7 +19,7 @@ import grabowski_lane_closeout as closeout
 import grabowski_work_acquire as work_acquire
 
 SHA = "a" * 40
-PHYSICAL = {"physical_identity_sha256": "f" * 64}
+PHYSICAL = {"physical_identity_sha256": "f" * 64, "common_dir": {"path": "/registered/common"}}
 
 
 class WorkAcquireTests(unittest.TestCase):
@@ -1247,7 +1247,7 @@ class WorkAcquireTests(unittest.TestCase):
             patch.object(
                 work_acquire.checkouts,
                 "_worktree_for_path",
-                return_value=(self.repo, self.repo / ".git", record),
+                return_value=(self.repo, Path(PHYSICAL["common_dir"]["path"]), record),
             ),
             patch.object(work_acquire.checkouts, "_require_linked"),
             patch.object(work_acquire.physical_checkout, "capture_physical_checkout_identity", return_value=PHYSICAL),
@@ -1311,7 +1311,7 @@ class WorkAcquireTests(unittest.TestCase):
         sanitized = {"PATH": "/usr/bin", "GIT_TERMINAL_PROMPT": "0"}
         completed = __import__("subprocess").CompletedProcess([], 0, b"", b"")
         with (
-            patch.object(work_acquire.checkouts, "_worktree_for_path", return_value=(self.repo, self.repo / ".git", record)),
+            patch.object(work_acquire.checkouts, "_worktree_for_path", return_value=(self.repo, Path(PHYSICAL["common_dir"]["path"]), record)),
             patch.object(work_acquire.checkouts, "_require_linked"),
             patch.object(work_acquire.physical_checkout, "capture_physical_checkout_identity", return_value=PHYSICAL),
             patch.object(work_acquire.physical_checkout, "verify_physical_checkout_identity", return_value=PHYSICAL),
@@ -1374,7 +1374,7 @@ class WorkAcquireTests(unittest.TestCase):
             raise AssertionError(argv)
 
         with (
-            patch.object(work_acquire.checkouts, "_worktree_for_path", return_value=(self.repo, self.repo / ".git", record)),
+            patch.object(work_acquire.checkouts, "_worktree_for_path", return_value=(self.repo, Path(PHYSICAL["common_dir"]["path"]), record)),
             patch.object(work_acquire.checkouts, "_require_linked"),
             patch.object(work_acquire.physical_checkout, "capture_physical_checkout_identity", return_value=PHYSICAL),
             patch.object(work_acquire.physical_checkout, "verify_physical_checkout_identity", return_value=PHYSICAL),
@@ -1451,7 +1451,7 @@ class WorkAcquireTests(unittest.TestCase):
             "updated_at_unix": 123,
         }
         with (
-            patch.object(work_acquire.checkouts, "_worktree_for_path", return_value=(self.repo, self.repo / ".git", record)),
+            patch.object(work_acquire.checkouts, "_worktree_for_path", return_value=(self.repo, Path(PHYSICAL["common_dir"]["path"]), record)),
             patch.object(work_acquire.checkouts, "_require_linked"),
             patch.object(work_acquire.physical_checkout, "capture_physical_checkout_identity", return_value=PHYSICAL),
             patch.object(work_acquire.physical_checkout, "verify_physical_checkout_identity", return_value=PHYSICAL),
@@ -1523,7 +1523,7 @@ class WorkAcquireTests(unittest.TestCase):
             "updated_at_unix": 123,
         }
         with (
-            patch.object(work_acquire.checkouts, "_worktree_for_path", return_value=(self.repo, self.repo / ".git", record)),
+            patch.object(work_acquire.checkouts, "_worktree_for_path", return_value=(self.repo, Path(PHYSICAL["common_dir"]["path"]), record)),
             patch.object(work_acquire.checkouts, "_require_linked"),
             patch.object(work_acquire.physical_checkout, "capture_physical_checkout_identity", return_value=PHYSICAL),
             patch.object(work_acquire.physical_checkout, "verify_physical_checkout_identity", return_value=PHYSICAL),
@@ -1536,6 +1536,77 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertEqual(blocked["state"], "blocked")
         self.assertIn("assume-unchanged", blocked["error"])
         self.assertEqual(ensure.call_count, 1)
+
+    def test_continuation_rejects_preexisting_unregistered_physical_checkout(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        checkout_key = "a" * 64
+        prior = {
+            "state": "ready",
+            "worktree_receipt": {
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "lifecycle": {"checkout_key": checkout_key},
+            },
+        }
+        record = {"checkout_key": checkout_key, "branch": inputs["branch"], "detached": False}
+        replacement = {
+            "physical_identity_sha256": "e" * 64,
+            "common_dir": {"path": "/replacement/common"},
+        }
+        with (
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                return_value=(self.repo, Path("/registered/common"), record),
+            ),
+            patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_physical_checkout_identity",
+                return_value=replacement,
+            ),
+            self.assertRaisesRegex(RuntimeError, "registered Git common directory"),
+        ):
+            work_acquire._continuation_preimage(
+                prior, inputs, lifecycle_source, Mock()
+            )
+
+    def test_bounded_raw_nul_probe_stops_after_record_limit(self) -> None:
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b"x\0" * 101)
+        os.close(write_fd)
+
+        class FakeProcess:
+            def __init__(self) -> None:
+                self.stdout = os.fdopen(read_fd, "rb", closefd=True)
+                self.returncode = None
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def kill(self) -> None:
+                self.returncode = -9
+
+            def wait(self, timeout: float | None = None) -> int:
+                if self.returncode is None:
+                    self.returncode = 0
+                return self.returncode
+
+        fake = FakeProcess()
+        with (
+            patch.object(work_acquire.subprocess, "Popen", return_value=fake),
+            patch.object(work_acquire.operator, "_git_environment", return_value={"PATH": "/usr/bin"}),
+            self.assertRaisesRegex(RuntimeError, "record limit exceeded"),
+        ):
+            work_acquire._bounded_raw_nul_git_probe(
+                self.repo,
+                ["ls-files", "--others", "--exclude-standard", "-z"],
+                max_records=100,
+                max_stdout_bytes=512 * 1024,
+                timeout_seconds=5,
+            )
 
     def test_dirty_lane_continuation_rejects_physical_drift_after_preimage(self) -> None:
         params = self.parameters()
@@ -1577,7 +1648,7 @@ class WorkAcquireTests(unittest.TestCase):
             raise AssertionError(argv)
 
         with (
-            patch.object(work_acquire.checkouts, "_worktree_for_path", return_value=(self.repo, self.repo / ".git", record)),
+            patch.object(work_acquire.checkouts, "_worktree_for_path", return_value=(self.repo, Path(PHYSICAL["common_dir"]["path"]), record)),
             patch.object(work_acquire.checkouts, "_require_linked"),
             patch.object(work_acquire.physical_checkout, "capture_physical_checkout_identity", return_value=PHYSICAL),
             patch.object(
@@ -1649,7 +1720,7 @@ class WorkAcquireTests(unittest.TestCase):
             patch.object(
                 work_acquire.checkouts,
                 "_worktree_for_path",
-                return_value=(self.repo, self.repo / ".git", record),
+                return_value=(self.repo, Path(PHYSICAL["common_dir"]["path"]), record),
             ),
             patch.object(work_acquire.checkouts, "_require_linked"),
             patch.object(work_acquire.physical_checkout, "capture_physical_checkout_identity", return_value=PHYSICAL),

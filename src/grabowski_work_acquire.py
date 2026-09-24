@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import stat
 import subprocess
 import time
@@ -1538,6 +1539,72 @@ def _git_runner(cwd: Path, arguments: list[str]) -> dict[str, Any]:
     )
 
 
+def _bounded_raw_nul_git_probe(
+    cwd: Path,
+    arguments: list[str],
+    *,
+    max_records: int,
+    max_stdout_bytes: int,
+    timeout_seconds: int = 30,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run one byte-preserving Git read with pre-buffer record and byte bounds."""
+
+    if max_records < 1 or max_stdout_bytes < 1 or timeout_seconds < 1:
+        raise ValueError("bounded raw Git probe limits must be positive")
+    command = [
+        "git",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        *arguments,
+    ]
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=operator._git_environment(),
+    )
+    assert process.stdout is not None
+    output = bytearray()
+    record_count = 0
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("bounded raw Git probe timed out")
+            ready, _, _ = select.select([process.stdout], [], [], remaining)
+            if not ready:
+                raise RuntimeError("bounded raw Git probe timed out")
+            chunk = os.read(process.stdout.fileno(), 64 * 1024)
+            if not chunk:
+                break
+            output.extend(chunk)
+            record_count += chunk.count(b"\0")
+            if record_count > max_records:
+                raise RuntimeError("bounded raw Git probe record limit exceeded")
+            if len(output) > max_stdout_bytes:
+                raise RuntimeError("bounded raw Git probe byte limit exceeded")
+        remaining = max(0.001, deadline - time.monotonic())
+        returncode = process.wait(timeout=remaining)
+        return subprocess.CompletedProcess(
+            command,
+            returncode,
+            bytes(output),
+            b"",
+        )
+    except Exception:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+        raise
+    finally:
+        process.stdout.close()
+
+
 def _effect_observed(output: dict[str, Any]) -> bool:
     post = output.get("post_state")
     return bool(
@@ -1575,7 +1642,7 @@ def _continuation_preimage(
 
     target = Path(inputs["target_path"])
     repo = Path(inputs["repo"])
-    _top_level, _common_dir, record = checkouts._worktree_for_path(repo, target)
+    _top_level, registered_common_dir, record = checkouts._worktree_for_path(repo, target)
     checkouts._require_linked(record)
     checkout_key = record.get("checkout_key")
     if not isinstance(checkout_key, str) or checkout_key != prior_lifecycle.get("checkout_key"):
@@ -1586,6 +1653,14 @@ def _continuation_preimage(
         raise RuntimeError(
             "managed worktree continuation physical identity capture failed"
         ) from exc
+    physical_common = expected_physical.get("common_dir")
+    if (
+        not isinstance(physical_common, dict)
+        or physical_common.get("path") != str(registered_common_dir)
+    ):
+        raise RuntimeError(
+            "managed worktree continuation is not bound to the registered Git common directory"
+        )
 
     live_lifecycle = checkouts._strict_lifecycle_binding(checkout_key)
     expected_lifecycle = {
@@ -1634,6 +1709,17 @@ def _continuation_preimage(
             check=False,
             timeout=30,
             env=operator._git_environment(),
+        )
+
+    def bounded_untracked_probe(
+        cwd: Path, argv: list[str]
+    ) -> subprocess.CompletedProcess[bytes]:
+        return _bounded_raw_nul_git_probe(
+            cwd,
+            argv,
+            max_records=100,
+            max_stdout_bytes=512 * 1024,
+            timeout_seconds=30,
         )
 
     try:
@@ -1686,7 +1772,7 @@ def _continuation_preimage(
         raise RuntimeError("managed worktree continuation HEAD is not a descendant of ensure")
     try:
         untracked_preimage = git_preimage.capture_untracked_preimage(
-            target, raw_probe, max_paths=100
+            target, bounded_untracked_probe, max_paths=100
         )
     except Exception as exc:
         raise RuntimeError(
