@@ -6743,8 +6743,7 @@ def grabowski_status(
     )
     transport_roundtrip = _transport_roundtrip_status(ctx)
     normal_mutation_path_ready = (
-        transport_roundtrip.get("state") == "unavailable"
-        or transport_roundtrip.get("normal_mutation_path_ready") is True
+        transport_roundtrip.get("normal_mutation_path_ready") is True
     )
     if not bool(tool_contract.get("client_snapshot_observable")):
         snapshot_state = str(client_snapshot.get("state", "unavailable"))
@@ -6964,6 +6963,7 @@ def grabowski_status(
         compact_transport_keys = (
             "state",
             "normal_mutation_path",
+            "normal_mutation_path_ready",
             "legacy_roundtrip_required",
             "recommended_next_action",
         )
@@ -6972,12 +6972,10 @@ def grabowski_status(
             for key in compact_transport_keys
             if key in transport_roundtrip
         }
-        # Schema 3 binds both compatibility names to the same effective
-        # readiness used by warnings and recommended_next_action. Schema-2
-        # standard/evidence retain the raw legacy roundtrip gate.
-        base_payload["transport_roundtrip"]["normal_mutation_path_ready"] = (
-            normal_mutation_path_ready
-        )
+        # Schema 3 preserves the published selected-path readiness field when
+        # the transport status exposes it, and adds one always-present,
+        # fail-closed effective mutation gate. Schema-2 standard/evidence retain
+        # the raw legacy roundtrip gate.
         base_payload["transport_roundtrip"]["mutation_gate_open"] = (
             normal_mutation_path_ready
         )

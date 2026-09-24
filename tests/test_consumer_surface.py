@@ -403,24 +403,38 @@ class ConsumerSurfaceTests(unittest.TestCase):
         self.assertFalse(standard["transport_roundtrip"]["mutation_gate_open"])
         self.assertTrue(standard["transport_roundtrip"]["normal_mutation_path_ready"])
         self.assertFalse(degraded_minimal["transport_roundtrip"]["mutation_gate_open"])
-        self.assertFalse(
-            degraded_minimal["transport_roundtrip"]["normal_mutation_path_ready"]
+        self.assertNotIn(
+            "normal_mutation_path_ready", degraded_minimal["transport_roundtrip"]
+        )
+        self.assertNotIn("normal_mutation_path", degraded_minimal["transport_roundtrip"])
+        self.assertNotIn(
+            "legacy_roundtrip_required", degraded_minimal["transport_roundtrip"]
         )
         self.assertEqual(
             degraded_minimal["transport_roundtrip"]["state"],
             "connector_identity_required",
         )
         self.assertFalse(runtime_invalid_minimal["transport_roundtrip"]["mutation_gate_open"])
-        self.assertFalse(
-            runtime_invalid_minimal["transport_roundtrip"]["normal_mutation_path_ready"]
+        self.assertNotIn(
+            "normal_mutation_path_ready", runtime_invalid_minimal["transport_roundtrip"]
+        )
+        self.assertNotIn(
+            "normal_mutation_path", runtime_invalid_minimal["transport_roundtrip"]
+        )
+        self.assertNotIn(
+            "legacy_roundtrip_required", runtime_invalid_minimal["transport_roundtrip"]
         )
         self.assertEqual(
             runtime_invalid_minimal["transport_roundtrip"]["state"],
             "runtime_invalid",
         )
-        self.assertTrue(unavailable_minimal["transport_roundtrip"]["mutation_gate_open"])
-        self.assertTrue(
-            unavailable_minimal["transport_roundtrip"]["normal_mutation_path_ready"]
+        self.assertFalse(unavailable_minimal["transport_roundtrip"]["mutation_gate_open"])
+        self.assertNotIn(
+            "normal_mutation_path_ready", unavailable_minimal["transport_roundtrip"]
+        )
+        self.assertNotIn("normal_mutation_path", unavailable_minimal["transport_roundtrip"])
+        self.assertNotIn(
+            "legacy_roundtrip_required", unavailable_minimal["transport_roundtrip"]
         )
         self.assertTrue(legacy_minimal["transport_roundtrip"]["mutation_gate_open"])
         self.assertTrue(
