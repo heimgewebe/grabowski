@@ -2600,18 +2600,41 @@ def _archive_partial_completion_assessment(
             "reason": str(manifest_info.get("reason", "archive-manifest-unproven")),
             "verified_recovery_refs": verified_refs,
         }
+    if (
+        "lifecycle_preimage" not in evidence
+        or "retention_preimage" not in evidence
+    ):
+        return {
+            "state": "foreign_or_ambiguous",
+            "reason": "archive-fence-missing-database-preimages",
+            "verified_recovery_refs": verified_refs,
+        }
+    lifecycle_preimage = evidence["lifecycle_preimage"]
+    retention_preimage = evidence["retention_preimage"]
+    if (
+        lifecycle_preimage is not None
+        and not isinstance(lifecycle_preimage, dict)
+    ) or (
+        retention_preimage is not None
+        and not isinstance(retention_preimage, dict)
+    ):
+        return {
+            "state": "foreign_or_ambiguous",
+            "reason": "archive-fence-database-preimage-shape-mismatch",
+            "verified_recovery_refs": verified_refs,
+        }
     terminal_transition = manifest_info["terminal_detached_transition"]
-    preimage_expected_head = evidence.get("expected_head")
-    preimage_expected_branch = evidence.get("expected_branch")
+    coordination_branch = evidence.get("expected_branch")
+    if isinstance(lifecycle_preimage, dict):
+        coordination_branch = lifecycle_preimage.get("expected_branch")
     if terminal_transition is not None:
-        preimage_expected_head = terminal_transition["expected_head"]
-        preimage_expected_branch = terminal_transition["expected_branch"]
+        coordination_branch = terminal_transition["expected_branch"]
         branch_read = _git_read(
             repo,
             [
                 "rev-parse",
                 "--verify",
-                f"refs/heads/{preimage_expected_branch}^{{commit}}",
+                f"refs/heads/{coordination_branch}^{{commit}}",
             ],
             check=False,
         )
@@ -2648,46 +2671,26 @@ def _archive_partial_completion_assessment(
             "verified_recovery_refs": verified_refs,
         }
     lifecycle = _strict_lifecycle_binding(str(evidence["checkout_key"]))
-    if lifecycle is not None:
-        lifecycle_matches = (
-            lifecycle.get("checkout_key") == evidence.get("checkout_key")
-            and lifecycle.get("repo_common_dir") == evidence.get("git_common_dir")
-            and lifecycle.get("repo_path") == evidence.get("repo")
-            and lifecycle.get("checkout_path") == evidence.get("checkout_path")
-            and lifecycle.get("owner_id") == evidence.get("owner_id")
-            and lifecycle.get("phase") in {"active", "completed_retained"}
-            and lifecycle.get("expected_head") == preimage_expected_head
-            and lifecycle.get("expected_branch") == preimage_expected_branch
-        )
-        if not lifecycle_matches:
-            return {
-                "state": "contradictory",
-                "reason": "archive-lifecycle-preimage-mismatch",
-                "verified_recovery_refs": verified_refs,
-            }
+    if lifecycle != lifecycle_preimage:
+        return {
+            "state": "contradictory",
+            "reason": "archive-lifecycle-preimage-mismatch",
+            "verified_recovery_refs": verified_refs,
+        }
     retention = _retention_records([str(evidence["checkout_key"])]).get(
         str(evidence["checkout_key"])
     )
-    if retention is not None:
-        retention_matches = (
-            retention.get("repo_common_dir") == evidence.get("git_common_dir")
-            and retention.get("repo_path") == evidence.get("repo")
-            and retention.get("checkout_path") == evidence.get("checkout_path")
-            and retention.get("owner_id") == evidence.get("owner_id")
-            and retention.get("expected_head") == preimage_expected_head
-            and retention.get("expected_branch") == preimage_expected_branch
-        )
-        if not retention_matches:
-            return {
-                "state": "contradictory",
-                "reason": "archive-retention-preimage-mismatch",
-                "verified_recovery_refs": verified_refs,
-            }
+    if retention != retention_preimage:
+        return {
+            "state": "contradictory",
+            "reason": "archive-retention-preimage-mismatch",
+            "verified_recovery_refs": verified_refs,
+        }
     coordination = _linked_checkout_coordination(
         checkout,
         top_level,
         common_dir,
-        branch=preimage_expected_branch,
+        branch=coordination_branch,
         owner_id=str(evidence["owner_id"]),
         include_processes=True,
         include_tasks=True,
@@ -2719,10 +2722,10 @@ def _archive_partial_completion_assessment(
             else evidence["expected_physical_identity"].get("physical_identity_sha256")
         ),
         "lifecycle_preimage_sha256": (
-            None if lifecycle is None else _sha256_json(lifecycle)
+            None if lifecycle_preimage is None else _sha256_json(lifecycle_preimage)
         ),
         "retention_preimage_sha256": (
-            None if retention is None else _sha256_json(retention)
+            None if retention_preimage is None else _sha256_json(retention_preimage)
         ),
     }
     return {
@@ -2733,8 +2736,8 @@ def _archive_partial_completion_assessment(
         "purpose": manifest_info["purpose"],
         "retention_until_unix": manifest_info["retention_until_unix"],
         "metadata_binding": manifest_info["metadata_binding"],
-        "lifecycle_preimage": lifecycle,
-        "retention_preimage": retention,
+        "lifecycle_preimage": lifecycle_preimage,
+        "retention_preimage": retention_preimage,
     }
 
 
@@ -2885,8 +2888,15 @@ def _complete_partial_archive(
         )
         if confirmed.get("state") != "confirmed_success":
             return {
-                "state": "still_fenced",
+                "state": "completion_committed_still_fenced",
                 "reason": "partial-archive-completion-postcondition-failed",
+                "archive_id": str(evidence["archive_id"]),
+                "assessment_sha256": expected_assessment_sha256,
+                "manifest_created_at_unix": manifest_created,
+                "completed_at_unix": completed,
+                "durable_completion_committed": True,
+                "postcondition_confirmed": False,
+                "fence_release_allowed": False,
                 "readback": confirmed,
             }
         return {
@@ -3165,6 +3175,33 @@ def grabowski_checkout_uncertainty_reconcile(
             expected_assessment_sha256=str(readback["assessment_sha256"]),
         )
         outcome = str(readback.get("state"))
+    if outcome == "completion_committed_still_fenced":
+        audit = {
+            "timestamp_unix": _now(),
+            "operation": "checkout-operation-uncertainty-reconcile",
+            "fence_id": fence["fence_id"],
+            "checkout_key": fence["checkout_key"],
+            "owner_id": fence["owner_id"],
+            "effect_operation": fence["operation"],
+            "effect_operation_id": fence["operation_id"],
+            "outcome": outcome,
+            "readback": readback,
+            "durable_completion_committed": True,
+            "postcondition_confirmed": False,
+            "fence_release_attempted": False,
+            "lease_preparation": {
+                "state": "not_attempted",
+                "reason": "partial-archive-completion-postcondition-failed",
+            },
+        }
+        base._append_audit(audit)
+        return {
+            "state": "still_fenced",
+            "reason": "partial-archive-completion-postcondition-failed",
+            "fence": fence,
+            "readback": readback,
+            "audit": audit,
+        }
     if outcome == "still_fenced":
         return {"state": "still_fenced", "fence": fence, "readback": readback}
     if outcome not in {"confirmed_success", "confirmed_no_effect", "reconciled_success"}:
@@ -5797,6 +5834,9 @@ def grabowski_checkout_archive(
     lifecycle_before = _lifecycle_bindings([record["checkout_key"]]).get(
         record["checkout_key"]
     )
+    retention_before = _retention_records([record["checkout_key"]]).get(
+        record["checkout_key"]
+    )
     if lifecycle_before is not None and lifecycle_before["owner_id"] != owner:
         raise PermissionError("Checkout lifecycle binding is owned by another owner")
     lease_branch = record.get("branch")
@@ -5836,6 +5876,11 @@ def grabowski_checkout_archive(
         )
         if lifecycle != lifecycle_before:
             raise RuntimeError("Checkout lifecycle binding changed during archive preflight")
+        retention_now = _retention_records([record["checkout_key"]]).get(
+            record["checkout_key"]
+        )
+        if retention_now != retention_before:
+            raise RuntimeError("Checkout retention changed during archive preflight")
         terminal_detached_transition = None
         if lifecycle is not None:
             if lifecycle["expected_branch"] != record.get("branch"):
@@ -5877,6 +5922,8 @@ def grabowski_checkout_archive(
                 "archive_purpose": archive_purpose,
                 "archive_retention_until_unix": until,
                 "archive_intent_validated_at_unix": archive_intent_validated_at_unix,
+                "lifecycle_preimage": lifecycle_before,
+                "retention_preimage": retention_before,
                 "planned_recovery_refs": planned_refs,
             },
         )
