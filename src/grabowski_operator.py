@@ -7337,8 +7337,9 @@ def grabowski_job_cancel(unit: str) -> dict[str, Any]:
     """Stop one Grabowski background job."""
     name = _validate_unit(unit, job_only=True)
     _require_operator_mutation("durable_job", task_id=name)
+    systemd_unit = name if "." in name else f"{name}.service"
     return _run_mutating_user_systemd_unit(
-        name,
+        systemd_unit,
         "stop",
         mutation_timeout_seconds=60,
         max_output_bytes=DEFAULT_OUTPUT_BYTES,

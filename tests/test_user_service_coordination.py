@@ -1044,9 +1044,10 @@ class UserServiceCoordinationTests(unittest.TestCase):
             )
 
     def test_real_resource_layer_blocks_other_public_writer_on_same_unit(self) -> None:
-        unit = "grabowski-job-coordination-test.service"
-        key = f"service:user-systemd:{unit}"
-        fragment = f"/home/alex/.config/systemd/user/{unit}"
+        unit = "grabowski-job-coordination-test"
+        systemd_unit = f"{unit}.service"
+        key = f"service:user-systemd:{systemd_unit}"
+        fragment = f"/home/alex/.config/systemd/user/{systemd_unit}"
         with tempfile.TemporaryDirectory() as temporary:
             database = Path(temporary) / "resources.sqlite3"
             with patch.object(real_resources, "RESOURCE_DB", database):
