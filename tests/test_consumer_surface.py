@@ -167,7 +167,7 @@ class ConsumerSurfaceTests(unittest.TestCase):
         }
         transport_status = {
             "state": "ready",
-            "mutation_gate_open": True,
+            "mutation_gate_open": False,
             "normal_mutation_path": "signed_one_call",
             "normal_mutation_path_ready": True,
             "legacy_roundtrip_required": False,
@@ -312,6 +312,18 @@ class ConsumerSurfaceTests(unittest.TestCase):
                 }
             )
             runtime_invalid_minimal = grabowski_mcp.grabowski_status(view="minimal")
+            transport_status.clear()
+            transport_status.update(
+                {
+                    "state": "verified",
+                    "mutation_gate_open": True,
+                    "normal_mutation_path": "signed_one_call",
+                    "normal_mutation_path_ready": False,
+                    "legacy_roundtrip_required": False,
+                    "recommended_next_action": "repair signed ingress before mutation",
+                }
+            )
+            broken_signed_minimal = grabowski_mcp.grabowski_status(view="minimal")
 
         self.assertEqual(minimal["view"], "minimal")
         self.assertEqual(minimal["schema_version"], 3)
@@ -356,6 +368,8 @@ class ConsumerSurfaceTests(unittest.TestCase):
         self.assertNotIn("platform_schema_mismatches", minimal["tool_contract"])
         self.assertIn("platform_schema_mismatches", standard["tool_contract"])
         self.assertTrue(minimal["transport_roundtrip"]["mutation_gate_open"])
+        self.assertFalse(standard["transport_roundtrip"]["mutation_gate_open"])
+        self.assertTrue(standard["transport_roundtrip"]["normal_mutation_path_ready"])
         self.assertFalse(degraded_minimal["transport_roundtrip"]["mutation_gate_open"])
         self.assertEqual(
             degraded_minimal["transport_roundtrip"]["state"],
@@ -365,6 +379,10 @@ class ConsumerSurfaceTests(unittest.TestCase):
         self.assertEqual(
             runtime_invalid_minimal["transport_roundtrip"]["state"],
             "runtime_invalid",
+        )
+        self.assertFalse(broken_signed_minimal["transport_roundtrip"]["mutation_gate_open"])
+        self.assertFalse(
+            broken_signed_minimal["transport_roundtrip"]["normal_mutation_path_ready"]
         )
         self.assertNotIn("last_consumption_receipt_sha256", minimal["transport_roundtrip"])
         self.assertIn("last_consumption_receipt_sha256", standard["transport_roundtrip"])

@@ -36,7 +36,7 @@ A matched declaration is stored as a private mode-0600, owner-bound, self-hashed
 - `mismatch`: the declaration does not match the current server contract;
 - `matched`: the receipt is fresh and all bound values match.
 
-`client_snapshot_observable=true` means only that a fresh client declaration was compared with and matched the current server contract. It does not mean the platform independently attested the client process. `grabowski_status(view="minimal")` uses response schema 3 and retains the explicit transport `mutation_gate_open` boolean, including `false` in degraded states; callers must not infer gate state from omitted detail fields.
+`client_snapshot_observable=true` means only that a fresh client declaration was compared with and matched the current server contract. It does not mean the platform independently attested the client process. `grabowski_status(view="minimal")` uses response schema 3. Its `transport_roundtrip.mutation_gate_open` boolean is the effective readiness of the selected normal mutation path: it is `true` for a ready signed-one-call path even if the legacy roundtrip gate is closed, and `false` when the selected signed path is invalid even if a legacy verification remains open. Schema-2 standard/evidence retain the raw legacy gate as diagnostic detail alongside `normal_mutation_path_ready`.
 
 ## Consolidated operator overview
 

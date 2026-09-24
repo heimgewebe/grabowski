@@ -6963,7 +6963,6 @@ def grabowski_status(
         }
         compact_transport_keys = (
             "state",
-            "mutation_gate_open",
             "normal_mutation_path",
             "normal_mutation_path_ready",
             "legacy_roundtrip_required",
@@ -6974,6 +6973,11 @@ def grabowski_status(
             for key in compact_transport_keys
             if key in transport_roundtrip
         }
+        # Schema 3 projects the effective gate for the selected normal mutation
+        # path. Schema-2 standard/evidence retain the raw legacy roundtrip gate.
+        base_payload["transport_roundtrip"]["mutation_gate_open"] = (
+            transport_roundtrip.get("normal_mutation_path_ready") is True
+        )
 
     if selected_view in {"standard", "evidence"}:
         assert system_overview is not None

@@ -25,7 +25,7 @@ Neue Clients sollen die kanonischen Namen senden und das zurückgegebene Feld `v
 
 `schema_version` versioniert die konkrete Antwortform einer Oberfläche, nicht das gesamte Grabowski-Protokoll. Ein Client muss deshalb pro Werkzeug und Antwortobjekt auf die angegebene Schemaversion reagieren.
 
-`grabowski_status` ist absichtlich gemischt versioniert: `minimal` und der Alias `concise` liefern Schema 3; `standard`, `evidence` und der Alias `full` bleiben Schema 2. Schema 3 der Minimalansicht ergänzt keinen zweiten Statusvertrag, sondern hält im kompakten `transport_roundtrip` den expliziten Bool `mutation_gate_open` auch bei degradierten Zuständen sichtbar.
+`grabowski_status` ist absichtlich gemischt versioniert: `minimal` und der Alias `concise` liefern Schema 3; `standard`, `evidence` und der Alias `full` bleiben Schema 2. Schema 3 der Minimalansicht ergänzt keinen zweiten Statusvertrag. Im kompakten `transport_roundtrip` bedeutet `mutation_gate_open` die effektive Bereitschaft des aktuell ausgewählten Normalpfads; damit kann weder ein geschlossener Legacy-Gate einen bereiten Signed-One-Call-Pfad verdecken noch ein alter bereiter Legacy-Gate einen defekten Signed-Pfad maskieren. Schema 2 behält den rohen Legacy-Gate als Diagnosewert.
 
 Für Consumer-Antworten mit Schema 2 gilt:
 
