@@ -1327,6 +1327,40 @@ class WorkAcquireTests(unittest.TestCase):
 
         self.assertEqual(run.call_args.kwargs["env"], sanitized)
         self.assertNotIn("GIT_INDEX_FILE", run.call_args.kwargs["env"])
+        self.assertTrue(
+            any("--no-replace-objects" in call.args[0] for call in run.call_args_list)
+        )
+        self.assertIsNotNone(capture.call_args.kwargs["index_probe"])
+        self.assertEqual(capture.call_args.kwargs["max_tracked_paths"], 25_000)
+        self.assertEqual(
+            capture.call_args.kwargs["max_tracked_bytes"], 1024 * 1024 * 1024
+        )
+        self.assertTrue(capture.call_args.kwargs["reject_gitlinks"])
+
+    def test_tracked_worktree_hash_enforces_path_byte_and_deadline_bounds(self) -> None:
+        first = b"100644 " + (b"a" * 40) + b" 0\tfirst.txt\0"
+        second = b"100644 " + (b"b" * 40) + b" 0\tsecond.txt\0"
+        with self.assertRaisesRegex(RuntimeError, "path limit exceeded"):
+            work_acquire.git_preimage._tracked_worktree_sha256(
+                self.repo,
+                first + second,
+                max_paths=1,
+            )
+
+        (self.repo / "first.txt").write_bytes(b"abcd")
+        with self.assertRaisesRegex(RuntimeError, "byte limit exceeded"):
+            work_acquire.git_preimage._tracked_worktree_sha256(
+                self.repo,
+                first,
+                max_total_bytes=1,
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "preimage deadline"):
+            work_acquire.git_preimage._tracked_worktree_sha256(
+                self.repo,
+                first,
+                deadline_monotonic=time.monotonic() - 1,
+            )
 
     def test_continuation_preimage_changes_with_raw_tracked_worktree_hash(self) -> None:
         params = self.parameters()

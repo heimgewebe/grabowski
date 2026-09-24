@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import stat
 import subprocess
+import time
 from typing import Any, Callable
 
 import grabowski_consumer_surface as consumer_surface
@@ -36,10 +37,27 @@ def _tracked_index_paths(index_bytes: bytes) -> list[bytes]:
     return sorted(paths)
 
 
-def _safe_worktree_paths_sha256(repo: Path, paths: list[bytes], *, max_paths: int) -> str:
+def _deadline_guard(deadline_monotonic: float | None, label: str) -> None:
+    if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+        raise RuntimeError(f"{label} exceeded the preimage deadline")
+
+
+def _safe_worktree_paths_sha256(
+    repo: Path,
+    paths: list[bytes],
+    *,
+    max_paths: int,
+    max_total_bytes: int | None = None,
+    deadline_monotonic: float | None = None,
+) -> str:
+    if max_paths < 1:
+        raise ValueError("max_paths must be positive")
+    if max_total_bytes is not None and max_total_bytes < 1:
+        raise ValueError("max_total_bytes must be positive")
     if len(paths) > max_paths:
         raise RuntimeError("Git worktree path set exceeds continuation bound")
     digest = hashlib.sha256()
+    total_bytes = 0
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         directory_flags |= os.O_NOFOLLOW
@@ -49,13 +67,17 @@ def _safe_worktree_paths_sha256(repo: Path, paths: list[bytes], *, max_paths: in
     root_fd = os.open(repo, directory_flags)
     try:
         for path in sorted(paths):
+            _deadline_guard(deadline_monotonic, "untracked worktree hashing")
             components = path.split(b"/")
-            if path.startswith(b"/") or any(c in {b"", b".", b".."} for c in components):
+            if path.startswith(b"/") or any(
+                component in {b"", b".", b".."} for component in components
+            ):
                 raise RuntimeError("Git worktree observation contains an unsafe path")
             _frame(digest, b"path", path)
             directory_fd = os.dup(root_fd)
             try:
                 for component in components[:-1]:
+                    _deadline_guard(deadline_monotonic, "untracked worktree hashing")
                     next_fd = os.open(component, directory_flags, dir_fd=directory_fd)
                     os.close(directory_fd)
                     directory_fd = next_fd
@@ -69,14 +91,27 @@ def _safe_worktree_paths_sha256(repo: Path, paths: list[bytes], *, max_paths: in
                         content = hashlib.sha256()
                         size = 0
                         while True:
+                            _deadline_guard(
+                                deadline_monotonic, "untracked worktree hashing"
+                            )
                             chunk = os.read(descriptor, 1024 * 1024)
                             if not chunk:
                                 break
                             size += len(chunk)
+                            total_bytes += len(chunk)
+                            if (
+                                max_total_bytes is not None
+                                and total_bytes > max_total_bytes
+                            ):
+                                raise RuntimeError(
+                                    "untracked worktree byte limit exceeded"
+                                )
                             content.update(chunk)
                         after = os.fstat(descriptor)
                         if not _same_open_file(before, after):
-                            raise RuntimeError("Worktree file changed during preimage capture")
+                            raise RuntimeError(
+                                "Worktree file changed during preimage capture"
+                            )
                     finally:
                         os.close(descriptor)
                     _frame(digest, b"regular-mode", mode_bytes)
@@ -84,8 +119,17 @@ def _safe_worktree_paths_sha256(repo: Path, paths: list[bytes], *, max_paths: in
                     _frame(digest, b"regular-content-sha256", content.digest())
                 elif stat.S_ISLNK(linked.st_mode):
                     target = os.readlink(leaf, dir_fd=directory_fd)
+                    target_bytes = (
+                        target if isinstance(target, bytes) else os.fsencode(target)
+                    )
+                    total_bytes += len(target_bytes)
+                    if (
+                        max_total_bytes is not None
+                        and total_bytes > max_total_bytes
+                    ):
+                        raise RuntimeError("untracked worktree byte limit exceeded")
                     _frame(digest, b"symlink-mode", mode_bytes)
-                    _frame(digest, b"symlink-target", target if isinstance(target, bytes) else os.fsencode(target))
+                    _frame(digest, b"symlink-target", target_bytes)
                 else:
                     raise RuntimeError("Unsupported untracked worktree entry type")
             finally:
@@ -100,12 +144,21 @@ def capture_untracked_preimage(
     probe: Callable[[Path, list[str]], subprocess.CompletedProcess[bytes]],
     *,
     max_paths: int = 100,
+    max_total_bytes: int | None = None,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
+    _deadline_guard(deadline_monotonic, "untracked preimage capture")
     completed = probe(repo, ["ls-files", "--others", "--exclude-standard", "-z"])
     if completed.returncode != 0:
         raise RuntimeError("Git untracked observation failed")
     paths = [path for path in completed.stdout.split(b"\0") if path]
-    digest = _safe_worktree_paths_sha256(repo, paths, max_paths=max_paths)
+    digest = _safe_worktree_paths_sha256(
+        repo,
+        paths,
+        max_paths=max_paths,
+        max_total_bytes=max_total_bytes,
+        deadline_monotonic=deadline_monotonic,
+    )
     material = {"schema_version": 1, "count": len(paths), "worktree_sha256": digest}
     return {
         **material,
@@ -133,13 +186,25 @@ def _same_open_file(before: os.stat_result, after: os.stat_result) -> bool:
     )
 
 
-def _tracked_worktree_sha256(repo: Path, index_bytes: bytes) -> str:
+def _tracked_worktree_sha256(
+    repo: Path,
+    index_bytes: bytes,
+    *,
+    max_paths: int | None = None,
+    max_total_bytes: int | None = None,
+    deadline_monotonic: float | None = None,
+) -> str:
     """Hash raw tracked worktree bytes without Git clean/smudge normalization."""
+    if max_paths is not None and max_paths < 1:
+        raise ValueError("max_paths must be positive")
+    if max_total_bytes is not None and max_total_bytes < 1:
+        raise ValueError("max_total_bytes must be positive")
+    _deadline_guard(deadline_monotonic, "tracked worktree hashing")
+    paths = _tracked_index_paths(index_bytes)
+    if max_paths is not None and len(paths) > max_paths:
+        raise RuntimeError("tracked worktree path limit exceeded")
     digest = hashlib.sha256()
-    # Git diff can normalize bytes or trust index hints, while hash-object --stdin-paths
-    # follows symlinks and cannot represent newline-containing paths safely. Walk the
-    # index-declared paths through no-follow dirfds so the CAS binds the raw entries
-    # that a destructive checkout/restore/reset could replace.
+    total_bytes = 0
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         directory_flags |= os.O_NOFOLLOW
@@ -149,13 +214,15 @@ def _tracked_worktree_sha256(repo: Path, index_bytes: bytes) -> str:
 
     root_fd = os.open(repo, directory_flags)
     try:
-        for path in _tracked_index_paths(index_bytes):
+        for path in paths:
+            _deadline_guard(deadline_monotonic, "tracked worktree hashing")
             _frame(digest, b"path", path)
             components = path.split(b"/")
             directory_fd = os.dup(root_fd)
             try:
                 blocked = False
                 for component in components[:-1]:
+                    _deadline_guard(deadline_monotonic, "tracked worktree hashing")
                     try:
                         linked = os.stat(
                             component, dir_fd=directory_fd, follow_symlinks=False
@@ -220,10 +287,21 @@ def _tracked_worktree_sha256(repo: Path, index_bytes: bytes) -> str:
                         content = hashlib.sha256()
                         size = 0
                         while True:
+                            _deadline_guard(
+                                deadline_monotonic, "tracked worktree hashing"
+                            )
                             chunk = os.read(descriptor, 1024 * 1024)
                             if not chunk:
                                 break
                             size += len(chunk)
+                            total_bytes += len(chunk)
+                            if (
+                                max_total_bytes is not None
+                                and total_bytes > max_total_bytes
+                            ):
+                                raise RuntimeError(
+                                    "tracked worktree byte limit exceeded"
+                                )
                             content.update(chunk)
                         opened_after = os.fstat(descriptor)
                         if not _same_open_file(opened_before, opened_after):
@@ -237,12 +315,17 @@ def _tracked_worktree_sha256(repo: Path, index_bytes: bytes) -> str:
                     _frame(digest, b"regular-content-sha256", content.digest())
                 elif stat.S_ISLNK(linked.st_mode):
                     target = os.readlink(leaf, dir_fd=directory_fd)
-                    _frame(digest, b"symlink-mode", mode_bytes)
-                    _frame(
-                        digest,
-                        b"symlink-target",
-                        target if isinstance(target, bytes) else os.fsencode(target),
+                    target_bytes = (
+                        target if isinstance(target, bytes) else os.fsencode(target)
                     )
+                    total_bytes += len(target_bytes)
+                    if (
+                        max_total_bytes is not None
+                        and total_bytes > max_total_bytes
+                    ):
+                        raise RuntimeError("tracked worktree byte limit exceeded")
+                    _frame(digest, b"symlink-mode", mode_bytes)
+                    _frame(digest, b"symlink-target", target_bytes)
                 elif stat.S_ISDIR(linked.st_mode):
                     _frame(digest, b"directory-mode", mode_bytes)
                     _frame(digest, b"directory-inode", linked.st_ino.to_bytes(8, "big"))
@@ -265,6 +348,11 @@ def capture_branch_preimage(
     probe: Callable[[Path, list[str]], subprocess.CompletedProcess[bytes]],
     *,
     require_attached: bool = True,
+    index_probe: Callable[[Path, list[str]], subprocess.CompletedProcess[bytes]] | None = None,
+    max_tracked_paths: int | None = None,
+    max_tracked_bytes: int | None = None,
+    deadline_monotonic: float | None = None,
+    reject_gitlinks: bool = False,
 ) -> dict[str, Any]:
     """Build one exact branch/index/raw-worktree CAS preimage from safe observations.
 
@@ -273,6 +361,7 @@ def capture_branch_preimage(
     transient same-UID swap-and-restore race during an individual subprocess probe.
     """
     requested_repo = Path(os.path.abspath(os.fspath(repo)))
+    _deadline_guard(deadline_monotonic, "branch preimage capture")
     physical_before = physical_checkout.capture_physical_checkout_identity(requested_repo)
     repo = Path(physical_before["root"]["path"])
     branch_probe = probe(repo, ["symbolic-ref", "--quiet", "--short", "HEAD"])
@@ -300,14 +389,29 @@ def capture_branch_preimage(
     else:
         raise RuntimeError("Git HEAD observation failed")
 
-    index_probe = probe(repo, ["ls-files", "--stage", "-z"])
-    if index_probe.returncode != 0:
+    _deadline_guard(deadline_monotonic, "branch preimage capture")
+    index_reader = index_probe or probe
+    index_result = index_reader(repo, ["ls-files", "--stage", "-z"])
+    if index_result.returncode != 0:
         raise RuntimeError("Git index observation failed")
-    index_sha256 = hashlib.sha256(index_probe.stdout).hexdigest()
-    worktree_sha256 = _tracked_worktree_sha256(repo, index_probe.stdout)
+    if reject_gitlinks and any(
+        record.startswith(b"160000 ")
+        for record in index_result.stdout.split(b"\0")
+        if record
+    ):
+        raise RuntimeError("Git index contains a tracked submodule")
+    index_sha256 = hashlib.sha256(index_result.stdout).hexdigest()
+    worktree_sha256 = _tracked_worktree_sha256(
+        repo,
+        index_result.stdout,
+        max_paths=max_tracked_paths,
+        max_total_bytes=max_tracked_bytes,
+        deadline_monotonic=deadline_monotonic,
+    )
 
     operation_refs: dict[str, str] = {}
     for name in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD"):
+        _deadline_guard(deadline_monotonic, "branch preimage capture")
         ref_probe = probe(repo, ["rev-parse", "--verify", "--quiet", name])
         if ref_probe.returncode == 0:
             value = ref_probe.stdout.decode("ascii", errors="strict").strip()

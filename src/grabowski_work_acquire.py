@@ -1545,7 +1545,7 @@ def _bounded_raw_nul_git_probe(
     *,
     max_records: int,
     max_stdout_bytes: int,
-    timeout_seconds: int = 30,
+    timeout_seconds: int | float = 30,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run one byte-preserving Git read with pre-buffer record and byte bounds."""
 
@@ -1699,6 +1699,14 @@ def _continuation_preimage(
     head_sha = str(head.get("stdout") or "").strip().lower()
     if SHA40_RE.fullmatch(head_sha) is None:
         raise RuntimeError("managed worktree continuation HEAD is invalid")
+    snapshot_deadline = time.monotonic() + 30.0
+
+    def remaining_snapshot_seconds() -> float:
+        remaining = snapshot_deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("managed worktree continuation preimage deadline exceeded")
+        return remaining
+
     def raw_probe(cwd: Path, argv: list[str]) -> subprocess.CompletedProcess[bytes]:
         return subprocess.run(
             ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *argv],
@@ -1707,8 +1715,19 @@ def _continuation_preimage(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
-            timeout=30,
+            timeout=remaining_snapshot_seconds(),
             env=operator._git_environment(),
+        )
+
+    def bounded_tracked_index_probe(
+        cwd: Path, argv: list[str]
+    ) -> subprocess.CompletedProcess[bytes]:
+        return _bounded_raw_nul_git_probe(
+            cwd,
+            argv,
+            max_records=100_000,
+            max_stdout_bytes=32 * 1024 * 1024,
+            timeout_seconds=remaining_snapshot_seconds(),
         )
 
     def bounded_untracked_probe(
@@ -1719,12 +1738,19 @@ def _continuation_preimage(
             argv,
             max_records=100,
             max_stdout_bytes=512 * 1024,
-            timeout_seconds=30,
+            timeout_seconds=remaining_snapshot_seconds(),
         )
 
     try:
         branch_preimage = git_preimage.capture_branch_preimage(
-            target, raw_probe, require_attached=True
+            target,
+            raw_probe,
+            require_attached=True,
+            index_probe=bounded_tracked_index_probe,
+            max_tracked_paths=25_000,
+            max_tracked_bytes=1024 * 1024 * 1024,
+            deadline_monotonic=snapshot_deadline,
+            reject_gitlinks=True,
         )
     except Exception as exc:
         raise RuntimeError(
@@ -1744,16 +1770,6 @@ def _continuation_preimage(
     if branch_preimage.get("operation_refs"):
         raise RuntimeError("managed worktree continuation has in-progress Git operation")
 
-    raw_index = raw_probe(target, ["ls-files", "--stage", "-z"])
-    if raw_index.returncode != 0:
-        raise RuntimeError("managed worktree continuation raw index readback failed")
-    if any(
-        record.startswith(b"160000 ")
-        for record in raw_index.stdout.split(b"\0")
-        if record
-    ):
-        raise RuntimeError("managed worktree continuation has tracked submodule")
-
     index_entries = [
         entry for entry in str(index_flags.get("stdout") or "").split("\0") if entry
     ]
@@ -1765,14 +1781,25 @@ def _continuation_preimage(
     prior_head = live_lifecycle.get("expected_head")
     if not isinstance(prior_head, str) or SHA40_RE.fullmatch(prior_head) is None:
         raise RuntimeError("managed worktree continuation prior HEAD evidence is invalid")
-    ancestry = runner(
-        target, ["merge-base", "--is-ancestor", prior_head, head_sha]
+    ancestry = raw_probe(
+        target,
+        [
+            "--no-replace-objects",
+            "merge-base",
+            "--is-ancestor",
+            prior_head,
+            head_sha,
+        ],
     )
-    if ancestry.get("returncode") != 0:
+    if ancestry.returncode != 0:
         raise RuntimeError("managed worktree continuation HEAD is not a descendant of ensure")
     try:
         untracked_preimage = git_preimage.capture_untracked_preimage(
-            target, bounded_untracked_probe, max_paths=100
+            target,
+            bounded_untracked_probe,
+            max_paths=100,
+            max_total_bytes=256 * 1024 * 1024,
+            deadline_monotonic=snapshot_deadline,
         )
     except Exception as exc:
         raise RuntimeError(
