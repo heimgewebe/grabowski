@@ -2244,6 +2244,42 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertEqual(4, result["total_attention"])
         self.assertEqual("raw_task_state_projection_before_decisions", result["total_attention_scope"])
 
+    def test_attention_row_projection_omits_bulk_payload_without_retry_binding(self) -> None:
+        record = self._failed_task()
+        task_id = str(record["task_id"])
+        launcher = {
+            "returncode": 1, "stdout": "", "stderr": "", "timed_out": False,
+            "stdout_truncated": False, "stderr_truncated": False,
+            "command": "x" * 32_000, "argv": ["y" * 32_000],
+        }
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET launcher_json=?, argv_json=?, last_observation_json=? "
+                "WHERE task_id=?",
+                (
+                    json.dumps(launcher), json.dumps(["z" * 32_000]),
+                    json.dumps({"payload": "q" * 32_000}), task_id,
+                ),
+            )
+            row = dict(
+                connection.execute(
+                    "SELECT * FROM tasks WHERE task_id=?", (task_id,)
+                ).fetchone()
+            )
+        projected = tasks._task_attention_record(row)
+        self.assertIsNone(projected["launcher_json"])
+        self.assertNotIn("argv_json", projected)
+        self.assertNotIn("last_observation_json", projected)
+        self.assertRegex(projected["_task_projection_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_attention_row_projection_preserves_retry_binding_launcher(self) -> None:
+        _source, successor = self._verified_retry_pair()
+        projected = tasks._task_attention_record(
+            tasks._row(str(successor["task_id"]))
+        )
+        self.assertIsInstance(projected["launcher_json"], dict)
+        self.assertIn("retry_binding", projected["launcher_json"])
+
     def test_current_reconciliation_auto_hides_non_actionable_failure_classes(self) -> None:
         started = self._start()
         expected_red = tasks._set_state(
