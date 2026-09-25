@@ -360,6 +360,68 @@ class PhysicalCheckoutIdentityTests(unittest.TestCase):
                     identity["common_dir"]["path"], worktree
                 )
 
+    def test_new_registration_during_backlink_revalidation_is_detected_before_return(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            worktree = root / "worktree"
+            self._init_committed_repo(repo, branch="main")
+            self._run(
+                "git",
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked",
+                str(worktree),
+                "HEAD",
+                cwd=repo,
+            )
+
+            identity = physical_checkout.capture_physical_checkout_identity(worktree)
+            registered_name = Path(identity["git_dir"]["path"]).name
+            worktrees = Path(identity["common_dir"]["path"]) / "worktrees"
+            duplicate = worktrees / "late-duplicate"
+            original_open = physical_checkout._open_relative_directory
+            target_admin_open_count = 0
+
+            def create_duplicate_during_revalidation(
+                parent_descriptor: int,
+                name: str,
+                *,
+                label: str,
+            ):
+                nonlocal target_admin_open_count
+                if (
+                    label == "git worktree admin directory"
+                    and name == registered_name
+                ):
+                    target_admin_open_count += 1
+                    if target_admin_open_count == 2:
+                        duplicate.mkdir()
+                        (duplicate / "gitdir").write_text(
+                            str(worktree / ".git") + "\n",
+                            encoding="utf-8",
+                        )
+                return original_open(parent_descriptor, name, label=label)
+
+            with (
+                patch.object(
+                    physical_checkout,
+                    "_open_relative_directory",
+                    side_effect=create_duplicate_during_revalidation,
+                ),
+                self.assertRaisesRegex(
+                    physical_checkout.PhysicalCheckoutIdentityError,
+                    "git worktrees directory changed during registered identity capture",
+                ),
+            ):
+                physical_checkout.capture_registered_linked_worktree_git_dir(
+                    identity["common_dir"]["path"], worktree
+                )
+
+            self.assertEqual(2, target_admin_open_count)
+
     def test_untracked_hash_rejects_atomic_leaf_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -822,6 +822,11 @@ def capture_registered_linked_worktree_git_dir(
             )
         finally:
             os.close(descriptor)
+        final = os.fstat(worktrees_descriptor)
+        if not _same_file_snapshot(before, final):
+            raise PhysicalCheckoutIdentityError(
+                "git worktrees directory changed during registered identity capture"
+            )
         return registered
     finally:
         if worktrees_descriptor is not None:
