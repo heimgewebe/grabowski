@@ -122,6 +122,7 @@ USER_SYSTEMD_UNCERTAINTY_KIND = "grabowski_user_systemd_uncertainty_fence"
 USER_SYSTEMD_UNCERTAINTY_PHASES = frozenset(
     {"prepared", "dispatching", "outcome_unknown", "preexisting_job"}
 )
+USER_SYSTEMD_UNIT_FILE_ACTIONS = frozenset({"enable", "disable"})
 RECONCILIATION_NON_CLAIMS = [
     "permission_to_release_changed_lease",
     "permission_to_release_other_owner",
@@ -1636,6 +1637,42 @@ def _work_lane_path_scope(
     return {"repository": repository, "paths": sorted(set(paths))}
 
 
+def _user_systemd_unit_file_path_scope(
+    keys: list[str], metadata: dict[str, Any], *, owner_id: str
+) -> dict[str, Any] | None:
+    if DIRECT_OPERATOR_OWNER_RE.fullmatch(owner_id) is None:
+        return None
+    if metadata.get("action") not in USER_SYSTEMD_UNIT_FILE_ACTIONS:
+        return None
+    raw_root = metadata.get("unit_file_config_root")
+    if raw_root is None:
+        return None
+    if not isinstance(raw_root, str):
+        raise RuntimeError("user-systemd unit-file config scope is invalid")
+    root_path = Path(raw_root).expanduser()
+    if not root_path.is_absolute():
+        raise RuntimeError("user-systemd unit-file config scope is not absolute")
+    root = os.path.normpath(str(root_path))
+    if f"path:{root}" not in keys:
+        return None
+    unit = metadata.get("unit")
+    if not isinstance(unit, str) or SERVICE_RE.fullmatch(unit) is None:
+        raise RuntimeError("user-systemd unit-file config scope unit is invalid")
+    return {"repository": None, "paths": [root]}
+
+
+def _hierarchical_path_scope(
+    keys: list[str], metadata: dict[str, Any], *, owner_id: str
+) -> dict[str, Any] | None:
+    lane_scope = _work_lane_path_scope(keys, metadata, owner_id=owner_id)
+    unit_file_scope = _user_systemd_unit_file_path_scope(
+        keys, metadata, owner_id=owner_id
+    )
+    if lane_scope is not None and unit_file_scope is not None:
+        raise RuntimeError("resource lease exposes multiple hierarchical path scopes")
+    return lane_scope if lane_scope is not None else unit_file_scope
+
+
 def _path_scope_contains(scope_path: str, path: str) -> bool:
     try:
         return os.path.commonpath([scope_path, path]) == scope_path
@@ -1651,20 +1688,19 @@ def _check_work_lane_path_scope_conflicts(
     metadata: dict[str, Any],
     now: int,
 ) -> None:
-    """Protect Work Lane directory scopes without redefining exact path leases.
+    """Protect explicit subtree authorities without redefining ordinary path leases.
 
-    ``path:`` remains an exact resource identity for legacy and lifecycle users.
-    Work Lane write paths are different: the sandbox permits a declared directory
-    and therefore everything below it to be written.  The server-generated lane
-    metadata lets us apply subtree overlap only to lane paths inside the canonical
-    repository; the usual sibling target-worktree path therefore stays exact.
+    ``path:`` remains exact by default. Work Lane write directories and the
+    permanent user-systemd unit-file config root are the bounded exceptions:
+    trusted metadata marks those paths as hierarchical scopes, so overlapping
+    parent/child writers conflict while unrelated path leases stay parallel.
     """
     requested_exact_paths = [
         key.removeprefix("path:") for key in keys if key.startswith("path:")
     ]
     if not requested_exact_paths:
         return
-    requested_scope = _work_lane_path_scope(keys, metadata, owner_id=owner)
+    requested_scope = _hierarchical_path_scope(keys, metadata, owner_id=owner)
     rows = connection.execute(
         "SELECT * FROM leases WHERE resource_key>=? AND resource_key<? "
         "AND owner_id<>? AND expires_at_unix>? ORDER BY resource_key",
@@ -1678,7 +1714,7 @@ def _check_work_lane_path_scope_conflicts(
             raise ResourceConflict(
                 row["resource_key"], row["owner_id"], row["expires_at_unix"]
             )
-        existing_scope = _work_lane_path_scope(
+        existing_scope = _hierarchical_path_scope(
             [str(row["resource_key"])],
             existing_metadata,
             owner_id=str(row["owner_id"]),
@@ -5478,7 +5514,10 @@ def _validate_user_systemd_uncertainty_fence(value: Any) -> dict[str, Any]:
     if "component:user-systemd-manager" in keys:
         raise RuntimeError("user-systemd uncertainty fence must not use global manager authority")
     extra_keys = [key for key in keys if key != service_key]
-    if len(extra_keys) > 1 or any(not key.startswith("path:") for key in extra_keys):
+    max_path_keys = 2 if action in USER_SYSTEMD_UNIT_FILE_ACTIONS else 1
+    if len(extra_keys) > max_path_keys or any(
+        not key.startswith("path:") for key in extra_keys
+    ):
         raise RuntimeError("user-systemd uncertainty fence has unsupported authority keys")
     if value.get("resource_keys_sha256") != hashlib.sha256(
         _canonical_json(keys).encode("utf-8")
@@ -5641,8 +5680,11 @@ def _check_user_systemd_uncertainty_conflicts(
     metadata: dict[str, Any] | None = None,
 ) -> None:
     requested = set(keys)
+    requested_exact_paths = [
+        key.removeprefix("path:") for key in keys if key.startswith("path:")
+    ]
     requested_scope = (
-        _work_lane_path_scope(keys, metadata, owner_id=owner)
+        _hierarchical_path_scope(keys, metadata, owner_id=owner)
         if owner is not None and metadata is not None
         else None
     )
@@ -5654,13 +5696,23 @@ def _check_user_systemd_uncertainty_conflicts(
             raise ResourceUncertaintyConflict(
                 overlap[0], fence["fence_id"], fence["unit"], fence["phase"]
             )
-        if requested_scope is None or not requested_scope["paths"]:
-            continue
         fence_paths = [
             key.removeprefix("path:")
             for key in fence["resource_keys"]
             if key.startswith("path:")
         ]
+        if fence["action"] in USER_SYSTEMD_UNIT_FILE_ACTIONS:
+            for requested_path in requested_exact_paths:
+                for fence_path in fence_paths:
+                    if _path_scope_contains(fence_path, requested_path):
+                        raise ResourceUncertaintyConflict(
+                            f"path:{fence_path}",
+                            fence["fence_id"],
+                            fence["unit"],
+                            fence["phase"],
+                        )
+        if requested_scope is None or not requested_scope["paths"]:
+            continue
         for scope_path in requested_scope["paths"]:
             for fence_path in fence_paths:
                 if _path_scope_contains(scope_path, fence_path):
@@ -5694,7 +5746,10 @@ def prepare_user_systemd_uncertainty_fence(
     if "component:user-systemd-manager" in keys:
         raise ValueError("user-systemd uncertainty must not use global manager authority")
     extra_keys = [key for key in keys if key != service_key]
-    if len(extra_keys) > 1 or any(not key.startswith("path:") for key in extra_keys):
+    max_path_keys = 2 if action in USER_SYSTEMD_UNIT_FILE_ACTIONS else 1
+    if len(extra_keys) > max_path_keys or any(
+        not key.startswith("path:") for key in extra_keys
+    ):
         raise ValueError("user-systemd uncertainty has unsupported authority keys")
     snapshots = _normalize_mutation_lease_snapshots(
         expected_leases,

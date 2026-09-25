@@ -224,6 +224,114 @@ class UserServiceCoordinationTests(unittest.TestCase):
         resources.renew_resources.assert_not_called()
         resources.release_resources.assert_called_once()
 
+    def test_enable_and_disable_acquire_user_unit_config_scope(self) -> None:
+        fragment = "/usr/lib/systemd/user/demo.service"
+        xdg_config = Path("/tmp/grabowski-user-systemd-xdg")
+        config_root = xdg_config / "systemd" / "user"
+        for index, action in enumerate(("enable", "disable"), start=2):
+            with self.subTest(action=action):
+                resources = _fake_resources()
+                action_result = _result(stdout=action)
+                with (
+                    patch.dict(
+                        operator.os.environ,
+                        {"XDG_CONFIG_HOME": str(xdg_config)},
+                        clear=False,
+                    ),
+                    patch.dict(sys.modules, {"grabowski_resources": resources}),
+                    patch.object(operator, "_require_operator_capability"),
+                    patch.object(operator, "_require_operator_mutation"),
+                    patch.object(
+                        operator,
+                        "_run",
+                        side_effect=[
+                            _result(stdout=fragment + "\n"),
+                            _result(stdout=_reconciliation(fragment=fragment)),
+                            action_result,
+                        ],
+                    ),
+                    patch.object(
+                        operator.uuid,
+                        "uuid4",
+                        return_value=types.SimpleNamespace(hex=str(index) * 32),
+                    ),
+                ):
+                    result = operator.grabowski_user_service("demo.service", action)
+
+                self.assertIs(result, action_result)
+                owner = "operator:user-systemd-" + str(index) * 32
+                resource_keys = [
+                    "service:user-systemd:demo.service",
+                    f"path:{fragment}",
+                    f"path:{config_root}",
+                ]
+                resources.acquire_resources.assert_called_once_with(
+                    owner,
+                    resource_keys,
+                    purpose=f"user systemd {action} demo.service",
+                    ttl_seconds=operator._user_systemd_lease_ttl_seconds(
+                        operator._USER_SYSTEMD_MUTATION_TIMEOUT_SECONDS
+                    ),
+                    metadata={
+                        "unit": "demo.service",
+                        "action": action,
+                        "unit_file_config_root": str(config_root),
+                    },
+                )
+                prepared = resources.prepare_user_systemd_uncertainty_fence.call_args
+                self.assertEqual(prepared.args[1], resource_keys)
+                self.assertEqual(prepared.kwargs["unit"], "demo.service")
+                self.assertEqual(prepared.kwargs["action"], action)
+
+    def test_non_unit_file_actions_keep_narrow_authority(self) -> None:
+        fragment = "/usr/lib/systemd/user/demo.service"
+        xdg_config = Path("/tmp/grabowski-user-systemd-xdg")
+        config_key = f"path:{xdg_config / 'systemd' / 'user'}"
+        for index, action in enumerate(("start", "stop", "restart"), start=5):
+            with self.subTest(action=action):
+                resources = _fake_resources()
+                with (
+                    patch.dict(
+                        operator.os.environ,
+                        {"XDG_CONFIG_HOME": str(xdg_config)},
+                        clear=False,
+                    ),
+                    patch.dict(sys.modules, {"grabowski_resources": resources}),
+                    patch.object(operator, "_require_operator_capability"),
+                    patch.object(operator, "_require_operator_mutation"),
+                    patch.object(
+                        operator,
+                        "_run",
+                        side_effect=[
+                            _result(stdout=fragment + "\n"),
+                            _result(stdout=_reconciliation(fragment=fragment)),
+                            _result(stdout=action),
+                        ],
+                    ),
+                    patch.object(
+                        operator.uuid,
+                        "uuid4",
+                        return_value=types.SimpleNamespace(hex=str(index) * 32),
+                    ),
+                ):
+                    operator.grabowski_user_service("demo.service", action)
+
+                self.assertEqual(
+                    resources.acquire_resources.call_args.args[1],
+                    [
+                        "service:user-systemd:demo.service",
+                        f"path:{fragment}",
+                    ],
+                )
+                self.assertNotIn(
+                    "unit_file_config_root",
+                    resources.acquire_resources.call_args.kwargs["metadata"],
+                )
+                self.assertNotIn(
+                    config_key,
+                    resources.acquire_resources.call_args.args[1],
+                )
+
     def test_reconciliation_requests_empty_properties_explicitly(self) -> None:
         with patch.object(
             operator,

@@ -7741,6 +7741,20 @@ _USER_SYSTEMD_RECONCILIATION_LEASE_TTL_SECONDS = (
 )
 
 
+_USER_SYSTEMD_UNIT_FILE_ACTIONS = frozenset({"enable", "disable"})
+
+
+def _user_systemd_unit_config_root() -> Path:
+    raw = os.environ.get("XDG_CONFIG_HOME")
+    if raw:
+        config_home = Path(raw).expanduser()
+        if not config_home.is_absolute():
+            raise RuntimeError("XDG_CONFIG_HOME for user systemd must be absolute")
+    else:
+        config_home = HOME / ".config"
+    return Path(os.path.normpath(str(config_home / "systemd" / "user")))
+
+
 def _normalize_user_systemd_fragment_path(name: str, value: str) -> Path | None:
     lines = [line.strip() for line in value.splitlines() if line.strip()]
     if not lines:
@@ -8282,16 +8296,26 @@ def _run_mutating_user_systemd_unit(
         return _user_systemd_durable_fence_block_result(prior)
 
     fragment_before = _user_systemd_fragment_path(name)
+    unit_file_config_root = (
+        _user_systemd_unit_config_root()
+        if action in _USER_SYSTEMD_UNIT_FILE_ACTIONS
+        else None
+    )
     resource_keys = [unit_resource_key]
     if fragment_before is not None:
         resource_keys.append(f"path:{fragment_before}")
+    if unit_file_config_root is not None:
+        resource_keys.append(f"path:{unit_file_config_root}")
+    lease_metadata = {"unit": name, "action": action}
+    if unit_file_config_root is not None:
+        lease_metadata["unit_file_config_root"] = str(unit_file_config_root)
     owner_id = f"operator:user-systemd-{uuid.uuid4().hex}"
     lease = resources.acquire_resources(
         owner_id,
         resource_keys,
         purpose=f"user systemd {action} {name}",
         ttl_seconds=_user_systemd_lease_ttl_seconds(mutation_timeout_seconds),
-        metadata={"unit": name, "action": action},
+        metadata=lease_metadata,
     )
     lease_snapshots = list(lease["leases"])
 
