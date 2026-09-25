@@ -883,15 +883,21 @@ class OperatorSignedTransportTests(unittest.TestCase):
                 "target_branch": "main",
                 "expected_local_head": "1" * 40,
                 "expected_remote_head": "2" * 40,
+                "expected_physical_identity_sha256": "f" * 64,
                 "confirmation": "apply-protected-post-merge-sync",
             },
             "profile": "operator",
             "allow_mutation": True,
         }
-        evidence = operator._signed_replay_recovery_preflight(
-            tool_name="grip_run",
-            arguments=arguments,
-        )
+        with mock.patch.object(
+            operator.grabowski_physical_checkout,
+            "capture_physical_checkout_identity",
+            return_value={"physical_identity_sha256": "f" * 64},
+        ):
+            evidence = operator._signed_replay_recovery_preflight(
+                tool_name="grip_run",
+                arguments=arguments,
+            )
         self.assertIsInstance(evidence, dict)
         assert evidence is not None
         self.assertEqual(
@@ -905,7 +911,7 @@ class OperatorSignedTransportTests(unittest.TestCase):
         current_spec = operator.grabowski_grips.GRIP_SPECS["post-merge-sync-apply"]
         drifted_spec = SimpleNamespace(
             name=current_spec.name,
-            version="1.1",
+            version="1.2",
             required_parameters=current_spec.required_parameters,
             effect=current_spec.effect,
             runner=current_spec.runner,
@@ -921,6 +927,25 @@ class OperatorSignedTransportTests(unittest.TestCase):
                 operator._signed_replay_recovery_preflight(
                     tool_name="grip_run",
                     arguments=arguments,
+                )
+            )
+
+        mismatched_identity = {
+            **arguments,
+            "parameters": {
+                **arguments["parameters"],
+                "expected_physical_identity_sha256": "e" * 64,
+            },
+        }
+        with mock.patch.object(
+            operator.grabowski_physical_checkout,
+            "capture_physical_checkout_identity",
+            return_value={"physical_identity_sha256": "f" * 64},
+        ):
+            self.assertIsNone(
+                operator._signed_replay_recovery_preflight(
+                    tool_name="grip_run",
+                    arguments=mismatched_identity,
                 )
             )
 
@@ -957,6 +982,7 @@ class OperatorSignedTransportTests(unittest.TestCase):
                 "target_branch": "main",
                 "expected_local_head": "1" * 40,
                 "expected_remote_head": "2" * 40,
+                "expected_physical_identity_sha256": "f" * 64,
                 "confirmation": "apply-protected-post-merge-sync",
             },
             "profile": "operator",
@@ -974,12 +1000,17 @@ class OperatorSignedTransportTests(unittest.TestCase):
             mock.patch.object(roundtrip, "consume_verified") as consume_verified,
             mock.patch.object(roundtrip, "begin") as begin,
         ):
-            evidence = operator._require_transport_roundtrip_for_tool(
-                tool_name="grip_run",
-                arguments=arguments,
-                context=_ctx({}),
-                tool=tool,
-            )
+            with mock.patch.object(
+                operator.grabowski_physical_checkout,
+                "capture_physical_checkout_identity",
+                return_value={"physical_identity_sha256": "f" * 64},
+            ):
+                evidence = operator._require_transport_roundtrip_for_tool(
+                    tool_name="grip_run",
+                    arguments=arguments,
+                    context=_ctx({}),
+                    tool=tool,
+                )
         consume_verified.assert_not_called()
         begin.assert_not_called()
         self.assertTrue(evidence["signed_one_call_replay_recovery"])

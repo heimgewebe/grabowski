@@ -40,6 +40,7 @@ if "mcp" not in sys.modules:
 
 
 import grabowski_post_merge_sync_apply as sync_apply  # noqa: E402
+import grabowski_physical_checkout as physical_checkout  # noqa: E402
 
 
 def git(repo: Path, argv: list[str]) -> dict[str, object]:
@@ -392,11 +393,13 @@ class PostMergeSyncApplyTests(unittest.TestCase):
         runner=git,
         remote_reader=None,
     ) -> dict[str, object]:
+        physical = physical_checkout.capture_physical_checkout_identity(repo)
         return sync_apply.apply(
             repo=repo,
             target_branch="main",
             expected_local_head=local_head,
             expected_remote_head=remote_head,
+            expected_physical_identity_sha256=physical["physical_identity_sha256"],
             remote="origin",
             remote_target=str(remote),
             confirmation=sync_apply.CONFIRMATION,
@@ -404,6 +407,103 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             remote_head_reader=remote_reader or self.remote_reader(remote),
             pinned_target_factory=self.pinned(remote),
         )
+
+    def test_physical_identity_mismatch_blocks_before_leases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            expected = physical_checkout.capture_physical_checkout_identity(repo)
+            leases = LeaseHarness()
+            changed = {**expected, "physical_identity_sha256": "0" * 64}
+            with (
+                patched_leases(leases),
+                patch.object(
+                    sync_apply.physical_checkout,
+                    "capture_physical_checkout_identity",
+                    return_value=changed,
+                ),
+            ):
+                result = sync_apply.apply(
+                    repo=repo,
+                    target_branch="main",
+                    expected_local_head=base,
+                    expected_remote_head=target,
+                    expected_physical_identity_sha256=expected[
+                        "physical_identity_sha256"
+                    ],
+                    remote="origin",
+                    remote_target=str(remote),
+                    confirmation=sync_apply.CONFIRMATION,
+                    runner=git,
+                    remote_head_reader=self.remote_reader(remote),
+                    pinned_target_factory=self.pinned(remote),
+                )
+
+            self.assertEqual("blocked", result["receipt_status"])
+            self.assertEqual("physical_checkout_identity_mismatch", result["state"])
+            self.assertFalse(result["effect_started"])
+            self.assertEqual(0, leases.acquire_calls)
+
+    def test_physical_identity_drift_after_lease_blocks_before_git_effect(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            expected = physical_checkout.capture_physical_checkout_identity(repo)
+            changed = {**expected, "physical_identity_sha256": "0" * 64}
+            leases = LeaseHarness()
+            with (
+                patched_leases(leases),
+                patch.object(
+                    sync_apply.physical_checkout,
+                    "capture_physical_checkout_identity",
+                    side_effect=[expected, changed],
+                ),
+            ):
+                result = sync_apply.apply(
+                    repo=repo,
+                    target_branch="main",
+                    expected_local_head=base,
+                    expected_remote_head=target,
+                    expected_physical_identity_sha256=expected[
+                        "physical_identity_sha256"
+                    ],
+                    remote="origin",
+                    remote_target=str(remote),
+                    confirmation=sync_apply.CONFIRMATION,
+                    runner=git,
+                    remote_head_reader=self.remote_reader(remote),
+                    pinned_target_factory=self.pinned(remote),
+                )
+
+            self.assertEqual("blocked", result["receipt_status"])
+            self.assertEqual(
+                "physical_checkout_identity_drift_after_lease",
+                result["state"],
+            )
+            self.assertFalse(result["effect_started"])
+            self.assertEqual(1, leases.acquire_calls)
+            self.assertEqual(1, leases.release_calls)
+
+    def test_physical_identity_drift_at_final_readback_never_reports_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            expected = physical_checkout.capture_physical_checkout_identity(repo)
+            changed = {**expected, "physical_identity_sha256": "0" * 64}
+            leases = LeaseHarness()
+            with (
+                patched_leases(leases),
+                patch.object(
+                    sync_apply.physical_checkout,
+                    "capture_physical_checkout_identity",
+                    side_effect=[expected, expected, expected, changed],
+                ),
+            ):
+                result = self.apply(repo, remote, base, target)
+
+            self.assertEqual("failed", result["receipt_status"])
+            self.assertEqual("physical_checkout_identity_drift_final", result["state"])
+            self.assertFalse(result["physical_identity_verified"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertEqual(target, git_stdout(repo, "rev-parse", "HEAD"))
+            self.assertEqual(1, leases.release_calls)
 
     def test_successful_clean_fast_forward(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

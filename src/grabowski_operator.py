@@ -50,6 +50,7 @@ import grabowski_git_preimage
 import grabowski_transport_assertion
 import grabowski_transport_roundtrip
 import grabowski_serving_process
+import grabowski_physical_checkout
 
 
 HOME = Path.home().resolve()
@@ -1340,6 +1341,7 @@ def _post_merge_sync_apply_replay_preflight(
         "target_branch",
         "expected_local_head",
         "expected_remote_head",
+        "expected_physical_identity_sha256",
         "confirmation",
     }
     allowed_parameters = required_parameters | {"remote"}
@@ -1351,6 +1353,7 @@ def _post_merge_sync_apply_replay_preflight(
     spec = grabowski_grips.GRIP_SPECS.get("post-merge-sync-apply")
     required_acceptance = frozenset(
         {
+            "physical-checkout-bound",
             "protected-canonical-checkout",
             "clean-exact-preimage",
             "remote-head-bound",
@@ -1363,13 +1366,14 @@ def _post_merge_sync_apply_replay_preflight(
     )
     if (
         spec is None
-        or spec.version != "1.0"
+        or spec.version != "1.1"
         or tuple(spec.required_parameters)
         != (
             "repo",
             "target_branch",
             "expected_local_head",
             "expected_remote_head",
+            "expected_physical_identity_sha256",
             "confirmation",
         )
         or spec.effect != grabowski_grips.MUTATING
@@ -1384,6 +1388,9 @@ def _post_merge_sync_apply_replay_preflight(
     target_branch = parameters.get("target_branch")
     expected_local_head = parameters.get("expected_local_head")
     expected_remote_head = parameters.get("expected_remote_head")
+    expected_physical_identity_sha256 = parameters.get(
+        "expected_physical_identity_sha256"
+    )
     confirmation = parameters.get("confirmation")
     remote = parameters.get("remote", "origin")
     if (
@@ -1399,11 +1406,32 @@ def _post_merge_sync_apply_replay_preflight(
         or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", expected_remote_head)
         is None
         or len(expected_local_head) != len(expected_remote_head)
+        or not isinstance(expected_physical_identity_sha256, str)
+        or re.fullmatch(
+            r"[0-9a-f]{64}", expected_physical_identity_sha256
+        )
+        is None
         or confirmation != "apply-protected-post-merge-sync"
         or not isinstance(remote, str)
         or remote in {"", ".", ".."}
         or re.fullmatch(r"[A-Za-z0-9._-]{1,128}", remote) is None
         or remote.startswith("-")
+    ):
+        return None
+
+    try:
+        physical_identity = (
+            grabowski_physical_checkout.capture_physical_checkout_identity(repo)
+        )
+    except (
+        OSError,
+        ValueError,
+        grabowski_physical_checkout.PhysicalCheckoutIdentityError,
+    ):
+        return None
+    if (
+        physical_identity.get("physical_identity_sha256")
+        != expected_physical_identity_sha256
     ):
         return None
 
@@ -1423,6 +1451,7 @@ def _post_merge_sync_apply_replay_preflight(
         "tool_name": tool_name,
         "grip_name": "post-merge-sync-apply",
         "reentry_mode": "intrinsic_idempotent_domain",
+        "physical_identity_sha256": expected_physical_identity_sha256,
         "parameters_sha256": grabowski_transport_roundtrip.canonical_arguments_sha256(
             parameters
         ),

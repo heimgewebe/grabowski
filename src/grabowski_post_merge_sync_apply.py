@@ -8,6 +8,7 @@ import secrets
 from typing import Any, Callable
 
 import grabowski_resources as resources
+import grabowski_physical_checkout as physical_checkout
 
 
 CommandRunner = Callable[[Path, list[str]], dict[str, Any]]
@@ -26,6 +27,10 @@ class PostMergeSyncApplyError(RuntimeError):
 
 
 class PostMergeSyncNonFastForward(PostMergeSyncApplyError):
+    pass
+
+
+class PostMergeSyncPhysicalIdentityDrift(PostMergeSyncApplyError):
     pass
 
 
@@ -243,6 +248,7 @@ def apply(
     target_branch: str,
     expected_local_head: str,
     expected_remote_head: str,
+    expected_physical_identity_sha256: str,
     remote: str,
     remote_target: str,
     confirmation: str,
@@ -250,9 +256,37 @@ def apply(
     remote_head_reader: RemoteHeadReader,
     pinned_target_factory: PinnedTargetFactory,
 ) -> dict[str, Any]:
-    repo = repo.expanduser().resolve(strict=True)
     expected_local_head = expected_local_head.lower()
     expected_remote_head = expected_remote_head.lower()
+    expected_physical_identity_sha256 = expected_physical_identity_sha256.lower()
+    if re.fullmatch(r"[0-9a-f]{64}", expected_physical_identity_sha256) is None:
+        return _blocked(
+            "invalid_physical_checkout_identity",
+            physical_identity_verified=False,
+        )
+    try:
+        initial_physical = physical_checkout.capture_physical_checkout_identity(
+            repo.expanduser()
+        )
+    except (OSError, ValueError, physical_checkout.PhysicalCheckoutIdentityError) as exc:
+        return _blocked(
+            "physical_checkout_identity_unreadable",
+            physical_identity_verified=False,
+            error_class=type(exc).__name__,
+        )
+    if (
+        initial_physical.get("physical_identity_sha256")
+        != expected_physical_identity_sha256
+    ):
+        return _blocked(
+            "physical_checkout_identity_mismatch",
+            physical_identity_verified=False,
+            observed_physical_identity_sha256=initial_physical.get(
+                "physical_identity_sha256"
+            ),
+        )
+    repo = Path(str(initial_physical["root"]["path"]))
+    physical_identity_verified = True
 
     if target_branch not in PROTECTED_BRANCHES:
         return _blocked("unsupported_target_branch", target_branch=target_branch)
@@ -343,6 +377,7 @@ def apply(
             "effect_started": False,
             "preimage_verified": True,
             "remote_head_verified": remote_head_verified,
+            "physical_identity_verified": physical_identity_verified,
             "idempotent": True,
             "retry_authorized": False,
             "old_head": expected_remote_head,
@@ -359,6 +394,7 @@ def apply(
         "remote": remote,
         "expected_local_head": expected_local_head,
         "expected_remote_head": expected_remote_head,
+        "expected_physical_identity_sha256": expected_physical_identity_sha256,
         "identity": identity,
         "upstream": expected_upstream,
         "tracking_head": initial.get("tracking_head"),
@@ -394,6 +430,7 @@ def apply(
             lease_owner_id=owner_id,
             resource_keys=resource_keys,
             remote_head_verified=remote_head_verified,
+            physical_identity_verified=physical_identity_verified,
             error_class=type(exc).__name__,
         )
 
@@ -408,6 +445,7 @@ def apply(
             "state": "lease_snapshot_invalid",
             "effect_started": False,
             "remote_head_verified": remote_head_verified,
+            "physical_identity_verified": physical_identity_verified,
             "retry_authorized": False,
             "preimage_sha256": preimage_sha256,
             "lease_owner_id": owner_id,
@@ -448,8 +486,41 @@ def apply(
     fast_forward_verified = False
     release_error: Exception | None = None
     try:
-        live = resources.inspect_resources(resource_keys)
-        if (
+        try:
+            locked_physical = physical_checkout.capture_physical_checkout_identity(repo)
+        except (
+            OSError,
+            ValueError,
+            physical_checkout.PhysicalCheckoutIdentityError,
+        ) as exc:
+            physical_identity_verified = False
+            output = _blocked(
+                "physical_checkout_identity_drift_after_lease",
+                before=initial,
+                preimage_sha256=preimage_sha256,
+                resource_keys=resource_keys,
+                physical_identity_verified=False,
+                error_class=type(exc).__name__,
+            )
+        else:
+            if (
+                locked_physical.get("physical_identity_sha256")
+                != expected_physical_identity_sha256
+            ):
+                physical_identity_verified = False
+                output = _blocked(
+                    "physical_checkout_identity_drift_after_lease",
+                    before=initial,
+                    preimage_sha256=preimage_sha256,
+                    resource_keys=resource_keys,
+                    physical_identity_verified=False,
+                    observed_physical_identity_sha256=locked_physical.get(
+                        "physical_identity_sha256"
+                    ),
+                )
+
+        live = resources.inspect_resources(resource_keys) if output is None else {}
+        if output is None and (
             set(live) != set(resource_keys)
             or any(
                 not isinstance(value, dict)
@@ -687,6 +758,28 @@ def apply(
                     ],
                 )
 
+                try:
+                    final_physical = physical_checkout.capture_physical_checkout_identity(
+                        repo
+                    )
+                except (
+                    OSError,
+                    ValueError,
+                    physical_checkout.PhysicalCheckoutIdentityError,
+                ) as exc:
+                    physical_identity_verified = False
+                    raise PostMergeSyncPhysicalIdentityDrift(
+                        "physical checkout identity became unreadable during effect"
+                    ) from exc
+                if (
+                    final_physical.get("physical_identity_sha256")
+                    != expected_physical_identity_sha256
+                ):
+                    physical_identity_verified = False
+                    raise PostMergeSyncPhysicalIdentityDrift(
+                        "physical checkout identity changed during effect"
+                    )
+
                 final = _snapshot(
                     repo,
                     runner,
@@ -718,6 +811,7 @@ def apply(
                     "branch_cas_started": True,
                     "serialization_verified": serialization_verified,
                     "fast_forward_verified": fast_forward_verified,
+                    "physical_identity_verified": physical_identity_verified,
                     "retry_authorized": False,
                     "preimage_sha256": preimage_sha256,
                     "resource_keys": resource_keys,
@@ -779,7 +873,11 @@ def apply(
                     == initial.get("tracking_head")
                 )
                 local_post_verified = bool(local_final_exact)
-                if (
+                if isinstance(exc, PostMergeSyncPhysicalIdentityDrift):
+                    state = "physical_checkout_identity_drift_final"
+                    receipt_status = "failed"
+                    post_verified = False
+                elif (
                     isinstance(exc, PostMergeSyncNonFastForward)
                     and not worktree_effect_started
                     and not branch_cas_started
@@ -816,6 +914,7 @@ def apply(
                     "branch_cas_started": branch_cas_started,
                     "serialization_verified": serialization_verified,
                     "fast_forward_verified": fast_forward_verified,
+                    "physical_identity_verified": physical_identity_verified,
                     "retry_authorized": False,
                     "preimage_sha256": preimage_sha256,
                     "resource_keys": resource_keys,
@@ -860,6 +959,7 @@ def apply(
             "branch_cas_started": branch_cas_started,
             "serialization_verified": serialization_verified,
             "fast_forward_verified": fast_forward_verified,
+            "physical_identity_verified": physical_identity_verified,
             "retry_authorized": False,
             "readback_required": True,
             "preimage_sha256": preimage_sha256,
@@ -898,6 +998,7 @@ def apply(
             "branch_cas_started": branch_cas_started,
             "serialization_verified": serialization_verified,
             "fast_forward_verified": fast_forward_verified,
+            "physical_identity_verified": physical_identity_verified,
             "retry_authorized": False,
             "readback_required": True,
             "preimage_sha256": preimage_sha256,
@@ -905,6 +1006,7 @@ def apply(
         }
     output.setdefault("remote_head_verified", remote_head_verified)
     output.setdefault("preimage_verified", preimage_verified)
+    output.setdefault("physical_identity_verified", physical_identity_verified)
     output.setdefault("lease_owner_id", owner_id)
     if release_error is not None:
         cleanup_next_action = (
