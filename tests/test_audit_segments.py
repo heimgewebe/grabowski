@@ -218,7 +218,8 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                 self.assertEqual(calls, 1)
                 self.assertEqual(audit.read_bytes(), active_before)
 
-    def test_append_retries_after_predecessor_change_then_succeeds(self) -> None:
+
+    def test_append_retries_after_active_head_identity_change_then_succeeds(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"
             state.mkdir(mode=0o700)
@@ -227,37 +228,74 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                 for index in range(25):
                     grabowski_mcp._append_audit(
                         {
-                            "operation": "predecessor-retry-setup",
+                            "operation": "active-head-retry-setup",
                             "index": index,
                             "payload": "r" * 120,
                         }
                     )
                 before = grabowski_mcp._verify_audit_log(audit)
-                original_head = grabowski_mcp._read_audit_head_unlocked
-                head_reads = 0
+                original_identity = grabowski_mcp._audit_descriptor_identity
+                identity_reads = 0
 
-                def change_predecessor_once(path):
-                    nonlocal head_reads
-                    result = original_head(path)
-                    head_reads += 1
-                    if head_reads == 2:
-                        current_head, current_predecessor = result
-                        self.assertIsNotNone(current_predecessor)
-                        changed = dict(current_predecessor)
-                        changed["sha256"] = "f" * 64
-                        return current_head, changed
-                    return result
+                def mismatch_once(descriptor, path):
+                    nonlocal identity_reads
+                    identity_reads += 1
+                    identity = original_identity(descriptor, path)
+                    if identity_reads == 1:
+                        return (*identity[:-1], identity[-1] + 1)
+                    return identity
 
                 with patch.object(
                     grabowski_mcp,
-                    "_read_audit_head_unlocked",
-                    side_effect=change_predecessor_once,
+                    "_audit_descriptor_identity",
+                    side_effect=mismatch_once,
                 ):
                     grabowski_mcp._append_audit(
-                        {"operation": "predecessor-retry-success"}
+                        {"operation": "active-head-retry-success"}
                     )
 
-                self.assertGreaterEqual(head_reads, 4)
+                self.assertGreaterEqual(identity_reads, 4)
+                after = grabowski_mcp._verify_audit_log(audit)
+                self.assertTrue(after["valid"], after)
+                self.assertEqual(
+                    after["total_records"],
+                    before["total_records"] + 1,
+                )
+
+    def test_append_contention_retries_beyond_legacy_attempt_ceiling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            audit, patches = self._patches(state)
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+                grabowski_mcp._append_audit(
+                    {"operation": "contention-retry-setup"}
+                )
+                before = grabowski_mcp._verify_audit_log(audit)
+                real_capture = grabowski_mcp._capture_verified_audit_head
+                captures = 0
+
+                def stale_capture(path):
+                    nonlocal captures
+                    captures += 1
+                    head, predecessor, identity = real_capture(path)
+                    if captures <= 20 and identity is not None:
+                        identity = (*identity[:-1], identity[-1] + captures)
+                    return head, predecessor, identity
+
+                with (
+                    patch.object(
+                        grabowski_mcp,
+                        "_capture_verified_audit_head",
+                        side_effect=stale_capture,
+                    ),
+                    patch.object(grabowski_mcp.time, "sleep", return_value=None),
+                ):
+                    grabowski_mcp._append_audit(
+                        {"operation": "contention-retry-success"}
+                    )
+
+                self.assertEqual(captures, 21)
                 after = grabowski_mcp._verify_audit_log(audit)
                 self.assertTrue(after["valid"], after)
                 self.assertEqual(
@@ -758,6 +796,7 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                 self.assertTrue(tampered)
                 self.assertEqual(audit.read_bytes(), active_before)
 
+
     def test_unchanged_sealed_segment_uses_identity_bound_cache(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"
@@ -773,15 +812,13 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                 self.assertTrue(first["valid"], first)
                 with patch.object(
                     grabowski_mcp,
-                    "_read_audit_file",
-                    wraps=grabowski_mcp._read_audit_file,
+                    "_read_audit_file_snapshot",
+                    wraps=grabowski_mcp._read_audit_file_snapshot,
                 ) as reader:
                     second = grabowski_mcp._verify_audit_log(audit)
                 self.assertTrue(second["valid"], second)
-                self.assertEqual(reader.call_count, 2)
-                self.assertTrue(
-                    all(call.args[0] == audit for call in reader.call_args_list)
-                )
+                self.assertEqual(reader.call_count, 1)
+                self.assertEqual(reader.call_args.args[0], audit)
 
     def test_append_rejects_invalid_predecessor_status_return(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1061,6 +1098,57 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                     status["total_records"],
                     before["total_records"] + 1,
                 )
+
+
+    def test_active_head_hash_verification_runs_outside_coordination_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            audit, patches = self._patches(state)
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+                for index in range(8):
+                    grabowski_mcp._append_audit(
+                        {
+                            "operation": "active-verify-lock-test",
+                            "index": index,
+                            "payload": "h" * 120,
+                        }
+                    )
+                original_verify = grabowski_mcp._verify_audit_bytes
+                lock_path = grabowski_mcp._audit_storage_paths(audit)[
+                    "coordination_lock"
+                ]
+                observations = []
+
+                def verify_outside_lock(path, data, *, exists):
+                    if path == audit and exists:
+                        fd = os.open(lock_path, os.O_RDWR | os.O_CLOEXEC)
+                        try:
+                            try:
+                                fcntl.flock(
+                                    fd,
+                                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                                )
+                            except BlockingIOError:
+                                observations.append(False)
+                            else:
+                                observations.append(True)
+                                fcntl.flock(fd, fcntl.LOCK_UN)
+                        finally:
+                            os.close(fd)
+                    return original_verify(path, data, exists=exists)
+
+                with patch.object(
+                    grabowski_mcp,
+                    "_verify_audit_bytes",
+                    side_effect=verify_outside_lock,
+                ):
+                    status = grabowski_mcp._verify_audit_log(audit)
+
+                self.assertTrue(status["valid"], status)
+                self.assertTrue(observations)
+                self.assertTrue(all(observations))
+
 
     def test_verify_scans_immutable_segments_outside_coordination_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

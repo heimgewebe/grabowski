@@ -1159,6 +1159,7 @@ def build_projection(
     *,
     as_of_unix: int,
     audit_source_binding: dict[str, Any],
+    audit_window_complete: bool = True,
     runtime_status_provider: Any = None,
     task_terminal_provider: Any = None,
 ) -> dict[str, Any]:
@@ -1206,23 +1207,44 @@ def build_projection(
     ]
     uncertain_outcome = _audit_signal_entry(
         "uncertain_outcome",
-        status="observed" if unresolved_count else "clear",
-        severity="critical" if unresolved_count else "none",
-        count=unresolved_count,
+        status=(
+            "observed"
+            if unresolved_count
+            else ("clear" if audit_window_complete else "indeterminate")
+        ),
+        severity=(
+            "critical"
+            if unresolved_count
+            else ("none" if audit_window_complete else "unknown")
+        ),
+        count=(
+            unresolved_count
+            if unresolved_count or audit_window_complete
+            else None
+        ),
         observed_count=len(uncertain_records),
         evidence_refs=uncertain_refs,
         evidence_quality=(
-            "direct_verified_audit_fields_plus_exact_task_terminality"
-            if terminal_resolutions
-            else "direct_verified_audit_fields"
+            "partial_verified_audit_window"
+            if not audit_window_complete
+            else (
+                "direct_verified_audit_fields_plus_exact_task_terminality"
+                if terminal_resolutions
+                else "direct_verified_audit_fields"
+            )
         ),
         recommended_action=(
             "read the exact target state and recovery evidence before any retry"
             if unresolved_count
-            else "none"
+            else (
+                "inspect a complete verified audit window before classifying uncertain outcomes as clear"
+                if not audit_window_complete
+                else "none"
+            )
         ),
         details={
             "window_seconds": AUDIT_SIGNAL_WINDOW_SECONDS,
+            "audit_window_complete": audit_window_complete,
             "historical_observed_count": len(uncertain_records),
             "terminally_resolved_count": len(terminal_resolutions),
             "unresolved_current_count": unresolved_count,
@@ -1234,6 +1256,11 @@ def build_projection(
             "root_cause",
             "historical_uncertainty_was_false",
             "completion_of_one_task_authorizes_any_new_effect",
+            *(
+                ["absence_of_uncertain_outcomes_outside_the_verified_scan"]
+                if not audit_window_complete
+                else []
+            ),
         ],
     )
     transition_gap = _audit_transition_gap_signal(
@@ -1241,6 +1268,50 @@ def build_projection(
         start_unix=start_unix,
         end_unix=as_of_unix,
     )
+    if not audit_window_complete:
+        partial_status = transition_gap["status"]
+        partial_count = transition_gap["count"]
+        if partial_status == "observed":
+            # Truncation removes only an older audit prefix.  A positively observed
+            # gap/reconciliation whose intent is present in the verified suffix
+            # cannot be invented by that omission: any later completion for the
+            # visible intent would also be in the suffix.  Preserve positive
+            # evidence while refusing to claim that additional gaps are absent.
+            transition_gap = {
+                **transition_gap,
+                "evidence_quality": "partial_verified_audit_window_positive_evidence",
+                "details": {
+                    **transition_gap["details"],
+                    "audit_window_complete": False,
+                    "partial_status": partial_status,
+                    "partial_count": partial_count,
+                },
+                "does_not_establish": [
+                    *transition_gap["does_not_establish"],
+                    "absence_of_additional_transition_gaps_outside_the_verified_scan",
+                ],
+            }
+        else:
+            transition_gap = {
+                **transition_gap,
+                "status": "indeterminate",
+                "severity": "unknown",
+                "count": None,
+                "evidence_quality": "partial_verified_audit_window",
+                "recommended_action": (
+                    "inspect a complete verified audit window before classifying transition gaps"
+                ),
+                "details": {
+                    **transition_gap["details"],
+                    "audit_window_complete": False,
+                    "partial_status": partial_status,
+                    "partial_count": partial_count,
+                },
+                "does_not_establish": [
+                    *transition_gap["does_not_establish"],
+                    "absence_or_presence_of_transition_gaps_across_the_scan_boundary",
+                ],
+            }
     friction_source = _audit_friction_signal_source()
     runtime_source = _runtime_signal_source(runtime_status_provider)
     contradiction_raw, blockade_raw, stale_raw = _audit_friction_signals(
