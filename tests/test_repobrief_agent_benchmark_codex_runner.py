@@ -3109,6 +3109,41 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 with self.assertRaisesRegex(runner.RunnerError, 'Codex usage is invalid'):
                     runner.normalize(request(), events)
 
+    def test_normalize_subtracts_cached_input_tokens_before_budget_check(self) -> None:
+        value = request()
+        events = [json.loads(line) for line in stream(value).splitlines()]
+        completed = next(event for event in events if event.get("type") == "turn.completed")
+        completed["usage"]["input_tokens"] = 100_000
+        completed["usage"]["cached_input_tokens"] = 40_000
+
+        input_tokens, output_tokens, _calls, _answer = runner.normalize(value, events)
+
+        self.assertEqual(input_tokens, 60_000)
+        self.assertEqual(output_tokens, 30)
+
+    def test_normalize_rejects_invalid_cached_input_tokens(self) -> None:
+        for cached_input_tokens in (None, True, -1, 121):
+            with self.subTest(cached_input_tokens=cached_input_tokens):
+                value = request()
+                events = [json.loads(line) for line in stream(value).splitlines()]
+                completed = next(
+                    event for event in events if event.get("type") == "turn.completed"
+                )
+                completed["usage"]["cached_input_tokens"] = cached_input_tokens
+
+                with self.assertRaisesRegex(runner.RunnerError, "Codex usage is invalid"):
+                    runner.normalize(value, events)
+
+    def test_normalize_r5_like_usage_still_exceeds_frozen_input_budget(self) -> None:
+        value = request()
+        events = [json.loads(line) for line in stream(value).splitlines()]
+        completed = next(event for event in events if event.get("type") == "turn.completed")
+        completed["usage"]["input_tokens"] = 422_147
+        completed["usage"]["cached_input_tokens"] = 357_376
+
+        with self.assertRaisesRegex(runner.RunnerError, "Codex token budget exceeded"):
+            runner.normalize(value, events)
+
     def test_normalize_requires_repobrief_call_for_treatment(self) -> None:
         value = request(condition="treatment")
         events = [json.loads(line) for line in stream(value).splitlines()]
