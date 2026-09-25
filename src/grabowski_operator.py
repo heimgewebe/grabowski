@@ -463,10 +463,14 @@ def _maulwurf_recovery_control_call(tool_name: Any, arguments: Any) -> bool:
     return _maulwurf_recovery_operation_name(tool_name, arguments) is not None
 
 
+def _maulwurf_recovery_restricted() -> bool:
+    return _maulwurf_runtime_active() and not _trusted_owner_mode()
+
+
 def _enforce_maulwurf_recovery_mode(
     tool_name: Any, arguments: Any, tool: Any
 ) -> None:
-    if not _maulwurf_runtime_active():
+    if not _maulwurf_recovery_restricted():
         return
     if _maulwurf_recovery_control_call(tool_name, arguments):
         return
@@ -2249,6 +2253,7 @@ def _install_deployment_admission_gate() -> None:
         maulwurf_recovery_operation = _maulwurf_recovery_operation_name(
             tool_name, arguments
         )
+        maulwurf_recovery_restricted = _maulwurf_recovery_restricted()
         kind = (
             _DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC
             if tool is not None and getattr(tool, "is_async", True) is False
@@ -2310,7 +2315,7 @@ def _install_deployment_admission_gate() -> None:
                     f"while marker state is {marker.get('state')}"
                 )
             if (
-                _maulwurf_runtime_active()
+                maulwurf_recovery_restricted
                 and not effective_read_only
                 and maulwurf_recovery_operation is None
             ):
@@ -2329,7 +2334,7 @@ def _install_deployment_admission_gate() -> None:
             ) = _effect_admission_transport_inputs(transport_evidence)
             enforcement_configured = (
                 grabowski_effect_interceptor.fence_enforcement_required()
-                if not effective_read_only and not _maulwurf_runtime_active()
+                if not effective_read_only and not maulwurf_recovery_restricted
                 else False
             )
             if not effective_read_only:
@@ -2337,7 +2342,7 @@ def _install_deployment_admission_gate() -> None:
                 if (
                     active_profile == "failover-mutate"
                     and not enforcement_configured
-                    and not _maulwurf_runtime_active()
+                    and not maulwurf_recovery_restricted
                 ):
                     raise grabowski_effect_interceptor.OperatorFenceEnforcementDenied(
                         "failover_mutation_requires_fence_config"
