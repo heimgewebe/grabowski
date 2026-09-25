@@ -1000,6 +1000,27 @@ def _connector_request_identity_sha256(payload: dict[str, Any]) -> str | None:
     return hashlib.sha256(canonical).hexdigest()
 
 
+def _is_known_non_transport_reported_error(payload: dict[str, Any]) -> bool:
+    """Recognize one exact tunnel startup warning that is not MCP transport failure."""
+    message = payload.get("msg")
+    error = payload.get("error")
+    url = payload.get("url")
+    return bool(
+        message == "harpoon host auto-registration failed"
+        and payload.get("component") == "harpoon"
+        and payload.get("source") == "oauth"
+        and payload.get("role") in {"prmd-resource", "prmd-source"}
+        and payload.get("inclusion_reason") == "loopback"
+        and isinstance(url, str)
+        and re.fullmatch(
+            r"http://(?:127\.0\.0\.1|\[::1\]|localhost)(?::\d+)?",
+            url,
+        )
+        and isinstance(error, str)
+        and error.endswith("base URL must use https")
+    )
+
+
 def _journal_transport_event(
     record: dict[str, Any],
     *,
@@ -1033,10 +1054,11 @@ def _journal_transport_event(
             if term in lowered:
                 domains.add(domain)
     error_value = payload.get("error")
-    if isinstance(error_value, str) and error_value.strip():
-        domains.add("reported_error")
-    elif isinstance(error_value, dict) and error_value:
-        domains.add("reported_error")
+    if not _is_known_non_transport_reported_error(payload):
+        if isinstance(error_value, str) and error_value.strip():
+            domains.add("reported_error")
+        elif isinstance(error_value, dict) and error_value:
+            domains.add("reported_error")
     invocation_id = _journal_invocation_id(record)
     expected_stop_component = CONNECTOR_PLANNED_STOP_ISSUE_COMPONENTS.get(message)
     completed_stop_at = (
