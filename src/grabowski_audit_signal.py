@@ -564,6 +564,23 @@ def _audit_transition_gap_signal(
         execution_refs
     )
     unique_execution_ref_count = len(set(ref for ref in execution_refs if ref))
+    prefix_monotonic_gaps = [
+        (intent, record, timestamp_unix)
+        for intent, record, timestamp_unix in gaps
+        if intent != retention_pair[0]
+    ]
+    prefix_monotonic_refs_all = [
+        ref
+        for _intent, record, _timestamp in prefix_monotonic_gaps
+        if (ref := _audit_record_ref(record))
+    ]
+    (
+        prefix_monotonic_refs,
+        prefix_monotonic_refs_truncated,
+    ) = _audit_signal_refs(prefix_monotonic_refs_all)
+    unique_prefix_monotonic_ref_count = len(
+        set(ref for ref in prefix_monotonic_refs_all if ref)
+    )
     reconciliation_refs_all = [
         ref for record in reconciled_records if (ref := _audit_record_ref(record))
     ]
@@ -613,6 +630,15 @@ def _audit_transition_gap_signal(
             "execution_gap_evidence_refs_truncated": execution_gap_refs_truncated,
             "execution_gap_evidence_refs_omitted_count": max(
                 0, unique_execution_ref_count - len(execution_gap_refs)
+            ),
+            "prefix_monotonic_execution_gap_count": len(prefix_monotonic_gaps),
+            "prefix_monotonic_execution_gap_evidence_refs": prefix_monotonic_refs,
+            "prefix_monotonic_execution_gap_evidence_refs_truncated": (
+                prefix_monotonic_refs_truncated
+            ),
+            "prefix_monotonic_execution_gap_evidence_refs_omitted_count": max(
+                0,
+                unique_prefix_monotonic_ref_count - len(prefix_monotonic_refs),
             ),
             "unmatched_intents_by_transition": dict(sorted(by_transition.items())),
             "completed_pairs_by_transition": dict(sorted(completed_counts.items())),
@@ -1271,29 +1297,81 @@ def build_projection(
     if not audit_window_complete:
         partial_status = transition_gap["status"]
         partial_count = transition_gap["count"]
-        # Prefix truncation can change retention-receipt ownership and therefore
-        # which visible intent appears unmatched.  Partial positive transition
-        # evidence is not monotonic, so never promote it to a reliable gap.
-        transition_gap = {
-            **transition_gap,
-            "status": "indeterminate",
-            "severity": "unknown",
-            "count": None,
-            "evidence_quality": "partial_verified_audit_window",
-            "recommended_action": (
-                "inspect a complete verified audit window before classifying transition gaps"
-            ),
-            "details": {
-                **transition_gap["details"],
-                "audit_window_complete": False,
-                "partial_status": partial_status,
-                "partial_count": partial_count,
-            },
-            "does_not_establish": [
-                *transition_gap["does_not_establish"],
-                "absence_or_presence_of_transition_gaps_across_the_scan_boundary",
-            ],
-        }
+        partial_observed_count = transition_gap["observed_count"]
+        transition_details = transition_gap["details"]
+        prefix_monotonic_count = transition_details.get(
+            "prefix_monotonic_execution_gap_count"
+        )
+        prefix_monotonic_refs = transition_details.get(
+            "prefix_monotonic_execution_gap_evidence_refs"
+        )
+        if (
+            isinstance(prefix_monotonic_count, int)
+            and not isinstance(prefix_monotonic_count, bool)
+            and prefix_monotonic_count > 0
+            and isinstance(prefix_monotonic_refs, list)
+        ):
+            # An omitted audit prefix precedes every visible non-retention intent.
+            # Those FIFO transition families can lose positive gaps through
+            # truncation, but the omitted prefix cannot invent one after a visible
+            # intent. Retention receipt ownership is different and remains
+            # indeterminate across the scan boundary.
+            transition_gap = {
+                **transition_gap,
+                "status": "observed",
+                "severity": "high",
+                "count": prefix_monotonic_count,
+                "observed_count": prefix_monotonic_count,
+                "evidence_refs": list(prefix_monotonic_refs),
+                "evidence_refs_truncated": bool(
+                    transition_details.get(
+                        "prefix_monotonic_execution_gap_evidence_refs_truncated"
+                    )
+                ),
+                "evidence_quality": (
+                    "partial_verified_audit_window_prefix_monotonic_positive_evidence"
+                ),
+                "recommended_action": (
+                    "trace each unmatched intent and read the exact target state before retry"
+                ),
+                "details": {
+                    **transition_details,
+                    "audit_window_complete": False,
+                    "partial_status": partial_status,
+                    "partial_count": partial_count,
+                    "partial_observed_count": partial_observed_count,
+                },
+                "does_not_establish": [
+                    *transition_gap["does_not_establish"],
+                    "absence_or_presence_of_retention_transition_gaps_across_the_scan_boundary",
+                    "absence_of_additional_transition_gaps_outside_the_verified_scan",
+                ],
+            }
+        else:
+            # Retention completion/reconciliation matching can depend on receipt
+            # ownership in the omitted prefix, so retention-only partial evidence
+            # cannot support a positive or negative transition-gap classification.
+            transition_gap = {
+                **transition_gap,
+                "status": "indeterminate",
+                "severity": "unknown",
+                "count": None,
+                "evidence_quality": "partial_verified_audit_window",
+                "recommended_action": (
+                    "inspect a complete verified audit window before classifying transition gaps"
+                ),
+                "details": {
+                    **transition_details,
+                    "audit_window_complete": False,
+                    "partial_status": partial_status,
+                    "partial_count": partial_count,
+                    "partial_observed_count": partial_observed_count,
+                },
+                "does_not_establish": [
+                    *transition_gap["does_not_establish"],
+                    "absence_or_presence_of_transition_gaps_across_the_scan_boundary",
+                ],
+            }
     friction_source = _audit_friction_signal_source()
     runtime_source = _runtime_signal_source(runtime_status_provider)
     contradiction_raw, blockade_raw, stale_raw = _audit_friction_signals(

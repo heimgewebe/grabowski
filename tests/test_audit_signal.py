@@ -406,6 +406,62 @@ class AuditSignalTests(unittest.TestCase):
             partial_gap["does_not_establish"],
         )
 
+    def test_incomplete_audit_window_preserves_prefix_monotonic_deploy_gap(self) -> None:
+        now = 1_800_000_000
+        retention_ref = "a" * 64
+        deploy_ref = "b" * 64
+        records = [
+            (
+                {
+                    "operation": "runtime-state-retention-intent",
+                    "record_sha256": retention_ref,
+                },
+                now - signal.AUDIT_SIGNAL_GRACE_SECONDS - 2,
+            ),
+            (
+                {
+                    "operation": "runtime-deploy-schedule-intent",
+                    "record_sha256": deploy_ref,
+                },
+                now - signal.AUDIT_SIGNAL_GRACE_SECONDS - 1,
+            ),
+        ]
+
+        with patch.dict(sys.modules, {"grabowski_friction": None}, clear=False):
+            result = signal.build_projection(
+                records,
+                as_of_unix=now,
+                audit_source_binding={},
+                audit_window_complete=False,
+            )
+
+        transition = next(
+            item for item in result["signals"] if item["id"] == "transition_gap"
+        )
+        self.assertEqual(
+            (transition["status"], transition["severity"], transition["count"]),
+            ("observed", "high", 1),
+        )
+        self.assertEqual(transition["observed_count"], 1)
+        self.assertEqual(
+            transition["evidence_refs"],
+            ["audit-record-sha256:" + deploy_ref],
+        )
+        self.assertEqual(
+            transition["evidence_quality"],
+            "partial_verified_audit_window_prefix_monotonic_positive_evidence",
+        )
+        self.assertEqual(transition["details"]["partial_status"], "observed")
+        self.assertEqual(transition["details"]["partial_count"], 2)
+        self.assertEqual(transition["details"]["partial_observed_count"], 2)
+        self.assertEqual(
+            transition["details"]["prefix_monotonic_execution_gap_count"], 1
+        )
+        self.assertIn(
+            "absence_or_presence_of_retention_transition_gaps_across_the_scan_boundary",
+            transition["does_not_establish"],
+        )
+
     def test_contract_contradiction_requires_conflict_language(self) -> None:
         normal = {
             "failure_class": "contract_error",
