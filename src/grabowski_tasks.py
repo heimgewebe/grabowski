@@ -7267,10 +7267,11 @@ _TASK_ATTENTION_PROJECTED_COLUMNS = (
 def _task_attention_retry_launcher(binding: Any) -> Any:
     if not isinstance(binding, dict):
         return _TASK_ATTENTION_INVALID_LAUNCHER_JSON
-    if (
-        len(_canonical_json(binding).encode("utf-8"))
-        > _TASK_ATTENTION_MAX_RETRY_BINDING_BYTES
-    ):
+    try:
+        binding_bytes = _canonical_json(binding).encode("utf-8")
+    except UnicodeEncodeError:
+        return _TASK_ATTENTION_INVALID_LAUNCHER_JSON
+    if len(binding_bytes) > _TASK_ATTENTION_MAX_RETRY_BINDING_BYTES:
         return _TASK_ATTENTION_INVALID_LAUNCHER_JSON
     try:
         validated = terminal_convergence.persisted_retry_binding(

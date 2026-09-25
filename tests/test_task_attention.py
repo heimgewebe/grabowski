@@ -2320,6 +2320,20 @@ class TaskAttentionTests(unittest.TestCase):
                 ):
                     terminal_convergence.persisted_retry_binding(projected)
 
+    def test_attention_row_projection_bounds_unencodable_retry_binding_fail_closed(self) -> None:
+        row = tasks._row_raw(str(self._failed_task()["task_id"]))
+        malformed = dict(row)
+        malformed["launcher_json"] = json.dumps(
+            {"retry_binding": {"junk": "\ud800"}},
+            ensure_ascii=True,
+        )
+        projected = tasks._task_attention_record(malformed)
+        self.assertEqual(
+            tasks._TASK_ATTENTION_INVALID_LAUNCHER_JSON,
+            projected["launcher_json"],
+        )
+        self.assertLess(len(str(projected["launcher_json"])), 64)
+
     def test_retry_successor_projection_omits_bulk_payload(self) -> None:
         source, successor = self._verified_retry_pair(successor_state="running")
         successor_row = tasks._row_raw(str(successor["task_id"]))

@@ -10356,9 +10356,11 @@ class TaskTests(unittest.TestCase):
             with patch.object(
                 tasks.terminal_convergence,
                 "persisted_retry_binding",
-                side_effect=lambda record: json.loads(record["launcher_json"])[
-                    "retry_binding"
-                ],
+                side_effect=lambda record: (
+                    json.loads(record["launcher_json"])
+                    if isinstance(record["launcher_json"], str)
+                    else record["launcher_json"]
+                )["retry_binding"],
             ):
                 records = tasks._task_retry_successor_records(
                     connection,
