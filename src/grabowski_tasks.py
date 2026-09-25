@@ -7248,6 +7248,85 @@ def _subtract_projected_task_counts(
     return current_exact, current_projections, current_unknown
 
 
+_TASK_ATTENTION_INVALID_LAUNCHER_JSON = "{invalid-task-launcher}"
+_TASK_ATTENTION_MAX_RETRY_BINDING_BYTES = 8 * 1024
+
+
+_TASK_ATTENTION_PROJECTED_COLUMNS = (
+    "task_id", "host", "unit", "authoritative_unit", "execution_backend",
+    "systemd_scope", "attempt", "state", "resume_policy", "argv_sha256",
+    "cwd", "resource_keys_json", "runtime_seconds", "cpu_weight", "io_weight",
+    "memory_max_bytes", "created_at_unix", "updated_at_unix",
+    "execution_envelope_sha256", "chronik_outbox_enabled",
+    "chronik_outbox_state_root", "chronik_context_json",
+    "terminalization_sha256", "terminalized_at_unix",
+    "lifecycle_receipt_sha256",
+)
+
+
+def _task_attention_retry_launcher(binding: Any) -> Any:
+    if not isinstance(binding, dict):
+        return _TASK_ATTENTION_INVALID_LAUNCHER_JSON
+    try:
+        binding_bytes = _canonical_json(binding).encode("utf-8")
+    except UnicodeEncodeError:
+        return _TASK_ATTENTION_INVALID_LAUNCHER_JSON
+    if len(binding_bytes) > _TASK_ATTENTION_MAX_RETRY_BINDING_BYTES:
+        return _TASK_ATTENTION_INVALID_LAUNCHER_JSON
+    try:
+        validated = terminal_convergence.persisted_retry_binding(
+            {"launcher_json": {"retry_binding": binding}}
+        )
+    except terminal_convergence.TerminalConvergenceError:
+        return _TASK_ATTENTION_INVALID_LAUNCHER_JSON
+    if validated is None:
+        return _TASK_ATTENTION_INVALID_LAUNCHER_JSON
+    return {"retry_binding": validated}
+
+
+def _task_attention_record(record: dict[str, Any]) -> dict[str, Any]:
+    task_projection = {
+        "task_id": record["task_id"],
+        "state": record["state"],
+        "updated_at_unix": record["updated_at_unix"],
+        "launcher_json": record["launcher_json"],
+        "last_observation_json": record.get("last_observation_json"),
+        "unit": record["unit"],
+        "authoritative_unit": _authoritative_unit(record),
+        "attempt": int(record["attempt"]),
+    }
+    raw_launcher = record.get("launcher_json")
+    compact_launcher: Any = None
+    if raw_launcher is not None:
+        if not isinstance(raw_launcher, str):
+            raise RuntimeError("Stored task launcher is not text")
+        try:
+            launcher = json.loads(raw_launcher)
+        except json.JSONDecodeError:
+            compact_launcher = _TASK_ATTENTION_INVALID_LAUNCHER_JSON
+        else:
+            if not isinstance(launcher, dict):
+                compact_launcher = _TASK_ATTENTION_INVALID_LAUNCHER_JSON
+            elif "retry_binding" in launcher:
+                compact_launcher = _task_attention_retry_launcher(
+                    launcher["retry_binding"]
+                )
+    projected = {
+        column: record.get(column)
+        for column in _TASK_ATTENTION_PROJECTED_COLUMNS
+    }
+    projected["launcher_json"] = compact_launcher
+    projected["_task_projection_sha256"] = _sha256_json(task_projection)
+    return projected
+
+
+def _task_attention_records(rows: Any) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        records.append(_task_attention_record(dict(row)))
+    return records
+
+
 def _task_current_records_for_states(
     connection: sqlite3.Connection,
     *,
@@ -7259,17 +7338,23 @@ def _task_current_records_for_states(
         f"SELECT * FROM tasks WHERE state IN ({placeholders}) "
         "ORDER BY created_at_unix DESC, task_id DESC",
         states,
-    ).fetchall()
-    raw_records = [dict(row) for row in rows]
-    archive_records = [_task_archive_record(record) for record in raw_records]
+    )
+    records: list[dict[str, Any]] = []
+    archive_records: list[dict[str, Any]] = []
+    for row in rows:
+        raw = dict(row)
+        archive_records.append(_task_archive_record(raw))
+        records.append(_task_attention_record(raw))
     current_archive_records = lifecycle_projection.bounded_current_task_projection(
         archive_records,
         projection=projection,
     )
-    current_task_ids = {str(record["task_id"]) for record in current_archive_records}
+    current_task_ids = {
+        str(record["task_id"]) for record in current_archive_records
+    }
     return [
         record
-        for record in raw_records
+        for record in records
         if str(record["task_id"]) in current_task_ids
     ]
 
@@ -7310,15 +7395,17 @@ def _task_retry_successor_records(
             '"retry_binding"',
             limit + 1,
         ),
-    ).fetchall()
-    if len(rows) > limit:
-        raise RuntimeError("retry successor convergence scan limit exceeded")
+    )
     records: list[dict[str, Any]] = []
+    row_count = 0
     for row in rows:
+        row_count += 1
+        if row_count > limit:
+            raise RuntimeError("retry successor convergence scan limit exceeded")
         record = dict(row)
         binding = terminal_convergence.persisted_retry_binding(record)
         if binding is not None:
-            records.append(record)
+            records.append(_task_attention_record(record))
     return records
 
 
