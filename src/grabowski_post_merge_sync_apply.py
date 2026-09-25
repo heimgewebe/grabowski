@@ -446,6 +446,77 @@ def apply(
                 before=initial,
                 remote_head_verified=remote_head_verified,
             )
+        try:
+            with physical_checkout.bind_physical_checkout(repo) as replay_bound:
+                rebound_physical = replay_bound.identity
+                if (
+                    rebound_physical.get("physical_identity_sha256")
+                    != expected_physical_identity_sha256
+                ):
+                    physical_identity_verified = False
+                    return _blocked(
+                        "physical_checkout_identity_drift_before_replay_success",
+                        before=initial,
+                        remote_head_verified=remote_head_verified,
+                        physical_identity_verified=False,
+                        observed_physical_identity_sha256=rebound_physical.get(
+                            "physical_identity_sha256"
+                        ),
+                    )
+                replay_runner = _fd_bound_runner(runner, replay_bound)
+                rebound = _snapshot(
+                    repo,
+                    replay_runner,
+                    target_branch=target_branch,
+                    remote=remote,
+                    sha_length=sha_length,
+                    identity_override=identity,
+                )
+                if not _final_exact(
+                    rebound,
+                    repo=repo,
+                    target_branch=target_branch,
+                    remote=remote,
+                    expected_remote_head=expected_remote_head,
+                ):
+                    return _blocked(
+                        "replay_readback_drift_before_success",
+                        before=initial,
+                        rebound=rebound,
+                        remote_head_verified=remote_head_verified,
+                        physical_identity_verified=True,
+                    )
+                replay_final_physical = (
+                    physical_checkout.capture_physical_checkout_identity(repo)
+                )
+                if (
+                    replay_final_physical.get("physical_identity_sha256")
+                    != expected_physical_identity_sha256
+                ):
+                    physical_identity_verified = False
+                    return _blocked(
+                        "physical_checkout_identity_drift_before_replay_success",
+                        before=initial,
+                        rebound=rebound,
+                        remote_head_verified=remote_head_verified,
+                        physical_identity_verified=False,
+                        observed_physical_identity_sha256=(
+                            replay_final_physical.get("physical_identity_sha256")
+                        ),
+                    )
+        except (
+            OSError,
+            ValueError,
+            physical_checkout.PhysicalCheckoutIdentityError,
+        ) as exc:
+            physical_identity_verified = False
+            return _blocked(
+                "physical_checkout_identity_drift_before_replay_success",
+                before=initial,
+                remote_head_verified=remote_head_verified,
+                physical_identity_verified=False,
+                error_class=type(exc).__name__,
+            )
         return {
             "receipt_status": "passed",
             "state": "already_synced",
@@ -458,7 +529,7 @@ def apply(
             "old_head": expected_remote_head,
             "new_head": expected_remote_head,
             "remote_head": expected_remote_head,
-            "post_state": initial,
+            "post_state": rebound,
             "post_state_verified": True,
             "merge_commit_created": False,
         }
@@ -885,6 +956,27 @@ def apply(
                 ):
                     raise PostMergeSyncApplyError(
                         "terminal readback does not match the exact final state"
+                    )
+                try:
+                    terminal_physical = (
+                        physical_checkout.capture_physical_checkout_identity(repo)
+                    )
+                except (
+                    OSError,
+                    ValueError,
+                    physical_checkout.PhysicalCheckoutIdentityError,
+                ) as exc:
+                    physical_identity_verified = False
+                    raise PostMergeSyncPhysicalIdentityDrift(
+                        "physical checkout identity became unreadable after terminal readback"
+                    ) from exc
+                if (
+                    terminal_physical.get("physical_identity_sha256")
+                    != expected_physical_identity_sha256
+                ):
+                    physical_identity_verified = False
+                    raise PostMergeSyncPhysicalIdentityDrift(
+                        "physical checkout identity changed after terminal readback"
                     )
                 output = {
                     "receipt_status": "passed",

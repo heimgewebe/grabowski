@@ -758,6 +758,125 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             self.assertEqual(base, git_stdout(repo, "rev-parse", "HEAD"))
             self.assertEqual("", git_stdout(repo, "status", "--porcelain"))
 
+    def test_already_synced_rebinds_original_checkout_before_success(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, remote, base, target = self.fixture(root)
+            retired = root / "retired"
+            replacement = root / "replacement"
+            swapped = False
+            restored = False
+
+            def swapping_runner(
+                run_repo: Path,
+                argv: list[str],
+            ) -> dict[str, object]:
+                nonlocal swapped
+                if not swapped:
+                    repo.rename(retired)
+                    subprocess.run(
+                        [
+                            "git",
+                            "clone",
+                            "-q",
+                            "-b",
+                            "main",
+                            str(remote),
+                            str(repo),
+                        ],
+                        check=True,
+                    )
+                    swapped = True
+                return git(run_repo, argv)
+
+            ordinary_remote_reader = self.remote_reader(remote)
+
+            def restoring_remote_reader(stage: str, effect_started: bool) -> str:
+                nonlocal restored
+                if stage == "before" and not restored:
+                    repo.rename(replacement)
+                    retired.rename(repo)
+                    restored = True
+                return ordinary_remote_reader(stage, effect_started)
+
+            result = self.apply(
+                repo,
+                remote,
+                base,
+                target,
+                runner=swapping_runner,
+                remote_reader=restoring_remote_reader,
+            )
+
+            self.assertTrue(swapped)
+            self.assertTrue(restored)
+            self.assertEqual("blocked", result["receipt_status"])
+            self.assertEqual(
+                "replay_readback_drift_before_success",
+                result["state"],
+            )
+            self.assertFalse(result["effect_started"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertEqual(base, git_stdout(repo, "rev-parse", "HEAD"))
+            self.assertEqual(target, git_stdout(replacement, "rev-parse", "HEAD"))
+
+    def test_path_replacement_during_final_remote_read_cannot_report_success(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, remote, base, target = self.fixture(root)
+            retired = root / "retired"
+            swapped = False
+            ordinary_remote_reader = self.remote_reader(remote)
+
+            def swapping_remote_reader(stage: str, effect_started: bool) -> str:
+                nonlocal swapped
+                if stage == "final" and not swapped:
+                    repo.rename(retired)
+                    subprocess.run(
+                        [
+                            "git",
+                            "clone",
+                            "-q",
+                            "-b",
+                            "main",
+                            str(remote),
+                            str(repo),
+                        ],
+                        check=True,
+                    )
+                    subprocess.run(
+                        ["git", "-C", str(repo), "reset", "-q", "--hard", base],
+                        check=True,
+                    )
+                    swapped = True
+                return ordinary_remote_reader(stage, effect_started)
+
+            leases = LeaseHarness()
+            with patched_leases(leases):
+                result = self.apply(
+                    repo,
+                    remote,
+                    base,
+                    target,
+                    remote_reader=swapping_remote_reader,
+                )
+
+            self.assertTrue(swapped)
+            self.assertEqual("failed", result["receipt_status"])
+            self.assertEqual(
+                "physical_checkout_identity_drift_final",
+                result["state"],
+            )
+            self.assertFalse(result["physical_identity_verified"])
+            self.assertTrue(result["readback_required"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertEqual(target, git_stdout(retired, "rev-parse", "HEAD"))
+            self.assertEqual(base, git_stdout(repo, "rev-parse", "HEAD"))
+
     def test_successful_clean_fast_forward(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo, remote, base, target = self.fixture(Path(tmp))
