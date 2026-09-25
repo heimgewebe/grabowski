@@ -6773,6 +6773,7 @@ def _run_post_merge_sync_apply(
         "invalid_physical_checkout_identity",
         "physical_checkout_identity_unreadable",
         "physical_checkout_identity_mismatch",
+        "physical_checkout_identity_drift_before_replay_success",
         "physical_checkout_identity_drift_after_lease",
         "physical_checkout_identity_drift_final",
     }
