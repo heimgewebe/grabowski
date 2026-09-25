@@ -540,6 +540,7 @@ def _git_operation_state_markers(
             ("rebase-apply", "directory"),
             ("rebase-merge", "directory"),
             ("sequencer", "directory"),
+            ("BISECT_START", "file"),
         ):
             _deadline_guard(deadline_monotonic, "Git operation-state observation")
             try:
@@ -555,6 +556,10 @@ def _git_operation_state_markers(
                     f"Git operation-state marker is a symlink: {name}"
                 )
             if expected_kind == "directory" and not stat.S_ISDIR(observed.st_mode):
+                raise RuntimeError(
+                    f"Git operation-state marker has unexpected type: {name}"
+                )
+            if expected_kind == "file" and not stat.S_ISREG(observed.st_mode):
                 raise RuntimeError(
                     f"Git operation-state marker has unexpected type: {name}"
                 )

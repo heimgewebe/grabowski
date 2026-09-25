@@ -548,6 +548,24 @@ class PhysicalCheckoutIdentityTests(unittest.TestCase):
                 preimage["operation_refs"]["STATE:rebase-apply"],
             )
 
+    def test_branch_preimage_detects_active_bisect_operation_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            self._init_committed_repo(repo, branch="main")
+            (repo / "README.md").write_text("second\n", encoding="utf-8")
+            self._run("git", "commit", "-q", "-am", "second", cwd=repo)
+            self._run("git", "bisect", "start", "HEAD", "HEAD^", cwd=repo)
+
+            preimage = git_preimage.capture_branch_preimage(
+                repo,
+                self._probe(repo),
+            )
+
+            self.assertEqual(
+                "present",
+                preimage["operation_refs"]["STATE:BISECT_START"],
+            )
+
     def test_gitdir_pointer_preserves_whitespace_as_path_material(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
