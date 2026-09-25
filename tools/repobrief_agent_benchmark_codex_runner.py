@@ -3937,6 +3937,7 @@ def build_command(
         "-c", f"permissions.{PERMISSION_PROFILE}.filesystem={filesystem}",
         "-c", f'permissions.{PERMISSION_PROFILE}.network={{enabled=true,mode="limited",allow_local_binding=false,domains={{}}}}',
         "--ephemeral", "--ignore-user-config", "--ignore-rules", "--strict-config",
+        "--disable", "apps",
         "--color", "never", "--json", "--model", MODEL,
         "-c", 'model_reasoning_effort="medium"',
         "-c", 'web_search="disabled"',
@@ -4089,6 +4090,7 @@ def run_bounded(
         limits = {"stdout": stdout_limit, "stderr": stderr_limit}
         overflow = {"stdout": False, "stderr": False}
         capture_error: str | None = None
+        containment_events: list[str] = []
         selector: selectors.BaseSelector | None = None
 
         def note_error(marker: str) -> None:
@@ -4097,6 +4099,10 @@ def run_bounded(
                 capture_error = marker
             elif marker not in capture_error.split(";"):
                 capture_error += ";" + marker
+
+        def note_containment(marker: str) -> None:
+            if marker not in containment_events:
+                containment_events.append(marker)
 
         def kill_process_tree() -> None:
             group_killed = False
@@ -4157,10 +4163,10 @@ def run_bounded(
             if not group_present and not adopted:
                 return
             if group_present:
-                note_error("process_group_survived_provider_exit")
+                note_containment("process_group_survived_provider_exit")
                 kill_process_tree()
             if adopted:
-                note_error("adopted_descendant_survived_provider_exit")
+                note_containment("adopted_descendant_survived_provider_exit")
                 kill_adopted_children(adopted)
             cleanup_deadline = time.monotonic() + 1.0
             while time.monotonic() < cleanup_deadline:
@@ -4345,6 +4351,7 @@ def run_bounded(
             "stdout": bytes(buffers["stdout"]),
             "stderr": bytes(buffers["stderr"]),
             "capture_error": capture_error,
+            "containment_events": list(containment_events),
             "stdout_overflow": overflow["stdout"],
             "stderr_overflow": overflow["stderr"],
         }
@@ -4562,6 +4569,7 @@ def persist_provider_capture(
                 "ended_at": iso(ended_at),
                 "returncode": capture.get("returncode"),
                 "capture_error": capture.get("capture_error"),
+                "containment_events": list(capture.get("containment_events") or []),
                 "raw_persistence_complete": False,
                 "raw_persisted": dict(raw_persisted),
                 "write_errors": [
@@ -4596,6 +4604,7 @@ def persist_provider_capture(
             "stderr_policy_version":STDERR_POLICY_VERSION,
             "started_at":iso(started_at), "ended_at":iso(ended_at),
             "returncode":capture.get("returncode"), "capture_error":capture.get("capture_error"),
+            "containment_events":list(capture.get("containment_events") or []),
             "stdout":{"artifact":names["stdout"],"sha256":sha_bytes(stdout),"bytes":len(stdout),"overflow":bool(capture.get("stdout_overflow"))},
             "stderr":{"artifact":names["stderr"],"sha256":sha_bytes(stderr),"bytes":len(stderr),"overflow":bool(capture.get("stderr_overflow"))},
             "semantic_interpretation":"not_performed",
