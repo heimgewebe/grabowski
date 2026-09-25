@@ -878,10 +878,18 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertTrue(any("domains={}" in item for item in baseline))
         self.assertTrue(any(":workspace_roots" in item for item in baseline))
         self.assertIn('web_search="disabled"', baseline)
-        self.assertIn("--disable", baseline)
-        self.assertEqual(baseline[baseline.index("--disable") + 1], "apps")
-        self.assertIn("--disable", treatment)
-        self.assertEqual(treatment[treatment.index("--disable") + 1], "apps")
+        baseline_disabled = [
+            baseline[index + 1]
+            for index, value in enumerate(baseline[:-1])
+            if value == "--disable"
+        ]
+        treatment_disabled = [
+            treatment[index + 1]
+            for index, value in enumerate(treatment[:-1])
+            if value == "--disable"
+        ]
+        self.assertEqual(baseline_disabled, ["apps", "plugins"])
+        self.assertEqual(treatment_disabled, ["apps", "plugins"])
         self.assertNotIn("mcp_servers.repobrief", baseline_joined)
         self.assertIn("mcp_servers.repobrief", treatment_joined)
         self.assertIn("--codex-mcp-proxy", treatment_joined)
