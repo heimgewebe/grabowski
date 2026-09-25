@@ -902,6 +902,28 @@ class OperatorSignedTransportTests(unittest.TestCase):
         self.assertRegex(evidence["grip_contract_sha256"], r"^[0-9a-f]{64}$")
         self.assertRegex(evidence["parameters_sha256"], r"^[0-9a-f]{64}$")
 
+        current_spec = operator.grabowski_grips.GRIP_SPECS["post-merge-sync-apply"]
+        drifted_spec = SimpleNamespace(
+            name=current_spec.name,
+            version="1.1",
+            required_parameters=current_spec.required_parameters,
+            effect=current_spec.effect,
+            runner=current_spec.runner,
+            operation_effect_class=current_spec.operation_effect_class,
+            operation_class=current_spec.operation_class,
+            acceptance_ids=current_spec.acceptance_ids,
+        )
+        with mock.patch.dict(
+            operator.grabowski_grips.GRIP_SPECS,
+            {"post-merge-sync-apply": drifted_spec},
+        ):
+            self.assertIsNone(
+                operator._signed_replay_recovery_preflight(
+                    tool_name="grip_run",
+                    arguments=arguments,
+                )
+            )
+
         unsafe = dict(arguments)
         unsafe["allow_mutation"] = False
         self.assertIsNone(

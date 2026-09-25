@@ -1363,9 +1363,20 @@ def _post_merge_sync_apply_replay_preflight(
     )
     if (
         spec is None
+        or spec.version != "1.0"
+        or tuple(spec.required_parameters)
+        != (
+            "repo",
+            "target_branch",
+            "expected_local_head",
+            "expected_remote_head",
+            "confirmation",
+        )
         or spec.effect != grabowski_grips.MUTATING
         or spec.runner != "post_merge_sync_apply"
-        or not required_acceptance.issubset(spec.acceptance_ids)
+        or spec.operation_effect_class != "worktree_admin"
+        or spec.operation_class != "worktree-admin"
+        or frozenset(spec.acceptance_ids) != required_acceptance
     ):
         return None
 
@@ -1399,9 +1410,12 @@ def _post_merge_sync_apply_replay_preflight(
     grip_contract = {
         "name": spec.name,
         "version": spec.version,
+        "required_parameters": list(spec.required_parameters),
         "effect": spec.effect,
         "runner": spec.runner,
-        "acceptance_ids": sorted(spec.acceptance_ids),
+        "operation_effect_class": spec.operation_effect_class,
+        "operation_class": spec.operation_class,
+        "acceptance_ids": list(spec.acceptance_ids),
     }
     return {
         "kind": "grabowski_signed_replay_recovery_preflight",
