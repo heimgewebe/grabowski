@@ -768,10 +768,20 @@ def bind_physical_checkout(
         git_descriptor = None
         return bound
     finally:
+        close_error: OSError | None = None
         if git_descriptor is not None:
-            os.close(git_descriptor)
+            try:
+                os.close(git_descriptor)
+            except OSError as exc:
+                close_error = exc
         if root_descriptor >= 0:
-            os.close(root_descriptor)
+            try:
+                os.close(root_descriptor)
+            except OSError as exc:
+                if close_error is None:
+                    close_error = exc
+        if close_error is not None:
+            raise close_error
 
 
 def verify_physical_checkout_identity(expected: dict[str, Any]) -> dict[str, Any]:

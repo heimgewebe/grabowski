@@ -657,6 +657,35 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             )
             self.assertEqual(target, git_stdout(retired, "rev-parse", "HEAD"))
 
+    def test_physical_resource_keys_collide_on_moved_git_directory_inode(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_a, _remote, _base, _target = self.fixture(root)
+            repo_b = root / "repo-b"
+            repo_b.mkdir()
+            before = physical_checkout.capture_physical_checkout_identity(repo_a)
+
+            (repo_a / ".git").rename(repo_b / ".git")
+            after = physical_checkout.capture_physical_checkout_identity(repo_b)
+
+            before_keys = set(sync_apply._physical_checkout_resource_keys(before))
+            after_keys = set(sync_apply._physical_checkout_resource_keys(after))
+            self.assertNotEqual(before["root"]["inode"], after["root"]["inode"])
+            self.assertEqual(before["git_dir"]["inode"], after["git_dir"]["inode"])
+            self.assertEqual(before["common_dir"]["inode"], after["common_dir"]["inode"])
+            self.assertEqual(
+                1,
+                len(
+                    {
+                        key
+                        for key in before_keys & after_keys
+                        if key.startswith("component:physical-git-common-dir:")
+                    }
+                ),
+            )
+
     def test_same_path_replacement_during_effect_cannot_receive_git_effects(
         self,
     ) -> None:
@@ -1079,11 +1108,18 @@ class PostMergeSyncApplyTests(unittest.TestCase):
                 result["lease_cleanup_next_action"],
             )
             self.assertEqual(1, leases.release_calls)
-            self.assertEqual(4, len(leases.live))
+            self.assertEqual(5, len(leases.live))
             self.assertEqual(
                 1,
                 sum(
                     key.startswith("component:physical-checkout-root:")
+                    for key in leases.live
+                ),
+            )
+            self.assertEqual(
+                1,
+                sum(
+                    key.startswith("component:physical-git-common-dir:")
                     for key in leases.live
                 ),
             )

@@ -62,20 +62,57 @@ def _run(
     return result
 
 
-def _physical_checkout_resource_key(identity: dict[str, Any]) -> str:
-    root = identity.get("root")
-    if not isinstance(root, dict):
-        raise PostMergeSyncApplyError("physical checkout root identity is missing")
-    device = root.get("device")
-    inode = root.get("inode")
+def _physical_node_resource_key(
+    identity: dict[str, Any],
+    *,
+    node_name: str,
+    resource_kind: str,
+) -> str:
+    node = identity.get(node_name)
+    if not isinstance(node, dict):
+        raise PostMergeSyncApplyError(
+            f"physical checkout {node_name} identity is missing"
+        )
+    device = node.get("device")
+    inode = node.get("inode")
     if (
         type(device) is not int
         or device < 0
         or type(inode) is not int
         or inode < 0
     ):
-        raise PostMergeSyncApplyError("physical checkout root identity is invalid")
-    return f"component:physical-checkout-root:{device}:{inode}"
+        raise PostMergeSyncApplyError(
+            f"physical checkout {node_name} identity is invalid"
+        )
+    return f"component:{resource_kind}:{device}:{inode}"
+
+
+def _physical_checkout_resource_keys(identity: dict[str, Any]) -> tuple[str, str]:
+    git_dir = identity.get("git_dir")
+    common_dir = identity.get("common_dir")
+    if not isinstance(git_dir, dict) or not isinstance(common_dir, dict):
+        raise PostMergeSyncApplyError(
+            "physical Git/common directory identity is missing"
+        )
+    if (
+        git_dir.get("device") != common_dir.get("device")
+        or git_dir.get("inode") != common_dir.get("inode")
+    ):
+        raise PostMergeSyncApplyError(
+            "physical Git/common directory identity does not describe one node"
+        )
+    return (
+        _physical_node_resource_key(
+            identity,
+            node_name="root",
+            resource_kind="physical-checkout-root",
+        ),
+        _physical_node_resource_key(
+            identity,
+            node_name="common_dir",
+            resource_kind="physical-git-common-dir",
+        ),
+    )
 
 
 def _fd_bound_runner(
@@ -447,7 +484,7 @@ def apply(
             f"repo:{repo}",
             f"path:{repo}",
             f"path:{identity['git_common_dir']}",
-            _physical_checkout_resource_key(initial_physical),
+            *_physical_checkout_resource_keys(initial_physical),
         ]
     )
     try:

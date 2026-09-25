@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import grabowski_git_preimage as git_preimage
 import grabowski_physical_checkout as physical_checkout
@@ -138,6 +139,93 @@ class PhysicalCheckoutIdentityTests(unittest.TestCase):
                     os.stat(bound.effect_root).st_ino,
                 )
 
+
+    def test_failed_bind_cleanup_attempts_root_close_after_git_close_error(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            self._init_committed_repo(repo)
+            expected = physical_checkout.capture_physical_checkout_identity(repo)
+            real_open_absolute = physical_checkout._open_absolute_directory
+            real_open_relative = physical_checkout._open_relative_directory
+            real_close = physical_checkout.os.close
+            opened: dict[str, int] = {}
+            close_attempts: list[int] = []
+
+            def recording_open_absolute(path: Path, *, label: str):
+                descriptor, metadata = real_open_absolute(path, label=label)
+                if label == "checkout root":
+                    opened["root"] = descriptor
+                return descriptor, metadata
+
+            def recording_open_relative(
+                parent_descriptor: int,
+                name: str,
+                *,
+                label: str,
+            ):
+                descriptor, metadata = real_open_relative(
+                    parent_descriptor,
+                    name,
+                    label=label,
+                )
+                if name == ".git":
+                    opened["git"] = descriptor
+                return descriptor, metadata
+
+            def fail_validation(*_args: object, **_kwargs: object) -> None:
+                close_attempts.clear()
+                raise physical_checkout.PhysicalCheckoutIdentityError(
+                    "injected bind validation failure"
+                )
+
+            def close_with_git_failure(descriptor: int) -> None:
+                close_attempts.append(descriptor)
+                if descriptor == opened.get("git"):
+                    raise OSError("injected git descriptor close failure")
+                real_close(descriptor)
+
+            try:
+                with (
+                    patch.object(
+                        physical_checkout,
+                        "capture_physical_checkout_identity",
+                        return_value=expected,
+                    ),
+                    patch.object(
+                        physical_checkout,
+                        "_open_absolute_directory",
+                        side_effect=recording_open_absolute,
+                    ),
+                    patch.object(
+                        physical_checkout,
+                        "_open_relative_directory",
+                        side_effect=recording_open_relative,
+                    ),
+                    patch.object(
+                        physical_checkout,
+                        "_assert_absolute_directory_node",
+                        side_effect=fail_validation,
+                    ),
+                    patch.object(
+                        physical_checkout.os,
+                        "close",
+                        side_effect=close_with_git_failure,
+                    ),
+                ):
+                    with self.assertRaises(OSError):
+                        physical_checkout.bind_physical_checkout(repo)
+
+                self.assertIn(opened["git"], close_attempts)
+                self.assertIn(opened["root"], close_attempts)
+            finally:
+                for descriptor in opened.values():
+                    try:
+                        os.fstat(descriptor)
+                    except OSError:
+                        continue
+                    real_close(descriptor)
 
     def test_stable_gitdir_pointer_detects_metadata_directory_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
