@@ -1271,47 +1271,29 @@ def build_projection(
     if not audit_window_complete:
         partial_status = transition_gap["status"]
         partial_count = transition_gap["count"]
-        if partial_status == "observed":
-            # Truncation removes only an older audit prefix.  A positively observed
-            # gap/reconciliation whose intent is present in the verified suffix
-            # cannot be invented by that omission: any later completion for the
-            # visible intent would also be in the suffix.  Preserve positive
-            # evidence while refusing to claim that additional gaps are absent.
-            transition_gap = {
-                **transition_gap,
-                "evidence_quality": "partial_verified_audit_window_positive_evidence",
-                "details": {
-                    **transition_gap["details"],
-                    "audit_window_complete": False,
-                    "partial_status": partial_status,
-                    "partial_count": partial_count,
-                },
-                "does_not_establish": [
-                    *transition_gap["does_not_establish"],
-                    "absence_of_additional_transition_gaps_outside_the_verified_scan",
-                ],
-            }
-        else:
-            transition_gap = {
-                **transition_gap,
-                "status": "indeterminate",
-                "severity": "unknown",
-                "count": None,
-                "evidence_quality": "partial_verified_audit_window",
-                "recommended_action": (
-                    "inspect a complete verified audit window before classifying transition gaps"
-                ),
-                "details": {
-                    **transition_gap["details"],
-                    "audit_window_complete": False,
-                    "partial_status": partial_status,
-                    "partial_count": partial_count,
-                },
-                "does_not_establish": [
-                    *transition_gap["does_not_establish"],
-                    "absence_or_presence_of_transition_gaps_across_the_scan_boundary",
-                ],
-            }
+        # Prefix truncation can change retention-receipt ownership and therefore
+        # which visible intent appears unmatched.  Partial positive transition
+        # evidence is not monotonic, so never promote it to a reliable gap.
+        transition_gap = {
+            **transition_gap,
+            "status": "indeterminate",
+            "severity": "unknown",
+            "count": None,
+            "evidence_quality": "partial_verified_audit_window",
+            "recommended_action": (
+                "inspect a complete verified audit window before classifying transition gaps"
+            ),
+            "details": {
+                **transition_gap["details"],
+                "audit_window_complete": False,
+                "partial_status": partial_status,
+                "partial_count": partial_count,
+            },
+            "does_not_establish": [
+                *transition_gap["does_not_establish"],
+                "absence_or_presence_of_transition_gaps_across_the_scan_boundary",
+            ],
+        }
     friction_source = _audit_friction_signal_source()
     runtime_source = _runtime_signal_source(runtime_status_provider)
     contradiction_raw, blockade_raw, stale_raw = _audit_friction_signals(
