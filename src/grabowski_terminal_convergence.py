@@ -134,6 +134,14 @@ def _canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _canonical_utf8_sha256(value: Any, *, error: str) -> str:
+    try:
+        payload = _canonical_json(value).encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise TerminalConvergenceError(error) from exc
+    return hashlib.sha256(payload).hexdigest()
+
+
 def task_execution_identity(
     *,
     host: str,
@@ -168,9 +176,10 @@ def task_execution_identity(
     }
     return {
         **material,
-        "identity_sha256": hashlib.sha256(
-            _canonical_json(material).encode("utf-8")
-        ).hexdigest(),
+        "identity_sha256": _canonical_utf8_sha256(
+            material,
+            error="attention execution identity is not UTF-8 encodable",
+        ),
     }
 
 
@@ -332,11 +341,14 @@ def persisted_retry_binding(record: dict[str, Any]) -> dict[str, Any] | None:
         raise TerminalConvergenceError("persisted retry binding shape is invalid")
     material = {key: binding[key] for key in required - {"context_sha256"}}
     context_sha256 = binding["context_sha256"]
+    expected_context_sha256 = _canonical_utf8_sha256(
+        material,
+        error="persisted retry binding integrity is invalid",
+    )
     if (
         not isinstance(context_sha256, str)
         or SHA256_RE.fullmatch(context_sha256) is None
-        or hashlib.sha256(_canonical_json(material).encode("utf-8")).hexdigest()
-        != context_sha256
+        or expected_context_sha256 != context_sha256
     ):
         raise TerminalConvergenceError("persisted retry binding integrity is invalid")
     if binding["schema_version"] != 1 or binding["kind"] != "grabowski_named_terminal_retry":

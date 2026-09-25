@@ -294,6 +294,71 @@ class TerminalConvergenceTests(unittest.TestCase):
         ):
             convergence.converge_attention_records([older, newer])
 
+    def test_persisted_retry_binding_rejects_unencodable_material(self) -> None:
+        record = self._failed_attention_record("2" * 24, 20, "b", "d")
+        record["launcher_json"] = json.dumps(
+            {
+                "retry_binding": {
+                    "schema_version": 1,
+                    "kind": "grabowski_named_terminal_retry",
+                    "source_task_id": "1" * 24,
+                    "source_attempt": 1,
+                    "source_state": "failed",
+                    "source_resume_policy": "never",
+                    "source_lifecycle_receipt_sha256": "a" * 64,
+                    "source_terminalization_sha256": "c" * 64,
+                    "source_execution_identity_sha256": "9" * 64,
+                    "named_state_change": "\ud800",
+                    "observed_at_unix": 15,
+                    "does_not_establish": [],
+                    "context_sha256": "0" * 64,
+                }
+            },
+            ensure_ascii=True,
+        )
+        with self.assertRaisesRegex(
+            convergence.TerminalConvergenceError,
+            "integrity",
+        ):
+            convergence.persisted_retry_binding(record)
+
+    def test_attention_execution_identity_rejects_unencodable_material(self) -> None:
+        base = {
+            "host": "local",
+            "argv_sha256": "7" * 64,
+            "cwd": "/repo",
+            "resource_keys_json": "[]",
+            "runtime_seconds": 60,
+            "cpu_weight": 100,
+            "io_weight": 100,
+            "memory_max_bytes": None,
+            "chronik_outbox_enabled": 1,
+            "chronik_outbox_state_root": None,
+            "chronik_context_json": None,
+            "execution_backend": "systemd-user",
+            "systemd_scope": "user",
+        }
+        cases = (
+            {
+                **base,
+                "resource_keys_json": json.dumps(["\ud800"], ensure_ascii=True),
+            },
+            {
+                **base,
+                "chronik_context_json": json.dumps(
+                    {"bureau_task_id": "\ud800"},
+                    ensure_ascii=True,
+                ),
+            },
+        )
+        for record in cases:
+            with self.subTest(record=record):
+                with self.assertRaisesRegex(
+                    convergence.TerminalConvergenceError,
+                    "not UTF-8 encodable",
+                ):
+                    convergence.attention_execution_identity(record)
+
     def test_attention_execution_identity_keeps_distinct_work_contexts(self) -> None:
         base = {
             "task_id": "5" * 24,
