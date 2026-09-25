@@ -2551,11 +2551,21 @@ def acquire_work(
                 existing, inputs, lifecycle_source, runner
             )
         except Exception as exc:
+            compensation, compensation_complete = _compensate_acquisitions(
+                owner_id=inputs["lease_owner_id"],
+                plan=acquisition_plan,
+                acquisitions=acquisitions,
+                release_resources_fn=release_resources_fn,
+                receipt_path=receipt_path,
+                base_record=base_record,
+                lease_receipt=acquired,
+            )
+            state = "blocked" if compensation_complete else "outcome_unknown"
             record = _write_state(
                 receipt_path,
                 {
                     **base_record,
-                    "state": "blocked",
+                    "state": state,
                     "decision": "HARD_BLOCK",
                     "lease_receipt": acquired,
                     **group_evidence,
@@ -2563,7 +2573,12 @@ def acquire_work(
                     "error_class": "WORKTREE_CONTINUATION_CONFLICT",
                     "error": str(exc)[:2048],
                     "effect_observed": False,
-                    "next_action": "reconcile_managed_worktree_continuation",
+                    "compensation": compensation,
+                    "next_action": (
+                        "reconcile_managed_worktree_continuation"
+                        if compensation_complete
+                        else "reconcile_lease_compensation_before_retry"
+                    ),
                 },
             )
             if audit_fn is not None:
@@ -2571,7 +2586,7 @@ def acquire_work(
                     {
                         "operation": "work-acquire",
                         "lane_id": lane_id,
-                        "state": "blocked",
+                        "state": state,
                         "decision": "HARD_BLOCK",
                         "inputs_sha256": inputs_sha256,
                         "effect_observed": False,

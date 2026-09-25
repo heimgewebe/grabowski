@@ -1706,9 +1706,10 @@ class WorkAcquireTests(unittest.TestCase):
                 "expected_branch": inputs["branch"],
             },
         })
+        release = Mock(side_effect=self.release)
         kwargs = {
             "acquire_resources_fn": self.acquire,
-            "release_resources_fn": Mock(),
+            "release_resources_fn": release,
             "inspect_resource_fn": Mock(),
             "ensure_worktree_fn": ensure,
         }
@@ -1770,6 +1771,8 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertEqual(blocked["state"], "blocked")
         self.assertEqual(blocked["error_class"], "WORKTREE_CONTINUATION_CONFLICT")
         self.assertIn("readback was truncated", blocked["error"])
+        self.assertEqual(blocked["compensation"]["state"], "complete")
+        release.assert_called_once()
         self.assertEqual(ensure.call_count, 1)
 
     def test_dirty_lane_continuation_rejects_hidden_index_entries(self) -> None:
@@ -1791,9 +1794,10 @@ class WorkAcquireTests(unittest.TestCase):
                 "expected_branch": inputs["branch"],
             },
         })
+        release = Mock(side_effect=self.release)
         kwargs = {
             "acquire_resources_fn": self.acquire,
-            "release_resources_fn": Mock(),
+            "release_resources_fn": release,
             "inspect_resource_fn": Mock(),
             "ensure_worktree_fn": ensure,
         }
@@ -1847,6 +1851,8 @@ class WorkAcquireTests(unittest.TestCase):
             blocked = work_acquire.acquire_work(params, runner=runner, **kwargs)
         self.assertEqual(blocked["state"], "blocked")
         self.assertIn("assume-unchanged", blocked["error"])
+        self.assertEqual(blocked["compensation"]["state"], "complete")
+        release.assert_called_once()
         self.assertEqual(ensure.call_count, 1)
 
     def test_continuation_rejects_preexisting_unregistered_physical_checkout(self) -> None:
@@ -2394,9 +2400,10 @@ class WorkAcquireTests(unittest.TestCase):
                 "expected_branch": inputs["branch"],
             },
         })
+        release = Mock(side_effect=self.release)
         kwargs = {
             "acquire_resources_fn": self.acquire,
-            "release_resources_fn": Mock(),
+            "release_resources_fn": release,
             "inspect_resource_fn": Mock(),
             "ensure_worktree_fn": ensure,
             "runner": Mock(),
@@ -2451,6 +2458,8 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertEqual(
             blocked["next_action"], "reconcile_managed_worktree_continuation"
         )
+        self.assertEqual(blocked["compensation"]["state"], "complete")
+        release.assert_called_once()
         self.assertEqual(ensure.call_count, 1)
 
     def test_writer_binding_survives_reacquire_block(self) -> None:
@@ -2726,6 +2735,86 @@ class WorkAcquireTests(unittest.TestCase):
             set(expected_leases[0]),
             work_acquire.resources.LEASE_SNAPSHOT_KEYS,
         )
+
+    def test_continuation_conflict_after_reacquire_compensates_fresh_leases(self) -> None:
+        params = self.parameters()
+        self.store_lane(params)
+        acquire = Mock(side_effect=self.acquire)
+        release = Mock(side_effect=self.release)
+        ensure = Mock()
+
+        with patch.object(
+            work_acquire,
+            "_continuation_preimage",
+            side_effect=RuntimeError("continuation evidence drifted"),
+        ):
+            result = work_acquire.acquire_work(
+                params,
+                acquire_resources_fn=acquire,
+                release_resources_fn=release,
+                inspect_resource_fn=Mock(),
+                ensure_worktree_fn=ensure,
+                runner=Mock(),
+            )
+
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["decision"], "HARD_BLOCK")
+        self.assertEqual(
+            result["error_class"], "WORKTREE_CONTINUATION_CONFLICT"
+        )
+        self.assertEqual(result["compensation"]["state"], "complete")
+        self.assertEqual(
+            result["next_action"], "reconcile_managed_worktree_continuation"
+        )
+        self.assertFalse(result["effect_observed"])
+        self.assertTrue(result["replayed"])
+        acquire.assert_called_once()
+        release.assert_called_once()
+        ensure.assert_not_called()
+        expected_leases = release.call_args.kwargs["expected_leases"]
+        self.assertTrue(expected_leases)
+        self.assertEqual(
+            set(expected_leases[0]),
+            work_acquire.resources.LEASE_SNAPSHOT_KEYS,
+        )
+
+    def test_continuation_conflict_with_uncertain_compensation_is_outcome_unknown(self) -> None:
+        params = self.parameters()
+        self.store_lane(params)
+        acquire = Mock(side_effect=self.acquire)
+        release = Mock(side_effect=RuntimeError("release response lost"))
+        ensure = Mock()
+        kwargs = {
+            "acquire_resources_fn": acquire,
+            "release_resources_fn": release,
+            "inspect_resource_fn": Mock(),
+            "ensure_worktree_fn": ensure,
+            "runner": Mock(),
+        }
+
+        with patch.object(
+            work_acquire,
+            "_continuation_preimage",
+            side_effect=RuntimeError("continuation evidence drifted"),
+        ):
+            first = work_acquire.acquire_work(params, **kwargs)
+            second = work_acquire.acquire_work(params, **kwargs)
+
+        self.assertEqual(first["state"], "outcome_unknown")
+        self.assertEqual(first["decision"], "HARD_BLOCK")
+        self.assertEqual(
+            first["error_class"], "WORKTREE_CONTINUATION_CONFLICT"
+        )
+        self.assertEqual(first["compensation"]["state"], "outcome_unknown")
+        self.assertEqual(
+            first["next_action"], "reconcile_lease_compensation_before_retry"
+        )
+        self.assertFalse(first["effect_observed"])
+        self.assertTrue(second["replayed"])
+        self.assertEqual(second["state"], "outcome_unknown")
+        self.assertEqual(acquire.call_count, 1)
+        self.assertEqual(release.call_count, 1)
+        ensure.assert_not_called()
 
     def test_non_object_result_is_durable_outcome_unknown(self) -> None:
         release = Mock()
