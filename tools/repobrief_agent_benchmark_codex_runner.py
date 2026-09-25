@@ -3937,7 +3937,7 @@ def build_command(
         "-c", f"permissions.{PERMISSION_PROFILE}.filesystem={filesystem}",
         "-c", f'permissions.{PERMISSION_PROFILE}.network={{enabled=true,mode="limited",allow_local_binding=false,domains={{}}}}',
         "--ephemeral", "--ignore-user-config", "--ignore-rules", "--strict-config",
-        "--disable", "apps",
+        "--disable", "apps", "--disable", "plugins",
         "--color", "never", "--json", "--model", MODEL,
         "-c", 'model_reasoning_effort="medium"',
         "-c", 'web_search="disabled"',
