@@ -25,6 +25,8 @@ Neue Clients sollen die kanonischen Namen senden und das zurückgegebene Feld `v
 
 `schema_version` versioniert die konkrete Antwortform einer Oberfläche, nicht das gesamte Grabowski-Protokoll. Ein Client muss deshalb pro Werkzeug und Antwortobjekt auf die angegebene Schemaversion reagieren.
 
+Bei `grabowski_status` meint `schema_version` in diesem Abschnitt ausdrücklich das Top-Level-Antwortfeld, nicht ein gegebenenfalls verschachteltes `transport_roundtrip.schema_version`. `minimal` und der Alias `concise` liefern Top-Level-Schema 3; `standard`, `evidence` und der Alias `full` bleiben Top-Level-Schema 2. In Schema 3 ist `mutation_gate_open` immer vorhanden und bildet fail-closed die effektive Bereitschaft des ausgewählten Normalpfads ab. Die bereits veröffentlichten Selected-Path-Felder `normal_mutation_path_ready`, `normal_mutation_path` und `legacy_roundtrip_required` behalten ihre bisherige Semantik und bleiben optional, wenn der Transportstatus keinen Normalpfad auswählen kann; ihr Fehlen bedeutet nicht bereit, `mutation_gate_open` ist dann `false`. Schema 2 bleibt diagnostisch: Dort bezeichnet `mutation_gate_open` weiterhin den rohen Legacy-Roundtrip-Gate, während `normal_mutation_path_ready` die Bereitschaft des ausgewählten Normalpfads beschreibt, sofern das Feld vorhanden ist. Consumer über mehrere Sichten müssen deshalb anhand des Top-Level-`schema_version` verzweigen.
+
 Für Consumer-Antworten mit Schema 2 gilt:
 
 - Warnungen, nächste Aktion und Top-Level-Nichtaussagen bleiben bei Feldprojektion erhalten;
@@ -88,7 +90,7 @@ Für bereits vorhandene Schema-1-Leser bleibt der Lesepfad kompatibel. Neue oder
 
 ## Client-Snapshot
 
-Ein Server-Deploy aktualisiert keinen bereits eingefrorenen clientseitigen Werkzeug-Snapshot. Nach einer Änderung des serverseitigen Werkzeugvertrags muss der Client seinen Snapshot über den jeweiligen Plattformmechanismus erneuern. Der Server kann diese Aktualisierung nur als nicht beobachtbar kennzeichnen.
+Ein Server-Deploy aktualisiert keinen bereits eingefrorenen clientseitigen Werkzeug-Snapshot. Nach einer Änderung des serverseitigen Werkzeugvertrags muss der Client seinen Snapshot über den jeweiligen Plattformmechanismus erneuern. Count und Werkzeugnamen-Hash dienen nur zum Erkennen und Binden der Abweichung; weder ein neu berechneter Hash noch ein serverseitiges Receipt aktualisiert den eingefrorenen Clientkatalog. Der Server kann diese Aktualisierung nur als nicht beobachtbar kennzeichnen.
 
 ## Umstellungsreihenfolge
 

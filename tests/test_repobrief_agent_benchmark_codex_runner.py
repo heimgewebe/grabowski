@@ -421,6 +421,67 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(runner.RunnerError, "Codex runner contract mismatch"):
             runner.validate_request(value)
 
+    def test_codex_output_schema_strips_only_unsupported_unique_items(self) -> None:
+        canonical = json.loads(json.dumps(runner.base.ANSWER_SCHEMA))
+        projected = runner._codex_output_schema()
+
+        self.assertEqual(runner.base.ANSWER_SCHEMA, canonical)
+        self.assertFalse(runner._schema_contains_unique_items(projected))
+
+        restored = json.loads(json.dumps(projected))
+        for field in runner._CODEX_OUTPUT_SCHEMA_UNIQUE_ITEM_FIELDS:
+            restored["properties"][field]["uniqueItems"] = True
+        self.assertEqual(restored, canonical)
+
+    def test_write_schema_emits_codex_compatible_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "answer-schema.json"
+            runner.write_schema(path)
+            self.assertEqual(
+                json.loads(path.read_text(encoding="utf-8")),
+                runner._codex_output_schema(),
+            )
+
+    def test_canonical_answer_validation_still_rejects_duplicates(self) -> None:
+        claim = sorted(runner.base.CLAIM_VOCABULARY)[0]
+        answer = {
+            "text": "bounded answer",
+            "outcome": "answer",
+            "reported_paths": ["src/example.py"],
+            "reported_symbols": ["example"],
+            "citations": [
+                {"path": "src/example.py", "start_line": 1, "end_line": 2}
+            ],
+            "claims": [claim],
+            "asserted_sufficient_evidence": False,
+        }
+        duplicates = {
+            "reported_paths": ["src/example.py", "src/example.py"],
+            "reported_symbols": ["example", "example"],
+            "claims": [claim, claim],
+            "citations": [
+                {"path": "src/example.py", "start_line": 1, "end_line": 2},
+                {"path": "src/example.py", "start_line": 1, "end_line": 2},
+            ],
+        }
+        for field, value in duplicates.items():
+            with self.subTest(field=field):
+                candidate = json.loads(json.dumps(answer))
+                candidate[field] = value
+                with self.assertRaisesRegex(runner.base.RunnerError, "duplicates"):
+                    runner.base.validate_answer(candidate)
+
+    def test_codex_output_schema_fails_closed_on_uniqueness_contract_drift(self) -> None:
+        drifted = json.loads(json.dumps(runner.base.ANSWER_SCHEMA))
+        del drifted["properties"]["reported_paths"]["uniqueItems"]
+        with (
+            patch.object(runner.base, "ANSWER_SCHEMA", drifted),
+            self.assertRaisesRegex(
+                runner.RunnerError, "output schema uniqueness contract drift"
+            ),
+        ):
+            runner._codex_output_schema()
+
     def test_provider_environment_removes_payg_keys(self) -> None:
         with patch.dict(
             os.environ,
@@ -575,6 +636,67 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 with self.assertRaisesRegex(runner.RunnerError, "ChatGPT subscription"):
                     runner.validate_chatgpt_subscription("/opt/codex")
 
+    def test_chatgpt_subscription_gate_qualifies_only_its_exact_tempdir_warning(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary) / "home"
+            auth_dir = home / ".codex"
+            auth_dir.mkdir(parents=True, mode=0o700)
+            auth = auth_dir / "auth.json"
+            auth.write_bytes(b"opaque-chatgpt-auth")
+            auth.chmod(0o600)
+
+            def status(argv, **kwargs):
+                snapshot_home = Path(kwargs["env"]["CODEX_HOME"])
+                temporary_dir = snapshot_home.parents[2]
+                warning = (
+                    "WARNING: proceeding, even though we could not create PATH aliases: "
+                    "Refusing to create helper binaries under temporary dir "
+                    f'"{temporary_dir}" '
+                    f'(codex_home: AbsolutePathBuf("{snapshot_home}"))\n'
+                )
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    stdout=b"",
+                    stderr=(warning + "Logged in using ChatGPT\n").encode(),
+                )
+
+            with (
+                patch.dict(os.environ, {"HOME": str(home)}, clear=True),
+                patch.object(runner, "validate_toolchain", return_value="/usr/bin:/bin"),
+                patch.object(runner.subprocess, "run", side_effect=status),
+            ):
+                self.assertEqual(
+                    runner.validate_chatgpt_subscription("/opt/codex"),
+                    b"opaque-chatgpt-auth",
+                )
+
+            def foreign_status(argv, **kwargs):
+                snapshot_home = Path(kwargs["env"]["CODEX_HOME"])
+                temporary_dir = snapshot_home.parents[2]
+                warning = (
+                    "WARNING: proceeding, even though we could not create PATH aliases: "
+                    "Refusing to create helper binaries under temporary dir "
+                    f'"{temporary_dir}" '
+                    f'(codex_home: AbsolutePathBuf("{snapshot_home}-foreign"))\n'
+                )
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    stdout=b"",
+                    stderr=(warning + "Logged in using ChatGPT\n").encode(),
+                )
+
+            with (
+                patch.dict(os.environ, {"HOME": str(home)}, clear=True),
+                patch.object(runner, "validate_toolchain", return_value="/usr/bin:/bin"),
+                patch.object(runner.subprocess, "run", side_effect=foreign_status),
+            ):
+                with self.assertRaisesRegex(runner.RunnerError, "ChatGPT subscription"):
+                    runner.validate_chatgpt_subscription("/opt/codex")
+
     def test_chatgpt_subscription_status_uses_exact_staged_auth_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary) / "home"
@@ -651,6 +773,15 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertEqual(qualified["classification"], "qualified_benign_text")
         self.assertEqual(qualified["meaningful_line_count"], 1)
         self.assertEqual(len(runner.QUALIFIED_BENIGN_STDERR_PATTERNS), 1)
+
+        login_only = runner.classify_stderr(
+            b"WARNING: proceeding, even though we could not create PATH aliases: "
+            b"Refusing to create helper binaries under temporary dir \"/tmp\" "
+            b"(codex_home: AbsolutePathBuf("
+            b"\"/tmp/grabowski-codex-auth-example/codex-runtime/session-example\"))\n"
+        )
+        self.assertFalse(login_only["allowed"])
+        self.assertEqual(login_only["classification"], "text_unqualified")
 
         near_match = runner.classify_stderr(
             b"WARNING: proceeding, even though we could not create PATH aliases: "

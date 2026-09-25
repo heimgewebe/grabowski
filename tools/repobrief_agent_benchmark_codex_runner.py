@@ -382,6 +382,24 @@ QUALIFIED_BENIGN_STDERR_PATTERNS: tuple[re.Pattern[str], ...] = (
     ),
 )
 
+
+# Codex 0.156.1 additionally warns when login status uses a temporary
+# CODEX_HOME. Qualify only the exact temp root and snapshot home created by
+# this invocation; the live-provider stderr policy remains unchanged.
+def _login_status_line_is_qualified(
+    line: str, *, snapshot_root: Path, snapshot_home: Path
+) -> bool:
+    if any(pattern.fullmatch(line) for pattern in QUALIFIED_BENIGN_STDERR_PATTERNS):
+        return True
+    expected = (
+        "WARNING: proceeding, even though we could not create PATH aliases: "
+        "Refusing to create helper binaries under temporary dir "
+        f'"{snapshot_root.parent}" '
+        f'(codex_home: AbsolutePathBuf("{snapshot_home}"))'
+    )
+    return hmac.compare_digest(line, expected)
+
+
 RunnerError = base.RunnerError
 
 
@@ -819,9 +837,13 @@ def validate_chatgpt_subscription(codex: str) -> bytes:
             except UnicodeDecodeError as exc:
                 raise RunnerError("Codex ChatGPT login status was not UTF-8") from exc
             lines = [line.strip() for line in text.splitlines() if line.strip()]
-            status_lines = [line for line in lines if not any(
-                pattern.fullmatch(line) for pattern in QUALIFIED_BENIGN_STDERR_PATTERNS
-            )]
+            status_lines = [
+                line
+                for line in lines
+                if not _login_status_line_is_qualified(
+                    line, snapshot_root=snapshot_root, snapshot_home=snapshot_home
+                )
+            ]
             if completed.returncode != 0 or status_lines != [CHATGPT_LOGIN_LINE]:
                 raise RunnerError("Codex must be logged in using the ChatGPT subscription")
             staged = _read_bound_regular_file(
@@ -3822,10 +3844,45 @@ def run_mcp_proxy(
     return returncode
 
 
+_CODEX_OUTPUT_SCHEMA_UNIQUE_ITEM_FIELDS = (
+    "reported_paths",
+    "reported_symbols",
+    "citations",
+    "claims",
+)
+
+
+def _schema_contains_unique_items(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        if "uniqueItems" in value:
+            return True
+        return any(_schema_contains_unique_items(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_schema_contains_unique_items(item) for item in value)
+    return False
+
+
+def _codex_output_schema() -> dict[str, Any]:
+    """Project the canonical answer contract into Codex Structured Outputs."""
+
+    schema = json.loads(json.dumps(base.ANSWER_SCHEMA))
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        raise RunnerError("Codex output schema properties contract drift")
+    for field in _CODEX_OUTPUT_SCHEMA_UNIQUE_ITEM_FIELDS:
+        node = properties.get(field)
+        if not isinstance(node, dict) or node.get("uniqueItems") is not True:
+            raise RunnerError("Codex output schema uniqueness contract drift")
+        del node["uniqueItems"]
+    if _schema_contains_unique_items(schema):
+        raise RunnerError("Codex output schema contains unsupported uniqueItems")
+    return schema
+
+
 def write_schema(path: Path) -> None:
     base._write_private_exclusive(
         path,
-        (json.dumps(base.ANSWER_SCHEMA, sort_keys=True, indent=2) + "\n").encode("utf-8"),
+        (json.dumps(_codex_output_schema(), sort_keys=True, indent=2) + "\n").encode("utf-8"),
     )
 
 
