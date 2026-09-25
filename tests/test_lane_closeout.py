@@ -303,6 +303,74 @@ class LaneCloseoutTests(unittest.TestCase):
         self.assertEqual(rescue["phase"], "rescue_required")
         self.assertIn("create_durable_followup", rescue["recovery_actions"])
 
+    def test_blocked_followup_assessment_preserves_followup_identity(self) -> None:
+        assessment = closeout.assess(
+            self.observation(
+                writer_state="outcome_unknown",
+                durable_followup_id="followup-1",
+                readback_errors=("github-timeout",),
+            ),
+            observed_at_unix=200,
+        )
+        self.assertEqual(
+            "blocked_with_durable_followup", assessment["closeout_state"]
+        )
+        self.assertEqual("followup-1", assessment["durable_followup_id"])
+        self.assertFalse(assessment["lease_release_ready"])
+        self.assertEqual(
+            closeout.validate_terminal_assessment(assessment),
+            assessment,
+        )
+
+    def test_terminal_assessment_validator_rejects_followup_id_on_other_state(self) -> None:
+        assessment = closeout.assess(
+            self.observation(
+                pr_number=631,
+                pr_state="open",
+                pr_head_sha=HEAD,
+            ),
+            observed_at_unix=200,
+        )
+        assessment["durable_followup_id"] = "followup-1"
+        material = {
+            key: value
+            for key, value in assessment.items()
+            if key not in {
+                "assessment_sha256",
+                "audit_record_sha256",
+                "does_not_establish",
+            }
+        }
+        assessment["assessment_sha256"] = closeout.sha256_json(material)
+        with self.assertRaisesRegex(
+            closeout.LaneCloseoutError,
+            "requires blocked followup state",
+        ):
+            closeout.validate_terminal_assessment(assessment)
+
+    def test_legacy_blocked_followup_without_persisted_id_remains_valid(self) -> None:
+        assessment = closeout.assess(
+            self.observation(
+                writer_state="outcome_unknown",
+                durable_followup_id="followup-1",
+                readback_errors=("github-timeout",),
+            ),
+            observed_at_unix=200,
+        )
+        legacy = dict(assessment)
+        legacy.pop("durable_followup_id")
+        material = {
+            key: value
+            for key, value in legacy.items()
+            if key not in {
+                "assessment_sha256",
+                "audit_record_sha256",
+                "does_not_establish",
+            }
+        }
+        legacy["assessment_sha256"] = closeout.sha256_json(material)
+        self.assertEqual(closeout.validate_terminal_assessment(legacy), legacy)
+
     def test_active_liveness_with_readback_errors_stays_non_terminal(self) -> None:
         active = closeout.classify(
             self.observation(

@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import stat
 from typing import Any
@@ -995,6 +996,73 @@ def _coordination(
     return checkouts._coordination_result(leases, tasks, processes)
 
 
+def _blocked_followup_capacity_release_ready(
+    source_evidence: dict[str, Any], checkout_key: str
+) -> bool:
+    if (
+        source_evidence.get("terminal_state") != "blocked_with_durable_followup"
+        or source_evidence.get("lease_release_ready") is not False
+        or source_evidence.get("checkout_key") != checkout_key
+    ):
+        return False
+    followup_id = source_evidence.get("durable_followup_id")
+    if (
+        not isinstance(followup_id, str)
+        or followup_id != followup_id.strip()
+        or not followup_id
+        or len(followup_id) > 512
+        or any(character in followup_id for character in "\r\n\x00")
+    ):
+        return False
+    binding = source_evidence.get("durable_followup_binding")
+    if not isinstance(binding, dict):
+        return False
+    claimed = binding.get("binding_sha256")
+    if not isinstance(claimed, str) or re.fullmatch(r"[0-9a-f]{64}", claimed) is None:
+        return False
+    material = {key: value for key, value in binding.items() if key != "binding_sha256"}
+    if checkouts._sha256_json(material) != claimed:
+        return False
+    kind = binding.get("kind")
+    if kind == "terminal_assessment":
+        return (
+            binding.get("durable_followup_id") == followup_id
+            and binding.get("assessment_sha256")
+            == source_evidence.get("assessment_sha256")
+            and binding.get("terminal_closeout_audit_record_sha256")
+            == source_evidence.get("terminal_closeout_audit_record_sha256")
+        )
+    if kind != "bureau_current_task_spec_reproduction":
+        return False
+    revision = binding.get("task_revision")
+    spec_sha256 = binding.get("task_spec_sha256")
+    state = binding.get("task_state")
+    reproduction = binding.get("reproduction")
+    if (
+        binding.get("task_id") != followup_id
+        or isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision < 1
+        or not isinstance(spec_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", spec_sha256) is None
+        or not isinstance(state, str)
+        or not state
+        or not isinstance(reproduction, dict)
+    ):
+        return False
+    expected_reproduction = {
+        "lane_id": source_evidence.get("source_id"),
+        "lane_receipt_sha256": source_evidence.get("lane_receipt_sha256"),
+        "lane_assessment_sha256": source_evidence.get("assessment_sha256"),
+        "lane_terminal_audit_sha256": source_evidence.get(
+            "terminal_closeout_audit_record_sha256"
+        ),
+        "lane_terminal_head": source_evidence.get("terminal_head_sha"),
+        "checkout_key": checkout_key,
+    }
+    return reproduction == expected_reproduction
+
+
 def _preview_state(
     checkout_key: str, *, ignore_lease_owner: str | None = None
 ) -> dict[str, Any]:
@@ -1053,7 +1121,13 @@ def _preview_state(
             blockers.append("present-checkout-not-active")
         if source_is_work_lane:
             if source_evidence.get("lease_release_ready") is not True:
-                blockers.append("work-lane-lease-release-not-ready")
+                if source_evidence.get("terminal_state") == "blocked_with_durable_followup":
+                    if not _blocked_followup_capacity_release_ready(
+                        source_evidence, key
+                    ):
+                        blockers.append("work-lane-durable-followup-binding-missing")
+                else:
+                    blockers.append("work-lane-lease-release-not-ready")
         elif source_is_thread_focus:
             if source_evidence.get("terminal_state") != "completed_without_current_obligation":
                 blockers.append("thread-focus-terminal-evidence-invalid")
