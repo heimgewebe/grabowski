@@ -62,6 +62,22 @@ def _run(
     return result
 
 
+def _physical_checkout_resource_key(identity: dict[str, Any]) -> str:
+    root = identity.get("root")
+    if not isinstance(root, dict):
+        raise PostMergeSyncApplyError("physical checkout root identity is missing")
+    device = root.get("device")
+    inode = root.get("inode")
+    if (
+        type(device) is not int
+        or device < 0
+        or type(inode) is not int
+        or inode < 0
+    ):
+        raise PostMergeSyncApplyError("physical checkout root identity is invalid")
+    return f"component:physical-checkout-root:{device}:{inode}"
+
+
 def _fd_bound_runner(
     runner: CommandRunner,
     bound: physical_checkout.BoundPhysicalCheckout,
@@ -431,6 +447,7 @@ def apply(
             f"repo:{repo}",
             f"path:{repo}",
             f"path:{identity['git_common_dir']}",
+            _physical_checkout_resource_key(initial_physical),
         ]
     )
     try:

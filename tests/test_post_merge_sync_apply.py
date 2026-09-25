@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from pathlib import Path
+import os
 import subprocess
 import sys
 import tempfile
@@ -183,6 +184,42 @@ class ConcurrentLeaseHarness(LeaseHarness):
             self.nested_result = callback()
         return {"leases": leases}
 
+
+
+
+class ExactConflictLeaseHarness(LeaseHarness):
+    """Conflict only when two owners request at least one identical resource key."""
+
+    def acquire(
+        self,
+        owner_id: str,
+        resource_keys: list[str],
+        *,
+        purpose: str,
+        ttl_seconds: int,
+        _work_admission_mode: str = "normal",
+    ) -> dict[str, object]:
+        self.acquire_calls += 1
+        self.work_admission_modes.append(_work_admission_mode)
+        for key in resource_keys:
+            existing = self.live.get(key)
+            if existing is not None and existing["owner_id"] != owner_id:
+                raise RuntimeError(f"resource conflict: {key}")
+        leases = []
+        for key in resource_keys:
+            lease = {
+                "resource_key": key,
+                "owner_id": owner_id,
+                "purpose": purpose,
+                "acquired_at_unix": 1,
+                "updated_at_unix": 1,
+                "expires_at_unix": 1 + ttl_seconds,
+                "metadata_sha256": "a" * 64,
+                "reclaimed_from_owner": None,
+            }
+            self.live[key] = lease
+            leases.append(lease)
+        return {"leases": leases}
 
 
 @contextmanager
@@ -549,6 +586,76 @@ class PostMergeSyncApplyTests(unittest.TestCase):
                     any(arg.startswith("--work-tree=/proc/") for arg in argv),
                     argv,
                 )
+
+    def test_renamed_checkout_cannot_reenter_with_disjoint_path_leases(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, remote, base, target = self.fixture(root)
+            retired = root / "retired"
+            leases = ExactConflictLeaseHarness()
+            nested_result: dict[str, object] | None = None
+            swapped = False
+
+            def outer_runner(
+                run_repo: Path,
+                argv: list[str],
+            ) -> dict[str, object]:
+                nonlocal nested_result, swapped
+                if (
+                    not swapped
+                    and str(run_repo).startswith("/proc/")
+                    and "fetch" in argv
+                ):
+                    repo.rename(retired)
+                    renamed_physical = (
+                        physical_checkout.capture_physical_checkout_identity(retired)
+                    )
+                    nested_result = sync_apply.apply(
+                        repo=retired,
+                        target_branch="main",
+                        expected_local_head=base,
+                        expected_remote_head=target,
+                        expected_physical_identity_sha256=renamed_physical[
+                            "physical_identity_sha256"
+                        ],
+                        remote="origin",
+                        remote_target=str(remote),
+                        confirmation=sync_apply.CONFIRMATION,
+                        runner=git,
+                        remote_head_reader=self.remote_reader(remote),
+                        pinned_target_factory=self.pinned(remote),
+                    )
+                    swapped = True
+                return git(run_repo, argv)
+
+            with patched_leases(leases):
+                outer_result = self.apply(
+                    repo,
+                    remote,
+                    base,
+                    target,
+                    runner=outer_runner,
+                )
+
+            self.assertTrue(swapped)
+            self.assertIsNotNone(nested_result)
+            assert nested_result is not None
+            self.assertEqual("blocked", nested_result["receipt_status"])
+            self.assertEqual("lease_acquisition_blocked", nested_result["state"])
+            self.assertEqual(
+                "physical-checkout-root:"
+                + str(os.stat(retired).st_dev)
+                + ":"
+                + str(os.stat(retired).st_ino),
+                next(
+                    key.removeprefix("component:")
+                    for key in outer_result["resource_keys"]
+                    if key.startswith("component:physical-checkout-root:")
+                ),
+            )
+            self.assertEqual(target, git_stdout(retired, "rev-parse", "HEAD"))
 
     def test_same_path_replacement_during_effect_cannot_receive_git_effects(
         self,
@@ -972,7 +1079,14 @@ class PostMergeSyncApplyTests(unittest.TestCase):
                 result["lease_cleanup_next_action"],
             )
             self.assertEqual(1, leases.release_calls)
-            self.assertEqual(3, len(leases.live))
+            self.assertEqual(4, len(leases.live))
+            self.assertEqual(
+                1,
+                sum(
+                    key.startswith("component:physical-checkout-root:")
+                    for key in leases.live
+                ),
+            )
             self.assertEqual(base, git_stdout(repo, "rev-parse", "HEAD"))
             self.assertEqual("", git_stdout(repo, "status", "--porcelain"))
 
