@@ -57,12 +57,18 @@ def _github_json(arguments: list[str], *, timeout_seconds: int = 30) -> Any:
         raise RuntimeError("GitHub observation returned invalid JSON") from exc
 
 
-def _bureau_state_store_path() -> Path:
-    configured = Path(
+def _bureau_state_root() -> Path:
+    legacy_root = Path(
         os.environ.get("BUREAU_STATE_DIR", "~/.local/state/bureau")
     ).expanduser()
-    root = Path(os.path.abspath(os.fspath(configured)))
-    return root / "bureau.sqlite3"
+    configured = Path(
+        os.environ.get("GRABOWSKI_BUREAU_COORDINATION_ROOT", str(legacy_root))
+    ).expanduser()
+    return Path(os.path.abspath(os.fspath(configured)))
+
+
+def _bureau_state_store_path() -> Path:
+    return _bureau_state_root() / "bureau.sqlite3"
 
 
 def _bureau_state_store_identity(metadata: os.stat_result) -> tuple[int, ...]:
@@ -268,13 +274,7 @@ def _bureau_json(
     control_root: Path,
     timeout_seconds: int = 30,
 ) -> dict[str, Any]:
-    legacy_root = Path(
-        os.environ.get("BUREAU_STATE_DIR", "~/.local/state/bureau")
-    ).expanduser()
-    state_root = Path(
-        os.environ.get("GRABOWSKI_BUREAU_COORDINATION_ROOT", str(legacy_root))
-    ).expanduser()
-    state_root = Path(os.path.abspath(os.fspath(state_root)))
+    state_root = _bureau_state_root()
 
     runtime = bureau_leases._contract_runtime()
     bureau_leases._assert_contract_runtime_unchanged(runtime)

@@ -152,7 +152,13 @@ class BlockedFollowupCheckoutLifecycleTests(unittest.TestCase):
     def test_pr1896_legacy_receipt_binds_exact_current_followup_taskspec(self) -> None:
         temporary, root = self._state_store([self._spec()])
         self.addCleanup(temporary.cleanup)
-        with patch.dict(os.environ, {"BUREAU_STATE_DIR": str(root)}):
+        with patch.dict(
+            os.environ,
+            {
+                "BUREAU_STATE_DIR": str(root),
+                "GRABOWSKI_BUREAU_COORDINATION_ROOT": str(root),
+            },
+        ):
             result = sources._legacy_blocked_followup_binding(
                 LANE_ID,
                 record=self._record(),
@@ -193,7 +199,13 @@ class BlockedFollowupCheckoutLifecycleTests(unittest.TestCase):
         temporary, root = self._state_store([spec])
         self.addCleanup(temporary.cleanup)
         with (
-            patch.dict(os.environ, {"BUREAU_STATE_DIR": str(root)}),
+            patch.dict(
+                os.environ,
+                {
+                    "BUREAU_STATE_DIR": str(root),
+                    "GRABOWSKI_BUREAU_COORDINATION_ROOT": str(root),
+                },
+            ),
             self.assertRaisesRegex(RuntimeError, "binding is missing"),
         ):
             sources._legacy_blocked_followup_binding(
@@ -209,7 +221,13 @@ class BlockedFollowupCheckoutLifecycleTests(unittest.TestCase):
         )
         self.addCleanup(temporary.cleanup)
         with (
-            patch.dict(os.environ, {"BUREAU_STATE_DIR": str(root)}),
+            patch.dict(
+                os.environ,
+                {
+                    "BUREAU_STATE_DIR": str(root),
+                    "GRABOWSKI_BUREAU_COORDINATION_ROOT": str(root),
+                },
+            ),
             self.assertRaisesRegex(RuntimeError, "binding is ambiguous"),
         ):
             sources._legacy_blocked_followup_binding(
@@ -237,7 +255,13 @@ class BlockedFollowupCheckoutLifecycleTests(unittest.TestCase):
             connection.close()
         database.chmod(0o600)
         with (
-            patch.dict(os.environ, {"BUREAU_STATE_DIR": str(root)}),
+            patch.dict(
+                os.environ,
+                {
+                    "BUREAU_STATE_DIR": str(root),
+                    "GRABOWSKI_BUREAU_COORDINATION_ROOT": str(root),
+                },
+            ),
             self.assertRaisesRegex(RuntimeError, "current pointer is invalid"),
         ):
             sources._current_bureau_task_specs()
@@ -249,11 +273,38 @@ class BlockedFollowupCheckoutLifecycleTests(unittest.TestCase):
         alias_root.mkdir()
         (alias_root / "bureau.sqlite3").symlink_to(real_root / "bureau.sqlite3")
         with (
-            patch.dict(os.environ, {"BUREAU_STATE_DIR": str(alias_root)}),
+            patch.dict(
+                os.environ,
+                {
+                    "BUREAU_STATE_DIR": str(alias_root),
+                    "GRABOWSKI_BUREAU_COORDINATION_ROOT": str(alias_root),
+                },
+            ),
             self.assertRaisesRegex(RuntimeError, "unsafe"),
         ):
             sources._current_bureau_task_specs()
 
+
+    def test_taskspec_state_store_prefers_configured_coordination_root(self) -> None:
+        default_temporary, default_root = self._state_store(
+            [self._spec("GRABOWSKI-DEFAULT-ROOT-T001")]
+        )
+        coordination_temporary, coordination_root = self._state_store([self._spec()])
+        self.addCleanup(default_temporary.cleanup)
+        self.addCleanup(coordination_temporary.cleanup)
+        with patch.dict(
+            os.environ,
+            {
+                "BUREAU_STATE_DIR": str(default_root),
+                "GRABOWSKI_BUREAU_COORDINATION_ROOT": str(coordination_root),
+            },
+        ):
+            observed = sources._current_bureau_task_specs()
+            self.assertEqual(
+                coordination_root / "bureau.sqlite3",
+                sources._bureau_state_store_path(),
+            )
+        self.assertEqual([TASK_ID], [item["task_id"] for item in observed])
 
     @staticmethod
     def _blocked_source_evidence(*, binding_sha256: str | None = None) -> dict[str, object]:
@@ -294,6 +345,25 @@ class BlockedFollowupCheckoutLifecycleTests(unittest.TestCase):
             **core,
             "evidence_sha256": sources.checkouts._sha256_json(core),
         }
+
+    def test_blocked_followup_capacity_release_requires_terminal_head(self) -> None:
+        for terminal_head in (None, "not-a-git-object"):
+            with self.subTest(terminal_head=terminal_head):
+                evidence = self._blocked_source_evidence()
+                evidence["terminal_head_sha"] = terminal_head
+                evidence["evidence_sha256"] = sources.checkouts._sha256_json(
+                    {
+                        key: value
+                        for key, value in evidence.items()
+                        if key != "evidence_sha256"
+                    }
+                )
+                self.assertFalse(
+                    reconciliation._blocked_followup_capacity_release_ready(
+                        evidence,
+                        CHECKOUT_KEY,
+                    )
+                )
 
     def test_present_blocked_followup_preview_releases_only_active_capacity(self) -> None:
         binding = {

@@ -27,10 +27,12 @@ trennt Inventar, Archivierung und Cleanup.
   unkoordiniert und remote recoverbar ist. Normalerweise ist zusätzlich
   `lease_release_ready=true` erforderlich. Die enge Ausnahme
   `blocked_with_durable_followup` darf `lease_release_ready=false` beibehalten,
-  wenn entweder das Terminal-Assessment selbst die `durable_followup_id`
-  revisionsgebunden enthält oder ein historisches Assessment ohne persistierte ID
+  wenn zusätzlich ein gültiger `terminal_head_sha` gebunden ist und entweder das
+  Terminal-Assessment selbst die `durable_followup_id` revisionsgebunden enthält
+  oder ein historisches Assessment ohne persistierte ID
   exakt durch die aktuelle, digest-validierte Bureau-TaskSpec-`metadata.reproduction`
-  aufgelöst wird. Diese Ausnahme gibt nur den Active-Creation-Slot frei; sie
+  aus demselben konfigurierten Bureau-Coordination-Root aufgelöst wird. Diese
+  Ausnahme gibt nur den Active-Creation-Slot frei; sie
   erteilt keine Lease-Release-, Follow-up-Completion-, Archiv-, Cleanup- oder
   Branch-Löschautorität. Bei aktuellen
   Work-Lane-Receipts muss der Checkout-Head außerdem exakt dem `terminal_head_sha`

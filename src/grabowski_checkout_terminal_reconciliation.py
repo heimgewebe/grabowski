@@ -1005,6 +1005,12 @@ def _blocked_followup_capacity_release_ready(
         or source_evidence.get("checkout_key") != checkout_key
     ):
         return False
+    terminal_head = source_evidence.get("terminal_head_sha")
+    if (
+        not isinstance(terminal_head, str)
+        or checkouts.GIT_OBJECT_RE.fullmatch(terminal_head) is None
+    ):
+        return False
     followup_id = source_evidence.get("durable_followup_id")
     if (
         not isinstance(followup_id, str)
