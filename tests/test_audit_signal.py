@@ -457,6 +457,28 @@ class AuditSignalTests(unittest.TestCase):
         self.assertEqual(
             transition["details"]["prefix_monotonic_execution_gap_count"], 1
         )
+        self.assertEqual(
+            transition["details"]["prefix_monotonic_unmatched_intents_by_transition"],
+            {"runtime-deploy-schedule-intent": 1},
+        )
+        self.assertEqual(transition["details"]["execution_gap_count"], 1)
+        self.assertEqual(transition["details"]["completion_audit_gap_count"], 0)
+        self.assertEqual(
+            transition["details"]["unmatched_intents_by_transition"],
+            {"runtime-deploy-schedule-intent": 1},
+        )
+        self.assertEqual(
+            transition["details"]["execution_gap_evidence_refs"],
+            ["audit-record-sha256:" + deploy_ref],
+        )
+        self.assertEqual(transition["details"]["partial_execution_gap_count"], 2)
+        self.assertEqual(
+            transition["details"]["partial_unmatched_intents_by_transition"],
+            {
+                "runtime-deploy-schedule-intent": 1,
+                "runtime-state-retention-intent": 1,
+            },
+        )
         self.assertIn(
             "absence_or_presence_of_retention_transition_gaps_across_the_scan_boundary",
             transition["does_not_establish"],
