@@ -878,6 +878,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertTrue(any("domains={}" in item for item in baseline))
         self.assertTrue(any(":workspace_roots" in item for item in baseline))
         self.assertIn('web_search="disabled"', baseline)
+        self.assertIn("--disable", baseline)
+        self.assertEqual(baseline[baseline.index("--disable") + 1], "apps")
+        self.assertIn("--disable", treatment)
+        self.assertEqual(treatment[treatment.index("--disable") + 1], "apps")
         self.assertNotIn("mcp_servers.repobrief", baseline_joined)
         self.assertIn("mcp_servers.repobrief", treatment_joined)
         self.assertIn("--codex-mcp-proxy", treatment_joined)
@@ -1854,8 +1858,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             capture = runner.run_bounded(
                 [sys.executable, str(script)], cwd=root, timeout_seconds=3, stdin_data=b""
             )
-            self.assertIn("process_group_survived_provider_exit", str(capture["capture_error"]))
-            self.assertNotIn("process_group_cleanup_failed", str(capture["capture_error"]))
+            self.assertIsNone(capture["capture_error"])
+            self.assertIn(
+                "process_group_survived_provider_exit",
+                capture["containment_events"],
+            )
             child_pid = int(child_state.read_text())
             deadline = time.monotonic() + 2
             while True:
@@ -1866,6 +1873,60 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 if time.monotonic() >= deadline:
                     self.fail("provider descendant survived process-group containment")
                 time.sleep(0.02)
+
+    def test_run_bounded_failed_post_exit_containment_remains_capture_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            child_state = root / "child.pid"
+            script = root / "provider.py"
+            script.write_text(
+                "import os, pathlib, time\n"
+                "child = os.fork()\n"
+                "if child == 0:\n"
+                f"    pathlib.Path({str(child_state)!r}).write_text(str(os.getpid()))\n"
+                "    for fd in (0, 1, 2):\n"
+                "        try:\n"
+                "            os.close(fd)\n"
+                "        except OSError:\n"
+                "            pass\n"
+                "    time.sleep(30)\n"
+                "    os._exit(0)\n"
+                f"state = pathlib.Path({str(child_state)!r})\n"
+                "while not state.exists():\n"
+                "    time.sleep(0.01)\n"
+                "os._exit(0)\n",
+                encoding="utf-8",
+            )
+            real_killpg = runner.os.killpg
+            failed_once = False
+
+            def fail_first_group_kill(pid: int, sig: int) -> None:
+                nonlocal failed_once
+                if sig == runner.signal.SIGKILL and not failed_once:
+                    failed_once = True
+                    raise PermissionError("simulated containment failure")
+                real_killpg(pid, sig)
+
+            with patch.object(runner.os, "killpg", side_effect=fail_first_group_kill):
+                capture = runner.run_bounded(
+                    [sys.executable, str(script)],
+                    cwd=root,
+                    timeout_seconds=3,
+                    stdin_data=b"",
+                )
+
+            self.assertTrue(failed_once)
+            self.assertIn(
+                "process_group_survived_provider_exit",
+                capture["containment_events"],
+            )
+            self.assertIn(
+                "process_group_kill_failed:PermissionError",
+                str(capture["capture_error"]),
+            )
+            child_pid = int(child_state.read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child_pid, 0)
 
     def test_run_bounded_reaps_descendant_that_detaches_from_provider_group(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1894,8 +1955,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             capture = runner.run_bounded(
                 [sys.executable, str(script)], cwd=root, timeout_seconds=3, stdin_data=b""
             )
-            self.assertIn("adopted_descendant_survived_provider_exit", str(capture["capture_error"]))
-            self.assertNotIn("process_group_cleanup_failed", str(capture["capture_error"]))
+            self.assertIsNone(capture["capture_error"])
+            self.assertIn(
+                "adopted_descendant_survived_provider_exit",
+                capture["containment_events"],
+            )
             child_pid = int(child_state.read_text())
             with self.assertRaises(ProcessLookupError):
                 os.kill(child_pid, 0)
