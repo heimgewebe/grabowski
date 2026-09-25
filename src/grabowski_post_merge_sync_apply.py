@@ -506,6 +506,28 @@ def apply(
                         remote_head_verified=False,
                         physical_identity_verified=False,
                     )
+                rebound = _snapshot(
+                    repo,
+                    replay_runner,
+                    target_branch=target_branch,
+                    remote=remote,
+                    sha_length=sha_length,
+                    identity_override=identity,
+                )
+                if not _final_exact(
+                    rebound,
+                    repo=repo,
+                    target_branch=target_branch,
+                    remote=remote,
+                    expected_remote_head=expected_remote_head,
+                ):
+                    return _blocked(
+                        "replay_readback_drift_before_success",
+                        before=initial,
+                        rebound=rebound,
+                        remote_head_verified=remote_head_verified,
+                        physical_identity_verified=True,
+                    )
                 replay_final_physical = (
                     physical_checkout.capture_physical_checkout_identity(repo)
                 )

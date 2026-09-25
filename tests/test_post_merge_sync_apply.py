@@ -897,6 +897,52 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             self.assertEqual("RuntimeError", result["error_class"])
             self.assertEqual(0, replay_leases.acquire_calls)
 
+    def test_in_place_local_drift_during_replay_final_remote_read_blocks_success(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            first_leases = LeaseHarness()
+            with patched_leases(first_leases):
+                first = self.apply(repo, remote, base, target)
+            self.assertEqual("synced", first["state"])
+
+            changed = False
+            ordinary_remote_reader = self.remote_reader(remote)
+
+            def drifting_remote_reader(stage: str, effect_started: bool) -> str:
+                nonlocal changed
+                if stage == "replay-final" and not changed:
+                    (repo / "state.txt").write_text(
+                        "in-place replay drift\n",
+                        encoding="utf-8",
+                    )
+                    changed = True
+                return ordinary_remote_reader(stage, effect_started)
+
+            replay_leases = LeaseHarness()
+            with patched_leases(replay_leases):
+                result = self.apply(
+                    repo,
+                    remote,
+                    target,
+                    target,
+                    remote_reader=drifting_remote_reader,
+                )
+
+            self.assertTrue(changed)
+            self.assertEqual("blocked", result["receipt_status"])
+            self.assertEqual(
+                "replay_readback_drift_before_success",
+                result["state"],
+            )
+            self.assertTrue(result["remote_head_verified"])
+            self.assertTrue(result["physical_identity_verified"])
+            self.assertFalse(result["effect_started"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertEqual(0, replay_leases.acquire_calls)
+            self.assertIn("state.txt", git_stdout(repo, "status", "--porcelain"))
+
     def test_path_replacement_during_replay_final_remote_read_cannot_report_success(
         self,
     ) -> None:
