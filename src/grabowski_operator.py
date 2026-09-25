@@ -1425,7 +1425,9 @@ def _post_merge_sync_apply_replay_preflight(
 
     try:
         physical_identity = (
-            grabowski_physical_checkout.capture_physical_checkout_identity(repo)
+            grabowski_physical_checkout.capture_physical_checkout_identity(
+                Path(repo).expanduser()
+            )
         )
     except (
         OSError,

@@ -972,6 +972,37 @@ class OperatorSignedTransportTests(unittest.TestCase):
             )
         )
 
+    def test_post_merge_sync_apply_replay_preflight_expands_home_relative_repo(
+        self,
+    ) -> None:
+        home_relative = "~/repos/grabowski"
+        expected_path = Path(home_relative).expanduser()
+        arguments = {
+            "name": "post-merge-sync-apply",
+            "parameters": {
+                "repo": home_relative,
+                "target_branch": "main",
+                "expected_local_head": "1" * 40,
+                "expected_remote_head": "2" * 40,
+                "expected_physical_identity_sha256": "f" * 64,
+                "confirmation": "apply-protected-post-merge-sync",
+            },
+            "profile": "operator",
+            "allow_mutation": True,
+        }
+        with mock.patch.object(
+            operator.grabowski_physical_checkout,
+            "capture_physical_checkout_identity",
+            return_value={"physical_identity_sha256": "f" * 64},
+        ) as capture:
+            evidence = operator._signed_replay_recovery_preflight(
+                tool_name="grip_run",
+                arguments=arguments,
+            )
+
+        self.assertIsInstance(evidence, dict)
+        capture.assert_called_once_with(expected_path)
+
     def test_operator_allows_intrinsic_post_merge_replay_without_roundtrip(
         self,
     ) -> None:
