@@ -486,6 +486,26 @@ def apply(
                         remote_head_verified=remote_head_verified,
                         physical_identity_verified=True,
                     )
+                try:
+                    replay_remote_final = read_remote_head("replay-final", False)
+                except Exception as exc:
+                    return _blocked(
+                        "remote_read_failed",
+                        before=initial,
+                        rebound=rebound,
+                        remote_head_verified=False,
+                        physical_identity_verified=False,
+                        error_class=type(exc).__name__,
+                    )
+                if replay_remote_final != expected_remote_head:
+                    return _blocked(
+                        "remote_head_mismatch",
+                        before=initial,
+                        rebound=rebound,
+                        actual_remote_head=replay_remote_final,
+                        remote_head_verified=False,
+                        physical_identity_verified=False,
+                    )
                 replay_final_physical = (
                     physical_checkout.capture_physical_checkout_identity(repo)
                 )

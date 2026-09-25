@@ -822,6 +822,138 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             self.assertEqual(base, git_stdout(repo, "rev-parse", "HEAD"))
             self.assertEqual(target, git_stdout(replacement, "rev-parse", "HEAD"))
 
+    def test_already_synced_rechecks_remote_immediately_before_success(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            first_leases = LeaseHarness()
+            with patched_leases(first_leases):
+                first = self.apply(repo, remote, base, target)
+            self.assertEqual("synced", first["state"])
+
+            stages: list[str] = []
+            ordinary_remote_reader = self.remote_reader(remote)
+
+            def drifting_remote_reader(stage: str, effect_started: bool) -> str:
+                stages.append(stage)
+                if stage == "replay-final":
+                    return base
+                return ordinary_remote_reader(stage, effect_started)
+
+            replay_leases = LeaseHarness()
+            with patched_leases(replay_leases):
+                result = self.apply(
+                    repo,
+                    remote,
+                    target,
+                    target,
+                    remote_reader=drifting_remote_reader,
+                )
+
+            self.assertEqual(["before", "replay-final"], stages)
+            self.assertEqual("blocked", result["receipt_status"])
+            self.assertEqual("remote_head_mismatch", result["state"])
+            self.assertEqual(base, result["actual_remote_head"])
+            self.assertFalse(result["remote_head_verified"])
+            self.assertFalse(result["physical_identity_verified"])
+            self.assertFalse(result["effect_started"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertEqual(0, replay_leases.acquire_calls)
+
+    def test_already_synced_final_remote_read_failure_blocks_success(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            first_leases = LeaseHarness()
+            with patched_leases(first_leases):
+                first = self.apply(repo, remote, base, target)
+            self.assertEqual("synced", first["state"])
+
+            ordinary_remote_reader = self.remote_reader(remote)
+
+            def failing_remote_reader(stage: str, effect_started: bool) -> str:
+                if stage == "replay-final":
+                    raise RuntimeError("injected final replay remote read failure")
+                return ordinary_remote_reader(stage, effect_started)
+
+            replay_leases = LeaseHarness()
+            with patched_leases(replay_leases):
+                result = self.apply(
+                    repo,
+                    remote,
+                    target,
+                    target,
+                    remote_reader=failing_remote_reader,
+                )
+
+            self.assertEqual("blocked", result["receipt_status"])
+            self.assertEqual("remote_read_failed", result["state"])
+            self.assertFalse(result["remote_head_verified"])
+            self.assertFalse(result["physical_identity_verified"])
+            self.assertFalse(result["effect_started"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertEqual("RuntimeError", result["error_class"])
+            self.assertEqual(0, replay_leases.acquire_calls)
+
+    def test_path_replacement_during_replay_final_remote_read_cannot_report_success(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, remote, base, target = self.fixture(root)
+            first_leases = LeaseHarness()
+            with patched_leases(first_leases):
+                first = self.apply(repo, remote, base, target)
+            self.assertEqual("synced", first["state"])
+
+            retired = root / "retired-replay"
+            swapped = False
+            ordinary_remote_reader = self.remote_reader(remote)
+
+            def swapping_remote_reader(stage: str, effect_started: bool) -> str:
+                nonlocal swapped
+                if stage == "replay-final" and not swapped:
+                    repo.rename(retired)
+                    subprocess.run(
+                        [
+                            "git",
+                            "clone",
+                            "-q",
+                            "-b",
+                            "main",
+                            str(remote),
+                            str(repo),
+                        ],
+                        check=True,
+                    )
+                    swapped = True
+                return ordinary_remote_reader(stage, effect_started)
+
+            replay_leases = LeaseHarness()
+            with patched_leases(replay_leases):
+                result = self.apply(
+                    repo,
+                    remote,
+                    target,
+                    target,
+                    remote_reader=swapping_remote_reader,
+                )
+
+            self.assertTrue(swapped)
+            self.assertEqual("blocked", result["receipt_status"])
+            self.assertEqual(
+                "physical_checkout_identity_drift_before_replay_success",
+                result["state"],
+            )
+            self.assertFalse(result["physical_identity_verified"])
+            self.assertFalse(result["effect_started"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertEqual(0, replay_leases.acquire_calls)
+            self.assertEqual(target, git_stdout(retired, "rev-parse", "HEAD"))
+            self.assertEqual(target, git_stdout(repo, "rev-parse", "HEAD"))
+
     def test_path_replacement_during_final_remote_read_cannot_report_success(
         self,
     ) -> None:
