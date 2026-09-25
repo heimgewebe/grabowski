@@ -101,6 +101,44 @@ class PhysicalCheckoutIdentityTests(unittest.TestCase):
             with self.assertRaises(physical_checkout.PhysicalCheckoutIdentityError):
                 physical_checkout.verify_physical_checkout_identity(identity_before)
 
+
+    def test_bound_checkout_effect_root_survives_lexical_path_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            retired = root / "retired"
+            self._init_committed_repo(repo)
+            original_head = self._run(
+                "git", "rev-parse", "HEAD", cwd=repo
+            ).stdout.decode("utf-8").strip()
+            expected = physical_checkout.capture_physical_checkout_identity(repo)
+
+            with physical_checkout.bind_physical_checkout(repo) as bound:
+                self.assertEqual(expected, bound.identity)
+                repo.rename(retired)
+                self._init_committed_repo(repo)
+                (repo / "README.md").write_text(
+                    "replacement\n", encoding="utf-8"
+                )
+                self._run("git", "add", "README.md", cwd=repo)
+                self._run(
+                    "git", "commit", "-q", "-m", "replacement", cwd=repo
+                )
+                replacement_head = self._run(
+                    "git", "rev-parse", "HEAD", cwd=repo
+                ).stdout.decode("utf-8").strip()
+                bound_head = self._run(
+                    "git", "-C", str(bound.effect_root), "rev-parse", "HEAD"
+                ).stdout.decode("utf-8").strip()
+
+                self.assertNotEqual(original_head, replacement_head)
+                self.assertEqual(original_head, bound_head)
+                self.assertEqual(
+                    expected["root"]["inode"],
+                    os.stat(bound.effect_root).st_ino,
+                )
+
+
     def test_stable_gitdir_pointer_detects_metadata_directory_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

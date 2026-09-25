@@ -502,8 +502,125 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             self.assertEqual("physical_checkout_identity_drift_final", result["state"])
             self.assertFalse(result["physical_identity_verified"])
             self.assertFalse(result["retry_authorized"])
+            self.assertTrue(result["readback_required"])
+            self.assertEqual(
+                "authoritative physical, local and remote readback before any new intent",
+                result["next_action"],
+            )
             self.assertEqual(target, git_stdout(repo, "rev-parse", "HEAD"))
             self.assertEqual(1, leases.release_calls)
+
+    def test_git_effects_are_routed_through_fd_bound_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            leases = LeaseHarness()
+            calls: list[tuple[Path, list[str]]] = []
+
+            def recording_runner(run_repo: Path, argv: list[str]) -> dict[str, object]:
+                calls.append((run_repo, list(argv)))
+                return git(run_repo, argv)
+
+            with patched_leases(leases):
+                result = self.apply(
+                    repo,
+                    remote,
+                    base,
+                    target,
+                    runner=recording_runner,
+                )
+
+            self.assertEqual("passed", result["receipt_status"])
+            effect_calls = [
+                (run_repo, argv)
+                for run_repo, argv in calls
+                if any(token in argv for token in {"fetch", "read-tree", "update-ref"})
+            ]
+            self.assertGreaterEqual(len(effect_calls), 3)
+            for run_repo, argv in effect_calls:
+                self.assertTrue(
+                    str(run_repo).startswith("/proc/"),
+                    (run_repo, argv),
+                )
+                self.assertTrue(
+                    any(arg.startswith("--git-dir=/proc/") for arg in argv),
+                    argv,
+                )
+                self.assertTrue(
+                    any(arg.startswith("--work-tree=/proc/") for arg in argv),
+                    argv,
+                )
+
+    def test_same_path_replacement_during_effect_cannot_receive_git_effects(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, remote, base, target = self.fixture(root)
+            retired = root / "retired"
+            leases = LeaseHarness()
+            swapped = False
+
+            def swapping_runner(
+                run_repo: Path,
+                argv: list[str],
+            ) -> dict[str, object]:
+                nonlocal swapped
+                if (
+                    not swapped
+                    and str(run_repo).startswith("/proc/")
+                    and "fetch" in argv
+                ):
+                    repo.rename(retired)
+                    subprocess.run(
+                        [
+                            "git",
+                            "clone",
+                            "-q",
+                            "-b",
+                            "main",
+                            str(remote),
+                            str(repo),
+                        ],
+                        check=True,
+                    )
+                    subprocess.run(
+                        ["git", "-C", str(repo), "reset", "-q", "--hard", base],
+                        check=True,
+                    )
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repo),
+                            "update-ref",
+                            "refs/remotes/origin/main",
+                            base,
+                        ],
+                        check=True,
+                    )
+                    swapped = True
+                return git(run_repo, argv)
+
+            with patched_leases(leases):
+                result = self.apply(
+                    repo,
+                    remote,
+                    base,
+                    target,
+                    runner=swapping_runner,
+                )
+
+            self.assertTrue(swapped)
+            self.assertEqual("failed", result["receipt_status"])
+            self.assertEqual(
+                "physical_checkout_identity_drift_final",
+                result["state"],
+            )
+            self.assertTrue(result["readback_required"])
+            self.assertEqual(target, result["readback"]["head"])
+            self.assertEqual(target, git_stdout(retired, "rev-parse", "HEAD"))
+            self.assertEqual(base, git_stdout(repo, "rev-parse", "HEAD"))
+            self.assertEqual("", git_stdout(repo, "status", "--porcelain"))
 
     def test_successful_clean_fast_forward(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -684,7 +801,7 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             leases = LeaseHarness()
 
             def failing_runner(path: Path, argv: list[str]) -> dict[str, object]:
-                if argv == ["update-ref", "refs/heads/main", target, base]:
+                if argv[-4:] == ["update-ref", "refs/heads/main", target, base]:
                     return {
                         "returncode": 1,
                         "stdout": "",
@@ -728,7 +845,7 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             leases = LeaseHarness()
 
             def failing_runner(path: Path, argv: list[str]) -> dict[str, object]:
-                if argv == ["update-ref", "refs/heads/main", target, base]:
+                if argv[-4:] == ["update-ref", "refs/heads/main", target, base]:
                     return {
                         "returncode": 1,
                         "stdout": "",
@@ -1053,7 +1170,7 @@ class PostMergeSyncApplyTests(unittest.TestCase):
                 path: Path,
                 argv: list[str],
             ) -> dict[str, object]:
-                if argv == [
+                if argv[-4:] == [
                     "show-ref",
                     "--verify",
                     "--hash",

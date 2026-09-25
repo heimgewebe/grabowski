@@ -62,6 +62,23 @@ def _run(
     return result
 
 
+def _fd_bound_runner(
+    runner: CommandRunner,
+    bound: physical_checkout.BoundPhysicalCheckout,
+) -> CommandRunner:
+    def run(_repo: Path, argv: list[str]) -> dict[str, Any]:
+        return runner(
+            bound.effect_root,
+            [
+                f"--git-dir={bound.effect_git_dir}",
+                f"--work-tree={bound.effect_root}",
+                *argv,
+            ],
+        )
+
+    return run
+
+
 def _stdout(result: dict[str, Any]) -> str:
     return str(result.get("stdout", "")).strip()
 
@@ -192,10 +209,15 @@ def _snapshot(
     target_branch: str,
     remote: str,
     sha_length: int,
+    identity_override: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     clean, status_sha256 = _status(repo, runner)
     return {
-        "identity": _checkout_identity(repo, runner),
+        "identity": (
+            _checkout_identity(repo, runner)
+            if identity_override is None
+            else identity_override
+        ),
         "branch": _current_branch(repo, runner),
         "head": _head(repo, runner),
         "clean": clean,
@@ -485,9 +507,13 @@ def apply(
     preimage_verified = False
     fast_forward_verified = False
     release_error: Exception | None = None
+    bound_checkout: physical_checkout.BoundPhysicalCheckout | None = None
+    effect_runner = runner
     try:
         try:
-            locked_physical = physical_checkout.capture_physical_checkout_identity(repo)
+            bound_checkout = physical_checkout.bind_physical_checkout(repo)
+            locked_physical = bound_checkout.identity
+            effect_runner = _fd_bound_runner(runner, bound_checkout)
         except (
             OSError,
             ValueError,
@@ -540,10 +566,11 @@ def apply(
             serialization_verified = True
             locked = _snapshot(
                 repo,
-                runner,
+                effect_runner,
                 target_branch=target_branch,
                 remote=remote,
                 sha_length=sha_length,
+                identity_override=identity,
             )
             if locked != initial or locked.get("head") != expected_local_head:
                 output = _blocked(
@@ -589,7 +616,7 @@ def apply(
                 effect_started = True
                 _run(
                     repo,
-                    runner,
+                    effect_runner,
                     [
                         "-c",
                         fetch_pin_config,
@@ -612,7 +639,7 @@ def apply(
                         expected_remote_head,
                     ],
                 )
-                _commit_head(repo, runner, expected_remote_head)
+                _commit_head(repo, effect_runner, expected_remote_head)
                 if read_remote_head("after_fetch", True) != expected_remote_head:
                     raise PostMergeSyncApplyError(
                         "remote branch advanced during exact-head materialization"
@@ -620,7 +647,7 @@ def apply(
 
                 ancestry = _run(
                     repo,
-                    runner,
+                    effect_runner,
                     [
                         "--no-replace-objects",
                         "merge-base",
@@ -639,14 +666,14 @@ def apply(
                 tracking_ref = f"refs/remotes/{remote}/{target_branch}"
                 tracking_before = _ref_head(
                     repo,
-                    runner,
+                    effect_runner,
                     tracking_ref,
                     sha_length=sha_length,
                 )
                 if tracking_before != expected_remote_head:
                     _run(
                         repo,
-                        runner,
+                        effect_runner,
                         [
                             "update-ref",
                             tracking_ref,
@@ -657,7 +684,7 @@ def apply(
                 if (
                     _ref_head(
                         repo,
-                        runner,
+                        effect_runner,
                         tracking_ref,
                         sha_length=sha_length,
                     )
@@ -669,10 +696,11 @@ def apply(
 
                 ready = _snapshot(
                     repo,
-                    runner,
+                    effect_runner,
                     target_branch=target_branch,
                     remote=remote,
                     sha_length=sha_length,
+                    identity_override=identity,
                 )
                 if (
                     ready.get("identity") != identity
@@ -690,7 +718,7 @@ def apply(
                 if (
                     _ref_head(
                         repo,
-                        runner,
+                        effect_runner,
                         branch_ref,
                         sha_length=sha_length,
                     )
@@ -703,7 +731,7 @@ def apply(
                 worktree_effect_started = True
                 _run(
                     repo,
-                    runner,
+                    effect_runner,
                     [
                         "-c",
                         "core.hooksPath=/dev/null",
@@ -718,11 +746,11 @@ def apply(
                         expected_remote_head,
                     ],
                 )
-                target_tree = _tree(repo, runner, expected_remote_head)
-                index_tree = _stdout(_run(repo, runner, ["write-tree"])).lower()
+                target_tree = _tree(repo, effect_runner, expected_remote_head)
+                index_tree = _stdout(_run(repo, effect_runner, ["write-tree"])).lower()
                 unstaged = _run(
                     repo,
-                    runner,
+                    effect_runner,
                     ["diff", "--quiet", "--"],
                     allowed_returncodes=(0, 1),
                 )
@@ -736,7 +764,7 @@ def apply(
                 if (
                     _ref_head(
                         repo,
-                        runner,
+                        effect_runner,
                         branch_ref,
                         sha_length=sha_length,
                     )
@@ -749,7 +777,7 @@ def apply(
                 branch_cas_started = True
                 _run(
                     repo,
-                    runner,
+                    effect_runner,
                     [
                         "update-ref",
                         branch_ref,
@@ -782,13 +810,14 @@ def apply(
 
                 final = _snapshot(
                     repo,
-                    runner,
+                    effect_runner,
                     target_branch=target_branch,
                     remote=remote,
                     sha_length=sha_length,
+                    identity_override=identity,
                 )
                 remote_final = read_remote_head("final", True)
-                final_tree = _stdout(_run(repo, runner, ["write-tree"])).lower()
+                final_tree = _stdout(_run(repo, effect_runner, ["write-tree"])).lower()
                 if (
                     not _final_exact(
                         final,
@@ -830,10 +859,11 @@ def apply(
                 try:
                     readback = _snapshot(
                         repo,
-                        runner,
+                        effect_runner,
                         target_branch=target_branch,
                         remote=remote,
                         sha_length=sha_length,
+                        identity_override=identity,
                     )
                 except Exception as read_exc:
                     readback = {"readback_error_type": type(read_exc).__name__}
@@ -929,25 +959,31 @@ def apply(
                         "outcome_unknown",
                         "effect_confirmed_remote_drift",
                         "effect_confirmed_remote_unreadable",
+                        "physical_checkout_identity_drift_final",
                     },
                     "next_action": (
-                        "authoritative local and remote readback before any new intent"
-                        if state in {
-                            "outcome_unknown",
-                            "effect_confirmed_remote_drift",
-                            "effect_confirmed_remote_unreadable",
-                        }
-                        else "form a fresh apply intent from current authoritative state"
+                        "authoritative physical, local and remote readback before any new intent"
+                        if state == "physical_checkout_identity_drift_final"
+                        else (
+                            "authoritative local and remote readback before any new intent"
+                            if state in {
+                                "outcome_unknown",
+                                "effect_confirmed_remote_drift",
+                                "effect_confirmed_remote_unreadable",
+                            }
+                            else "form a fresh apply intent from current authoritative state"
+                        )
                     ),
                 }
     except Exception as exc:
         try:
             readback = _snapshot(
                 repo,
-                runner,
+                effect_runner,
                 target_branch=target_branch,
                 remote=remote,
                 sha_length=sha_length,
+                identity_override=identity if bound_checkout is not None else None,
             )
         except Exception as read_exc:
             readback = {"readback_error_type": type(read_exc).__name__}
@@ -974,6 +1010,36 @@ def apply(
             ),
         }
     finally:
+        if bound_checkout is not None:
+            try:
+                bound_checkout.close()
+            except physical_checkout.PhysicalCheckoutIdentityError:
+                if output is None:
+                    output = {
+                        "receipt_status": "failed",
+                        "state": "bound_checkout_release_failed",
+                        "effect_started": effect_started,
+                        "worktree_effect_started": worktree_effect_started,
+                        "branch_cas_started": branch_cas_started,
+                        "serialization_verified": serialization_verified,
+                        "fast_forward_verified": fast_forward_verified,
+                        "physical_identity_verified": physical_identity_verified,
+                        "retry_authorized": False,
+                        "readback_required": True,
+                        "preimage_sha256": preimage_sha256,
+                        "resource_keys": resource_keys,
+                        "next_action": (
+                            "authoritative local and remote readback before any new intent"
+                        ),
+                    }
+                elif output.get("receipt_status") == "passed":
+                    output["receipt_status"] = "blocked"
+                    output["state"] = "bound_checkout_release_failed"
+                    output["retry_authorized"] = False
+                    output["readback_required"] = True
+                    output["next_action"] = (
+                        "authoritative local and remote readback before any new intent"
+                    )
         try:
             released = resources.release_resources(
                 owner_id,
