@@ -7248,6 +7248,9 @@ def _subtract_projected_task_counts(
     return current_exact, current_projections, current_unknown
 
 
+_TASK_ATTENTION_INVALID_LAUNCHER_JSON = "{invalid-task-launcher}"
+
+
 _TASK_ATTENTION_PROJECTED_COLUMNS = (
     "task_id", "host", "unit", "authoritative_unit", "execution_backend",
     "systemd_scope", "attempt", "state", "resume_policy", "argv_sha256",
@@ -7279,10 +7282,10 @@ def _task_attention_record(record: dict[str, Any]) -> dict[str, Any]:
         try:
             launcher = json.loads(raw_launcher)
         except json.JSONDecodeError:
-            compact_launcher = raw_launcher
+            compact_launcher = _TASK_ATTENTION_INVALID_LAUNCHER_JSON
         else:
             if not isinstance(launcher, dict):
-                compact_launcher = raw_launcher
+                compact_launcher = _TASK_ATTENTION_INVALID_LAUNCHER_JSON
             elif "retry_binding" in launcher:
                 compact_launcher = {"retry_binding": launcher["retry_binding"]}
     projected = {
@@ -7369,15 +7372,17 @@ def _task_retry_successor_records(
             '"retry_binding"',
             limit + 1,
         ),
-    ).fetchall()
-    if len(rows) > limit:
-        raise RuntimeError("retry successor convergence scan limit exceeded")
+    )
     records: list[dict[str, Any]] = []
+    row_count = 0
     for row in rows:
+        row_count += 1
+        if row_count > limit:
+            raise RuntimeError("retry successor convergence scan limit exceeded")
         record = dict(row)
         binding = terminal_convergence.persisted_retry_binding(record)
         if binding is not None:
-            records.append(record)
+            records.append(_task_attention_record(record))
     return records
 
 

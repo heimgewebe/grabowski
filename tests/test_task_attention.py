@@ -47,6 +47,7 @@ import grabowski_current_work_surface as current_work_surface
 import grabowski_lifecycle_archive as lifecycle_archive
 import grabowski_task_attention as attention
 import grabowski_tasks as tasks
+import grabowski_terminal_convergence as terminal_convergence
 
 
 LOCAL_HOST = {
@@ -2279,6 +2280,55 @@ class TaskAttentionTests(unittest.TestCase):
         )
         self.assertIsInstance(projected["launcher_json"], dict)
         self.assertIn("retry_binding", projected["launcher_json"])
+
+    def test_attention_row_projection_bounds_malformed_launcher_fail_closed(self) -> None:
+        row = tasks._row_raw(str(self._failed_task()["task_id"]))
+        for launcher in ("x" * 32_000, json.dumps(["x" * 32_000])):
+            with self.subTest(valid_json=launcher.startswith("[")):
+                malformed = dict(row)
+                malformed["launcher_json"] = launcher
+                projected = tasks._task_attention_record(malformed)
+                self.assertEqual(
+                    tasks._TASK_ATTENTION_INVALID_LAUNCHER_JSON,
+                    projected["launcher_json"],
+                )
+                self.assertLess(len(str(projected["launcher_json"])), 64)
+                with self.assertRaisesRegex(
+                    terminal_convergence.TerminalConvergenceError,
+                    "persisted task launcher is invalid",
+                ):
+                    terminal_convergence.persisted_retry_binding(projected)
+
+    def test_retry_successor_projection_omits_bulk_payload(self) -> None:
+        source, successor = self._verified_retry_pair(successor_state="running")
+        successor_row = tasks._row_raw(str(successor["task_id"]))
+        launcher = json.loads(str(successor_row["launcher_json"]))
+        launcher["command"] = "x" * 32_000
+        launcher["argv"] = ["y" * 32_000]
+        with tasks._database() as connection:
+            connection.execute(
+                "UPDATE tasks SET launcher_json=?, argv_json=?, last_observation_json=? "
+                "WHERE task_id=?",
+                (
+                    json.dumps(launcher),
+                    json.dumps(["z" * 32_000]),
+                    json.dumps({"payload": "q" * 32_000}),
+                    successor["task_id"],
+                ),
+            )
+            records = tasks._task_retry_successor_records(
+                connection,
+                source_task_ids={str(source["task_id"])},
+                limit=20,
+            )
+        self.assertEqual(1, len(records))
+        projected = records[0]
+        self.assertNotIn("argv_json", projected)
+        self.assertNotIn("last_observation_json", projected)
+        self.assertEqual(
+            {"retry_binding"},
+            set(projected["launcher_json"]),
+        )
 
     def test_current_reconciliation_auto_hides_non_actionable_failure_classes(self) -> None:
         started = self._start()
