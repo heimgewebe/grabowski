@@ -4858,17 +4858,27 @@ def normalize(
     if any(event.get("type") in {"turn.failed", "error"} for event in events):
         raise RunnerError("Codex emitted terminal error")
     usage = completed[0].get("usage") if isinstance(completed[0].get("usage"), dict) else {}
-    input_tokens = usage.get("input_tokens")
+    raw_input_tokens = usage.get("input_tokens")
+    cached_input_tokens = usage.get("cached_input_tokens")
     output_tokens = usage.get("output_tokens")
     if (
-        not isinstance(input_tokens, int)
-        or isinstance(input_tokens, bool)
-        or input_tokens < 0
+        not isinstance(raw_input_tokens, int)
+        or isinstance(raw_input_tokens, bool)
+        or raw_input_tokens < 0
+        or not isinstance(cached_input_tokens, int)
+        or isinstance(cached_input_tokens, bool)
+        or cached_input_tokens < 0
+        or cached_input_tokens > raw_input_tokens
         or not isinstance(output_tokens, int)
         or isinstance(output_tokens, bool)
         or output_tokens < 0
     ):
         raise RunnerError("Codex usage is invalid")
+    # Codex includes cached reads in input_tokens. The frozen benchmark was
+    # defined against Claude usage where cache-read tokens are reported
+    # separately, so compare the provider-reported non-cached input quantity.
+    # Cache-write input remains non-cached input and is therefore not deducted.
+    input_tokens = raw_input_tokens - cached_input_tokens
     budgets = request["budgets"]
     if input_tokens > budgets["input_tokens"] or output_tokens > budgets["output_tokens"]:
         raise RunnerError("Codex token budget exceeded")
