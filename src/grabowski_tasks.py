@@ -7249,6 +7249,7 @@ def _subtract_projected_task_counts(
 
 
 _TASK_ATTENTION_INVALID_LAUNCHER_JSON = "{invalid-task-launcher}"
+_TASK_ATTENTION_MAX_RETRY_BINDING_BYTES = 8 * 1024
 
 
 _TASK_ATTENTION_PROJECTED_COLUMNS = (
@@ -7261,6 +7262,25 @@ _TASK_ATTENTION_PROJECTED_COLUMNS = (
     "terminalization_sha256", "terminalized_at_unix",
     "lifecycle_receipt_sha256",
 )
+
+
+def _task_attention_retry_launcher(binding: Any) -> Any:
+    if not isinstance(binding, dict):
+        return _TASK_ATTENTION_INVALID_LAUNCHER_JSON
+    if (
+        len(_canonical_json(binding).encode("utf-8"))
+        > _TASK_ATTENTION_MAX_RETRY_BINDING_BYTES
+    ):
+        return _TASK_ATTENTION_INVALID_LAUNCHER_JSON
+    try:
+        validated = terminal_convergence.persisted_retry_binding(
+            {"launcher_json": {"retry_binding": binding}}
+        )
+    except terminal_convergence.TerminalConvergenceError:
+        return _TASK_ATTENTION_INVALID_LAUNCHER_JSON
+    if validated is None:
+        return _TASK_ATTENTION_INVALID_LAUNCHER_JSON
+    return {"retry_binding": validated}
 
 
 def _task_attention_record(record: dict[str, Any]) -> dict[str, Any]:
@@ -7287,7 +7307,9 @@ def _task_attention_record(record: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(launcher, dict):
                 compact_launcher = _TASK_ATTENTION_INVALID_LAUNCHER_JSON
             elif "retry_binding" in launcher:
-                compact_launcher = {"retry_binding": launcher["retry_binding"]}
+                compact_launcher = _task_attention_retry_launcher(
+                    launcher["retry_binding"]
+                )
     projected = {
         column: record.get(column)
         for column in _TASK_ATTENTION_PROJECTED_COLUMNS
