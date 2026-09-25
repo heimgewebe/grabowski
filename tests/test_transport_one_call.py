@@ -873,6 +873,125 @@ class OperatorSignedTransportTests(unittest.TestCase):
         )
         self.assertEqual(evidence["recovery_preflight"], preflight)
 
+    def test_post_merge_sync_apply_replay_preflight_requires_exact_intrinsic_contract(
+        self,
+    ) -> None:
+        arguments = {
+            "name": "post-merge-sync-apply",
+            "parameters": {
+                "repo": "/home/alex/repos/grabowski",
+                "target_branch": "main",
+                "expected_local_head": "1" * 40,
+                "expected_remote_head": "2" * 40,
+                "confirmation": "apply-protected-post-merge-sync",
+            },
+            "profile": "operator",
+            "allow_mutation": True,
+        }
+        evidence = operator._signed_replay_recovery_preflight(
+            tool_name="grip_run",
+            arguments=arguments,
+        )
+        self.assertIsInstance(evidence, dict)
+        assert evidence is not None
+        self.assertEqual(
+            evidence["reentry_mode"],
+            "intrinsic_idempotent_domain",
+        )
+        self.assertEqual(evidence["grip_name"], "post-merge-sync-apply")
+        self.assertRegex(evidence["grip_contract_sha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(evidence["parameters_sha256"], r"^[0-9a-f]{64}$")
+
+        unsafe = dict(arguments)
+        unsafe["allow_mutation"] = False
+        self.assertIsNone(
+            operator._signed_replay_recovery_preflight(
+                tool_name="grip_run",
+                arguments=unsafe,
+            )
+        )
+
+        wrong_confirmation = {
+            **arguments,
+            "parameters": {
+                **arguments["parameters"],
+                "confirmation": "not-authorized",
+            },
+        }
+        self.assertIsNone(
+            operator._signed_replay_recovery_preflight(
+                tool_name="grip_run",
+                arguments=wrong_confirmation,
+            )
+        )
+
+    def test_operator_allows_intrinsic_post_merge_replay_without_roundtrip(
+        self,
+    ) -> None:
+        arguments = {
+            "name": "post-merge-sync-apply",
+            "parameters": {
+                "repo": "/home/alex/repos/grabowski",
+                "target_branch": "main",
+                "expected_local_head": "1" * 40,
+                "expected_remote_head": "2" * 40,
+                "confirmation": "apply-protected-post-merge-sync",
+            },
+            "profile": "operator",
+            "allow_mutation": True,
+        }
+        expected_arguments_sha256 = roundtrip.canonical_arguments_sha256(arguments)
+        tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=False))
+        replay_message = "signed one-call transport request was already consumed"
+        with (
+            mock.patch.object(
+                base,
+                "_transport_signed_one_call_evidence",
+                side_effect=assertion.TransportAssertionReplay(replay_message),
+            ),
+            mock.patch.object(roundtrip, "consume_verified") as consume_verified,
+            mock.patch.object(roundtrip, "begin") as begin,
+        ):
+            evidence = operator._require_transport_roundtrip_for_tool(
+                tool_name="grip_run",
+                arguments=arguments,
+                context=_ctx({}),
+                tool=tool,
+            )
+        consume_verified.assert_not_called()
+        begin.assert_not_called()
+        self.assertTrue(evidence["signed_one_call_replay_recovery"])
+        self.assertTrue(evidence["effect_admission_transport_exempt"])
+        self.assertEqual(
+            evidence["recovery_basis"],
+            "authenticated_signed_replay_intrinsic_domain_idempotency",
+        )
+        self.assertEqual(evidence["arguments_sha256"], expected_arguments_sha256)
+        self.assertEqual(
+            evidence["runtime_binding_sha256"],
+            assertion.runtime_binding_sha256(BINDING),
+        )
+
+    def test_effect_admission_transport_inputs_keep_replay_runtime_bound(self) -> None:
+        replay = {
+            "signed_one_call_replay_recovery": True,
+            "effect_admission_transport_exempt": True,
+            "recovery_basis": "authenticated_signed_replay_intrinsic_domain_idempotency",
+            "runtime_binding_sha256": "a" * 64,
+        }
+        transport, runtime = operator._effect_admission_transport_inputs(replay)
+        self.assertIsNone(transport)
+        self.assertEqual(runtime, "a" * 64)
+
+        ordinary = {
+            "transport_mode": "signed-one-call-v1",
+            "runtime_binding_sha256": "b" * 64,
+            "consumption_receipt_sha256": "c" * 64,
+        }
+        transport, runtime = operator._effect_admission_transport_inputs(ordinary)
+        self.assertIs(transport, ordinary)
+        self.assertIsNone(runtime)
+
     def test_operator_generic_signed_replay_cannot_use_roundtrip_recovery(self) -> None:
         arguments = {"argv": ["true"]}
         tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=False))

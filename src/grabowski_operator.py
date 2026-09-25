@@ -1315,10 +1315,126 @@ def _require_current_serving_process() -> None:
     )
 
 
+def _post_merge_sync_apply_replay_preflight(
+    *, tool_name: str, arguments: Any
+) -> dict[str, Any] | None:
+    """Bind signed replay reentry to the exact intrinsically idempotent grip."""
+
+    if tool_name != "grip_run" or not isinstance(arguments, dict):
+        return None
+    allowed_outer = {"name", "parameters", "profile", "allow_mutation"}
+    if set(arguments) - allowed_outer:
+        return None
+    if arguments.get("name") != "post-merge-sync-apply":
+        return None
+    if arguments.get("profile", "operator") != "operator":
+        return None
+    if arguments.get("allow_mutation") is not True:
+        return None
+
+    parameters = arguments.get("parameters")
+    if not isinstance(parameters, dict):
+        return None
+    required_parameters = {
+        "repo",
+        "target_branch",
+        "expected_local_head",
+        "expected_remote_head",
+        "confirmation",
+    }
+    allowed_parameters = required_parameters | {"remote"}
+    if set(parameters) - allowed_parameters or not required_parameters.issubset(
+        parameters
+    ):
+        return None
+
+    spec = grabowski_grips.GRIP_SPECS.get("post-merge-sync-apply")
+    required_acceptance = frozenset(
+        {
+            "protected-canonical-checkout",
+            "clean-exact-preimage",
+            "remote-head-bound",
+            "fast-forward-only",
+            "worktree-common-dir-branch-serialized",
+            "branch-ref-cas",
+            "post-state-verified",
+            "outcome-unknown-fail-closed",
+        }
+    )
+    if (
+        spec is None
+        or spec.effect != grabowski_grips.MUTATING
+        or spec.runner != "post_merge_sync_apply"
+        or not required_acceptance.issubset(spec.acceptance_ids)
+    ):
+        return None
+
+    repo = parameters.get("repo")
+    target_branch = parameters.get("target_branch")
+    expected_local_head = parameters.get("expected_local_head")
+    expected_remote_head = parameters.get("expected_remote_head")
+    confirmation = parameters.get("confirmation")
+    remote = parameters.get("remote", "origin")
+    if (
+        not isinstance(repo, str)
+        or not repo.strip()
+        or repo != repo.strip()
+        or "\x00" in repo
+        or target_branch not in {"main", "master"}
+        or not isinstance(expected_local_head, str)
+        or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", expected_local_head)
+        is None
+        or not isinstance(expected_remote_head, str)
+        or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", expected_remote_head)
+        is None
+        or len(expected_local_head) != len(expected_remote_head)
+        or confirmation != "apply-protected-post-merge-sync"
+        or not isinstance(remote, str)
+        or remote in {"", ".", ".."}
+        or re.fullmatch(r"[A-Za-z0-9._-]{1,128}", remote) is None
+        or remote.startswith("-")
+    ):
+        return None
+
+    grip_contract = {
+        "name": spec.name,
+        "version": spec.version,
+        "effect": spec.effect,
+        "runner": spec.runner,
+        "acceptance_ids": sorted(spec.acceptance_ids),
+    }
+    return {
+        "kind": "grabowski_signed_replay_recovery_preflight",
+        "schema_version": 1,
+        "tool_name": tool_name,
+        "grip_name": "post-merge-sync-apply",
+        "reentry_mode": "intrinsic_idempotent_domain",
+        "parameters_sha256": grabowski_transport_roundtrip.canonical_arguments_sha256(
+            parameters
+        ),
+        "grip_contract_sha256": hashlib.sha256(
+            _canonical_json_bytes(grip_contract)
+        ).hexdigest(),
+        "does_not_establish": [
+            "generic replay retry authority",
+            "permission for another grip or argument digest",
+            "current target state",
+            "retry authorization after an outcome_unknown result",
+        ],
+    }
+
+
 def _signed_replay_recovery_preflight(
     *, tool_name: str, arguments: Any
 ) -> dict[str, Any] | None:
     """Prove one domain-safe replay recovery without granting generic retry."""
+
+    intrinsic = _post_merge_sync_apply_replay_preflight(
+        tool_name=tool_name,
+        arguments=arguments,
+    )
+    if intrinsic is not None:
+        return intrinsic
 
     if tool_name != "grabowski_bureau_task_publish" or not isinstance(arguments, dict):
         return None
@@ -1398,6 +1514,28 @@ def _signed_replay_recovery_preflight(
     }
 
 
+def _effect_admission_transport_inputs(
+    transport_evidence: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Project intrinsic signed-replay reentry into runtime-bound admission."""
+
+    if (
+        not isinstance(transport_evidence, dict)
+        or transport_evidence.get("effect_admission_transport_exempt") is not True
+    ):
+        return transport_evidence, None
+    runtime_sha256 = transport_evidence.get("runtime_binding_sha256")
+    if (
+        transport_evidence.get("signed_one_call_replay_recovery") is not True
+        or transport_evidence.get("recovery_basis")
+        != "authenticated_signed_replay_intrinsic_domain_idempotency"
+        or not isinstance(runtime_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", runtime_sha256) is None
+    ):
+        raise RuntimeError("signed replay recovery evidence is malformed")
+    return None, runtime_sha256
+
+
 def _require_transport_roundtrip_for_tool(
     *,
     tool_name: Any,
@@ -1445,6 +1583,40 @@ def _require_transport_roundtrip_for_tool(
                 )
                 if recovery_preflight is None:
                     raise RuntimeError(str(replay_exc)) from replay_exc
+                if (
+                    recovery_preflight.get("reentry_mode")
+                    == "intrinsic_idempotent_domain"
+                ):
+                    # TransportAssertionReplay is raised only after the current
+                    # signed request has passed capability, MAC, freshness and
+                    # runtime-binding validation. For this exact grip, the
+                    # domain itself is the replay reconciler: it re-reads the
+                    # canonical checkout and remote before any effect, returns
+                    # already_synced after a completed prior effect, and keeps
+                    # ambiguous partial states fail-closed.
+                    return {
+                        "schema_version": 1,
+                        "state": "replay_domain_reentry",
+                        "transport_mode": "signed-one-call-replay-domain-reentry-v1",
+                        "runtime_binding_sha256": (
+                            grabowski_transport_assertion.runtime_binding_sha256(
+                                runtime_binding
+                            )
+                        ),
+                        "tool_name": tool_name_text,
+                        "arguments_sha256": arguments_sha256,
+                        "signed_one_call_replay_recovery": True,
+                        "effect_admission_transport_exempt": True,
+                        "recovery_basis": (
+                            "authenticated_signed_replay_intrinsic_domain_idempotency"
+                        ),
+                        "recovery_preflight": recovery_preflight,
+                        "does_not_establish": [
+                            "generic replay retry authority",
+                            "fresh transport consumption",
+                            "permission for another tool or argument digest",
+                        ],
+                    }
                 client_scope = base._transport_roundtrip_client_scope(context)
                 try:
                     recovery_evidence = grabowski_transport_roundtrip.consume_verified(
@@ -2108,6 +2280,10 @@ def _install_deployment_admission_gate() -> None:
                 context=context,
                 tool=tool,
             )
+            (
+                admission_transport_evidence,
+                replay_reentry_runtime_sha256,
+            ) = _effect_admission_transport_inputs(transport_evidence)
             enforcement_configured = (
                 grabowski_effect_interceptor.fence_enforcement_required()
                 if not effective_read_only and not _maulwurf_runtime_active()
@@ -2153,9 +2329,11 @@ def _install_deployment_admission_gate() -> None:
                     effect_admission = grabowski_effect_interceptor.admit_mutation(
                         tool_name=str(tool_name),
                         arguments=arguments,
-                        transport_evidence=transport_evidence,
+                        transport_evidence=admission_transport_evidence,
                         runtime_sha256=(
-                            _provenance_recovery_fence_runtime_sha256()
+                            replay_reentry_runtime_sha256
+                            if replay_reentry_runtime_sha256 is not None
+                            else _provenance_recovery_fence_runtime_sha256()
                             if transport_evidence is None
                             else None
                         ),
