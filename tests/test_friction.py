@@ -848,6 +848,60 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         self.assertEqual(probe["error_domain_counts"], {"reported_error": 1})
         self.assertEqual(probe["window_state"], "errors_without_later_activity")
 
+    def test_connector_transport_probe_keeps_unobserved_harpoon_variants_fail_closed(self) -> None:
+        module = self._load_module()
+        base = {
+            "level": "WARN",
+            "component": "harpoon",
+            "msg": "harpoon host auto-registration failed",
+            "label": "oauth-prmd-resource-0",
+            "url": "http://127.0.0.1:18180",
+            "source": "oauth",
+            "role": "prmd-resource",
+            "group": "",
+            "inclusion_reason": "loopback",
+            "error": (
+                'harpoon: target "oauth-prmd-resource-0" '
+                "base URL must use https"
+            ),
+        }
+        variants = {
+            "trailing-slash": {"url": "http://127.0.0.1:18180/"},
+            "path": {"url": "http://127.0.0.1:18180/callback"},
+            "non-loopback": {"url": "http://192.0.2.10:18180"},
+            "wrong-role": {"role": "authorization-server"},
+            "wrong-component": {"component": "oauth"},
+            "wrong-error": {"error": "harpoon: target oauth-prmd-resource-0 registration failed"},
+        }
+
+        for label, overrides in variants.items():
+            with self.subTest(label=label):
+                payload = {**base, **overrides}
+                record = {
+                    "__REALTIME_TIMESTAMP": "100",
+                    "MESSAGE": json.dumps(payload),
+                }
+                module._run_diagnostic_command = lambda *args, **kwargs: {
+                    "returncode": 0,
+                    "timed_out": False,
+                    "stdout": json.dumps(record) + "\n",
+                    "stderr": "",
+                    "stdout_truncated": False,
+                    "stderr_truncated": False,
+                }
+
+                probe = module._journal_transport_probe(
+                    "tunnel-client-grabowski.service", 25
+                )
+
+                self.assertEqual(probe["transport_error_count"], 1)
+                self.assertEqual(
+                    probe["error_domain_counts"], {"reported_error": 1}
+                )
+                self.assertEqual(
+                    probe["window_state"], "errors_without_later_activity"
+                )
+
     def test_connector_transport_event_hashes_identity_only_for_lifecycle_signals(self) -> None:
         module = self._load_module()
         module._connector_request_identity_sha256 = lambda payload: self.fail(
