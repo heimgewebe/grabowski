@@ -306,6 +306,92 @@ class BlockedFollowupCheckoutLifecycleTests(unittest.TestCase):
             )
         self.assertEqual([TASK_ID], [item["task_id"] for item in observed])
 
+
+    def test_taskspec_state_store_rejects_world_writable_root(self) -> None:
+        temporary, root = self._state_store([self._spec()])
+        self.addCleanup(temporary.cleanup)
+        root.chmod(0o777)
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "BUREAU_STATE_DIR": str(root),
+                    "GRABOWSKI_BUREAU_COORDINATION_ROOT": str(root),
+                },
+            ),
+            self.assertRaisesRegex(RuntimeError, "root is unsafe"),
+        ):
+            sources._current_bureau_task_specs()
+
+    def test_taskspec_state_store_rejects_symlinked_wal_sidecar(self) -> None:
+        temporary, root = self._state_store([self._spec()])
+        self.addCleanup(temporary.cleanup)
+        outside = root / "outside-wal"
+        outside.write_bytes(b"not a wal")
+        (root / "bureau.sqlite3-wal").symlink_to(outside)
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "BUREAU_STATE_DIR": str(root),
+                    "GRABOWSKI_BUREAU_COORDINATION_ROOT": str(root),
+                },
+            ),
+            self.assertRaisesRegex(RuntimeError, "StateStore is unsafe"),
+        ):
+            sources._current_bureau_task_specs()
+
+    def test_taskspec_state_store_reads_wal_through_pinned_root(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        database = root / "bureau.sqlite3"
+        connection = sqlite3.connect(database)
+        try:
+            self.assertEqual("wal", connection.execute("PRAGMA journal_mode=WAL").fetchone()[0])
+            self._create_schema(connection)
+            self._insert_current(connection, self._spec())
+            connection.commit()
+            with patch.dict(
+                os.environ,
+                {
+                    "BUREAU_STATE_DIR": str(root),
+                    "GRABOWSKI_BUREAU_COORDINATION_ROOT": str(root),
+                },
+            ):
+                observed = sources._current_bureau_task_specs()
+        finally:
+            connection.close()
+        self.assertEqual([TASK_ID], [item["task_id"] for item in observed])
+
+    def test_legacy_receipt_without_checkout_key_uses_bound_lifecycle_key(self) -> None:
+        temporary, root = self._state_store([self._spec()])
+        self.addCleanup(temporary.cleanup)
+        legacy_record = self._record()
+        legacy_record.pop("worktree_receipt")
+        with patch.dict(
+            os.environ,
+            {
+                "BUREAU_STATE_DIR": str(root),
+                "GRABOWSKI_BUREAU_COORDINATION_ROOT": str(root),
+            },
+        ):
+            result = sources._bureau_blocked_followup_binding(
+                LANE_ID,
+                record=legacy_record,
+                assessment=self._assessment(),
+                audit_record_sha256=AUDIT,
+                expected_checkout_key=CHECKOUT_KEY,
+            )
+        self.assertEqual(CHECKOUT_KEY, result["checkout_key"])
+
+    def test_persisted_checkout_key_must_match_bound_lifecycle_key(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "checkout binding differs"):
+            sources._blocked_followup_checkout_key(
+                self._record(),
+                expected_checkout_key="f" * 64,
+            )
+
     @staticmethod
     def _blocked_source_evidence(*, binding_sha256: str | None = None) -> dict[str, object]:
         reproduction = {
@@ -395,6 +481,49 @@ class BlockedFollowupCheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual(
             "bureau_current_task_spec_reproduction",
             bound["durable_followup_binding"]["kind"],
+        )
+
+    def test_capacity_binding_requires_valid_outer_evidence_digest(self) -> None:
+        evidence = self._blocked_source_evidence()
+        evidence["evidence_sha256"] = "f" * 64
+        self.assertFalse(
+            sources.blocked_followup_binding_valid(
+                evidence,
+                CHECKOUT_KEY,
+            )
+        )
+
+    def test_archive_binding_requires_terminal_bureau_task_state(self) -> None:
+        evidence = self._blocked_source_evidence()
+        self.assertTrue(
+            sources.blocked_followup_binding_valid(
+                evidence,
+                CHECKOUT_KEY,
+                require_terminal_task=False,
+            )
+        )
+        self.assertFalse(
+            sources.blocked_followup_binding_valid(
+                evidence,
+                CHECKOUT_KEY,
+                require_terminal_task=True,
+            )
+        )
+        binding = dict(evidence["durable_followup_binding"])
+        binding["task_state"] = "verified"
+        material = {key: value for key, value in binding.items() if key != "binding_sha256"}
+        binding["binding_sha256"] = sources.checkouts._sha256_json(material)
+        evidence["durable_followup_binding"] = binding
+        evidence_core = {
+            key: value for key, value in evidence.items() if key != "evidence_sha256"
+        }
+        evidence["evidence_sha256"] = sources.checkouts._sha256_json(evidence_core)
+        self.assertTrue(
+            sources.blocked_followup_binding_valid(
+                evidence,
+                CHECKOUT_KEY,
+                require_terminal_task=True,
+            )
         )
 
     def test_string_only_terminal_assessment_binding_cannot_release_capacity(self) -> None:

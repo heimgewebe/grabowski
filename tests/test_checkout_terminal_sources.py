@@ -198,6 +198,7 @@ class CheckoutTerminalSourcesTests(unittest.TestCase):
             assessment=assessment,
             audit_record_sha256="f" * 64,
             expected_followup_id="GRABOWSKI-FOLLOWUP-T001",
+            expected_checkout_key=None,
         )
 
     def test_work_lane_terminal_evidence_rejects_missing_original_source_binding(self) -> None:

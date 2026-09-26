@@ -5798,6 +5798,34 @@ def _terminal_detached_archive_transition(
     return {**core, "evidence_sha256": _sha256_json(core)}
 
 
+def _require_completed_work_lane_archive_authority(
+    lifecycle: dict[str, Any] | None,
+    checkout_key: str,
+) -> dict[str, Any] | None:
+    if (
+        not isinstance(lifecycle, dict)
+        or lifecycle.get("phase") != "completed_retained"
+    ):
+        return None
+    source = lifecycle.get("source")
+    if not isinstance(source, dict) or source.get("kind") != "work_lane":
+        return None
+    import grabowski_checkout_terminal_sources as terminal_sources
+
+    evidence = terminal_sources.source_terminal_evidence(lifecycle)
+    if evidence.get("terminal_state") != "blocked_with_durable_followup":
+        return None
+    if not terminal_sources.blocked_followup_binding_valid(
+        evidence,
+        checkout_key,
+        require_terminal_task=True,
+    ):
+        raise RuntimeError(
+            "blocked durable followup capacity release does not authorize checkout archive"
+        )
+    return evidence
+
+
 @mcp.tool(name="grabowski_checkout_archive", annotations=MUTATING)
 def grabowski_checkout_archive(
     repo: str,
@@ -5839,6 +5867,10 @@ def grabowski_checkout_archive(
     )
     if lifecycle_before is not None and lifecycle_before["owner_id"] != owner:
         raise PermissionError("Checkout lifecycle binding is owned by another owner")
+    blocked_followup_archive_evidence = _require_completed_work_lane_archive_authority(
+        lifecycle_before,
+        record["checkout_key"],
+    )
     lease_branch = record.get("branch")
     if lease_branch is None and lifecycle_before is not None:
         lease_branch = lifecycle_before.get("expected_branch")
@@ -5881,6 +5913,22 @@ def grabowski_checkout_archive(
         )
         if retention_now != retention_before:
             raise RuntimeError("Checkout retention changed during archive preflight")
+        blocked_followup_archive_evidence_after_lease = (
+            _require_completed_work_lane_archive_authority(
+                lifecycle,
+                record["checkout_key"],
+            )
+        )
+        if (
+            blocked_followup_archive_evidence_after_lease
+            != blocked_followup_archive_evidence
+        ):
+            raise RuntimeError(
+                "blocked durable followup archive authority changed during archive preflight"
+            )
+        blocked_followup_archive_evidence = (
+            blocked_followup_archive_evidence_after_lease
+        )
         terminal_detached_transition = None
         if lifecycle is not None:
             if lifecycle["expected_branch"] != record.get("branch"):
@@ -5924,6 +5972,7 @@ def grabowski_checkout_archive(
                 "archive_intent_validated_at_unix": archive_intent_validated_at_unix,
                 "lifecycle_preimage": lifecycle_before,
                 "retention_preimage": retention_before,
+                "blocked_followup_archive_evidence": blocked_followup_archive_evidence,
                 "planned_recovery_refs": planned_refs,
             },
         )
@@ -6068,6 +6117,7 @@ def grabowski_checkout_archive(
             "status": status,
             "coordination_checked": coordination["blocking_counts"],
             "terminal_detached_transition": terminal_detached_transition,
+            "blocked_followup_archive_evidence": blocked_followup_archive_evidence,
             "resource_keys": [
                 item["resource_key"] for item in lease["leases"]
             ],

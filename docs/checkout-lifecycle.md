@@ -35,7 +35,11 @@ trennt Inventar, Archivierung und Cleanup.
   nur über genau einen eindeutigen Reproduction-Treffer aufgelöst werden. Diese
   Ausnahme gibt nur den Active-Creation-Slot frei; sie
   erteilt keine Lease-Release-, Follow-up-Completion-, Archiv-, Cleanup- oder
-  Branch-Löschautorität. Bei aktuellen
+  Branch-Löschautorität. Der Archivpfad revalidiert deshalb bei einem so
+  freigegebenen Work-Lane-Checkout die aktuelle Bureau-Reproduktion erneut und
+  bleibt blockiert, solange die gebundene Follow-up-TaskSpec nicht terminal (`verified`, `cancelled` oder `superseded`) ist. Erst dieser
+  zusätzliche Terminalnachweis darf die gewöhnliche Archivlogik wieder freigeben.
+  Bei aktuellen
   Work-Lane-Receipts muss der Checkout-Head außerdem exakt dem `terminal_head_sha`
   des Closeouts entsprechen; Legacy-Receipts ohne dieses Feld bleiben auf den
   strengeren historischen Recovery-Nachweis beschränkt. Eine zweite, bewusst enge
@@ -72,7 +76,13 @@ trennt Inventar, Archivierung und Cleanup.
   revisionsgebundenen `blocked_with_durable_followup`-Kapazitätsausnahme, ein Head
   nach aktuellem Work-Lane-Closeout oder nicht beobachtbare Recovery-Evidenz bleiben
   blockierend. Eine fehlende oder widersprüchliche Durable-Follow-up-Bindung blockiert
-  auch diese Ausnahme.
+  auch diese Ausnahme. Der Bureau-StateStore-Reader pinnt dabei den
+  Coordination-Root über einen no-follow Directory-Descriptor und prüft Datenbank,
+  WAL und SHM als ownergebundene, nicht gruppen-/weltbeschreibbare reguläre Dateien
+  vor und nach der read-only SQLite-Transaktion. Historische Lane-Receipts ohne
+  gespeicherten `checkout_key` dürfen ausschließlich den bereits separat
+  lifecycle-gebundenen Checkout-Key übernehmen; ein vorhandener abweichender Key
+  bleibt blockierend.
   Der Aufruf archiviert oder löscht nichts und verändert weder Branch noch Ref.
 - Die Grips `checkout-owner-handoff-preview` und `checkout-owner-handoff-apply`
   sind ein enger Reconciliation-Pfad für genau `binding-retention-owner-mismatch`:
