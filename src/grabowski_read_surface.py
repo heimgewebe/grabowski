@@ -1591,39 +1591,30 @@ def _tailscale_status_projection(payload: Any) -> dict[str, Any]:
 
 @mcp.tool(name="grabowski_runtime_health", annotations=LOCAL_READ)
 def grabowski_runtime_health() -> dict[str, Any]:
-    """Return minimal Grabowski deployment, audit and kill-switch health."""
-    deployment = base._deployment_metadata()
-    audit = base._verify_audit_log(base.AUDIT_LOG)
-    integrity = {
-        key: bool(deployment.get(key))
-        for key in DEPLOYMENT_INTEGRITY_FIELDS
-    }
-    audit_writable = bool(audit.get("audit_writable"))
+    """Report MCP tool-dispatch liveness without evaluating runtime integrity."""
     return {
+        "schema_version": 2,
         "service": runtime_extensions.LOGICAL_RUNTIME_SERVICE,
-        "service_model": runtime_extensions.runtime_service_model(deployment),
-        "healthy": (
-            deployment.get("completion_status") == "complete"
-            and all(integrity.values())
-            and bool(audit.get("valid"))
-            and audit_writable
-            and not bool(base._kill_switch_state().get("engaged"))
-        ),
-        "deployment_complete": deployment.get("completion_status") == "complete",
-        "deployment_integrity_valid": all(integrity.values()),
-        "audit_valid": bool(audit.get("valid")),
-        "audit_writable": audit_writable,
-        "audit_state": audit.get("audit_state"),
-        "audit_active_bytes": audit.get("active_bytes"),
-        "audit_max_bytes": audit.get("max_bytes"),
-        "audit_remaining_bytes": audit.get("remaining_bytes"),
-        "audit_reserve_bytes": audit.get("reserve_bytes"),
-        "audit_rotation_required": audit.get("rotation_required"),
-        "audit_archived_segment_count": audit.get("archived_segment_count"),
-        "audit_total_records": audit.get("total_records"),
-        "kill_switch_engaged": bool(base._kill_switch_state().get("engaged")),
-        "release_id": deployment.get("release_id"),
-        "repo_head": deployment.get("repo_head"),
+        "health_scope": "mcp_tool_dispatch",
+        "healthy": True,
+        "integrity_evaluated": False,
+        "deployment_complete": None,
+        "deployment_integrity_valid": None,
+        "audit_valid": None,
+        "audit_writable": None,
+        "audit_state": "not_evaluated",
+        "kill_switch_engaged": None,
+        "diagnostic_surface": {
+            "tool": "grabowski_status",
+            "arguments": {"view": "minimal"},
+        },
+        "does_not_establish": [
+            "deployment_integrity",
+            "audit_integrity",
+            "audit_writability",
+            "mutation_readiness",
+            "systemd_manager_scope",
+        ],
     }
 
 

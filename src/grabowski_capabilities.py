@@ -1117,7 +1117,7 @@ TOOL_PROFILES.update(
     {
         "grabowski_runtime_health": {
             "category": "context",
-            "purpose": "Read minimal deployment, audit and kill-switch health without path inventories.",
+            "purpose": "Read MCP tool-dispatch liveness without deployment, audit or kill-switch evaluation.",
             "risk_class": "low",
             "effects": [],
             "reversibility": "not-applicable",

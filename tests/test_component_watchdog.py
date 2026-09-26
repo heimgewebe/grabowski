@@ -112,6 +112,17 @@ class McpLifecycleProbeTests(unittest.TestCase):
                 log_path.read_text(encoding="utf-8").splitlines(),
             )
 
+    def test_versioned_dispatch_liveness_needs_no_integrity_verdict(self) -> None:
+        self.assertIsNone(self.probe(tool_payload={
+            "schema_version": 2,
+            "health_scope": "mcp_tool_dispatch",
+            "healthy": True,
+            "integrity_evaluated": False,
+            "audit_valid": None,
+            "audit_writable": None,
+            "deployment_integrity_valid": None,
+        }))
+
     def test_unrelated_jsonrpc_message_is_ignored(self) -> None:
         self.assertIsNone(self.probe(unrelated_before_initialize=True))
 
