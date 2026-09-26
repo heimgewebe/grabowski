@@ -24,6 +24,7 @@ import grabowski_operator_obligation
 import grabowski_operator_obligation_evidence
 import grabowski_worktree_ensure
 import grabowski_merge_guard
+import grabowski_physical_checkout
 
 Receipt = dict[str, Any]
 CommandRunner = Callable[[Path, list[str]], dict[str, Any]]
@@ -345,7 +346,7 @@ GRIP_SPECS: dict[str, GripSpec] = {
     ),
     "post-merge-sync-apply": GripSpec(
         name="post-merge-sync-apply",
-        version="1.0",
+        version="1.1",
         summary="Apply one exact protected-branch post-merge fast-forward under an exclusive repository guard.",
         effect=MUTATING,
         required_parameters=(
@@ -353,9 +354,11 @@ GRIP_SPECS: dict[str, GripSpec] = {
             "target_branch",
             "expected_local_head",
             "expected_remote_head",
+            "expected_physical_identity_sha256",
             "confirmation",
         ),
         acceptance_ids=(
+            "physical-checkout-bound",
             "protected-canonical-checkout",
             "clean-exact-preimage",
             "remote-head-bound",
@@ -2142,6 +2145,24 @@ def _repo_path(parameters: dict[str, Any]) -> Path:
     if not isinstance(raw, str) or not raw.strip():
         raise GripPreflightError("repo parameter must be a non-empty string")
     return Path(raw).expanduser().resolve()
+
+
+def _physical_checkout_identity(parameters: dict[str, Any]) -> dict[str, Any]:
+    raw = parameters.get("repo")
+    if not isinstance(raw, str) or not raw.strip():
+        raise GripPreflightError("repo parameter must be a non-empty string")
+    try:
+        return grabowski_physical_checkout.capture_physical_checkout_identity(
+            Path(raw).expanduser()
+        )
+    except (
+        OSError,
+        ValueError,
+        grabowski_physical_checkout.PhysicalCheckoutIdentityError,
+    ) as exc:
+        raise GripPreflightError(
+            f"repository physical identity is not safely observable: {exc}"
+        ) from exc
 
 
 def _require_parameters(spec: GripSpec, parameters: dict[str, Any]) -> None:
@@ -6639,6 +6660,7 @@ def _run_post_merge_sync(
         _check(receipt, "dry_run_only", "fail", "post-merge-sync foundation grip is dry-run only")
         raise GripPreflightError("post-merge-sync is dry-run only in GRIP-001")
     _check(receipt, "dry_run_only", "pass", "no mutation will be executed")
+    physical_identity = _physical_checkout_identity(parameters)
     orientation = _run_repo_orient(spec, parameters, receipt, runner)
     commands = [
         ["git", "fetch", "origin"],
@@ -6649,6 +6671,9 @@ def _run_post_merge_sync(
         "dry_run": True,
         "orientation": orientation,
         "target_branch": target,
+        "expected_physical_identity_sha256": physical_identity[
+            "physical_identity_sha256"
+        ],
         "planned_commands": commands,
     }
 
@@ -6661,6 +6686,46 @@ def _run_post_merge_sync_apply(
 ) -> dict[str, Any]:
     del spec
     import grabowski_post_merge_sync_apply as sync_apply
+
+    expected_physical_identity_sha256 = _string_parameter(
+        parameters, "expected_physical_identity_sha256"
+    )
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", expected_physical_identity_sha256)
+        is None
+    ):
+        _check(
+            receipt,
+            "physical-checkout-bound",
+            "fail",
+            "expected physical identity digest is invalid",
+        )
+        raise GripPreflightError(
+            "expected_physical_identity_sha256 must be a lowercase SHA-256 digest"
+        )
+    try:
+        physical_identity = _physical_checkout_identity(parameters)
+    except GripPreflightError as exc:
+        _check(
+            receipt,
+            "physical-checkout-bound",
+            "fail",
+            str(exc),
+        )
+        raise
+    if (
+        physical_identity.get("physical_identity_sha256")
+        != expected_physical_identity_sha256
+    ):
+        _check(
+            receipt,
+            "physical-checkout-bound",
+            "fail",
+            "repository physical identity differs from the bound intent",
+        )
+        raise GripPreflightError(
+            "repository physical identity does not match expected_physical_identity_sha256"
+        )
 
     repo = _repo_path(parameters)
     target_branch = _short_branch_name(parameters, "target_branch")
@@ -6701,6 +6766,7 @@ def _run_post_merge_sync_apply(
             target_branch=target_branch,
             expected_local_head=expected_local_head,
             expected_remote_head=expected_remote_head,
+            expected_physical_identity_sha256=expected_physical_identity_sha256,
             remote=remote,
             remote_target=remote_target,
             confirmation=confirmation,
@@ -6712,7 +6778,34 @@ def _run_post_merge_sync_apply(
         raise GripPreflightError(str(exc)) from exc
 
     state = str(output.get("state") or "unknown")
+    physical_bad = (
+        state in {
+            "invalid_physical_checkout_identity",
+            "physical_checkout_identity_unreadable",
+            "physical_checkout_identity_mismatch",
+            "physical_checkout_identity_drift_before_replay_success",
+            "physical_checkout_identity_drift_after_lease",
+            "physical_checkout_identity_drift_final",
+            "bound_checkout_release_failed",
+        }
+        or output.get("bound_checkout_release_failed") is True
+    )
+    _check(
+        receipt,
+        "physical-checkout-bound",
+        "fail"
+        if physical_bad
+        else (
+            "pass"
+            if output.get("physical_identity_verified") is True
+            else "skip"
+        ),
+        state,
+    )
     before_snapshot = state in {
+        "invalid_physical_checkout_identity",
+        "physical_checkout_identity_unreadable",
+        "physical_checkout_identity_mismatch",
         "unsupported_target_branch",
         "confirmation_mismatch",
         "invalid_bound_heads",
@@ -6764,12 +6857,18 @@ def _run_post_merge_sync_apply(
         "effect_confirmed_remote_drift",
         "effect_confirmed_remote_unreadable",
     }
+    remote_bound_observed = output.get("remote_head_bound_observed")
+    if remote_bound_observed is None:
+        # Compatibility for older/mocked outputs. The acceptance gate proves
+        # one exact bound observation; it does not claim a later external
+        # remote remained unchanged after subsequent local verification.
+        remote_bound_observed = output.get("remote_head_verified")
     remote_status = (
         "fail"
         if remote_bad
         else (
             "pass"
-            if output.get("remote_head_verified") is True
+            if remote_bound_observed is True
             else "skip"
         )
     )
@@ -11906,7 +12005,6 @@ def _saga_captain_audit_binding(
     if provenance is not None:
         body["merge_provenance"] = provenance
     return {**body, "binding_sha256": sha256_json(body)}
-
 
 def _saga_live_readback(
     plan: dict[str, Any], github_runner: GithubRunner

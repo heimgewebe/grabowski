@@ -1511,6 +1511,7 @@ class GripFoundationTests(unittest.TestCase):
             "expected_local_head": "1" * 40,
             "expected_remote_head": "2" * 40,
             "confirmation": "apply-protected-post-merge-sync",
+            "expected_physical_identity_sha256": "f" * 64,
         }
         cases = {
             "confirmation_mismatch": {
@@ -1555,6 +1556,11 @@ class GripFoundationTests(unittest.TestCase):
                 with (
                     patch.object(
                         grips,
+                        "_physical_checkout_identity",
+                        return_value={"physical_identity_sha256": "f" * 64},
+                    ),
+                    patch.object(
+                        grips,
                         "_validate_remote_materialization_target",
                         return_value="https://example.invalid/grabowski.git",
                     ),
@@ -1564,6 +1570,7 @@ class GripFoundationTests(unittest.TestCase):
                             "receipt_status": "blocked",
                             "state": state,
                             "retry_authorized": False,
+                            "physical_identity_verified": True,
                         },
                     ),
                 ):
@@ -1578,8 +1585,173 @@ class GripFoundationTests(unittest.TestCase):
                     item["id"]: item["status"]
                     for item in receipt["checks"]
                 }
+                self.assertEqual("pass", statuses["physical-checkout-bound"])
                 for check_id, status in expected.items():
                     self.assertEqual(status, statuses[check_id])
+
+    def test_post_merge_sync_apply_initial_physical_failure_skips_unobserved_canonical_check(
+        self,
+    ) -> None:
+        parameters = {
+            "repo": "/tmp/grabowski-pr1318-initial-physical-failure-test",
+            "target_branch": "main",
+            "expected_local_head": "1" * 40,
+            "expected_remote_head": "2" * 40,
+            "confirmation": "apply-protected-post-merge-sync",
+            "expected_physical_identity_sha256": "f" * 64,
+        }
+        for state in (
+            "invalid_physical_checkout_identity",
+            "physical_checkout_identity_unreadable",
+            "physical_checkout_identity_mismatch",
+        ):
+            with self.subTest(state=state):
+                receipt: dict[str, object] = {"checks": []}
+                with (
+                    patch.object(
+                        grips,
+                        "_physical_checkout_identity",
+                        return_value={"physical_identity_sha256": "f" * 64},
+                    ),
+                    patch.object(
+                        grips,
+                        "_validate_remote_materialization_target",
+                        return_value="https://example.invalid/grabowski.git",
+                    ),
+                    patch(
+                        "grabowski_post_merge_sync_apply.apply",
+                        return_value={
+                            "receipt_status": "blocked",
+                            "state": state,
+                            "retry_authorized": False,
+                            "physical_identity_verified": False,
+                        },
+                    ),
+                ):
+                    output = grips._run_post_merge_sync_apply(
+                        grips.GRIP_SPECS["post-merge-sync-apply"],
+                        parameters,
+                        receipt,
+                        FakeGit(),
+                    )
+                self.assertEqual(state, output["state"])
+                statuses = {
+                    item["id"]: item["status"]
+                    for item in receipt["checks"]
+                }
+                self.assertEqual("fail", statuses["physical-checkout-bound"])
+                self.assertEqual("skip", statuses["protected-canonical-checkout"])
+                self.assertEqual("skip", statuses["clean-exact-preimage"])
+                self.assertEqual("skip", statuses["remote-head-bound"])
+
+    def test_post_merge_sync_apply_replay_identity_drift_fails_physical_check(
+        self,
+    ) -> None:
+        parameters = {
+            "repo": "/tmp/grabowski-pr1318-replay-drift-test",
+            "target_branch": "main",
+            "expected_local_head": "1" * 40,
+            "expected_remote_head": "2" * 40,
+            "confirmation": "apply-protected-post-merge-sync",
+            "expected_physical_identity_sha256": "f" * 64,
+        }
+        receipt: dict[str, object] = {"checks": []}
+        with (
+            patch.object(
+                grips,
+                "_physical_checkout_identity",
+                return_value={"physical_identity_sha256": "f" * 64},
+            ),
+            patch.object(
+                grips,
+                "_validate_remote_materialization_target",
+                return_value="https://example.invalid/grabowski.git",
+            ),
+            patch(
+                "grabowski_post_merge_sync_apply.apply",
+                return_value={
+                    "receipt_status": "blocked",
+                    "state": "physical_checkout_identity_drift_before_replay_success",
+                    "retry_authorized": False,
+                    "physical_identity_verified": False,
+                    "effect_started": False,
+                },
+            ),
+        ):
+            output = grips._run_post_merge_sync_apply(
+                grips.GRIP_SPECS["post-merge-sync-apply"],
+                parameters,
+                receipt,
+                FakeGit(),
+            )
+
+        self.assertEqual(
+            "physical_checkout_identity_drift_before_replay_success",
+            output["state"],
+        )
+        statuses = {
+            item["id"]: item["status"]
+            for item in receipt["checks"]
+        }
+        self.assertEqual("fail", statuses["physical-checkout-bound"])
+
+    def test_post_merge_sync_apply_bound_checkout_close_failure_fails_physical_check(
+        self,
+    ) -> None:
+        parameters = {
+            "repo": "/tmp/grabowski-pr1318-close-failure-test",
+            "target_branch": "main",
+            "expected_local_head": "1" * 40,
+            "expected_remote_head": "2" * 40,
+            "confirmation": "apply-protected-post-merge-sync",
+            "expected_physical_identity_sha256": "f" * 64,
+        }
+        cases = (
+            {
+                "receipt_status": "failed",
+                "state": "bound_checkout_release_failed",
+                "retry_authorized": False,
+                "physical_identity_verified": False,
+                "bound_checkout_release_failed": True,
+            },
+            {
+                "receipt_status": "blocked",
+                "state": "remote_head_drift_after_lease",
+                "retry_authorized": False,
+                "physical_identity_verified": False,
+                "bound_checkout_release_failed": True,
+            },
+        )
+        for output_value in cases:
+            with self.subTest(state=output_value["state"]):
+                receipt: dict[str, object] = {"checks": []}
+                with (
+                    patch.object(
+                        grips,
+                        "_physical_checkout_identity",
+                        return_value={"physical_identity_sha256": "f" * 64},
+                    ),
+                    patch.object(
+                        grips,
+                        "_validate_remote_materialization_target",
+                        return_value="https://example.invalid/grabowski.git",
+                    ),
+                    patch(
+                        "grabowski_post_merge_sync_apply.apply",
+                        return_value=output_value,
+                    ),
+                ):
+                    grips._run_post_merge_sync_apply(
+                        grips.GRIP_SPECS["post-merge-sync-apply"],
+                        parameters,
+                        receipt,
+                        FakeGit(),
+                    )
+                statuses = {
+                    item["id"]: item["status"]
+                    for item in receipt["checks"]
+                }
+                self.assertEqual("fail", statuses["physical-checkout-bound"])
 
     def test_post_merge_sync_apply_fast_forward_requires_explicit_verification(
         self,
@@ -1590,6 +1762,7 @@ class GripFoundationTests(unittest.TestCase):
             "expected_local_head": "1" * 40,
             "expected_remote_head": "2" * 40,
             "confirmation": "apply-protected-post-merge-sync",
+            "expected_physical_identity_sha256": "f" * 64,
         }
         cases = (
             ({"state": "outcome_unknown", "resource_keys": ["repo:/tmp/x"]}, "skip"),
@@ -1612,6 +1785,11 @@ class GripFoundationTests(unittest.TestCase):
                     **output_patch,
                 }
                 with (
+                    patch.object(
+                        grips,
+                        "_physical_checkout_identity",
+                        return_value={"physical_identity_sha256": "f" * 64},
+                    ),
                     patch.object(
                         grips,
                         "_validate_remote_materialization_target",
@@ -1643,6 +1821,7 @@ class GripFoundationTests(unittest.TestCase):
             "expected_local_head": "1" * 40,
             "expected_remote_head": "2" * 40,
             "confirmation": "apply-protected-post-merge-sync",
+            "expected_physical_identity_sha256": "f" * 64,
         }
         cases = (
             ({"state": "outcome_unknown", "resource_keys": ["repo:/tmp/x"]}, "skip"),
@@ -1651,6 +1830,15 @@ class GripFoundationTests(unittest.TestCase):
                     "state": "outcome_unknown",
                     "resource_keys": ["repo:/tmp/x"],
                     "remote_head_verified": True,
+                },
+                "pass",
+            ),
+            (
+                {
+                    "state": "synced",
+                    "resource_keys": ["repo:/tmp/x"],
+                    "remote_head_verified": False,
+                    "remote_head_bound_observed": True,
                 },
                 "pass",
             ),
@@ -1707,6 +1895,11 @@ class GripFoundationTests(unittest.TestCase):
                 with (
                     patch.object(
                         grips,
+                        "_physical_checkout_identity",
+                        return_value={"physical_identity_sha256": "f" * 64},
+                    ),
+                    patch.object(
+                        grips,
                         "_validate_remote_materialization_target",
                         return_value="https://example.invalid/grabowski.git",
                     ),
@@ -1736,6 +1929,7 @@ class GripFoundationTests(unittest.TestCase):
             "expected_local_head": "1" * 40,
             "expected_remote_head": "2" * 40,
             "confirmation": "apply-protected-post-merge-sync",
+            "expected_physical_identity_sha256": "f" * 64,
         }
         cases = (
             ({"state": "outcome_unknown", "resource_keys": ["repo:/tmp/x"]}, "skip"),
@@ -1778,6 +1972,11 @@ class GripFoundationTests(unittest.TestCase):
                 with (
                     patch.object(
                         grips,
+                        "_physical_checkout_identity",
+                        return_value={"physical_identity_sha256": "f" * 64},
+                    ),
+                    patch.object(
+                        grips,
                         "_validate_remote_materialization_target",
                         return_value="https://example.invalid/grabowski.git",
                     ),
@@ -1806,9 +2005,15 @@ class GripFoundationTests(unittest.TestCase):
             "expected_local_head": "1" * 40,
             "expected_remote_head": "2" * 40,
             "confirmation": "apply-protected-post-merge-sync",
+            "expected_physical_identity_sha256": "f" * 64,
         }
         receipt: dict[str, object] = {"checks": []}
         with (
+            patch.object(
+                grips,
+                "_physical_checkout_identity",
+                return_value={"physical_identity_sha256": "f" * 64},
+            ),
             patch.object(
                 grips,
                 "_validate_remote_materialization_target",
@@ -5470,7 +5675,6 @@ class GripFoundationTests(unittest.TestCase):
 
         self.assertEqual("blocked", result["receipt"]["status"])
         self.assertIn("profile observer cannot run mutating grips", result["output"]["error"])
-
     def test_mechanic_loop_runs_normal_actions_with_visible_scope_and_receipts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             result = grips.run_grip(
@@ -6693,6 +6897,71 @@ class GripFoundationTests(unittest.TestCase):
         checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
         self.assertEqual("fail", checks["expected_branch"])
         self.assertEqual(64, len(result["receipt"]["receipt_sha256"]))
+
+    def test_post_merge_sync_emits_physical_checkout_binding(self) -> None:
+        physical = {
+            "schema_version": 1,
+            "kind": "grabowski.physical_checkout_identity",
+            "root": {"path": "/tmp/repo", "device": 1, "inode": 2},
+            "git_dir": {"path": "/tmp/repo/.git", "device": 1, "inode": 3},
+            "common_dir": {"path": "/tmp/repo/.git", "device": 1, "inode": 3},
+            "physical_identity_sha256": "f" * 64,
+        }
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "grabowski_physical_checkout.capture_physical_checkout_identity",
+            return_value=physical,
+        ):
+            result = grips.run_grip(
+                "post-merge-sync",
+                {"repo": tmp, "target_branch": "main"},
+                command_runner=FakeGit(branch="main", dirty=False),
+            )
+
+        self.assertEqual("passed", result["status"])
+        self.assertEqual(
+            "f" * 64,
+            result["output"]["expected_physical_identity_sha256"],
+        )
+
+    def test_post_merge_sync_apply_rejects_symlink_repository_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            alias = root / "repo-alias"
+            subprocess.run(
+                ["git", "init", "-q", "-b", "main", str(repo)],
+                check=True,
+            )
+            alias.symlink_to(repo, target_is_directory=True)
+            physical = grips.grabowski_physical_checkout.capture_physical_checkout_identity(
+                repo
+            )
+            fake = FakeGit(branch="main", head="1" * 40)
+            result = grips.run_grip(
+                "post-merge-sync-apply",
+                {
+                    "repo": str(alias),
+                    "target_branch": "main",
+                    "expected_local_head": "1" * 40,
+                    "expected_remote_head": "2" * 40,
+                    "expected_physical_identity_sha256": physical[
+                        "physical_identity_sha256"
+                    ],
+                    "confirmation": "apply-protected-post-merge-sync",
+                },
+                allow_mutation=True,
+                command_runner=fake,
+            )
+
+        self.assertEqual("blocked", result["status"])
+        self.assertEqual("preflight", result["receipt"]["phase"])
+        self.assertIn("physical identity", result["output"]["error"])
+        checks = {
+            item["id"]: item["status"]
+            for item in result["receipt"]["checks"]
+        }
+        self.assertEqual("fail", checks["physical-checkout-bound"])
+        self.assertEqual([], fake.calls)
 
     def test_post_merge_sync_validates_target_branch_before_orienting(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
