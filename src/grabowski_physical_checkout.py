@@ -787,6 +787,40 @@ def bind_physical_checkout(
                 "physical checkout descriptor cleanup failed"
             ) from close_error
 
+def verify_physical_checkout_identity(expected: dict[str, Any]) -> dict[str, Any]:
+    required_fields = {
+        "schema_version",
+        "kind",
+        "root",
+        "git_dir",
+        "common_dir",
+        "physical_identity_sha256",
+    }
+    if (
+        not isinstance(expected, dict)
+        or set(expected) != required_fields
+        or expected.get("schema_version") != SCHEMA_VERSION
+        or expected.get("kind") != KIND
+    ):
+        raise PhysicalCheckoutIdentityError("expected physical identity is invalid")
+
+    root = _validated_identity_node(expected.get("root"), label="root")
+    git_dir = _validated_identity_node(expected.get("git_dir"), label="git_dir")
+    common_dir = _validated_identity_node(expected.get("common_dir"), label="common_dir")
+    material = _identity_material(root=root, git_dir=git_dir, common_dir=common_dir)
+    expected_digest = expected.get("physical_identity_sha256")
+    if not isinstance(expected_digest, str) or expected_digest != _identity_sha256(material):
+        raise PhysicalCheckoutIdentityError(
+            "expected physical identity digest is internally inconsistent"
+        )
+
+    observed = capture_physical_checkout_identity(root["path"])
+    if expected_digest != observed["physical_identity_sha256"]:
+        raise PhysicalCheckoutIdentityError(
+            "physical checkout identity changed since the expected observation"
+        )
+    return observed
+
 
 def capture_registered_linked_worktree_git_dir(
     common_dir: str | os.PathLike[str],
@@ -993,38 +1027,3 @@ def capture_registered_linked_worktree_git_dir(
         if worktrees_descriptor is not None:
             os.close(worktrees_descriptor)
         os.close(common_descriptor)
-
-
-def verify_physical_checkout_identity(expected: dict[str, Any]) -> dict[str, Any]:
-    required_fields = {
-        "schema_version",
-        "kind",
-        "root",
-        "git_dir",
-        "common_dir",
-        "physical_identity_sha256",
-    }
-    if (
-        not isinstance(expected, dict)
-        or set(expected) != required_fields
-        or expected.get("schema_version") != SCHEMA_VERSION
-        or expected.get("kind") != KIND
-    ):
-        raise PhysicalCheckoutIdentityError("expected physical identity is invalid")
-
-    root = _validated_identity_node(expected.get("root"), label="root")
-    git_dir = _validated_identity_node(expected.get("git_dir"), label="git_dir")
-    common_dir = _validated_identity_node(expected.get("common_dir"), label="common_dir")
-    material = _identity_material(root=root, git_dir=git_dir, common_dir=common_dir)
-    expected_digest = expected.get("physical_identity_sha256")
-    if not isinstance(expected_digest, str) or expected_digest != _identity_sha256(material):
-        raise PhysicalCheckoutIdentityError(
-            "expected physical identity digest is internally inconsistent"
-        )
-
-    observed = capture_physical_checkout_identity(root["path"])
-    if expected_digest != observed["physical_identity_sha256"]:
-        raise PhysicalCheckoutIdentityError(
-            "physical checkout identity changed since the expected observation"
-        )
-    return observed
