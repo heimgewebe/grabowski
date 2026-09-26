@@ -214,7 +214,10 @@ class PhysicalCheckoutIdentityTests(unittest.TestCase):
                         side_effect=close_with_git_failure,
                     ),
                 ):
-                    with self.assertRaises(OSError):
+                    with self.assertRaisesRegex(
+                        physical_checkout.PhysicalCheckoutIdentityError,
+                        "injected bind validation failure",
+                    ):
                         physical_checkout.bind_physical_checkout(repo)
 
                 self.assertIn(opened["git"], close_attempts)

@@ -6703,7 +6703,16 @@ def _run_post_merge_sync_apply(
         raise GripPreflightError(
             "expected_physical_identity_sha256 must be a lowercase SHA-256 digest"
         )
-    physical_identity = _physical_checkout_identity(parameters)
+    try:
+        physical_identity = _physical_checkout_identity(parameters)
+    except GripPreflightError as exc:
+        _check(
+            receipt,
+            "physical-checkout-bound",
+            "fail",
+            str(exc),
+        )
+        raise
     if (
         physical_identity.get("physical_identity_sha256")
         != expected_physical_identity_sha256
@@ -6769,14 +6778,18 @@ def _run_post_merge_sync_apply(
         raise GripPreflightError(str(exc)) from exc
 
     state = str(output.get("state") or "unknown")
-    physical_bad = state in {
-        "invalid_physical_checkout_identity",
-        "physical_checkout_identity_unreadable",
-        "physical_checkout_identity_mismatch",
-        "physical_checkout_identity_drift_before_replay_success",
-        "physical_checkout_identity_drift_after_lease",
-        "physical_checkout_identity_drift_final",
-    }
+    physical_bad = (
+        state in {
+            "invalid_physical_checkout_identity",
+            "physical_checkout_identity_unreadable",
+            "physical_checkout_identity_mismatch",
+            "physical_checkout_identity_drift_before_replay_success",
+            "physical_checkout_identity_drift_after_lease",
+            "physical_checkout_identity_drift_final",
+            "bound_checkout_release_failed",
+        }
+        or output.get("bound_checkout_release_failed") is True
+    )
     _check(
         receipt,
         "physical-checkout-bound",

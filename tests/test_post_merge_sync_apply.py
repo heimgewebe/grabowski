@@ -480,6 +480,34 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             self.assertFalse(result["effect_started"])
             self.assertEqual(0, leases.acquire_calls)
 
+    def test_early_block_after_physical_identity_preserves_verification(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            expected = physical_checkout.capture_physical_checkout_identity(repo)
+            result = sync_apply.apply(
+                repo=repo,
+                target_branch="main",
+                expected_local_head=base,
+                expected_remote_head=target,
+                expected_physical_identity_sha256=expected[
+                    "physical_identity_sha256"
+                ],
+                remote="origin",
+                remote_target=str(remote),
+                confirmation="wrong-confirmation",
+                runner=git,
+                remote_head_reader=self.remote_reader(remote),
+                pinned_target_factory=self.pinned(remote),
+            )
+
+            self.assertEqual("blocked", result["receipt_status"])
+            self.assertEqual("confirmation_mismatch", result["state"])
+            self.assertTrue(result["physical_identity_verified"])
+            self.assertFalse(result["effect_started"])
+            self.assertFalse(result["retry_authorized"])
+
     def test_physical_identity_drift_after_lease_blocks_before_git_effect(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo, remote, base, target = self.fixture(Path(tmp))
@@ -545,6 +573,101 @@ class PostMergeSyncApplyTests(unittest.TestCase):
                 result["next_action"],
             )
             self.assertEqual(target, git_stdout(repo, "rev-parse", "HEAD"))
+            self.assertEqual(1, leases.release_calls)
+
+    def test_bound_checkout_close_failure_cannot_preserve_success(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            real_bind = physical_checkout.bind_physical_checkout
+
+            def bind_with_failing_close(path: Path):
+                inner = real_bind(path)
+
+                class CloseFailingBound:
+                    identity = inner.identity
+                    effect_root = inner.effect_root
+                    effect_git_dir = inner.effect_git_dir
+
+                    def close(self) -> None:
+                        inner.close()
+                        raise physical_checkout.PhysicalCheckoutIdentityError(
+                            "injected bound checkout close failure"
+                        )
+
+                return CloseFailingBound()
+
+            leases = LeaseHarness()
+            with (
+                patched_leases(leases),
+                patch.object(
+                    sync_apply.physical_checkout,
+                    "bind_physical_checkout",
+                    side_effect=bind_with_failing_close,
+                ),
+            ):
+                result = self.apply(repo, remote, base, target)
+
+            self.assertEqual("failed", result["receipt_status"])
+            self.assertEqual("bound_checkout_release_failed", result["state"])
+            self.assertTrue(result["bound_checkout_release_failed"])
+            self.assertFalse(result["physical_identity_verified"])
+            self.assertFalse(result["post_state_verified"])
+            self.assertTrue(result["readback_required"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertEqual(1, leases.release_calls)
+
+    def test_bound_checkout_close_failure_is_recorded_on_prior_block(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            real_bind = physical_checkout.bind_physical_checkout
+
+            def bind_with_failing_close(path: Path):
+                inner = real_bind(path)
+
+                class CloseFailingBound:
+                    identity = inner.identity
+                    effect_root = inner.effect_root
+                    effect_git_dir = inner.effect_git_dir
+
+                    def close(self) -> None:
+                        inner.close()
+                        raise physical_checkout.PhysicalCheckoutIdentityError(
+                            "injected bound checkout close failure"
+                        )
+
+                return CloseFailingBound()
+
+            def drifting_remote(stage: str, _effect_started: bool) -> str:
+                return base if stage == "locked" else target
+
+            leases = LeaseHarness()
+            with (
+                patched_leases(leases),
+                patch.object(
+                    sync_apply.physical_checkout,
+                    "bind_physical_checkout",
+                    side_effect=bind_with_failing_close,
+                ),
+            ):
+                result = self.apply(
+                    repo,
+                    remote,
+                    base,
+                    target,
+                    remote_reader=drifting_remote,
+                )
+
+            self.assertEqual("blocked", result["receipt_status"])
+            self.assertEqual("remote_head_drift_after_lease", result["state"])
+            self.assertTrue(result["bound_checkout_release_failed"])
+            self.assertFalse(result["physical_identity_verified"])
+            self.assertFalse(result["post_state_verified"])
+            self.assertTrue(result["readback_required"])
+            self.assertFalse(result["retry_authorized"])
             self.assertEqual(1, leases.release_calls)
 
     def test_git_effects_are_routed_through_fd_bound_checkout(self) -> None:
@@ -1745,6 +1868,72 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             self.assertTrue(changed)
             self.assertEqual("failed", result["receipt_status"])
             self.assertEqual("outcome_unknown", result["state"])
+            self.assertFalse(result["post_state_verified"])
+            self.assertTrue(result["readback_required"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertEqual(target, result["remote_readback"])
+            self.assertEqual(base, git_stdout(repo, "rev-parse", "refs/heads/main"))
+            self.assertEqual(1, leases.acquire_calls)
+            self.assertEqual(1, leases.release_calls)
+
+    def test_error_readback_rechecks_local_after_physical_verification(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            error_readback_seen = False
+            changed = False
+            real_capture = physical_checkout.capture_physical_checkout_identity
+
+            def recovering_remote(stage: str, _effect_started: bool) -> str:
+                nonlocal error_readback_seen
+                if stage == "final":
+                    raise RuntimeError("injected final remote read failure")
+                if stage == "error_readback":
+                    error_readback_seen = True
+                return target
+
+            def capture_with_in_place_drift(path: Path):
+                nonlocal changed
+                identity = real_capture(path)
+                if error_readback_seen and not changed:
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repo),
+                            "update-ref",
+                            "refs/heads/main",
+                            base,
+                            target,
+                        ],
+                        check=True,
+                    )
+                    changed = True
+                return identity
+
+            leases = LeaseHarness()
+            with (
+                patched_leases(leases),
+                patch.object(
+                    sync_apply.physical_checkout,
+                    "capture_physical_checkout_identity",
+                    side_effect=capture_with_in_place_drift,
+                ),
+            ):
+                result = self.apply(
+                    repo,
+                    remote,
+                    base,
+                    target,
+                    remote_reader=recovering_remote,
+                )
+
+            self.assertTrue(error_readback_seen)
+            self.assertTrue(changed)
+            self.assertEqual("failed", result["receipt_status"])
+            self.assertEqual("outcome_unknown", result["state"])
+            self.assertFalse(result["local_post_state_verified"])
             self.assertFalse(result["post_state_verified"])
             self.assertTrue(result["readback_required"])
             self.assertFalse(result["retry_authorized"])

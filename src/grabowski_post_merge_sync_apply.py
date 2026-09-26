@@ -364,17 +364,30 @@ def apply(
     physical_identity_verified = True
 
     if target_branch not in PROTECTED_BRANCHES:
-        return _blocked("unsupported_target_branch", target_branch=target_branch)
+        return _blocked(
+            "unsupported_target_branch",
+            target_branch=target_branch,
+            physical_identity_verified=True,
+        )
     if confirmation != CONFIRMATION:
-        return _blocked("confirmation_mismatch")
+        return _blocked(
+            "confirmation_mismatch",
+            physical_identity_verified=True,
+        )
     if (
         SHA_RE.fullmatch(expected_local_head) is None
         or SHA_RE.fullmatch(expected_remote_head) is None
         or len(expected_local_head) != len(expected_remote_head)
     ):
-        return _blocked("invalid_bound_heads")
+        return _blocked(
+            "invalid_bound_heads",
+            physical_identity_verified=True,
+        )
     if REMOTE_RE.fullmatch(remote) is None or remote.startswith("-"):
-        return _blocked("invalid_remote")
+        return _blocked(
+            "invalid_remote",
+            physical_identity_verified=True,
+        )
 
     sha_length = len(expected_remote_head)
     expected_upstream = f"{remote}/{target_branch}"
@@ -393,13 +406,26 @@ def apply(
         return _blocked(
             "canonical_checkout_mismatch",
             before=initial,
+            physical_identity_verified=True,
         )
     if initial.get("clean") is not True:
-        return _blocked("dirty_checkout", before=initial)
+        return _blocked(
+            "dirty_checkout",
+            before=initial,
+            physical_identity_verified=True,
+        )
     if initial.get("head") not in {expected_local_head, expected_remote_head}:
-        return _blocked("local_head_mismatch", before=initial)
+        return _blocked(
+            "local_head_mismatch",
+            before=initial,
+            physical_identity_verified=True,
+        )
     if initial.get("upstream") != expected_upstream:
-        return _blocked("upstream_mismatch", before=initial)
+        return _blocked(
+            "upstream_mismatch",
+            before=initial,
+            physical_identity_verified=True,
+        )
 
     remote_head_verified = False
 
@@ -419,6 +445,7 @@ def apply(
         return _blocked(
             "remote_read_failed",
             before=initial,
+            physical_identity_verified=True,
             error_class=type(exc).__name__,
         )
     if remote_before != expected_remote_head:
@@ -426,6 +453,7 @@ def apply(
             "remote_head_mismatch",
             before=initial,
             actual_remote_head=remote_before,
+            physical_identity_verified=True,
         )
     remote_head_verified = True
 
@@ -436,6 +464,7 @@ def apply(
             "local_preimage_commit_unreadable",
             before=initial,
             remote_head_verified=remote_head_verified,
+            physical_identity_verified=True,
             error=str(exc),
         )
 
@@ -445,6 +474,7 @@ def apply(
                 "tracking_ref_mismatch_on_replay",
                 before=initial,
                 remote_head_verified=remote_head_verified,
+                physical_identity_verified=True,
             )
         try:
             with physical_checkout.bind_physical_checkout(repo) as replay_bound:
@@ -1119,6 +1149,29 @@ def apply(
                         ):
                             physical_identity_verified = False
                             recovery_physical_drift = True
+                    if not recovery_physical_drift:
+                        try:
+                            readback = _snapshot(
+                                repo,
+                                effect_runner,
+                                target_branch=target_branch,
+                                remote=remote,
+                                sha_length=sha_length,
+                                identity_override=identity,
+                            )
+                        except Exception as read_exc:
+                            readback = {
+                                "readback_error_type": type(read_exc).__name__
+                            }
+                            local_final_exact = False
+                        else:
+                            local_final_exact = _final_exact(
+                                readback,
+                                repo=repo,
+                                target_branch=target_branch,
+                                remote=remote,
+                                expected_remote_head=expected_remote_head,
+                            )
                 remote_final_exact = (
                     local_final_exact
                     and remote_readback == expected_remote_head
@@ -1250,6 +1303,10 @@ def apply(
             try:
                 bound_checkout.close()
             except physical_checkout.PhysicalCheckoutIdentityError:
+                close_next_action = (
+                    "authoritative physical, local and remote readback before any new intent"
+                )
+                physical_identity_verified = False
                 if output is None:
                     output = {
                         "receipt_status": "failed",
@@ -1259,23 +1316,32 @@ def apply(
                         "branch_cas_started": branch_cas_started,
                         "serialization_verified": serialization_verified,
                         "fast_forward_verified": fast_forward_verified,
-                        "physical_identity_verified": physical_identity_verified,
+                        "physical_identity_verified": False,
+                        "post_state_verified": False,
+                        "bound_checkout_release_failed": True,
                         "retry_authorized": False,
                         "readback_required": True,
                         "preimage_sha256": preimage_sha256,
                         "resource_keys": resource_keys,
-                        "next_action": (
-                            "authoritative local and remote readback before any new intent"
-                        ),
+                        "next_action": close_next_action,
                     }
-                elif output.get("receipt_status") == "passed":
-                    output["receipt_status"] = "blocked"
-                    output["state"] = "bound_checkout_release_failed"
+                else:
+                    prior_next_action = output.get("next_action")
+                    output["bound_checkout_release_failed"] = True
+                    output["physical_identity_verified"] = False
+                    output["post_state_verified"] = False
                     output["retry_authorized"] = False
                     output["readback_required"] = True
-                    output["next_action"] = (
-                        "authoritative local and remote readback before any new intent"
-                    )
+                    if output.get("receipt_status") == "passed":
+                        output["receipt_status"] = "failed"
+                        output["state"] = "bound_checkout_release_failed"
+                    if (
+                        isinstance(prior_next_action, str)
+                        and prior_next_action.strip()
+                        and close_next_action not in prior_next_action
+                    ):
+                        output["effect_next_action"] = prior_next_action
+                    output["next_action"] = close_next_action
         try:
             released = resources.release_resources(
                 owner_id,

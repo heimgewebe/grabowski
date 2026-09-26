@@ -1556,6 +1556,7 @@ class GripFoundationTests(unittest.TestCase):
                             "receipt_status": "blocked",
                             "state": state,
                             "retry_authorized": False,
+                            "physical_identity_verified": True,
                         },
                     ),
                 ):
@@ -1570,6 +1571,7 @@ class GripFoundationTests(unittest.TestCase):
                     item["id"]: item["status"]
                     for item in receipt["checks"]
                 }
+                self.assertEqual("pass", statuses["physical-checkout-bound"])
                 for check_id, status in expected.items():
                     self.assertEqual(status, statuses[check_id])
 
@@ -1623,6 +1625,64 @@ class GripFoundationTests(unittest.TestCase):
             for item in receipt["checks"]
         }
         self.assertEqual("fail", statuses["physical-checkout-bound"])
+
+    def test_post_merge_sync_apply_bound_checkout_close_failure_fails_physical_check(
+        self,
+    ) -> None:
+        parameters = {
+            "repo": "/tmp/grabowski-pr1318-close-failure-test",
+            "target_branch": "main",
+            "expected_local_head": "1" * 40,
+            "expected_remote_head": "2" * 40,
+            "confirmation": "apply-protected-post-merge-sync",
+            "expected_physical_identity_sha256": "f" * 64,
+        }
+        cases = (
+            {
+                "receipt_status": "failed",
+                "state": "bound_checkout_release_failed",
+                "retry_authorized": False,
+                "physical_identity_verified": False,
+                "bound_checkout_release_failed": True,
+            },
+            {
+                "receipt_status": "blocked",
+                "state": "remote_head_drift_after_lease",
+                "retry_authorized": False,
+                "physical_identity_verified": False,
+                "bound_checkout_release_failed": True,
+            },
+        )
+        for output_value in cases:
+            with self.subTest(state=output_value["state"]):
+                receipt: dict[str, object] = {"checks": []}
+                with (
+                    patch.object(
+                        grips,
+                        "_physical_checkout_identity",
+                        return_value={"physical_identity_sha256": "f" * 64},
+                    ),
+                    patch.object(
+                        grips,
+                        "_validate_remote_materialization_target",
+                        return_value="https://example.invalid/grabowski.git",
+                    ),
+                    patch(
+                        "grabowski_post_merge_sync_apply.apply",
+                        return_value=output_value,
+                    ),
+                ):
+                    grips._run_post_merge_sync_apply(
+                        grips.GRIP_SPECS["post-merge-sync-apply"],
+                        parameters,
+                        receipt,
+                        FakeGit(),
+                    )
+                statuses = {
+                    item["id"]: item["status"]
+                    for item in receipt["checks"]
+                }
+                self.assertEqual("fail", statuses["physical-checkout-bound"])
 
     def test_post_merge_sync_apply_fast_forward_requires_explicit_verification(
         self,
@@ -6819,6 +6879,11 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("blocked", result["status"])
         self.assertEqual("preflight", result["receipt"]["phase"])
         self.assertIn("physical identity", result["output"]["error"])
+        checks = {
+            item["id"]: item["status"]
+            for item in result["receipt"]["checks"]
+        }
+        self.assertEqual("fail", checks["physical-checkout-bound"])
         self.assertEqual([], fake.calls)
 
     def test_post_merge_sync_validates_target_branch_before_orienting(self) -> None:

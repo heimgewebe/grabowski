@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import sys
 from typing import Any
 
 
@@ -768,6 +769,7 @@ def bind_physical_checkout(
         git_descriptor = None
         return bound
     finally:
+        primary_exception_active = sys.exc_info()[0] is not None
         close_error: OSError | None = None
         if git_descriptor is not None:
             try:
@@ -780,8 +782,10 @@ def bind_physical_checkout(
             except OSError as exc:
                 if close_error is None:
                     close_error = exc
-        if close_error is not None:
-            raise close_error
+        if close_error is not None and not primary_exception_active:
+            raise PhysicalCheckoutIdentityError(
+                "physical checkout descriptor cleanup failed"
+            ) from close_error
 
 
 def verify_physical_checkout_identity(expected: dict[str, Any]) -> dict[str, Any]:
