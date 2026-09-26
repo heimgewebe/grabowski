@@ -623,7 +623,7 @@ def _validated_mcp_proxy_python(
 def validate_toolchain(codex: str) -> str:
     bundled_rg = Path(codex).parent.parent / "codex-path" / "rg"
     _validate_support_executable(bundled_rg, require_read_only_mount=True)
-    for path in (Path("/usr/bin/cat"), Path("/usr/bin/sed"), Path("/usr/bin/bash")):
+    for path in (Path("/usr/bin/cat"), Path("/usr/bin/sed"), Path("/bin/bash")):
         _validate_support_executable(path, owner_uid=0)
     _validated_mcp_proxy_python()
     return f"{bundled_rg.parent}:/usr/bin:/bin"
@@ -3933,10 +3933,12 @@ def build_command(
     command = [
         codex, "exec",
         "-c", f'default_permissions="{PERMISSION_PROFILE}"',
+        "-c", "allow_login_shell=false",
         "-c", "features.network_proxy=true",
         "-c", f"permissions.{PERMISSION_PROFILE}.filesystem={filesystem}",
         "-c", f'permissions.{PERMISSION_PROFILE}.network={{enabled=true,mode="limited",allow_local_binding=false,domains={{}}}}',
         "--ephemeral", "--ignore-user-config", "--ignore-rules", "--strict-config",
+        "--disable", "apps", "--disable", "plugins",
         "--color", "never", "--json", "--model", MODEL,
         "-c", 'model_reasoning_effort="medium"',
         "-c", 'web_search="disabled"',
@@ -4089,6 +4091,7 @@ def run_bounded(
         limits = {"stdout": stdout_limit, "stderr": stderr_limit}
         overflow = {"stdout": False, "stderr": False}
         capture_error: str | None = None
+        containment_events: list[str] = []
         selector: selectors.BaseSelector | None = None
 
         def note_error(marker: str) -> None:
@@ -4097,6 +4100,10 @@ def run_bounded(
                 capture_error = marker
             elif marker not in capture_error.split(";"):
                 capture_error += ";" + marker
+
+        def note_containment(marker: str) -> None:
+            if marker not in containment_events:
+                containment_events.append(marker)
 
         def kill_process_tree() -> None:
             group_killed = False
@@ -4157,10 +4164,10 @@ def run_bounded(
             if not group_present and not adopted:
                 return
             if group_present:
-                note_error("process_group_survived_provider_exit")
+                note_containment("process_group_survived_provider_exit")
                 kill_process_tree()
             if adopted:
-                note_error("adopted_descendant_survived_provider_exit")
+                note_containment("adopted_descendant_survived_provider_exit")
                 kill_adopted_children(adopted)
             cleanup_deadline = time.monotonic() + 1.0
             while time.monotonic() < cleanup_deadline:
@@ -4345,6 +4352,7 @@ def run_bounded(
             "stdout": bytes(buffers["stdout"]),
             "stderr": bytes(buffers["stderr"]),
             "capture_error": capture_error,
+            "containment_events": list(containment_events),
             "stdout_overflow": overflow["stdout"],
             "stderr_overflow": overflow["stderr"],
         }
@@ -4562,6 +4570,7 @@ def persist_provider_capture(
                 "ended_at": iso(ended_at),
                 "returncode": capture.get("returncode"),
                 "capture_error": capture.get("capture_error"),
+                "containment_events": list(capture.get("containment_events") or []),
                 "raw_persistence_complete": False,
                 "raw_persisted": dict(raw_persisted),
                 "write_errors": [
@@ -4596,6 +4605,7 @@ def persist_provider_capture(
             "stderr_policy_version":STDERR_POLICY_VERSION,
             "started_at":iso(started_at), "ended_at":iso(ended_at),
             "returncode":capture.get("returncode"), "capture_error":capture.get("capture_error"),
+            "containment_events":list(capture.get("containment_events") or []),
             "stdout":{"artifact":names["stdout"],"sha256":sha_bytes(stdout),"bytes":len(stdout),"overflow":bool(capture.get("stdout_overflow"))},
             "stderr":{"artifact":names["stderr"],"sha256":sha_bytes(stderr),"bytes":len(stderr),"overflow":bool(capture.get("stderr_overflow"))},
             "semantic_interpretation":"not_performed",
@@ -4828,6 +4838,11 @@ def _sed_kind(parts: Sequence[str]) -> str:
 
 def command_kind(command: str) -> str:
     parts = _split_shell_words(command)
+    # build_command pins allow_login_shell=false; normalize only Codex's
+    # corresponding non-login wrapper so user profiles cannot change the
+    # validated benchmark toolchain before the inner command runs.
+    if len(parts) == 3 and parts[:2] == ["/bin/bash", "-c"]:
+        parts = _split_shell_words(parts[2])
     if not parts:
         raise RunnerError("empty Codex command")
     executable = parts[0]
@@ -4849,17 +4864,27 @@ def normalize(
     if any(event.get("type") in {"turn.failed", "error"} for event in events):
         raise RunnerError("Codex emitted terminal error")
     usage = completed[0].get("usage") if isinstance(completed[0].get("usage"), dict) else {}
-    input_tokens = usage.get("input_tokens")
+    raw_input_tokens = usage.get("input_tokens")
+    cached_input_tokens = usage.get("cached_input_tokens")
     output_tokens = usage.get("output_tokens")
     if (
-        not isinstance(input_tokens, int)
-        or isinstance(input_tokens, bool)
-        or input_tokens < 0
+        not isinstance(raw_input_tokens, int)
+        or isinstance(raw_input_tokens, bool)
+        or raw_input_tokens < 0
+        or not isinstance(cached_input_tokens, int)
+        or isinstance(cached_input_tokens, bool)
+        or cached_input_tokens < 0
+        or cached_input_tokens > raw_input_tokens
         or not isinstance(output_tokens, int)
         or isinstance(output_tokens, bool)
         or output_tokens < 0
     ):
         raise RunnerError("Codex usage is invalid")
+    # Codex includes cached reads in input_tokens. The frozen benchmark was
+    # defined against Claude usage where cache-read tokens are reported
+    # separately, so compare the provider-reported non-cached input quantity.
+    # Cache-write input remains non-cached input and is therefore not deducted.
+    input_tokens = raw_input_tokens - cached_input_tokens
     budgets = request["budgets"]
     if input_tokens > budgets["input_tokens"] or output_tokens > budgets["output_tokens"]:
         raise RunnerError("Codex token budget exceeded")

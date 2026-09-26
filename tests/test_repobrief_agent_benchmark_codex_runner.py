@@ -492,6 +492,8 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "AZURE_OPENAI_API_KEY": "must-not-leak",
                 "ANTHROPIC_API_KEY": "must-not-leak",
                 "CODEX_ACCESS_TOKEN": "must-not-leak",
+                "BASH_ENV": "/tmp/must-not-load",
+                "ENV": "/tmp/must-not-load",
             },
             clear=True,
         ):
@@ -501,6 +503,8 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertNotIn("AZURE_OPENAI_API_KEY", environment)
         self.assertNotIn("ANTHROPIC_API_KEY", environment)
         self.assertNotIn("CODEX_ACCESS_TOKEN", environment)
+        self.assertNotIn("BASH_ENV", environment)
+        self.assertNotIn("ENV", environment)
         self.assertEqual(environment["PATH"], "/usr/bin:/bin")
 
     def test_direct_runner_rejects_unbootstrapped_start(self) -> None:
@@ -800,6 +804,24 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertEqual(runner.command_kind("rg --regexp=example src"), "grep")
         self.assertEqual(runner.command_kind("cat src/example.py"), "read_file")
         self.assertEqual(runner.command_kind("sed -n '1,2p' src/example.py"), "read_file")
+        self.assertEqual(
+            runner.command_kind(
+                "/bin/bash -c \"rg -n 'finaliz|Finaliz' "
+                "--glob '*.py' --glob '*.md'\""
+            ),
+            "grep",
+        )
+        self.assertEqual(
+            runner.command_kind(
+                "/bin/bash -c \"sed -n '62,177p' "
+                "src/grabowski_job_finalizer.py\""
+            ),
+            "read_file",
+        )
+        self.assertEqual(
+            runner.command_kind("/bin/bash -c 'cat src/example.py'"),
+            "read_file",
+        )
         for command in (
             "ls",
             "git status",
@@ -822,6 +844,17 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             "/usr/bin/cat src/example.py",
             "sh -lc 'cat src/example.py'",
             "bash -lc 'cat src/example.py'",
+            "/bin/sh -lc 'cat src/example.py'",
+            "/usr/bin/bash -lc 'cat src/example.py'",
+            "/bin/bash -lc 'cat src/example.py'",
+            "/bin/bash -c 'cat src/example.py' extra",
+            "/bin/bash -c 'cat src/example.py | head'",
+            "/bin/bash -c 'cat src/example.py && cat src/example.py'",
+            "/bin/bash -c 'cat src/example.py > output'",
+            "/bin/bash -c 'cat $HOME/file'",
+            "/bin/bash -c 'python -c \"print(1)\"'",
+            "/bin/bash -c \"/bin/bash -c 'cat src/example.py'\"",
+            "/bin/bash -c ''",
             "rg needle src\ncat secret",
             "cat src/example.py\r\nrg needle src",
             "rg needle src |& id",
@@ -874,10 +907,25 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertIn(flag, baseline)
         self.assertNotIn("--sandbox", baseline)
         self.assertIn(f'default_permissions="{runner.PERMISSION_PROFILE}"', baseline)
+        self.assertIn("allow_login_shell=false", baseline)
+        self.assertIn("allow_login_shell=false", treatment)
         self.assertIn("features.network_proxy=true", baseline)
+        self.assertFalse(any("credential_broker" in item for item in baseline))
         self.assertTrue(any("domains={}" in item for item in baseline))
         self.assertTrue(any(":workspace_roots" in item for item in baseline))
         self.assertIn('web_search="disabled"', baseline)
+        baseline_disabled = [
+            baseline[index + 1]
+            for index, value in enumerate(baseline[:-1])
+            if value == "--disable"
+        ]
+        treatment_disabled = [
+            treatment[index + 1]
+            for index, value in enumerate(treatment[:-1])
+            if value == "--disable"
+        ]
+        self.assertEqual(baseline_disabled, ["apps", "plugins"])
+        self.assertEqual(treatment_disabled, ["apps", "plugins"])
         self.assertNotIn("mcp_servers.repobrief", baseline_joined)
         self.assertIn("mcp_servers.repobrief", treatment_joined)
         self.assertIn("--codex-mcp-proxy", treatment_joined)
@@ -921,6 +969,27 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     path,
                     owner_uid=os.geteuid(),
                 )
+
+    def test_validate_toolchain_binds_exact_bash_wrapper_path(self) -> None:
+        with (
+            patch.object(
+                runner,
+                "_validate_support_executable",
+                return_value="/validated",
+            ) as validate,
+            patch.object(
+                runner,
+                "_validated_mcp_proxy_python",
+                return_value="/usr/bin/python3",
+            ),
+        ):
+            self.assertEqual(
+                runner.validate_toolchain("/opt/codex/bin/codex"),
+                "/opt/codex/codex-path:/usr/bin:/bin",
+            )
+        validated_paths = [entry.args[0] for entry in validate.call_args_list]
+        self.assertIn(Path("/bin/bash"), validated_paths)
+        self.assertNotIn(Path("/usr/bin/bash"), validated_paths)
 
     def test_mcp_executable_rejects_special_permission_bits(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1854,8 +1923,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             capture = runner.run_bounded(
                 [sys.executable, str(script)], cwd=root, timeout_seconds=3, stdin_data=b""
             )
-            self.assertIn("process_group_survived_provider_exit", str(capture["capture_error"]))
-            self.assertNotIn("process_group_cleanup_failed", str(capture["capture_error"]))
+            self.assertIsNone(capture["capture_error"])
+            self.assertIn(
+                "process_group_survived_provider_exit",
+                capture["containment_events"],
+            )
             child_pid = int(child_state.read_text())
             deadline = time.monotonic() + 2
             while True:
@@ -1866,6 +1938,60 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 if time.monotonic() >= deadline:
                     self.fail("provider descendant survived process-group containment")
                 time.sleep(0.02)
+
+    def test_run_bounded_failed_post_exit_containment_remains_capture_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            child_state = root / "child.pid"
+            script = root / "provider.py"
+            script.write_text(
+                "import os, pathlib, time\n"
+                "child = os.fork()\n"
+                "if child == 0:\n"
+                f"    pathlib.Path({str(child_state)!r}).write_text(str(os.getpid()))\n"
+                "    for fd in (0, 1, 2):\n"
+                "        try:\n"
+                "            os.close(fd)\n"
+                "        except OSError:\n"
+                "            pass\n"
+                "    time.sleep(30)\n"
+                "    os._exit(0)\n"
+                f"state = pathlib.Path({str(child_state)!r})\n"
+                "while not state.exists():\n"
+                "    time.sleep(0.01)\n"
+                "os._exit(0)\n",
+                encoding="utf-8",
+            )
+            real_killpg = runner.os.killpg
+            failed_once = False
+
+            def fail_first_group_kill(pid: int, sig: int) -> None:
+                nonlocal failed_once
+                if sig == runner.signal.SIGKILL and not failed_once:
+                    failed_once = True
+                    raise PermissionError("simulated containment failure")
+                real_killpg(pid, sig)
+
+            with patch.object(runner.os, "killpg", side_effect=fail_first_group_kill):
+                capture = runner.run_bounded(
+                    [sys.executable, str(script)],
+                    cwd=root,
+                    timeout_seconds=3,
+                    stdin_data=b"",
+                )
+
+            self.assertTrue(failed_once)
+            self.assertIn(
+                "process_group_survived_provider_exit",
+                capture["containment_events"],
+            )
+            self.assertIn(
+                "process_group_kill_failed:PermissionError",
+                str(capture["capture_error"]),
+            )
+            child_pid = int(child_state.read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child_pid, 0)
 
     def test_run_bounded_reaps_descendant_that_detaches_from_provider_group(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1894,8 +2020,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             capture = runner.run_bounded(
                 [sys.executable, str(script)], cwd=root, timeout_seconds=3, stdin_data=b""
             )
-            self.assertIn("adopted_descendant_survived_provider_exit", str(capture["capture_error"]))
-            self.assertNotIn("process_group_cleanup_failed", str(capture["capture_error"]))
+            self.assertIsNone(capture["capture_error"])
+            self.assertIn(
+                "adopted_descendant_survived_provider_exit",
+                capture["containment_events"],
+            )
             child_pid = int(child_state.read_text())
             with self.assertRaises(ProcessLookupError):
                 os.kill(child_pid, 0)
@@ -3044,6 +3173,41 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 completed['usage'][field] = value
                 with self.assertRaisesRegex(runner.RunnerError, 'Codex usage is invalid'):
                     runner.normalize(request(), events)
+
+    def test_normalize_subtracts_cached_input_tokens_before_budget_check(self) -> None:
+        value = request()
+        events = [json.loads(line) for line in stream(value).splitlines()]
+        completed = next(event for event in events if event.get("type") == "turn.completed")
+        completed["usage"]["input_tokens"] = 100_000
+        completed["usage"]["cached_input_tokens"] = 40_000
+
+        input_tokens, output_tokens, _calls, _answer = runner.normalize(value, events)
+
+        self.assertEqual(input_tokens, 60_000)
+        self.assertEqual(output_tokens, 30)
+
+    def test_normalize_rejects_invalid_cached_input_tokens(self) -> None:
+        for cached_input_tokens in (None, True, -1, 121):
+            with self.subTest(cached_input_tokens=cached_input_tokens):
+                value = request()
+                events = [json.loads(line) for line in stream(value).splitlines()]
+                completed = next(
+                    event for event in events if event.get("type") == "turn.completed"
+                )
+                completed["usage"]["cached_input_tokens"] = cached_input_tokens
+
+                with self.assertRaisesRegex(runner.RunnerError, "Codex usage is invalid"):
+                    runner.normalize(value, events)
+
+    def test_normalize_r5_like_usage_still_exceeds_frozen_input_budget(self) -> None:
+        value = request()
+        events = [json.loads(line) for line in stream(value).splitlines()]
+        completed = next(event for event in events if event.get("type") == "turn.completed")
+        completed["usage"]["input_tokens"] = 422_147
+        completed["usage"]["cached_input_tokens"] = 357_376
+
+        with self.assertRaisesRegex(runner.RunnerError, "Codex token budget exceeded"):
+            runner.normalize(value, events)
 
     def test_normalize_requires_repobrief_call_for_treatment(self) -> None:
         value = request(condition="treatment")
