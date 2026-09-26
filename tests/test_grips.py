@@ -786,6 +786,17 @@ class FakeGh:
                 payload = state.get("review") if isinstance(state, dict) else None
                 return {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""}
         if argv[:1] == ["api"]:
+            jq = (
+                argv[argv.index("--jq") + 1]
+                if "--jq" in argv and argv.index("--jq") + 1 < len(argv)
+                else None
+            )
+            if jq == ".delete_branch_on_merge":
+                return {
+                    "returncode": 0,
+                    "stdout": json.dumps(self.repo_settings.get("delete_branch_on_merge")),
+                    "stderr": "",
+                }
             if self.repo_settings_returncode != 0:
                 return {"returncode": self.repo_settings_returncode, "stdout": "", "stderr": "repo policy failed"}
             if self.repo_settings_invalid_json:
@@ -795,6 +806,9 @@ class FakeGh:
                 if self.repo_settings_sequence
                 else self.repo_settings
             )
+            if isinstance(jq, str) and jq.startswith("{") and jq.endswith("}"):
+                keys = [key for key in jq[1:-1].split(",") if key]
+                settings = {key: settings[key] for key in keys if key in settings}
             return {"returncode": 0, "stdout": json.dumps(settings), "stderr": ""}
         if argv[:2] == ["pr", "create"]:
             return {"returncode": 0, "stdout": str(self.view["url"]), "stderr": ""}
@@ -13949,16 +13963,42 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual("passed", result["receipt"]["status"])
         execution = result["output"]["executions"][0]
         self.assertTrue(execution["execution_invoked"])
-        self.assertEqual([], execution["configured_automatic_platform_effects"])
-        self.assertEqual([], execution["automatic_platform_effects"])
+        configured_effects = execution["configured_automatic_platform_effects"]
+        self.assertEqual(
+            ["branch-deletion"],
+            [effect["effect"] for effect in configured_effects],
+        )
+        self.assertEqual(configured_effects, execution["automatic_platform_effects"])
         self.assertEqual("not_evaluated", execution["effect_scope_decision"]["decision"])
+        self.assertTrue(
+            execution["automatic_platform_effect_observation"]["observed"]
+        )
+        self.assertTrue(
+            execution["automatic_platform_effect_observation"]["delete_branch_on_merge"]
+        )
+        self.assertEqual(
+            ["repository_configured_automatic_effects_are_observational"],
+            execution["effect_scope_decision"]["reasons"],
+        )
+        self.assertEqual(
+            [],
+            execution["effect_scope_decision"]["required_effect_authorizations"],
+        )
         self.assertNotIn("delete_branch_on_merge", execution["merge_policy"]["settings"])
         policy_call = next(
             call
             for call in gh.calls
             if call[:2] == ("api", "repos/heimgewebe/grabowski")
+            and call[-1] != ".delete_branch_on_merge"
         )
         self.assertNotIn("delete_branch_on_merge", " ".join(policy_call))
+        self.assertTrue(
+            any(
+                call[:2] == ("api", "repos/heimgewebe/grabowski")
+                and call[-1] == ".delete_branch_on_merge"
+                for call in gh.calls
+            )
+        )
         self.assertTrue(any(call[:2] == ("pr", "merge") for call in gh.calls))
 
 
@@ -14027,6 +14067,68 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             execution["merge_lease_guard"]["status"],
         )
         self.assertFalse(any(call[:2] == ("pr", "merge") for call in gh.calls))
+
+
+    def test_captain_run_does_not_block_on_auto_delete_only_repository_drift(self) -> None:
+        action = captain_action(
+            scope={
+                "allowed_effects": ["merge pull request 96 into main"],
+                "forbidden_effects": ["force-push", "branch-deletion"],
+                "boundaries": "single pull request in heimgewebe/grabowski",
+                "max_targets": 1,
+            }
+        )
+        policy_before = {
+            "allow_merge_commit": True,
+            "allow_squash_merge": True,
+            "allow_rebase_merge": True,
+            "delete_branch_on_merge": False,
+        }
+        policy_after = {
+            **policy_before,
+            "delete_branch_on_merge": True,
+        }
+        parameters = captain_parameters(
+            [action],
+            trusted_owner_mode=True,
+            autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+            allow_execution=True,
+        )
+        parameters.pop("human_authorization")
+        parameters.pop("execution_authority")
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            },
+            repo_settings=policy_after,
+            repo_settings_sequence=[policy_before, policy_after],
+        )
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        execution = result["output"]["executions"][0]
+        self.assertTrue(execution["execution_invoked"])
+        self.assertEqual("completed", execution["merge_lease_guard"]["status"])
+        self.assertTrue(
+            execution["automatic_platform_effect_observation"]["delete_branch_on_merge"]
+        )
+        self.assertTrue(any(call[:2] == ("pr", "merge") for call in gh.calls))
 
 
     def test_captain_run_blocks_when_repository_merge_policy_is_unusable(self) -> None:

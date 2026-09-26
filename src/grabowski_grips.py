@@ -14355,6 +14355,7 @@ CAPTAIN_PR_MERGE_METHOD_PREFERENCE = (
     ("squash", "allow_squash_merge", "--squash"),
     ("rebase", "allow_rebase_merge", "--rebase"),
 )
+CAPTAIN_PR_MERGE_AUTOMATIC_EFFECT_BRANCH_DELETION = "branch-deletion"
 CAPTAIN_REPOSITORY_MERGE_POLICY_BOOLEAN_FIELDS = tuple(
     field for _method, field, _flag in CAPTAIN_PR_MERGE_METHOD_PREFERENCE
 )
@@ -14610,6 +14611,81 @@ def _captain_repository_merge_policy(
 
 
 
+def _captain_pr_merge_configured_automatic_effects(
+    repo_path: Path,
+    github_runner: GithubRunner,
+    *,
+    repo_slug: str,
+    action: dict[str, Any],
+    pre_view: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    args = [
+        "api",
+        f"repos/{repo_slug}",
+        "--jq",
+        ".delete_branch_on_merge",
+    ]
+    try:
+        result = github_runner(repo_path, args)
+    except Exception as exc:  # pragma: no cover - defensive observation boundary
+        return [], {
+            "command": ["gh", *args],
+            "observed": False,
+            "error": f"github automatic-effect observation raised: {type(exc).__name__}",
+        }
+    info = {"command": ["gh", *args], **_command_result_info(result)}
+    if info["returncode"] != 0:
+        info["observed"] = False
+        return [], info
+    try:
+        raw = _json_stdout(result)
+    except GripActionError as exc:
+        info["observed"] = False
+        info["error"] = str(exc)
+        return [], info
+    value = raw.get("delete_branch_on_merge") if isinstance(raw, dict) else raw
+    if not isinstance(value, bool):
+        info["observed"] = False
+        info["error"] = "delete_branch_on_merge observation is not boolean"
+        return [], info
+    info["observed"] = True
+    info["delete_branch_on_merge"] = value
+    if not value:
+        return [], info
+    head_repository_value = pre_view.get("headRepository")
+    head_repository = (
+        head_repository_value.get("nameWithOwner")
+        if isinstance(head_repository_value, dict)
+        else None
+    )
+    head_branch = pre_view.get("headRefName")
+    head_oid = _normalize_40_sha(pre_view.get("headRefOid"))
+    is_cross_repository = pre_view.get("isCrossRepository")
+    return [
+        {
+            "effect": CAPTAIN_PR_MERGE_AUTOMATIC_EFFECT_BRANCH_DELETION,
+            "automatic": True,
+            "source": "github_repository_setting",
+            "setting": "delete_branch_on_merge",
+            "configured": True,
+            "target": {
+                "base_repository": action["target"].get("repo"),
+                "pull_request": action["target"].get("pr"),
+                "repository": head_repository,
+                "ref": (
+                    f"refs/heads/{head_branch}"
+                    if isinstance(head_branch, str) and head_branch
+                    else None
+                ),
+                "head_branch": head_branch,
+                "head_oid": head_oid,
+                "cross_repository": is_cross_repository,
+            },
+            "application": "after successful merge when GitHub considers the head branch eligible",
+        }
+    ], info
+
+
 def _run_captain_pr_merge(
     repo_path: Path,
     action: dict[str, Any],
@@ -14693,6 +14769,28 @@ def _run_captain_pr_merge(
         detail = "; ".join(merge_policy_errors) if merge_policy_errors else "repository_merge_policy_unavailable"
         execution_result["verification_error"] = f"repository merge policy unavailable; merge not attempted: {detail}"
         return execution_result
+    configured_effects, effect_observation = (
+        _captain_pr_merge_configured_automatic_effects(
+            repo_path,
+            github_runner,
+            repo_slug=repo_slug,
+            action=action,
+            pre_view=pre_view,
+        )
+    )
+    execution_result["automatic_platform_effect_observation"] = effect_observation
+    execution_result["configured_automatic_platform_effects"] = configured_effects
+    execution_result["automatic_platform_effects"] = configured_effects
+    effect_scope_decision = _captain_effect_scope_not_evaluated()
+    effect_scope_decision["reasons"] = [
+        (
+            "repository_configured_automatic_effects_are_observational"
+            if effect_observation.get("observed") is True
+            else "repository_configured_automatic_effect_observation_unavailable"
+        )
+    ]
+    effect_scope_decision["configured_automatic_effects"] = configured_effects
+    execution_result["effect_scope_decision"] = effect_scope_decision
     (
         base_update_guard,
         base_update_guard_evidence,
