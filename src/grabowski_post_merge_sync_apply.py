@@ -975,6 +975,7 @@ def apply(
                         "physical checkout identity changed during effect"
                     )
 
+                remote_final = read_remote_head("final", True)
                 final = _snapshot(
                     repo,
                     effect_runner,
@@ -983,7 +984,6 @@ def apply(
                     sha_length=sha_length,
                     identity_override=identity,
                 )
-                remote_final = read_remote_head("final", True)
                 final_tree = _stdout(_run(repo, effect_runner, ["write-tree"])).lower()
                 if (
                     not _final_exact(

@@ -1000,6 +1000,52 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             self.assertEqual(target, git_stdout(retired, "rev-parse", "HEAD"))
             self.assertEqual(target, git_stdout(repo, "rev-parse", "HEAD"))
 
+    def test_in_place_branch_drift_during_final_remote_read_cannot_report_success(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            changed = False
+            ordinary_remote_reader = self.remote_reader(remote)
+
+            def drifting_remote_reader(stage: str, effect_started: bool) -> str:
+                nonlocal changed
+                if stage == "final" and not changed:
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repo),
+                            "update-ref",
+                            "refs/heads/main",
+                            base,
+                            target,
+                        ],
+                        check=True,
+                    )
+                    changed = True
+                return ordinary_remote_reader(stage, effect_started)
+
+            leases = LeaseHarness()
+            with patched_leases(leases):
+                result = self.apply(
+                    repo,
+                    remote,
+                    base,
+                    target,
+                    remote_reader=drifting_remote_reader,
+                )
+
+            self.assertTrue(changed)
+            self.assertNotEqual("passed", result["receipt_status"])
+            self.assertEqual("outcome_unknown", result["state"])
+            self.assertTrue(result["readback_required"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertFalse(result["post_state_verified"])
+            self.assertEqual(base, git_stdout(repo, "rev-parse", "refs/heads/main"))
+            self.assertEqual(1, leases.acquire_calls)
+            self.assertEqual(1, leases.release_calls)
+
     def test_path_replacement_during_final_remote_read_cannot_report_success(
         self,
     ) -> None:
