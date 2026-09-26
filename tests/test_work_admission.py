@@ -850,6 +850,120 @@ class WorkAdmissionTests(unittest.TestCase):
         self.assertEqual(result["decision"], "allow")
         self.assertNotIn("bounded-inventory-exceeded", result["blocker_codes"])
 
+    def test_scoped_broad_repository_lease_can_target_canonical_checkout(self) -> None:
+        ordinary_write_scope = self._scoped_repository_write(
+            target_path=str(self.repo),
+            branch="main",
+        )
+        unrelated = self._linked(
+            state="managed_active_attention",
+            dirty=True,
+            owner="foreign-owner",
+            foreign_lease=True,
+        )
+        ordinary_write = admission.assess_repository_admission(
+            repo=str(self.repo),
+            owner_id="owner-a",
+            operation="broad_repository_lease",
+            requested_scope=ordinary_write_scope,
+            inventory_loader=lambda _repo: self._complete_inventory(
+                [self._main(), unrelated]
+            ),
+            reconciliation_loader=lambda _repo: self._reconciliation(),
+        )
+        self.assertEqual("repository", ordinary_write["scope_mode"])
+        self.assertEqual("blocked", ordinary_write["decision"])
+
+        scope = {
+            **ordinary_write_scope,
+            "effects": ["worktree-admin"],
+            "paths": [str(self.repo)],
+            "shared_gates": ["repository-worktree-admin"],
+        }
+        allowed = admission.assess_repository_admission(
+            repo=str(self.repo),
+            owner_id="owner-a",
+            operation="broad_repository_lease",
+            requested_scope=scope,
+            inventory_loader=lambda _repo: self._complete_inventory(
+                [self._main(), unrelated]
+            ),
+            reconciliation_loader=lambda _repo: self._reconciliation(),
+        )
+        self.assertEqual("allow", allowed["decision"])
+        self.assertEqual("exact_checkout", allowed["scope_mode"])
+        self.assertEqual(
+            {"target_path": str(self.repo), "branch": "main"},
+            allowed["scope_identity"],
+        )
+
+        linked_admin_scope = {
+            **scope,
+            "worktree": unrelated["path"],
+            "branch": unrelated["branch"],
+        }
+        linked_admin = admission.assess_repository_admission(
+            repo=str(self.repo),
+            owner_id="owner-a",
+            operation="broad_repository_lease",
+            requested_scope=linked_admin_scope,
+            inventory_loader=lambda _repo: self._complete_inventory(
+                [self._main(), unrelated]
+            ),
+            reconciliation_loader=lambda _repo: self._reconciliation(),
+        )
+        self.assertEqual("repository", linked_admin["scope_mode"])
+        self.assertEqual("blocked", linked_admin["decision"])
+
+        dirty_main = admission.assess_repository_admission(
+            repo=str(self.repo),
+            owner_id="owner-a",
+            operation="broad_repository_lease",
+            requested_scope=scope,
+            inventory_loader=lambda _repo: self._complete_inventory(
+                [self._main(dirty=True), unrelated]
+            ),
+            reconciliation_loader=lambda _repo: self._reconciliation(),
+        )
+        self.assertEqual("blocked", dirty_main["decision"])
+        self.assertIn("dirty-worktree", dirty_main["blocker_codes"])
+
+        coordinated_main = self._main()
+        coordinated_main["coordination"]["resource_leases"] = [
+            {
+                "blocking": True,
+                "resource_key": f"path:{self.repo}",
+                "owner_id": "foreign-owner",
+            }
+        ]
+        foreign_main = admission.assess_repository_admission(
+            repo=str(self.repo),
+            owner_id="owner-a",
+            operation="broad_repository_lease",
+            requested_scope=scope,
+            inventory_loader=lambda _repo: self._complete_inventory(
+                [coordinated_main, unrelated]
+            ),
+            reconciliation_loader=lambda _repo: self._reconciliation(),
+        )
+        self.assertEqual("blocked", foreign_main["decision"])
+        self.assertIn("foreign-live-coordination", foreign_main["blocker_codes"])
+
+        non_broad = admission.assess_repository_admission(
+            repo=str(self.repo),
+            owner_id="owner-a",
+            operation="worktree_create",
+            requested_scope=scope,
+            target_path=str(self.repo),
+            branch="main",
+            inventory_loader=lambda _repo: self._complete_inventory(
+                [self._main(dirty=True), unrelated]
+            ),
+            reconciliation_loader=lambda _repo: self._reconciliation(),
+        )
+        self.assertEqual("repository", non_broad["scope_mode"])
+        self.assertEqual("blocked", non_broad["decision"])
+
     def test_exact_scope_above_bound_rejects_unobservable_partial_or_unbound_inventory(
         self,
     ) -> None:

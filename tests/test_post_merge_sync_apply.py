@@ -74,6 +74,7 @@ class LeaseHarness:
         self.live: dict[str, dict[str, object]] = {}
         self.acquire_calls = 0
         self.work_admission_modes: list[str] = []
+        self.metadatas: list[dict[str, object] | None] = []
         self.release_calls = 0
         self.release_expected_leases: list[dict[str, object]] | None = None
 
@@ -84,10 +85,12 @@ class LeaseHarness:
         *,
         purpose: str,
         ttl_seconds: int,
+        metadata: dict[str, object] | None = None,
         _work_admission_mode: str = "normal",
     ) -> dict[str, object]:
         self.acquire_calls += 1
         self.work_admission_modes.append(_work_admission_mode)
+        self.metadatas.append(metadata)
         if self.acquire_effect is not None:
             self.acquire_effect()
         leases = []
@@ -144,10 +147,12 @@ class ConcurrentLeaseHarness(LeaseHarness):
         *,
         purpose: str,
         ttl_seconds: int,
+        metadata: dict[str, object] | None = None,
         _work_admission_mode: str = "normal",
     ) -> dict[str, object]:
         self.acquire_calls += 1
         self.work_admission_modes.append(_work_admission_mode)
+        self.metadatas.append(metadata)
         self.owner_ids.append(owner_id)
         if self.live:
             live_owners = {
@@ -197,10 +202,12 @@ class ExactConflictLeaseHarness(LeaseHarness):
         *,
         purpose: str,
         ttl_seconds: int,
+        metadata: dict[str, object] | None = None,
         _work_admission_mode: str = "normal",
     ) -> dict[str, object]:
         self.acquire_calls += 1
         self.work_admission_modes.append(_work_admission_mode)
+        self.metadatas.append(metadata)
         for key in resource_keys:
             existing = self.live.get(key)
             if existing is not None and existing["owner_id"] != owner_id:
@@ -1703,6 +1710,7 @@ class PostMergeSyncApplyTests(unittest.TestCase):
                 *,
                 purpose: str,
                 ttl_seconds: int,
+                metadata: dict[str, object] | None = None,
                 _work_admission_mode: str = "normal",
             ) -> dict[str, object]:
                 acquired = leases.acquire(
@@ -1710,6 +1718,7 @@ class PostMergeSyncApplyTests(unittest.TestCase):
                     resource_keys,
                     purpose=purpose,
                     ttl_seconds=ttl_seconds,
+                    metadata=metadata,
                     _work_admission_mode=_work_admission_mode,
                 )
                 snapshots = list(acquired["leases"])
@@ -2377,6 +2386,35 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             self.assertEqual("", git_stdout(repo, "status", "--porcelain"))
 
 
+    def test_sync_lease_binds_exact_canonical_checkout_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            leases = LeaseHarness()
+
+            with patched_leases(leases):
+                result = self.apply(repo, remote, base, target)
+
+            self.assertEqual("synced", result["state"])
+            self.assertEqual(["convergence"], leases.work_admission_modes)
+            self.assertEqual(1, len(leases.metadatas))
+            metadata = leases.metadatas[0]
+            self.assertIsInstance(metadata, dict)
+            scope = metadata["scope_manifest"]
+            self.assertEqual(str(repo), scope["repository"])
+            self.assertEqual(str(repo), scope["worktree"])
+            self.assertEqual("main", scope["branch"])
+            self.assertEqual(base, scope["base_head"])
+            self.assertEqual(target, scope["head"])
+            self.assertEqual(["worktree-admin"], scope["effects"])
+            self.assertEqual([str(repo)], scope["paths"])
+            self.assertEqual(
+                ["repository-worktree-admin"],
+                scope["shared_gates"],
+            )
+            self.assertIn(f"repo:{repo}", result["resource_keys"])
+            self.assertIn(f"path:{repo}", result["resource_keys"])
+            self.assertIn(f"path:{repo / '.git'}", result["resource_keys"])
+
     def test_foreign_repository_guard_conflict_blocks_before_git_effect(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo, remote, base, target = self.fixture(Path(tmp))
@@ -2388,6 +2426,7 @@ class PostMergeSyncApplyTests(unittest.TestCase):
                 *,
                 purpose: str,
                 ttl_seconds: int,
+                metadata: dict[str, object] | None = None,
                 _work_admission_mode: str = "normal",
             ) -> dict[str, object]:
                 self.assertEqual("convergence", _work_admission_mode)
