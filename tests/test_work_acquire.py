@@ -1838,6 +1838,127 @@ class WorkAcquireTests(unittest.TestCase):
                 head="d" * 40,
             )
 
+    def test_successor_handoff_rechecks_successor_checkout_after_publication(self) -> None:
+        predecessor_id = "a" * 32
+        successor_id = "b" * 32
+        predecessor_inputs = {
+            "lane_id": predecessor_id,
+            "lease_owner_id": f"lane:{predecessor_id}",
+            "repo": str(self.repo),
+            "target_path": str(self.target),
+            "branch": "topic-old",
+        }
+        successor_inputs = {
+            "lane_id": successor_id,
+            "lease_owner_id": f"lane:{successor_id}",
+            "repo": str(self.repo),
+            "target_path": str(self.root / "successor"),
+            "branch": "topic-new",
+            "base_head": "d" * 40,
+            "source": {"kind": "work_lane", "id": predecessor_id},
+            "resource_keys": ["path:/successor"],
+        }
+        predecessor = {
+            "lane_id": predecessor_id,
+            "inputs": predecessor_inputs,
+            "inputs_sha256": work_acquire._sha(predecessor_inputs),
+            "created_at_unix": 100,
+        }
+        successor = {
+            "lane_id": successor_id,
+            "inputs": successor_inputs,
+            "inputs_sha256": work_acquire._sha(successor_inputs),
+            "receipt_sha256": "e" * 64,
+            "created_at_unix": 101,
+            "state": "ready",
+        }
+        assessment = closeout.assess_successor_handoff(
+            lane_id=predecessor_id,
+            successor_lane_id=successor_id,
+            predecessor_head_sha="c" * 40,
+            successor_head_sha="d" * 40,
+            successor_receipt_sha256="e" * 64,
+            pr_number=1329,
+            observed_at_unix=200,
+        )
+        lease = {
+            "resource_key": "path:/successor",
+            "owner_id": f"lane:{successor_id}",
+            "purpose": "verify",
+            "acquired_at_unix": 50,
+            "updated_at_unix": 60,
+            "expires_at_unix": 200,
+            "metadata_sha256": "f" * 64,
+        }
+        worktrees = [
+            (self.repo, self.repo / ".git", {"branch": "topic-old"}),
+            (self.repo, self.repo / ".git", {"branch": "topic-new"}),
+            (self.repo, self.repo / ".git", {"branch": "topic-new"}),
+        ]
+        expected = Mock(
+            side_effect=[
+                None,
+                None,
+                RuntimeError("successor checkout head drifted after publication"),
+            ]
+        )
+        with (
+            patch.object(
+                work_acquire,
+                "_terminal_lane_resource_observation",
+                return_value=(
+                    f"lane:{successor_id}",
+                    ["path:/successor"],
+                    [lease],
+                ),
+            ),
+            patch.object(work_acquire.time, "time", return_value=100),
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                side_effect=worktrees,
+            ) as worktree,
+            patch.object(work_acquire.checkouts, "_require_clean_linked"),
+            patch.object(
+                work_acquire.checkouts,
+                "_require_expected",
+                expected,
+            ),
+            patch.object(
+                work_acquire.checkouts,
+                "_linked_checkout_coordination",
+                return_value={},
+            ),
+            patch.object(work_acquire.checkouts, "_require_no_blockers"),
+            patch.object(
+                work_acquire,
+                "_git_runner",
+                return_value={"returncode": 0},
+            ),
+            patch.object(
+                work_acquire,
+                "_github_open_pr_exact_head",
+                return_value={
+                    "repository": "heimgewebe/grabowski",
+                    "pr_number": 1329,
+                    "state": "OPEN",
+                    "head_ref_name": "topic-old",
+                    "head_sha": "d" * 40,
+                },
+            ) as publication,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "successor checkout head drifted after publication",
+            ),
+        ):
+            work_acquire._verify_successor_handoff_locked(
+                predecessor,
+                successor,
+                assessment,
+            )
+        self.assertEqual(3, worktree.call_count)
+        publication.assert_called_once()
+
     def test_terminal_assessment_replay_hash_preserves_legacy_equivalence(self) -> None:
         assessment = self.terminal_assessment("a" * 32, 200)
         legacy = dict(assessment)

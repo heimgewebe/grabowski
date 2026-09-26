@@ -1568,6 +1568,32 @@ def _verify_successor_handoff_locked(
         branch=str(predecessor_inputs["branch"]),
         head=str(binding["successor_head_sha"]),
     )
+
+    # The GitHub read above crosses a network boundary. Re-orient the successor
+    # afterwards so local checkout drift cannot hide behind an otherwise-stable
+    # lease snapshot while predecessor authority is being released.
+    (
+        final_successor_top,
+        final_successor_common,
+        final_successor_checkout,
+    ) = checkouts._worktree_for_path(repo, successor_path)
+    checkouts._require_clean_linked(final_successor_checkout)
+    checkouts._require_expected(
+        final_successor_checkout,
+        str(binding["successor_head_sha"]),
+        str(successor_inputs["branch"]),
+    )
+    final_successor_coordination = checkouts._linked_checkout_coordination(
+        successor_path,
+        final_successor_top,
+        final_successor_common,
+        branch=final_successor_checkout.get("branch"),
+        include_processes=True,
+        include_tasks=True,
+        include_resources=True,
+        ignored_lease_owner_ids=[successor_owner],
+    )
+    checkouts._require_no_blockers(final_successor_coordination)
     (
         _final_owner,
         _final_registered,
