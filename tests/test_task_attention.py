@@ -2751,6 +2751,65 @@ class TaskAttentionTests(unittest.TestCase):
             {item["task_id"] for item in bounded_page["records"]},
         )
 
+    def test_bounded_current_retry_support_count_is_unique_across_raw_batches(
+        self,
+    ) -> None:
+        visible = self._failed_task()
+        source, middle = self._verified_retry_pair(successor_state="failed")
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 125},
+            ),
+        ):
+            resumed = tasks.reconcile_tasks_resume(
+                task_id=str(middle["task_id"]),
+                max_resumes=1,
+                reason="second verified retry in chain",
+            )
+        tail_id = str(resumed["resumed"][0]["task_id"])
+
+        with patch.object(attention, "MAX_PAGE_LIMIT", 1):
+            global_page = attention.reconcile_attention(
+                {"limit": 1, "view": "current"}
+            )
+            bounded_page = attention.reconcile_attention(
+                {"limit": 1, "view": "current"},
+                _bounded_current_projection=True,
+            )
+
+        self.assertEqual(
+            [visible["task_id"]],
+            [item["task_id"] for item in bounded_page["records"]],
+        )
+        self.assertEqual(
+            [item["task_id"] for item in global_page["records"]],
+            [item["task_id"] for item in bounded_page["records"]],
+        )
+        self.assertEqual(
+            global_page["pagination"],
+            bounded_page["pagination"],
+        )
+        self.assertEqual(3, bounded_page["pagination"]["scanned_raw"])
+        self.assertEqual(1, global_page["retry_successor_record_count"])
+        self.assertEqual(
+            global_page["retry_successor_record_count"],
+            bounded_page["retry_successor_record_count"],
+        )
+        self.assertNotIn(
+            source["task_id"],
+            {item["task_id"] for item in bounded_page["records"]},
+        )
+        self.assertNotIn(
+            middle["task_id"],
+            {item["task_id"] for item in bounded_page["records"]},
+        )
+        self.assertNotEqual(tail_id, visible["task_id"])
+
     def test_bounded_current_reconciliation_budget_exhaustion_fails_visible(
         self,
     ) -> None:

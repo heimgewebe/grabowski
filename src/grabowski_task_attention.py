@@ -3384,10 +3384,14 @@ def _bounded_current_retry_convergence(
         frontier = next_frontier
         depth += 1
 
-    return terminal_convergence.converge_attention_records(
+    convergence = terminal_convergence.converge_attention_records(
         [*attention_by_task.values(), *support_by_task.values()],
         attention_task_ids=set(attention_by_task),
     )
+    return {
+        **convergence,
+        "_support_task_ids": tuple(sorted(support_by_task)),
+    }
 
 
 def reconcile_attention(
@@ -3474,6 +3478,7 @@ def reconcile_attention(
     }
     converged_attention_count = 0
     retry_successor_record_count = 0
+    bounded_retry_successor_task_ids: set[str] = set()
     convergence_excluded_task_ids: set[str] = set()
     decision_excluded_task_ids: set[str] = set()
     current_attention_count: int | None = None
@@ -3673,8 +3678,9 @@ def reconcile_attention(
                                 if item.get("convergence_classification") == name
                             )
                         converged_attention_count += len(local_historical)
-                        retry_successor_record_count += int(
-                            local_convergence["support_record_count"]
+                        bounded_retry_successor_task_ids.update(
+                            str(task_id)
+                            for task_id in local_convergence["_support_task_ids"]
                         )
 
                 for row in rows:
@@ -3737,6 +3743,10 @@ def reconcile_attention(
                     scan_created_at = int(last_raw["created_at_unix"])
                     scan_task_id = str(last_raw["task_id"])
 
+            if _bounded_current_projection:
+                retry_successor_record_count = len(
+                    bounded_retry_successor_task_ids
+                )
             if (
                 _bounded_current_projection
                 and convergence_status != "degraded"
