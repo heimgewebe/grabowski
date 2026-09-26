@@ -623,7 +623,7 @@ def _validated_mcp_proxy_python(
 def validate_toolchain(codex: str) -> str:
     bundled_rg = Path(codex).parent.parent / "codex-path" / "rg"
     _validate_support_executable(bundled_rg, require_read_only_mount=True)
-    for path in (Path("/usr/bin/cat"), Path("/usr/bin/sed"), Path("/usr/bin/bash")):
+    for path in (Path("/usr/bin/cat"), Path("/usr/bin/sed"), Path("/bin/bash")):
         _validate_support_executable(path, owner_uid=0)
     _validated_mcp_proxy_python()
     return f"{bundled_rg.parent}:/usr/bin:/bin"

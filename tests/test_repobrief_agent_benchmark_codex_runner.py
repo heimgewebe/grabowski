@@ -970,6 +970,27 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     owner_uid=os.geteuid(),
                 )
 
+    def test_validate_toolchain_binds_exact_bash_wrapper_path(self) -> None:
+        with (
+            patch.object(
+                runner,
+                "_validate_support_executable",
+                return_value="/validated",
+            ) as validate,
+            patch.object(
+                runner,
+                "_validated_mcp_proxy_python",
+                return_value="/usr/bin/python3",
+            ),
+        ):
+            self.assertEqual(
+                runner.validate_toolchain("/opt/codex/bin/codex"),
+                "/opt/codex/codex-path:/usr/bin:/bin",
+            )
+        validated_paths = [entry.args[0] for entry in validate.call_args_list]
+        self.assertIn(Path("/bin/bash"), validated_paths)
+        self.assertNotIn(Path("/usr/bin/bash"), validated_paths)
+
     def test_mcp_executable_rejects_special_permission_bits(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "mcp-python"
