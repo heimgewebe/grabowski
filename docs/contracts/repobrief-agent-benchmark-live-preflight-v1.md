@@ -159,6 +159,13 @@ Das Treatment muss mindestens einen normalisierten RepoBrief-Aufruf enthalten:
 Die Baseline darf keinen dieser Aufrufe enthalten. Ihre MCP-Konfiguration ist
 leer und `mcp__*` ist ausdrücklich untersagt.
 
+Der Codex-Treatmentprozess bindet den RepoBrief-MCP-Server zusätzlich explizit
+als `enabled=true` und `required=true`. `enabled_tools` enthält genau die vier
+oben genannten Benchmarkwerkzeuge. Kann der aktivierte Server nicht
+initialisiert werden, muss Codex den Start fail-closed abbrechen; ein
+Treatment darf nicht still ohne die gebundene RepoBrief-Werkzeugmenge
+fortfahren.
+
 ## Evidenz
 
 Der Bericht bindet:
@@ -186,6 +193,8 @@ Der Preflight endet ohne Retry bei:
 - fehlendem oder widersprüchlichem Modell-, Session- oder Usage-Beleg;
 - ungültigem Lenskit-Receipt;
 - fehlendem RepoBrief-Aufruf im Treatment;
+- nicht initialisierbarem verpflichtendem RepoBrief-MCP-Server oder abweichender
+  Treatment-Tool-Allowlist;
 - RepoBrief-Aufruf in der Baseline;
 - nicht frischem Snapshot;
 - Quellmutation;
