@@ -459,6 +459,7 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
                 reviews, "REVIEW_ROLE_RELEASE_ROOT", release_root
             ):
                 for provenance in (
+                    rotated(Path("~missing-user/grabowski_agent_role.py")),
                     rotated(outside),
                     rotated(historical_module),
                 ):

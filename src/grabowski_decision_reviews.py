@@ -137,7 +137,7 @@ def _historical_review_role_module_matches(
         or _SHA256_RE.fullmatch(expected_sha256) is None
     ):
         return False
-    path = Path(value).expanduser()
+    path = Path(value)
     if not path.is_absolute():
         return False
     try:
