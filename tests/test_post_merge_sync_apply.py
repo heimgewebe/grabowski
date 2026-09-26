@@ -1753,6 +1753,102 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             self.assertEqual(1, leases.acquire_calls)
             self.assertEqual(1, leases.release_calls)
 
+    def test_error_readback_remote_drift_rechecks_local_state(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            changed = False
+
+            def drifting_remote(stage: str, _effect_started: bool) -> str:
+                nonlocal changed
+                if stage == "final":
+                    return base
+                if stage == "error_readback" and not changed:
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repo),
+                            "update-ref",
+                            "refs/heads/main",
+                            base,
+                            target,
+                        ],
+                        check=True,
+                    )
+                    changed = True
+                    return base
+                return target
+
+            leases = LeaseHarness()
+            with patched_leases(leases):
+                result = self.apply(
+                    repo,
+                    remote,
+                    base,
+                    target,
+                    remote_reader=drifting_remote,
+                )
+
+            self.assertTrue(changed)
+            self.assertEqual("failed", result["receipt_status"])
+            self.assertEqual("outcome_unknown", result["state"])
+            self.assertFalse(result["local_post_state_verified"])
+            self.assertFalse(result["post_state_verified"])
+            self.assertTrue(result["readback_required"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertEqual(base, result["remote_readback"])
+            self.assertEqual(base, git_stdout(repo, "rev-parse", "refs/heads/main"))
+
+    def test_error_readback_unreadable_rechecks_local_state(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            changed = False
+
+            def unreadable_remote(stage: str, _effect_started: bool) -> str:
+                nonlocal changed
+                if stage == "final":
+                    raise RuntimeError("injected final remote read failure")
+                if stage == "error_readback" and not changed:
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repo),
+                            "update-ref",
+                            "refs/heads/main",
+                            base,
+                            target,
+                        ],
+                        check=True,
+                    )
+                    changed = True
+                    raise RuntimeError("injected recovery remote read failure")
+                return target
+
+            leases = LeaseHarness()
+            with patched_leases(leases):
+                result = self.apply(
+                    repo,
+                    remote,
+                    base,
+                    target,
+                    remote_reader=unreadable_remote,
+                )
+
+            self.assertTrue(changed)
+            self.assertEqual("failed", result["receipt_status"])
+            self.assertEqual("outcome_unknown", result["state"])
+            self.assertFalse(result["local_post_state_verified"])
+            self.assertFalse(result["post_state_verified"])
+            self.assertTrue(result["readback_required"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertEqual("RuntimeError", result["remote_readback_error_type"])
+            self.assertEqual(base, git_stdout(repo, "rev-parse", "refs/heads/main"))
+
     def test_final_remote_drift_blocks_even_when_local_effect_is_exact(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo, remote, base, target = self.fixture(Path(tmp))

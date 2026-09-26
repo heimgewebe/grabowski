@@ -1079,53 +1079,46 @@ def apply(
                         )
                     except Exception as remote_exc:
                         remote_readback_error_type = type(remote_exc).__name__
+                    try:
+                        readback = _snapshot(
+                            repo,
+                            effect_runner,
+                            target_branch=target_branch,
+                            remote=remote,
+                            sha_length=sha_length,
+                            identity_override=identity,
+                        )
+                    except Exception as read_exc:
+                        readback = {
+                            "readback_error_type": type(read_exc).__name__
+                        }
+                        local_final_exact = False
                     else:
-                        if remote_readback == expected_remote_head:
-                            try:
-                                readback = _snapshot(
-                                    repo,
-                                    effect_runner,
-                                    target_branch=target_branch,
-                                    remote=remote,
-                                    sha_length=sha_length,
-                                    identity_override=identity,
-                                )
-                            except Exception as read_exc:
-                                readback = {
-                                    "readback_error_type": type(read_exc).__name__
-                                }
-                                local_final_exact = False
-                            else:
-                                local_final_exact = _final_exact(
-                                    readback,
-                                    repo=repo,
-                                    target_branch=target_branch,
-                                    remote=remote,
-                                    expected_remote_head=expected_remote_head,
-                                )
-                                if local_final_exact:
-                                    try:
-                                        recovery_physical = (
-                                            physical_checkout.capture_physical_checkout_identity(
-                                                repo
-                                            )
-                                        )
-                                    except (
-                                        OSError,
-                                        ValueError,
-                                        physical_checkout.PhysicalCheckoutIdentityError,
-                                    ):
-                                        physical_identity_verified = False
-                                        recovery_physical_drift = True
-                                    else:
-                                        if (
-                                            recovery_physical.get(
-                                                "physical_identity_sha256"
-                                            )
-                                            != expected_physical_identity_sha256
-                                        ):
-                                            physical_identity_verified = False
-                                            recovery_physical_drift = True
+                        local_final_exact = _final_exact(
+                            readback,
+                            repo=repo,
+                            target_branch=target_branch,
+                            remote=remote,
+                            expected_remote_head=expected_remote_head,
+                        )
+                    try:
+                        recovery_physical = (
+                            physical_checkout.capture_physical_checkout_identity(repo)
+                        )
+                    except (
+                        OSError,
+                        ValueError,
+                        physical_checkout.PhysicalCheckoutIdentityError,
+                    ):
+                        physical_identity_verified = False
+                        recovery_physical_drift = True
+                    else:
+                        if (
+                            recovery_physical.get("physical_identity_sha256")
+                            != expected_physical_identity_sha256
+                        ):
+                            physical_identity_verified = False
+                            recovery_physical_drift = True
                 remote_final_exact = (
                     local_final_exact
                     and remote_readback == expected_remote_head
