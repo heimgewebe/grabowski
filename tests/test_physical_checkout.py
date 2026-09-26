@@ -102,6 +102,134 @@ class PhysicalCheckoutIdentityTests(unittest.TestCase):
             with self.assertRaises(physical_checkout.PhysicalCheckoutIdentityError):
                 physical_checkout.verify_physical_checkout_identity(identity_before)
 
+
+    def test_bound_checkout_effect_root_survives_lexical_path_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            retired = root / "retired"
+            self._init_committed_repo(repo)
+            original_head = self._run(
+                "git", "rev-parse", "HEAD", cwd=repo
+            ).stdout.decode("utf-8").strip()
+            expected = physical_checkout.capture_physical_checkout_identity(repo)
+
+            with physical_checkout.bind_physical_checkout(repo) as bound:
+                self.assertEqual(expected, bound.identity)
+                repo.rename(retired)
+                self._init_committed_repo(repo)
+                (repo / "README.md").write_text(
+                    "replacement\n", encoding="utf-8"
+                )
+                self._run("git", "add", "README.md", cwd=repo)
+                self._run(
+                    "git", "commit", "-q", "-m", "replacement", cwd=repo
+                )
+                replacement_head = self._run(
+                    "git", "rev-parse", "HEAD", cwd=repo
+                ).stdout.decode("utf-8").strip()
+                bound_head = self._run(
+                    "git", "-C", str(bound.effect_root), "rev-parse", "HEAD"
+                ).stdout.decode("utf-8").strip()
+
+                self.assertNotEqual(original_head, replacement_head)
+                self.assertEqual(original_head, bound_head)
+                self.assertEqual(
+                    expected["root"]["inode"],
+                    os.stat(bound.effect_root).st_ino,
+                )
+
+
+    def test_failed_bind_cleanup_attempts_root_close_after_git_close_error(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            self._init_committed_repo(repo)
+            expected = physical_checkout.capture_physical_checkout_identity(repo)
+            real_open_absolute = physical_checkout._open_absolute_directory
+            real_open_relative = physical_checkout._open_relative_directory
+            real_close = physical_checkout.os.close
+            opened: dict[str, int] = {}
+            close_attempts: list[int] = []
+
+            def recording_open_absolute(path: Path, *, label: str):
+                descriptor, metadata = real_open_absolute(path, label=label)
+                if label == "checkout root":
+                    opened["root"] = descriptor
+                return descriptor, metadata
+
+            def recording_open_relative(
+                parent_descriptor: int,
+                name: str,
+                *,
+                label: str,
+            ):
+                descriptor, metadata = real_open_relative(
+                    parent_descriptor,
+                    name,
+                    label=label,
+                )
+                if name == ".git":
+                    opened["git"] = descriptor
+                return descriptor, metadata
+
+            def fail_validation(*_args: object, **_kwargs: object) -> None:
+                close_attempts.clear()
+                raise physical_checkout.PhysicalCheckoutIdentityError(
+                    "injected bind validation failure"
+                )
+
+            def close_with_git_failure(descriptor: int) -> None:
+                close_attempts.append(descriptor)
+                if descriptor == opened.get("git"):
+                    raise OSError("injected git descriptor close failure")
+                real_close(descriptor)
+
+            try:
+                with (
+                    patch.object(
+                        physical_checkout,
+                        "capture_physical_checkout_identity",
+                        return_value=expected,
+                    ),
+                    patch.object(
+                        physical_checkout,
+                        "_open_absolute_directory",
+                        side_effect=recording_open_absolute,
+                    ),
+                    patch.object(
+                        physical_checkout,
+                        "_open_relative_directory",
+                        side_effect=recording_open_relative,
+                    ),
+                    patch.object(
+                        physical_checkout,
+                        "_assert_absolute_directory_node",
+                        side_effect=fail_validation,
+                    ),
+                    patch.object(
+                        physical_checkout.os,
+                        "close",
+                        side_effect=close_with_git_failure,
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        physical_checkout.PhysicalCheckoutIdentityError,
+                        "injected bind validation failure",
+                    ):
+                        physical_checkout.bind_physical_checkout(repo)
+
+                self.assertIn(opened["git"], close_attempts)
+                self.assertIn(opened["root"], close_attempts)
+            finally:
+                for descriptor in opened.values():
+                    try:
+                        os.fstat(descriptor)
+                    except OSError:
+                        continue
+                    real_close(descriptor)
+
     def test_stable_gitdir_pointer_detects_metadata_directory_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

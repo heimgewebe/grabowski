@@ -102,6 +102,7 @@ class PrReviewGateTargetMatrixTests(unittest.TestCase):
     def test_direct_cutover_bootstrap_mappings_apply_when_base_has_no_catalog(self) -> None:
         cases = {
             "heimgewebe/audio": ("safety",),
+            "heimgewebe/asr": ("validate (3.10)", "validate (3.12)"),
             "heimgewebe/chronik": ("repo-root", "templates"),
             "heimgewebe/hausKI": ("Detect changes",),
             "heimgewebe/hauski": ("Detect changes",),
