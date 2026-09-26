@@ -576,6 +576,28 @@ def apply(
                             replay_final_physical.get("physical_identity_sha256")
                         ),
                     )
+                rebound = _snapshot(
+                    repo,
+                    replay_runner,
+                    target_branch=target_branch,
+                    remote=remote,
+                    sha_length=sha_length,
+                    identity_override=identity,
+                )
+                if not _final_exact(
+                    rebound,
+                    repo=repo,
+                    target_branch=target_branch,
+                    remote=remote,
+                    expected_remote_head=expected_remote_head,
+                ):
+                    return _blocked(
+                        "replay_readback_drift_before_success",
+                        before=initial,
+                        rebound=rebound,
+                        remote_head_verified=remote_head_verified,
+                        physical_identity_verified=True,
+                    )
         except (
             OSError,
             ValueError,
@@ -1049,6 +1071,30 @@ def apply(
                     physical_identity_verified = False
                     raise PostMergeSyncPhysicalIdentityDrift(
                         "physical checkout identity changed after terminal readback"
+                    )
+                final = _snapshot(
+                    repo,
+                    effect_runner,
+                    target_branch=target_branch,
+                    remote=remote,
+                    sha_length=sha_length,
+                    identity_override=identity,
+                )
+                final_tree = _stdout(
+                    _run(repo, effect_runner, ["write-tree"])
+                ).lower()
+                if (
+                    not _final_exact(
+                        final,
+                        repo=repo,
+                        target_branch=target_branch,
+                        remote=remote,
+                        expected_remote_head=expected_remote_head,
+                    )
+                    or final_tree != target_tree
+                ):
+                    raise PostMergeSyncApplyError(
+                        "terminal local recheck does not match the exact final state"
                     )
                 output = {
                     "receipt_status": "passed",
