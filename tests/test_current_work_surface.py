@@ -40,6 +40,35 @@ def task_payload() -> dict:
 
 
 class CurrentWorkSurfaceTests(unittest.TestCase):
+    def test_attention_payload_uses_bounded_projection_only_for_current_work(
+        self,
+    ) -> None:
+        calls: list[tuple[dict, dict]] = []
+
+        def reconcile(parameters: dict, **kwargs: object) -> dict:
+            calls.append((parameters, kwargs))
+            return {"records": [], "pagination": {"has_more": False}}
+
+        fake_attention = SimpleNamespace(
+            MAX_PAGE_LIMIT=100,
+            reconcile_attention=reconcile,
+        )
+        with patch.object(surface, "_module", return_value=fake_attention):
+            surface._attention_payload("current")
+            surface._attention_payload("history")
+
+        self.assertEqual(
+            (
+                {"limit": 100, "view": "current"},
+                {"_bounded_current_projection": True},
+            ),
+            calls[0],
+        )
+        self.assertEqual(
+            ({"limit": 100, "view": "history"}, {}),
+            calls[1],
+        )
+
     def test_surface_collects_sources_without_creating_a_second_truth(self) -> None:
         operator = SimpleNamespace(_require_operator_capability=lambda capability: None)
         with patch.object(surface, "_operator", return_value=operator), patch.object(
