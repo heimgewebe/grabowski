@@ -1366,7 +1366,9 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             self.assertEqual("passed", result["receipt_status"])
             self.assertEqual("synced", result["state"])
             self.assertTrue(result["serialization_verified"])
-            self.assertTrue(result["remote_head_verified"])
+            self.assertFalse(result["remote_head_verified"])
+            self.assertTrue(result["remote_head_bound_observed"])
+            self.assertEqual("final", result["remote_head_observation_stage"])
             self.assertTrue(result["fast_forward_verified"])
             self.assertTrue(result["preimage_verified"])
             self.assertEqual(target, git_stdout(repo, "rev-parse", "HEAD"))
@@ -1525,7 +1527,12 @@ class PostMergeSyncApplyTests(unittest.TestCase):
 
             self.assertEqual("passed", second["receipt_status"])
             self.assertEqual("already_synced", second["state"])
-            self.assertTrue(second["remote_head_verified"])
+            self.assertFalse(second["remote_head_verified"])
+            self.assertTrue(second["remote_head_bound_observed"])
+            self.assertEqual(
+                "replay-final",
+                second["remote_head_observation_stage"],
+            )
             self.assertTrue(second["idempotent"])
             self.assertEqual(0, second_leases.acquire_calls)
 
@@ -1958,6 +1965,42 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             self.assertEqual("", git_stdout(repo, "status", "--porcelain"))
             self.assertEqual(target, result["readback"]["tracking_head"])
             self.assertEqual(1, leases.release_calls)
+
+    def test_error_readback_success_records_bound_remote_observation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            stages: list[str] = []
+            ordinary_remote_reader = self.remote_reader(remote)
+
+            def recovering_remote(stage: str, effect_started: bool) -> str:
+                stages.append(stage)
+                if stage == "final":
+                    raise RuntimeError("injected final remote read failure")
+                return ordinary_remote_reader(stage, effect_started)
+
+            leases = LeaseHarness()
+            with patched_leases(leases):
+                result = self.apply(
+                    repo,
+                    remote,
+                    base,
+                    target,
+                    remote_reader=recovering_remote,
+                )
+
+            self.assertEqual("passed", result["receipt_status"])
+            self.assertEqual("effect_confirmed_after_error", result["state"])
+            self.assertFalse(result["remote_head_verified"])
+            self.assertTrue(result["remote_head_bound_observed"])
+            self.assertEqual(
+                "error_readback",
+                result["remote_head_observation_stage"],
+            )
+            self.assertTrue(result["post_state_verified"])
+            self.assertIn("error_readback", stages)
+            self.assertFalse(result["retry_authorized"])
 
     def test_error_readback_rechecks_local_state_after_remote_read(
         self,

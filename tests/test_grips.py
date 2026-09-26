@@ -1766,6 +1766,15 @@ class GripFoundationTests(unittest.TestCase):
             ),
             (
                 {
+                    "state": "synced",
+                    "resource_keys": ["repo:/tmp/x"],
+                    "remote_head_verified": False,
+                    "remote_head_bound_observed": True,
+                },
+                "pass",
+            ),
+            (
+                {
                     "state": "remote_read_failed_after_lease",
                     "resource_keys": ["repo:/tmp/x"],
                     "remote_head_verified": False,
@@ -5597,7 +5606,6 @@ class GripFoundationTests(unittest.TestCase):
 
         self.assertEqual("blocked", result["receipt"]["status"])
         self.assertIn("profile observer cannot run mutating grips", result["output"]["error"])
-
     def test_mechanic_loop_runs_normal_actions_with_visible_scope_and_receipts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             result = grips.run_grip(

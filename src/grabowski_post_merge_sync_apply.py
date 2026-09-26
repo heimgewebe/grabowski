@@ -616,7 +616,9 @@ def apply(
             "state": "already_synced",
             "effect_started": False,
             "preimage_verified": True,
-            "remote_head_verified": remote_head_verified,
+            "remote_head_verified": False,
+            "remote_head_bound_observed": True,
+            "remote_head_observation_stage": "replay-final",
             "physical_identity_verified": physical_identity_verified,
             "idempotent": True,
             "retry_authorized": False,
@@ -1105,6 +1107,9 @@ def apply(
                     "serialization_verified": serialization_verified,
                     "fast_forward_verified": fast_forward_verified,
                     "physical_identity_verified": physical_identity_verified,
+                    "remote_head_verified": False,
+                    "remote_head_bound_observed": True,
+                    "remote_head_observation_stage": "final",
                     "retry_authorized": False,
                     "preimage_sha256": preimage_sha256,
                     "resource_keys": resource_keys,
@@ -1274,6 +1279,21 @@ def apply(
                 output = {
                     "receipt_status": receipt_status,
                     "state": state,
+                    "remote_head_verified": (
+                        False
+                        if state == "effect_confirmed_after_error"
+                        else remote_head_verified
+                    ),
+                    "remote_head_bound_observed": (
+                        True
+                        if state == "effect_confirmed_after_error"
+                        else remote_head_verified
+                    ),
+                    "remote_head_observation_stage": (
+                        "error_readback"
+                        if state == "effect_confirmed_after_error"
+                        else None
+                    ),
                     "effect_started": effect_started,
                     "worktree_effect_started": worktree_effect_started,
                     "branch_cas_started": branch_cas_started,
@@ -1419,6 +1439,7 @@ def apply(
             "resource_keys": resource_keys,
         }
     output.setdefault("remote_head_verified", remote_head_verified)
+    output.setdefault("remote_head_bound_observed", remote_head_verified)
     output.setdefault("preimage_verified", preimage_verified)
     output.setdefault("physical_identity_verified", physical_identity_verified)
     output.setdefault("lease_owner_id", owner_id)

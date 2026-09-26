@@ -6854,12 +6854,18 @@ def _run_post_merge_sync_apply(
         "effect_confirmed_remote_drift",
         "effect_confirmed_remote_unreadable",
     }
+    remote_bound_observed = output.get("remote_head_bound_observed")
+    if remote_bound_observed is None:
+        # Compatibility for older/mocked outputs. The acceptance gate proves
+        # one exact bound observation; it does not claim a later external
+        # remote remained unchanged after subsequent local verification.
+        remote_bound_observed = output.get("remote_head_verified")
     remote_status = (
         "fail"
         if remote_bad
         else (
             "pass"
-            if output.get("remote_head_verified") is True
+            if remote_bound_observed is True
             else "skip"
         )
     )
@@ -11996,7 +12002,6 @@ def _saga_captain_audit_binding(
     if provenance is not None:
         body["merge_provenance"] = provenance
     return {**body, "binding_sha256": sha256_json(body)}
-
 
 def _saga_live_readback(
     plan: dict[str, Any], github_runner: GithubRunner
