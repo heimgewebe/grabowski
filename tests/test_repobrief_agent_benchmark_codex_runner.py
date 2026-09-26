@@ -872,6 +872,25 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 with self.assertRaises(runner.RunnerError):
                     runner.command_kind(command)
 
+    def test_treatment_prompt_requires_successful_repoground_use(self) -> None:
+        baseline = runner.prompt_for(request())
+        treatment = runner.prompt_for(request(condition="treatment"))
+
+        requirement = (
+            "must successfully use at least one of these RepoGround MCP tools "
+            "before answering"
+        )
+        self.assertNotIn(requirement, baseline)
+        self.assertIn(requirement, treatment)
+        self.assertNotIn("may additionally use only these RepoGround MCP tools", treatment)
+        for name in (
+            "ask_context",
+            "grounding_verify",
+            "live_freshness",
+            "repobrief_resource_read",
+        ):
+            self.assertIn(name, treatment)
+
     def test_build_commands_isolates_baseline_and_treatment(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

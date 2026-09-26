@@ -1100,8 +1100,9 @@ def prompt_for(request: Mapping[str, Any]) -> str:
     extra = ""
     if request["condition"] == "treatment":
         extra = (
-            " You may additionally use only these RepoGround MCP tools: ask_context, "
-            "grounding_verify, live_freshness, repobrief_resource_read."
+            " For treatment, you must successfully use at least one of these RepoGround "
+            "MCP tools before answering: ask_context, grounding_verify, live_freshness, "
+            "repobrief_resource_read. Use only these RepoGround MCP tools."
         )
     return (
         str(request["prompt"])
