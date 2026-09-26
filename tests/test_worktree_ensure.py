@@ -663,6 +663,19 @@ class WorktreeEnsureTests(unittest.TestCase):
         )
         self.assertEqual(lifecycle["expected_head"], self.head)
         self.assertEqual(lifecycle["expected_branch"], "feat/worktree-case")
+        physical = lifecycle["physical_checkout"]
+        self.assertEqual(physical["root"]["path"], str(Path(parameters["target_path"])))
+        self.assertEqual(
+            physical["common_dir"]["path"],
+            str(self.repo / ".git"),
+        )
+        expected_git_dir = self._git(
+            Path(parameters["target_path"]),
+            "rev-parse",
+            "--absolute-git-dir",
+        ).stdout.strip()
+        self.assertEqual(physical["git_dir"]["path"], expected_git_dir)
+        self.assertRegex(physical["physical_identity_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(lifecycle["terminal_decision"], "retain")
         self.assertFalse(lifecycle["automatic_cleanup_authorized"])
         self.assertEqual(replayed["lifecycle"]["checkout_key"], lifecycle["checkout_key"])
