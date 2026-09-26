@@ -13,6 +13,7 @@ SCHEMA_VERSION = 1
 KIND = "grabowski.lane_closeout_assessment"
 SHA = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+LANE_ID = re.compile(r"[0-9a-f]{32}\Z")
 TERMINAL_CLOSEOUT_STATES = frozenset(
     {
         "pr_opened",
@@ -20,6 +21,7 @@ TERMINAL_CLOSEOUT_STATES = frozenset(
         "pr_merged",
         "deployed",
         "candidate_adopted",
+        "successor_handoff",
         "no_change_proven",
         "blocked_with_durable_followup",
     }
@@ -502,6 +504,98 @@ def classify(observation: LaneCloseoutObservation) -> dict[str, Any]:
         actions.append("refresh_git_task_process_and_pr_readback")
     actions.append("create_durable_followup")
     return _rescue_result(data, reasons, actions)
+
+
+def assess_successor_handoff(
+    *,
+    lane_id: str,
+    successor_lane_id: str,
+    predecessor_head_sha: str,
+    successor_head_sha: str,
+    successor_receipt_sha256: str,
+    pr_number: int,
+    observed_at_unix: int | None = None,
+    append_audit: AuditAppender | None = None,
+) -> dict[str, Any]:
+    """Build terminal closeout evidence for one exact verified successor lane.
+
+    This builder validates only the immutable evidence shape. The caller must
+    verify the live successor lane, checkout, ancestry and leases before using
+    the assessment for effects.
+    """
+    predecessor_lane = _identity(lane_id, "lane_id")
+    successor_lane = _identity(successor_lane_id, "successor_lane_id")
+    assert predecessor_lane is not None
+    assert successor_lane is not None
+    if LANE_ID.fullmatch(predecessor_lane) is None:
+        raise ValueError("lane_id must be a 32-character lowercase hex Work Lane id")
+    if LANE_ID.fullmatch(successor_lane) is None:
+        raise ValueError(
+            "successor_lane_id must be a 32-character lowercase hex Work Lane id"
+        )
+    if predecessor_lane == successor_lane:
+        raise ValueError("successor lane must differ from predecessor lane")
+    if isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number <= 0:
+        raise ValueError("pr_number must be a positive integer")
+    predecessor_head = _sha(predecessor_head_sha, "predecessor_head_sha")
+    successor_head = _sha(successor_head_sha, "successor_head_sha")
+    successor_receipt = _sha256(
+        successor_receipt_sha256, "successor_receipt_sha256"
+    )
+    assert predecessor_head is not None
+    assert successor_head is not None
+    assert successor_receipt is not None
+    binding = {
+        "schema_version": 1,
+        "kind": "grabowski.work_lane_successor_handoff",
+        "predecessor_lane_id": predecessor_lane,
+        "successor_lane_id": successor_lane,
+        "predecessor_head_sha": predecessor_head,
+        "successor_head_sha": successor_head,
+        "successor_receipt_sha256": successor_receipt,
+        "pr_number": pr_number,
+    }
+    observed_at = _timestamp(observed_at_unix)
+    assessment = _terminal_result(
+        {"lane_id": predecessor_lane},
+        "successor_handoff",
+        ["successor_work_lane_exactly_bound"],
+    )
+    material = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": KIND,
+        "observed_at_unix": observed_at,
+        "observation_sha256": sha256_json(binding),
+        "terminal_head_sha": predecessor_head,
+        **assessment,
+        "successor_handoff": binding,
+    }
+    assessment_sha256 = sha256_json(material)
+    audit_record_sha256: str | None = None
+    if append_audit is not None:
+        value = append_audit(
+            {
+                "timestamp_unix": observed_at,
+                "operation": "lane-closeout-assessment",
+                **material,
+                "assessment_sha256": assessment_sha256,
+            }
+        )
+        if value is not None and (
+            not isinstance(value, str) or SHA256.fullmatch(value) is None
+        ):
+            raise LaneCloseoutError("audit appender returned an invalid digest")
+        audit_record_sha256 = value
+    return {
+        **material,
+        "assessment_sha256": assessment_sha256,
+        "audit_record_sha256": audit_record_sha256,
+        "does_not_establish": [
+            "successor_live_state_without_caller_revalidation",
+            "workspace_cleanup_authority",
+            "merge_or_deployment_authority",
+        ],
+    }
 
 
 def assess(
