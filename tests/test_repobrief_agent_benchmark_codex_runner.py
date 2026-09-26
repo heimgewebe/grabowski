@@ -947,6 +947,21 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertEqual(treatment_disabled, ["apps", "plugins"])
         self.assertNotIn("mcp_servers.repobrief", baseline_joined)
         self.assertIn("mcp_servers.repobrief", treatment_joined)
+        self.assertIn("mcp_servers.repobrief.enabled=true", treatment)
+        self.assertIn("mcp_servers.repobrief.required=true", treatment)
+        expected_enabled_tools = (
+            "mcp_servers.repobrief.enabled_tools="
+            + runner.canonical(sorted(runner.ALLOWED_MCP))
+        )
+        self.assertIn(expected_enabled_tools, treatment)
+        self.assertEqual(
+            [
+                item
+                for item in treatment
+                if item.startswith("mcp_servers.repobrief.enabled_tools=")
+            ],
+            [expected_enabled_tools],
+        )
         self.assertIn("--codex-mcp-proxy", treatment_joined)
 
 
