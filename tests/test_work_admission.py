@@ -851,20 +851,35 @@ class WorkAdmissionTests(unittest.TestCase):
         self.assertNotIn("bounded-inventory-exceeded", result["blocker_codes"])
 
     def test_scoped_broad_repository_lease_can_target_canonical_checkout(self) -> None:
-        scope = self._scoped_repository_write(
+        ordinary_write_scope = self._scoped_repository_write(
             target_path=str(self.repo),
             branch="main",
         )
-        scope["effects"] = ["worktree-admin"]
-        scope["paths"] = [str(self.repo)]
-        scope["shared_gates"] = ["repository-worktree-admin"]
         unrelated = self._linked(
             state="managed_active_attention",
             dirty=True,
             owner="foreign-owner",
             foreign_lease=True,
         )
+        ordinary_write = admission.assess_repository_admission(
+            repo=str(self.repo),
+            owner_id="owner-a",
+            operation="broad_repository_lease",
+            requested_scope=ordinary_write_scope,
+            inventory_loader=lambda _repo: self._complete_inventory(
+                [self._main(), unrelated]
+            ),
+            reconciliation_loader=lambda _repo: self._reconciliation(),
+        )
+        self.assertEqual("repository", ordinary_write["scope_mode"])
+        self.assertEqual("blocked", ordinary_write["decision"])
 
+        scope = {
+            **ordinary_write_scope,
+            "effects": ["worktree-admin"],
+            "paths": [str(self.repo)],
+            "shared_gates": ["repository-worktree-admin"],
+        }
         allowed = admission.assess_repository_admission(
             repo=str(self.repo),
             owner_id="owner-a",

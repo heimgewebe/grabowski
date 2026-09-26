@@ -744,6 +744,7 @@ def _exact_checkout_scope(
     canonical_target = _canonical_checkout_path(scope_target)
     canonical_repository_target = (
         operation == "broad_repository_lease"
+        and worktree_admin_scope
         and canonical_target is not None
         and _same_checkout_path(repository, canonical_target)
     )
