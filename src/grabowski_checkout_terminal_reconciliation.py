@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import stat
 from typing import Any
@@ -995,6 +996,15 @@ def _coordination(
     return checkouts._coordination_result(leases, tasks, processes)
 
 
+def _blocked_followup_capacity_release_ready(
+    source_evidence: dict[str, Any], checkout_key: str
+) -> bool:
+    return sources.blocked_followup_binding_valid(
+        source_evidence,
+        checkout_key,
+        require_terminal_task=False,
+    )
+
 def _preview_state(
     checkout_key: str, *, ignore_lease_owner: str | None = None
 ) -> dict[str, Any]:
@@ -1053,7 +1063,13 @@ def _preview_state(
             blockers.append("present-checkout-not-active")
         if source_is_work_lane:
             if source_evidence.get("lease_release_ready") is not True:
-                blockers.append("work-lane-lease-release-not-ready")
+                if source_evidence.get("terminal_state") == "blocked_with_durable_followup":
+                    if not _blocked_followup_capacity_release_ready(
+                        source_evidence, key
+                    ):
+                        blockers.append("work-lane-durable-followup-binding-missing")
+                else:
+                    blockers.append("work-lane-lease-release-not-ready")
         elif source_is_thread_focus:
             if source_evidence.get("terminal_state") != "completed_without_current_obligation":
                 blockers.append("thread-focus-terminal-evidence-invalid")

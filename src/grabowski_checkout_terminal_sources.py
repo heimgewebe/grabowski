@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 import re
+import sqlite3
+import stat
 import subprocess
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -19,6 +21,17 @@ TERMINAL_TASK_STATES = frozenset({"verified", "cancelled", "superseded"})
 GITHUB_ISSUE_SOURCE_RE = re.compile(
     r"(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(?P<number>[1-9][0-9]*)(?::(?P<suffix>[^\x00]+))?\Z"
 )
+BUREAU_TASK_SPEC_SCAN_LIMIT = 4096
+BUREAU_TASK_SPEC_SCHEMA = {
+    "task_specs": {"task_id", "current_revision", "spec_sha256"},
+    "task_spec_revisions": {
+        "task_id",
+        "revision",
+        "parent_revision",
+        "spec_sha256",
+        "spec_json",
+    },
+}
 
 
 def _terminal_evidence(core: dict[str, Any]) -> dict[str, Any]:
@@ -44,19 +57,391 @@ def _github_json(arguments: list[str], *, timeout_seconds: int = 30) -> Any:
         raise RuntimeError("GitHub observation returned invalid JSON") from exc
 
 
+def _bureau_state_root() -> Path:
+    legacy_root = Path(
+        os.environ.get("BUREAU_STATE_DIR", "~/.local/state/bureau")
+    ).expanduser()
+    configured = Path(
+        os.environ.get("GRABOWSKI_BUREAU_COORDINATION_ROOT", str(legacy_root))
+    ).expanduser()
+    return Path(os.path.abspath(os.fspath(configured)))
+
+
+def _bureau_state_store_path() -> Path:
+    return _bureau_state_root() / "bureau.sqlite3"
+
+
+def _bureau_task_spec_digest(spec: dict[str, Any]) -> str:
+    canonical = json.dumps(
+        spec,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _bureau_state_store_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_nlink,
+    )
+
+
+def _bureau_state_store_entry_identity(
+    root_descriptor: int, name: str, *, required: bool
+) -> tuple[int, ...] | None:
+    try:
+        metadata = os.stat(
+            name,
+            dir_fd=root_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError as exc:
+        if required:
+            raise RuntimeError("Bureau TaskSpec StateStore is unavailable") from exc
+        return None
+    except OSError as exc:
+        raise RuntimeError("Bureau TaskSpec StateStore could not be inspected safely") from exc
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        raise RuntimeError("Bureau TaskSpec StateStore is unsafe")
+    return _bureau_state_store_identity(metadata)
+
+
+def _bureau_state_store_snapshot(root_descriptor: int) -> dict[str, tuple[int, ...] | None]:
+    return {
+        "database": _bureau_state_store_entry_identity(
+            root_descriptor, "bureau.sqlite3", required=True
+        ),
+        "wal": _bureau_state_store_entry_identity(
+            root_descriptor, "bureau.sqlite3-wal", required=False
+        ),
+        "shm": _bureau_state_store_entry_identity(
+            root_descriptor, "bureau.sqlite3-shm", required=False
+        ),
+    }
+
+
+def _open_bureau_state_root() -> tuple[Path, int]:
+    root = _bureau_state_root()
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(root, flags)
+    except OSError as exc:
+        raise RuntimeError("Bureau TaskSpec StateStore root is unavailable or unsafe") from exc
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        os.close(descriptor)
+        raise RuntimeError("Bureau TaskSpec StateStore root is unsafe")
+    return root, descriptor
+
+
+def _current_bureau_task_specs() -> list[dict[str, Any]]:
+    _root, root_descriptor = _open_bureau_state_root()
+    connection: sqlite3.Connection | None = None
+    try:
+        before = _bureau_state_store_snapshot(root_descriptor)
+        pinned_path = f"/proc/self/fd/{root_descriptor}/bureau.sqlite3"
+        connection = sqlite3.connect(
+            "file:" + pinned_path + "?mode=ro",
+            uri=True,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("BEGIN")
+        if _bureau_state_store_snapshot(root_descriptor) != before:
+            raise RuntimeError("Bureau TaskSpec StateStore identity changed")
+        for table, required in BUREAU_TASK_SPEC_SCHEMA.items():
+            observed = {
+                str(row["name"])
+                for row in connection.execute(f"PRAGMA table_info({table})")
+            }
+            if not required.issubset(observed):
+                raise RuntimeError("Bureau TaskSpec StateStore schema is incomplete")
+        rows = connection.execute(
+            "SELECT p.task_id,p.current_revision,p.spec_sha256 AS pointer_sha256,"
+            "r.revision,r.parent_revision,r.spec_sha256 AS revision_sha256,r.spec_json "
+            "FROM task_specs p JOIN task_spec_revisions r "
+            "ON r.task_id=p.task_id AND r.revision=p.current_revision "
+            "ORDER BY p.task_id LIMIT ?",
+            (BUREAU_TASK_SPEC_SCAN_LIMIT + 1,),
+        ).fetchall()
+        if _bureau_state_store_snapshot(root_descriptor) != before:
+            raise RuntimeError("Bureau TaskSpec StateStore identity changed")
+        if len(rows) > BUREAU_TASK_SPEC_SCAN_LIMIT:
+            raise RuntimeError("Bureau TaskSpec StateStore scan is incomplete")
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            task_id = row["task_id"]
+            revision = row["current_revision"]
+            parent_revision = row["parent_revision"]
+            pointer_sha256 = row["pointer_sha256"]
+            revision_sha256 = row["revision_sha256"]
+            if (
+                not isinstance(task_id, str)
+                or not task_id
+                or isinstance(revision, bool)
+                or not isinstance(revision, int)
+                or revision < 1
+                or row["revision"] != revision
+                or parent_revision != (None if revision == 1 else revision - 1)
+                or not isinstance(pointer_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", pointer_sha256) is None
+                or pointer_sha256 != revision_sha256
+            ):
+                raise RuntimeError("Bureau TaskSpec current pointer is invalid")
+            try:
+                spec = json.loads(str(row["spec_json"]))
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("Bureau TaskSpec revision JSON is invalid") from exc
+            if (
+                not isinstance(spec, dict)
+                or spec.get("id") != task_id
+                or _bureau_task_spec_digest(spec) != pointer_sha256
+            ):
+                raise RuntimeError("Bureau TaskSpec revision digest or identity differs")
+            result.append(
+                {
+                    "task_id": task_id,
+                    "revision": revision,
+                    "spec_sha256": pointer_sha256,
+                    "spec": spec,
+                }
+            )
+        return result
+    finally:
+        if connection is not None:
+            connection.close()
+        os.close(root_descriptor)
+
+def _blocked_followup_checkout_key(
+    record: dict[str, Any], *, expected_checkout_key: str | None = None
+) -> str:
+    worktree_receipt = record.get("worktree_receipt")
+    lifecycle = (
+        worktree_receipt.get("lifecycle")
+        if isinstance(worktree_receipt, dict)
+        else None
+    )
+    checkout_key = lifecycle.get("checkout_key") if isinstance(lifecycle, dict) else None
+    if checkout_key is not None:
+        if (
+            not isinstance(checkout_key, str)
+            or re.fullmatch(r"[0-9a-f]{64}", checkout_key) is None
+        ):
+            raise RuntimeError("work lane durable followup checkout binding is invalid")
+        if expected_checkout_key is not None and checkout_key != expected_checkout_key:
+            raise RuntimeError("work lane durable followup checkout binding differs")
+        return checkout_key
+    if (
+        isinstance(expected_checkout_key, str)
+        and re.fullmatch(r"[0-9a-f]{64}", expected_checkout_key) is not None
+    ):
+        return expected_checkout_key
+    raise RuntimeError("work lane durable followup checkout binding is missing")
+
+def _bureau_blocked_followup_binding(
+    source_id: str,
+    *,
+    record: dict[str, Any],
+    assessment: dict[str, Any],
+    audit_record_sha256: str,
+    expected_followup_id: str | None = None,
+    expected_checkout_key: str | None = None,
+) -> dict[str, Any]:
+    if assessment.get("closeout_state") != "blocked_with_durable_followup":
+        raise RuntimeError("Bureau durable followup binding requires blocked closeout")
+    if expected_followup_id is not None and (
+        not isinstance(expected_followup_id, str)
+        or not expected_followup_id
+        or expected_followup_id != expected_followup_id.strip()
+    ):
+        raise RuntimeError("Bureau durable followup id is invalid")
+    reason_codes = assessment.get("reason_codes")
+    if (
+        not isinstance(reason_codes, list)
+        or "durable_followup_bound" not in reason_codes
+    ):
+        raise RuntimeError("legacy durable followup binding is not evidenced")
+    expected = {
+        "lane_id": source_id,
+        "lane_receipt_sha256": record.get("receipt_sha256"),
+        "lane_assessment_sha256": assessment.get("assessment_sha256"),
+        "lane_terminal_audit_sha256": audit_record_sha256,
+        "lane_terminal_head": assessment.get("terminal_head_sha"),
+        "checkout_key": _blocked_followup_checkout_key(
+            record, expected_checkout_key=expected_checkout_key
+        ),
+    }
+    if any(not isinstance(value, str) or not value for value in expected.values()):
+        raise RuntimeError("legacy durable followup reproduction evidence is incomplete")
+    matches: list[dict[str, Any]] = []
+    for current in _current_bureau_task_specs():
+        if (
+            expected_followup_id is not None
+            and current["task_id"] != expected_followup_id
+        ):
+            continue
+        task = current["spec"]
+        metadata = task.get("metadata")
+        reproduction = (
+            metadata.get("reproduction") if isinstance(metadata, dict) else None
+        )
+        if not isinstance(reproduction, dict):
+            continue
+        if any(reproduction.get(key) != value for key, value in expected.items()):
+            continue
+        state = task.get("state")
+        if not isinstance(state, str) or not state:
+            raise RuntimeError("Bureau durable followup TaskSpec state is invalid")
+        matches.append(
+            {
+                "task_id": current["task_id"],
+                "revision": current["revision"],
+                "spec_sha256": current["spec_sha256"],
+                "state": state,
+            }
+        )
+    if not matches:
+        raise RuntimeError("Bureau durable followup binding is missing")
+    if len(matches) != 1:
+        raise RuntimeError("Bureau durable followup binding is ambiguous")
+    match = matches[0]
+    binding_core = {
+        "kind": "bureau_current_task_spec_reproduction",
+        "task_id": match["task_id"],
+        "task_revision": match["revision"],
+        "task_spec_sha256": match["spec_sha256"],
+        "task_state": match["state"],
+        "reproduction": expected,
+        "does_not_establish": [
+            "followup_completion",
+            "lease_release_authority",
+            "archive_or_cleanup_authority",
+            "branch_or_ref_deletion_authority",
+        ],
+    }
+    return {
+        "checkout_key": expected["checkout_key"],
+        "durable_followup_id": match["task_id"],
+        "durable_followup_binding": {
+            **binding_core,
+            "binding_sha256": checkouts._sha256_json(binding_core),
+        },
+    }
+
+
+
+def blocked_followup_binding_valid(
+    source_evidence: dict[str, Any],
+    checkout_key: str,
+    *,
+    require_terminal_task: bool = False,
+) -> bool:
+    if (
+        not isinstance(checkout_key, str)
+        or re.fullmatch(r"[0-9a-f]{64}", checkout_key) is None
+        or source_evidence.get("terminal_state") != "blocked_with_durable_followup"
+        or source_evidence.get("lease_release_ready") is not False
+        or source_evidence.get("checkout_key") != checkout_key
+    ):
+        return False
+    evidence_sha256 = source_evidence.get("evidence_sha256")
+    evidence_core = {
+        key: value
+        for key, value in source_evidence.items()
+        if key != "evidence_sha256"
+    }
+    if (
+        not isinstance(evidence_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", evidence_sha256) is None
+        or checkouts._sha256_json(evidence_core) != evidence_sha256
+    ):
+        return False
+    source_id = source_evidence.get("source_id")
+    terminal_head = source_evidence.get("terminal_head_sha")
+    followup_id = source_evidence.get("durable_followup_id")
+    if (
+        not isinstance(source_id, str)
+        or re.fullmatch(r"[0-9a-f]{32}", source_id) is None
+        or not isinstance(terminal_head, str)
+        or checkouts.GIT_OBJECT_RE.fullmatch(terminal_head) is None
+        or not isinstance(followup_id, str)
+        or followup_id != followup_id.strip()
+        or not followup_id
+        or len(followup_id) > 512
+        or any(character in followup_id for character in "\r\n\x00")
+    ):
+        return False
+    for field in (
+        "lane_receipt_sha256",
+        "assessment_sha256",
+        "terminal_closeout_audit_record_sha256",
+    ):
+        value = source_evidence.get(field)
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            return False
+    binding = source_evidence.get("durable_followup_binding")
+    if not isinstance(binding, dict):
+        return False
+    claimed = binding.get("binding_sha256")
+    if not isinstance(claimed, str) or re.fullmatch(r"[0-9a-f]{64}", claimed) is None:
+        return False
+    material = {key: value for key, value in binding.items() if key != "binding_sha256"}
+    if checkouts._sha256_json(material) != claimed:
+        return False
+    if binding.get("kind") != "bureau_current_task_spec_reproduction":
+        return False
+    revision = binding.get("task_revision")
+    spec_sha256 = binding.get("task_spec_sha256")
+    state = binding.get("task_state")
+    reproduction = binding.get("reproduction")
+    if (
+        binding.get("task_id") != followup_id
+        or isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision < 1
+        or not isinstance(spec_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", spec_sha256) is None
+        or not isinstance(state, str)
+        or not state
+        or (require_terminal_task and state not in TERMINAL_TASK_STATES)
+        or not isinstance(reproduction, dict)
+    ):
+        return False
+    expected_reproduction = {
+        "lane_id": source_id,
+        "lane_receipt_sha256": source_evidence["lane_receipt_sha256"],
+        "lane_assessment_sha256": source_evidence["assessment_sha256"],
+        "lane_terminal_audit_sha256": source_evidence[
+            "terminal_closeout_audit_record_sha256"
+        ],
+        "lane_terminal_head": terminal_head,
+        "checkout_key": checkout_key,
+    }
+    return reproduction == expected_reproduction
+
 def _bureau_json(
     arguments: list[str],
     *,
     control_root: Path,
     timeout_seconds: int = 30,
 ) -> dict[str, Any]:
-    legacy_root = Path(
-        os.environ.get("BUREAU_STATE_DIR", "~/.local/state/bureau")
-    ).expanduser()
-    state_root = Path(
-        os.environ.get("GRABOWSKI_BUREAU_COORDINATION_ROOT", str(legacy_root))
-    ).expanduser()
-    state_root = Path(os.path.abspath(os.fspath(state_root)))
+    state_root = _bureau_state_root()
 
     runtime = bureau_leases._contract_runtime()
     bureau_leases._assert_contract_runtime_unchanged(runtime)
@@ -235,7 +620,9 @@ def bureau_task_terminal_evidence(source_id: str) -> dict[str, Any]:
     )
 
 
-def work_lane_terminal_evidence(source_id: str) -> dict[str, Any]:
+def work_lane_terminal_evidence(
+    source_id: str, *, expected_checkout_key: str | None = None
+) -> dict[str, Any]:
     if not isinstance(source_id, str) or re.fullmatch(r"[0-9a-f]{32}", source_id) is None:
         raise ValueError("work lane source id must be a 32-character lowercase hex lane id")
     # Import lazily so checkout lifecycle observation does not create an import
@@ -296,6 +683,22 @@ def work_lane_terminal_evidence(source_id: str) -> dict[str, Any]:
             "closed_at_unix": closed_at_unix,
         }
 
+    followup_projection: dict[str, Any] = {}
+    if closeout_state == "blocked_with_durable_followup":
+        # Capacity release is a narrower authority than lane terminalization.
+        # A caller-supplied follow-up id is therefore not sufficient: resolve
+        # every capacity-release candidate against the current digest-bound
+        # Bureau TaskSpec reproduction. Legacy assessments without a persisted
+        # id may still resolve uniquely by their exact lane reproduction.
+        followup_projection = _bureau_blocked_followup_binding(
+            source_id,
+            record=record,
+            assessment=assessment,
+            audit_record_sha256=audit_record_sha256,
+            expected_followup_id=assessment.get("durable_followup_id"),
+            expected_checkout_key=expected_checkout_key,
+        )
+
     return _terminal_evidence(
         {
             "schema_version": SCHEMA_VERSION,
@@ -303,6 +706,7 @@ def work_lane_terminal_evidence(source_id: str) -> dict[str, Any]:
             "source_id": source_id,
             "terminal_state": closeout_state,
             **outcome_projection,
+            **followup_projection,
             "lane_receipt_sha256": record.get("receipt_sha256"),
             "assessment_sha256": assessment_sha256,
             "terminal_head_sha": assessment.get("terminal_head_sha"),
@@ -570,7 +974,13 @@ def source_terminal_evidence(binding: dict[str, Any]) -> dict[str, Any]:
                 "checkout absence, retention expiry and lease absence do not establish terminality"
             )
         raise RuntimeError(f"unsupported checkout lifecycle source kind: {kind}")
-    evidence = observer(source_id)
+    if canonical_kind == "work_lane" and observer is work_lane_terminal_evidence:
+        evidence = work_lane_terminal_evidence(
+            source_id,
+            expected_checkout_key=binding.get("checkout_key"),
+        )
+    else:
+        evidence = observer(source_id)
     if evidence.get("kind") != canonical_kind or evidence.get("source_id") != source_id:
         raise RuntimeError("source terminal evidence is bound to another source")
     claimed = evidence.get("evidence_sha256")

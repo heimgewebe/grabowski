@@ -105,6 +105,102 @@ class CheckoutTerminalSourcesTests(unittest.TestCase):
             ),
         )
 
+    def test_blocked_followup_terminal_evidence_preserves_direct_followup_binding(self) -> None:
+        lane_id = "2" * 32
+        assessment = lane_closeout.assess(
+            lane_closeout.LaneCloseoutObservation(
+                lane_id=lane_id,
+                repository="/tmp/repo",
+                workspace="/tmp/worktree",
+                branch="feat/example",
+                base_revision="a" * 40,
+                writer_state="outcome_unknown",
+                task_active=False,
+                process_active=False,
+                lease_active=False,
+                git_dirty=False,
+                head_sha="b" * 40,
+                remote_head_sha="b" * 40,
+                ahead_commits=0,
+                behind_commits=0,
+                durable_followup_id="GRABOWSKI-FOLLOWUP-T001",
+                readback_errors=("github-timeout",),
+            ),
+            observed_at_unix=200,
+        )
+        record = {
+            "lane_id": lane_id,
+            "receipt_sha256": "d" * 64,
+            "created_at_unix": 100,
+            "inputs": {"source": {"kind": "direct-user", "id": "request-123"}},
+            "worktree_receipt": {
+                "lifecycle": {
+                    "checkout_key": "c" * 64,
+                }
+            },
+            "terminal_closeout": {
+                "schema_version": 1,
+                "kind": "grabowski.work_lane_terminal_closeout",
+                "closeout_state": assessment["closeout_state"],
+                "assessment_sha256": assessment["assessment_sha256"],
+                "expected_receipt_sha256": "e" * 64,
+                "assessment": assessment,
+            },
+        }
+        bureau_binding = {
+            "checkout_key": "c" * 64,
+            "durable_followup_id": "GRABOWSKI-FOLLOWUP-T001",
+            "durable_followup_binding": {
+                "kind": "bureau_current_task_spec_reproduction",
+                "task_id": "GRABOWSKI-FOLLOWUP-T001",
+                "task_revision": 1,
+                "task_spec_sha256": "a" * 64,
+                "task_state": "ready",
+                "reproduction": {},
+                "does_not_establish": [
+                    "followup_completion",
+                    "lease_release_authority",
+                    "archive_or_cleanup_authority",
+                    "branch_or_ref_deletion_authority",
+                ],
+                "binding_sha256": "b" * 64,
+            },
+        }
+        with (
+            patch.object(work_acquire, "_read_state", return_value=record),
+            patch.object(
+                work_acquire,
+                "_find_terminal_closeout_audit",
+                return_value="f" * 64,
+            ),
+            patch.object(
+                sources,
+                "_bureau_blocked_followup_binding",
+                return_value=bureau_binding,
+            ) as authoritative_binding,
+        ):
+            evidence = sources.work_lane_terminal_evidence(lane_id)
+        self.assertEqual(
+            "blocked_with_durable_followup", evidence["terminal_state"]
+        )
+        self.assertFalse(evidence["lease_release_ready"])
+        self.assertEqual("c" * 64, evidence["checkout_key"])
+        self.assertEqual(
+            "GRABOWSKI-FOLLOWUP-T001", evidence["durable_followup_id"]
+        )
+        self.assertEqual(
+            "bureau_current_task_spec_reproduction",
+            evidence["durable_followup_binding"]["kind"],
+        )
+        authoritative_binding.assert_called_once_with(
+            lane_id,
+            record=record,
+            assessment=assessment,
+            audit_record_sha256="f" * 64,
+            expected_followup_id="GRABOWSKI-FOLLOWUP-T001",
+            expected_checkout_key=None,
+        )
+
     def test_work_lane_terminal_evidence_rejects_missing_original_source_binding(self) -> None:
         lane_id = "1" * 32
         record = {

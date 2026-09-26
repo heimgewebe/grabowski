@@ -103,6 +103,22 @@ def validate_terminal_assessment(value: Mapping[str, Any]) -> dict[str, Any]:
         not isinstance(terminal_head_sha, str) or SHA.fullmatch(terminal_head_sha) is None
     ):
         raise LaneCloseoutError("terminal closeout assessment head is invalid")
+    durable_followup_id = value.get("durable_followup_id")
+    if durable_followup_id is not None and (
+        not isinstance(durable_followup_id, str)
+        or durable_followup_id != durable_followup_id.strip()
+        or not durable_followup_id
+        or len(durable_followup_id) > MAX_IDENTITY_LENGTH
+        or any(character in durable_followup_id for character in "\r\n\x00")
+    ):
+        raise LaneCloseoutError("terminal closeout durable followup id is invalid")
+    if (
+        durable_followup_id is not None
+        and value.get("closeout_state") != "blocked_with_durable_followup"
+    ):
+        raise LaneCloseoutError(
+            "terminal closeout durable followup id requires blocked followup state"
+        )
     supplied = value.get("assessment_sha256")
     material = {
         key: item for key, item in value.items()
@@ -264,7 +280,7 @@ def _terminal_result(
 ) -> dict[str, Any]:
     if closeout_state not in TERMINAL_CLOSEOUT_STATES:
         raise ValueError(f"invalid terminal closeout state: {closeout_state}")
-    return {
+    result = {
         "phase": "terminal",
         "closeout_state": closeout_state,
         "action_required": False,
@@ -274,6 +290,9 @@ def _terminal_result(
         "workspace_cleanup_ready": False,
         "lane_id": data["lane_id"],
     }
+    if closeout_state == "blocked_with_durable_followup":
+        result["durable_followup_id"] = data["durable_followup_id"]
+    return result
 
 
 def _rescue_result(

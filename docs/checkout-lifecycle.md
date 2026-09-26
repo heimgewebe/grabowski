@@ -24,7 +24,22 @@ trennt Inventar, Archivierung und Cleanup.
   und fehlende Koordination als `externally_terminal_missing` vorbereitet werden.
   Zusätzlich kann ein noch vorhandener `active`-Checkout für eine terminal belegte
   Work Lane als `completed_retained` vorbereitet werden, wenn er sauber,
-  unkoordiniert, remote recoverbar und `lease_release_ready=true` ist. Bei aktuellen
+  unkoordiniert und remote recoverbar ist. Normalerweise ist zusätzlich
+  `lease_release_ready=true` erforderlich. Die enge Ausnahme
+  `blocked_with_durable_followup` darf `lease_release_ready=false` beibehalten,
+  wenn zusätzlich ein gültiger `terminal_head_sha` gebunden ist und die Restpflicht
+  durch die aktuelle, digest-validierte Bureau-TaskSpec-`metadata.reproduction`
+  aus demselben konfigurierten Bureau-Coordination-Root autoritativ belegt wird.
+  Bei aktuellen Assessments muss die persistierte `durable_followup_id` exakt
+  dieser TaskSpec entsprechen; historische Assessments ohne persistierte ID dürfen
+  nur über genau einen eindeutigen Reproduction-Treffer aufgelöst werden. Diese
+  Ausnahme gibt nur den Active-Creation-Slot frei; sie
+  erteilt keine Lease-Release-, Follow-up-Completion-, Archiv-, Cleanup- oder
+  Branch-Löschautorität. Der Archivpfad revalidiert deshalb bei einem so
+  freigegebenen Work-Lane-Checkout die aktuelle Bureau-Reproduktion erneut und
+  bleibt blockiert, solange die gebundene Follow-up-TaskSpec nicht terminal (`verified`, `cancelled` oder `superseded`) ist. Erst dieser
+  zusätzliche Terminalnachweis darf die gewöhnliche Archivlogik wieder freigeben.
+  Bei aktuellen
   Work-Lane-Receipts muss der Checkout-Head außerdem exakt dem `terminal_head_sha`
   des Closeouts entsprechen; Legacy-Receipts ohne dieses Feld bleiben auf den
   strengeren historischen Recovery-Nachweis beschränkt. Eine zweite, bewusst enge
@@ -57,8 +72,17 @@ trennt Inventar, Archivierung und Cleanup.
   `thread_focus`-Fall wird zusätzlich das exakte `.review-audits`-Manifest in den
   Receipt gebunden; Preview-vs-Apply-Drift macht den CAS stale. Die Evidence-Dateien
   selbst werden weder verändert, verschoben, gestasht, committed noch gelöscht.
-  Divergenz, fehlende Work-Lane-Release-Readiness, ein Head nach aktuellem
-  Work-Lane-Closeout oder nicht beobachtbare Recovery-Evidenz bleiben blockierend.
+  Divergenz, fehlende Work-Lane-Release-Readiness außerhalb der eng
+  revisionsgebundenen `blocked_with_durable_followup`-Kapazitätsausnahme, ein Head
+  nach aktuellem Work-Lane-Closeout oder nicht beobachtbare Recovery-Evidenz bleiben
+  blockierend. Eine fehlende oder widersprüchliche Durable-Follow-up-Bindung blockiert
+  auch diese Ausnahme. Der Bureau-StateStore-Reader pinnt dabei den
+  Coordination-Root über einen no-follow Directory-Descriptor und prüft Datenbank,
+  WAL und SHM als ownergebundene, nicht gruppen-/weltbeschreibbare reguläre Dateien
+  vor und nach der read-only SQLite-Transaktion. Historische Lane-Receipts ohne
+  gespeicherten `checkout_key` dürfen ausschließlich den bereits separat
+  lifecycle-gebundenen Checkout-Key übernehmen; ein vorhandener abweichender Key
+  bleibt blockierend.
   Der Aufruf archiviert oder löscht nichts und verändert weder Branch noch Ref.
 - Die Grips `checkout-owner-handoff-preview` und `checkout-owner-handoff-apply`
   sind ein enger Reconciliation-Pfad für genau `binding-retention-owner-mismatch`:
@@ -115,7 +139,12 @@ Die Phasen werden read-only wie folgt projiziert:
   lässt Lifecycle-, Dirty-, Pfad- und Branch-Schutz unverändert und erteilt
   keine Cleanup-, Terminalitäts- oder Wiederverwendungsautorität.
 - `completed_retained` bleibt als terminal-retained und
-  archivierungspflichtig sichtbar. Ein vorhandener `thread_focus`-Checkout darf
+  archivierungspflichtig sichtbar. Bei `blocked_with_durable_followup` bedeutet
+  dieser Zustand ausschließlich, dass die Quell-Lane keine aktive Checkout-Kapazität
+  mehr belegt; `lease_release_ready` bleibt falsch und die revisionsgebundene
+  `durable_followup_id` bleibt als offene Restpflicht im Source-Evidence-Receipt
+  sichtbar. Archivierung und physisches Cleanup bleiben vollständig getrennte
+  Verträge. Ein vorhandener `thread_focus`-Checkout darf
   diesen Zustand trotz untracked Review-Evidence nur über die oben beschriebene
   evidence-only Admission erreichen; normale Dirty-Arbeit bleibt unverändert
   blockiert. Der generische Identity-Rebind bleibt weiterhin clean-only.
