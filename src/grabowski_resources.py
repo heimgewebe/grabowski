@@ -116,6 +116,13 @@ TASK_TERMINALIZATION_SCHEMA_VERSION = 1
 TASK_TERMINALIZATION_KIND = "grabowski_task_terminalization"
 TASK_AUTHORITY_ADOPTION_KIND = "grabowski_task_authority_adoption"
 NONRENEWABLE_CRITICAL_RESOURCE_PREFIXES = ("gate:github-merge:",)
+USER_SYSTEMD_UNCERTAINTY_METADATA_PREFIX = "user_systemd_uncertainty_fence_v1:"
+USER_SYSTEMD_UNCERTAINTY_HISTORY_METADATA_PREFIX = "user_systemd_uncertainty_history_v1:"
+USER_SYSTEMD_UNCERTAINTY_KIND = "grabowski_user_systemd_uncertainty_fence"
+USER_SYSTEMD_UNCERTAINTY_PHASES = frozenset(
+    {"prepared", "dispatching", "outcome_unknown", "preexisting_job"}
+)
+USER_SYSTEMD_UNIT_FILE_ACTIONS = frozenset({"enable", "disable"})
 RECONCILIATION_NON_CLAIMS = [
     "permission_to_release_changed_lease",
     "permission_to_release_other_owner",
@@ -169,6 +176,26 @@ class ResourceConflict(RuntimeError):
         self.resource_key = resource_key
         self.owner_id = owner_id
         self.expires_at_unix = expires_at_unix
+
+
+class ResourceUncertaintyConflict(RuntimeError):
+    """A durable user-systemd fence blocks overlapping resource acquisition."""
+
+    def __init__(
+        self,
+        resource_key: str,
+        fence_id: str,
+        unit: str,
+        phase: str,
+    ) -> None:
+        super().__init__(
+            "Resource is durably fenced by uncertain user-systemd state: "
+            f"{resource_key} fence_id={fence_id} unit={unit} phase={phase}"
+        )
+        self.resource_key = resource_key
+        self.fence_id = fence_id
+        self.unit = unit
+        self.phase = phase
 
 
 class SameOwnerBranchAttemptConflict(RuntimeError):
@@ -1610,6 +1637,42 @@ def _work_lane_path_scope(
     return {"repository": repository, "paths": sorted(set(paths))}
 
 
+def _user_systemd_unit_file_path_scope(
+    keys: list[str], metadata: dict[str, Any], *, owner_id: str
+) -> dict[str, Any] | None:
+    if DIRECT_OPERATOR_OWNER_RE.fullmatch(owner_id) is None:
+        return None
+    if metadata.get("action") not in USER_SYSTEMD_UNIT_FILE_ACTIONS:
+        return None
+    raw_root = metadata.get("unit_file_config_root")
+    if raw_root is None:
+        return None
+    if not isinstance(raw_root, str):
+        raise RuntimeError("user-systemd unit-file config scope is invalid")
+    root_path = Path(raw_root).expanduser()
+    if not root_path.is_absolute():
+        raise RuntimeError("user-systemd unit-file config scope is not absolute")
+    root = os.path.normpath(str(root_path))
+    if f"path:{root}" not in keys:
+        return None
+    unit = metadata.get("unit")
+    if not isinstance(unit, str) or SERVICE_RE.fullmatch(unit) is None:
+        raise RuntimeError("user-systemd unit-file config scope unit is invalid")
+    return {"repository": None, "paths": [root]}
+
+
+def _hierarchical_path_scope(
+    keys: list[str], metadata: dict[str, Any], *, owner_id: str
+) -> dict[str, Any] | None:
+    lane_scope = _work_lane_path_scope(keys, metadata, owner_id=owner_id)
+    unit_file_scope = _user_systemd_unit_file_path_scope(
+        keys, metadata, owner_id=owner_id
+    )
+    if lane_scope is not None and unit_file_scope is not None:
+        raise RuntimeError("resource lease exposes multiple hierarchical path scopes")
+    return lane_scope if lane_scope is not None else unit_file_scope
+
+
 def _path_scope_contains(scope_path: str, path: str) -> bool:
     try:
         return os.path.commonpath([scope_path, path]) == scope_path
@@ -1625,20 +1688,19 @@ def _check_work_lane_path_scope_conflicts(
     metadata: dict[str, Any],
     now: int,
 ) -> None:
-    """Protect Work Lane directory scopes without redefining exact path leases.
+    """Protect explicit subtree authorities without redefining ordinary path leases.
 
-    ``path:`` remains an exact resource identity for legacy and lifecycle users.
-    Work Lane write paths are different: the sandbox permits a declared directory
-    and therefore everything below it to be written.  The server-generated lane
-    metadata lets us apply subtree overlap only to lane paths inside the canonical
-    repository; the usual sibling target-worktree path therefore stays exact.
+    ``path:`` remains exact by default. Work Lane write directories and the
+    permanent user-systemd unit-file config root are the bounded exceptions:
+    trusted metadata marks those paths as hierarchical scopes, so overlapping
+    parent/child writers conflict while unrelated path leases stay parallel.
     """
     requested_exact_paths = [
         key.removeprefix("path:") for key in keys if key.startswith("path:")
     ]
     if not requested_exact_paths:
         return
-    requested_scope = _work_lane_path_scope(keys, metadata, owner_id=owner)
+    requested_scope = _hierarchical_path_scope(keys, metadata, owner_id=owner)
     rows = connection.execute(
         "SELECT * FROM leases WHERE resource_key>=? AND resource_key<? "
         "AND owner_id<>? AND expires_at_unix>? ORDER BY resource_key",
@@ -1652,7 +1714,7 @@ def _check_work_lane_path_scope_conflicts(
             raise ResourceConflict(
                 row["resource_key"], row["owner_id"], row["expires_at_unix"]
             )
-        existing_scope = _work_lane_path_scope(
+        existing_scope = _hierarchical_path_scope(
             [str(row["resource_key"])],
             existing_metadata,
             owner_id=str(row["owner_id"]),
@@ -5412,6 +5474,440 @@ def acquire_merge_guard_resources(
     }
 
 
+def _validate_user_systemd_uncertainty_fence(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise RuntimeError("user-systemd uncertainty fence is malformed")
+    required = {
+        "schema_version", "kind", "fence_id", "owner_id", "unit", "action",
+        "phase", "resource_keys", "resource_keys_sha256", "lease_snapshots",
+        "lease_bindings_sha256", "created_at_unix", "updated_at_unix",
+        "cleared_at_unix", "clearance",
+    }
+    if set(value) != required:
+        raise RuntimeError("user-systemd uncertainty fence shape is invalid")
+    if value.get("schema_version") != 1 or value.get("kind") != USER_SYSTEMD_UNCERTAINTY_KIND:
+        raise RuntimeError("user-systemd uncertainty fence contract is invalid")
+    fence_id = value.get("fence_id")
+    if not isinstance(fence_id, str) or re.fullmatch(r"[0-9a-f]{32}", fence_id) is None:
+        raise RuntimeError("user-systemd uncertainty fence id is invalid")
+    owner = _owner(value.get("owner_id"))
+    if DIRECT_OPERATOR_OWNER_RE.fullmatch(owner) is None:
+        raise RuntimeError("user-systemd uncertainty fence owner is invalid")
+    unit = value.get("unit")
+    action = value.get("action")
+    phase = value.get("phase")
+    if not isinstance(unit, str) or SERVICE_RE.fullmatch(unit) is None:
+        raise RuntimeError("user-systemd uncertainty fence unit is invalid")
+    if not isinstance(action, str) or SERVICE_RE.fullmatch(action) is None:
+        raise RuntimeError("user-systemd uncertainty fence action is invalid")
+    if phase not in USER_SYSTEMD_UNCERTAINTY_PHASES:
+        raise RuntimeError("user-systemd uncertainty fence phase is invalid")
+    raw_keys = value.get("resource_keys")
+    if not isinstance(raw_keys, list):
+        raise RuntimeError("user-systemd uncertainty resource keys are invalid")
+    keys = normalize_resource_keys(raw_keys)
+    if keys != raw_keys:
+        raise RuntimeError("user-systemd uncertainty resource keys are not canonical")
+    service_key = f"service:user-systemd:{unit}"
+    if service_key not in keys:
+        raise RuntimeError("user-systemd uncertainty fence is missing exact unit authority")
+    if "component:user-systemd-manager" in keys:
+        raise RuntimeError("user-systemd uncertainty fence must not use global manager authority")
+    extra_keys = [key for key in keys if key != service_key]
+    max_path_keys = 2 if action in USER_SYSTEMD_UNIT_FILE_ACTIONS else 1
+    if len(extra_keys) > max_path_keys or any(
+        not key.startswith("path:") for key in extra_keys
+    ):
+        raise RuntimeError("user-systemd uncertainty fence has unsupported authority keys")
+    if value.get("resource_keys_sha256") != hashlib.sha256(
+        _canonical_json(keys).encode("utf-8")
+    ).hexdigest():
+        raise RuntimeError("user-systemd uncertainty resource digest is invalid")
+    snapshots = _normalize_mutation_lease_snapshots(
+        value.get("lease_snapshots"),
+        expected_owner_id=owner,
+        resource_keys=keys,
+    )
+    if value.get("lease_bindings_sha256") != hashlib.sha256(
+        _canonical_json(snapshots).encode("utf-8")
+    ).hexdigest():
+        raise RuntimeError("user-systemd uncertainty lease digest is invalid")
+    for field in ("created_at_unix", "updated_at_unix"):
+        item = value.get(field)
+        if not isinstance(item, int) or isinstance(item, bool) or item < 0:
+            raise RuntimeError(f"user-systemd uncertainty {field} is invalid")
+    if value["updated_at_unix"] < value["created_at_unix"]:
+        raise RuntimeError("user-systemd uncertainty timestamps are invalid")
+    cleared_at = value.get("cleared_at_unix")
+    clearance = value.get("clearance")
+    if cleared_at is None:
+        if clearance is not None:
+            raise RuntimeError("active user-systemd uncertainty has clearance data")
+    else:
+        if (
+            not isinstance(cleared_at, int)
+            or isinstance(cleared_at, bool)
+            or cleared_at < value["created_at_unix"]
+            or cleared_at > value["updated_at_unix"]
+            or not isinstance(clearance, dict)
+        ):
+            raise RuntimeError("user-systemd uncertainty clearance is invalid")
+        if set(clearance) != {"outcome", "evidence_sha256", "cleared_at_unix"}:
+            raise RuntimeError("user-systemd uncertainty clearance shape is invalid")
+        if clearance.get("outcome") not in {
+            "definite_action_result", "terminal_readback", "pre_effect_abort"
+        }:
+            raise RuntimeError("user-systemd uncertainty clearance outcome is invalid")
+        evidence_sha256 = clearance.get("evidence_sha256")
+        if (
+            not isinstance(evidence_sha256, str)
+            or SHA256_RE.fullmatch(evidence_sha256) is None
+            or clearance.get("cleared_at_unix") != cleared_at
+        ):
+            raise RuntimeError("user-systemd uncertainty clearance evidence is invalid")
+    return {
+        **value,
+        "owner_id": owner,
+        "resource_keys": keys,
+        "lease_snapshots": snapshots,
+    }
+
+
+def _user_systemd_uncertainty_metadata_key(unit: str) -> str:
+    if not isinstance(unit, str) or SERVICE_RE.fullmatch(unit) is None:
+        raise ValueError("user-systemd uncertainty unit is invalid")
+    service_key = f"service:user-systemd:{unit}"
+    digest = hashlib.sha256(service_key.encode("utf-8")).hexdigest()
+    return f"{USER_SYSTEMD_UNCERTAINTY_METADATA_PREFIX}{digest}"
+
+
+def _user_systemd_uncertainties_from_connection(
+    connection: sqlite3.Connection,
+) -> list[tuple[str, dict[str, Any]]]:
+    rows = connection.execute(
+        "SELECT key, value FROM metadata WHERE key GLOB ? ORDER BY key",
+        (f"{USER_SYSTEMD_UNCERTAINTY_METADATA_PREFIX}*",),
+    ).fetchall()
+    fences: list[tuple[str, dict[str, Any]]] = []
+    for row in rows:
+        metadata_key = str(row[0])
+        try:
+            decoded = json.loads(str(row[1]))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("user-systemd uncertainty metadata is not JSON") from exc
+        fence = _validate_user_systemd_uncertainty_fence(decoded)
+        if metadata_key != _user_systemd_uncertainty_metadata_key(fence["unit"]):
+            raise RuntimeError("user-systemd uncertainty metadata key is invalid")
+        fences.append((metadata_key, fence))
+    return fences
+
+
+def _user_systemd_uncertainty_by_id(
+    connection: sqlite3.Connection,
+    fence_id: str,
+) -> tuple[str, dict[str, Any]] | None:
+    matches = [
+        (metadata_key, fence)
+        for metadata_key, fence in _user_systemd_uncertainties_from_connection(connection)
+        if fence["fence_id"] == fence_id
+    ]
+    if len(matches) > 1:
+        raise RuntimeError("user-systemd uncertainty fence id is duplicated")
+    return matches[0] if matches else None
+
+
+def _user_systemd_uncertainty_history_metadata_key(fence_id: str) -> str:
+    if (
+        not isinstance(fence_id, str)
+        or re.fullmatch(r"[0-9a-f]{32}", fence_id) is None
+    ):
+        raise ValueError("user-systemd uncertainty fence id is invalid")
+    return f"{USER_SYSTEMD_UNCERTAINTY_HISTORY_METADATA_PREFIX}{fence_id}"
+
+
+def _user_systemd_uncertainty_history_by_id(
+    connection: sqlite3.Connection,
+    fence_id: str,
+) -> dict[str, Any] | None:
+    metadata_key = _user_systemd_uncertainty_history_metadata_key(fence_id)
+    row = connection.execute(
+        "SELECT value FROM metadata WHERE key=?",
+        (metadata_key,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        decoded = json.loads(str(row[0]))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "user-systemd uncertainty history metadata is not JSON"
+        ) from exc
+    fence = _validate_user_systemd_uncertainty_fence(decoded)
+    if fence["fence_id"] != fence_id or fence["cleared_at_unix"] is None:
+        raise RuntimeError("user-systemd uncertainty history binding is invalid")
+    return fence
+
+
+def user_systemd_uncertainty_status(
+    resource_keys: Iterable[str] = (),
+) -> dict[str, Any] | None:
+    raw_keys = list(resource_keys)
+    wanted = normalize_resource_keys(raw_keys) if raw_keys else []
+    with _database() as connection:
+        active = [
+            fence
+            for _, fence in _user_systemd_uncertainties_from_connection(connection)
+            if fence["cleared_at_unix"] is None
+            and (
+                not wanted
+                or set(wanted).intersection(fence["resource_keys"])
+            )
+        ]
+    if not active:
+        return None
+    if len(active) > 1:
+        raise RuntimeError(
+            "multiple active user-systemd uncertainty fences require exact resource keys"
+        )
+    return active[0]
+
+
+def _check_user_systemd_uncertainty_conflicts(
+    connection: sqlite3.Connection,
+    *,
+    keys: list[str],
+    owner: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    requested = set(keys)
+    requested_exact_paths = [
+        key.removeprefix("path:") for key in keys if key.startswith("path:")
+    ]
+    requested_scope = (
+        _hierarchical_path_scope(keys, metadata, owner_id=owner)
+        if owner is not None and metadata is not None
+        else None
+    )
+    for _, fence in _user_systemd_uncertainties_from_connection(connection):
+        if fence["cleared_at_unix"] is not None:
+            continue
+        overlap = sorted(requested.intersection(fence["resource_keys"]))
+        if overlap:
+            raise ResourceUncertaintyConflict(
+                overlap[0], fence["fence_id"], fence["unit"], fence["phase"]
+            )
+        fence_paths = [
+            key.removeprefix("path:")
+            for key in fence["resource_keys"]
+            if key.startswith("path:")
+        ]
+        if fence["action"] in USER_SYSTEMD_UNIT_FILE_ACTIONS:
+            for requested_path in requested_exact_paths:
+                for fence_path in fence_paths:
+                    if _path_scope_contains(fence_path, requested_path):
+                        raise ResourceUncertaintyConflict(
+                            f"path:{fence_path}",
+                            fence["fence_id"],
+                            fence["unit"],
+                            fence["phase"],
+                        )
+        if requested_scope is None or not requested_scope["paths"]:
+            continue
+        for scope_path in requested_scope["paths"]:
+            for fence_path in fence_paths:
+                if _path_scope_contains(scope_path, fence_path):
+                    raise ResourceUncertaintyConflict(
+                        f"path:{fence_path}",
+                        fence["fence_id"],
+                        fence["unit"],
+                        fence["phase"],
+                    )
+
+
+def prepare_user_systemd_uncertainty_fence(
+    owner_id: str,
+    resource_keys: Iterable[str],
+    *,
+    expected_leases: list[dict[str, Any]],
+    unit: str,
+    action: str,
+) -> dict[str, Any]:
+    owner = _owner(owner_id)
+    if DIRECT_OPERATOR_OWNER_RE.fullmatch(owner) is None:
+        raise ValueError("user-systemd uncertainty requires a direct Operator owner")
+    keys = normalize_resource_keys(resource_keys)
+    if not isinstance(unit, str) or SERVICE_RE.fullmatch(unit) is None:
+        raise ValueError("user-systemd uncertainty unit is invalid")
+    if not isinstance(action, str) or SERVICE_RE.fullmatch(action) is None:
+        raise ValueError("user-systemd uncertainty action is invalid")
+    service_key = f"service:user-systemd:{unit}"
+    if service_key not in keys:
+        raise ValueError("user-systemd uncertainty requires exact unit authority")
+    if "component:user-systemd-manager" in keys:
+        raise ValueError("user-systemd uncertainty must not use global manager authority")
+    extra_keys = [key for key in keys if key != service_key]
+    max_path_keys = 2 if action in USER_SYSTEMD_UNIT_FILE_ACTIONS else 1
+    if len(extra_keys) > max_path_keys or any(
+        not key.startswith("path:") for key in extra_keys
+    ):
+        raise ValueError("user-systemd uncertainty has unsupported authority keys")
+    snapshots = _normalize_mutation_lease_snapshots(
+        expected_leases,
+        expected_owner_id=owner,
+        resource_keys=keys,
+    )
+    now = _now()
+    material = {
+        "schema_version": 1,
+        "kind": USER_SYSTEMD_UNCERTAINTY_KIND,
+        "fence_id": os.urandom(16).hex(),
+        "owner_id": owner,
+        "unit": unit,
+        "action": action,
+        "phase": "prepared",
+        "resource_keys": keys,
+        "resource_keys_sha256": hashlib.sha256(
+            _canonical_json(keys).encode("utf-8")
+        ).hexdigest(),
+        "lease_snapshots": snapshots,
+        "lease_bindings_sha256": hashlib.sha256(
+            _canonical_json(snapshots).encode("utf-8")
+        ).hexdigest(),
+        "created_at_unix": now,
+        "updated_at_unix": now,
+        "cleared_at_unix": None,
+        "clearance": None,
+    }
+    metadata_key = _user_systemd_uncertainty_metadata_key(unit)
+    with _database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            _check_user_systemd_uncertainty_conflicts(connection, keys=keys)
+            placeholders = ",".join("?" for _ in keys)
+            rows = connection.execute(
+                f"SELECT * FROM leases WHERE resource_key IN ({placeholders}) ORDER BY resource_key",
+                keys,
+            ).fetchall()
+            observed = [_release_lease_snapshot(row) for row in rows]
+            if observed != snapshots:
+                raise RuntimeError(
+                    "user-systemd lease set changed before uncertainty fence persistence"
+                )
+            connection.execute(
+                "INSERT INTO metadata(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (metadata_key, _canonical_json(material)),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+    return _validate_user_systemd_uncertainty_fence(material)
+
+
+def update_user_systemd_uncertainty_fence(
+    fence_id: str,
+    *,
+    phase: str,
+) -> dict[str, Any]:
+    if not isinstance(fence_id, str) or re.fullmatch(r"[0-9a-f]{32}", fence_id) is None:
+        raise ValueError("user-systemd uncertainty fence id is invalid")
+    if phase not in USER_SYSTEMD_UNCERTAINTY_PHASES:
+        raise ValueError("user-systemd uncertainty phase is invalid")
+    with _database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            found = _user_systemd_uncertainty_by_id(connection, fence_id)
+            if found is None:
+                raise RuntimeError("active user-systemd uncertainty fence changed")
+            metadata_key, fence = found
+            if fence["cleared_at_unix"] is not None:
+                raise RuntimeError("active user-systemd uncertainty fence changed")
+            updated = {**fence, "phase": phase, "updated_at_unix": _now()}
+            connection.execute(
+                "UPDATE metadata SET value=? WHERE key=?",
+                (_canonical_json(updated), metadata_key),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+    return _validate_user_systemd_uncertainty_fence(updated)
+
+
+def clear_user_systemd_uncertainty_fence(
+    fence_id: str,
+    *,
+    outcome: str,
+    evidence_sha256: str,
+) -> dict[str, Any]:
+    if not isinstance(fence_id, str) or re.fullmatch(r"[0-9a-f]{32}", fence_id) is None:
+        raise ValueError("user-systemd uncertainty fence id is invalid")
+    if outcome not in {"definite_action_result", "terminal_readback", "pre_effect_abort"}:
+        raise ValueError("user-systemd uncertainty clearance outcome is invalid")
+    if not isinstance(evidence_sha256, str) or SHA256_RE.fullmatch(evidence_sha256) is None:
+        raise ValueError("user-systemd uncertainty evidence digest is invalid")
+    with _database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            found = _user_systemd_uncertainty_by_id(connection, fence_id)
+            if found is None:
+                historical = _user_systemd_uncertainty_history_by_id(
+                    connection, fence_id
+                )
+                if historical is None:
+                    raise RuntimeError("user-systemd uncertainty fence changed")
+                connection.commit()
+                return historical
+            metadata_key, fence = found
+            if fence["cleared_at_unix"] is None:
+                now = _now()
+                updated = {
+                    **fence,
+                    "updated_at_unix": now,
+                    "cleared_at_unix": now,
+                    "clearance": {
+                        "outcome": outcome,
+                        "evidence_sha256": evidence_sha256,
+                        "cleared_at_unix": now,
+                    },
+                }
+            else:
+                updated = fence
+            updated = _validate_user_systemd_uncertainty_fence(updated)
+            history_key = _user_systemd_uncertainty_history_metadata_key(fence_id)
+            existing_history = connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (history_key,),
+            ).fetchone()
+            if existing_history is None:
+                connection.execute(
+                    "INSERT INTO metadata(key, value) VALUES(?, ?)",
+                    (history_key, _canonical_json(updated)),
+                )
+            else:
+                try:
+                    historical = _validate_user_systemd_uncertainty_fence(
+                        json.loads(str(existing_history[0]))
+                    )
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        "user-systemd uncertainty history metadata is not JSON"
+                    ) from exc
+                if historical != updated:
+                    raise RuntimeError(
+                        "user-systemd uncertainty history binding changed"
+                    )
+            connection.execute(
+                "DELETE FROM metadata WHERE key=?",
+                (metadata_key,),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+    return updated
+
 def acquire_resources(
     owner_id: str,
     resource_keys: Iterable[str],
@@ -5631,6 +6127,12 @@ def acquire_resources(
                 ).fetchone()
                 if terminalization is not None:
                     raise ValueError("terminalized task owner cannot acquire resources")
+            _check_user_systemd_uncertainty_conflicts(
+                connection,
+                keys=keys,
+                owner=owner,
+                metadata=sanitized_metadata,
+            )
             merge_guard_nonconflicts = _check_active_merge_guard_conflicts(
                 connection, keys=keys, metadata=sanitized_metadata, now=now
             )

@@ -997,6 +997,345 @@ class ResourceTests(unittest.TestCase):
                 metadata=lane_metadata,
             )
 
+    def test_user_systemd_fence_blocks_work_lane_parent_scope(self) -> None:
+        repository = self.root / "repo"
+        unit = "demo.service"
+        service_key = f"service:user-systemd:{unit}"
+        fragment_path = repository / "units" / unit
+        fragment_key = f"path:{fragment_path}"
+        fence_owner = "operator:user-systemd-fence-parent-scope"
+        lease = resources.acquire_resources(
+            fence_owner,
+            [service_key, fragment_key],
+            purpose="uncertain unit mutation",
+            ttl_seconds=120,
+            metadata={"unit": unit, "action": "restart"},
+        )
+        fence = resources.prepare_user_systemd_uncertainty_fence(
+            fence_owner,
+            [service_key, fragment_key],
+            expected_leases=lease["leases"],
+            unit=unit,
+            action="restart",
+        )
+        resources.release_resources(
+            fence_owner,
+            [service_key, fragment_key],
+            expected_leases=lease["leases"],
+        )
+
+        lane_id = "9" * 32
+        parent_key = f"path:{fragment_path.parent}"
+        lane_metadata = self.work_lane_metadata(
+            repository, target=self.root / "lane-fence-parent", lane_id=lane_id
+        )
+        with self.assertRaises(resources.ResourceUncertaintyConflict) as raised:
+            resources.acquire_resources(
+                f"lane:{lane_id}",
+                [parent_key],
+                purpose="lane parent scope must respect durable fence",
+                ttl_seconds=60,
+                metadata=lane_metadata,
+            )
+        self.assertEqual(fragment_key, raised.exception.resource_key)
+        active = resources.user_systemd_uncertainty_status([fragment_key])
+        self.assertIsNotNone(active)
+        self.assertEqual(fence["fence_id"], active["fence_id"])
+
+    def test_user_systemd_unit_file_live_scope_blocks_config_child_writer(self) -> None:
+        repository = self.root / "repo"
+        unit = "demo.service"
+        service_key = f"service:user-systemd:{unit}"
+        fragment_path = self.root / "vendor" / "systemd" / "user" / unit
+        fragment_key = f"path:{fragment_path}"
+        config_root = repository / "xdg" / "systemd" / "user"
+        config_key = f"path:{config_root}"
+        owner = "operator:user-systemd-enable-live"
+        resources.acquire_resources(
+            owner,
+            [service_key, fragment_key, config_key],
+            purpose="live unit-file enable scope",
+            ttl_seconds=120,
+            metadata={
+                "unit": unit,
+                "action": "enable",
+                "unit_file_config_root": str(config_root),
+            },
+        )
+
+        child_key = f"path:{config_root / 'default.target.wants' / unit}"
+        with self.assertRaises(resources.ResourceConflict) as raised:
+            resources.acquire_resources(
+                "ordinary-config-child-writer",
+                [child_key],
+                purpose="must not overlap live unit-file mutation",
+                ttl_seconds=60,
+            )
+        self.assertEqual(config_key, raised.exception.resource_key)
+
+    def test_existing_config_child_writer_blocks_user_systemd_unit_file_scope(self) -> None:
+        repository = self.root / "repo"
+        unit = "demo.service"
+        service_key = f"service:user-systemd:{unit}"
+        fragment_path = self.root / "vendor" / "systemd" / "user" / unit
+        fragment_key = f"path:{fragment_path}"
+        config_root = repository / "xdg" / "systemd" / "user"
+        config_key = f"path:{config_root}"
+        child_key = f"path:{config_root / 'default.target.wants' / unit}"
+        child_lease = resources.acquire_resources(
+            "ordinary-config-child-before-enable",
+            [child_key],
+            purpose="existing config child writer",
+            ttl_seconds=60,
+        )
+
+        with self.assertRaises(resources.ResourceConflict) as raised:
+            resources.acquire_resources(
+                "operator:user-systemd-enable-after-child",
+                [service_key, fragment_key, config_key],
+                purpose="enable must respect existing child writer",
+                ttl_seconds=120,
+                metadata={
+                    "unit": unit,
+                    "action": "enable",
+                    "unit_file_config_root": str(config_root),
+                },
+            )
+        self.assertEqual(child_key, raised.exception.resource_key)
+        resources.release_resources(
+            child_lease["owner_id"],
+            [child_key],
+            expected_leases=child_lease["leases"],
+        )
+
+    def test_non_unit_file_fence_rejects_second_path_authority(self) -> None:
+        unit = "demo.service"
+        service_key = f"service:user-systemd:{unit}"
+        first_path = f"path:{self.root / 'one' / unit}"
+        second_path = f"path:{self.root / 'two' / unit}"
+        owner = "operator:user-systemd-restart-authority-bound"
+        keys = [service_key, first_path, second_path]
+        lease = resources.acquire_resources(
+            owner,
+            keys,
+            purpose="restart authority bound",
+            ttl_seconds=120,
+            metadata={"unit": unit, "action": "restart"},
+        )
+        with self.assertRaisesRegex(ValueError, "unsupported authority keys"):
+            resources.prepare_user_systemd_uncertainty_fence(
+                owner,
+                keys,
+                expected_leases=lease["leases"],
+                unit=unit,
+                action="restart",
+            )
+        resources.release_resources(
+            owner,
+            keys,
+            expected_leases=lease["leases"],
+        )
+
+    def test_user_systemd_unit_file_fence_blocks_config_child_writer(self) -> None:
+        repository = self.root / "repo"
+        unit = "demo.service"
+        service_key = f"service:user-systemd:{unit}"
+        fragment_path = self.root / "vendor" / "systemd" / "user" / unit
+        fragment_key = f"path:{fragment_path}"
+        config_root = repository / "xdg" / "systemd" / "user"
+        config_key = f"path:{config_root}"
+        owner = "operator:user-systemd-disable-fence"
+        keys = [service_key, fragment_key, config_key]
+        lease = resources.acquire_resources(
+            owner,
+            keys,
+            purpose="uncertain unit-file disable",
+            ttl_seconds=120,
+            metadata={
+                "unit": unit,
+                "action": "disable",
+                "unit_file_config_root": str(config_root),
+            },
+        )
+        fence = resources.prepare_user_systemd_uncertainty_fence(
+            owner,
+            keys,
+            expected_leases=lease["leases"],
+            unit=unit,
+            action="disable",
+        )
+        resources.release_resources(
+            owner,
+            keys,
+            expected_leases=lease["leases"],
+        )
+
+        child_key = f"path:{config_root / 'default.target.wants' / unit}"
+        with self.assertRaises(resources.ResourceUncertaintyConflict) as raised:
+            resources.acquire_resources(
+                "ordinary-config-child-after-lease",
+                [child_key],
+                purpose="durable unit-file fence owns config subtree",
+                ttl_seconds=60,
+            )
+        self.assertEqual(config_key, raised.exception.resource_key)
+        active = resources.user_systemd_uncertainty_status([service_key])
+        self.assertIsNotNone(active)
+        self.assertEqual(fence["fence_id"], active["fence_id"])
+        self.assertIn(config_key, active["resource_keys"])
+
+    def test_user_systemd_unit_file_fence_blocks_work_lane_parent_scope(self) -> None:
+        repository = self.root / "repo"
+        unit = "demo.service"
+        service_key = f"service:user-systemd:{unit}"
+        fragment_path = self.root / "vendor" / "systemd" / "user" / unit
+        fragment_key = f"path:{fragment_path}"
+        config_root = repository / "xdg" / "systemd" / "user"
+        config_key = f"path:{config_root}"
+        owner = "operator:user-systemd-enable-fence-lane"
+        keys = [service_key, fragment_key, config_key]
+        lease = resources.acquire_resources(
+            owner,
+            keys,
+            purpose="uncertain unit-file enable",
+            ttl_seconds=120,
+            metadata={
+                "unit": unit,
+                "action": "enable",
+                "unit_file_config_root": str(config_root),
+            },
+        )
+        resources.prepare_user_systemd_uncertainty_fence(
+            owner,
+            keys,
+            expected_leases=lease["leases"],
+            unit=unit,
+            action="enable",
+        )
+        resources.release_resources(
+            owner,
+            keys,
+            expected_leases=lease["leases"],
+        )
+
+        lane_id = "8" * 32
+        parent_key = f"path:{config_root.parent}"
+        lane_metadata = self.work_lane_metadata(
+            repository,
+            target=self.root / "lane-unit-file-parent",
+            lane_id=lane_id,
+        )
+        with self.assertRaises(resources.ResourceUncertaintyConflict) as raised:
+            resources.acquire_resources(
+                f"lane:{lane_id}",
+                [parent_key],
+                purpose="lane parent scope must respect unit-file fence",
+                ttl_seconds=60,
+                metadata=lane_metadata,
+            )
+        self.assertEqual(config_key, raised.exception.resource_key)
+
+    def test_cleared_user_systemd_fence_moves_out_of_active_scan(self) -> None:
+        unit = "grabowski-cleared-fence-history.service"
+        service_key = f"service:user-systemd:{unit}"
+        owner = "operator:user-systemd-cleared-history"
+        lease = resources.acquire_resources(
+            owner,
+            [service_key],
+            purpose="cleared fence history fixture",
+            ttl_seconds=120,
+            metadata={"unit": unit, "action": "restart"},
+        )
+        fence = resources.prepare_user_systemd_uncertainty_fence(
+            owner,
+            [service_key],
+            expected_leases=lease["leases"],
+            unit=unit,
+            action="restart",
+        )
+        resources.release_resources(
+            owner,
+            [service_key],
+            expected_leases=lease["leases"],
+        )
+
+        cleared = resources.clear_user_systemd_uncertainty_fence(
+            fence["fence_id"],
+            outcome="terminal_readback",
+            evidence_sha256="c" * 64,
+        )
+
+        self.assertIsNone(
+            resources.user_systemd_uncertainty_status([service_key])
+        )
+        with resources._database() as connection:
+            active = connection.execute(
+                "SELECT key FROM metadata WHERE key GLOB ?",
+                (f"{resources.USER_SYSTEMD_UNCERTAINTY_METADATA_PREFIX}*",),
+            ).fetchall()
+            history = connection.execute(
+                "SELECT key FROM metadata WHERE key GLOB ?",
+                (f"{resources.USER_SYSTEMD_UNCERTAINTY_HISTORY_METADATA_PREFIX}*",),
+            ).fetchall()
+        self.assertEqual(active, [])
+        self.assertEqual(
+            [resources._user_systemd_uncertainty_history_metadata_key(fence["fence_id"])],
+            [str(row[0]) for row in history],
+        )
+        replay = resources.clear_user_systemd_uncertainty_fence(
+            fence["fence_id"],
+            outcome="terminal_readback",
+            evidence_sha256="c" * 64,
+        )
+        self.assertEqual(cleared, replay)
+
+        replacement = resources.acquire_resources(
+            "operator:user-systemd-after-clear",
+            [service_key],
+            purpose="active scan ignores cleared history",
+            ttl_seconds=60,
+        )
+        resources.release_resources(
+            replacement["owner_id"],
+            [service_key],
+            expected_leases=replacement["leases"],
+        )
+
+    def test_user_systemd_fence_does_not_redefine_exact_path_identity(self) -> None:
+        repository = self.root / "repo"
+        unit = "demo.service"
+        service_key = f"service:user-systemd:{unit}"
+        fragment_key = f"path:{repository / 'units' / unit}"
+        fence_owner = "operator:user-systemd-fence-exact-path"
+        lease = resources.acquire_resources(
+            fence_owner,
+            [service_key, fragment_key],
+            purpose="uncertain unit mutation",
+            ttl_seconds=120,
+            metadata={"unit": unit, "action": "restart"},
+        )
+        resources.prepare_user_systemd_uncertainty_fence(
+            fence_owner,
+            [service_key, fragment_key],
+            expected_leases=lease["leases"],
+            unit=unit,
+            action="restart",
+        )
+        resources.release_resources(
+            fence_owner,
+            [service_key, fragment_key],
+            expected_leases=lease["leases"],
+        )
+
+        parent_key = f"path:{repository / 'units'}"
+        acquired = resources.acquire_resources(
+            "owner-exact-parent",
+            [parent_key],
+            purpose="exact parent remains exact outside Work Lane scope",
+            ttl_seconds=60,
+        )
+        self.assertEqual(parent_key, acquired["leases"][0]["resource_key"])
+
     def test_same_owner_may_hold_nested_work_lane_paths(self) -> None:
         repository = self.root / "repo"
         parent = f"path:{repository / 'src'}"

@@ -9515,11 +9515,22 @@ def grabowski_task_cancel(task_id: str) -> dict[str, Any]:
             timeout_seconds=60,
         )
     else:
-        result = _dispatch(
-            record["host"],
-            ["systemctl", "--user", "stop", _authoritative_unit(record)],
-            timeout_seconds=60,
+        resolved_host, target, _legacy_local_alias = _resolve_task_dispatch_host(
+            str(record["host"])
         )
+        if target["transport"] == "local":
+            result = operator._run_mutating_user_systemd_unit(
+                _authoritative_unit(record),
+                "stop",
+                mutation_timeout_seconds=60,
+                max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
+            )
+        else:
+            result = _dispatch(
+                resolved_host,
+                ["systemctl", "--user", "stop", _authoritative_unit(record)],
+                timeout_seconds=60,
+            )
     if result.get("outcome_unknown"):
         state = "outcome_unknown"
     else:
