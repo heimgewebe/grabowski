@@ -296,6 +296,47 @@ def work_lane_terminal_evidence(source_id: str) -> dict[str, Any]:
             "closed_at_unix": closed_at_unix,
         }
 
+    successor_projection: dict[str, Any] = {}
+    if closeout_state == "successor_handoff":
+        binding = assessment.get("successor_handoff")
+        required = {
+            "schema_version",
+            "kind",
+            "predecessor_lane_id",
+            "successor_lane_id",
+            "predecessor_head_sha",
+            "successor_head_sha",
+            "successor_receipt_sha256",
+            "pr_number",
+        }
+        if not isinstance(binding, dict) or set(binding) != required:
+            raise RuntimeError("work lane successor handoff binding is invalid")
+        successor_lane_id = binding.get("successor_lane_id")
+        predecessor_head = binding.get("predecessor_head_sha")
+        successor_head = binding.get("successor_head_sha")
+        successor_receipt = binding.get("successor_receipt_sha256")
+        pr_number = binding.get("pr_number")
+        if (
+            binding.get("schema_version") != 1
+            or binding.get("kind") != "grabowski.work_lane_successor_handoff"
+            or binding.get("predecessor_lane_id") != source_id
+            or predecessor_head != assessment.get("terminal_head_sha")
+            or not isinstance(successor_lane_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", successor_lane_id) is None
+            or successor_lane_id == source_id
+            or not isinstance(predecessor_head, str)
+            or re.fullmatch(r"[0-9a-f]{40}", predecessor_head) is None
+            or not isinstance(successor_head, str)
+            or re.fullmatch(r"[0-9a-f]{40}", successor_head) is None
+            or not isinstance(successor_receipt, str)
+            or re.fullmatch(r"[0-9a-f]{64}", successor_receipt) is None
+            or isinstance(pr_number, bool)
+            or not isinstance(pr_number, int)
+            or pr_number <= 0
+        ):
+            raise RuntimeError("work lane successor handoff binding is invalid")
+        successor_projection = {"successor_handoff": dict(binding)}
+
     return _terminal_evidence(
         {
             "schema_version": SCHEMA_VERSION,
@@ -303,6 +344,7 @@ def work_lane_terminal_evidence(source_id: str) -> dict[str, Any]:
             "source_id": source_id,
             "terminal_state": closeout_state,
             **outcome_projection,
+            **successor_projection,
             "lane_receipt_sha256": record.get("receipt_sha256"),
             "assessment_sha256": assessment_sha256,
             "terminal_head_sha": assessment.get("terminal_head_sha"),
@@ -336,6 +378,94 @@ THREAD_FOCUS_WORK_LANE_SCAN_LIMIT = 4096
 THREAD_FOCUS_COMPLETING_WORK_LANE_STATES = frozenset({"pr_merged", "deployed", "no_change_proven"})
 
 
+def _thread_focus_lane_summary(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "lane_id": item["source_id"],
+        "terminal_state": item["terminal_state"],
+        "terminal_head_sha": item.get("terminal_head_sha"),
+        "assessment_sha256": item["assessment_sha256"],
+        "terminal_closeout_audit_record_sha256": item[
+            "terminal_closeout_audit_record_sha256"
+        ],
+        "evidence_sha256": item["evidence_sha256"],
+    }
+
+
+def _thread_focus_completion_chain(
+    source_id: str,
+    lane_id: str,
+    *,
+    root: Path,
+    records: dict[str, dict[str, Any]],
+    work_acquire: Any,
+) -> list[dict[str, Any]]:
+    expected_source = {"kind": "thread_focus", "id": source_id}
+    current_lane_id = lane_id
+    visited: set[str] = set()
+    chain: list[dict[str, Any]] = []
+
+    while True:
+        if current_lane_id in visited:
+            raise RuntimeError("thread focus work-lane successor chain contains a cycle")
+        visited.add(current_lane_id)
+        if len(visited) > THREAD_FOCUS_WORK_LANE_SCAN_LIMIT:
+            raise RuntimeError("thread focus work-lane successor chain exceeds scan limit")
+
+        expected_record = records.get(current_lane_id)
+        if expected_record is None:
+            raise RuntimeError(
+                "thread focus successor lane is missing from bounded scan"
+            )
+        terminal = work_lane_terminal_evidence(current_lane_id)
+        observed_record = work_acquire._read_state(
+            root / f"{current_lane_id}.json"
+        )
+        if observed_record != expected_record:
+            raise RuntimeError(
+                "thread focus work-lane evidence changed during completion observation"
+            )
+        if terminal.get("source_binding") != expected_source:
+            raise RuntimeError("thread focus work-lane source binding changed")
+        chain.append(terminal)
+
+        terminal_state = terminal.get("terminal_state")
+        if terminal_state in THREAD_FOCUS_COMPLETING_WORK_LANE_STATES:
+            return chain
+        if terminal_state != "successor_handoff":
+            raise RuntimeError(
+                "thread focus work lane is terminal but does not establish completion"
+            )
+
+        handoff = terminal.get("successor_handoff")
+        if not isinstance(handoff, dict):
+            raise RuntimeError("thread focus successor handoff evidence is missing")
+        successor_lane_id = handoff.get("successor_lane_id")
+        if (
+            not isinstance(successor_lane_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", successor_lane_id) is None
+        ):
+            raise RuntimeError("thread focus successor handoff lane id is invalid")
+        successor_record = records.get(successor_lane_id)
+        if successor_record is None:
+            raise RuntimeError(
+                "thread focus successor lane is missing from bounded scan"
+            )
+        successor_inputs = successor_record.get("inputs")
+        successor_terminal = successor_record.get("terminal_closeout")
+        if (
+            not isinstance(successor_inputs, dict)
+            or successor_inputs.get("source")
+            != {"kind": "work_lane", "id": current_lane_id}
+            or successor_inputs.get("base_head") != handoff.get("successor_head_sha")
+            or not isinstance(successor_terminal, dict)
+            or successor_terminal.get("expected_receipt_sha256")
+            != handoff.get("successor_receipt_sha256")
+        ):
+            raise RuntimeError("thread focus successor lane binding differs")
+        expected_source = {"kind": "work_lane", "id": current_lane_id}
+        current_lane_id = successor_lane_id
+
+
 def _thread_focus_terminal_work_lane_evidence(source_id: str) -> dict[str, Any]:
     import grabowski_work_acquire as work_acquire
 
@@ -346,7 +476,8 @@ def _thread_focus_terminal_work_lane_evidence(source_id: str) -> dict[str, Any]:
     if len(paths) > THREAD_FOCUS_WORK_LANE_SCAN_LIMIT:
         raise RuntimeError("thread focus work-lane evidence scan is incomplete")
 
-    lane_evidence: list[dict[str, Any]] = []
+    records: dict[str, dict[str, Any]] = {}
+    root_lane_ids: list[str] = []
     for path in paths:
         record = work_acquire._read_state(path)
         if not isinstance(record, dict):
@@ -356,38 +487,44 @@ def _thread_focus_terminal_work_lane_evidence(source_id: str) -> dict[str, Any]:
             raise RuntimeError("thread focus work-lane identity is invalid")
         if path.name != f"{lane_id}.json":
             raise RuntimeError("thread focus work-lane canonical identity is invalid")
+        if lane_id in records:
+            raise RuntimeError("thread focus work-lane identity is duplicated")
+        records[lane_id] = record
         inputs = record.get("inputs")
         source = inputs.get("source") if isinstance(inputs, dict) else None
-        if source != {"kind": "thread_focus", "id": source_id}:
-            continue
-        terminal = work_lane_terminal_evidence(lane_id)
-        if terminal.get("source_binding") != source:
-            raise RuntimeError("thread focus work-lane source binding changed")
-        if terminal.get("terminal_state") not in THREAD_FOCUS_COMPLETING_WORK_LANE_STATES:
-            raise RuntimeError(
-                "thread focus work lane is terminal but does not establish completion"
-            )
-        lane_evidence.append(terminal)
+        if source == {"kind": "thread_focus", "id": source_id}:
+            root_lane_ids.append(lane_id)
 
-    if not lane_evidence:
+    lanes: list[dict[str, Any]] = []
+    for lane_id in root_lane_ids:
+        chain = _thread_focus_completion_chain(
+            source_id,
+            lane_id,
+            root=root,
+            records=records,
+            work_acquire=work_acquire,
+        )
+        root_terminal = chain[0]
+        lane = _thread_focus_lane_summary(root_terminal)
+        if len(chain) > 1:
+            successor_chain = [
+                _thread_focus_lane_summary(item) for item in chain[1:]
+            ]
+            completion = chain[-1]
+            lane.update(
+                {
+                    "successor_chain": successor_chain,
+                    "successor_chain_sha256": checkouts._sha256_json(successor_chain),
+                    "completion_lane_id": completion["source_id"],
+                    "completion_terminal_state": completion["terminal_state"],
+                }
+            )
+        lanes.append(lane)
+
+    if not lanes:
         raise RuntimeError("thread focus source has no acceptance-bound completion")
 
-    lanes = sorted(
-        [
-            {
-                "lane_id": item["source_id"],
-                "terminal_state": item["terminal_state"],
-                "terminal_head_sha": item.get("terminal_head_sha"),
-                "assessment_sha256": item["assessment_sha256"],
-                "terminal_closeout_audit_record_sha256": item[
-                    "terminal_closeout_audit_record_sha256"
-                ],
-                "evidence_sha256": item["evidence_sha256"],
-            }
-            for item in lane_evidence
-        ],
-        key=lambda item: item["lane_id"],
-    )
+    lanes.sort(key=lambda item: item["lane_id"])
     return _terminal_evidence(
         {
             "schema_version": SCHEMA_VERSION,
