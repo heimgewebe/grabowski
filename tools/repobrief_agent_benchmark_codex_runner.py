@@ -3967,6 +3967,9 @@ def build_command(
         command[2:2] = [
             "-c", f"mcp_servers.repobrief.command={_toml_string(proxy_python)}",
             "-c", "mcp_servers.repobrief.args=" + canonical(proxy_args),
+            "-c", "mcp_servers.repobrief.enabled=true",
+            "-c", "mcp_servers.repobrief.required=true",
+            "-c", "mcp_servers.repobrief.enabled_tools=" + canonical(sorted(ALLOWED_MCP)),
         ]
     return command
 
