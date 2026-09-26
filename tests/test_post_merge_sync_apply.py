@@ -547,6 +547,51 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             self.assertEqual(1, leases.acquire_calls)
             self.assertEqual(1, leases.release_calls)
 
+    def test_bind_physical_checkout_failure_after_lease_blocks_before_git_effect(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            expected = physical_checkout.capture_physical_checkout_identity(repo)
+            leases = LeaseHarness()
+            with (
+                patched_leases(leases),
+                patch.object(
+                    sync_apply.physical_checkout,
+                    "bind_physical_checkout",
+                    side_effect=physical_checkout.PhysicalCheckoutIdentityError(
+                        "synthetic bind failure"
+                    ),
+                ),
+            ):
+                result = sync_apply.apply(
+                    repo=repo,
+                    target_branch="main",
+                    expected_local_head=base,
+                    expected_remote_head=target,
+                    expected_physical_identity_sha256=expected[
+                        "physical_identity_sha256"
+                    ],
+                    remote="origin",
+                    remote_target=str(remote),
+                    confirmation=sync_apply.CONFIRMATION,
+                    runner=git,
+                    remote_head_reader=self.remote_reader(remote),
+                    pinned_target_factory=self.pinned(remote),
+                )
+
+            self.assertEqual("blocked", result["receipt_status"])
+            self.assertEqual(
+                "physical_checkout_identity_drift_after_lease",
+                result["state"],
+            )
+            self.assertFalse(result["effect_started"])
+            self.assertFalse(result.get("worktree_effect_started", False))
+            self.assertFalse(result.get("branch_cas_started", False))
+            self.assertEqual(base, git_stdout(repo, "rev-parse", "HEAD"))
+            self.assertEqual(1, leases.acquire_calls)
+            self.assertEqual(1, leases.release_calls)
+
     def test_physical_identity_drift_at_final_readback_never_reports_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo, remote, base, target = self.fixture(Path(tmp))

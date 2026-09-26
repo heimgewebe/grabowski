@@ -766,22 +766,23 @@ def apply(
                     ),
                 )
 
-        live = resources.inspect_resources(resource_keys) if output is None else {}
-        if output is None and (
-            set(live) != set(resource_keys)
-            or any(
-                not isinstance(value, dict)
-                or value.get("owner_id") != owner_id
-                for value in live.values()
-            )
-        ):
-            output = _blocked(
-                "lease_preimage_drift",
-                before=initial,
-                preimage_sha256=preimage_sha256,
-                resource_keys=resource_keys,
-                serialization_verified=False,
-            )
+        if output is None:
+            live = resources.inspect_resources(resource_keys)
+            if (
+                set(live) != set(resource_keys)
+                or any(
+                    not isinstance(value, dict)
+                    or value.get("owner_id") != owner_id
+                    for value in live.values()
+                )
+            ):
+                output = _blocked(
+                    "lease_preimage_drift",
+                    before=initial,
+                    preimage_sha256=preimage_sha256,
+                    resource_keys=resource_keys,
+                    serialization_verified=False,
+                )
 
         if output is None:
             serialization_verified = True
