@@ -38,6 +38,7 @@ MAX_WRITER_ARGV = 256
 MAX_WRITER_ARGUMENT_BYTES = 8192
 MAX_TERMINAL_OWNER_LEASES = 512
 MAX_RESOURCE_RELEASE_BATCH = 64
+SUCCESSOR_HANDOFF_MIN_LEASE_REMAINING_SECONDS = 30
 DEFERRED_RESOURCE_RELEASE_CLOSEOUT_STATES = frozenset({"candidate_adopted"})
 
 
@@ -1110,6 +1111,7 @@ def persist_terminal_closeout(
     expected_receipt_sha256: str,
     audit_fn: Callable[[dict[str, Any]], str | None] | None = None,
     audit_lookup_fn: Callable[[dict[str, Any]], str | None] | None = None,
+    _pre_effect_guard: Callable[[dict[str, Any], dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """CAS-persist one terminal assessment and converge release-ready lane leases.
 
@@ -1167,6 +1169,14 @@ def persist_terminal_closeout(
             if resource_closeout is not None:
                 result["resource_lease_closeout"] = resource_closeout
             return result
+
+        if (
+            validated.get("closeout_state") == "successor_handoff"
+            and _pre_effect_guard is None
+        ):
+            raise RuntimeError(
+                "successor handoff terminal effects require the live pre-effect guard"
+            )
 
         pending = _terminal_closeout_pending_assessment(record)
         terminal_physical_identity: dict[str, Any] | None
@@ -1231,6 +1241,8 @@ def persist_terminal_closeout(
         # The durable pending intent prevents normal work-acquire replay from
         # re-entering execution while terminal effects converge.  Checkout
         # validation comes first so dirty/head drift fails before lease release.
+        if _pre_effect_guard is not None:
+            _pre_effect_guard(record, effective)
         lifecycle = _converge_terminal_checkout_lifecycle(
             record, assessment=effective
         )
@@ -1276,6 +1288,388 @@ def persist_terminal_closeout(
         if resource_closeout is not None:
             result["resource_lease_closeout"] = resource_closeout
         return result
+
+
+def _successor_handoff_binding(assessment: dict[str, Any]) -> dict[str, Any]:
+    validated = lane_closeout.validate_terminal_assessment(assessment)
+    if validated.get("closeout_state") != "successor_handoff":
+        raise RuntimeError("successor handoff requires successor_handoff terminal state")
+    binding = validated.get("successor_handoff")
+    required = {
+        "schema_version",
+        "kind",
+        "predecessor_lane_id",
+        "successor_lane_id",
+        "predecessor_head_sha",
+        "successor_head_sha",
+        "successor_receipt_sha256",
+        "pr_number",
+    }
+    if not isinstance(binding, dict) or set(binding) != required:
+        raise RuntimeError("successor handoff assessment binding is invalid")
+    if (
+        binding.get("schema_version") != 1
+        or binding.get("kind") != "grabowski.work_lane_successor_handoff"
+        or binding.get("predecessor_lane_id") != validated.get("lane_id")
+        or binding.get("predecessor_head_sha") != validated.get("terminal_head_sha")
+    ):
+        raise RuntimeError("successor handoff assessment identity is invalid")
+    _text(
+        binding.get("predecessor_lane_id"),
+        "predecessor_lane_id",
+        pattern=re.compile(r"[0-9a-f]{32}\Z"),
+    )
+    _text(
+        binding.get("successor_lane_id"),
+        "successor_lane_id",
+        pattern=re.compile(r"[0-9a-f]{32}\Z"),
+    )
+    _text(
+        binding.get("predecessor_head_sha"),
+        "predecessor_head_sha",
+        pattern=SHA40_RE,
+    )
+    _text(
+        binding.get("successor_head_sha"),
+        "successor_head_sha",
+        pattern=SHA40_RE,
+    )
+    _text(
+        binding.get("successor_receipt_sha256"),
+        "successor_receipt_sha256",
+        pattern=re.compile(r"[0-9a-f]{64}\Z"),
+    )
+    pr_number = binding.get("pr_number")
+    if isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number <= 0:
+        raise RuntimeError("successor handoff pr_number is invalid")
+    if binding["predecessor_lane_id"] == binding["successor_lane_id"]:
+        raise RuntimeError("successor handoff cannot target the predecessor lane")
+    return dict(binding)
+
+
+def _successor_handoff_live_leases(
+    record: dict[str, Any],
+    *,
+    expected_owner: str | None = None,
+    expected_registered: list[str] | None = None,
+    expected_leases: list[dict[str, Any]] | None = None,
+) -> tuple[str, list[str], list[dict[str, Any]], int]:
+    owner, registered, leases = _terminal_lane_resource_observation(record)
+    if [item["resource_key"] for item in leases] != registered:
+        raise RuntimeError("successor handoff successor lease set is incomplete or extended")
+    if not leases:
+        raise RuntimeError("successor handoff successor has no live resource leases")
+    if expected_owner is not None and owner != expected_owner:
+        raise RuntimeError("successor handoff successor lease owner drifted")
+    if expected_registered is not None and registered != expected_registered:
+        raise RuntimeError("successor handoff successor registered lease set drifted")
+    if expected_leases is not None and leases != expected_leases:
+        raise RuntimeError("successor handoff successor lease snapshot drifted")
+    lease_now = int(time.time())
+    minimum_expiry = min(int(item["expires_at_unix"]) for item in leases)
+    minimum_remaining = minimum_expiry - lease_now
+    if minimum_remaining < SUCCESSOR_HANDOFF_MIN_LEASE_REMAINING_SECONDS:
+        raise RuntimeError("successor handoff successor leases are too close to expiry")
+    return owner, registered, leases, minimum_remaining
+
+
+def _github_open_pr_exact_head(
+    repo: Path,
+    *,
+    pr_number: int,
+    branch: str,
+    head: str,
+) -> dict[str, Any]:
+    """Require one exact open GitHub PR publication for the successor head."""
+    if isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number <= 0:
+        raise RuntimeError("successor handoff PR number is invalid")
+    _text(branch, "successor handoff PR branch")
+    _text(head, "successor handoff PR head", pattern=SHA40_RE)
+    origin = _git_runner(repo, ["config", "--get-all", "remote.origin.url"])
+    if (
+        origin.get("timed_out") is True
+        or int(origin.get("returncode", 1)) != 0
+        or origin.get("stdout_truncated") is True
+    ):
+        raise RuntimeError("successor handoff could not verify GitHub origin")
+    urls = [
+        line.strip()
+        for line in str(origin.get("stdout") or "").splitlines()
+        if line.strip()
+    ]
+    if len(urls) != 1:
+        raise RuntimeError("successor handoff requires one exact origin remote")
+    github_repo = checkouts._github_repository_slug_from_remote_url(urls[0])
+    if github_repo is None:
+        raise RuntimeError("successor handoff origin is not one supported GitHub repository")
+    viewed = operator._run(
+        [
+            "gh",
+            "pr",
+            "view",
+            str(pr_number),
+            "--repo",
+            github_repo,
+            "--json",
+            "number,state,headRefName,headRefOid",
+        ],
+        cwd=repo,
+        timeout_seconds=30,
+        max_output_bytes=64 * 1024,
+    )
+    if (
+        viewed.get("timed_out") is True
+        or int(viewed.get("returncode", 1)) != 0
+        or viewed.get("stdout_truncated") is True
+    ):
+        raise RuntimeError("successor handoff GitHub PR readback failed")
+    try:
+        payload = json.loads(str(viewed.get("stdout") or ""))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("successor handoff GitHub PR readback returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("successor handoff GitHub PR readback returned invalid payload")
+    if payload.get("number") != pr_number:
+        raise RuntimeError("successor handoff GitHub PR number drifted")
+    if payload.get("state") != "OPEN":
+        raise RuntimeError("successor handoff requires the bound PR to remain open")
+    if payload.get("headRefName") != branch:
+        raise RuntimeError("successor handoff GitHub PR branch drifted")
+    observed_head = payload.get("headRefOid")
+    if not isinstance(observed_head, str) or observed_head.lower() != head:
+        raise RuntimeError("successor handoff GitHub PR head drifted")
+    return {
+        "repository": github_repo,
+        "pr_number": pr_number,
+        "state": "OPEN",
+        "head_ref_name": branch,
+        "head_sha": head,
+    }
+
+
+def _verify_successor_handoff_locked(
+    predecessor_record: dict[str, Any],
+    successor_record: dict[str, Any],
+    assessment: dict[str, Any],
+) -> dict[str, Any]:
+    binding = _successor_handoff_binding(assessment)
+    predecessor_lane_id = str(binding["predecessor_lane_id"])
+    successor_lane_id = str(binding["successor_lane_id"])
+    if predecessor_record.get("lane_id") != predecessor_lane_id:
+        raise RuntimeError("successor handoff predecessor lane changed")
+    predecessor_inputs = predecessor_record.get("inputs")
+    successor_inputs = successor_record.get("inputs")
+    if (
+        not isinstance(predecessor_inputs, dict)
+        or predecessor_record.get("inputs_sha256") != _sha(predecessor_inputs)
+        or predecessor_inputs.get("lane_id") != predecessor_lane_id
+        or predecessor_inputs.get("lease_owner_id") != f"lane:{predecessor_lane_id}"
+    ):
+        raise RuntimeError("successor handoff predecessor inputs are invalid")
+    if (
+        successor_record.get("lane_id") != successor_lane_id
+        or not isinstance(successor_inputs, dict)
+        or successor_record.get("inputs_sha256") != _sha(successor_inputs)
+        or successor_inputs.get("lane_id") != successor_lane_id
+        or successor_inputs.get("lease_owner_id") != f"lane:{successor_lane_id}"
+    ):
+        raise RuntimeError("successor handoff successor inputs are invalid")
+    if successor_record.get("receipt_sha256") != binding["successor_receipt_sha256"]:
+        raise RuntimeError("successor handoff successor receipt changed")
+    if (
+        successor_record.get("state") != "ready"
+        or successor_record.get("terminal_closeout") is not None
+        or successor_record.get("terminal_closeout_pending") is not None
+    ):
+        raise RuntimeError("successor handoff requires one active ready successor lane")
+    if successor_inputs.get("source") != {
+        "kind": "work_lane",
+        "id": predecessor_lane_id,
+    }:
+        raise RuntimeError("successor handoff successor source does not name predecessor")
+    if successor_inputs.get("repo") != predecessor_inputs.get("repo"):
+        raise RuntimeError("successor handoff lanes belong to different repositories")
+    if successor_inputs.get("base_head") != binding["successor_head_sha"]:
+        raise RuntimeError("successor handoff successor base does not match bound head")
+    predecessor_created = predecessor_record.get("created_at_unix")
+    successor_created = successor_record.get("created_at_unix")
+    if (
+        type(predecessor_created) is not int
+        or type(successor_created) is not int
+        or successor_created <= predecessor_created
+    ):
+        raise RuntimeError("successor handoff successor is not newer than predecessor")
+
+    (
+        successor_owner,
+        successor_registered,
+        successor_leases,
+        _initial_minimum_remaining,
+    ) = _successor_handoff_live_leases(successor_record)
+
+    repo = Path(str(predecessor_inputs["repo"]))
+    predecessor_path = Path(str(predecessor_inputs["target_path"]))
+    successor_path = Path(str(successor_inputs["target_path"]))
+    predecessor_top, predecessor_common, predecessor_checkout = (
+        checkouts._worktree_for_path(repo, predecessor_path)
+    )
+    successor_top, successor_common, successor_checkout = checkouts._worktree_for_path(
+        repo, successor_path
+    )
+    checkouts._require_clean_linked(predecessor_checkout)
+    checkouts._require_expected(
+        predecessor_checkout,
+        str(binding["predecessor_head_sha"]),
+        str(predecessor_inputs["branch"]),
+    )
+    checkouts._require_clean_linked(successor_checkout)
+    checkouts._require_expected(
+        successor_checkout,
+        str(binding["successor_head_sha"]),
+        str(successor_inputs["branch"]),
+    )
+    predecessor_coordination = checkouts._linked_checkout_coordination(
+        predecessor_path,
+        predecessor_top,
+        predecessor_common,
+        branch=predecessor_checkout.get("branch"),
+        include_processes=True,
+        include_tasks=True,
+        include_resources=True,
+        ignored_lease_owner_ids=[str(predecessor_inputs["lease_owner_id"])],
+    )
+    successor_coordination = checkouts._linked_checkout_coordination(
+        successor_path,
+        successor_top,
+        successor_common,
+        branch=successor_checkout.get("branch"),
+        include_processes=True,
+        include_tasks=True,
+        include_resources=True,
+        ignored_lease_owner_ids=[successor_owner],
+    )
+    checkouts._require_no_blockers(predecessor_coordination)
+    checkouts._require_no_blockers(successor_coordination)
+    ancestry = _git_runner(
+        repo,
+        [
+            "--no-replace-objects",
+            "merge-base",
+            "--is-ancestor",
+            str(binding["predecessor_head_sha"]),
+            str(binding["successor_head_sha"]),
+        ],
+    )
+    if int(ancestry.get("returncode", 1)) != 0:
+        raise RuntimeError("successor handoff successor head is not a descendant")
+    publication = _github_open_pr_exact_head(
+        repo,
+        pr_number=int(binding["pr_number"]),
+        branch=str(predecessor_inputs["branch"]),
+        head=str(binding["successor_head_sha"]),
+    )
+    (
+        _final_owner,
+        _final_registered,
+        _final_leases,
+        minimum_remaining,
+    ) = _successor_handoff_live_leases(
+        successor_record,
+        expected_owner=successor_owner,
+        expected_registered=successor_registered,
+        expected_leases=successor_leases,
+    )
+    return {
+        "schema_version": 1,
+        "kind": "grabowski.work_lane_successor_handoff_verification",
+        "predecessor_lane_id": predecessor_lane_id,
+        "successor_lane_id": successor_lane_id,
+        "predecessor_head_sha": binding["predecessor_head_sha"],
+        "successor_head_sha": binding["successor_head_sha"],
+        "successor_receipt_sha256": binding["successor_receipt_sha256"],
+        "successor_resource_key_count": len(successor_registered),
+        "successor_minimum_lease_remaining_seconds": minimum_remaining,
+        "publication": publication,
+        "predecessor_coordination_blocking": False,
+        "successor_coordination_blocking": False,
+        "ancestry": "ancestor",
+    }
+
+
+def persist_successor_handoff_closeout(
+    lane_id: str,
+    *,
+    successor_lane_id: str,
+    expected_predecessor_head: str,
+    expected_successor_head: str,
+    expected_successor_receipt_sha256: str,
+    expected_pr_number: int,
+    expected_receipt_sha256: str,
+    audit_fn: Callable[[dict[str, Any]], str | None] | None = None,
+    audit_lookup_fn: Callable[[dict[str, Any]], str | None] | None = None,
+) -> dict[str, Any]:
+    """Terminalize a predecessor only while its exact live successor is locked."""
+    assessment = lane_closeout.assess_successor_handoff(
+        lane_id=lane_id,
+        successor_lane_id=successor_lane_id,
+        predecessor_head_sha=expected_predecessor_head,
+        successor_head_sha=expected_successor_head,
+        successor_receipt_sha256=expected_successor_receipt_sha256,
+        pr_number=expected_pr_number,
+    )
+    _successor_handoff_binding(assessment)
+
+    # Terminal replay must remain independent of later successor lifetime.
+    with _lane_lock(lane_id) as predecessor_receipt_path:
+        predecessor_record = _read_state(predecessor_receipt_path)
+        if predecessor_record is None or predecessor_record.get("lane_id") != lane_id:
+            raise RuntimeError("work-lane receipt is missing or bound to another lane")
+        existing = _terminal_closeout_assessment(predecessor_record)
+    if existing is not None:
+        return persist_terminal_closeout(
+            lane_id,
+            assessment,
+            expected_receipt_sha256=expected_receipt_sha256,
+            audit_fn=audit_fn,
+            audit_lookup_fn=audit_lookup_fn,
+        )
+
+    # Check immutable lineage before nested locking. This makes the only valid
+    # lock direction successor -> predecessor and prevents reverse-handoff cycles.
+    successor_inputs = _stored_lane_inputs(successor_lane_id)
+    if successor_inputs.get("source") != {"kind": "work_lane", "id": lane_id}:
+        raise RuntimeError("successor handoff successor source does not name predecessor")
+
+    verification: dict[str, Any] = {}
+    with _lane_lock(successor_lane_id) as successor_receipt_path:
+        successor_record = _read_state(successor_receipt_path)
+        if successor_record is None:
+            raise RuntimeError("successor Work Lane receipt is missing")
+
+        def pre_effect_guard(
+            predecessor_record_value: dict[str, Any],
+            assessment_value: dict[str, Any],
+        ) -> None:
+            current_successor = _read_state(successor_receipt_path)
+            if current_successor is None:
+                raise RuntimeError("successor Work Lane disappeared during handoff")
+            current = _verify_successor_handoff_locked(
+                predecessor_record_value,
+                current_successor,
+                assessment_value,
+            )
+            verification.clear()
+            verification.update(current)
+
+        result = persist_terminal_closeout(
+            lane_id,
+            assessment,
+            expected_receipt_sha256=expected_receipt_sha256,
+            audit_fn=audit_fn,
+            audit_lookup_fn=audit_lookup_fn,
+            _pre_effect_guard=pre_effect_guard,
+        )
+    return {**result, "successor_handoff_verification": verification}
 
 
 def _write_path_resource_keys(repo: Path, value: Any) -> list[str]:
@@ -2538,12 +2932,51 @@ def grabowski_work_acquire(
                 audit_fn=operator.base._append_audit_with_digest,
                 audit_lookup_fn=_find_terminal_closeout_audit,
             )
+        successor_handoff_keys = {
+            "expected_receipt_sha256",
+            "successor_handoff",
+        }
+        if set(terminal_closeout) == successor_handoff_keys:
+            handoff = terminal_closeout["successor_handoff"]
+            if not isinstance(handoff, dict) or set(handoff) != {
+                "lane_id",
+                "successor_lane_id",
+                "expected_predecessor_head",
+                "expected_successor_head",
+                "expected_successor_receipt_sha256",
+                "expected_pr_number",
+            }:
+                raise ValueError("terminal_closeout.successor_handoff shape is invalid")
+            lane_id = handoff["lane_id"]
+            if not isinstance(lane_id, str):
+                raise ValueError(
+                    "terminal_closeout.successor_handoff.lane_id must be a string"
+                )
+            inputs = _closeout_inputs(parameters, lane_id)
+            operator._require_operator_mutation(
+                "resource_lease", path=inputs["target_path"], repo=inputs["repo"]
+            )
+            return persist_successor_handoff_closeout(
+                inputs["lane_id"],
+                successor_lane_id=handoff["successor_lane_id"],
+                expected_predecessor_head=handoff["expected_predecessor_head"],
+                expected_successor_head=handoff["expected_successor_head"],
+                expected_successor_receipt_sha256=handoff[
+                    "expected_successor_receipt_sha256"
+                ],
+                expected_pr_number=handoff["expected_pr_number"],
+                expected_receipt_sha256=terminal_closeout[
+                    "expected_receipt_sha256"
+                ],
+                audit_fn=operator.base._append_audit_with_digest,
+                audit_lookup_fn=_find_terminal_closeout_audit,
+            )
         if set(terminal_closeout) != {
             "expected_receipt_sha256",
             "observation",
         }:
             raise ValueError(
-                "terminal_closeout must contain either expected_receipt_sha256 + observation or expected_receipt_sha256 + lane_id + reconcile_audit_only"
+                "terminal_closeout must contain expected_receipt_sha256 plus observation, successor_handoff, or lane_id + reconcile_audit_only"
             )
         observation = terminal_closeout["observation"]
         if not isinstance(observation, dict):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import os
 from pathlib import Path
 import sys
@@ -1478,6 +1479,365 @@ class WorkAcquireTests(unittest.TestCase):
             no_change_proven=True,
         ), observed_at_unix=observed_at)
 
+    def test_successor_handoff_assessment_is_terminal_and_exactly_bound(self) -> None:
+        assessment = closeout.assess_successor_handoff(
+            lane_id="a" * 32,
+            successor_lane_id="b" * 32,
+            predecessor_head_sha="c" * 40,
+            successor_head_sha="d" * 40,
+            successor_receipt_sha256="e" * 64,
+            pr_number=1329,
+            observed_at_unix=200,
+        )
+        self.assertEqual("successor_handoff", assessment["closeout_state"])
+        self.assertTrue(assessment["lease_release_ready"])
+        self.assertEqual("c" * 40, assessment["terminal_head_sha"])
+        self.assertEqual(
+            "b" * 32,
+            assessment["successor_handoff"]["successor_lane_id"],
+        )
+        self.assertEqual(
+            assessment,
+            closeout.validate_terminal_assessment(assessment),
+        )
+
+    def test_terminal_closeout_runs_successor_guard_before_lifecycle_and_release(self) -> None:
+        params = self.parameters()
+        _inputs, receipt = self.store_lane(params)
+        lane_id = str(receipt["lane_id"])
+        assessment = self.terminal_assessment(lane_id, 200)
+        order: list[str] = []
+
+        def guard(_record: dict, _assessment: dict) -> None:
+            order.append("guard")
+
+        with (
+            patch.object(
+                work_acquire,
+                "_converge_terminal_checkout_lifecycle",
+                side_effect=lambda *_args, **_kwargs: order.append("lifecycle"),
+            ),
+            patch.object(
+                work_acquire,
+                "_converge_terminal_resource_leases",
+                side_effect=lambda *_args, **_kwargs: order.append("release"),
+            ),
+        ):
+            work_acquire.persist_terminal_closeout(
+                lane_id,
+                assessment,
+                expected_receipt_sha256=str(receipt["receipt_sha256"]),
+                _pre_effect_guard=guard,
+            )
+        self.assertEqual(["guard", "lifecycle", "release"], order)
+
+    def test_successor_handoff_cannot_bypass_live_pre_effect_guard(self) -> None:
+        params = self.parameters()
+        _inputs, receipt = self.store_lane(params)
+        lane_id = str(receipt["lane_id"])
+        assessment = closeout.assess_successor_handoff(
+            lane_id=lane_id,
+            successor_lane_id="b" * 32,
+            predecessor_head_sha=SHA,
+            successor_head_sha="c" * 40,
+            successor_receipt_sha256="d" * 64,
+            pr_number=1329,
+            observed_at_unix=200,
+        )
+        with self.assertRaisesRegex(RuntimeError, "live pre-effect guard"):
+            work_acquire.persist_terminal_closeout(
+                lane_id,
+                assessment,
+                expected_receipt_sha256=str(receipt["receipt_sha256"]),
+            )
+        stored = work_acquire._read_state(
+            work_acquire._state_root() / f"{lane_id}.json"
+        )
+        self.assertIsNotNone(stored)
+        assert stored is not None
+        self.assertIsNone(stored.get("terminal_closeout_pending"))
+        self.assertIsNone(stored.get("terminal_closeout"))
+
+    def test_successor_handoff_rejects_wrong_lineage_before_terminal_effect(self) -> None:
+        params = self.parameters()
+        _inputs, receipt = self.store_lane(params)
+        lane_id = str(receipt["lane_id"])
+        successor_id = "b" * 32
+        with (
+            patch.object(
+                work_acquire,
+                "_stored_lane_inputs",
+                return_value={"source": {"kind": "direct", "id": "other"}},
+            ),
+            patch.object(work_acquire, "persist_terminal_closeout") as persist,
+            self.assertRaisesRegex(
+                RuntimeError, "successor source does not name predecessor"
+            ),
+        ):
+            work_acquire.persist_successor_handoff_closeout(
+                lane_id,
+                successor_lane_id=successor_id,
+                expected_predecessor_head=SHA,
+                expected_successor_head="b" * 40,
+                expected_successor_receipt_sha256="c" * 64,
+                expected_pr_number=1329,
+                expected_receipt_sha256=str(receipt["receipt_sha256"]),
+            )
+        persist.assert_not_called()
+
+    def test_successor_handoff_verifier_requires_exact_successor_receipt(self) -> None:
+        predecessor_id = "a" * 32
+        successor_id = "b" * 32
+        predecessor_inputs = {
+            "lane_id": predecessor_id,
+            "lease_owner_id": f"lane:{predecessor_id}",
+            "repo": str(self.repo),
+            "target_path": str(self.target),
+            "branch": "topic-old",
+        }
+        successor_inputs = {
+            "lane_id": successor_id,
+            "lease_owner_id": f"lane:{successor_id}",
+            "repo": str(self.repo),
+            "target_path": str(self.root / "successor"),
+            "branch": "topic-new",
+            "base_head": "d" * 40,
+            "source": {"kind": "work_lane", "id": predecessor_id},
+            "resource_keys": ["path:/successor"],
+        }
+        predecessor = {
+            "lane_id": predecessor_id,
+            "inputs": predecessor_inputs,
+            "inputs_sha256": work_acquire._sha(predecessor_inputs),
+            "created_at_unix": 100,
+        }
+        successor = {
+            "lane_id": successor_id,
+            "inputs": successor_inputs,
+            "inputs_sha256": work_acquire._sha(successor_inputs),
+            "receipt_sha256": "f" * 64,
+            "created_at_unix": 101,
+            "state": "ready",
+        }
+        assessment = closeout.assess_successor_handoff(
+            lane_id=predecessor_id,
+            successor_lane_id=successor_id,
+            predecessor_head_sha="c" * 40,
+            successor_head_sha="d" * 40,
+            successor_receipt_sha256="e" * 64,
+            pr_number=1329,
+            observed_at_unix=200,
+        )
+        with self.assertRaisesRegex(RuntimeError, "successor receipt changed"):
+            work_acquire._verify_successor_handoff_locked(
+                predecessor, successor, assessment
+            )
+
+    def test_successor_handoff_verifier_rejects_incomplete_successor_leases(self) -> None:
+        predecessor_id = "a" * 32
+        successor_id = "b" * 32
+        predecessor_inputs = {
+            "lane_id": predecessor_id,
+            "lease_owner_id": f"lane:{predecessor_id}",
+            "repo": str(self.repo),
+            "target_path": str(self.target),
+            "branch": "topic-old",
+        }
+        successor_inputs = {
+            "lane_id": successor_id,
+            "lease_owner_id": f"lane:{successor_id}",
+            "repo": str(self.repo),
+            "target_path": str(self.root / "successor"),
+            "branch": "topic-new",
+            "base_head": "d" * 40,
+            "source": {"kind": "work_lane", "id": predecessor_id},
+            "resource_keys": ["path:/successor"],
+        }
+        predecessor = {
+            "lane_id": predecessor_id,
+            "inputs": predecessor_inputs,
+            "inputs_sha256": work_acquire._sha(predecessor_inputs),
+            "created_at_unix": 100,
+        }
+        successor = {
+            "lane_id": successor_id,
+            "inputs": successor_inputs,
+            "inputs_sha256": work_acquire._sha(successor_inputs),
+            "receipt_sha256": "e" * 64,
+            "created_at_unix": 101,
+            "state": "ready",
+        }
+        assessment = closeout.assess_successor_handoff(
+            lane_id=predecessor_id,
+            successor_lane_id=successor_id,
+            predecessor_head_sha="c" * 40,
+            successor_head_sha="d" * 40,
+            successor_receipt_sha256="e" * 64,
+            pr_number=1329,
+            observed_at_unix=200,
+        )
+        with (
+            patch.object(
+                work_acquire,
+                "_terminal_lane_resource_observation",
+                return_value=(f"lane:{successor_id}", ["path:/successor"], []),
+            ),
+            self.assertRaisesRegex(
+                RuntimeError, "successor lease set is incomplete or extended"
+            ),
+        ):
+            work_acquire._verify_successor_handoff_locked(
+                predecessor, successor, assessment
+            )
+
+    def test_successor_handoff_rejects_near_expiry_successor_leases(self) -> None:
+        predecessor_id = "a" * 32
+        successor_id = "b" * 32
+        predecessor_inputs = {
+            "lane_id": predecessor_id,
+            "lease_owner_id": f"lane:{predecessor_id}",
+            "repo": str(self.repo),
+            "target_path": str(self.target),
+            "branch": "topic-old",
+        }
+        successor_inputs = {
+            "lane_id": successor_id,
+            "lease_owner_id": f"lane:{successor_id}",
+            "repo": str(self.repo),
+            "target_path": str(self.root / "successor"),
+            "branch": "topic-new",
+            "base_head": "d" * 40,
+            "source": {"kind": "work_lane", "id": predecessor_id},
+            "resource_keys": ["path:/successor"],
+        }
+        predecessor = {
+            "lane_id": predecessor_id,
+            "inputs": predecessor_inputs,
+            "inputs_sha256": work_acquire._sha(predecessor_inputs),
+            "created_at_unix": 100,
+        }
+        successor = {
+            "lane_id": successor_id,
+            "inputs": successor_inputs,
+            "inputs_sha256": work_acquire._sha(successor_inputs),
+            "receipt_sha256": "e" * 64,
+            "created_at_unix": 101,
+            "state": "ready",
+        }
+        assessment = closeout.assess_successor_handoff(
+            lane_id=predecessor_id,
+            successor_lane_id=successor_id,
+            predecessor_head_sha="c" * 40,
+            successor_head_sha="d" * 40,
+            successor_receipt_sha256="e" * 64,
+            pr_number=1329,
+            observed_at_unix=200,
+        )
+        with (
+            patch.object(
+                work_acquire,
+                "_terminal_lane_resource_observation",
+                return_value=(
+                    f"lane:{successor_id}",
+                    ["path:/successor"],
+                    [{"resource_key": "path:/successor", "expires_at_unix": 110}],
+                ),
+            ),
+            patch.object(work_acquire.time, "time", return_value=100),
+            self.assertRaisesRegex(RuntimeError, "too close to expiry"),
+        ):
+            work_acquire._verify_successor_handoff_locked(
+                predecessor, successor, assessment
+            )
+
+    def test_successor_handoff_rejects_successor_lease_snapshot_drift(self) -> None:
+        successor_id = "b" * 32
+        observed = [
+            {
+                "resource_key": "path:/successor",
+                "owner_id": f"lane:{successor_id}",
+                "purpose": "verify",
+                "acquired_at_unix": 50,
+                "updated_at_unix": 60,
+                "expires_at_unix": 200,
+                "metadata_sha256": "a" * 64,
+            }
+        ]
+        expected = [dict(observed[0], expires_at_unix=190)]
+        with (
+            patch.object(
+                work_acquire,
+                "_terminal_lane_resource_observation",
+                return_value=(
+                    f"lane:{successor_id}",
+                    ["path:/successor"],
+                    observed,
+                ),
+            ),
+            patch.object(work_acquire.time, "time", return_value=100),
+            self.assertRaisesRegex(RuntimeError, "lease snapshot drifted"),
+        ):
+            work_acquire._successor_handoff_live_leases(
+                {"lane_id": successor_id},
+                expected_owner=f"lane:{successor_id}",
+                expected_registered=["path:/successor"],
+                expected_leases=expected,
+            )
+
+    def test_successor_handoff_github_publication_requires_exact_open_pr_head(self) -> None:
+        origin = {
+            "returncode": 0,
+            "timed_out": False,
+            "stdout_truncated": False,
+            "stdout": "git@github.com:heimgewebe/grabowski.git\n",
+        }
+        published = {
+            "returncode": 0,
+            "timed_out": False,
+            "stdout_truncated": False,
+            "stdout": json.dumps(
+                {
+                    "number": 1329,
+                    "state": "OPEN",
+                    "headRefName": "topic-old",
+                    "headRefOid": "d" * 40,
+                }
+            ),
+        }
+        with (
+            patch.object(work_acquire, "_git_runner", return_value=origin),
+            patch.object(work_acquire.operator, "_run", return_value=published),
+        ):
+            result = work_acquire._github_open_pr_exact_head(
+                self.repo,
+                pr_number=1329,
+                branch="topic-old",
+                head="d" * 40,
+            )
+        self.assertEqual("heimgewebe/grabowski", result["repository"])
+        self.assertEqual("d" * 40, result["head_sha"])
+
+        drifted = dict(published)
+        drifted["stdout"] = json.dumps(
+            {
+                "number": 1329,
+                "state": "OPEN",
+                "headRefName": "topic-old",
+                "headRefOid": "f" * 40,
+            }
+        )
+        with (
+            patch.object(work_acquire, "_git_runner", return_value=origin),
+            patch.object(work_acquire.operator, "_run", return_value=drifted),
+            self.assertRaisesRegex(RuntimeError, "PR head drifted"),
+        ):
+            work_acquire._github_open_pr_exact_head(
+                self.repo,
+                pr_number=1329,
+                branch="topic-old",
+                head="d" * 40,
+            )
+
     def test_terminal_assessment_replay_hash_preserves_legacy_equivalence(self) -> None:
         assessment = self.terminal_assessment("a" * 32, 200)
         legacy = dict(assessment)
@@ -2567,6 +2927,67 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertEqual(persist.call_args.args[0], lane_id)
         self.assertEqual(persist.call_args.args[1]["terminal_head_sha"], SHA)
         self.assertNotIn("terminal_head_sha", persist.call_args.kwargs)
+        acquire.assert_not_called()
+
+    def test_mcp_entry_routes_exact_successor_handoff_without_generic_assessment(self) -> None:
+        params = self.parameters()
+        stored_inputs, receipt = self.store_lane(params)
+        lane_id = str(stored_inputs["lane_id"])
+        expected = {"lane_id": lane_id, "closeout_state": "successor_handoff"}
+        with (
+            patch.object(work_acquire.operator, "_require_operator_mutation"),
+            patch.object(
+                work_acquire,
+                "persist_successor_handoff_closeout",
+                return_value=expected,
+            ) as persist,
+            patch.object(
+                work_acquire.lane_closeout,
+                "assess",
+                side_effect=AssertionError(
+                    "successor handoff must not use generic observation"
+                ),
+            ) as assess,
+            patch.object(work_acquire, "acquire_work") as acquire,
+        ):
+            result = work_acquire.grabowski_work_acquire(
+                source_kind=str(params["source_kind"]),
+                source_id=str(params["source_id"]),
+                controller_actor=str(params["controller_actor"]),
+                repo=str(params["repo"]),
+                base_head=str(params["base_head"]),
+                branch=str(params["branch"]),
+                target_path=str(params["target_path"]),
+                purpose=str(params["purpose"]),
+                retention_until_unix=int(params["retention_until_unix"]),
+                idempotency_key=str(params["idempotency_key"]),
+                scoped_writer_actor=str(params["scoped_writer_actor"]),
+                ttl_seconds=int(params["ttl_seconds"]),
+                terminal_closeout={
+                    "expected_receipt_sha256": str(receipt["receipt_sha256"]),
+                    "successor_handoff": {
+                        "lane_id": lane_id,
+                        "successor_lane_id": "b" * 32,
+                        "expected_predecessor_head": SHA,
+                        "expected_successor_head": "c" * 40,
+                        "expected_successor_receipt_sha256": "d" * 64,
+                        "expected_pr_number": 1329,
+                    },
+                },
+            )
+        self.assertEqual(expected, result)
+        persist.assert_called_once_with(
+            lane_id,
+            successor_lane_id="b" * 32,
+            expected_predecessor_head=SHA,
+            expected_successor_head="c" * 40,
+            expected_successor_receipt_sha256="d" * 64,
+            expected_pr_number=1329,
+            expected_receipt_sha256=str(receipt["receipt_sha256"]),
+            audit_fn=work_acquire.operator.base._append_audit_with_digest,
+            audit_lookup_fn=work_acquire._find_terminal_closeout_audit,
+        )
+        assess.assert_not_called()
         acquire.assert_not_called()
 
     def test_mcp_entry_reconciles_only_missing_terminal_audit_without_reassessment(self) -> None:
