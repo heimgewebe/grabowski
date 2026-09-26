@@ -164,7 +164,7 @@ def _historical_review_role_module_matches(
         ):
             return False
         payload = resolved.read_bytes()
-    except (FileNotFoundError, OSError, ValueError):
+    except (FileNotFoundError, OSError, RuntimeError, ValueError):
         return False
 
     parts = relative.parts

@@ -454,6 +454,10 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
             outside.parent.mkdir()
             outside.write_bytes(current_module.read_bytes())
             historical_module.write_bytes(b"changed-review-role-module")
+            loop_a = release_root / "loop-a"
+            loop_b = release_root / "loop-b"
+            loop_a.symlink_to(loop_b)
+            loop_b.symlink_to(loop_a)
 
             with mock.patch.object(
                 reviews, "REVIEW_ROLE_RELEASE_ROOT", release_root
@@ -462,6 +466,7 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
                     rotated(Path("~missing-user/grabowski_agent_role.py")),
                     rotated(outside),
                     rotated(historical_module),
+                    rotated(loop_a),
                 ):
                     with self.subTest(path=provenance["runner_module_path"]):
                         with self.assertRaisesRegex(
