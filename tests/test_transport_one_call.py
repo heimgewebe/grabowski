@@ -908,6 +908,25 @@ class OperatorSignedTransportTests(unittest.TestCase):
         self.assertRegex(evidence["grip_contract_sha256"], r"^[0-9a-f]{64}$")
         self.assertRegex(evidence["parameters_sha256"], r"^[0-9a-f]{64}$")
 
+        uppercase_heads = {
+            **arguments,
+            "parameters": {
+                **arguments["parameters"],
+                "expected_local_head": "A" * 40,
+                "expected_remote_head": "B" * 40,
+            },
+        }
+        with mock.patch.object(
+            operator.grabowski_physical_checkout,
+            "capture_physical_checkout_identity",
+            return_value={"physical_identity_sha256": "f" * 64},
+        ):
+            uppercase_evidence = operator._signed_replay_recovery_preflight(
+                tool_name="grip_run",
+                arguments=uppercase_heads,
+            )
+        self.assertIsInstance(uppercase_evidence, dict)
+
         current_spec = operator.grabowski_grips.GRIP_SPECS["post-merge-sync-apply"]
         drifted_spec = SimpleNamespace(
             name=current_spec.name,
@@ -1997,7 +2016,6 @@ class OperatorSignedTransportTests(unittest.TestCase):
             ),
             "ghe.example.internal",
         )
-
     def test_isolated_github_repo_like_option_value_is_not_a_selector(self) -> None:
         source = {"GH_HOST": "github.com"}
         self.assertEqual(

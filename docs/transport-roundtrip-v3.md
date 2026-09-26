@@ -28,6 +28,8 @@ Der Reentry ist zusätzlich an den aktuellen Grip-Vertrag gebunden. Seit `post-m
 
 Die Domain prüft denselben physischen Digest erneut beim Eintritt, nach Erwerb der Repository-Leases und vor erfolgreichem finalem Readback. Zusätzlich müssen geschützter kanonischer Checkout, saubere exakte Preimage, Remote-Head-Bindung, Fast-Forward-Prüfung, exklusive Worktree/Common-Dir/Branch-Serialisierung, Branch-CAS, verifizierter Post-State und fail-closed `outcome_unknown` Bestandteil der Acceptance-Gates bleiben. Ein bereits abgeschlossener vorheriger Effekt konvergiert auf `already_synced`; Physical-Identity-, Dirty-, Drift-, Lease-, CAS- oder mehrdeutige Teilzustände blockieren weiterhin mit `retry_authorized=false`. Ändert sich Version, Required-Parameter-, Effect-, Runner-, Operation-Class- oder Acceptance-Vertrag des Grips, fällt die Replay-Ausnahme automatisch wieder fail-closed.
 
+Die terminalen Remote-, Physical- und Local-Checks sind dabei bewusst eine gebundene **Sequenz von Beobachtungen**, kein atomarer Snapshot über einen lokal und extern unabhängig veränderbaren Zustand. `remote_head_verified=true` bedeutet, dass der exakt gebundene Remote-Head am vorgesehenen Remote-Readback beobachtet wurde; eine spätere externe Änderung ist neuer Zustand und keine Replay-Autorität. Der Vertrag simuliert deshalb keine atomare Gleichzeitigkeit durch endlos alternierende Remote-/Local-Rechecks.
+
 Für die zentrale Effect-Admission wird dieser Reentry nicht als neuer Transport-Receipt ausgegeben. Stattdessen bleibt er an den Digest der bereits signierten Runtime gebunden, sodass die vorhandene Writer-Fence- und Audit-Admission weiter greift. Andere Grips, andere Argumentdigests und generische Replay-Fälle bleiben unverändert gesperrt.
 
 ### Roundtrip-Fallback

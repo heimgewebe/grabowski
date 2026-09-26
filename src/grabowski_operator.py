@@ -1404,10 +1404,10 @@ def _post_merge_sync_apply_replay_preflight(
         or "\x00" in repo
         or target_branch not in {"main", "master"}
         or not isinstance(expected_local_head, str)
-        or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", expected_local_head)
+        or re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", expected_local_head)
         is None
         or not isinstance(expected_remote_head, str)
-        or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", expected_remote_head)
+        or re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", expected_remote_head)
         is None
         or len(expected_local_head) != len(expected_remote_head)
         or not isinstance(expected_physical_identity_sha256, str)
