@@ -1397,6 +1397,84 @@ class BureauIntakeAdapterTests(unittest.TestCase):
             invoke.call_args.args[0],
         )
 
+    def test_acceptance_authenticate_delegates_exact_digest_bound_call(self) -> None:
+        expected_sha256 = "a" * 64
+        with mock.patch.object(
+            intake,
+            "_invoke_bureau",
+            return_value={
+                "schema_version": 1,
+                "kind": "bureau.manual_acceptance_authentication_receipt",
+                "status": "authenticated",
+            },
+        ) as invoke:
+            result = intake.grabowski_bureau_acceptance_authenticate(
+                "BUR-RUN-20260926T165340Z-1addeb3bd4",
+                "offline-recovery-key",
+                expected_sha256,
+                "manual-gate-d-reviewer-20260926-r6",
+            )
+        self.assertEqual("authenticated", result["status"])
+        self.assertEqual(
+            [
+                "--json",
+                "--json-envelope",
+                "--state-root",
+                str(intake.BUREAU_STATE_ROOT),
+                "acceptance-authenticate",
+                "BUR-RUN-20260926T165340Z-1addeb3bd4",
+                "offline-recovery-key",
+                "--expected-evidence-sha256",
+                expected_sha256,
+                "--reviewer",
+                "manual-gate-d-reviewer-20260926-r6",
+            ],
+            invoke.call_args.args[0],
+        )
+        self.assertTrue(invoke.call_args.kwargs["mutation"])
+        self.assertEqual(
+            ["bureau_run:BUR-RUN-20260926T165340Z-1addeb3bd4"],
+            invoke.call_args.kwargs["required_readback"],
+        )
+
+    def test_acceptance_authenticate_rejects_invalid_bindings_before_dispatch(self) -> None:
+        invalid = (
+            ("", "criterion", "a" * 64, "reviewer"),
+            ("run\x00id", "criterion", "a" * 64, "reviewer"),
+            ("run", "", "a" * 64, "reviewer"),
+            ("run", "criterion", "A" * 64, "reviewer"),
+            ("run", "criterion", "a" * 63, "reviewer"),
+            ("run", "criterion", "a" * 64, ""),
+            ("run", "criterion", "a" * 64, "reviewer\x00x"),
+        )
+        for values in invalid:
+            with self.subTest(values=values), mock.patch.object(
+                intake, "_invoke_bureau"
+            ) as invoke:
+                with self.assertRaises(ValueError):
+                    intake.grabowski_bureau_acceptance_authenticate(*values)
+                invoke.assert_not_called()
+
+    def test_acceptance_authenticate_registered_schema_is_exact(self) -> None:
+        if not hasattr(intake.mcp, "list_tools"):
+            self.skipTest("real FastMCP unavailable in dependency-free validation")
+        tool = next(
+            item
+            for item in asyncio.run(intake.mcp.list_tools())
+            if item.name == "grabowski_bureau_acceptance_authenticate"
+        )
+        schema = tool.inputSchema
+        self.assertEqual(
+            {
+                "run_id",
+                "criterion_id",
+                "expected_evidence_sha256",
+                "reviewer",
+            },
+            set(schema["properties"]),
+        )
+        self.assertEqual(set(schema["properties"]), set(schema["required"]))
+
     def test_registry_defaults_use_isolated_control_checkout(self) -> None:
         expected = str(intake.bureau_runtime.BUREAU_CONTROL_ROOT)
         functions = (

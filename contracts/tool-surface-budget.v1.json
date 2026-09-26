@@ -203,6 +203,31 @@
         "tool": "grabowski_browser_worker_stored_form_action"
       }
     },
+    "grabowski_bureau_acceptance_authenticate": {
+      "evidence_refs": [
+        "bureau-candidate:candidate-5d867671026ec0c9c7a19462",
+        "friction:eb499f6bf267433da2a83d37721ce34a",
+        "tests:test_bureau_intake_adapter.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool authenticates only one exact manual Bureau acceptance evidence item bound to the caller-supplied run, criterion, evidence digest and reviewer.",
+        "evidence": "Bureau remains authoritative for current run revision, evidence bundle digest, observation scope, reviewer separation, append-only journal identity and idempotent readback; Grabowski validates only the narrow transport fields and preserves ambiguous mutation readback."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "The generic terminal plus dynamic transport-roundtrip route was observed to be blocked upstream before Grabowski execution and exposes arbitrary argv authority. Repackaging through shell, root, Fleet or Python was rejected as broader and as a policy bypass.",
+      "rationale": "Manual acceptance authentication is a distinct append-only Bureau authority transition. A first-class four-field surface is narrower than generic command execution and delegates all domain semantics to Bureau unchanged.",
+      "tool_contract": {
+        "authority_class": "mutation",
+        "category": "bureau",
+        "effects": [
+          "bureau_acceptance_authentication_event"
+        ],
+        "read_only": false,
+        "reversibility": "append-only-idempotent-attestation",
+        "risk_class": "medium",
+        "tool": "grabowski_bureau_acceptance_authenticate"
+      }
+    },
     "grabowski_bureau_candidate_assess": {
       "evidence_refs": [
         "bureau:OPERATOR-MACHINE-READABILITY-V1-T017",

@@ -8,6 +8,7 @@ Der Adapter stellt den in Bureau definierten Operator-Intake-Vertrag als schmale
 
 | Werkzeug | Wirkung |
 |---|---|
+| `grabowski_bureau_acceptance_authenticate` | Authentifiziert genau ein run-/criterion-/digest-/reviewer-gebundenes manuelles Acceptance-Item über Bureaus kanonischen StateStore-Journalvertrag. |
 | `grabowski_bureau_candidate_record` | Hängt einen quellgebundenen Kandidaten oder eine append-only Korrektur idempotent an das Bureau Live Register an. |
 | `grabowski_bureau_candidate_assess` | Bewertet einen Kandidaten read-only gegen aktuelle Registry- und Live-Register-Wahrheit. |
 | `grabowski_bureau_task_propose` | Erzeugt ein digestgebundenes privates Proposal-Artefakt; Registry und Queue bleiben unverändert. |
@@ -16,6 +17,8 @@ Der Adapter stellt den in Bureau definierten Operator-Intake-Vertrag als schmale
 | `grabowski_bureau_task_publish` | Erwirbt zwei exakte Kurzleasen, publiziert Branch und Pull Request und gibt Leases nur nach eindeutigem Ausgang frei. |
 
 ## Kandidaten-Refinement
+
+`grabowski_bureau_acceptance_authenticate` besitzt keine eigene Acceptance-Domänenlogik. Grabowski validiert nur die vier Transportfelder `run_id`, `criterion_id`, `expected_evidence_sha256` und `reviewer`, ruft den immutable Bureau-Launcher mit `acceptance-authenticate` und explizitem State-Root auf und behandelt Mutationsambiguität als rungebundene Readback-Pflicht. Current-run revision, Evidence-Digest, Observation-Scope, Reviewer-Trennung, Journal-Idempotenz und Authentifizierungswahrheit bleiben ausschließlich bei Bureau.
 
 `grabowski_bureau_candidate_record` transportiert optional `supersedes_event_id` unverändert im digestgebundenen Request. Typprüfung, Aktualität, Kandidatenzugehörigkeit und Supersession-Zulässigkeit entscheidet ausschließlich der append-only Bureau-Live-Register-Vertrag; der Adapter bewahrt dessen wirkungsfreie Fehler- und Readback-Semantik ohne eigene Domänenentscheidung.
 

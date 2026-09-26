@@ -43,6 +43,7 @@ ARTIFACT_ROOT = Path(
     )
 ).expanduser()
 BUREAU_ROOT = bureau_runtime.BUREAU_CONTROL_ROOT
+BUREAU_STATE_ROOT = Path.home() / ".local/state/bureau"
 MAX_INPUT_BYTES = 1024 * 1024
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 COMMAND_TIMEOUT_SECONDS = 30
@@ -76,6 +77,7 @@ BUREAU_FAILURE_IDENTITY_SCHEMA_VERSION = 1
 BUREAU_ADAPTER_SURFACE = "grabowski_bureau_intake"
 BUREAU_ADAPTER_COMMANDS = frozenset(
     {
+        "acceptance-authenticate",
         "operator-candidate-assess",
         "operator-candidate-record",
         "operator-task-propose",
@@ -1446,6 +1448,63 @@ def grabowski_bureau_candidate_assess(
         if value:
             arguments.extend([option, value])
     return _invoke_bureau(arguments)
+
+
+@mcp.tool(name="grabowski_bureau_acceptance_authenticate", annotations=MUTATING)
+def grabowski_bureau_acceptance_authenticate(
+    run_id: str,
+    criterion_id: str,
+    expected_evidence_sha256: str,
+    reviewer: str,
+) -> dict[str, Any]:
+    """Authenticate one exact manual Bureau acceptance item through Bureau's canonical contract."""
+    operator._require_operator_mutation("bureau_mutation")
+    normalized: dict[str, str] = {}
+    for label, value, maximum in (
+        ("run_id", run_id, 128),
+        ("criterion_id", criterion_id, 256),
+        ("reviewer", reviewer, 200),
+    ):
+        if not isinstance(value, str):
+            raise ValueError(f"{label} must be text")
+        current = value.strip()
+        if not current or "\x00" in current or len(current) > maximum:
+            raise ValueError(
+                f"{label} must contain 1-{maximum} non-NUL characters"
+            )
+        normalized[label] = current
+    if (
+        not isinstance(expected_evidence_sha256, str)
+        or SHA256_RE.fullmatch(expected_evidence_sha256) is None
+    ):
+        raise ValueError(
+            "expected_evidence_sha256 must be a lowercase SHA-256 digest"
+        )
+    payload = _invoke_bureau(
+        [
+            "--json",
+            "--json-envelope",
+            "--state-root",
+            str(BUREAU_STATE_ROOT),
+            "acceptance-authenticate",
+            normalized["run_id"],
+            normalized["criterion_id"],
+            "--expected-evidence-sha256",
+            expected_evidence_sha256,
+            "--reviewer",
+            normalized["reviewer"],
+        ],
+        mutation=True,
+        required_readback=[f"bureau_run:{normalized['run_id']}"],
+    )
+    _audit(
+        "bureau-acceptance-authenticate",
+        payload,
+        run_id=normalized["run_id"],
+        criterion_id=normalized["criterion_id"],
+        expected_evidence_sha256=expected_evidence_sha256,
+    )
+    return payload
 
 
 @mcp.tool(name="grabowski_bureau_task_propose", annotations=MUTATING)

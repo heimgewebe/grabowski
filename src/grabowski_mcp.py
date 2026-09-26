@@ -787,6 +787,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_gui_worker_status": ("gui_worker",),
     "grabowski_gui_worker_stop": ("gui_worker",),
     "grabowski_gui_worker_list": ("gui_worker",),
+    "grabowski_bureau_acceptance_authenticate": ("bureau_mutation",),
     "grabowski_bureau_candidate_record": ("bureau_mutation",),
     "grabowski_bureau_candidate_assess": (),
     "grabowski_bureau_task_propose": ("bureau_mutation",),
@@ -801,6 +802,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
 OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
     "grabowski_service_logs",
     "grabowski_work_acquire",
+    "grabowski_bureau_acceptance_authenticate",
     "grabowski_bureau_candidate_record",
     "grabowski_bureau_task_propose",
     "grabowski_bureau_task_review",
