@@ -40,6 +40,90 @@ def task_payload() -> dict:
 
 
 class CurrentWorkSurfaceTests(unittest.TestCase):
+    def test_attention_payload_uses_bounded_projection_only_for_current_work(
+        self,
+    ) -> None:
+        calls: list[tuple[dict, dict]] = []
+
+        def reconcile(parameters: dict, **kwargs: object) -> dict:
+            calls.append((parameters, kwargs))
+            return {"records": [], "pagination": {"has_more": False}}
+
+        fake_attention = SimpleNamespace(
+            MAX_PAGE_LIMIT=100,
+            reconcile_attention=reconcile,
+        )
+        with patch.object(surface, "_module", return_value=fake_attention):
+            surface._attention_payload("current")
+            surface._attention_payload("history")
+
+        self.assertEqual(
+            (
+                {"limit": 100, "view": "current"},
+                {"_bounded_current_projection": True},
+            ),
+            calls[0],
+        )
+        self.assertEqual(
+            ({"limit": 100, "view": "history"}, {}),
+            calls[1],
+        )
+
+    def test_current_work_caps_parallel_source_workers(self) -> None:
+        real_executor = surface.ThreadPoolExecutor
+        observed_max_workers: list[int] = []
+
+        def executor_factory(*args: object, **kwargs: object):
+            observed_max_workers.append(int(kwargs["max_workers"]))
+            return real_executor(*args, **kwargs)
+
+        operator = SimpleNamespace(
+            _require_operator_capability=lambda capability: None
+        )
+        with patch.object(
+            surface,
+            "ThreadPoolExecutor",
+            side_effect=executor_factory,
+        ), patch.object(
+            surface, "_operator", return_value=operator
+        ), patch.object(
+            surface, "_task_payload", return_value=task_payload()
+        ), patch.object(
+            surface,
+            "_attention_payload",
+            return_value={"records": [], "pagination": {"has_more": False}},
+        ), patch.object(
+            surface,
+            "_resources_payload",
+            return_value={"leases": [], "count": 0, "truncated": False},
+        ), patch.object(
+            surface,
+            "_checkout_payloads",
+            return_value=[{"repository": REPOSITORY, "worktrees": []}],
+        ), patch.object(
+            surface,
+            "_reconciliation_payload",
+            return_value={
+                "bindings": [],
+                "pagination": {"has_more": False},
+                "total_count": 0,
+            },
+        ), patch.object(
+            surface, "_tmux_payload", return_value={"returncode": 0, "stdout": ""}
+        ), patch.object(
+            surface, "_process_payload", return_value={"returncode": 0, "lines": []}
+        ), patch.object(
+            surface,
+            "_worker_payload",
+            side_effect=lambda kind, view: {"workers": [], "has_more": False},
+        ):
+            surface.grabowski_current_work([REPOSITORY])
+
+        self.assertEqual(
+            [surface.CURRENT_WORK_MAX_PARALLEL_SOURCES],
+            observed_max_workers,
+        )
+
     def test_surface_collects_sources_without_creating_a_second_truth(self) -> None:
         operator = SimpleNamespace(_require_operator_capability=lambda capability: None)
         with patch.object(surface, "_operator", return_value=operator), patch.object(
