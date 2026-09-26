@@ -1104,14 +1104,14 @@ def converge_terminal_resource_closeout(
         }
 
 
-def persist_terminal_closeout(
+def _persist_terminal_closeout_impl(
     lane_id: str,
     assessment: dict[str, Any],
     *,
     expected_receipt_sha256: str,
     audit_fn: Callable[[dict[str, Any]], str | None] | None = None,
     audit_lookup_fn: Callable[[dict[str, Any]], str | None] | None = None,
-    _pre_effect_guard: Callable[[dict[str, Any], dict[str, Any]], None] | None = None,
+    _successor_handoff_guard: Callable[[dict[str, Any], dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """CAS-persist one terminal assessment and converge release-ready lane leases.
 
@@ -1172,10 +1172,10 @@ def persist_terminal_closeout(
 
         if (
             validated.get("closeout_state") == "successor_handoff"
-            and _pre_effect_guard is None
+            and _successor_handoff_guard is None
         ):
             raise RuntimeError(
-                "successor handoff terminal effects require the live pre-effect guard"
+                "successor handoff terminal effects require persist_successor_handoff_closeout"
             )
 
         pending = _terminal_closeout_pending_assessment(record)
@@ -1241,8 +1241,8 @@ def persist_terminal_closeout(
         # The durable pending intent prevents normal work-acquire replay from
         # re-entering execution while terminal effects converge.  Checkout
         # validation comes first so dirty/head drift fails before lease release.
-        if _pre_effect_guard is not None:
-            _pre_effect_guard(record, effective)
+        if _successor_handoff_guard is not None:
+            _successor_handoff_guard(record, effective)
         lifecycle = _converge_terminal_checkout_lifecycle(
             record, assessment=effective
         )
@@ -1288,6 +1288,29 @@ def persist_terminal_closeout(
         if resource_closeout is not None:
             result["resource_lease_closeout"] = resource_closeout
         return result
+
+
+def persist_terminal_closeout(
+    lane_id: str,
+    assessment: dict[str, Any],
+    *,
+    expected_receipt_sha256: str,
+    audit_fn: Callable[[dict[str, Any]], str | None] | None = None,
+    audit_lookup_fn: Callable[[dict[str, Any]], str | None] | None = None,
+) -> dict[str, Any]:
+    """Persist ordinary terminal closeout; successor handoff has one typed entrypoint."""
+    validated = lane_closeout.validate_terminal_assessment(assessment)
+    if validated.get("closeout_state") == "successor_handoff":
+        raise RuntimeError(
+            "successor handoff closeout must use persist_successor_handoff_closeout"
+        )
+    return _persist_terminal_closeout_impl(
+        lane_id,
+        validated,
+        expected_receipt_sha256=expected_receipt_sha256,
+        audit_fn=audit_fn,
+        audit_lookup_fn=audit_lookup_fn,
+    )
 
 
 def _successor_handoff_binding(assessment: dict[str, Any]) -> dict[str, Any]:
@@ -1451,6 +1474,8 @@ def _verify_successor_handoff_locked(
     predecessor_record: dict[str, Any],
     successor_record: dict[str, Any],
     assessment: dict[str, Any],
+    *,
+    successor_receipt_path: Path | None = None,
 ) -> dict[str, Any]:
     binding = _successor_handoff_binding(assessment)
     predecessor_lane_id = str(binding["predecessor_lane_id"])
@@ -1562,6 +1587,8 @@ def _verify_successor_handoff_locked(
     )
     if int(ancestry.get("returncode", 1)) != 0:
         raise RuntimeError("successor handoff successor head is not a descendant")
+    # Publication deliberately keeps the predecessor PR branch name while
+    # the exact head SHA comes from the successor lane after base convergence.
     publication = _github_open_pr_exact_head(
         repo,
         pr_number=int(binding["pr_number"]),
@@ -1594,13 +1621,21 @@ def _verify_successor_handoff_locked(
         ignored_lease_owner_ids=[successor_owner],
     )
     checkouts._require_no_blockers(final_successor_coordination)
+    final_successor_record = successor_record
+    if successor_receipt_path is not None:
+        reread = _read_state(successor_receipt_path)
+        if reread is None or reread.get("lane_id") != successor_lane_id:
+            raise RuntimeError("successor Work Lane receipt disappeared after publication")
+        if reread.get("receipt_sha256") != binding["successor_receipt_sha256"]:
+            raise RuntimeError("successor handoff successor receipt changed after publication")
+        final_successor_record = reread
     (
         _final_owner,
         _final_registered,
         _final_leases,
         minimum_remaining,
     ) = _successor_handoff_live_leases(
-        successor_record,
+        final_successor_record,
         expected_owner=successor_owner,
         expected_registered=successor_registered,
         expected_leases=successor_leases,
@@ -1652,13 +1687,18 @@ def persist_successor_handoff_closeout(
             raise RuntimeError("work-lane receipt is missing or bound to another lane")
         existing = _terminal_closeout_assessment(predecessor_record)
     if existing is not None:
-        return persist_terminal_closeout(
+        result = _persist_terminal_closeout_impl(
             lane_id,
             assessment,
             expected_receipt_sha256=expected_receipt_sha256,
             audit_fn=audit_fn,
             audit_lookup_fn=audit_lookup_fn,
         )
+        return {
+            **result,
+            "replayed": True,
+            "successor_handoff_verification": None,
+        }
 
     # Check immutable lineage before nested locking. This makes the only valid
     # lock direction successor -> predecessor and prevents reverse-handoff cycles.
@@ -1683,19 +1723,28 @@ def persist_successor_handoff_closeout(
                 predecessor_record_value,
                 current_successor,
                 assessment_value,
+                successor_receipt_path=successor_receipt_path,
             )
             verification.clear()
             verification.update(current)
 
-        result = persist_terminal_closeout(
+        result = _persist_terminal_closeout_impl(
             lane_id,
             assessment,
             expected_receipt_sha256=expected_receipt_sha256,
             audit_fn=audit_fn,
             audit_lookup_fn=audit_lookup_fn,
-            _pre_effect_guard=pre_effect_guard,
+            _successor_handoff_guard=pre_effect_guard,
         )
-    return {**result, "successor_handoff_verification": verification}
+    if result.get("replayed") is True and not verification:
+        return {
+            **result,
+            "replayed": True,
+            "successor_handoff_verification": None,
+        }
+    if not verification:
+        raise RuntimeError("successor handoff verification was not produced")
+    return {**result, "successor_handoff_verification": dict(verification)}
 
 
 def _write_path_resource_keys(repo: Path, value: Any) -> list[str]:

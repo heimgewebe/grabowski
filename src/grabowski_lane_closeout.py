@@ -94,6 +94,53 @@ def sha256_json(value: Any) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
+def _validate_successor_handoff_assessment(value: Mapping[str, Any]) -> None:
+    binding = value.get("successor_handoff")
+    required = {
+        "schema_version",
+        "kind",
+        "predecessor_lane_id",
+        "successor_lane_id",
+        "predecessor_head_sha",
+        "successor_head_sha",
+        "successor_receipt_sha256",
+        "pr_number",
+    }
+    if not isinstance(binding, Mapping) or set(binding) != required:
+        raise LaneCloseoutError("successor handoff assessment binding is invalid")
+    if (
+        binding.get("schema_version") != 1
+        or binding.get("kind") != "grabowski.work_lane_successor_handoff"
+    ):
+        raise LaneCloseoutError("successor handoff assessment binding identity is invalid")
+    predecessor_lane = binding.get("predecessor_lane_id")
+    successor_lane = binding.get("successor_lane_id")
+    predecessor_head = binding.get("predecessor_head_sha")
+    successor_head = binding.get("successor_head_sha")
+    successor_receipt = binding.get("successor_receipt_sha256")
+    pr_number = binding.get("pr_number")
+    if not isinstance(predecessor_lane, str) or LANE_ID.fullmatch(predecessor_lane) is None:
+        raise LaneCloseoutError("successor handoff predecessor lane is invalid")
+    if not isinstance(successor_lane, str) or LANE_ID.fullmatch(successor_lane) is None:
+        raise LaneCloseoutError("successor handoff successor lane is invalid")
+    if predecessor_lane == successor_lane:
+        raise LaneCloseoutError("successor handoff successor must differ from predecessor")
+    if not isinstance(predecessor_head, str) or SHA.fullmatch(predecessor_head) is None:
+        raise LaneCloseoutError("successor handoff predecessor head is invalid")
+    if not isinstance(successor_head, str) or SHA.fullmatch(successor_head) is None:
+        raise LaneCloseoutError("successor handoff successor head is invalid")
+    if not isinstance(successor_receipt, str) or SHA256.fullmatch(successor_receipt) is None:
+        raise LaneCloseoutError("successor handoff successor receipt is invalid")
+    if isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number <= 0:
+        raise LaneCloseoutError("successor handoff PR number is invalid")
+    if value.get("lane_id") != predecessor_lane:
+        raise LaneCloseoutError("successor handoff predecessor lane binding drifted")
+    if value.get("terminal_head_sha") != predecessor_head:
+        raise LaneCloseoutError("successor handoff predecessor head binding drifted")
+    if value.get("observation_sha256") != sha256_json(dict(binding)):
+        raise LaneCloseoutError("successor handoff observation digest mismatch")
+
+
 def validate_terminal_assessment(value: Mapping[str, Any]) -> dict[str, Any]:
     """Validate an exact terminal assess() result before durable reuse."""
     if not isinstance(value, Mapping):
@@ -105,6 +152,10 @@ def validate_terminal_assessment(value: Mapping[str, Any]) -> dict[str, Any]:
         not isinstance(terminal_head_sha, str) or SHA.fullmatch(terminal_head_sha) is None
     ):
         raise LaneCloseoutError("terminal closeout assessment head is invalid")
+    if value.get("closeout_state") == "successor_handoff":
+        _validate_successor_handoff_assessment(value)
+    elif "successor_handoff" in value:
+        raise LaneCloseoutError("non-handoff assessment contains successor handoff binding")
     supplied = value.get("assessment_sha256")
     material = {
         key: item for key, item in value.items()

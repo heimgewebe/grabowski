@@ -1501,35 +1501,49 @@ class WorkAcquireTests(unittest.TestCase):
             closeout.validate_terminal_assessment(assessment),
         )
 
-    def test_terminal_closeout_runs_successor_guard_before_lifecycle_and_release(self) -> None:
+    def test_successor_handoff_assessment_rejects_digest_valid_malformed_binding(self) -> None:
+        assessment = closeout.assess_successor_handoff(
+            lane_id="a" * 32,
+            successor_lane_id="b" * 32,
+            predecessor_head_sha="c" * 40,
+            successor_head_sha="d" * 40,
+            successor_receipt_sha256="e" * 64,
+            pr_number=1329,
+            observed_at_unix=200,
+        )
+        malformed = dict(assessment)
+        binding = dict(assessment["successor_handoff"])
+        binding.pop("pr_number")
+        malformed["successor_handoff"] = binding
+        malformed["observation_sha256"] = closeout.sha256_json(binding)
+        material = {
+            key: value
+            for key, value in malformed.items()
+            if key not in {"assessment_sha256", "audit_record_sha256", "does_not_establish"}
+        }
+        malformed["assessment_sha256"] = closeout.sha256_json(material)
+        with self.assertRaisesRegex(
+            closeout.LaneCloseoutError,
+            "successor handoff assessment binding is invalid",
+        ):
+            closeout.validate_terminal_assessment(malformed)
+
+    def test_terminal_closeout_does_not_expose_generic_pre_effect_guard(self) -> None:
         params = self.parameters()
         _inputs, receipt = self.store_lane(params)
         lane_id = str(receipt["lane_id"])
         assessment = self.terminal_assessment(lane_id, 200)
-        order: list[str] = []
-
-        def guard(_record: dict, _assessment: dict) -> None:
-            order.append("guard")
-
-        with (
-            patch.object(
-                work_acquire,
-                "_converge_terminal_checkout_lifecycle",
-                side_effect=lambda *_args, **_kwargs: order.append("lifecycle"),
-            ),
-            patch.object(
-                work_acquire,
-                "_converge_terminal_resource_leases",
-                side_effect=lambda *_args, **_kwargs: order.append("release"),
-            ),
-        ):
+        self.assertNotIn(
+            "_pre_effect_guard",
+            inspect.signature(work_acquire.persist_terminal_closeout).parameters,
+        )
+        with self.assertRaises(TypeError):
             work_acquire.persist_terminal_closeout(
                 lane_id,
                 assessment,
                 expected_receipt_sha256=str(receipt["receipt_sha256"]),
-                _pre_effect_guard=guard,
+                _pre_effect_guard=lambda *_args: None,
             )
-        self.assertEqual(["guard", "lifecycle", "release"], order)
 
     def test_successor_handoff_cannot_bypass_live_pre_effect_guard(self) -> None:
         params = self.parameters()
@@ -1544,7 +1558,10 @@ class WorkAcquireTests(unittest.TestCase):
             pr_number=1329,
             observed_at_unix=200,
         )
-        with self.assertRaisesRegex(RuntimeError, "live pre-effect guard"):
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "must use persist_successor_handoff_closeout",
+        ):
             work_acquire.persist_terminal_closeout(
                 lane_id,
                 assessment,
@@ -1569,7 +1586,7 @@ class WorkAcquireTests(unittest.TestCase):
                 "_stored_lane_inputs",
                 return_value={"source": {"kind": "direct", "id": "other"}},
             ),
-            patch.object(work_acquire, "persist_terminal_closeout") as persist,
+            patch.object(work_acquire, "_persist_terminal_closeout_impl") as persist,
             self.assertRaisesRegex(
                 RuntimeError, "successor source does not name predecessor"
             ),
@@ -1584,6 +1601,141 @@ class WorkAcquireTests(unittest.TestCase):
                 expected_receipt_sha256=str(receipt["receipt_sha256"]),
             )
         persist.assert_not_called()
+
+    def test_successor_handoff_persist_happy_path_and_replay_are_stable(self) -> None:
+        predecessor_params = self.parameters()
+        predecessor_inputs, predecessor_receipt = self.store_lane(predecessor_params)
+        predecessor_id = str(predecessor_inputs["lane_id"])
+
+        successor_params = self.parameters()
+        successor_params.update(
+            source_kind="work_lane",
+            source_id=predecessor_id,
+            branch="feat/authority-successor",
+            target_path=str(self.root / "successor-worktree"),
+            base_head="b" * 40,
+            idempotency_key="authority-successor",
+        )
+        successor_inputs, successor_receipt = self.store_lane(successor_params)
+        successor_id = str(successor_inputs["lane_id"])
+        verification = {
+            "schema_version": 1,
+            "kind": "grabowski.work_lane_successor_handoff_verification",
+            "successor_lane_id": successor_id,
+        }
+
+        with (
+            patch.object(
+                work_acquire,
+                "_verify_successor_handoff_locked",
+                return_value=verification,
+            ) as verify,
+            patch.object(
+                work_acquire,
+                "_converge_terminal_checkout_lifecycle",
+                return_value=None,
+            ),
+            patch.object(
+                work_acquire,
+                "_converge_terminal_resource_leases",
+                return_value=None,
+            ),
+        ):
+            first = work_acquire.persist_successor_handoff_closeout(
+                predecessor_id,
+                successor_lane_id=successor_id,
+                expected_predecessor_head=SHA,
+                expected_successor_head="b" * 40,
+                expected_successor_receipt_sha256=str(
+                    successor_receipt["receipt_sha256"]
+                ),
+                expected_pr_number=1329,
+                expected_receipt_sha256=str(predecessor_receipt["receipt_sha256"]),
+            )
+            stored = work_acquire._read_state(
+                work_acquire._state_root() / f"{predecessor_id}.json"
+            )
+            self.assertIsNotNone(stored)
+            assert stored is not None
+            second = work_acquire.persist_successor_handoff_closeout(
+                predecessor_id,
+                successor_lane_id=successor_id,
+                expected_predecessor_head=SHA,
+                expected_successor_head="b" * 40,
+                expected_successor_receipt_sha256=str(
+                    successor_receipt["receipt_sha256"]
+                ),
+                expected_pr_number=1329,
+                expected_receipt_sha256=str(stored["receipt_sha256"]),
+            )
+
+        self.assertFalse(first["replayed"])
+        self.assertEqual(
+            verification,
+            first["successor_handoff_verification"],
+        )
+        self.assertEqual(
+            "successor_handoff",
+            first["terminal_closeout"]["closeout_state"],
+        )
+        self.assertTrue(second["replayed"])
+        self.assertIsNone(second["successor_handoff_verification"])
+        verify.assert_called_once()
+
+    def test_successor_handoff_verifier_requires_ready_newer_successor(self) -> None:
+        predecessor_id = "a" * 32
+        successor_id = "b" * 32
+        predecessor_inputs = {
+            "lane_id": predecessor_id,
+            "lease_owner_id": f"lane:{predecessor_id}",
+            "repo": str(self.repo),
+            "target_path": str(self.target),
+            "branch": "topic-old",
+        }
+        successor_inputs = {
+            "lane_id": successor_id,
+            "lease_owner_id": f"lane:{successor_id}",
+            "repo": str(self.repo),
+            "target_path": str(self.root / "successor"),
+            "branch": "topic-new",
+            "base_head": "d" * 40,
+            "source": {"kind": "work_lane", "id": predecessor_id},
+            "resource_keys": ["path:/successor"],
+        }
+        predecessor = {
+            "lane_id": predecessor_id,
+            "inputs": predecessor_inputs,
+            "inputs_sha256": work_acquire._sha(predecessor_inputs),
+            "created_at_unix": 100,
+        }
+        successor = {
+            "lane_id": successor_id,
+            "inputs": successor_inputs,
+            "inputs_sha256": work_acquire._sha(successor_inputs),
+            "receipt_sha256": "e" * 64,
+            "created_at_unix": 101,
+            "state": "writer_starting",
+        }
+        assessment = closeout.assess_successor_handoff(
+            lane_id=predecessor_id,
+            successor_lane_id=successor_id,
+            predecessor_head_sha="c" * 40,
+            successor_head_sha="d" * 40,
+            successor_receipt_sha256="e" * 64,
+            pr_number=1329,
+            observed_at_unix=200,
+        )
+        with self.assertRaisesRegex(RuntimeError, "active ready successor lane"):
+            work_acquire._verify_successor_handoff_locked(
+                predecessor, successor, assessment
+            )
+
+        successor["state"] = "ready"
+        successor["created_at_unix"] = 100
+        with self.assertRaisesRegex(RuntimeError, "successor is not newer"):
+            work_acquire._verify_successor_handoff_locked(
+                predecessor, successor, assessment
+            )
 
     def test_successor_handoff_verifier_requires_exact_successor_receipt(self) -> None:
         predecessor_id = "a" * 32
@@ -1838,6 +1990,223 @@ class WorkAcquireTests(unittest.TestCase):
                 head="d" * 40,
             )
 
+    def test_successor_handoff_github_publication_rejects_closed_timeout_and_bad_json(self) -> None:
+        origin = {
+            "returncode": 0,
+            "timed_out": False,
+            "stdout_truncated": False,
+            "stdout": "git@github.com:heimgewebe/grabowski.git\n",
+        }
+        for state in ("CLOSED", "MERGED"):
+            with (
+                self.subTest(state=state),
+                patch.object(work_acquire, "_git_runner", return_value=origin),
+                patch.object(
+                    work_acquire.operator,
+                    "_run",
+                    return_value={
+                        "returncode": 0,
+                        "timed_out": False,
+                        "stdout_truncated": False,
+                        "stdout": json.dumps(
+                            {
+                                "number": 1329,
+                                "state": state,
+                                "headRefName": "topic-old",
+                                "headRefOid": "d" * 40,
+                            }
+                        ),
+                    },
+                ),
+                self.assertRaisesRegex(RuntimeError, "bound PR to remain open"),
+            ):
+                work_acquire._github_open_pr_exact_head(
+                    self.repo,
+                    pr_number=1329,
+                    branch="topic-old",
+                    head="d" * 40,
+                )
+
+        with (
+            patch.object(
+                work_acquire,
+                "_git_runner",
+                return_value={**origin, "stdout": "one\ntwo\n"},
+            ),
+            self.assertRaisesRegex(RuntimeError, "one exact origin remote"),
+        ):
+            work_acquire._github_open_pr_exact_head(
+                self.repo,
+                pr_number=1329,
+                branch="topic-old",
+                head="d" * 40,
+            )
+
+        with (
+            patch.object(work_acquire, "_git_runner", return_value=origin),
+            patch.object(
+                work_acquire.operator,
+                "_run",
+                return_value={
+                    "returncode": 0,
+                    "timed_out": True,
+                    "stdout_truncated": False,
+                    "stdout": "",
+                },
+            ),
+            self.assertRaisesRegex(RuntimeError, "GitHub PR readback failed"),
+        ):
+            work_acquire._github_open_pr_exact_head(
+                self.repo,
+                pr_number=1329,
+                branch="topic-old",
+                head="d" * 40,
+            )
+
+        with (
+            patch.object(work_acquire, "_git_runner", return_value=origin),
+            patch.object(
+                work_acquire.operator,
+                "_run",
+                return_value={
+                    "returncode": 0,
+                    "timed_out": False,
+                    "stdout_truncated": False,
+                    "stdout": "{not-json",
+                },
+            ),
+            self.assertRaisesRegex(RuntimeError, "invalid JSON"),
+        ):
+            work_acquire._github_open_pr_exact_head(
+                self.repo,
+                pr_number=1329,
+                branch="topic-old",
+                head="d" * 40,
+            )
+
+    def test_successor_handoff_verifier_rejects_dirty_checkout_and_ancestry_miss(self) -> None:
+        predecessor_id = "a" * 32
+        successor_id = "b" * 32
+        predecessor_inputs = {
+            "lane_id": predecessor_id,
+            "lease_owner_id": f"lane:{predecessor_id}",
+            "repo": str(self.repo),
+            "target_path": str(self.target),
+            "branch": "topic-old",
+        }
+        successor_inputs = {
+            "lane_id": successor_id,
+            "lease_owner_id": f"lane:{successor_id}",
+            "repo": str(self.repo),
+            "target_path": str(self.root / "successor"),
+            "branch": "topic-new",
+            "base_head": "d" * 40,
+            "source": {"kind": "work_lane", "id": predecessor_id},
+            "resource_keys": ["path:/successor"],
+        }
+        predecessor = {
+            "lane_id": predecessor_id,
+            "inputs": predecessor_inputs,
+            "inputs_sha256": work_acquire._sha(predecessor_inputs),
+            "created_at_unix": 100,
+        }
+        successor = {
+            "lane_id": successor_id,
+            "inputs": successor_inputs,
+            "inputs_sha256": work_acquire._sha(successor_inputs),
+            "receipt_sha256": "e" * 64,
+            "created_at_unix": 101,
+            "state": "ready",
+        }
+        assessment = closeout.assess_successor_handoff(
+            lane_id=predecessor_id,
+            successor_lane_id=successor_id,
+            predecessor_head_sha="c" * 40,
+            successor_head_sha="d" * 40,
+            successor_receipt_sha256="e" * 64,
+            pr_number=1329,
+            observed_at_unix=200,
+        )
+        lease = {
+            "resource_key": "path:/successor",
+            "owner_id": f"lane:{successor_id}",
+            "purpose": "verify",
+            "acquired_at_unix": 50,
+            "updated_at_unix": 60,
+            "expires_at_unix": 200,
+            "metadata_sha256": "f" * 64,
+        }
+        worktrees = [
+            (self.repo, self.repo / ".git", {"branch": "topic-old"}),
+            (self.repo, self.repo / ".git", {"branch": "topic-new"}),
+        ]
+        for dirty_index, message in ((0, "dirty predecessor"), (1, "dirty successor")):
+            side_effect = [None, None]
+            side_effect[dirty_index] = RuntimeError(message)
+            with (
+                self.subTest(message=message),
+                patch.object(
+                    work_acquire,
+                    "_terminal_lane_resource_observation",
+                    return_value=(
+                        f"lane:{successor_id}",
+                        ["path:/successor"],
+                        [lease],
+                    ),
+                ),
+                patch.object(work_acquire.time, "time", return_value=100),
+                patch.object(
+                    work_acquire.checkouts,
+                    "_worktree_for_path",
+                    side_effect=list(worktrees),
+                ),
+                patch.object(
+                    work_acquire.checkouts,
+                    "_require_clean_linked",
+                    side_effect=side_effect,
+                ),
+                patch.object(work_acquire.checkouts, "_require_expected"),
+                self.assertRaisesRegex(RuntimeError, message),
+            ):
+                work_acquire._verify_successor_handoff_locked(
+                    predecessor, successor, assessment
+                )
+
+        with (
+            patch.object(
+                work_acquire,
+                "_terminal_lane_resource_observation",
+                return_value=(
+                    f"lane:{successor_id}",
+                    ["path:/successor"],
+                    [lease],
+                ),
+            ),
+            patch.object(work_acquire.time, "time", return_value=100),
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                side_effect=list(worktrees),
+            ),
+            patch.object(work_acquire.checkouts, "_require_clean_linked"),
+            patch.object(work_acquire.checkouts, "_require_expected"),
+            patch.object(
+                work_acquire.checkouts,
+                "_linked_checkout_coordination",
+                return_value={},
+            ),
+            patch.object(work_acquire.checkouts, "_require_no_blockers"),
+            patch.object(
+                work_acquire,
+                "_git_runner",
+                return_value={"returncode": 1},
+            ),
+            self.assertRaisesRegex(RuntimeError, "successor head is not a descendant"),
+        ):
+            work_acquire._verify_successor_handoff_locked(
+                predecessor, successor, assessment
+            )
+
     def test_successor_handoff_rechecks_successor_checkout_after_publication(self) -> None:
         predecessor_id = "a" * 32
         successor_id = "b" * 32
@@ -1958,6 +2327,123 @@ class WorkAcquireTests(unittest.TestCase):
             )
         self.assertEqual(3, worktree.call_count)
         publication.assert_called_once()
+
+    def test_successor_handoff_rereads_successor_receipt_after_publication(self) -> None:
+        predecessor_id = "a" * 32
+        successor_id = "b" * 32
+        predecessor_inputs = {
+            "lane_id": predecessor_id,
+            "lease_owner_id": f"lane:{predecessor_id}",
+            "repo": str(self.repo),
+            "target_path": str(self.target),
+            "branch": "topic-old",
+        }
+        successor_inputs = {
+            "lane_id": successor_id,
+            "lease_owner_id": f"lane:{successor_id}",
+            "repo": str(self.repo),
+            "target_path": str(self.root / "successor"),
+            "branch": "topic-new",
+            "base_head": "d" * 40,
+            "source": {"kind": "work_lane", "id": predecessor_id},
+            "resource_keys": ["path:/successor"],
+        }
+        predecessor = {
+            "lane_id": predecessor_id,
+            "inputs": predecessor_inputs,
+            "inputs_sha256": work_acquire._sha(predecessor_inputs),
+            "created_at_unix": 100,
+        }
+        successor = {
+            "lane_id": successor_id,
+            "inputs": successor_inputs,
+            "inputs_sha256": work_acquire._sha(successor_inputs),
+            "receipt_sha256": "e" * 64,
+            "created_at_unix": 101,
+            "state": "ready",
+        }
+        assessment = closeout.assess_successor_handoff(
+            lane_id=predecessor_id,
+            successor_lane_id=successor_id,
+            predecessor_head_sha="c" * 40,
+            successor_head_sha="d" * 40,
+            successor_receipt_sha256="e" * 64,
+            pr_number=1329,
+            observed_at_unix=200,
+        )
+        lease = {
+            "resource_key": "path:/successor",
+            "owner_id": f"lane:{successor_id}",
+            "purpose": "verify",
+            "acquired_at_unix": 50,
+            "updated_at_unix": 60,
+            "expires_at_unix": 200,
+            "metadata_sha256": "f" * 64,
+        }
+        worktrees = [
+            (self.repo, self.repo / ".git", {"branch": "topic-old"}),
+            (self.repo, self.repo / ".git", {"branch": "topic-new"}),
+            (self.repo, self.repo / ".git", {"branch": "topic-new"}),
+        ]
+        drifted_successor = {**successor, "receipt_sha256": "f" * 64}
+        with (
+            patch.object(
+                work_acquire,
+                "_terminal_lane_resource_observation",
+                return_value=(
+                    f"lane:{successor_id}",
+                    ["path:/successor"],
+                    [lease],
+                ),
+            ),
+            patch.object(work_acquire.time, "time", return_value=100),
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                side_effect=worktrees,
+            ),
+            patch.object(work_acquire.checkouts, "_require_clean_linked"),
+            patch.object(work_acquire.checkouts, "_require_expected"),
+            patch.object(
+                work_acquire.checkouts,
+                "_linked_checkout_coordination",
+                return_value={},
+            ),
+            patch.object(work_acquire.checkouts, "_require_no_blockers"),
+            patch.object(
+                work_acquire,
+                "_git_runner",
+                return_value={"returncode": 0},
+            ),
+            patch.object(
+                work_acquire,
+                "_github_open_pr_exact_head",
+                return_value={
+                    "repository": "heimgewebe/grabowski",
+                    "pr_number": 1329,
+                    "state": "OPEN",
+                    "head_ref_name": "topic-old",
+                    "head_sha": "d" * 40,
+                },
+            ) as publication,
+            patch.object(
+                work_acquire,
+                "_read_state",
+                return_value=drifted_successor,
+            ) as reread,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "successor receipt changed after publication",
+            ),
+        ):
+            work_acquire._verify_successor_handoff_locked(
+                predecessor,
+                successor,
+                assessment,
+                successor_receipt_path=self.root / "successor-receipt.json",
+            )
+        publication.assert_called_once()
+        reread.assert_called_once()
 
     def test_terminal_assessment_replay_hash_preserves_legacy_equivalence(self) -> None:
         assessment = self.terminal_assessment("a" * 32, 200)
