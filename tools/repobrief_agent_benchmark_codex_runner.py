@@ -623,7 +623,7 @@ def _validated_mcp_proxy_python(
 def validate_toolchain(codex: str) -> str:
     bundled_rg = Path(codex).parent.parent / "codex-path" / "rg"
     _validate_support_executable(bundled_rg, require_read_only_mount=True)
-    for path in (Path("/usr/bin/cat"), Path("/usr/bin/sed"), Path("/usr/bin/bash")):
+    for path in (Path("/usr/bin/cat"), Path("/usr/bin/sed"), Path("/bin/bash")):
         _validate_support_executable(path, owner_uid=0)
     _validated_mcp_proxy_python()
     return f"{bundled_rg.parent}:/usr/bin:/bin"
@@ -3933,6 +3933,7 @@ def build_command(
     command = [
         codex, "exec",
         "-c", f'default_permissions="{PERMISSION_PROFILE}"',
+        "-c", "allow_login_shell=false",
         "-c", "features.network_proxy=true",
         "-c", f"permissions.{PERMISSION_PROFILE}.filesystem={filesystem}",
         "-c", f'permissions.{PERMISSION_PROFILE}.network={{enabled=true,mode="limited",allow_local_binding=false,domains={{}}}}',
@@ -4837,6 +4838,11 @@ def _sed_kind(parts: Sequence[str]) -> str:
 
 def command_kind(command: str) -> str:
     parts = _split_shell_words(command)
+    # build_command pins allow_login_shell=false; normalize only Codex's
+    # corresponding non-login wrapper so user profiles cannot change the
+    # validated benchmark toolchain before the inner command runs.
+    if len(parts) == 3 and parts[:2] == ["/bin/bash", "-c"]:
+        parts = _split_shell_words(parts[2])
     if not parts:
         raise RunnerError("empty Codex command")
     executable = parts[0]
