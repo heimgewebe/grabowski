@@ -182,6 +182,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_host_capability_resolve` | knowledge | yes | low | Resolve one declared host-local capability intent through the installed byte-identical operator-entry contract without execution authority. |
 | `grabowski_systemkatalog_query` | knowledge | yes | low | Run one bounded, revision-bound Systemkatalog v2 semantic query without catalog, task, runtime or merge authority. |
 | `grabowski_operational_guidance` | knowledge | yes | low | Return bounded, source-cited operational runbook guidance in shadow mode without task, policy, retry, recovery or execution authority. |
+| `grabowski_bureau_acceptance_authenticate` | bureau | no | medium | Authenticate one exact digest- and revision-bound manual Bureau acceptance item through Bureau's canonical StateStore journal contract. |
 | `grabowski_bureau_candidate_record` | bureau | no | medium | Record one source-bound candidate through Bureau's canonical append-only operator intake contract. |
 | `grabowski_bureau_candidate_assess` | bureau | yes | low | Assess one explicitly typed operator-intake candidate or event against current Registry and Live Register truth; task and initiative values are binding checks, never selectors. |
 | `grabowski_bureau_task_propose` | bureau | no | medium | Create one immutable reviewed Bureau task proposal artifact without Registry or Queue mutation. |

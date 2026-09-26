@@ -1422,6 +1422,16 @@ TOOL_PROFILES.update(
 
 TOOL_PROFILES.update(
     {
+        "grabowski_bureau_acceptance_authenticate": {
+            "category": "bureau",
+            "purpose": (
+                "Authenticate one exact digest- and revision-bound manual Bureau "
+                "acceptance item through Bureau's canonical StateStore journal contract."
+            ),
+            "risk_class": "medium",
+            "effects": ["bureau_acceptance_authentication_event"],
+            "reversibility": "append-only-idempotent-attestation",
+        },
         "grabowski_bureau_candidate_record": {
             "category": "bureau",
             "purpose": "Record one source-bound candidate through Bureau's canonical append-only operator intake contract.",
