@@ -3389,6 +3389,7 @@ def _bounded_current_retry_convergence(
         attention_task_ids=set(attention_by_task),
     )
 
+
 def reconcile_attention(
     parameters: dict[str, Any] | None = None,
     *,
@@ -3406,6 +3407,10 @@ def reconcile_attention(
     view = parameters.get("view", "current")
     if not isinstance(view, str) or view not in ATTENTION_VIEWS:
         raise TaskAttentionInputError("view must be current or history")
+    if _bounded_current_projection and view != "current":
+        raise TaskAttentionInputError(
+            "bounded current projection requires current view"
+        )
     cursor = parameters.get("cursor")
     if cursor is not None and not isinstance(cursor, str):
         raise TaskAttentionInputError("cursor must be a string when provided")
@@ -3515,7 +3520,7 @@ def reconcile_attention(
         else:
             snapshot_status = str(decision_snapshot.get("status") or "degraded")
             if _bounded_current_projection:
-                convergence_status = "verified"
+                convergence_status = "bounded_not_evaluated"
             elif raw_total_attention > MAX_CURRENT_CONVERGENCE_ROWS:
                 convergence_status = "degraded"
                 convergence_error = "attention_convergence_scan_limit_exceeded"
@@ -3624,10 +3629,13 @@ def reconcile_attention(
                             connection,
                             [dict(row) for row in rows],
                         )
-                    except terminal_convergence.TerminalConvergenceError:
+                    except terminal_convergence.TerminalConvergenceError as exc:
                         convergence_status = "degraded"
                         if convergence_error is None:
-                            convergence_error = "TaskAttentionIntegrityError"
+                            convergence_error = type(exc).__name__
+                        # Malformed retry evidence cannot be attributed safely to
+                        # one source. Discard every exclusion for this batch so
+                        # uncertain work reappears instead of being hidden.
                         batch_convergence_excluded_task_ids = set()
                     except (
                         TaskAttentionError,
@@ -3728,6 +3736,13 @@ def reconcile_attention(
                     last_raw = dict(rows[-1])
                     scan_created_at = int(last_raw["created_at_unix"])
                     scan_task_id = str(last_raw["task_id"])
+
+            if (
+                _bounded_current_projection
+                and convergence_status != "degraded"
+                and convergence_error is None
+            ):
+                convergence_status = "verified_bounded"
 
             scan_budget_exhausted = False
             if scanned_raw >= MAX_CURRENT_SCAN_ROWS and not source_exhausted:

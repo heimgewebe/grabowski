@@ -2565,6 +2565,10 @@ class TaskAttentionTests(unittest.TestCase):
             successor["task_id"], {item["task_id"] for item in bounded_page["records"]}
         )
         self.assertEqual(global_page["pagination"], bounded_page["pagination"])
+        self.assertEqual(
+            "verified_bounded",
+            bounded_page["attention_convergence_status"],
+        )
         self.assertFalse(bounded_page["current_attention_exact"])
         self.assertIsNone(bounded_page["current_attention_count"])
 
@@ -2637,7 +2641,7 @@ class TaskAttentionTests(unittest.TestCase):
         )
         self.assertEqual("degraded", bounded_page["attention_convergence_status"])
         self.assertEqual(
-            "TaskAttentionIntegrityError", bounded_page["attention_convergence_error"]
+            "TerminalConvergenceError", bounded_page["attention_convergence_error"]
         )
 
     def test_bounded_current_reconciliation_real_retry_regression_ids(self) -> None:
@@ -2809,7 +2813,7 @@ class TaskAttentionTests(unittest.TestCase):
 
         self.assertEqual("degraded", page["attention_convergence_status"])
         self.assertEqual(
-            "TaskAttentionIntegrityError", page["attention_convergence_error"]
+            "TerminalConvergenceError", page["attention_convergence_error"]
         )
         self.assertIn(
             source["task_id"],
@@ -2892,7 +2896,7 @@ class TaskAttentionTests(unittest.TestCase):
 
         self.assertEqual("degraded", page["attention_convergence_status"])
         self.assertEqual(
-            "TaskAttentionIntegrityError", page["attention_convergence_error"]
+            "TerminalConvergenceError", page["attention_convergence_error"]
         )
         self.assertIn(
             source["task_id"],
@@ -2929,7 +2933,7 @@ class TaskAttentionTests(unittest.TestCase):
 
         self.assertEqual("degraded", page["attention_convergence_status"])
         self.assertEqual(
-            "TaskAttentionIntegrityError", page["attention_convergence_error"]
+            "TerminalConvergenceError", page["attention_convergence_error"]
         )
         self.assertIn(
             source["task_id"],
@@ -2940,6 +2944,41 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertNotIn("argv_json", attention._ATTENTION_SELECT_COLUMNS)
         self.assertIn("launcher_json", attention._ATTENTION_SELECT_COLUMNS)
         self.assertIn("last_observation_json", attention._ATTENTION_SELECT_COLUMNS)
+
+    def test_bounded_current_reconciliation_rejects_history_view(self) -> None:
+        with self.assertRaisesRegex(
+            attention.TaskAttentionInputError,
+            "bounded current projection requires current view",
+        ):
+            attention.reconcile_attention(
+                {"limit": 1, "view": "history"},
+                _bounded_current_projection=True,
+            )
+
+    def test_bounded_current_reconciliation_malformed_retry_json_fails_visible(
+        self,
+    ) -> None:
+        source, successor = self._verified_retry_pair(successor_state="running")
+        with tasks._database() as connection:
+            connection.execute(
+                "UPDATE tasks SET launcher_json=? WHERE task_id=?",
+                ('{"retry_binding":', successor["task_id"]),
+            )
+
+        page = attention.reconcile_attention(
+            {"limit": 20, "view": "current"},
+            _bounded_current_projection=True,
+        )
+
+        self.assertEqual("degraded", page["attention_convergence_status"])
+        self.assertEqual(
+            "TerminalConvergenceError",
+            page["attention_convergence_error"],
+        )
+        self.assertIn(
+            source["task_id"],
+            {item["task_id"] for item in page["records"]},
+        )
 
     def test_current_attention_projection_separates_operational_signal_from_raw_history(self) -> None:
         closed = self._failed_task()
