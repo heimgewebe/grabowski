@@ -1575,6 +1575,61 @@ class GripFoundationTests(unittest.TestCase):
                 for check_id, status in expected.items():
                     self.assertEqual(status, statuses[check_id])
 
+    def test_post_merge_sync_apply_initial_physical_failure_skips_unobserved_canonical_check(
+        self,
+    ) -> None:
+        parameters = {
+            "repo": "/tmp/grabowski-pr1318-initial-physical-failure-test",
+            "target_branch": "main",
+            "expected_local_head": "1" * 40,
+            "expected_remote_head": "2" * 40,
+            "confirmation": "apply-protected-post-merge-sync",
+            "expected_physical_identity_sha256": "f" * 64,
+        }
+        for state in (
+            "invalid_physical_checkout_identity",
+            "physical_checkout_identity_unreadable",
+            "physical_checkout_identity_mismatch",
+        ):
+            with self.subTest(state=state):
+                receipt: dict[str, object] = {"checks": []}
+                with (
+                    patch.object(
+                        grips,
+                        "_physical_checkout_identity",
+                        return_value={"physical_identity_sha256": "f" * 64},
+                    ),
+                    patch.object(
+                        grips,
+                        "_validate_remote_materialization_target",
+                        return_value="https://example.invalid/grabowski.git",
+                    ),
+                    patch(
+                        "grabowski_post_merge_sync_apply.apply",
+                        return_value={
+                            "receipt_status": "blocked",
+                            "state": state,
+                            "retry_authorized": False,
+                            "physical_identity_verified": False,
+                        },
+                    ),
+                ):
+                    output = grips._run_post_merge_sync_apply(
+                        grips.GRIP_SPECS["post-merge-sync-apply"],
+                        parameters,
+                        receipt,
+                        FakeGit(),
+                    )
+                self.assertEqual(state, output["state"])
+                statuses = {
+                    item["id"]: item["status"]
+                    for item in receipt["checks"]
+                }
+                self.assertEqual("fail", statuses["physical-checkout-bound"])
+                self.assertEqual("skip", statuses["protected-canonical-checkout"])
+                self.assertEqual("skip", statuses["clean-exact-preimage"])
+                self.assertEqual("skip", statuses["remote-head-bound"])
+
     def test_post_merge_sync_apply_replay_identity_drift_fails_physical_check(
         self,
     ) -> None:

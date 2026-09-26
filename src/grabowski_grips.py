@@ -6803,6 +6803,9 @@ def _run_post_merge_sync_apply(
         state,
     )
     before_snapshot = state in {
+        "invalid_physical_checkout_identity",
+        "physical_checkout_identity_unreadable",
+        "physical_checkout_identity_mismatch",
         "unsupported_target_branch",
         "confirmation_mismatch",
         "invalid_bound_heads",
