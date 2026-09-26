@@ -1030,14 +1030,6 @@ def _blocked_followup_capacity_release_ready(
     if checkouts._sha256_json(material) != claimed:
         return False
     kind = binding.get("kind")
-    if kind == "terminal_assessment":
-        return (
-            binding.get("durable_followup_id") == followup_id
-            and binding.get("assessment_sha256")
-            == source_evidence.get("assessment_sha256")
-            and binding.get("terminal_closeout_audit_record_sha256")
-            == source_evidence.get("terminal_closeout_audit_record_sha256")
-        )
     if kind != "bureau_current_task_spec_reproduction":
         return False
     revision = binding.get("task_revision")

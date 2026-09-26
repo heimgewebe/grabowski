@@ -147,6 +147,25 @@ class CheckoutTerminalSourcesTests(unittest.TestCase):
                 "assessment": assessment,
             },
         }
+        bureau_binding = {
+            "checkout_key": "c" * 64,
+            "durable_followup_id": "GRABOWSKI-FOLLOWUP-T001",
+            "durable_followup_binding": {
+                "kind": "bureau_current_task_spec_reproduction",
+                "task_id": "GRABOWSKI-FOLLOWUP-T001",
+                "task_revision": 1,
+                "task_spec_sha256": "a" * 64,
+                "task_state": "ready",
+                "reproduction": {},
+                "does_not_establish": [
+                    "followup_completion",
+                    "lease_release_authority",
+                    "archive_or_cleanup_authority",
+                    "branch_or_ref_deletion_authority",
+                ],
+                "binding_sha256": "b" * 64,
+            },
+        }
         with (
             patch.object(work_acquire, "_read_state", return_value=record),
             patch.object(
@@ -154,6 +173,11 @@ class CheckoutTerminalSourcesTests(unittest.TestCase):
                 "_find_terminal_closeout_audit",
                 return_value="f" * 64,
             ),
+            patch.object(
+                sources,
+                "_bureau_blocked_followup_binding",
+                return_value=bureau_binding,
+            ) as authoritative_binding,
         ):
             evidence = sources.work_lane_terminal_evidence(lane_id)
         self.assertEqual(
@@ -164,20 +188,16 @@ class CheckoutTerminalSourcesTests(unittest.TestCase):
         self.assertEqual(
             "GRABOWSKI-FOLLOWUP-T001", evidence["durable_followup_id"]
         )
-        binding = evidence["durable_followup_binding"]
-        self.assertEqual("terminal_assessment", binding["kind"])
         self.assertEqual(
-            assessment["assessment_sha256"], binding["assessment_sha256"]
+            "bureau_current_task_spec_reproduction",
+            evidence["durable_followup_binding"]["kind"],
         )
-        self.assertEqual(
-            "f" * 64,
-            binding["terminal_closeout_audit_record_sha256"],
-        )
-        material = {
-            key: value for key, value in binding.items() if key != "binding_sha256"
-        }
-        self.assertEqual(
-            checkouts._sha256_json(material), binding["binding_sha256"]
+        authoritative_binding.assert_called_once_with(
+            lane_id,
+            record=record,
+            assessment=assessment,
+            audit_record_sha256="f" * 64,
+            expected_followup_id="GRABOWSKI-FOLLOWUP-T001",
         )
 
     def test_work_lane_terminal_evidence_rejects_missing_original_source_binding(self) -> None:

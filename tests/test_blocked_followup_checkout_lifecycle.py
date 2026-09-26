@@ -159,7 +159,7 @@ class BlockedFollowupCheckoutLifecycleTests(unittest.TestCase):
                 "GRABOWSKI_BUREAU_COORDINATION_ROOT": str(root),
             },
         ):
-            result = sources._legacy_blocked_followup_binding(
+            result = sources._bureau_blocked_followup_binding(
                 LANE_ID,
                 record=self._record(),
                 assessment=self._assessment(),
@@ -208,7 +208,7 @@ class BlockedFollowupCheckoutLifecycleTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(RuntimeError, "binding is missing"),
         ):
-            sources._legacy_blocked_followup_binding(
+            sources._bureau_blocked_followup_binding(
                 LANE_ID,
                 record=self._record(),
                 assessment=self._assessment(),
@@ -230,7 +230,7 @@ class BlockedFollowupCheckoutLifecycleTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(RuntimeError, "binding is ambiguous"),
         ):
-            sources._legacy_blocked_followup_binding(
+            sources._bureau_blocked_followup_binding(
                 LANE_ID,
                 record=self._record(),
                 assessment=self._assessment(),
@@ -308,11 +308,21 @@ class BlockedFollowupCheckoutLifecycleTests(unittest.TestCase):
 
     @staticmethod
     def _blocked_source_evidence(*, binding_sha256: str | None = None) -> dict[str, object]:
+        reproduction = {
+            "lane_id": LANE_ID,
+            "lane_receipt_sha256": LANE_RECEIPT,
+            "lane_assessment_sha256": ASSESSMENT,
+            "lane_terminal_audit_sha256": AUDIT,
+            "lane_terminal_head": TERMINAL_HEAD,
+            "checkout_key": CHECKOUT_KEY,
+        }
         binding_core = {
-            "kind": "terminal_assessment",
-            "durable_followup_id": TASK_ID,
-            "assessment_sha256": ASSESSMENT,
-            "terminal_closeout_audit_record_sha256": AUDIT,
+            "kind": "bureau_current_task_spec_reproduction",
+            "task_id": TASK_ID,
+            "task_revision": 3,
+            "task_spec_sha256": "a" * 64,
+            "task_state": "ready",
+            "reproduction": reproduction,
             "does_not_establish": [
                 "followup_completion",
                 "lease_release_authority",
@@ -345,6 +355,79 @@ class BlockedFollowupCheckoutLifecycleTests(unittest.TestCase):
             **core,
             "evidence_sha256": sources.checkouts._sha256_json(core),
         }
+
+    def test_current_followup_id_requires_matching_bureau_taskspec(self) -> None:
+        temporary, root = self._state_store([self._spec()])
+        self.addCleanup(temporary.cleanup)
+        current_assessment = {
+            **self._assessment(),
+            "durable_followup_id": TASK_ID,
+        }
+        with patch.dict(
+            os.environ,
+            {
+                "BUREAU_STATE_DIR": str(root),
+                "GRABOWSKI_BUREAU_COORDINATION_ROOT": str(root),
+            },
+        ):
+            bound = sources._bureau_blocked_followup_binding(
+                LANE_ID,
+                record=self._record(),
+                assessment=current_assessment,
+                audit_record_sha256=AUDIT,
+                expected_followup_id=TASK_ID,
+            )
+            with self.assertRaisesRegex(
+                RuntimeError, "Bureau durable followup binding is missing"
+            ):
+                sources._bureau_blocked_followup_binding(
+                    LANE_ID,
+                    record=self._record(),
+                    assessment={
+                        **current_assessment,
+                        "durable_followup_id": "THIS-TASK-DOES-NOT-EXIST",
+                    },
+                    audit_record_sha256=AUDIT,
+                    expected_followup_id="THIS-TASK-DOES-NOT-EXIST",
+                )
+
+        self.assertEqual(TASK_ID, bound["durable_followup_id"])
+        self.assertEqual(
+            "bureau_current_task_spec_reproduction",
+            bound["durable_followup_binding"]["kind"],
+        )
+
+    def test_string_only_terminal_assessment_binding_cannot_release_capacity(self) -> None:
+        evidence = self._blocked_source_evidence()
+        binding_core = {
+            "kind": "terminal_assessment",
+            "durable_followup_id": TASK_ID,
+            "assessment_sha256": ASSESSMENT,
+            "terminal_closeout_audit_record_sha256": AUDIT,
+            "does_not_establish": [
+                "followup_completion",
+                "lease_release_authority",
+                "archive_or_cleanup_authority",
+                "branch_or_ref_deletion_authority",
+            ],
+        }
+        evidence["durable_followup_binding"] = {
+            **binding_core,
+            "binding_sha256": sources.checkouts._sha256_json(binding_core),
+        }
+        evidence["evidence_sha256"] = sources.checkouts._sha256_json(
+            {
+                key: value
+                for key, value in evidence.items()
+                if key != "evidence_sha256"
+            }
+        )
+        self.assertFalse(
+            reconciliation._blocked_followup_capacity_release_ready(
+                evidence,
+                CHECKOUT_KEY,
+            )
+        )
 
     def test_blocked_followup_capacity_release_requires_terminal_head(self) -> None:
         for terminal_head in (None, "not-a-git-object"):

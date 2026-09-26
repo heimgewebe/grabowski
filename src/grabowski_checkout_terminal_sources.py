@@ -192,15 +192,22 @@ def _blocked_followup_checkout_key(record: dict[str, Any]) -> str:
     return checkout_key
 
 
-def _legacy_blocked_followup_binding(
+def _bureau_blocked_followup_binding(
     source_id: str,
     *,
     record: dict[str, Any],
     assessment: dict[str, Any],
     audit_record_sha256: str,
+    expected_followup_id: str | None = None,
 ) -> dict[str, Any]:
     if assessment.get("closeout_state") != "blocked_with_durable_followup":
-        raise RuntimeError("legacy durable followup binding requires blocked closeout")
+        raise RuntimeError("Bureau durable followup binding requires blocked closeout")
+    if expected_followup_id is not None and (
+        not isinstance(expected_followup_id, str)
+        or not expected_followup_id
+        or expected_followup_id != expected_followup_id.strip()
+    ):
+        raise RuntimeError("Bureau durable followup id is invalid")
     reason_codes = assessment.get("reason_codes")
     if (
         not isinstance(reason_codes, list)
@@ -219,6 +226,11 @@ def _legacy_blocked_followup_binding(
         raise RuntimeError("legacy durable followup reproduction evidence is incomplete")
     matches: list[dict[str, Any]] = []
     for current in _current_bureau_task_specs():
+        if (
+            expected_followup_id is not None
+            and current["task_id"] != expected_followup_id
+        ):
+            continue
         task = current["spec"]
         metadata = task.get("metadata")
         reproduction = (
@@ -240,9 +252,9 @@ def _legacy_blocked_followup_binding(
             }
         )
     if not matches:
-        raise RuntimeError("legacy durable followup binding is missing")
+        raise RuntimeError("Bureau durable followup binding is missing")
     if len(matches) != 1:
-        raise RuntimeError("legacy durable followup binding is ambiguous")
+        raise RuntimeError("Bureau durable followup binding is ambiguous")
     match = matches[0]
     binding_core = {
         "kind": "bureau_current_task_spec_reproduction",
@@ -516,36 +528,18 @@ def work_lane_terminal_evidence(source_id: str) -> dict[str, Any]:
 
     followup_projection: dict[str, Any] = {}
     if closeout_state == "blocked_with_durable_followup":
-        durable_followup_id = assessment.get("durable_followup_id")
-        checkout_key = _blocked_followup_checkout_key(record)
-        if durable_followup_id is None:
-            followup_projection = _legacy_blocked_followup_binding(
-                source_id,
-                record=record,
-                assessment=assessment,
-                audit_record_sha256=audit_record_sha256,
-            )
-        else:
-            binding_core = {
-                "kind": "terminal_assessment",
-                "durable_followup_id": durable_followup_id,
-                "assessment_sha256": assessment_sha256,
-                "terminal_closeout_audit_record_sha256": audit_record_sha256,
-                "does_not_establish": [
-                    "followup_completion",
-                    "lease_release_authority",
-                    "archive_or_cleanup_authority",
-                    "branch_or_ref_deletion_authority",
-                ],
-            }
-            followup_projection = {
-                "checkout_key": checkout_key,
-                "durable_followup_id": durable_followup_id,
-                "durable_followup_binding": {
-                    **binding_core,
-                    "binding_sha256": checkouts._sha256_json(binding_core),
-                },
-            }
+        # Capacity release is a narrower authority than lane terminalization.
+        # A caller-supplied follow-up id is therefore not sufficient: resolve
+        # every capacity-release candidate against the current digest-bound
+        # Bureau TaskSpec reproduction. Legacy assessments without a persisted
+        # id may still resolve uniquely by their exact lane reproduction.
+        followup_projection = _bureau_blocked_followup_binding(
+            source_id,
+            record=record,
+            assessment=assessment,
+            audit_record_sha256=audit_record_sha256,
+            expected_followup_id=assessment.get("durable_followup_id"),
+        )
 
     return _terminal_evidence(
         {
