@@ -2249,12 +2249,133 @@ class WorkAcquireTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(
                 RuntimeError,
-                "lifecycle authority changed during stable readback",
+                "lifecycle authority drifted",
             ),
         ):
             work_acquire._continuation_preimage(
                 prior, inputs, lifecycle_source, runner
             )
+
+    def test_continuation_rechecks_git_after_second_lifecycle_read(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        checkout_key = "a" * 64
+        prior = {
+            "state": "ready",
+            "worktree_receipt": {
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "lifecycle": {
+                    "checkout_key": checkout_key,
+                    "physical_checkout": PHYSICAL,
+                },
+            },
+        }
+        record = {
+            "checkout_key": checkout_key,
+            "branch": inputs["branch"],
+            "detached": False,
+        }
+        lifecycle = {
+            "checkout_key": checkout_key,
+            "physical_checkout": PHYSICAL,
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "source": lifecycle_source,
+            "artifact_class": inputs["artifact_class"],
+            "phase": "active",
+            "expected_branch": inputs["branch"],
+            "expected_head": SHA,
+            "updated_at_unix": 123,
+        }
+        state = {"git_changed": False, "lifecycle_reads": 0}
+
+        def lifecycle_read(_checkout_key: str) -> dict[str, object]:
+            state["lifecycle_reads"] += 1
+            if state["lifecycle_reads"] == 2:
+                state["git_changed"] = True
+            return lifecycle
+
+        def runner(_cwd: Path, argv: list[str]) -> dict[str, object]:
+            if argv[0] == "status":
+                return {"returncode": 0, "stdout": "## feat/authority-p0\n"}
+            if argv[0] == "rev-parse":
+                return {"returncode": 0, "stdout": SHA + "\n"}
+            if argv[0] in ("diff-index", "diff-files"):
+                return {
+                    "returncode": 1 if state["git_changed"] else 0,
+                    "stdout": "",
+                }
+            if argv[0] == "ls-files":
+                return {"returncode": 0, "stdout": ""}
+            raise AssertionError(argv)
+
+        completed = __import__("subprocess").CompletedProcess([], 0, b"", b"")
+
+        def branch_preimage(*_args: object, **_kwargs: object) -> dict[str, object]:
+            changed = state["git_changed"]
+            return {
+                "branch": inputs["branch"],
+                "head": SHA,
+                "operation_refs": {},
+                "physical_checkout": PHYSICAL,
+                "preimage_sha256": ("f" if changed else "c") * 64,
+                "index_sha256": "d" * 64,
+                "worktree_sha256": ("0" if changed else "e") * 64,
+            }
+
+        with (
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                return_value=(
+                    self.repo,
+                    Path(PHYSICAL["common_dir"]["path"]),
+                    record,
+                ),
+            ),
+            patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.checkouts,
+                "_strict_lifecycle_binding",
+                side_effect=lifecycle_read,
+            ),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                return_value=PHYSICAL["git_dir"],
+            ),
+            patch.object(
+                work_acquire.physical_checkout,
+                "verify_physical_checkout_identity",
+                return_value=PHYSICAL,
+            ),
+            patch.object(work_acquire.subprocess, "run", return_value=completed),
+            patch.object(
+                work_acquire.git_preimage,
+                "capture_branch_preimage",
+                side_effect=branch_preimage,
+            ),
+            patch.object(
+                work_acquire.git_preimage,
+                "capture_untracked_preimage",
+                return_value={
+                    "count": 0,
+                    "worktree_sha256": "1" * 64,
+                    "preimage_sha256": "2" * 64,
+                },
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "Git state changed during stable readback",
+            ),
+        ):
+            work_acquire._continuation_preimage(
+                prior, inputs, lifecycle_source, runner
+            )
+
+        self.assertEqual(state["lifecycle_reads"], 2)
 
     def test_continuation_rejects_legacy_receipt_without_physical_identity(self) -> None:
         params = self.parameters()

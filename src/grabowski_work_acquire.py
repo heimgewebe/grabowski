@@ -2219,7 +2219,6 @@ def _continuation_preimage(
             "managed worktree continuation registered Git directory drifted"
         )
 
-    live_lifecycle = checkouts._strict_lifecycle_binding(checkout_key)
     expected_lifecycle = {
         "checkout_path": str(target),
         "owner_id": inputs["lease_owner_id"],
@@ -2228,16 +2227,8 @@ def _continuation_preimage(
         "phase": "active",
         "expected_branch": inputs["branch"],
     }
-    if not isinstance(live_lifecycle, dict) or any(
-        live_lifecycle.get(field) != value for field, value in expected_lifecycle.items()
-    ):
-        raise RuntimeError("managed worktree continuation lifecycle authority drifted")
     if record.get("branch") != inputs["branch"] or record.get("detached"):
         raise RuntimeError("managed worktree continuation branch identity drifted")
-
-    prior_head = live_lifecycle.get("expected_head")
-    if not isinstance(prior_head, str) or SHA40_RE.fullmatch(prior_head) is None:
-        raise RuntimeError("managed worktree continuation prior HEAD evidence is invalid")
 
     snapshot_deadline = time.monotonic() + 30.0
 
@@ -2246,6 +2237,24 @@ def _continuation_preimage(
         if remaining <= 0:
             raise RuntimeError("managed worktree continuation preimage deadline exceeded")
         return remaining
+
+    def capture_lifecycle() -> dict[str, Any]:
+        remaining_snapshot_seconds()
+        lifecycle = checkouts._strict_lifecycle_binding(checkout_key)
+        remaining_snapshot_seconds()
+        if not isinstance(lifecycle, dict) or any(
+            lifecycle.get(field) != value
+            for field, value in expected_lifecycle.items()
+        ):
+            raise RuntimeError(
+                "managed worktree continuation lifecycle authority drifted"
+            )
+        prior_head = lifecycle.get("expected_head")
+        if not isinstance(prior_head, str) or SHA40_RE.fullmatch(prior_head) is None:
+            raise RuntimeError(
+                "managed worktree continuation prior HEAD evidence is invalid"
+            )
+        return lifecycle
 
     def raw_probe(cwd: Path, argv: list[str]) -> subprocess.CompletedProcess[bytes]:
         return subprocess.run(
@@ -2295,6 +2304,8 @@ def _continuation_preimage(
         return result
 
     def capture_snapshot() -> dict[str, Any]:
+        lifecycle = capture_lifecycle()
+        prior_head = lifecycle["expected_head"]
         status = snapshot_runner(
             ["status", "--short", "--branch", "--untracked-files=normal"]
         )
@@ -2423,6 +2434,8 @@ def _continuation_preimage(
         remaining_snapshot_seconds()
 
         return {
+            "lifecycle": lifecycle,
+            "lifecycle_sha256": _sha(lifecycle),
             "head": head_sha,
             "status_header": status_lines[0] if status_lines else "",
             "status_entries": status_entries[:100],
@@ -2463,10 +2476,7 @@ def _continuation_preimage(
             "managed worktree continuation Git state changed during stable readback"
         )
 
-    remaining_snapshot_seconds()
-    final_lifecycle = checkouts._strict_lifecycle_binding(checkout_key)
-    remaining_snapshot_seconds()
-    if final_lifecycle != live_lifecycle:
+    if first_snapshot["lifecycle_sha256"] != stable_snapshot["lifecycle_sha256"]:
         raise RuntimeError(
             "managed worktree continuation lifecycle authority changed during stable readback"
         )
@@ -2480,7 +2490,7 @@ def _continuation_preimage(
         "physical_identity_sha256": expected_physical["physical_identity_sha256"],
         "branch": inputs["branch"],
         "head": stable_snapshot["head"],
-        "ensure_head": prior_head,
+        "ensure_head": stable_snapshot["lifecycle"]["expected_head"],
         "dirty": bool(stable_snapshot["status_entries"]),
         "status_header": stable_snapshot["status_header"],
         "status_entries": stable_snapshot["status_entries"],
@@ -2493,7 +2503,9 @@ def _continuation_preimage(
         "untracked_worktree_sha256": stable_snapshot["untracked_worktree_sha256"],
         "untracked_count": stable_snapshot["untracked_count"],
         "prior_worktree_receipt_sha256": prior.get("durable_receipt_sha256"),
-        "lifecycle_updated_at_unix": final_lifecycle.get("updated_at_unix"),
+        "lifecycle_updated_at_unix": stable_snapshot["lifecycle"].get(
+            "updated_at_unix"
+        ),
     }
     return {**material, "preimage_sha256": _sha(material)}
 
