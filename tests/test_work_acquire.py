@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import inspect
 import json
 import os
 from pathlib import Path
+import sqlite3
 import sys
 import tempfile
 import time
@@ -46,9 +48,12 @@ class WorkAcquireTests(unittest.TestCase):
         self.retention = int(time.time()) + 3600
         self.previous = os.environ.get("GRABOWSKI_WORK_LANE_ROOT")
         os.environ["GRABOWSKI_WORK_LANE_ROOT"] = str(self.state)
+        self.previous_checkout_db = work_acquire.checkouts.CHECKOUT_DB
+        work_acquire.checkouts.CHECKOUT_DB = self.state / "checkouts.sqlite3"
         self.addCleanup(self._restore_env)
 
     def _restore_env(self) -> None:
+        work_acquire.checkouts.CHECKOUT_DB = self.previous_checkout_db
         if self.previous is None:
             os.environ.pop("GRABOWSKI_WORK_LANE_ROOT", None)
         else:
@@ -1254,6 +1259,7 @@ class WorkAcquireTests(unittest.TestCase):
             "source": lifecycle_source,
             "artifact_class": inputs["artifact_class"],
             "phase": "active",
+            "retention_until_unix": self.retention,
             "expected_branch": inputs["branch"],
             "expected_head": SHA,
             "updated_at_unix": 123,
@@ -1311,6 +1317,7 @@ class WorkAcquireTests(unittest.TestCase):
             "source": lifecycle_source,
             "artifact_class": inputs["artifact_class"],
             "phase": "active",
+            "retention_until_unix": self.retention,
             "expected_branch": inputs["branch"],
             "expected_head": SHA,
             "updated_at_unix": 123,
@@ -1392,6 +1399,7 @@ class WorkAcquireTests(unittest.TestCase):
             "source": lifecycle_source,
             "artifact_class": inputs["artifact_class"],
             "phase": "active",
+            "retention_until_unix": self.retention,
             "expected_branch": inputs["branch"],
             "expected_head": SHA,
             "updated_at_unix": 123,
@@ -1510,6 +1518,7 @@ class WorkAcquireTests(unittest.TestCase):
             "source": lifecycle_source,
             "artifact_class": inputs["artifact_class"],
             "phase": "active",
+            "retention_until_unix": self.retention,
             "expected_branch": inputs["branch"],
             "expected_head": SHA,
             "updated_at_unix": 123,
@@ -1644,6 +1653,7 @@ class WorkAcquireTests(unittest.TestCase):
             "source": lifecycle_source,
             "artifact_class": inputs["artifact_class"],
             "phase": "active",
+            "retention_until_unix": self.retention,
             "expected_branch": inputs["branch"],
             "expected_head": SHA,
             "updated_at_unix": 123,
@@ -1748,6 +1758,7 @@ class WorkAcquireTests(unittest.TestCase):
             "source": lifecycle_source,
             "artifact_class": inputs["artifact_class"],
             "phase": "active",
+            "retention_until_unix": self.retention,
             "expected_branch": inputs["branch"],
             "expected_head": SHA,
             "updated_at_unix": 123,
@@ -1830,6 +1841,7 @@ class WorkAcquireTests(unittest.TestCase):
             "source": lifecycle_source,
             "artifact_class": inputs["artifact_class"],
             "phase": "active",
+            "retention_until_unix": self.retention,
             "expected_branch": inputs["branch"],
             "expected_head": SHA,
             "updated_at_unix": 123,
@@ -1973,6 +1985,7 @@ class WorkAcquireTests(unittest.TestCase):
             "source": lifecycle_source,
             "artifact_class": inputs["artifact_class"],
             "phase": "active",
+            "retention_until_unix": self.retention,
             "expected_branch": inputs["branch"],
             "expected_head": SHA,
             "updated_at_unix": 123,
@@ -2075,6 +2088,7 @@ class WorkAcquireTests(unittest.TestCase):
             "source": lifecycle_source,
             "artifact_class": inputs["artifact_class"],
             "phase": "active",
+            "retention_until_unix": self.retention,
             "expected_branch": inputs["branch"],
             "expected_head": SHA,
             "updated_at_unix": 123,
@@ -2176,6 +2190,7 @@ class WorkAcquireTests(unittest.TestCase):
             "source": lifecycle_source,
             "artifact_class": inputs["artifact_class"],
             "phase": "active",
+            "retention_until_unix": self.retention,
             "expected_branch": inputs["branch"],
             "expected_head": SHA,
             "updated_at_unix": 123,
@@ -2285,6 +2300,7 @@ class WorkAcquireTests(unittest.TestCase):
             "source": lifecycle_source,
             "artifact_class": inputs["artifact_class"],
             "phase": "active",
+            "retention_until_unix": self.retention,
             "expected_branch": inputs["branch"],
             "expected_head": SHA,
             "updated_at_unix": 123,
@@ -2377,6 +2393,154 @@ class WorkAcquireTests(unittest.TestCase):
 
         self.assertEqual(state["lifecycle_reads"], 2)
 
+    def test_continuation_lifecycle_guard_blocks_concurrent_checkout_db_writer(self) -> None:
+        with work_acquire._continuation_lifecycle_guard(1.0):
+            competitor = sqlite3.connect(
+                work_acquire.checkouts.CHECKOUT_DB,
+                timeout=0.0,
+            )
+            try:
+                with self.assertRaises(sqlite3.OperationalError):
+                    competitor.execute("BEGIN IMMEDIATE")
+            finally:
+                competitor.close()
+
+    def test_continuation_rejects_retention_expiring_after_final_snapshot(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        checkout_key = "a" * 64
+        prior = {
+            "state": "ready",
+            "worktree_receipt": {
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "lifecycle": {
+                    "checkout_key": checkout_key,
+                    "physical_checkout": PHYSICAL,
+                },
+            },
+        }
+        record = {
+            "checkout_key": checkout_key,
+            "branch": inputs["branch"],
+            "detached": False,
+        }
+        lifecycle = {
+            "checkout_key": checkout_key,
+            "physical_checkout": PHYSICAL,
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "source": lifecycle_source,
+            "artifact_class": inputs["artifact_class"],
+            "phase": "active",
+            "retention_until_unix": 101,
+            "expected_branch": inputs["branch"],
+            "expected_head": SHA,
+            "updated_at_unix": 123,
+        }
+        state = {"guarded": False, "branch_preimages": 0}
+
+        @contextmanager
+        def tracked_guard(_timeout_seconds: float):
+            self.assertFalse(state["guarded"])
+            state["guarded"] = True
+            try:
+                yield
+            finally:
+                state["guarded"] = False
+
+        def runner(_cwd: Path, argv: list[str]) -> dict[str, object]:
+            if argv[0] == "status":
+                return {"returncode": 0, "stdout": "## feat/authority-p0\n"}
+            if argv[0] == "rev-parse":
+                return {"returncode": 0, "stdout": SHA + "\n"}
+            if argv[0] in ("diff-index", "diff-files"):
+                return {"returncode": 0, "stdout": ""}
+            if argv[0] == "ls-files":
+                return {"returncode": 0, "stdout": ""}
+            raise AssertionError(argv)
+
+        def branch_preimage(*_args: object, **_kwargs: object) -> dict[str, object]:
+            state["branch_preimages"] += 1
+            if state["branch_preimages"] == 1:
+                self.assertFalse(state["guarded"])
+            else:
+                self.assertTrue(state["guarded"])
+            return {
+                "branch": inputs["branch"],
+                "head": SHA,
+                "operation_refs": {},
+                "physical_checkout": PHYSICAL,
+                "preimage_sha256": "c" * 64,
+                "index_sha256": "d" * 64,
+                "worktree_sha256": "e" * 64,
+            }
+
+        completed = __import__("subprocess").CompletedProcess([], 0, b"", b"")
+        with (
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                return_value=(
+                    self.repo,
+                    Path(PHYSICAL["common_dir"]["path"]),
+                    record,
+                ),
+            ),
+            patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.checkouts,
+                "_strict_lifecycle_binding",
+                return_value=lifecycle,
+            ),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                return_value=PHYSICAL["git_dir"],
+            ),
+            patch.object(
+                work_acquire.physical_checkout,
+                "verify_physical_checkout_identity",
+                return_value=PHYSICAL,
+            ),
+            patch.object(work_acquire.subprocess, "run", return_value=completed),
+            patch.object(
+                work_acquire.git_preimage,
+                "capture_branch_preimage",
+                side_effect=branch_preimage,
+            ),
+            patch.object(
+                work_acquire.git_preimage,
+                "capture_untracked_preimage",
+                return_value={
+                    "count": 0,
+                    "worktree_sha256": "1" * 64,
+                    "preimage_sha256": "2" * 64,
+                },
+            ),
+            patch.object(
+                work_acquire,
+                "_continuation_lifecycle_guard",
+                tracked_guard,
+            ),
+            patch.object(
+                work_acquire.time,
+                "time",
+                side_effect=[100.0, 100.0, 102.0],
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "lifecycle retention expired",
+            ),
+        ):
+            work_acquire._continuation_preimage(
+                prior, inputs, lifecycle_source, runner
+            )
+
+        self.assertEqual(state["branch_preimages"], 2)
+        self.assertFalse(state["guarded"])
+
     def test_continuation_rejects_legacy_receipt_without_physical_identity(self) -> None:
         params = self.parameters()
         inputs = work_acquire._normalize(params)
@@ -2451,6 +2615,7 @@ class WorkAcquireTests(unittest.TestCase):
             "source": lifecycle_source,
             "artifact_class": inputs["artifact_class"],
             "phase": "active",
+            "retention_until_unix": self.retention,
             "expected_branch": inputs["branch"],
             "expected_head": SHA,
             "updated_at_unix": 123,
@@ -2545,6 +2710,7 @@ class WorkAcquireTests(unittest.TestCase):
             "source": lifecycle_source,
             "artifact_class": inputs["artifact_class"],
             "phase": "active",
+            "retention_until_unix": self.retention,
             "expected_branch": inputs["branch"],
         }
         with (
