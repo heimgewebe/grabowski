@@ -38,30 +38,32 @@ deduplication, retry-state guards, leases and durable status readback. Keeping
 the transport body permanently quarantined as well would turn a completed task
 invocation into a permanent ban on a later intentional identical task start.
 
-For a request carrying an MCP session id, Grabowski keeps the exact
-transport request id permanently single-use while storing the task-start
-session/body replay evidence in adjacent five-minute epochs. The bounded key is
-also tied to the asserted runtime binding. The current and preceding epoch are
-consumed atomically with the permanent request-id key, so a fresh request id with
-the same session/body/runtime remains rejected for between five and ten minutes
-depending on its position in the epoch. After that quarantine, a later fresh
-signed request identity may reach the task layer, which remains authoritative
-for active reuse, unresolved or unknown outcome blocking, named retry recovery
-and resource leases.
+For a request carrying an MCP session id, Grabowski stores the canonical
+task-start argument digest in adjacent five-minute epochs inside the stable
+connector scope. The current and preceding epoch are consumed atomically, so the
+same task-start arguments remain rejected for between five and ten minutes even
+when the connector uses a different JSON-RPC request id, request body encoding,
+token, MCP session, or runtime release. After that quarantine, a later fresh
+signed invocation may reach the task layer, which remains authoritative for
+active reuse, unresolved or unknown outcome blocking, named retry recovery and
+resource leases.
+
+The signed assertion itself remains fresh for only 90 seconds. Replaying an old
+captured assertion after that bound is rejected as stale before replay-state
+admission; within the freshness window the bounded argument epoch rejects the
+duplicate. A newly signed invocation after the quarantine is therefore treated
+as a new transport attempt for the same durable task intent instead of being
+permanently banned by historical request-id or body bits.
 
 This exception is deliberately narrow:
 
 - sessionless grabowski_task_start keeps the historical permanent replay rule;
-- the same transport request id remains permanently consumed even after the
-  bounded task-start window;
 - every other mutating tool keeps permanent durable replay protection;
-- historical permanent task-start body bits and body-matching tombstones are
-  not deleted or rewritten, but they no longer impose an eternal body quarantine
-  on a sessionful task start with a fresh request identity;
-- connector-token rotation does not shorten the active bounded quarantine for
-  the same stable client scope, while a new runtime binding gets a distinct
-  bounded namespace; the exact request-id single-use rule still prevents
-  rebinding one consumed transport identity across runtimes;
+- historical permanent task-start request-id/body bits and matching tombstones
+  are not deleted or rewritten, but sessionful task starts no longer consult
+  them as eternal replay authority;
+- a legacy tombstone that rebinds the same request id or body to different
+  tool/argument evidence still fails closed;
 - expiry of the transport quarantine is not evidence that a prior task failed,
   succeeded, or is safe to duplicate. Task state must still be reconciled when
   the prior outcome is uncertain.
