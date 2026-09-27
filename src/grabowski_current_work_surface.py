@@ -16,6 +16,7 @@ CURRENT_TASK_STATES = ("launching", "running", "interrupted", "outcome_unknown")
 CURRENT_WORK_GIT_TIMEOUT_SECONDS = 1.0
 CURRENT_WORK_CHECKOUT_OBSERVATION_BUDGET_SECONDS = 4.0
 CURRENT_WORK_CHECKOUT_MAX_WORKTREES: int | None = None
+CURRENT_WORK_MAX_PARALLEL_SOURCES = 2
 
 
 def _module(name: str) -> Any:
@@ -153,9 +154,13 @@ def _task_payload(
 
 def _attention_payload(view: str) -> dict[str, Any]:
     task_attention = _module("grabowski_task_attention")
-    return task_attention.reconcile_attention(
-        {"limit": task_attention.MAX_PAGE_LIMIT, "view": view}
-    )
+    parameters = {"limit": task_attention.MAX_PAGE_LIMIT, "view": view}
+    if view == "current":
+        return task_attention.reconcile_attention(
+            parameters,
+            _bounded_current_projection=True,
+        )
+    return task_attention.reconcile_attention(parameters)
 
 
 def _resources_payload() -> dict[str, Any]:
@@ -317,7 +322,7 @@ def grabowski_current_work(
     ]
 
     with ThreadPoolExecutor(
-        max_workers=len(independent_sources),
+        max_workers=min(CURRENT_WORK_MAX_PARALLEL_SOURCES, len(independent_sources)),
         thread_name_prefix="grabowski-current-work",
     ) as executor:
         futures = {

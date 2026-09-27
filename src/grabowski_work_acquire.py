@@ -673,11 +673,73 @@ def _converge_terminal_checkout_lifecycle(
     repo_value = inputs.get("repo")
     if not isinstance(repo_value, str) or not repo_value:
         raise RuntimeError("terminal Work Lane repository identity is missing")
-    _, _, worktree = checkouts._worktree_for_path(Path(repo_value), Path(checkout_path))
+    top_level, common_dir, worktree = checkouts._worktree_for_path(
+        Path(repo_value), Path(checkout_path)
+    )
     if worktree.get("checkout_key") != checkout_key:
         raise RuntimeError("terminal Work Lane checkout key drifted")
     checkouts._require_clean_linked(worktree)
     checkouts._require_expected(worktree, head, expected_branch)
+
+    if (
+        current_lifecycle is not None
+        and current_lifecycle.get("phase") == "archived"
+    ):
+        if current_lifecycle.get("expected_head") != head:
+            raise RuntimeError(
+                "terminal Work Lane archived lifecycle head drifted"
+            )
+        retention = checkouts._retention_records([checkout_key]).get(checkout_key)
+        if (
+            not isinstance(retention, dict)
+            or retention.get("checkout_key") != checkout_key
+            or retention.get("repo_common_dir") != str(common_dir)
+            or retention.get("repo_path") != str(top_level)
+            or retention.get("checkout_path") != checkout_path
+            or retention.get("owner_id") != owner_id
+            or retention.get("expected_head") != head
+            or retention.get("expected_branch") != expected_branch
+        ):
+            raise RuntimeError(
+                "terminal Work Lane archived lifecycle retention evidence drifted"
+            )
+        archive = checkouts._latest_archive_for_key(checkout_key)
+        if (
+            not isinstance(archive, dict)
+            or not isinstance(archive.get("archive_id"), str)
+            or archive.get("checkout_key") != checkout_key
+            or archive.get("owner_id") != owner_id
+            or archive.get("repo_path") != str(top_level)
+            or archive.get("checkout_path") != checkout_path
+            or archive.get("head") != head
+            or archive.get("branch") != expected_branch
+            or archive.get("cleaned_at_unix") is not None
+            or archive.get("cleanup_plan_id") is not None
+        ):
+            raise RuntimeError(
+                "terminal Work Lane archived lifecycle archive evidence drifted"
+            )
+        verified_refs = checkouts._verify_recovery_refs(
+            top_level, archive.get("recovery_refs", [])
+        )
+        if not verified_refs or not all(
+            item.get("present") is True for item in verified_refs
+        ):
+            raise RuntimeError(
+                "terminal Work Lane archived lifecycle recovery refs are incomplete"
+            )
+        return {
+            "state": "archived",
+            "checkout_key": checkout_key,
+            "owner_id": owner_id,
+            "expected_head": head,
+            "expected_branch": expected_branch,
+            "archive_id": archive["archive_id"],
+            "active_capacity_released": True,
+            "retention_preserved": True,
+            "archive_preserved": True,
+        }
+
     binding = checkouts._mark_checkout_completed_retained(
         checkout_key=checkout_key,
         owner_id=owner_id,
