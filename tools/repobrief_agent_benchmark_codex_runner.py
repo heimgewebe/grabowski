@@ -3209,7 +3209,7 @@ def _repoground_source_tree_snapshot(
     commit = runtime.get("git_commit") if isinstance(runtime, dict) else None
     if (
         not isinstance(commit, str)
-        or re.fullmatch(r"[0-9a-f]{40}", commit) is None
+        or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", commit) is None
         or runtime.get("git_dirty") is not False
     ):
         raise RunnerError("RepoGround manifest generator commit is invalid")
@@ -3217,6 +3217,19 @@ def _repoground_source_tree_snapshot(
         source_root = script.resolve(strict=True).parent.parent
     except OSError as exc:
         raise RunnerError("RepoGround MCP source root is unavailable") from exc
+    try:
+        object_format = base._run_checked(
+            ["git", "rev-parse", "--show-object-format"], cwd=source_root
+        )
+    except base.RunnerError as exc:
+        raise RunnerError("RepoGround MCP source checkout is unavailable") from exc
+    if object_format not in {"sha1", "sha256"}:
+        raise RunnerError("RepoGround MCP generator object format is unsupported")
+    oid_length = 40 if object_format == "sha1" else 64
+    if len(commit) != oid_length:
+        raise RunnerError(
+            "RepoGround manifest generator commit does not match source object format"
+        )
 
     def verify_source() -> None:
         try:
@@ -3264,9 +3277,6 @@ def _repoground_source_tree_snapshot(
         raise RunnerError("RepoGround MCP source tree is incomplete")
 
     try:
-        object_format = base._run_checked(
-            ["git", "rev-parse", "--show-object-format"], cwd=source_root
-        )
         committed_tree = base._run_checked(
             ["git", "ls-tree", "-rz", "--full-tree", commit, "--", "merger"],
             cwd=source_root,
@@ -3275,9 +3285,6 @@ def _repoground_source_tree_snapshot(
         raise RunnerError(
             "RepoGround MCP generator tree cannot be verified"
         ) from exc
-    if object_format not in {"sha1", "sha256"}:
-        raise RunnerError("RepoGround MCP generator object format is unsupported")
-    oid_length = 40 if object_format == "sha1" else 64
     committed_blobs: dict[Path, str] = {}
     for item in committed_tree.split("\0"):
         if not item:

@@ -2914,6 +2914,120 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "",
             )
 
+    def test_staged_repoground_mcp_upstream_accepts_sha256_generator_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "repoground-sha256"
+            source.mkdir()
+            git(["init", "--object-format=sha256"], source)
+            git(["config", "user.email", "test@example.invalid"], source)
+            git(["config", "user.name", "Test"], source)
+            scripts = source / "scripts"
+            scripts.mkdir()
+            package = source / "merger" / "repoground" / "cli"
+            package.mkdir(parents=True)
+            for init in (
+                source / "merger" / "__init__.py",
+                source / "merger" / "repoground" / "__init__.py",
+                package / "__init__.py",
+            ):
+                init.write_text("", encoding="utf-8")
+            implementation = package / "mcp_stdio.py"
+            implementation.write_text(
+                "def main():\n    return 0\n",
+                encoding="utf-8",
+            )
+            script = scripts / "repoground-mcp-stdio.py"
+            script.write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                "root = Path(__file__).resolve().parents[1]\n"
+                "sys.path.insert(0, str(root))\n"
+                "from merger.repoground.cli.mcp_stdio import main\n"
+                "raise SystemExit(main())\n",
+                encoding="utf-8",
+            )
+            git(["add", "."], source)
+            git(["commit", "-m", "sha256 fixture"], source)
+            commit = git(["rev-parse", "HEAD"], source)
+            self.assertEqual(
+                git(["rev-parse", "--show-object-format"], source),
+                "sha256",
+            )
+            self.assertRegex(commit, r"^[0-9a-f]{64}$")
+
+            state_root = root / "state"
+            state_root.mkdir(mode=0o700)
+            manifest = root / "chosen.bundle.manifest.json"
+
+            def write_manifest(generator_commit: str) -> None:
+                manifest.write_text(
+                    json.dumps(
+                        {
+                            "artifacts": [],
+                            "generator": {
+                                "runtime": {
+                                    "git_commit": generator_commit,
+                                    "git_dirty": False,
+                                }
+                            },
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+            write_manifest(commit)
+            executable = Path(sys.executable).resolve()
+            upstream = [
+                str(executable),
+                str(script),
+                "--bundle-root",
+                str(manifest),
+            ]
+            authorized = [
+                file_identity(executable),
+                file_identity(script),
+                file_identity(manifest),
+            ]
+            staged = runner.stage_mcp_upstream(
+                state_root,
+                upstream,
+                manifest,
+                authorized,
+            )
+            runtime_dir = Path(staged["runtime_dir"])
+            self.assertEqual(staged["source_tree"]["commit"], commit)
+            self.assertGreater(staged["source_tree"]["file_count"], 0)
+            self.assertEqual(staged["argv"][1:3], ["-I", "-B"])
+            completed = subprocess.run(
+                staged["argv"],
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIsNone(runner.cleanup_staged_mcp_upstream(staged))
+            self.assertFalse(runtime_dir.exists())
+
+            write_manifest("0" * 40)
+            invalid_authorized = [
+                file_identity(executable),
+                file_identity(script),
+                file_identity(manifest),
+            ]
+            with self.assertRaisesRegex(
+                runner.RunnerError,
+                "does not match source object format",
+            ):
+                runner.stage_mcp_upstream(
+                    state_root,
+                    upstream,
+                    manifest,
+                    invalid_authorized,
+                )
+
     def test_mcp_absolute_interpreter_symlink_resolves_to_bound_target(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
