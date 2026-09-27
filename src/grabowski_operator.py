@@ -8636,7 +8636,22 @@ def _run_mutating_user_systemd_unit(
     lease_snapshots = list(lease["leases"])
 
     if recovering_prior_fence:
-        fence = recovery_fence
+        assert recovery_fence is not None
+        try:
+            fence = resources.rebind_user_systemd_stop_recovery_fence(
+                recovery_fence["fence_id"],
+                owner_id,
+                resource_keys,
+                expected_leases=lease_snapshots,
+            )
+        except Exception as primary_error:
+            _abort_user_systemd_stop_recovery_pre_effect(
+                resources,
+                primary_error,
+                owner_id=owner_id,
+                resource_keys=resource_keys,
+                lease_snapshots=lease_snapshots,
+            )
     else:
         try:
             fence = resources.prepare_user_systemd_uncertainty_fence(

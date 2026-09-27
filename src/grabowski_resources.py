@@ -5522,6 +5522,8 @@ def _validate_user_systemd_uncertainty_fence(value: Any) -> dict[str, Any]:
         raise RuntimeError("user-systemd uncertainty fence must not use global manager authority")
     extra_keys = [key for key in keys if key != service_key]
     max_path_keys = 2 if action in USER_SYSTEMD_UNIT_FILE_ACTIONS else 1
+    if phase == "stop_recovery":
+        max_path_keys += 1
     if len(extra_keys) > max_path_keys or any(
         not key.startswith("path:") for key in extra_keys
     ):
@@ -5861,6 +5863,92 @@ def update_user_systemd_uncertainty_fence(
             connection.rollback()
             raise
     return _validate_user_systemd_uncertainty_fence(updated)
+
+
+def rebind_user_systemd_stop_recovery_fence(
+    fence_id: str,
+    owner_id: str,
+    resource_keys: Iterable[str],
+    *,
+    expected_leases: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Atomically bind an active uncertainty fence to exact stop-recovery authority."""
+    if not isinstance(fence_id, str) or re.fullmatch(r"[0-9a-f]{32}", fence_id) is None:
+        raise ValueError("user-systemd uncertainty fence id is invalid")
+    owner = _owner(owner_id)
+    if DIRECT_OPERATOR_OWNER_RE.fullmatch(owner) is None:
+        raise ValueError("user-systemd stop recovery requires a direct Operator owner")
+    keys = normalize_resource_keys(resource_keys)
+    snapshots = _normalize_mutation_lease_snapshots(
+        expected_leases,
+        expected_owner_id=owner,
+        resource_keys=keys,
+    )
+    with _database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            found = _user_systemd_uncertainty_by_id(connection, fence_id)
+            if found is None:
+                raise RuntimeError("active user-systemd uncertainty fence changed")
+            metadata_key, fence = found
+            if fence["cleared_at_unix"] is not None:
+                raise RuntimeError("active user-systemd uncertainty fence changed")
+            prior_keys = set(fence["resource_keys"])
+            requested_keys = set(keys)
+            if not prior_keys.issubset(requested_keys):
+                raise RuntimeError(
+                    "stop recovery may not drop prior user-systemd fence authority"
+                )
+            added_keys = sorted(requested_keys - prior_keys)
+            if len(added_keys) > 1 or any(
+                not key.startswith("path:") for key in added_keys
+            ):
+                raise RuntimeError(
+                    "stop recovery may add at most one exact fragment path authority"
+                )
+            allowed = _check_user_systemd_uncertainty_conflicts(
+                connection,
+                keys=keys,
+                owner=owner,
+                metadata={"unit": fence["unit"], "action": "stop"},
+                allowed_stop_recovery_fence_id=fence_id,
+            )
+            if not allowed:
+                raise RuntimeError("stop recovery fence binding changed")
+            placeholders = ",".join("?" for _ in keys)
+            rows = connection.execute(
+                f"SELECT * FROM leases WHERE resource_key IN ({placeholders}) ORDER BY resource_key",
+                keys,
+            ).fetchall()
+            observed = [_release_lease_snapshot(row) for row in rows]
+            if observed != snapshots:
+                raise RuntimeError(
+                    "stop recovery lease set changed before fence rebind"
+                )
+            updated = {
+                **fence,
+                "owner_id": owner,
+                "phase": "stop_recovery",
+                "resource_keys": keys,
+                "resource_keys_sha256": hashlib.sha256(
+                    _canonical_json(keys).encode("utf-8")
+                ).hexdigest(),
+                "lease_snapshots": snapshots,
+                "lease_bindings_sha256": hashlib.sha256(
+                    _canonical_json(snapshots).encode("utf-8")
+                ).hexdigest(),
+                "updated_at_unix": _now(),
+            }
+            updated = _validate_user_systemd_uncertainty_fence(updated)
+            connection.execute(
+                "UPDATE metadata SET value=? WHERE key=?",
+                (_canonical_json(updated), metadata_key),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+    return updated
 
 
 def clear_user_systemd_uncertainty_fence(
