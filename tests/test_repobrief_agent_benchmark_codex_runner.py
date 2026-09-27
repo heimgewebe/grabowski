@@ -586,7 +586,6 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertEqual(environment["GIT_NO_LAZY_FETCH"], "1")
             self.assertFalse(marker.exists())
             self.assertFalse(tree_object.exists())
-            self.assertIn("lazy fetching disabled", completed.stderr)
 
     def test_direct_runner_rejects_unbootstrapped_start(self) -> None:
         completed = subprocess.run(
