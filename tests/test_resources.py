@@ -798,6 +798,26 @@ class ResourceTests(unittest.TestCase):
             )
         self.assertEqual(0, resources.count_resources())
 
+    def test_public_resource_acquire_rejects_spoofed_user_systemd_subtree_authority(
+        self,
+    ) -> None:
+        with patch.object(resources.operator, "_require_operator_mutation"):
+            with self.assertRaisesRegex(
+                ValueError, "unit_file_config_root.*server-owned authority surface"
+            ):
+                resources.grabowski_resource_acquire(
+                    "operator:spoof-user-systemd-scope",
+                    ["path:/"],
+                    "spoofed user-systemd subtree authority",
+                    60,
+                    {
+                        "unit": "demo.service",
+                        "action": "enable",
+                        "unit_file_config_root": "/",
+                    },
+                )
+        self.assertEqual(0, resources.count_resources())
+
     def test_public_resource_acquire_rejects_spoofed_bureau_publication_authority_metadata(
         self,
     ) -> None:

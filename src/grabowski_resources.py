@@ -34,6 +34,7 @@ BUREAU_TASK_PUBLICATION_AUTHORITY_KIND = (
 SERVER_OWNED_AUTHORITY_METADATA_KINDS = frozenset(
     {"grabowski.work_lane", BUREAU_TASK_PUBLICATION_AUTHORITY_KIND}
 )
+PUBLIC_RESERVED_AUTHORITY_METADATA_FIELDS = frozenset({"unit_file_config_root"})
 DEFAULT_RESOURCE_LIST_LIMIT = 200
 RESOURCE_DB = Path(
     os.environ.get(
@@ -8240,8 +8241,9 @@ def grabowski_resource_acquire(
     Emergency-recovery mode is derived only from a validated Bureau recovery
     contract; caller-supplied lease-mode metadata is not an authority surface.
     Self-scoped branch and operation keys are authoritative and reject scope
-    manifests. Work Lane identity metadata is server-owned and can only be
-    created through the Work Lane acquisition path.
+    manifests. Work Lane identity metadata and user-systemd subtree authority
+    metadata are server-owned and can only be created through their internal
+    acquisition paths.
     """
     if isinstance(metadata, dict):
         metadata_kind = metadata.get("kind")
@@ -8251,6 +8253,15 @@ def grabowski_resource_acquire(
         ):
             raise ValueError(
                 f"metadata.kind {metadata_kind} is a server-owned authority surface"
+            )
+        reserved_fields = sorted(
+            PUBLIC_RESERVED_AUTHORITY_METADATA_FIELDS.intersection(metadata)
+        )
+        if reserved_fields:
+            raise ValueError(
+                "metadata field(s) "
+                + ", ".join(reserved_fields)
+                + " are server-owned authority surfaces"
             )
     normalized_resource_keys = _public_repository_scope_keys(resource_keys, metadata)
     operator._require_operator_mutation("resource_lease")
