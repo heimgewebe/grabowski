@@ -3219,7 +3219,7 @@ def _repoground_source_tree_snapshot(
         raise RunnerError("RepoGround MCP source root is unavailable") from exc
     try:
         object_format = base._run_checked(
-            ["git", "rev-parse", "--show-object-format"], cwd=source_root
+            ["git", "-c", "core.fsmonitor=false", "rev-parse", "--show-object-format"], cwd=source_root
         )
     except base.RunnerError as exc:
         raise RunnerError("RepoGround MCP source checkout is unavailable") from exc
@@ -3235,12 +3235,12 @@ def _repoground_source_tree_snapshot(
         try:
             git_root = Path(
                 base._run_checked(
-                    ["git", "rev-parse", "--show-toplevel"], cwd=source_root
+                    ["git", "-c", "core.fsmonitor=false", "rev-parse", "--show-toplevel"], cwd=source_root
                 )
             ).resolve(strict=True)
-            head = base._run_checked(["git", "rev-parse", "HEAD"], cwd=source_root)
+            head = base._run_checked(["git", "-c", "core.fsmonitor=false", "rev-parse", "HEAD"], cwd=source_root)
             status = base._run_checked(
-                ["git", "status", "--porcelain", "--untracked-files=normal"],
+                ["git", "-c", "core.fsmonitor=false", "status", "--porcelain", "--untracked-files=normal"],
                 cwd=source_root,
             )
         except (base.RunnerError, OSError) as exc:
@@ -3257,7 +3257,7 @@ def _repoground_source_tree_snapshot(
     verify_source()
     try:
         tracked = base._run_checked(
-            ["git", "ls-files", "-v", "-z", "--", "merger"], cwd=source_root
+            ["git", "-c", "core.fsmonitor=false", "ls-files", "-v", "-z", "--", "merger"], cwd=source_root
         )
     except base.RunnerError as exc:
         raise RunnerError("RepoGround MCP source tree cannot be enumerated") from exc
@@ -3278,7 +3278,7 @@ def _repoground_source_tree_snapshot(
 
     try:
         committed_tree = base._run_checked(
-            ["git", "ls-tree", "-rz", "--full-tree", commit, "--", "merger"],
+            ["git", "-c", "core.fsmonitor=false", "ls-tree", "-rz", "--full-tree", commit, "--", "merger"],
             cwd=source_root,
         )
     except base.RunnerError as exc:

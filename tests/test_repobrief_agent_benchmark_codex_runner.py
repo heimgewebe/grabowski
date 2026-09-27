@@ -2951,6 +2951,31 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         authorized,
                     )
 
+            fsmonitor_marker = root / "fsmonitor-ran"
+            fsmonitor_hook = root / "fsmonitor-hook.py"
+            fsmonitor_hook.write_text(
+                "#!/usr/bin/env python3\n"
+                "from pathlib import Path\n"
+                f"Path({str(fsmonitor_marker)!r}).write_text('ran', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            fsmonitor_hook.chmod(0o700)
+            git(["config", "core.fsmonitor", str(fsmonitor_hook)], source)
+            try:
+                staged = runner.stage_mcp_upstream(
+                    state_root,
+                    upstream,
+                    manifest,
+                    authorized,
+                )
+                runtime_dir = Path(staged["runtime_dir"])
+                self.assertFalse(fsmonitor_marker.exists())
+                self.assertIsNone(runner.cleanup_staged_mcp_upstream(staged))
+                self.assertFalse(runtime_dir.exists())
+            finally:
+                git(["config", "--unset", "core.fsmonitor"], source)
+            self.assertFalse(fsmonitor_marker.exists())
+
     def test_staged_repoground_mcp_upstream_accepts_sha256_generator_commit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
