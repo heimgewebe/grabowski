@@ -3254,10 +3254,22 @@ def _repoground_source_tree_snapshot(
         if status:
             raise RunnerError("RepoGround MCP source checkout is dirty")
 
+    launcher_relative = Path("scripts/repoground-mcp-stdio.py")
+    try:
+        if script.resolve(strict=True) != (source_root / launcher_relative).resolve(strict=True):
+            raise RunnerError("RepoGround MCP launcher path is invalid")
+    except OSError as exc:
+        raise RunnerError("RepoGround MCP launcher is unavailable") from exc
+
     verify_source()
     try:
         tracked = base._run_checked(
-            ["git", "-c", "core.fsmonitor=false", "ls-files", "-v", "-z", "--", "merger"], cwd=source_root
+            [
+                "git", "-c", "core.fsmonitor=false",
+                "ls-files", "-v", "-z", "--",
+                "merger", str(launcher_relative),
+            ],
+            cwd=source_root,
         )
     except base.RunnerError as exc:
         raise RunnerError("RepoGround MCP source tree cannot be enumerated") from exc
@@ -3267,18 +3279,28 @@ def _repoground_source_tree_snapshot(
         for item in tracked_entries
     ):
         raise RunnerError("RepoGround MCP source tree index flags are unsafe")
-    relatives = [Path(item[2:]) for item in tracked_entries]
+    tracked_relatives = [Path(item[2:]) for item in tracked_entries]
+    relatives = [
+        relative
+        for relative in tracked_relatives
+        if relative.parts and relative.parts[0] == "merger"
+    ]
     required = Path("merger/repoground/cli/mcp_stdio.py")
     if (
         not relatives
         or len(relatives) > MAX_MCP_SOURCE_TREE_FILES
         or required not in relatives
+        or launcher_relative not in tracked_relatives
     ):
         raise RunnerError("RepoGround MCP source tree is incomplete")
 
     try:
         committed_tree = base._run_checked(
-            ["git", "-c", "core.fsmonitor=false", "ls-tree", "-rz", "--full-tree", commit, "--", "merger"],
+            [
+                "git", "-c", "core.fsmonitor=false",
+                "ls-tree", "-rz", "--full-tree", commit, "--",
+                "merger", str(launcher_relative),
+            ],
             cwd=source_root,
         )
     except base.RunnerError as exc:
@@ -3304,7 +3326,7 @@ def _repoground_source_tree_snapshot(
         if relative in committed_blobs:
             raise RunnerError("RepoGround MCP generator tree contains duplicate paths")
         committed_blobs[relative] = fields[2]
-    if set(committed_blobs) != set(relatives):
+    if set(committed_blobs) != set(tracked_relatives):
         raise RunnerError(
             "RepoGround MCP source tree does not match the generator commit tree"
         )
@@ -3359,6 +3381,25 @@ def _repoground_source_tree_snapshot(
                 "sha256": sha_bytes(raw),
             }
         )
+
+    launcher_raw = _read_bound_regular_file(
+        script,
+        label="RepoGround MCP launcher",
+        max_bytes=MAX_MCP_SOURCE_TREE_BYTES,
+    )
+    launcher_object = (
+        b"blob " + str(len(launcher_raw)).encode("ascii") + b"\0" + launcher_raw
+    )
+    launcher_oid = (
+        hashlib.sha1(launcher_object).hexdigest()
+        if object_format == "sha1"
+        else hashlib.sha256(launcher_object).hexdigest()
+    )
+    if launcher_oid != committed_blobs[launcher_relative]:
+        raise RunnerError(
+            "RepoGround MCP launcher does not match generator commit"
+        )
+
     verify_source()
     return {
         "root": source_root,

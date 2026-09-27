@@ -2865,6 +2865,50 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         "",
                     )
 
+            launcher_relative = "scripts/repoground-mcp-stdio.py"
+            original_launcher = script.read_text(encoding="utf-8")
+            for set_flag, clear_flag in (
+                ("--assume-unchanged", "--no-assume-unchanged"),
+                ("--skip-worktree", "--no-skip-worktree"),
+            ):
+                with self.subTest(launcher_index_flag=set_flag):
+                    git(["update-index", set_flag, launcher_relative], source)
+                    script.write_text(
+                        original_launcher + "# hidden launcher drift\n",
+                        encoding="utf-8",
+                    )
+                    self.assertEqual(
+                        git(
+                            ["status", "--porcelain", "--untracked-files=normal"],
+                            source,
+                        ),
+                        "",
+                    )
+                    hidden_launcher_authorized = [
+                        file_identity(executable),
+                        file_identity(script),
+                        file_identity(manifest),
+                    ]
+                    with self.assertRaisesRegex(
+                        runner.RunnerError,
+                        "source tree index flags are unsafe",
+                    ):
+                        runner.stage_mcp_upstream(
+                            state_root,
+                            upstream,
+                            manifest,
+                            hidden_launcher_authorized,
+                        )
+                    script.write_text(original_launcher, encoding="utf-8")
+                    git(["update-index", clear_flag, launcher_relative], source)
+                    self.assertEqual(
+                        git(
+                            ["status", "--porcelain", "--untracked-files=normal"],
+                            source,
+                        ),
+                        "",
+                    )
+
             original_source_read = runner._read_bound_regular_file
             transient_payload = b"def main():\n    return 9\n"
 
