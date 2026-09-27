@@ -31,6 +31,13 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "grip_read": {
+        "category": "grip-surface",
+        "purpose": "Dispatch one allowlisted READ_ONLY Grabowski grip through a statically read-only MCP frontdoor.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
     "grip_run": {
         "category": "grip-surface",
         "purpose": "Dispatch one allowlisted Grabowski grip and return its receipt-bound result.",

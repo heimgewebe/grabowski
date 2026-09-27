@@ -85,8 +85,12 @@ class AgentInstructionsTests(unittest.TestCase):
         self.assertEqual(len(rules), len(grabowski_mcp.AGENT_INSTRUCTION_RULES))
         self.assertIn("live runtime state", rules["truth-hierarchy"].lower())
         narrow = rules["narrowest-typed-read-first"].lower()
-        self.assertIn("narrowest typed read", narrow)
+        self.assertIn("dedicated typed reads", narrow)
+        self.assertIn("grip_read", narrow)
+        self.assertIn("read_only", narrow)
+        self.assertIn("grip_run", narrow)
         self.assertIn("connectivity-only health ping", narrow)
+        self.assertIn("generic terminal", narrow)
         self.assertIn("serve as the probe", narrow)
         host_resolution = rules["host-capability-resolution"].lower()
         for phrase in (
@@ -152,7 +156,7 @@ class AgentInstructionsTests(unittest.TestCase):
         self.assertNotIn("only challenge_receipt_sha256", transport)
         self.assertNotIn("remains for compatibility", transport)
         typed = rules["typed-operation-preference"].lower()
-        for phrase in ("typed operations", "terminal", "git", "github"):
+        for phrase in ("typed operations", "git", "github"):
             self.assertIn(phrase, typed)
         github = rules["github-connector-first"].lower()
         for phrase in (
@@ -180,6 +184,7 @@ class AgentInstructionsTests(unittest.TestCase):
             self.assertIn(phrase, direction)
         obligation = rules["operator-obligation-lifecycle"].lower()
         for phrase in (
+            "grip_read",
             "grip_run",
             "operator-obligation-list",
             "operator-obligation-open",

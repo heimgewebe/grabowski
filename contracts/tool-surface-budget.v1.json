@@ -1383,6 +1383,29 @@
         "tool": "grabowski_work_acquire"
       }
     },
+    "grip_read": {
+      "evidence_refs": [
+        "docs:typed-read-surface.md",
+        "tests:test_operator_v2_runtime.py",
+        "tests:test_transport_one_call.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool owns only statically read-only dispatch of currently READ_ONLY allowlisted grips through the existing grip engine.",
+        "evidence": "READ_ANNOTATIONS on the public MCP tool, no allow_mutation parameter, current GripSpec.effect checks, existing allow_mutation=false runner guard, repeated-identical-read transport regression, and capability/profile gate regressions."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "A typed operation or semantic exemption behind grip_run was rejected because the public grip_run MCP tool must remain statically mutating; reusing it would preserve the replay-classification mismatch this surface fixes. Generic terminal execution would widen authority further.",
+      "rationale": "READ_ONLY grip dispatch requires a statically read-only MCP authority boundary while preserving grip_run as the general mutating frontdoor. grip_read narrows authority and reuses the same GripSpec, profile, capability, precondition and runner machinery without adding a second execution engine or weakening durable mutation replay.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "grip-surface",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grip_read"
+      }
+    },
     "ipad_bluetooth_inspect": {
       "evidence_refs": [
         "docs:juno-ipad-bluetooth.md",

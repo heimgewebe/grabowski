@@ -19,6 +19,31 @@ The typed read surface removes that ambiguity without removing operator capabili
 7. Numeric and string bounds are present in the MCP input schemas, not only checked after invocation.
 8. This change does not register a second connector.
 
+## READ_ONLY grip frontdoor
+
+`grip_read(name, parameters, profile)` publishes allowlisted READ_ONLY grips through
+a statically read-only MCP tool. The server reads the current `GripSpec` on every
+call and dispatches only when the grip is still allowlisted and
+`GripSpec.effect == READ_ONLY`. There is no `allow_mutation` parameter. Existing
+profile, capability and grip preconditions remain authoritative because
+`grip_read` delegates to the same grip core and runner as `grip_run`.
+
+`grip_run` remains the general, statically mutating grip frontdoor. A grip that
+drifts from READ_ONLY to MUTATING therefore fails closed through `grip_read`
+without widening replay authority. The durable mutation replay filter and the
+domain-specific post-merge replay reentry remain unchanged.
+
+Repeated identical `grip_read` inputs are observations, not replayed mutations:
+each call executes a fresh read instead of returning a transport cache. No grip
+name, command text or caller claim can establish read safety; the current
+server-side `GripSpec.effect` does. Generic terminal execution remains
+conservatively effect-bearing even when a command appears observational.
+
+Selection order is: a dedicated typed read tool when one exists, otherwise
+`grip_read` for a READ_ONLY grip, then `grip_run` for effect-bearing grips.
+Generic terminal/Git/GitHub surfaces are fallbacks only when no narrower typed
+surface expresses the operation.
+
 ## Narrow context tools
 
 - `grabowski_runtime_health`

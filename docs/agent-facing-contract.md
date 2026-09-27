@@ -30,9 +30,9 @@ would weaken the deployment identity.
 The rendered contract requires the agent to:
 
 1. treat live runtime state and concrete receipts as higher-authority than prose;
-2. use the narrowest typed read tool that can answer the question before broader
-   surfaces, without adding a connectivity-only health ping when that required
-   read can serve as the probe;
+2. use a dedicated typed read first, then `grip_read` for a READ_ONLY grip;
+   use `grip_run` for mutations, and do not add a connectivity-only health ping
+   or generic terminal call when a narrower read can serve as the probe;
 3. reuse existing capability infrastructure before building a parallel path: prefer
    a native typed Grabowski capability first. For a host-local capability with no
    native surface, use `grabowski_host_capability_resolve`; only an explicit host
@@ -63,8 +63,7 @@ The rendered contract requires the agent to:
 9. use the normal mutating MCP call path and the server-owned transport-roundtrip
    continuation when a fresh challenge is returned; ambiguous mutation outcomes
    still require target readback before any retry;
-10. prefer typed operations to generic terminal, Git or GitHub calls when both can
-    express the effect;
+10. prefer typed operations over generic Git or GitHub calls;
 11. use the platform GitHub connector as the normal control plane for PR reads and
     narrowly typed PR mutations. Local `gh` is a recovery fallback only after
     observed connector unavailability or authorization failure. A local `gh`
@@ -75,14 +74,16 @@ The rendered contract requires the agent to:
     the minimum sufficient mechanism; persistent complexity requires proof of benefit.
     Compare a simpler path against fresh evidence, then explicitly choose `CONTINUE`,
     `CHANGE` or `PARK/STOP`; a tool failure alone is not strategic evidence;
-13. for nontrivial operator work, use the durable operator-obligation lifecycle to
-    resume matching unfinished work and end only with completed, explicitly blocked
-    or durably delegated evidence, or with an evidence-bound direct v2
+13. for nontrivial operator work, use `grip_read` for
+    `operator-obligation-list` and `operator-obligation-status`, while mutating
+    obligation grips remain on `grip_run`; resume matching unfinished work and end
+    only with completed, explicitly blocked or durably delegated evidence, or with
+    an evidence-bound direct v2
     `deferred`/`superseded` resolution that keeps `work_complete=false` and sets
     `continuation_required=false`; resume parked work via a new obligation;
-14. bind and assess risk-adaptive convergence evidence before claiming systemic
-    convergence when the convergence plan requires it; ordinary work completion is
-    not itself a systemic-convergence claim;
+14. bind and assess risk-adaptive convergence evidence through `grip_read`
+    before claiming systemic convergence when the convergence plan requires it;
+    ordinary work completion is not itself a systemic-convergence claim;
 15. treat the instructions as non-authoritative: they grant no action, merge,
     deploy, secret or retry authority.
 

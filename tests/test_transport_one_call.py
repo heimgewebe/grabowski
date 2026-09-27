@@ -677,6 +677,34 @@ class OperatorSignedTransportTests(unittest.TestCase):
         self.assertEqual(evidence["transport_mode"], assertion.ASSERTION_VERSION)
         self.assertEqual(evidence["client_scope_kind"], "connector_capability")
 
+    def test_grip_read_static_read_hint_bypasses_replay_on_identical_calls(self) -> None:
+        arguments = {
+            "name": "repo-orient",
+            "parameters": {"repo": "/tmp/repo"},
+            "profile": "operator",
+        }
+        tool = SimpleNamespace(
+            annotations=SimpleNamespace(readOnlyHint=True),
+        )
+        self.assertFalse(
+            operator._transport_roundtrip_exempt_call("grip_read", arguments)
+        )
+        with (
+            mock.patch.object(operator, "_require_current_serving_process") as serving,
+            mock.patch.object(base, "_transport_signed_one_call_evidence") as signed,
+        ):
+            for _ in range(2):
+                self.assertIsNone(
+                    operator._require_transport_roundtrip_for_tool(
+                        tool_name="grip_read",
+                        arguments=arguments,
+                        context=None,
+                        tool=tool,
+                    )
+                )
+        serving.assert_not_called()
+        signed.assert_not_called()
+
     def test_mcp_preserves_typed_signed_one_call_replay(self) -> None:
         arguments = {"argv": ["true"]}
         body = _tool_body(arguments)

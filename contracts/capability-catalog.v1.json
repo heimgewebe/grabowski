@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "d372f005e8d2c10ab43eca49832071b32d24a2d4bbbc9e7c13829d21913db2e4",
+  "capability_source_sha256": "cd27be790e91d7d056efa9eb4d83466bd3826a08209cf4385746125a93c6c91c",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "03ebb6191f56cf3eaf8e966ab4208fc6dabeb1d63c1c2c8ec587b688245d0f46",
+  "contract_sha256": "d5a2cdc220b74f1a92895cf917af5f68c9c50521b99a8b834a21d2d0c421ac22",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -52,6 +52,17 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grip_list"
+    },
+    {
+      "category": "grip-surface",
+      "description": "Run one currently READ_ONLY allowlisted Grabowski grip.",
+      "effects": [],
+      "id": "grip_read",
+      "purpose": "Dispatch one allowlisted READ_ONLY Grabowski grip through a statically read-only MCP frontdoor.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grip_read"
     },
     {
       "category": "grip-surface",

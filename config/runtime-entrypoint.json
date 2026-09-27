@@ -3,6 +3,7 @@
     "grabowski_status",
     "grabowski_context",
     "grip_list",
+    "grip_read",
     "grip_run",
     "grabowski_list_directory",
     "grabowski_stat",

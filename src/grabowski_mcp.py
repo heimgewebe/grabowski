@@ -74,7 +74,7 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "narrowest-typed-read-first",
-        "Use the narrowest typed read that answers the question; no connectivity-only health ping when that read can serve as the probe.",
+        "Use dedicated typed reads first, then grip_read for READ_ONLY grips; use grip_run for mutations. No connectivity-only health ping or generic terminal when a narrower read can serve as the probe.",
     ),
     (
         "host-capability-resolution",
@@ -106,7 +106,7 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "typed-operation-preference",
-        "Prefer typed operations to generic terminal, Git, or GitHub calls when both can express the effect.",
+        "Prefer typed operations over Git/GitHub.",
     ),
     (
         "github-connector-first",
@@ -118,11 +118,11 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "operator-obligation-lifecycle",
-        "For nontrivial work use grip_run/operator-obligation-list, operator-obligation-open and before ending operator-obligation-status. End only when operator-obligation-close is completed, explicitly blocked or durably delegated, or operator-obligation-resolve defers/supersedes open work with continuation_required=false and work_complete=false. Resume with a new obligation.",
+        "For nontrivial work: grip_read operator-obligation-list and operator-obligation-status; grip_run operator-obligation-open, operator-obligation-close and operator-obligation-resolve. End only when completed, explicitly blocked or durably delegated, or resolve defers/supersedes with continuation_required=false and work_complete=false. Resume with a new obligation.",
     ),
     (
         "convergence-before-high-risk-closure",
-        "At admission bind risk-adaptive system_convergence_plan when classification evidence exists. Work/delivery closeout is not systemic convergence. Before claiming it, resolve criticality if classification_required; if systemic_closure_gate=hard, grip_run convergence-assess a hash-bound request, require terminally_closed, and bind its receipt into completion evidence. A nonterminal assessment blocks only that claim and grants no mutation authority.",
+        "At admission bind risk-adaptive system_convergence_plan when classification evidence exists. Work/delivery closeout is not systemic convergence. Before claiming it, resolve criticality if classification_required; if systemic_closure_gate=hard, grip_read convergence-assess a hash-bound request, require terminally_closed, and bind its receipt into completion evidence. A nonterminal assessment blocks only that claim and grants no mutation authority.",
     ),
     (
         "no-authority-escalation",
@@ -564,6 +564,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_status": (),
     "grabowski_context": (),
     "grip_list": ("file_read",),
+    "grip_read": (),
     "grip_run": (),
     "grabowski_list_directory": ("file_read",),
     "grabowski_stat": ("file_read",),
@@ -14969,6 +14970,48 @@ def _grip_run_core(
     return result
 
 
+def _grip_read_core(
+    name: str,
+    parameters: dict[str, Any] | None = None,
+    profile: str = "operator",
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Dispatch only a currently READ_ONLY allowlisted grip."""
+
+    raw_parameters = dict(parameters or {})
+    spec = grabowski_grips.GRIP_SPECS.get(name)
+    if spec is None or name not in grabowski_grips.GRIP_SURFACE_ALLOWLIST:
+        return grabowski_grips._blocked_surface_receipt(
+            name,
+            raw_parameters,
+            f"grip is not exposed by surface allowlist: {name}",
+        )
+    if spec.effect != grabowski_grips.READ_ONLY:
+        return grabowski_grips._blocked_surface_receipt(
+            name,
+            raw_parameters,
+            f"grip_read requires current GripSpec.effect=read_only: {name}",
+        )
+    return _grip_run_core(
+        name,
+        raw_parameters,
+        profile,
+        False,
+        ctx,
+    )
+
+
+def grip_read(
+    name: str,
+    parameters: dict[str, Any] | None = None,
+    profile: str = "operator",
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Run one allowlisted READ_ONLY grip synchronously for direct Python callers."""
+
+    return _grip_read_core(name, parameters, profile, ctx)
+
+
 def grip_run(
     name: str,
     parameters: dict[str, Any] | None = None,
@@ -14983,6 +15026,24 @@ def grip_run(
         parameters,
         profile,
         allow_mutation,
+        ctx,
+    )
+
+
+@mcp.tool(name="grip_read", annotations=READ_ANNOTATIONS)
+async def _grip_read_mcp(
+    name: str,
+    parameters: dict[str, Any] | None = None,
+    profile: str = "operator",
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Run one currently READ_ONLY allowlisted Grabowski grip."""
+
+    return await asyncio.to_thread(
+        _grip_read_core,
+        name,
+        parameters,
+        profile,
         ctx,
     )
 

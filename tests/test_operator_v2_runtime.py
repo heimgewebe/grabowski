@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import dataclasses
 import hashlib
 import importlib.util
 import json
@@ -651,6 +652,133 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                         profile="operator",
                         allow_mutation=True,
                     )
+
+    def test_grip_read_is_statically_read_only_and_has_no_mutation_flag(self) -> None:
+        source = ast.parse((ROOT / "src/grabowski_mcp.py").read_text(encoding="utf-8"))
+        function = next(
+            node
+            for node in source.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_grip_read_mcp"
+        )
+        decorator = next(
+            item
+            for item in function.decorator_list
+            if isinstance(item, ast.Call)
+            and isinstance(item.func, ast.Attribute)
+            and item.func.attr == "tool"
+        )
+        annotations = next(
+            item.value for item in decorator.keywords if item.arg == "annotations"
+        )
+        self.assertIsInstance(annotations, ast.Name)
+        self.assertEqual("READ_ANNOTATIONS", annotations.id)
+        argument_names = [item.arg for item in function.args.args]
+        self.assertNotIn("allow_mutation", argument_names)
+        values = grabowski_mcp.READ_ANNOTATIONS.values
+        self.assertIs(values["readOnlyHint"], True)
+        self.assertIs(values["destructiveHint"], False)
+        self.assertIs(values["idempotentHint"], True)
+
+    def test_grip_read_reexecutes_identical_read_only_grips(self) -> None:
+        decision = {"allowed": True}
+        for name, parameters in (
+            ("repo-orient", {"repo": "/tmp/repo"}),
+            ("operator-obligation-list", {}),
+            ("operator-obligation-status", {"obligation_id": "goo-read-only-test-0001"}),
+        ):
+            with self.subTest(name=name):
+                with (
+                    patch.object(grabowski_mcp, "_require_capability"),
+                    patch.object(
+                        grabowski_mcp,
+                        "_session_grip_policy_decision",
+                        return_value=decision,
+                    ),
+                    patch.object(
+                        grabowski_mcp.grabowski_grips,
+                        "grip_run",
+                        side_effect=[{"observation": 1}, {"observation": 2}],
+                    ) as run,
+                ):
+                    first = grabowski_mcp.grip_read(name, parameters)
+                    second = grabowski_mcp.grip_read(name, parameters)
+                    self.assertEqual({"observation": 1}, first)
+                    self.assertEqual({"observation": 2}, second)
+                    self.assertEqual(2, run.call_count)
+                    for call in run.call_args_list:
+                        self.assertIs(call.kwargs["allow_mutation"], False)
+
+    def test_grip_read_blocks_mutating_unknown_and_effect_drift_before_dispatch(self) -> None:
+        with patch.object(grabowski_mcp.grabowski_grips, "grip_run") as run:
+            for name in (
+                "post-merge-sync-apply",
+                "captain-run",
+                "operator-obligation-close",
+            ):
+                with self.subTest(name=name):
+                    result = grabowski_mcp.grip_read(name, {})
+                    self.assertEqual("blocked", result["status"])
+                    self.assertIn(
+                        "GripSpec.effect=read_only",
+                        result["output"]["error"],
+                    )
+            unknown = grabowski_mcp.grip_read("unknown-grip", {})
+            self.assertEqual("blocked", unknown["status"])
+
+            spec = grabowski_mcp.grabowski_grips.GRIP_SPECS["repo-orient"]
+            drifted = dataclasses.replace(
+                spec,
+                effect=grabowski_mcp.grabowski_grips.MUTATING,
+            )
+            with patch.dict(
+                grabowski_mcp.grabowski_grips.GRIP_SPECS,
+                {"repo-orient": drifted},
+            ):
+                drift = grabowski_mcp.grip_read(
+                    "repo-orient",
+                    {"repo": "/tmp/repo"},
+                )
+            self.assertEqual("blocked", drift["status"])
+            self.assertIn("GripSpec.effect=read_only", drift["output"]["error"])
+            run.assert_not_called()
+
+    def test_grip_read_preserves_capability_and_profile_gates(self) -> None:
+        with (
+            patch.object(
+                grabowski_mcp.grabowski_grips,
+                "grip_required_capability",
+                return_value="terminal_execute",
+            ),
+            patch.object(
+                grabowski_mcp,
+                "_require_capability",
+                side_effect=PermissionError("terminal_execute required"),
+            ) as capability,
+            patch.object(grabowski_mcp, "_session_grip_policy_decision") as policy,
+        ):
+            with self.assertRaisesRegex(PermissionError, "terminal_execute"):
+                grabowski_mcp.grip_read(
+                    "repo-orient",
+                    {"repo": "/tmp/repo"},
+                )
+        capability.assert_called_once_with("terminal_execute")
+        policy.assert_not_called()
+
+        with (
+            patch.object(grabowski_mcp, "_require_capability"),
+            patch.object(
+                grabowski_mcp,
+                "_session_grip_policy_decision",
+                return_value={"allowed": False, "reason": "profile-blocked"},
+            ),
+            patch.object(grabowski_mcp.grabowski_grips, "grip_run") as run,
+        ):
+            blocked = grabowski_mcp.grip_read(
+                "repo-orient",
+                {"repo": "/tmp/repo"},
+            )
+        self.assertEqual("blocked", blocked["status"])
+        run.assert_not_called()
 
     def test_connector_snapshot_wrapper_injects_server_owned_binding(self) -> None:
         server_observed_tools = {
@@ -1992,8 +2120,8 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             ]
         }
         summary = status["capability_requirements"]
-        self.assertEqual(summary["registered_tool_requirements"], 198)
-        self.assertEqual(summary["known_tool_requirements"], 199)
+        self.assertEqual(summary["registered_tool_requirements"], 199)
+        self.assertEqual(summary["known_tool_requirements"], 200)
         self.assertEqual(
             summary["staged_unpublished_tools"],
             ["grabowski_agent_workspace_adopt"],
