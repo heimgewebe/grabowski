@@ -1,6 +1,6 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "d372f005e8d2c10ab43eca49832071b32d24a2d4bbbc9e7c13829d21913db2e4",
+  "capability_source_sha256": "18e106d6956d60e60953673ca7c8083f03f42521ca78a89beef313c63d6ff0a1",
   "contract": "config/runtime-entrypoint.json",
   "contract_sha256": "03ebb6191f56cf3eaf8e966ab4208fc6dabeb1d63c1c2c8ec587b688245d0f46",
   "integrity": {
@@ -449,10 +449,10 @@
     },
     {
       "category": "context",
-      "description": "Return minimal Grabowski deployment, audit and kill-switch health.",
+      "description": "Report MCP tool-dispatch liveness without evaluating runtime integrity.",
       "effects": [],
       "id": "grabowski_runtime_health",
-      "purpose": "Read minimal deployment, audit and kill-switch health without path inventories.",
+      "purpose": "Read MCP tool-dispatch liveness without deployment, audit or kill-switch evaluation.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",

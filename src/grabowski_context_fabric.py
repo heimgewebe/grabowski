@@ -331,7 +331,10 @@ SOURCES: dict[str, dict[str, Any]] = {
         "claim_types": ("runtime_health_state",),
         "historical": False,
         "max_sensitivity": "internal_operational",
-        "does_not_establish": ("deployment_authorization", "release_correctness"),
+        "does_not_establish": (
+            "deployment_authorization", "release_correctness",
+            "deployment_integrity", "audit_integrity", "mutation_readiness",
+        ),
     },
     "grabowski_service_status": {
         "authority": "systemd_user_service",

@@ -509,10 +509,10 @@
     },
     {
       "category": "context",
-      "description": "Return minimal Grabowski deployment, audit and kill-switch health.",
+      "description": "Report MCP tool-dispatch liveness without evaluating runtime integrity.",
       "effects": [],
       "id": "grabowski_runtime_health",
-      "purpose": "Read minimal deployment, audit and kill-switch health without path inventories.",
+      "purpose": "Read MCP tool-dispatch liveness without deployment, audit or kill-switch evaluation.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
@@ -3592,7 +3592,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "d372f005e8d2c10ab43eca49832071b32d24a2d4bbbc9e7c13829d21913db2e4"
+      "sha256": "18e106d6956d60e60953673ca7c8083f03f42521ca78a89beef313c63d6ff0a1"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3703,7 +3703,7 @@
       "src/grabowski_privileged.py": "dee9efff822ef2ec1fde16329807c6514595eb9678ff0604f0ddd17f2756c4ef",
       "src/grabowski_privileged_broker.py": "d43c37ffa9fa154ae7ce53b6c3620b72cff62ecf0eabbf14f60639097f526829",
       "src/grabowski_provenance_recovery.py": "b507add38c5fdaf9ad4248f0e2cc5bf7570f1a62415a06e1bf171d44f26e0730",
-      "src/grabowski_read_surface.py": "1df8cb96e2c84f52817bbb0f64832de0f66f376de37a683849d41f50e7b08e1f",
+      "src/grabowski_read_surface.py": "5f3b2bae25f20351d1b89b674b3ab7d3c18559d0fba78c8829d87a8eca44739c",
       "src/grabowski_recall.py": "386afec03e078b6a7934b0744eb17edb1ae97b0addde982c34c544d0c1b74413",
       "src/grabowski_recovery.py": "0ed22cef9bc1f41b18e4f40b4cedf0492a78469b9d02ffd2747481c337b43013",
       "src/grabowski_repobrief.py": "1e842a9f310c967012914afbaf2dbbc4af3a29c222734f14f902421773713ded",

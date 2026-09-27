@@ -1132,56 +1132,50 @@ class ReadSurfaceTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 read_surface.grabowski_service_logs("demo.service", 2001)
 
-    def test_runtime_health_distinguishes_logical_service_and_units(self) -> None:
-        deployment = {
-            "completion_status": "complete",
-            "release_id": "release-1",
-            "repo_head": "a" * 40,
-        }
-        deployment.update({key: True for key in read_surface.DEPLOYMENT_INTEGRITY_FIELDS})
-        audit = {
-            "valid": True,
-            "audit_writable": True,
-            "audit_state": "ready",
-            "active_bytes": 123,
-            "max_bytes": 456,
-            "remaining_bytes": 333,
-            "reserve_bytes": 64,
-            "rotation_required": False,
-            "archived_segment_count": 2,
-            "total_records": 99,
-        }
+    def test_runtime_health_only_reports_dispatch_liveness(self) -> None:
         with (
-            patch.object(read_surface.base, "_deployment_metadata", return_value=deployment),
-            patch.object(read_surface.base, "_verify_audit_log", return_value=audit),
+            patch.object(read_surface.base, "_deployment_metadata", side_effect=AssertionError("deployment read")),
+            patch.object(read_surface.base, "_verify_audit_log", side_effect=AssertionError("audit read")),
+            patch.object(read_surface.base, "_audit_records_snapshot", side_effect=AssertionError("history snapshot")),
+            patch.object(read_surface.base, "_kill_switch_state", side_effect=AssertionError("kill-switch read")),
+            patch.object(read_surface.runtime_extensions, "runtime_service_model", side_effect=AssertionError("service projection")),
         ):
             health = read_surface.grabowski_runtime_health()
+        self.assertEqual(health["schema_version"], 2)
         self.assertEqual(health["service"], "grabowski-mcp")
-        self.assertEqual(health["service_model"]["operator_unit"], "grabowski-operator.service")
-        self.assertEqual(health["service_model"]["tunnel_unit"], "tunnel-client-grabowski.service")
-        self.assertEqual(health["service_model"]["deployment_release"], "release-1")
+        self.assertEqual(health["health_scope"], "mcp_tool_dispatch")
         self.assertTrue(health["healthy"])
-        self.assertTrue(health["audit_writable"])
-        self.assertEqual(health["audit_active_bytes"], 123)
-        self.assertEqual(health["audit_archived_segment_count"], 2)
-
-    def test_runtime_health_is_not_healthy_when_audit_is_valid_but_not_writable(self) -> None:
-        deployment = {"completion_status": "complete"}
-        deployment.update({key: True for key in read_surface.DEPLOYMENT_INTEGRITY_FIELDS})
-        audit = {
-            "valid": True,
-            "audit_writable": False,
-            "audit_state": "storage_exhausted",
-        }
-        with (
-            patch.object(read_surface.base, "_deployment_metadata", return_value=deployment),
-            patch.object(read_surface.base, "_verify_audit_log", return_value=audit),
+        self.assertFalse(health["integrity_evaluated"])
+        for field in (
+            "deployment_complete", "deployment_integrity_valid",
+            "audit_valid", "audit_writable", "kill_switch_engaged",
         ):
-            health = read_surface.grabowski_runtime_health()
-        self.assertFalse(health["healthy"])
-        self.assertTrue(health["audit_valid"])
-        self.assertFalse(health["audit_writable"])
-        self.assertEqual(health["audit_state"], "storage_exhausted")
+            self.assertIsNone(health[field])
+        self.assertEqual(health["audit_state"], "not_evaluated")
+        self.assertEqual(
+            health["diagnostic_surface"],
+            {"tool": "grabowski_status", "arguments": {"view": "minimal"}},
+        )
+        for field in ("service_model", "release_id", "repo_head", "audit_total_records"):
+            self.assertNotIn(field, health)
+        self.assertIn("mutation_readiness", health["does_not_establish"])
+
+    def test_runtime_health_has_no_history_size_dependency(self) -> None:
+        responses = []
+        for count in (0, 1_000, 1_000_000):
+            with (
+                patch.object(read_surface.base, "_deployment_metadata") as deployment,
+                patch.object(read_surface.base, "_verify_audit_log", return_value={
+                    "valid": False, "audit_writable": False, "total_records": count,
+                }) as audit,
+                patch.object(read_surface.base, "_audit_records_snapshot") as snapshot,
+                patch.object(read_surface.base, "_kill_switch_state") as kill_switch,
+            ):
+                responses.append(read_surface.grabowski_runtime_health())
+                for provider in (deployment, audit, snapshot, kill_switch):
+                    provider.assert_not_called()
+        self.assertEqual(responses[0], responses[1])
+        self.assertEqual(responses[1], responses[2])
 
     def test_github_fields_exclude_body_and_comments(self) -> None:
         fields = set(read_surface.GITHUB_PR_FIELDS)
