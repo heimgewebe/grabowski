@@ -3141,6 +3141,193 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertFalse(state["guarded"])
         start.assert_called_once()
 
+    def test_continuation_ready_persistence_failure_preserves_leases_after_writer_start(self) -> None:
+        params = self.parameters()
+        params["scoped_writer_argv"] = ["writer", "--once"]
+        params["scoped_writer_runtime_seconds"] = 600
+        inputs, stored = self.store_lane(params)
+        checkout_key = "a" * 64
+        worktree_receipt = {
+            "result_state": "CREATED",
+            "durable_receipt_sha256": "b" * 64,
+            "post_state": {
+                "target_registered": True,
+                "target_path_exists": True,
+            },
+            "lifecycle": {
+                "checkout_key": checkout_key,
+                "physical_checkout": PHYSICAL,
+            },
+        }
+        receipt_path = self.state / f"{inputs['lane_id']}.json"
+        work_acquire._write_state(
+            receipt_path,
+            {**stored, "worktree_receipt": worktree_receipt},
+        )
+        continuation_preimage = {
+            "checkout_key": checkout_key,
+            "lifecycle_sha256": "c" * 64,
+            "lifecycle_retention_until_unix": self.retention,
+            "preimage_sha256": "d" * 64,
+        }
+        original_write_state = work_acquire._write_state
+        ready_failed = False
+
+        @contextmanager
+        def authorization_guard(_preimage: dict[str, object] | None):
+            yield
+
+        def fail_first_ready_write(path: Path, payload: dict[str, object]):
+            nonlocal ready_failed
+            if payload.get("state") == "ready" and not ready_failed:
+                ready_failed = True
+                raise RuntimeError("lost final ready persistence")
+            return original_write_state(path, payload)
+
+        release = Mock(side_effect=self.release)
+        start = Mock(return_value=self.writer_result(self.target))
+        with (
+            patch.object(
+                work_acquire,
+                "_continuation_preimage",
+                return_value=continuation_preimage,
+            ),
+            patch.object(
+                work_acquire,
+                "_continuation_authorization_guard",
+                authorization_guard,
+            ),
+            patch.object(
+                work_acquire,
+                "_write_state",
+                side_effect=fail_first_ready_write,
+            ),
+        ):
+            result = work_acquire.acquire_work(
+                params,
+                acquire_resources_fn=self.acquire,
+                release_resources_fn=release,
+                inspect_resource_fn=Mock(),
+                ensure_worktree_fn=Mock(),
+                runner=Mock(),
+                start_writer_fn=start,
+            )
+
+        self.assertTrue(ready_failed)
+        self.assertEqual(result["state"], "outcome_unknown")
+        self.assertEqual(result["decision"], "HARD_BLOCK")
+        self.assertIs(result["effect_observed"], True)
+        self.assertIsNone(result["compensation"])
+        self.assertEqual(
+            result["next_action"], "readback_scoped_writer_before_retry"
+        )
+        self.assertEqual(result["writer_start"]["state"], "started")
+        self.assertIsInstance(result["writer_job"], dict)
+        release.assert_not_called()
+        start.assert_called_once()
+        persisted = json.loads(receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["state"], "outcome_unknown")
+        self.assertIs(persisted["effect_observed"], True)
+
+    def test_continuation_double_persistence_failure_keeps_writer_starting_fail_closed(self) -> None:
+        params = self.parameters()
+        params["scoped_writer_argv"] = ["writer", "--once"]
+        params["scoped_writer_runtime_seconds"] = 600
+        inputs, stored = self.store_lane(params)
+        checkout_key = "a" * 64
+        worktree_receipt = {
+            "result_state": "CREATED",
+            "durable_receipt_sha256": "b" * 64,
+            "post_state": {
+                "target_registered": True,
+                "target_path_exists": True,
+            },
+            "lifecycle": {
+                "checkout_key": checkout_key,
+                "physical_checkout": PHYSICAL,
+            },
+        }
+        receipt_path = self.state / f"{inputs['lane_id']}.json"
+        work_acquire._write_state(
+            receipt_path,
+            {**stored, "worktree_receipt": worktree_receipt},
+        )
+        continuation_preimage = {
+            "checkout_key": checkout_key,
+            "lifecycle_sha256": "c" * 64,
+            "lifecycle_retention_until_unix": self.retention,
+            "preimage_sha256": "d" * 64,
+        }
+        original_write_state = work_acquire._write_state
+
+        @contextmanager
+        def authorization_guard(_preimage: dict[str, object] | None):
+            yield
+
+        def fail_post_effect_persistence(path: Path, payload: dict[str, object]):
+            if payload.get("state") in {"ready", "outcome_unknown"}:
+                raise RuntimeError("post-effect persistence unavailable")
+            return original_write_state(path, payload)
+
+        release = Mock(side_effect=self.release)
+        start = Mock(return_value=self.writer_result(self.target))
+        with (
+            patch.object(
+                work_acquire,
+                "_continuation_preimage",
+                return_value=continuation_preimage,
+            ),
+            patch.object(
+                work_acquire,
+                "_continuation_authorization_guard",
+                authorization_guard,
+            ),
+            patch.object(
+                work_acquire,
+                "_write_state",
+                side_effect=fail_post_effect_persistence,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError, "post-effect persistence unavailable"
+            ),
+        ):
+            work_acquire.acquire_work(
+                params,
+                acquire_resources_fn=self.acquire,
+                release_resources_fn=release,
+                inspect_resource_fn=Mock(),
+                ensure_worktree_fn=Mock(),
+                runner=Mock(),
+                start_writer_fn=start,
+            )
+
+        release.assert_not_called()
+        start.assert_called_once()
+        persisted = json.loads(receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["state"], "writer_starting")
+        self.assertEqual(persisted["writer_start"]["state"], "starting")
+
+        acquire_retry = Mock()
+        ensure_retry = Mock()
+        retry = work_acquire.acquire_work(
+            params,
+            acquire_resources_fn=acquire_retry,
+            release_resources_fn=release,
+            inspect_resource_fn=Mock(),
+            ensure_worktree_fn=ensure_retry,
+            runner=Mock(),
+            start_writer_fn=start,
+        )
+        self.assertEqual(retry["state"], "outcome_unknown")
+        self.assertEqual(
+            retry["next_action"], "readback_scoped_writer_before_retry"
+        )
+        self.assertEqual(retry["writer_start"]["state"], "outcome_unknown")
+        self.assertEqual(start.call_count, 1)
+        acquire_retry.assert_not_called()
+        ensure_retry.assert_not_called()
+        release.assert_not_called()
+
     def test_continuation_authorization_conflict_compensates_before_writer_start(self) -> None:
         params = self.parameters()
         params["scoped_writer_argv"] = ["writer", "--once"]

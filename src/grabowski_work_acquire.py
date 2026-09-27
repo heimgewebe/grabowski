@@ -3576,7 +3576,52 @@ def acquire_work(
                         record = _write_state(receipt_path, ready_payload)
                     continuation_authorized = True
             except Exception as exc:
-                return continuation_conflict(exc, output)
+                if writer_job is None:
+                    return continuation_conflict(exc, output)
+                record = _write_state(
+                    receipt_path,
+                    {
+                        **base_record,
+                        "state": "outcome_unknown",
+                        "decision": "HARD_BLOCK",
+                        "lease_receipt": acquired,
+                        **group_evidence,
+                        "worktree_receipt": output,
+                        **(
+                            {"continuation_preimage": continuation_preimage}
+                            if continuation_preimage is not None
+                            else {}
+                        ),
+                        "authority": authority,
+                        "writer_job": writer_job,
+                        **(
+                            {"writer_start": writer_start}
+                            if writer_start is not None
+                            else {}
+                        ),
+                        "error_class": type(exc).__name__,
+                        "error": str(exc)[:2048],
+                        "effect_observed": True,
+                        "compensation": None,
+                        "next_action": "readback_scoped_writer_before_retry",
+                    },
+                )
+                if audit_fn is not None:
+                    audit_fn(
+                        {
+                            "operation": "work-acquire",
+                            "lane_id": lane_id,
+                            "state": "outcome_unknown",
+                            "decision": "HARD_BLOCK",
+                            "inputs_sha256": inputs_sha256,
+                            "effect_observed": True,
+                        }
+                    )
+                return {
+                    **record,
+                    "durable_receipt_path": str(receipt_path),
+                    "replayed": existing is not None,
+                }
             if audit_fn is not None:
                 audit_fn({"operation": "work-acquire", "lane_id": lane_id, "state": "ready", "decision": decision, "inputs_sha256": inputs_sha256, "worktree_receipt_sha256": output.get("durable_receipt_sha256")})
             return {**record, "durable_receipt_path": str(receipt_path), "replayed": existing is not None}
