@@ -2,7 +2,7 @@
 
 ## Zweck
 
-Der Adapter stellt den in Bureau definierten Operator-Intake-Vertrag als schmale Grabowski-Werkzeuge bereit. Bureau bleibt alleinige Quelle für Kandidaten-, Bewertungs-, Proposal- und Publikationssemantik. Grabowski besitzt nur Transport, private Artefakte, Laufzeitbindung, Leases, Audit und begrenzten Ambiguitäts-Readback.
+Der Adapter stellt den in Bureau definierten Operator-Intake-Vertrag als schmale Grabowski-Werkzeuge bereit. Bureau bleibt alleinige Quelle für Acceptance-, Kandidaten-, Bewertungs-, Proposal- und Publikationssemantik. Grabowski besitzt nur Transport, private Artefakte, Laufzeitbindung, Leases, Audit und begrenzten Ambiguitäts-Readback.
 
 ## Werkzeuge
 
@@ -16,9 +16,11 @@ Der Adapter stellt den in Bureau definierten Operator-Intake-Vertrag als schmale
 | `grabowski_bureau_task_publish_preview` | Validiert ein Proposal und liefert die exakt benötigten Publikationsressourcen ohne Wirkung. |
 | `grabowski_bureau_task_publish` | Erwirbt zwei exakte Kurzleasen, publiziert Branch und Pull Request und gibt Leases nur nach eindeutigem Ausgang frei. |
 
-## Kandidaten-Refinement
+## Acceptance-Authentifizierung
 
 `grabowski_bureau_acceptance_authenticate` besitzt keine eigene Acceptance-Domänenlogik. Grabowski validiert nur die vier Transportfelder `run_id`, `criterion_id`, `expected_evidence_sha256` und `reviewer`, ruft den immutable Bureau-Launcher mit `acceptance-authenticate` und explizitem State-Root auf und behandelt Mutationsambiguität als rungebundene Readback-Pflicht. Current-run revision, Evidence-Digest, Observation-Scope, Reviewer-Trennung, Journal-Idempotenz und Authentifizierungswahrheit bleiben ausschließlich bei Bureau.
+
+## Kandidaten-Refinement
 
 `grabowski_bureau_candidate_record` transportiert optional `supersedes_event_id` unverändert im digestgebundenen Request. Typprüfung, Aktualität, Kandidatenzugehörigkeit und Supersession-Zulässigkeit entscheidet ausschließlich der append-only Bureau-Live-Register-Vertrag; der Adapter bewahrt dessen wirkungsfreie Fehler- und Readback-Semantik ohne eigene Domänenentscheidung.
 

@@ -43,7 +43,7 @@ ARTIFACT_ROOT = Path(
     )
 ).expanduser()
 BUREAU_ROOT = bureau_runtime.BUREAU_CONTROL_ROOT
-BUREAU_STATE_ROOT = Path.home() / ".local/state/bureau"
+BUREAU_STATE_ROOT = bureau_runtime.BUREAU_COORDINATION_ROOT
 MAX_INPUT_BYTES = 1024 * 1024
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 COMMAND_TIMEOUT_SECONDS = 30
@@ -1458,7 +1458,8 @@ def grabowski_bureau_acceptance_authenticate(
     reviewer: str,
 ) -> dict[str, Any]:
     """Authenticate one exact manual Bureau acceptance item through Bureau's canonical contract."""
-    operator._require_operator_mutation("bureau_mutation")
+    state_root = Path(BUREAU_STATE_ROOT).expanduser().resolve()
+    operator._require_operator_mutation("bureau_mutation", path=str(state_root))
     normalized: dict[str, str] = {}
     for label, value, maximum in (
         ("run_id", run_id, 128),
@@ -1485,7 +1486,7 @@ def grabowski_bureau_acceptance_authenticate(
             "--json",
             "--json-envelope",
             "--state-root",
-            str(BUREAU_STATE_ROOT),
+            str(state_root),
             "acceptance-authenticate",
             normalized["run_id"],
             normalized["criterion_id"],
@@ -1503,6 +1504,7 @@ def grabowski_bureau_acceptance_authenticate(
         run_id=normalized["run_id"],
         criterion_id=normalized["criterion_id"],
         expected_evidence_sha256=expected_evidence_sha256,
+        reviewer=normalized["reviewer"],
     )
     return payload
 

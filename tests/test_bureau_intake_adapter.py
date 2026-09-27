@@ -1437,6 +1437,43 @@ class BureauIntakeAdapterTests(unittest.TestCase):
             invoke.call_args.kwargs["required_readback"],
         )
 
+    def test_acceptance_authenticate_binds_canonical_state_root_gate_and_audit(self) -> None:
+        self.assertEqual(
+            intake.BUREAU_STATE_ROOT,
+            intake.bureau_runtime.BUREAU_COORDINATION_ROOT,
+        )
+        expected_sha256 = "b" * 64
+        state_root = self.root / "configured-bureau-state"
+        result_payload = {
+            "schema_version": 1,
+            "kind": "bureau.manual_acceptance_authentication_receipt",
+            "status": "authenticated",
+        }
+        with (
+            mock.patch.object(intake, "BUREAU_STATE_ROOT", state_root),
+            mock.patch.object(
+                intake, "_invoke_bureau", return_value=result_payload
+            ) as invoke,
+        ):
+            result = intake.grabowski_bureau_acceptance_authenticate(
+                "BUR-RUN-20260927T000000Z-0123456789",
+                "production-boundary",
+                expected_sha256,
+                "reviewer-a",
+            )
+        resolved = state_root.expanduser().resolve()
+        self.assertEqual(result_payload, result)
+        intake.operator._require_operator_mutation.assert_called_once_with(
+            "bureau_mutation", path=str(resolved)
+        )
+        arguments = invoke.call_args.args[0]
+        self.assertEqual(
+            arguments[arguments.index("--state-root") + 1],
+            str(resolved),
+        )
+        intake._audit.assert_called_once()
+        self.assertEqual(intake._audit.call_args.kwargs["reviewer"], "reviewer-a")
+
     def test_acceptance_authenticate_rejects_invalid_bindings_before_dispatch(self) -> None:
         invalid = (
             ("", "criterion", "a" * 64, "reviewer"),
