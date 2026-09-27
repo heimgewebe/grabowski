@@ -4594,6 +4594,7 @@ def _resolve_active_execution_reuse(
     identity: dict[str, Any],
     *,
     resume_policy: ResumePolicy,
+    allow_active_reuse: bool = True,
 ) -> dict[str, Any] | None:
     latest = _latest_matching_active_execution_record(identity)
     if latest is None:
@@ -4609,11 +4610,14 @@ def _resolve_active_execution_reuse(
             f"reconcile task {latest['task_id']} before another start"
         )
     now = _now()
-    if not _task_has_fresh_active_observation(latest, now=now):
+    if (
+        not allow_active_reuse
+        or not _task_has_fresh_active_observation(latest, now=now)
+    ):
         grabowski_task_status(str(latest["task_id"]))
         latest = _row_raw(str(latest["task_id"]))
     if str(latest["state"]) in TASK_STATE_PROJECTIONS["active"]:
-        return latest
+        return latest if allow_active_reuse else None
     return None
 
 
@@ -8741,13 +8745,13 @@ def grabowski_task_start(
         and operation_retry_binding is None
         and _retry_context is None
     ):
-        if mutating_agent_workspace is None:
-            execution_reuse = _resolve_active_execution_reuse(
-                execution_identity,
-                resume_policy=policy,
-            )
-            if execution_reuse is not None:
-                execution_reuse_reason = "active_execution_identity"
+        execution_reuse = _resolve_active_execution_reuse(
+            execution_identity,
+            resume_policy=policy,
+            allow_active_reuse=mutating_agent_workspace is None,
+        )
+        if execution_reuse is not None:
+            execution_reuse_reason = "active_execution_identity"
         if execution_reuse is None:
             execution_reuse = _resolve_recent_completed_execution_reuse(
                 execution_identity,

@@ -4401,9 +4401,23 @@ class TaskTests(unittest.TestCase):
 
     def test_mutating_agents_cannot_share_one_implicit_workspace(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
+        active_observation = {
+            "state": "running",
+            "observed_at_unix": tasks._now(),
+            "properties": {
+                "LoadState": "loaded",
+                "ActiveState": "active",
+                "SubState": "running",
+                "Result": "success",
+                "ExecMainCode": "exited",
+                "ExecMainStatus": "0",
+            },
+        }
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_validate_command", return_value=argv
-        ), patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch, patch.object(
+        ), patch.object(tasks, "_observe", return_value=active_observation) as observe, patch.object(
+            tasks, "_dispatch", return_value=_launcher()
+        ) as dispatch, patch.object(
             tasks.base, "_append_audit"
         ), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 151}
@@ -4415,8 +4429,68 @@ class TaskTests(unittest.TestCase):
                 tasks.grabowski_task_start(
                     "local", argv, cwd=str(self.root), runtime_seconds=60
                 )
+        observe.assert_called_once()
         self.assertEqual(dispatch.call_count, 1)
         self.assertEqual(tasks.grabowski_task_list()["count"], 1)
+
+    def test_completed_mutating_agent_retry_refreshes_before_workspace_reacquire(
+        self,
+    ) -> None:
+        argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_validate_command", return_value=argv),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 151}
+            ),
+        ):
+            first = tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root), runtime_seconds=60
+            )
+        task_id = str(first["task"]["task_id"])
+        self.assertIn(first["task"]["state"], tasks.TASK_STATE_PROJECTIONS["active"])
+        resource_keys = list(first["task"]["resource_keys"])
+        self.assertTrue(resource_keys)
+        for key in resource_keys:
+            self.assertIsNotNone(tasks.resources.inspect_resource(key))
+
+        completed_observation = {
+            "state": "completed",
+            "observed_at_unix": tasks._now(),
+            "properties": {
+                "ActiveState": "inactive",
+                "SubState": "dead",
+                "Result": "success",
+                "ExecMainCode": "exited",
+                "ExecMainStatus": "0",
+            },
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_validate_command", return_value=argv),
+            patch.object(tasks, "_observe", return_value=completed_observation) as observe,
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 152}
+            ),
+        ):
+            second = tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root), runtime_seconds=60
+            )
+        observe.assert_called_once()
+        dispatch.assert_not_called()
+        self.assertEqual(task_id, second["task"]["task_id"])
+        self.assertEqual("completed", second["task"]["state"])
+        self.assertEqual(
+            "recent_completed_execution_identity",
+            second["deduplicated_reuse"]["reason"],
+        )
+        for key in resource_keys:
+            self.assertIsNone(tasks.resources.inspect_resource(key))
+        self.assertEqual(1, tasks.grabowski_task_list()["count"])
 
     def test_explicit_file_scopes_do_not_replace_workspace_guard(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
