@@ -1341,6 +1341,105 @@ class OperatorSignedTransportTests(unittest.TestCase):
             )
         )
 
+    def test_simple_terminal_sed_range_read_redirects_before_replay_state(self) -> None:
+        arguments = {
+            "argv": ["sed", "-n", "10,20p", "src/grabowski_operator.py"],
+            "cwd": "/home/alex/repos/grabowski",
+        }
+        redirect = operator._terminal_typed_read_redirect(
+            "grabowski_terminal_run", arguments
+        )
+        self.assertEqual(
+            redirect,
+            {
+                "schema_version": 1,
+                "code": "typed_read_route_required",
+                "source_tool": "grabowski_terminal_run",
+                "typed_tool": "grabowski_read_text",
+                "typed_arguments": {
+                    "path": "/home/alex/repos/grabowski/src/grabowski_operator.py",
+                    "start_line": 10,
+                    "max_lines": 11,
+                },
+                "reason": "exact simple sed range read has an existing typed read surface",
+                "transport_consumed": False,
+                "does_not_establish": [
+                    "typed read success",
+                    "path authorization",
+                    "permission to retry the terminal command",
+                ],
+            },
+        )
+        tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=False))
+        with mock.patch.object(
+            base,
+            "_transport_signed_one_call_evidence",
+            side_effect=AssertionError(
+                "typed read redirect must happen before signed replay state"
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "typed read route required before mutation transport"
+            ):
+                operator._require_transport_roundtrip_for_tool(
+                    tool_name="grabowski_terminal_run",
+                    arguments=arguments,
+                    context=None,
+                    tool=tool,
+                )
+
+    def test_terminal_sed_read_redirect_is_exact_and_fail_closed(self) -> None:
+        unsafe = [
+            {"argv": ["sed", "-i", "10,20d", "file.txt"], "cwd": "/tmp"},
+            {"argv": ["sed", "-n", "10,20w /tmp/out", "file.txt"], "cwd": "/tmp"},
+            {"argv": ["sed", "-n", "10,20e id", "file.txt"], "cwd": "/tmp"},
+            {"argv": ["sed", "-n", "20,10p", "file.txt"], "cwd": "/tmp"},
+            {"argv": ["sed", "-n", "1,2001p", "file.txt"], "cwd": "/tmp"},
+            {"argv": ["sed", "-n", "10,20p", "-i"], "cwd": "/tmp"},
+            {"argv": ["sed", "-n", "10,20p", "file.txt", "extra"], "cwd": "/tmp"},
+            {"argv": ["sed", "-n", "10,20p", "file.txt"]},
+            {"argv": ["cat", "file.txt"], "cwd": "/tmp"},
+        ]
+        for arguments in unsafe:
+            with self.subTest(arguments=arguments):
+                self.assertIsNone(
+                    operator._terminal_typed_read_redirect(
+                        "grabowski_terminal_run", arguments
+                    )
+                )
+
+        single_line = operator._terminal_typed_read_redirect(
+            "grabowski_terminal_run",
+            {
+                "argv": ["sed", "-n", "7p", "src/grabowski_operator.py"],
+                "cwd": "/home/alex/repos/grabowski",
+            },
+        )
+        self.assertIsNotNone(single_line)
+        assert single_line is not None
+        self.assertEqual(single_line["typed_arguments"]["start_line"], 7)
+        self.assertEqual(single_line["typed_arguments"]["max_lines"], 1)
+
+    def test_typed_read_can_repeat_without_signed_replay_state(self) -> None:
+        tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=True))
+        arguments = {"path": "/tmp/example.txt", "start_line": 1, "max_lines": 5}
+        with mock.patch.object(
+            base,
+            "_transport_signed_one_call_evidence",
+            side_effect=AssertionError(
+                "explicit typed reads must not consume signed replay state"
+            ),
+        ):
+            for _ in range(2):
+                self.assertIsNone(
+                    operator._require_transport_roundtrip_for_tool(
+                        tool_name="grabowski_read_text",
+                        arguments=arguments,
+                        context=None,
+                        tool=tool,
+                    )
+                )
+
     def test_captain_preflight_exact_read_only_shape_is_transport_exempt(self) -> None:
         arguments = {
             "name": "captain-preflight",

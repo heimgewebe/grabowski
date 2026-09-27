@@ -152,7 +152,15 @@ class AgentInstructionsTests(unittest.TestCase):
         self.assertNotIn("only challenge_receipt_sha256", transport)
         self.assertNotIn("remains for compatibility", transport)
         typed = rules["typed-operation-preference"].lower()
-        for phrase in ("typed operations", "terminal", "git", "github"):
+        for phrase in (
+            "typed operations",
+            "terminal",
+            "git",
+            "github",
+            "file-range reads",
+            "grabowski_read_text",
+            "terminal_run/sed",
+        ):
             self.assertIn(phrase, typed)
         github = rules["github-connector-first"].lower()
         for phrase in (
