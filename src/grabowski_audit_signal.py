@@ -1372,6 +1372,10 @@ def build_projection(
                     "unmatched_intents_by_transition": dict(
                         prefix_monotonic_by_transition
                     ),
+                    # Completed-pair attribution is not prefix-monotonic: an omitted
+                    # older intent can consume a visible completion. Do not publish
+                    # suffix-only pairings as canonical evidence.
+                    "completed_pairs_by_transition": {},
                     "completion_audit_gaps_by_transition": {},
                     "completion_audit_gap_evidence_refs": [],
                     "completion_audit_gap_evidence_refs_truncated": False,
@@ -1388,6 +1392,9 @@ def build_projection(
                     ),
                     "partial_unmatched_intents_by_transition": transition_details.get(
                         "unmatched_intents_by_transition"
+                    ),
+                    "partial_completed_pairs_by_transition": transition_details.get(
+                        "completed_pairs_by_transition"
                     ),
                     "partial_completion_audit_gaps_by_transition": transition_details.get(
                         "completion_audit_gaps_by_transition"

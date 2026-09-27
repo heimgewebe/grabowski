@@ -410,13 +410,30 @@ class AuditSignalTests(unittest.TestCase):
         now = 1_800_000_000
         retention_ref = "a" * 64
         deploy_ref = "b" * 64
+        second_retention_ref = "c" * 64
+        completion_ref = "d" * 64
         records = [
             (
                 {
                     "operation": "runtime-state-retention-intent",
                     "record_sha256": retention_ref,
                 },
-                now - signal.AUDIT_SIGNAL_GRACE_SECONDS - 2,
+                now - signal.AUDIT_SIGNAL_GRACE_SECONDS - 5,
+            ),
+            (
+                {
+                    "operation": "runtime-state-retention-intent",
+                    "record_sha256": second_retention_ref,
+                },
+                now - signal.AUDIT_SIGNAL_GRACE_SECONDS - 4,
+            ),
+            (
+                {
+                    "operation": "runtime-state-retention-complete",
+                    "record_sha256": completion_ref,
+                    "receipt_sha256": "e" * 64,
+                },
+                now - signal.AUDIT_SIGNAL_GRACE_SECONDS - 3,
             ),
             (
                 {
@@ -466,6 +483,11 @@ class AuditSignalTests(unittest.TestCase):
         self.assertEqual(
             transition["details"]["unmatched_intents_by_transition"],
             {"runtime-deploy-schedule-intent": 1},
+        )
+        self.assertEqual(transition["details"]["completed_pairs_by_transition"], {})
+        self.assertEqual(
+            transition["details"]["partial_completed_pairs_by_transition"],
+            {"runtime-state-retention-intent": 1},
         )
         self.assertEqual(
             transition["details"]["execution_gap_evidence_refs"],
