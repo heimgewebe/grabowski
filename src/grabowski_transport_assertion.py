@@ -18,14 +18,10 @@ ASSERTION_VERSION = "signed-one-call-v1"
 ASSERTION_AUDIENCE = "grabowski-mcp"
 ASSERTION_MAX_AGE_SECONDS = 90
 ASSERTION_CLOCK_SKEW_SECONDS = 30
-# Kept as a public compatibility constant for tests/documentation that refer to
-# the original short replay window. Generic mutation replay remains monotone.
+# Historical compatibility constant. Durable replay remains monotone for
+# opaque mutation surfaces; domain-delegated tools do not consult replay state.
 REPLAY_RETENTION_SECONDS = 900
-# Sessionful durable task starts are the one bounded exception. Two adjacent
-# buckets are consumed atomically, yielding a 5-10 minute quarantine without
-# adding a timestamp store or clearing any historical replay bits.
-TASK_START_REPLAY_BUCKET_SECONDS = 300
-TASK_START_REPLAY_MAX_QUARANTINE_SECONDS = 2 * TASK_START_REPLAY_BUCKET_SECONDS
+DOMAIN_REPLAY_DELEGATED_TO_SEMANTICS = frozenset({"grabowski_task_start"})
 CONSUMPTION_KIND = "grabowski_transport_one_call_consumption"
 STATE_ROOT = Path.home() / ".local/state/grabowski/transport-one-call"
 LOCK_PATH = STATE_ROOT / ".lock"
@@ -551,33 +547,6 @@ def _stable_scope_replay_id(body_sha256: str, session_id: str = "") -> str:
         # This also preserves all existing durable replay bits for that path.
         material = b"grabowski-stable-client-scope-body-replay-id-v1\x00" + body
     return hashlib.sha256(material).hexdigest()[:32]
-
-
-def _task_start_bounded_replay_ids(
-    arguments_sha256: str,
-    *,
-    now_unix: int,
-) -> tuple[str, ...]:
-    """Return adjacent replay epochs for one canonical durable-task intent."""
-
-    if isinstance(now_unix, bool) or not isinstance(now_unix, int) or now_unix < 0:
-        raise TransportAssertionError(
-            "bounded task-start replay timestamp is invalid"
-        )
-    arguments = bytes.fromhex(
-        _sha256(arguments_sha256, "transport assertion arguments hash")
-    )
-    current_bucket = now_unix // TASK_START_REPLAY_BUCKET_SECONDS
-    buckets = (current_bucket, max(0, current_bucket - 1))
-    return tuple(
-        hashlib.sha256(
-            b"grabowski-task-start-arguments-replay-id-v2\x00"
-            + arguments
-            + b"\x00"
-            + str(bucket).encode("ascii")
-        ).hexdigest()[:32]
-        for bucket in dict.fromkeys(buckets)
-    )
 
 
 def _pread_exact(fd: int, size: int, offset: int, label: str) -> bytes:
@@ -1153,77 +1122,54 @@ def consume_assertion(
     if not hmac.compare_digest(asserted_runtime_hash, runtime_hash):
         raise TransportAssertionError("transport assertion runtime binding mismatch")
 
-    bounded_task_start = (
-        material["tool_name"] == "grabowski_task_start" and bool(session_id)
+    replay_policy = (
+        "domain_delegated"
+        if material["tool_name"] in DOMAIN_REPLAY_DELEGATED_TO_SEMANTICS
+        else "durable_transport_replay"
     )
-    with _state_lock():
-        for legacy_scope_hash, legacy_path in _legacy_tombstone_inventory(
-            scope_hash, material["request_id"]
-        ):
-            existing = _read_tombstone(legacy_path)
-            if existing is None:
-                continue
-            legacy = _validated_legacy_tombstone(
-                existing, legacy_scope_hash, legacy_path
-            )
-            same_target = (
-                legacy["tool_name"] == material["tool_name"]
-                and legacy["arguments_sha256"] == material["arguments_sha256"]
-                and legacy["body_sha256"] == material["body_sha256"]
-                and legacy["runtime_binding_sha256"]
-                == material["runtime_binding_sha256"]
-            )
-            same_intent = (
-                legacy["tool_name"] == material["tool_name"]
-                and legacy["arguments_sha256"] == material["arguments_sha256"]
-                and legacy["body_sha256"] == material["body_sha256"]
-            )
-            if legacy["request_id"] == material["request_id"]:
-                if not same_intent:
-                    raise TransportAssertionError(
-                        "transport request id was reused for different evidence"
-                    )
-                if not bounded_task_start:
-                    raise TransportAssertionReplay(
-                        "signed one-call transport request was already consumed; do not repeat the mutation; reconcile target state"
-                    )
-            if legacy["body_sha256"] == material["body_sha256"]:
-                if not same_intent:
-                    raise TransportAssertionError(
-                        "transport request body was rebound to different legacy evidence"
-                    )
-                if not bounded_task_start:
-                    # Legacy receipts predate stable connector identities, so token
-                    # rotation cannot be linked back to one connector scope. Exact
-                    # body-and-target evidence remains authoritative for generic
-                    # mutation replay.
-                    raise TransportAssertionReplay(
-                        "signed one-call transport request was already consumed; do not repeat the mutation; reconcile target state"
-                    )
-
-        if bounded_task_start:
-            bounded_ids = _task_start_bounded_replay_ids(
-                material["arguments_sha256"],
-                now_unix=now,
-            )
-            try:
-                _consume_replay_filter(
-                    tuple((scope_hash, replay_id) for replay_id in bounded_ids)
+    if replay_policy == "durable_transport_replay":
+        with _state_lock():
+            for legacy_scope_hash, legacy_path in _legacy_tombstone_inventory(
+                scope_hash, material["request_id"]
+            ):
+                existing = _read_tombstone(legacy_path)
+                if existing is None:
+                    continue
+                legacy = _validated_legacy_tombstone(
+                    existing, legacy_scope_hash, legacy_path
                 )
-            except TransportAssertionReplay as exc:
-                raise TransportAssertionReplay(
-                    "signed task-start request is still inside the bounded replay "
-                    "quarantine; reconcile task state before any retry"
-                ) from exc
-        else:
+                same_target = (
+                    legacy["tool_name"] == material["tool_name"]
+                    and legacy["arguments_sha256"] == material["arguments_sha256"]
+                    and legacy["body_sha256"] == material["body_sha256"]
+                    and legacy["runtime_binding_sha256"]
+                    == material["runtime_binding_sha256"]
+                )
+                same_intent = (
+                    legacy["tool_name"] == material["tool_name"]
+                    and legacy["arguments_sha256"] == material["arguments_sha256"]
+                    and legacy["body_sha256"] == material["body_sha256"]
+                )
+                if legacy["request_id"] == material["request_id"]:
+                    if not same_target:
+                        raise TransportAssertionError(
+                            "transport request id was reused for different evidence"
+                        )
+                    raise TransportAssertionReplay(
+                        "signed one-call transport request was already consumed; do not repeat the mutation; reconcile target state"
+                    )
+                if legacy["body_sha256"] == material["body_sha256"]:
+                    if not same_intent:
+                        raise TransportAssertionError(
+                            "transport request body was rebound to different legacy evidence"
+                        )
+                    raise TransportAssertionReplay(
+                        "signed one-call transport request was already consumed; do not repeat the mutation; reconcile target state"
+                    )
             if session_id and _replay_filter_contains(
                 scope_hash,
                 _stable_scope_replay_id(material["body_sha256"]),
             ):
-                # Pre-upgrade sessionful requests wrote only the v1 stable body
-                # key. Keep that historical evidence authoritative for every
-                # mutation except the explicitly bounded durable task-start
-                # surface.
                 raise TransportAssertionReplay(
                     "signed one-call transport request was already consumed or conservatively rejected by the durable replay filter; do not repeat the mutation; reconcile target state"
                 )
@@ -1251,12 +1197,14 @@ def consume_assertion(
         "tool_name": material["tool_name"],
         "arguments_sha256": material["arguments_sha256"],
         "body_sha256": material["body_sha256"],
+        "replay_policy": replay_policy,
     }
     receipt["receipt_sha256"] = _sha256_json(receipt)
     return {
         "schema_version": SCHEMA_VERSION,
-        "state": "consumed",
-        "single_use": True,
+        "state": "validated" if replay_policy == "domain_delegated" else "consumed",
+        "single_use": replay_policy != "domain_delegated",
+        "replay_policy": replay_policy,
         "transport_mode": ASSERTION_VERSION,
         "client_scope_sha256": scope_hash,
         "runtime_binding_sha256": material["runtime_binding_sha256"],
@@ -1266,7 +1214,14 @@ def consume_assertion(
         "consumption_receipt_sha256": receipt["receipt_sha256"],
         "does_not_establish": [
             "application-level success of the admitted mutation",
-            "safe replay after response loss",
             "human identity behind the authenticated connector",
+            *(
+                [
+                    "application-level duplicate suppression",
+                    "safe retry authority outside the durable task semantics",
+                ]
+                if replay_policy == "domain_delegated"
+                else ["safe replay after response loss"]
+            ),
         ],
     }

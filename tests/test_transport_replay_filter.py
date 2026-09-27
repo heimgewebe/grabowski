@@ -143,276 +143,76 @@ class ReplayFilterTests(unittest.TestCase):
         with self.assertRaises(assertion.TransportAssertionReplay):
             assertion.consume_assertion(**restarted, now_unix=5001)
 
-    def test_sessionful_task_start_replay_quarantine_is_bounded(self) -> None:
+    def test_task_start_replay_is_delegated_to_task_semantics(self) -> None:
         session_id = "task-start-session"
-        first = _task_start_evidence(
-            now=301,
-            session_id=session_id,
-            rpc_request_id="task-start-rpc-1",
-        )
-        assertion.consume_assertion(**first, session_id=session_id, now_unix=301)
+        item = _task_start_evidence(now=100, session_id=session_id)
 
-        previous_bucket = _task_start_evidence(
-            now=601,
+        first = assertion.consume_assertion(
+            **item,
             session_id=session_id,
-            rpc_request_id="task-start-rpc-2",
+            now_unix=100,
         )
-        with self.assertRaisesRegex(
-            assertion.TransportAssertionReplay, "bounded replay quarantine"
-        ):
-            assertion.consume_assertion(
-                **previous_bucket,
-                session_id=session_id,
-                now_unix=601,
+        second = assertion.consume_assertion(
+            **item,
+            session_id=session_id,
+            now_unix=101,
+        )
+
+        for evidence in (first, second):
+            self.assertEqual(evidence["state"], "validated")
+            self.assertFalse(evidence["single_use"])
+            self.assertEqual(evidence["replay_policy"], "domain_delegated")
+            self.assertRegex(
+                str(evidence["consumption_receipt_sha256"]),
+                r"^[0-9a-f]{64}$",
             )
 
-        expired = _task_start_evidence(
-            now=901,
-            session_id=session_id,
-            rpc_request_id="task-start-rpc-3",
-        )
-        consumed = assertion.consume_assertion(
-            **expired,
-            session_id=session_id,
-            now_unix=901,
-        )
-        self.assertEqual(consumed["state"], "consumed")
-
-    def test_sessionful_task_start_quarantine_survives_session_change(
-        self,
-    ) -> None:
-        first_session = "task-start-session-a"
-        second_session = "task-start-session-b"
-        first = _task_start_evidence(
-            now=301,
-            session_id=first_session,
-            rpc_request_id="same-task-start-rpc",
-        )
-        second = _task_start_evidence(
-            now=302,
-            session_id=second_session,
-            rpc_request_id="same-task-start-rpc",
-        )
-        self.assertNotEqual(first["request_id"], second["request_id"])
-
+    def test_task_start_delegation_does_not_create_replay_state(self) -> None:
+        session_id = "task-start-no-state-session"
+        item = _task_start_evidence(now=100, session_id=session_id)
         assertion.consume_assertion(
-            **first,
-            session_id=first_session,
-            now_unix=301,
-        )
-        with self.assertRaisesRegex(
-            assertion.TransportAssertionReplay, "bounded replay quarantine"
-        ):
-            assertion.consume_assertion(
-                **second,
-                session_id=second_session,
-                now_unix=302,
-            )
-
-    def test_sessionful_task_start_same_request_id_is_admitted_after_window(
-        self,
-    ) -> None:
-        session_id = "task-start-request-id-session"
-        first = _task_start_evidence(now=301, session_id=session_id)
-        assertion.consume_assertion(**first, session_id=session_id, now_unix=301)
-
-        repeated = _task_start_evidence(now=901, session_id=session_id)
-        consumed = assertion.consume_assertion(
-            **repeated,
+            **item,
             session_id=session_id,
-            now_unix=901,
+            now_unix=100,
         )
-        self.assertEqual(consumed["state"], "consumed")
+        self.assertFalse(assertion.STATE_ROOT.exists())
 
-    def test_sessionful_task_start_quarantine_is_argument_bound_across_body_ids(
-        self,
-    ) -> None:
-        session_id = "task-start-argument-session"
-        first = _task_start_evidence(
-            now=301,
-            session_id=session_id,
-            rpc_request_id="argument-rpc-1",
-            body=hashlib.sha256(b"body-with-rpc-1").hexdigest(),
-        )
-        assertion.consume_assertion(**first, session_id=session_id, now_unix=301)
-
-        same_arguments_new_body = _task_start_evidence(
-            now=302,
-            session_id=session_id,
-            rpc_request_id="argument-rpc-2",
-            body=hashlib.sha256(b"body-with-rpc-2").hexdigest(),
-        )
-        with self.assertRaisesRegex(
-            assertion.TransportAssertionReplay, "bounded replay quarantine"
-        ):
-            assertion.consume_assertion(
-                **same_arguments_new_body,
-                session_id=session_id,
-                now_unix=302,
-            )
-
-    def test_sessionful_task_start_quarantine_survives_secret_rotation(self) -> None:
-        session_id = "task-start-rotation-session"
-        first = _task_start_evidence(now=301, session_id=session_id)
-        assertion.consume_assertion(**first, session_id=session_id, now_unix=301)
-
-        rotated = _task_start_evidence(
-            now=302,
-            session_id=session_id,
-            secret="B" * 43,
-        )
-        self.assertNotEqual(first["request_id"], rotated["request_id"])
-        with self.assertRaisesRegex(
-            assertion.TransportAssertionReplay, "bounded replay quarantine"
-        ):
-            assertion.consume_assertion(
-                **rotated,
-                session_id=session_id,
-                now_unix=302,
-            )
-
-    def test_sessionful_task_start_quarantine_survives_runtime_change(self) -> None:
-        session_id = "task-start-runtime-session"
-        first = _task_start_evidence(
-            now=301,
-            session_id=session_id,
-            rpc_request_id="task-start-runtime-rpc-1",
-        )
-        assertion.consume_assertion(**first, session_id=session_id, now_unix=301)
-
-        changed_runtime = _task_start_evidence(
-            now=302,
-            session_id=session_id,
-            runtime="3" * 64,
-            rpc_request_id="task-start-runtime-rpc-2",
-        )
-        with self.assertRaisesRegex(
-            assertion.TransportAssertionReplay, "bounded replay quarantine"
-        ):
-            assertion.consume_assertion(
-                **changed_runtime,
-                session_id=session_id,
-                now_unix=302,
-            )
-
-    def test_sessionful_task_start_ignores_historical_unbounded_keys(self) -> None:
+    def test_task_start_ignores_historical_durable_replay_bits(self) -> None:
         session_id = "task-start-migration-session"
-        first = _task_start_evidence(now=301, session_id=session_id)
-        body = str(first["body_sha256"])
-        assertion.STATE_ROOT.mkdir(mode=0o700)
-        assertion._consume_replay_filter(
-            (
-                (SCOPE, assertion._stable_scope_replay_id(body)),
-                (
-                    SCOPE,
-                    assertion._stable_scope_replay_id(
-                        body,
-                        session_id=session_id,
-                    ),
-                ),
-            )
-        )
-
-        consumed = assertion.consume_assertion(
-            **first,
-            session_id=session_id,
-            now_unix=301,
-        )
-        self.assertEqual(consumed["state"], "consumed")
-
-    def test_sessionful_task_start_ignores_historical_request_id_bit(self) -> None:
-        session_id = "task-start-historical-request-session"
-        replay = _task_start_evidence(now=901, session_id=session_id)
+        item = _task_start_evidence(now=100, session_id=session_id)
         assertion.STATE_ROOT.mkdir(mode=0o700)
         assertion._consume_replay_filter(
             (
                 (
                     assertion._replay_scope_sha256(SECRET),
-                    str(replay["request_id"]),
+                    str(item["request_id"]),
+                ),
+                (
+                    SCOPE,
+                    assertion._stable_scope_replay_id(
+                        str(item["body_sha256"]),
+                        session_id=session_id,
+                    ),
                 ),
             )
         )
-
-        consumed = assertion.consume_assertion(
-            **replay,
+        evidence = assertion.consume_assertion(
+            **item,
             session_id=session_id,
-            now_unix=901,
+            now_unix=100,
         )
-        self.assertEqual(consumed["state"], "consumed")
+        self.assertEqual(evidence["replay_policy"], "domain_delegated")
 
-    def test_sessionful_task_start_ignores_legacy_body_for_new_request_id(
-        self,
-    ) -> None:
-        session_id = "task-start-legacy-tombstone-session"
-        legacy = _task_start_evidence(
-            now=301,
-            session_id=session_id,
-            rpc_request_id="legacy-task-start-rpc",
-        )
-        assertion.STATE_ROOT.mkdir(mode=0o700)
-        scope_dir = assertion.STATE_ROOT / SCOPE
-        scope_dir.mkdir(mode=0o700)
-        receipt = {
-            "request_id": legacy["request_id"],
-            "client_scope_sha256": SCOPE,
-            "tool_name": legacy["tool_name"],
-            "arguments_sha256": legacy["arguments_sha256"],
-            "body_sha256": legacy["body_sha256"],
-            "runtime_binding_sha256": legacy["runtime_binding_sha256"],
-        }
-        path = scope_dir / f"{legacy['request_id']}.json"
-        path.write_text(json.dumps(receipt), encoding="utf-8")
-        path.chmod(0o600)
+    def test_sessionless_task_start_is_also_domain_delegated(self) -> None:
+        item = _task_start_evidence(now=100, session_id="")
+        first = assertion.consume_assertion(**item, now_unix=100)
+        second = assertion.consume_assertion(**item, now_unix=101)
+        self.assertEqual(first["state"], "validated")
+        self.assertEqual(second["state"], "validated")
+        self.assertFalse(first["single_use"])
+        self.assertFalse(second["single_use"])
 
-        fresh = _task_start_evidence(
-            now=901,
-            session_id=session_id,
-            rpc_request_id="fresh-task-start-rpc",
-        )
-        consumed = assertion.consume_assertion(
-            **fresh,
-            session_id=session_id,
-            now_unix=901,
-        )
-        self.assertEqual(consumed["state"], "consumed")
-
-    def test_sessionful_task_start_legacy_tombstone_still_rejects_rebinding(self) -> None:
-        session_id = "task-start-legacy-rebind-session"
-        first = _task_start_evidence(now=301, session_id=session_id)
-        assertion.STATE_ROOT.mkdir(mode=0o700)
-        scope_dir = assertion.STATE_ROOT / SCOPE
-        scope_dir.mkdir(mode=0o700)
-        receipt = {
-            "request_id": first["request_id"],
-            "client_scope_sha256": SCOPE,
-            "tool_name": first["tool_name"],
-            "arguments_sha256": "9" * 64,
-            "body_sha256": first["body_sha256"],
-            "runtime_binding_sha256": RUNTIME,
-        }
-        path = scope_dir / f"{first['request_id']}.json"
-        path.write_text(json.dumps(receipt), encoding="utf-8")
-        path.chmod(0o600)
-
-        with self.assertRaisesRegex(
-            assertion.TransportAssertionError,
-            "different evidence|rebound",
-        ):
-            assertion.consume_assertion(
-                **first,
-                session_id=session_id,
-                now_unix=301,
-            )
-
-    def test_sessionless_task_start_replay_remains_durable(self) -> None:
-        first = _task_start_evidence(now=100, session_id="")
-        assertion.consume_assertion(**first, now_unix=100)
-
-        later = _task_start_evidence(now=5000, session_id="")
-        with self.assertRaises(assertion.TransportAssertionReplay):
-            assertion.consume_assertion(**later, now_unix=5000)
-
-    def test_non_task_mutation_replay_remains_durable_after_task_window(self) -> None:
+    def test_non_task_mutation_replay_remains_durable_after_time(self) -> None:
         first = _evidence(44, now=100)
         assertion.consume_assertion(**first, now_unix=100)
         later = _evidence(44, now=5000)

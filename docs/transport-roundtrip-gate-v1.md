@@ -29,44 +29,34 @@ If the process restarts, the retained target expires or is safely evicted, or th
 
 A stable client-declared scope may use `action=begin`, then `action=ack`, then invoke the exact mutation once. `action=ack` remains fail-closed for `shared_unlabeled` because a shared label is not caller identity.
 
-## Bounded durable task-start replay
+## Replay authority split
 
-The sessionful grabowski_task_start surface is the one bounded exception to
-permanent signed mutation replay quarantine. Starting a persistent task already
-enters a second server-owned lifecycle with task identity, active-execution
-deduplication, retry-state guards, leases and durable status readback. Keeping
-the transport body permanently quarantined as well would turn a completed task
-invocation into a permanent ban on a later intentional identical task start.
+Replay protection is not a global history of "this tool call has been seen
+before". The transport layer authenticates every signed one-call request and
+keeps durable replay state only where the downstream mutation surface cannot
+itself reconcile repetition safely.
 
-For a request carrying an MCP session id, Grabowski stores the canonical
-task-start argument digest in adjacent five-minute epochs inside the stable
-connector scope. The current and preceding epoch are consumed atomically, so the
-same task-start arguments remain rejected for between five and ten minutes even
-when the connector uses a different JSON-RPC request id, request body encoding,
-token, MCP session, or runtime release. After that quarantine, a later fresh
-signed invocation may reach the task layer, which remains authoritative for
-active reuse, unresolved or unknown outcome blocking, named retry recovery and
-resource leases.
+- Read-only tools never enter the mutation replay path.
+- grabowski_task_start validates connector capability, request MAC, freshness,
+  runtime binding and the exact raw argument digest, but does not read or mutate
+  the durable replay filter. Its replay policy is domain_delegated.
+- The durable task layer is authoritative for repeated task starts. Task
+  mutations are serialized, the task row is committed before _launch() can
+  start a process, active execution identities are reused, and terminal or
+  outcome-unknown predecessors remain subject to the task retry/reconcile
+  contract.
+- Other mutating tools remain on durable_transport_replay by default. Their
+  exact request id and stable body identity stay fail-closed until a narrower
+  domain-specific idempotency/readback path proves re-entry safe.
+- Existing intrinsic domain replay recovery remains valid for the small set of
+  mutations whose post-state preflight proves that a repeated effect is safe.
 
-The signed assertion itself remains fresh for only 90 seconds. Replaying an old
-captured assertion after that bound is rejected as stale before replay-state
-admission; within the freshness window the bounded argument epoch rejects the
-duplicate. A newly signed invocation after the quarantine is therefore treated
-as a new transport attempt for the same durable task intent instead of being
-permanently banned by historical request-id or body bits.
-
-This exception is deliberately narrow:
-
-- sessionless grabowski_task_start keeps the historical permanent replay rule;
-- every other mutating tool keeps permanent durable replay protection;
-- historical permanent task-start request-id/body bits and matching tombstones
-  are not deleted or rewritten, but sessionful task starts no longer consult
-  them as eternal replay authority;
-- a legacy tombstone that rebinds the same request id or body to different
-  tool/argument evidence still fails closed;
-- expiry of the transport quarantine is not evidence that a prior task failed,
-  succeeded, or is safe to duplicate. Task state must still be reconciled when
-  the prior outcome is uncertain.
+This separation intentionally removes the permanent same-task-start veto. A
+repeated signed task-start call reaches the task semantics even if an earlier
+transport response was lost or an identical command was run previously. The
+transport validation receipt does not itself establish duplicate suppression,
+retry authority, task success or permission to bypass task-state
+reconciliation.
 
 ## Bound evidence
 
