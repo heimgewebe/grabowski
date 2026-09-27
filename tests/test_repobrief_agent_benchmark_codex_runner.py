@@ -2914,6 +2914,43 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "",
             )
 
+            original_source_read = runner._read_bound_regular_file
+
+            def reject_oversized_source_read(path, *, label, max_bytes):
+                if (
+                    Path(path).resolve() == implementation.resolve()
+                    and label
+                    == f"RepoGround MCP source tree file {implementation_relative}"
+                ):
+                    raise AssertionError(
+                        "oversized RepoGround source must be rejected before reading"
+                    )
+                return original_source_read(
+                    path,
+                    label=label,
+                    max_bytes=max_bytes,
+                )
+
+            with patch.object(
+                runner,
+                "MAX_MCP_SOURCE_TREE_BYTES",
+                1,
+            ), patch.object(
+                runner,
+                "_read_bound_regular_file",
+                side_effect=reject_oversized_source_read,
+            ):
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "source tree exceeds its byte budget",
+                ):
+                    runner.stage_mcp_upstream(
+                        state_root,
+                        upstream,
+                        manifest,
+                        authorized,
+                    )
+
     def test_staged_repoground_mcp_upstream_accepts_sha256_generator_commit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

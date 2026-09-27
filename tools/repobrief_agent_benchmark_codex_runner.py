@@ -3331,10 +3331,13 @@ def _repoground_source_tree_snapshot(
             or metadata.st_mode & 0o022
         ):
             raise RunnerError("RepoGround MCP source tree file is unsafe")
+        remaining_bytes = MAX_MCP_SOURCE_TREE_BYTES - total_bytes
+        if remaining_bytes < 0 or metadata.st_size > remaining_bytes:
+            raise RunnerError("RepoGround MCP source tree exceeds its byte budget")
         raw = _read_bound_regular_file(
             source,
             label=f"RepoGround MCP source tree file {relative}",
-            max_bytes=MAX_PROVIDER_EXECUTABLE_BYTES,
+            max_bytes=remaining_bytes,
         )
         git_object = b"blob " + str(len(raw)).encode("ascii") + b"\0" + raw
         blob_oid = (
