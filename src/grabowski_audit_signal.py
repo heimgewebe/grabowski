@@ -1309,6 +1309,10 @@ def build_projection(
         partial_status = transition_gap["status"]
         partial_count = transition_gap["count"]
         partial_observed_count = transition_gap["observed_count"]
+        partial_evidence_refs = list(transition_gap["evidence_refs"])
+        partial_evidence_refs_truncated = bool(
+            transition_gap["evidence_refs_truncated"]
+        )
         transition_details = transition_gap["details"]
         prefix_monotonic_count = transition_details.get(
             "prefix_monotonic_execution_gap_count"
@@ -1384,6 +1388,8 @@ def build_projection(
                     "partial_status": partial_status,
                     "partial_count": partial_count,
                     "partial_observed_count": partial_observed_count,
+                    "partial_evidence_refs": partial_evidence_refs,
+                    "partial_evidence_refs_truncated": partial_evidence_refs_truncated,
                     "partial_execution_gap_count": transition_details.get(
                         "execution_gap_count"
                     ),
@@ -1402,8 +1408,20 @@ def build_projection(
                     "partial_execution_gap_evidence_refs": transition_details.get(
                         "execution_gap_evidence_refs"
                     ),
+                    "partial_execution_gap_evidence_refs_truncated": transition_details.get(
+                        "execution_gap_evidence_refs_truncated"
+                    ),
+                    "partial_execution_gap_evidence_refs_omitted_count": transition_details.get(
+                        "execution_gap_evidence_refs_omitted_count"
+                    ),
                     "partial_completion_audit_gap_evidence_refs": transition_details.get(
                         "completion_audit_gap_evidence_refs"
+                    ),
+                    "partial_completion_audit_gap_evidence_refs_truncated": transition_details.get(
+                        "completion_audit_gap_evidence_refs_truncated"
+                    ),
+                    "partial_completion_audit_gap_evidence_refs_omitted_count": transition_details.get(
+                        "completion_audit_gap_evidence_refs_omitted_count"
                     ),
                 },
                 "does_not_establish": [
@@ -1414,23 +1432,75 @@ def build_projection(
             }
         else:
             # Retention completion/reconciliation matching can depend on receipt
-            # ownership in the omitted prefix, so retention-only partial evidence
-            # cannot support a positive or negative transition-gap classification.
+            # ownership in the omitted prefix, so suffix-only counts, pairings and
+            # evidence are diagnostic rather than canonical in this branch.
             transition_gap = {
                 **transition_gap,
                 "status": "indeterminate",
                 "severity": "unknown",
                 "count": None,
+                "evidence_refs": [],
+                "evidence_refs_truncated": False,
                 "evidence_quality": "partial_verified_audit_window",
                 "recommended_action": (
                     "inspect a complete verified audit window before classifying transition gaps"
                 ),
                 "details": {
                     **transition_details,
+                    "execution_gap_count": None,
+                    "completion_audit_gap_count": None,
+                    "count_semantics": "indeterminate_in_partial_verified_audit_window",
+                    "observed_count_semantics": (
+                        "partial_suffix_diagnostic_count_in_indeterminate_window"
+                    ),
+                    "execution_gap_evidence_refs": [],
+                    "execution_gap_evidence_refs_truncated": False,
+                    "execution_gap_evidence_refs_omitted_count": 0,
+                    "unmatched_intents_by_transition": {},
+                    "completed_pairs_by_transition": {},
+                    "completion_audit_gaps_by_transition": {},
+                    "completion_audit_gap_evidence_refs": [],
+                    "completion_audit_gap_evidence_refs_truncated": False,
+                    "completion_audit_gap_evidence_refs_omitted_count": 0,
                     "audit_window_complete": False,
                     "partial_status": partial_status,
                     "partial_count": partial_count,
                     "partial_observed_count": partial_observed_count,
+                    "partial_evidence_refs": partial_evidence_refs,
+                    "partial_evidence_refs_truncated": partial_evidence_refs_truncated,
+                    "partial_execution_gap_count": transition_details.get(
+                        "execution_gap_count"
+                    ),
+                    "partial_completion_audit_gap_count": transition_details.get(
+                        "completion_audit_gap_count"
+                    ),
+                    "partial_unmatched_intents_by_transition": transition_details.get(
+                        "unmatched_intents_by_transition"
+                    ),
+                    "partial_completed_pairs_by_transition": transition_details.get(
+                        "completed_pairs_by_transition"
+                    ),
+                    "partial_completion_audit_gaps_by_transition": transition_details.get(
+                        "completion_audit_gaps_by_transition"
+                    ),
+                    "partial_execution_gap_evidence_refs": transition_details.get(
+                        "execution_gap_evidence_refs"
+                    ),
+                    "partial_execution_gap_evidence_refs_truncated": transition_details.get(
+                        "execution_gap_evidence_refs_truncated"
+                    ),
+                    "partial_execution_gap_evidence_refs_omitted_count": transition_details.get(
+                        "execution_gap_evidence_refs_omitted_count"
+                    ),
+                    "partial_completion_audit_gap_evidence_refs": transition_details.get(
+                        "completion_audit_gap_evidence_refs"
+                    ),
+                    "partial_completion_audit_gap_evidence_refs_truncated": transition_details.get(
+                        "completion_audit_gap_evidence_refs_truncated"
+                    ),
+                    "partial_completion_audit_gap_evidence_refs_omitted_count": transition_details.get(
+                        "completion_audit_gap_evidence_refs_omitted_count"
+                    ),
                 },
                 "does_not_establish": [
                     *transition_gap["does_not_establish"],
