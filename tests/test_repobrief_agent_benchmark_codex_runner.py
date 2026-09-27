@@ -507,6 +507,87 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertNotIn("ENV", environment)
         self.assertEqual(environment["PATH"], "/usr/bin:/bin")
 
+    def test_git_environment_disables_lazy_fetch(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "PATH": "/usr/bin",
+                "HOME": "/home/test",
+                "GIT_NO_LAZY_FETCH": "0",
+            },
+            clear=True,
+        ):
+            environment = runner.base._git_environment()
+        self.assertEqual(environment["GIT_NO_LAZY_FETCH"], "1")
+        self.assertEqual(environment["GIT_NO_REPLACE_OBJECTS"], "1")
+        self.assertEqual(environment["GIT_CONFIG_GLOBAL"], "/dev/null")
+        self.assertEqual(environment["GIT_CONFIG_SYSTEM"], "/dev/null")
+
+    def test_git_environment_blocks_promisor_lazy_fetch_uploadpack(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            git(["init"], source)
+            git(["config", "user.email", "test@example.invalid"], source)
+            git(["config", "user.name", "Test"], source)
+            merger = source / "merger"
+            merger.mkdir()
+            (merger / "payload.py").write_text("value = 1\n", encoding="utf-8")
+            scripts = source / "scripts"
+            scripts.mkdir()
+            (scripts / "repoground-mcp-stdio.py").write_text(
+                "print('fixture')\n",
+                encoding="utf-8",
+            )
+            git(["add", "."], source)
+            git(["commit", "-m", "fixture"], source)
+
+            remote = root / "remote.git"
+            completed = subprocess.run(
+                ["git", "clone", "--bare", "-q", str(source), str(remote)],
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            git(["remote", "add", "origin", str(remote)], source)
+
+            head = git(["rev-parse", "HEAD"], source)
+            tree = git(["rev-parse", "HEAD^{tree}"], source)
+            tree_object = source / ".git" / "objects" / tree[:2] / tree[2:]
+            self.assertTrue(tree_object.is_file())
+            tree_object.unlink()
+
+            marker = root / "uploadpack-ran"
+            uploadpack = root / "uploadpack-wrapper"
+            uploadpack.write_text(
+                "#!/bin/sh\n"
+                f"printf ran > {str(marker)!r}\n"
+                'exec git-upload-pack "$@"\n',
+                encoding="utf-8",
+            )
+            uploadpack.chmod(0o700)
+            git(["config", "remote.origin.promisor", "true"], source)
+            git(["config", "remote.origin.partialclonefilter", "blob:none"], source)
+            git(["config", "remote.origin.uploadpack", str(uploadpack)], source)
+
+            environment = runner.base._git_environment()
+            completed = subprocess.run(
+                ["git", "ls-tree", "-r", head, "--", "merger"],
+                cwd=source,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertEqual(environment["GIT_NO_LAZY_FETCH"], "1")
+            self.assertFalse(marker.exists())
+            self.assertFalse(tree_object.exists())
+            self.assertIn("lazy fetching disabled", completed.stderr)
+
     def test_direct_runner_rejects_unbootstrapped_start(self) -> None:
         completed = subprocess.run(
             [sys.executable, str(MODULE_PATH), "--help"],
