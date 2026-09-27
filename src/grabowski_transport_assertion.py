@@ -19,8 +19,13 @@ ASSERTION_AUDIENCE = "grabowski-mcp"
 ASSERTION_MAX_AGE_SECONDS = 90
 ASSERTION_CLOCK_SKEW_SECONDS = 30
 # Kept as a public compatibility constant for tests/documentation that refer to
-# the original short replay window. The durable replay filter never expires.
+# the original short replay window. Generic mutation replay remains monotone.
 REPLAY_RETENTION_SECONDS = 900
+# Sessionful durable task starts are the one bounded exception. Two adjacent
+# buckets are consumed atomically, yielding a 5-10 minute quarantine without
+# adding a timestamp store or clearing any historical replay bits.
+TASK_START_REPLAY_BUCKET_SECONDS = 300
+TASK_START_REPLAY_MAX_QUARANTINE_SECONDS = 2 * TASK_START_REPLAY_BUCKET_SECONDS
 CONSUMPTION_KIND = "grabowski_transport_one_call_consumption"
 STATE_ROOT = Path.home() / ".local/state/grabowski/transport-one-call"
 LOCK_PATH = STATE_ROOT / ".lock"
@@ -546,6 +551,42 @@ def _stable_scope_replay_id(body_sha256: str, session_id: str = "") -> str:
         # This also preserves all existing durable replay bits for that path.
         material = b"grabowski-stable-client-scope-body-replay-id-v1\x00" + body
     return hashlib.sha256(material).hexdigest()[:32]
+
+
+def _task_start_bounded_replay_ids(
+    body_sha256: str,
+    *,
+    session_id: str,
+    runtime_binding_sha256: str,
+    now_unix: int,
+) -> tuple[str, ...]:
+    """Return the current and preceding replay epochs for one durable task start."""
+
+    if not isinstance(session_id, str) or not session_id:
+        raise TransportAssertionError(
+            "bounded task-start replay requires one MCP session id"
+        )
+    if isinstance(now_unix, bool) or not isinstance(now_unix, int) or now_unix < 0:
+        raise TransportAssertionError(
+            "bounded task-start replay timestamp is invalid"
+        )
+    stable = _stable_scope_replay_id(body_sha256, session_id=session_id)
+    runtime = bytes.fromhex(
+        _sha256(runtime_binding_sha256, "transport runtime binding hash")
+    )
+    current_bucket = now_unix // TASK_START_REPLAY_BUCKET_SECONDS
+    buckets = (current_bucket, max(0, current_bucket - 1))
+    return tuple(
+        hashlib.sha256(
+            b"grabowski-task-start-bounded-replay-v1\x00"
+            + stable.encode("ascii")
+            + b"\x00"
+            + runtime
+            + b"\x00"
+            + str(bucket).encode("ascii")
+        ).hexdigest()[:32]
+        for bucket in dict.fromkeys(buckets)
+    )
 
 
 def _pread_exact(fd: int, size: int, offset: int, label: str) -> bytes:
@@ -1121,6 +1162,9 @@ def consume_assertion(
     if not hmac.compare_digest(asserted_runtime_hash, runtime_hash):
         raise TransportAssertionError("transport assertion runtime binding mismatch")
 
+    bounded_task_start = (
+        material["tool_name"] == "grabowski_task_start" and bool(session_id)
+    )
     with _state_lock():
         for legacy_scope_hash, legacy_path in _legacy_tombstone_inventory(
             scope_hash, material["request_id"]
@@ -1138,43 +1182,73 @@ def consume_assertion(
                 and legacy["runtime_binding_sha256"]
                 == material["runtime_binding_sha256"]
             )
-            if legacy["request_id"] == material["request_id"] and not same_target:
-                raise TransportAssertionError(
-                    "transport request id was reused for different evidence"
-                )
-            if legacy["body_sha256"] == material["body_sha256"]:
+            same_intent = (
+                legacy["tool_name"] == material["tool_name"]
+                and legacy["arguments_sha256"] == material["arguments_sha256"]
+                and legacy["body_sha256"] == material["body_sha256"]
+            )
+            if legacy["request_id"] == material["request_id"]:
                 if not same_target:
                     raise TransportAssertionError(
-                        "transport request body was rebound to different legacy evidence"
+                        "transport request id was reused for different evidence"
                     )
-                # Legacy receipts predate stable connector identities, so token
-                # rotation cannot be linked back to one connector scope. Exact
-                # body-and-target evidence is conservatively authoritative
-                # across the bounded legacy inventory.
                 raise TransportAssertionReplay(
                     "signed one-call transport request was already consumed; do not repeat the mutation; reconcile target state"
                 )
-        if session_id and _replay_filter_contains(
-            scope_hash,
-            _stable_scope_replay_id(material["body_sha256"]),
-        ):
-            # Pre-upgrade sessionful requests wrote only the v1 stable body key.
-            # Check that historical evidence without writing it for new sessions;
-            # otherwise the v2 migration would reintroduce body-wide coupling.
-            raise TransportAssertionReplay(
-                "signed one-call transport request was already consumed or conservatively rejected by the durable replay filter; do not repeat the mutation; reconcile target state"
+            if legacy["body_sha256"] == material["body_sha256"]:
+                if not same_intent:
+                    raise TransportAssertionError(
+                        "transport request body was rebound to different legacy evidence"
+                    )
+                if not bounded_task_start:
+                    # Legacy receipts predate stable connector identities, so token
+                    # rotation cannot be linked back to one connector scope. Exact
+                    # body-and-target evidence remains authoritative for generic
+                    # mutation replay.
+                    raise TransportAssertionReplay(
+                        "signed one-call transport request was already consumed; do not repeat the mutation; reconcile target state"
+                    )
+
+        if bounded_task_start:
+            bounded_ids = _task_start_bounded_replay_ids(
+                material["body_sha256"],
+                session_id=session_id,
+                runtime_binding_sha256=material["runtime_binding_sha256"],
+                now_unix=now,
             )
-        _consume_replay_filter(
-            (
-                (legacy_replay_scope_hash, material["request_id"]),
+            try:
+                _consume_replay_filter(
+                    ((legacy_replay_scope_hash, material["request_id"]),)
+                    + tuple((scope_hash, replay_id) for replay_id in bounded_ids)
+                )
+            except TransportAssertionReplay as exc:
+                raise TransportAssertionReplay(
+                    "signed task-start request is still inside the bounded replay "
+                    "quarantine; reconcile task state before any retry"
+                ) from exc
+        else:
+            if session_id and _replay_filter_contains(
+                scope_hash,
+                _stable_scope_replay_id(material["body_sha256"]),
+            ):
+                # Pre-upgrade sessionful requests wrote only the v1 stable body
+                # key. Keep that historical evidence authoritative for every
+                # mutation except the explicitly bounded durable task-start
+                # surface.
+                raise TransportAssertionReplay(
+                    "signed one-call transport request was already consumed or conservatively rejected by the durable replay filter; do not repeat the mutation; reconcile target state"
+                )
+            _consume_replay_filter(
                 (
-                    scope_hash,
-                    _stable_scope_replay_id(
-                        material["body_sha256"], session_id=session_id
+                    (legacy_replay_scope_hash, material["request_id"]),
+                    (
+                        scope_hash,
+                        _stable_scope_replay_id(
+                            material["body_sha256"], session_id=session_id
+                        ),
                     ),
-                ),
+                )
             )
-        )
 
     receipt = {
         "schema_version": SCHEMA_VERSION,

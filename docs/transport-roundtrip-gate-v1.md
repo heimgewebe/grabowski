@@ -29,6 +29,43 @@ If the process restarts, the retained target expires or is safely evicted, or th
 
 A stable client-declared scope may use `action=begin`, then `action=ack`, then invoke the exact mutation once. `action=ack` remains fail-closed for `shared_unlabeled` because a shared label is not caller identity.
 
+## Bounded durable task-start replay
+
+The sessionful grabowski_task_start surface is the one bounded exception to
+permanent signed mutation replay quarantine. Starting a persistent task already
+enters a second server-owned lifecycle with task identity, active-execution
+deduplication, retry-state guards, leases and durable status readback. Keeping
+the transport body permanently quarantined as well would turn a completed task
+invocation into a permanent ban on a later intentional identical task start.
+
+For a request carrying an MCP session id, Grabowski keeps the exact
+transport request id permanently single-use while storing the task-start
+session/body replay evidence in adjacent five-minute epochs. The bounded key is
+also tied to the asserted runtime binding. The current and preceding epoch are
+consumed atomically with the permanent request-id key, so a fresh request id with
+the same session/body/runtime remains rejected for between five and ten minutes
+depending on its position in the epoch. After that quarantine, a later fresh
+signed request identity may reach the task layer, which remains authoritative
+for active reuse, unresolved or unknown outcome blocking, named retry recovery
+and resource leases.
+
+This exception is deliberately narrow:
+
+- sessionless grabowski_task_start keeps the historical permanent replay rule;
+- the same transport request id remains permanently consumed even after the
+  bounded task-start window;
+- every other mutating tool keeps permanent durable replay protection;
+- historical permanent task-start body bits and body-matching tombstones are
+  not deleted or rewritten, but they no longer impose an eternal body quarantine
+  on a sessionful task start with a fresh request identity;
+- connector-token rotation does not shorten the active bounded quarantine for
+  the same stable client scope, while a new runtime binding gets a distinct
+  bounded namespace; the exact request-id single-use rule still prevents
+  rebinding one consumed transport identity across runtimes;
+- expiry of the transport quarantine is not evidence that a prior task failed,
+  succeeded, or is safe to duplicate. Task state must still be reconciled when
+  the prior outcome is uncertain.
+
 ## Bound evidence
 
 Each durable transport receipt binds the scope kind and hash, release id, full repository head, registered tool-name hash, agent-instruction hash, timestamps, receipt chain, and canonical receipt hash. The consumption receipt additionally binds the mutating tool name and canonical argument SHA-256. Release, head, catalog, instruction, time, receipt, file-owner, permission, symlink, or hardlink drift closes the gate.
