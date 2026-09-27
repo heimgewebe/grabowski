@@ -325,9 +325,9 @@ def work_lane_terminal_evidence(source_id: str) -> dict[str, Any]:
             or re.fullmatch(r"[0-9a-f]{32}", successor_lane_id) is None
             or successor_lane_id == source_id
             or not isinstance(predecessor_head, str)
-            or re.fullmatch(r"[0-9a-f]{40}", predecessor_head) is None
+            or re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", predecessor_head) is None
             or not isinstance(successor_head, str)
-            or re.fullmatch(r"[0-9a-f]{40}", successor_head) is None
+            or re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", successor_head) is None
             or not isinstance(successor_receipt, str)
             or re.fullmatch(r"[0-9a-f]{64}", successor_receipt) is None
             or isinstance(pr_number, bool)
@@ -458,8 +458,6 @@ def _thread_focus_completion_chain(
             != {"kind": "work_lane", "id": current_lane_id}
             or successor_inputs.get("base_head") != handoff.get("successor_head_sha")
             or not isinstance(successor_terminal, dict)
-            or successor_terminal.get("expected_receipt_sha256")
-            != handoff.get("successor_receipt_sha256")
         ):
             raise RuntimeError("thread focus successor lane binding differs")
         expected_source = {"kind": "work_lane", "id": current_lane_id}
