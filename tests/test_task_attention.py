@@ -2831,6 +2831,149 @@ class TaskAttentionTests(unittest.TestCase):
             {item["task_id"] for item in bounded_page["records"]},
         )
 
+    def test_bounded_current_reconciliation_exact_row_budget_without_retry_is_verified(
+        self,
+    ) -> None:
+        record = self._failed_task()
+
+        with patch.object(attention, "MAX_CURRENT_LOCAL_CONVERGENCE_ROWS", 1):
+            page = attention.reconcile_attention(
+                {"limit": 20, "view": "current"},
+                _bounded_current_projection=True,
+            )
+
+        self.assertEqual("verified_bounded", page["attention_convergence_status"])
+        self.assertIsNone(page["attention_convergence_error"])
+        self.assertEqual(
+            [record["task_id"]],
+            [item["task_id"] for item in page["records"]],
+        )
+
+    def test_bounded_current_reconciliation_valid_json_nontext_source_fails_visible(
+        self,
+    ) -> None:
+        source, successor = self._verified_retry_pair(successor_state="running")
+        row = tasks._row_raw(str(successor["task_id"]))
+        launcher = json.loads(str(row["launcher_json"]))
+        binding = dict(launcher["retry_binding"])
+        binding["source_task_id"] = 7
+        material = {
+            key: value for key, value in binding.items() if key != "context_sha256"
+        }
+        import hashlib
+
+        binding["context_sha256"] = hashlib.sha256(
+            json.dumps(
+                material,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        launcher["retry_binding"] = binding
+        with tasks._database() as connection:
+            connection.execute(
+                "UPDATE tasks SET launcher_json=? WHERE task_id=?",
+                (
+                    json.dumps(
+                        launcher,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    successor["task_id"],
+                ),
+            )
+
+        page = attention.reconcile_attention(
+            {"limit": 20, "view": "current"},
+            _bounded_current_projection=True,
+        )
+
+        self.assertEqual("degraded", page["attention_convergence_status"])
+        self.assertEqual(
+            "TerminalConvergenceError", page["attention_convergence_error"]
+        )
+        self.assertIn(
+            source["task_id"],
+            {item["task_id"] for item in page["records"]},
+        )
+        self.assertEqual(0, page["convergence_excluded_attention_count"])
+
+    def test_bounded_current_reconciliation_late_batch_error_rolls_back_prior_exclusion(
+        self,
+    ) -> None:
+        poison = self._failed_task()
+        source, successor = self._verified_retry_pair()
+        successor_row = tasks._row_raw(str(successor["task_id"]))
+        retry_binding = dict(
+            json.loads(str(successor_row["launcher_json"]))["retry_binding"]
+        )
+        retry_binding["source_task_id"] = poison["task_id"]
+        material = {
+            key: value
+            for key, value in retry_binding.items()
+            if key != "context_sha256"
+        }
+        import hashlib
+
+        retry_binding["context_sha256"] = hashlib.sha256(
+            json.dumps(
+                material,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        poison_row = tasks._row_raw(str(poison["task_id"]))
+        poison_launcher = json.loads(str(poison_row["launcher_json"]))
+        poison_launcher["retry_binding"] = retry_binding
+        observed_at = int(retry_binding["observed_at_unix"])
+        with tasks._database() as connection:
+            connection.execute(
+                "UPDATE tasks SET launcher_json=?, created_at_unix=? WHERE task_id=?",
+                (
+                    json.dumps(
+                        poison_launcher,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    max(0, observed_at - 1),
+                    poison["task_id"],
+                ),
+            )
+            connection.execute(
+                "UPDATE tasks SET created_at_unix=? WHERE task_id=?",
+                (observed_at, source["task_id"]),
+            )
+            connection.execute(
+                "UPDATE tasks SET created_at_unix=? WHERE task_id=?",
+                (observed_at + 1, successor["task_id"]),
+            )
+
+        with patch.object(attention, "MAX_PAGE_LIMIT", 2):
+            page = attention.reconcile_attention(
+                {"limit": 2, "view": "current"},
+                _bounded_current_projection=True,
+            )
+
+        self.assertEqual("degraded", page["attention_convergence_status"])
+        self.assertEqual(
+            "TerminalConvergenceError", page["attention_convergence_error"]
+        )
+        self.assertIn(
+            source["task_id"],
+            {item["task_id"] for item in page["records"]},
+        )
+        self.assertEqual(0, page["convergence_excluded_attention_count"])
+        self.assertEqual(
+            0,
+            page["filtered_classification_counts"][
+                "superseded_by_verified_retry"
+            ],
+        )
+
     def test_bounded_current_reconciliation_self_reference_fails_visible(self) -> None:
         source, successor = self._verified_retry_pair()
         row = tasks._row_raw(str(successor["task_id"]))
@@ -2948,19 +3091,17 @@ class TaskAttentionTests(unittest.TestCase):
                 ),
             )
 
-        page = attention.reconcile_attention(
-            {"limit": 20, "view": "current"},
-            _bounded_current_projection=True,
-        )
+        with patch.object(attention, "MAX_PAGE_LIMIT", 1):
+            page = attention.reconcile_attention(
+                {"limit": 1, "view": "current"},
+                _bounded_current_projection=True,
+            )
 
         self.assertEqual("degraded", page["attention_convergence_status"])
         self.assertEqual(
             "TerminalConvergenceError", page["attention_convergence_error"]
         )
-        self.assertIn(
-            source["task_id"],
-            {item["task_id"] for item in page["records"]},
-        )
+        self.assertGreaterEqual(page["pagination"]["scanned_raw"], 1)
 
     def test_bounded_current_reconciliation_cycle_fails_visible(self) -> None:
         source, successor = self._verified_retry_pair()
@@ -3000,9 +3141,11 @@ class TaskAttentionTests(unittest.TestCase):
         )
 
     def test_attention_select_projection_excludes_bulk_columns(self) -> None:
-        self.assertNotIn("argv_json", attention._ATTENTION_SELECT_COLUMNS)
-        self.assertIn("launcher_json", attention._ATTENTION_SELECT_COLUMNS)
-        self.assertIn("last_observation_json", attention._ATTENTION_SELECT_COLUMNS)
+        columns = attention._ATTENTION_SELECT_COLUMNS.split(", ")
+        self.assertEqual(len(columns), len(set(columns)))
+        self.assertNotIn("argv_json", columns)
+        self.assertIn("launcher_json", columns)
+        self.assertIn("last_observation_json", columns)
 
     def test_bounded_current_reconciliation_rejects_history_view(self) -> None:
         with self.assertRaisesRegex(
