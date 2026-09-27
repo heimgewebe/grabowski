@@ -143,8 +143,10 @@ class ReplayFilterTests(unittest.TestCase):
         with self.assertRaises(assertion.TransportAssertionReplay):
             assertion.consume_assertion(**restarted, now_unix=5001)
 
-    def test_task_start_replay_is_delegated_to_task_semantics(self) -> None:
-        session_id = "task-start-session"
+    def test_task_start_exact_request_is_single_use_while_fresh_retry_is_delegated(
+        self,
+    ) -> None:
+        session_id = "task-start-session-a"
         item = _task_start_evidence(now=100, session_id=session_id)
 
         first = assertion.consume_assertion(
@@ -152,41 +154,71 @@ class ReplayFilterTests(unittest.TestCase):
             session_id=session_id,
             now_unix=100,
         )
-        second = assertion.consume_assertion(
-            **item,
-            session_id=session_id,
-            now_unix=101,
+        self.assertEqual(first["state"], "consumed")
+        self.assertTrue(first["single_use"])
+        self.assertEqual(first["replay_policy"], "domain_delegated")
+        self.assertRegex(
+            str(first["consumption_receipt_sha256"]),
+            r"^[0-9a-f]{64}$",
         )
 
-        for evidence in (first, second):
-            self.assertEqual(evidence["state"], "validated")
-            self.assertFalse(evidence["single_use"])
-            self.assertEqual(evidence["replay_policy"], "domain_delegated")
-            self.assertRegex(
-                str(evidence["consumption_receipt_sha256"]),
-                r"^[0-9a-f]{64}$",
+        with self.assertRaises(assertion.TransportAssertionReplay):
+            assertion.consume_assertion(
+                **item,
+                session_id=session_id,
+                now_unix=101,
             )
 
-    def test_task_start_delegation_does_not_create_replay_state(self) -> None:
-        session_id = "task-start-no-state-session"
+        fresh_session = "task-start-session-b"
+        fresh = _task_start_evidence(
+            now=101,
+            session_id=fresh_session,
+            body=str(item["body_sha256"]),
+        )
+        self.assertNotEqual(item["request_id"], fresh["request_id"])
+        retried = assertion.consume_assertion(
+            **fresh,
+            session_id=fresh_session,
+            now_unix=101,
+        )
+        self.assertEqual(retried["state"], "consumed")
+        self.assertTrue(retried["single_use"])
+        self.assertEqual(retried["replay_policy"], "domain_delegated")
+
+    def test_task_start_replay_state_contains_only_exact_request_identity(self) -> None:
+        session_id = "task-start-exact-only-session"
         item = _task_start_evidence(now=100, session_id=session_id)
         assertion.consume_assertion(
             **item,
             session_id=session_id,
             now_unix=100,
         )
-        self.assertFalse(assertion.STATE_ROOT.exists())
 
-    def test_task_start_ignores_historical_durable_replay_bits(self) -> None:
+        self.assertTrue(assertion.STATE_ROOT.exists())
+        self.assertTrue(
+            assertion._replay_filter_contains(
+                assertion._replay_scope_sha256(SECRET),
+                str(item["request_id"]),
+            )
+        )
+        self.assertFalse(
+            assertion._replay_filter_contains(
+                SCOPE,
+                assertion._stable_scope_replay_id(
+                    str(item["body_sha256"]),
+                    session_id=session_id,
+                ),
+            )
+        )
+
+    def test_task_start_ignores_historical_body_quarantine_for_fresh_request(
+        self,
+    ) -> None:
         session_id = "task-start-migration-session"
         item = _task_start_evidence(now=100, session_id=session_id)
         assertion.STATE_ROOT.mkdir(mode=0o700)
         assertion._consume_replay_filter(
             (
-                (
-                    assertion._replay_scope_sha256(SECRET),
-                    str(item["request_id"]),
-                ),
                 (
                     SCOPE,
                     assertion._stable_scope_replay_id(
@@ -196,21 +228,36 @@ class ReplayFilterTests(unittest.TestCase):
                 ),
             )
         )
+
         evidence = assertion.consume_assertion(
             **item,
             session_id=session_id,
             now_unix=100,
         )
+        self.assertEqual(evidence["state"], "consumed")
+        self.assertTrue(evidence["single_use"])
         self.assertEqual(evidence["replay_policy"], "domain_delegated")
 
-    def test_sessionless_task_start_is_also_domain_delegated(self) -> None:
+    def test_sessionless_task_start_exact_request_is_single_use(self) -> None:
         item = _task_start_evidence(now=100, session_id="")
         first = assertion.consume_assertion(**item, now_unix=100)
-        second = assertion.consume_assertion(**item, now_unix=101)
-        self.assertEqual(first["state"], "validated")
-        self.assertEqual(second["state"], "validated")
-        self.assertFalse(first["single_use"])
-        self.assertFalse(second["single_use"])
+        self.assertEqual(first["state"], "consumed")
+        self.assertTrue(first["single_use"])
+
+        with self.assertRaises(assertion.TransportAssertionReplay):
+            assertion.consume_assertion(**item, now_unix=101)
+
+        fresh = _task_start_evidence(
+            now=101,
+            session_id="",
+            rpc_request_id="task-start-rpc-fresh",
+            body=str(item["body_sha256"]),
+        )
+        self.assertNotEqual(item["request_id"], fresh["request_id"])
+        retried = assertion.consume_assertion(**fresh, now_unix=101)
+        self.assertEqual(retried["state"], "consumed")
+        self.assertTrue(retried["single_use"])
+        self.assertEqual(retried["replay_policy"], "domain_delegated")
 
     def test_non_task_mutation_replay_remains_durable_after_time(self) -> None:
         first = _evidence(44, now=100)

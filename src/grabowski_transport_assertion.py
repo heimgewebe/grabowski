@@ -19,7 +19,9 @@ ASSERTION_AUDIENCE = "grabowski-mcp"
 ASSERTION_MAX_AGE_SECONDS = 90
 ASSERTION_CLOCK_SKEW_SECONDS = 30
 # Historical compatibility constant. Durable replay remains monotone for
-# opaque mutation surfaces; domain-delegated tools do not consult replay state.
+# opaque mutation surfaces. Domain-delegated task starts consume the exact
+# signed request id once, while fresh logical retries skip body/session replay
+# quarantine and reconcile in the task layer.
 REPLAY_RETENTION_SECONDS = 900
 DOMAIN_REPLAY_DELEGATED_TO_SEMANTICS = frozenset({"grabowski_task_start"})
 CONSUMPTION_KIND = "grabowski_transport_one_call_consumption"
@@ -1127,45 +1129,54 @@ def consume_assertion(
         if material["tool_name"] in DOMAIN_REPLAY_DELEGATED_TO_SEMANTICS
         else "durable_transport_replay"
     )
-    if replay_policy == "durable_transport_replay":
-        with _state_lock():
-            for legacy_scope_hash, legacy_path in _legacy_tombstone_inventory(
-                scope_hash, material["request_id"]
+    with _state_lock():
+        for legacy_scope_hash, legacy_path in _legacy_tombstone_inventory(
+            scope_hash, material["request_id"]
+        ):
+            existing = _read_tombstone(legacy_path)
+            if existing is None:
+                continue
+            legacy = _validated_legacy_tombstone(
+                existing, legacy_scope_hash, legacy_path
+            )
+            same_target = (
+                legacy["tool_name"] == material["tool_name"]
+                and legacy["arguments_sha256"] == material["arguments_sha256"]
+                and legacy["body_sha256"] == material["body_sha256"]
+                and legacy["runtime_binding_sha256"]
+                == material["runtime_binding_sha256"]
+            )
+            if legacy["request_id"] == material["request_id"]:
+                if not same_target:
+                    raise TransportAssertionError(
+                        "transport request id was reused for different evidence"
+                    )
+                raise TransportAssertionReplay(
+                    "signed one-call transport request was already consumed; do not repeat the mutation; reconcile target state"
+                )
+            if (
+                replay_policy == "durable_transport_replay"
+                and legacy["body_sha256"] == material["body_sha256"]
             ):
-                existing = _read_tombstone(legacy_path)
-                if existing is None:
-                    continue
-                legacy = _validated_legacy_tombstone(
-                    existing, legacy_scope_hash, legacy_path
-                )
-                same_target = (
-                    legacy["tool_name"] == material["tool_name"]
-                    and legacy["arguments_sha256"] == material["arguments_sha256"]
-                    and legacy["body_sha256"] == material["body_sha256"]
-                    and legacy["runtime_binding_sha256"]
-                    == material["runtime_binding_sha256"]
-                )
                 same_intent = (
                     legacy["tool_name"] == material["tool_name"]
                     and legacy["arguments_sha256"] == material["arguments_sha256"]
-                    and legacy["body_sha256"] == material["body_sha256"]
                 )
-                if legacy["request_id"] == material["request_id"]:
-                    if not same_target:
-                        raise TransportAssertionError(
-                            "transport request id was reused for different evidence"
-                        )
-                    raise TransportAssertionReplay(
-                        "signed one-call transport request was already consumed; do not repeat the mutation; reconcile target state"
+                if not same_intent:
+                    raise TransportAssertionError(
+                        "transport request body was rebound to different legacy evidence"
                     )
-                if legacy["body_sha256"] == material["body_sha256"]:
-                    if not same_intent:
-                        raise TransportAssertionError(
-                            "transport request body was rebound to different legacy evidence"
-                        )
-                    raise TransportAssertionReplay(
-                        "signed one-call transport request was already consumed; do not repeat the mutation; reconcile target state"
-                    )
+                raise TransportAssertionReplay(
+                    "signed one-call transport request was already consumed; do not repeat the mutation; reconcile target state"
+                )
+
+        if replay_policy == "domain_delegated":
+            # Keep the signed packet single-use even though a newly signed
+            # logical retry is delegated to normalized task semantics.
+            _consume_replay_filter(
+                ((legacy_replay_scope_hash, material["request_id"]),)
+            )
+        else:
             if session_id and _replay_filter_contains(
                 scope_hash,
                 _stable_scope_replay_id(material["body_sha256"]),
@@ -1202,8 +1213,8 @@ def consume_assertion(
     receipt["receipt_sha256"] = _sha256_json(receipt)
     return {
         "schema_version": SCHEMA_VERSION,
-        "state": "validated" if replay_policy == "domain_delegated" else "consumed",
-        "single_use": replay_policy != "domain_delegated",
+        "state": "consumed",
+        "single_use": True,
         "replay_policy": replay_policy,
         "transport_mode": ASSERTION_VERSION,
         "client_scope_sha256": scope_hash,

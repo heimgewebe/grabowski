@@ -38,8 +38,10 @@ itself reconcile repetition safely.
 
 - Read-only tools never enter the mutation replay path.
 - grabowski_task_start validates connector capability, request MAC, freshness,
-  runtime binding and the exact raw argument digest, but does not read or mutate
-  the durable replay filter. Its replay policy is domain_delegated.
+  runtime binding and the exact raw argument digest. The exact signed request id
+  is consumed once in the bounded durable replay filter, but body identity and
+  MCP session are not quarantine keys. A newly signed logical retry therefore
+  reaches task semantics. Its replay policy is domain_delegated.
 - The durable task layer is authoritative for repeated task starts. Task
   mutations are serialized, the task row is committed before _launch() can
   start a process, active execution identities are reused, and a completed
@@ -63,12 +65,13 @@ itself reconcile repetition safely.
 - Existing intrinsic domain replay recovery remains valid for the small set of
   mutations whose post-state preflight proves that a repeated effect is safe.
 
-This separation intentionally removes the permanent same-task-start veto. A
-repeated signed task-start call reaches the task semantics even if an earlier
-transport response was lost or an identical command was run previously. The
-transport validation receipt does not itself establish duplicate suppression,
-retry authority, task success or permission to bypass task-state
-reconciliation.
+This separation removes the permanent same-task-start veto without making one
+captured signed packet reusable. Replaying the exact signed request id is
+rejected, including after cancellation. A freshly signed task-start retry with
+a new request id reaches task semantics even if an earlier transport response
+was lost or an identical command was run previously. The transport receipt
+does not itself establish application-level duplicate suppression, retry
+authority, task success or permission to bypass task-state reconciliation.
 
 ## Bound evidence
 

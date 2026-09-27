@@ -677,7 +677,7 @@ class OperatorSignedTransportTests(unittest.TestCase):
         self.assertEqual(evidence["transport_mode"], assertion.ASSERTION_VERSION)
         self.assertEqual(evidence["client_scope_kind"], "connector_capability")
 
-    def test_mcp_task_start_signed_replay_is_domain_delegated(self) -> None:
+    def test_mcp_task_start_exact_request_is_single_use_and_fresh_retry_delegates(self) -> None:
         arguments = {"host": "heim-pc", "argv": ["true"]}
         body = json.dumps(
             {
@@ -694,17 +694,18 @@ class OperatorSignedTransportTests(unittest.TestCase):
             separators=(",", ":"),
         ).encode("utf-8")
         now = int(__import__("time").time())
+        session_id = "task-domain-session"
         signed = ingress.signed_tool_headers(
             token=SECRET,
             body=body,
-            session_id="task-domain-session",
+            session_id=session_id,
             runtime_binding_sha256=_runtime_sha256(),
             now_unix=now,
         )
         headers = {
             base._TRANSPORT_CONNECTOR_CAPABILITY_HEADER: SECRET,
             base._TRANSPORT_INGRESS_VERSION_HEADER: assertion.ASSERTION_VERSION,
-            base._TRANSPORT_MCP_SESSION_ID_HEADER: "task-domain-session",
+            base._TRANSPORT_MCP_SESSION_ID_HEADER: session_id,
             base._TRANSPORT_REQUEST_ID_HEADER: signed[ingress.REQUEST_ID_HEADER],
             base._TRANSPORT_REQUEST_TIMESTAMP_HEADER: signed[
                 ingress.REQUEST_TIMESTAMP_HEADER
@@ -728,17 +729,60 @@ class OperatorSignedTransportTests(unittest.TestCase):
             arguments_sha256=digest,
             runtime_binding=BINDING,
         )
-        second = base._transport_signed_one_call_evidence(
-            _ctx(headers),
+        self.assertEqual(first["state"], "consumed")
+        self.assertTrue(first["single_use"])
+        self.assertEqual(first["replay_policy"], "domain_delegated")
+
+        with self.assertRaises(assertion.TransportAssertionReplay):
+            base._transport_signed_one_call_evidence(
+                _ctx(headers),
+                tool_name="grabowski_task_start",
+                arguments_sha256=digest,
+                runtime_binding=BINDING,
+            )
+
+        fresh_session_id = "task-domain-session-fresh"
+        fresh_signed = ingress.signed_tool_headers(
+            token=SECRET,
+            body=body,
+            session_id=fresh_session_id,
+            runtime_binding_sha256=_runtime_sha256(),
+            now_unix=now,
+        )
+        fresh_headers = dict(headers)
+        fresh_headers.update(
+            {
+                base._TRANSPORT_MCP_SESSION_ID_HEADER: fresh_session_id,
+                base._TRANSPORT_REQUEST_ID_HEADER: fresh_signed[
+                    ingress.REQUEST_ID_HEADER
+                ],
+                base._TRANSPORT_REQUEST_TIMESTAMP_HEADER: fresh_signed[
+                    ingress.REQUEST_TIMESTAMP_HEADER
+                ],
+                base._TRANSPORT_REQUEST_AUDIENCE_HEADER: fresh_signed[
+                    ingress.REQUEST_AUDIENCE_HEADER
+                ],
+                base._TRANSPORT_REQUEST_BODY_SHA256_HEADER: fresh_signed[
+                    ingress.REQUEST_BODY_SHA256_HEADER
+                ],
+                base._TRANSPORT_RUNTIME_BINDING_SHA256_HEADER: fresh_signed[
+                    ingress.RUNTIME_BINDING_SHA256_HEADER
+                ],
+                base._TRANSPORT_REQUEST_MAC_HEADER: fresh_signed[
+                    ingress.REQUEST_MAC_HEADER
+                ],
+            }
+        )
+        fresh = base._transport_signed_one_call_evidence(
+            _ctx(fresh_headers),
             tool_name="grabowski_task_start",
             arguments_sha256=digest,
             runtime_binding=BINDING,
         )
-
-        for evidence in (first, second):
-            self.assertEqual(evidence["state"], "validated")
-            self.assertFalse(evidence["single_use"])
-            self.assertEqual(evidence["replay_policy"], "domain_delegated")
+        self.assertNotEqual(first["request_id"], fresh["request_id"])
+        self.assertEqual(fresh["state"], "consumed")
+        self.assertTrue(fresh["single_use"])
+        self.assertEqual(fresh["replay_policy"], "domain_delegated")
 
     def test_mcp_preserves_typed_signed_one_call_replay(self) -> None:
         arguments = {"argv": ["true"]}
