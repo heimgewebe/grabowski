@@ -397,15 +397,14 @@ def _record_evidence_digest(record: dict[str, Any], raw_line: bytes) -> str:
 def capture_verified_audit_snapshot(path: Path | None = None) -> VerifiedAuditSnapshot:
     """Capture a verified immutable audit view while minimizing shared-lock hold time.
 
-    The active segment bytes are retained because they may change after the lock is
-    released. Only that mutable head is verified while the shared coordination lock is
-    held. Its predecessor binding is then used to verify immutable historical segments
-    outside the lock, preserving the same hash/manifest fail-closed chain contract
-    without making a cold historical verification block audit writers.
+    The active segment bytes are copied while the short shared coordination/file
+    lock is held, then hash-chain verification runs after release. Its predecessor
+    binding is used to verify immutable historical segments outside the lock,
+    preserving the same fail-closed chain contract without making active parsing or
+    cold historical verification block audit writers.
     """
     active_path = path if path is not None else base.AUDIT_LOG
-    with base._audit_coordination_lock(active_path, exclusive=False):
-        active_component, predecessor = base._read_audit_head_unlocked(active_path)
+    active_component, predecessor = base._read_audit_head_unlocked(active_path)
 
     components = [active_component]
     compatibility = False

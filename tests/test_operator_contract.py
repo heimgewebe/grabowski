@@ -1119,6 +1119,72 @@ class OperatorContractTests(unittest.TestCase):
                 ):
                     operator._enforce_maulwurf_recovery_mode(name, arguments, tool)
 
+    def test_maulwurf_trusted_owner_bypasses_recovery_restrictions(self) -> None:
+        operator = _load_operator_module()
+        tool = types.SimpleNamespace(
+            is_async=True,
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {"GRABOWSKI_MCP_BRANDING_VARIANT": "der-kleine-maulwurf"},
+            ),
+            patch.object(operator, "_trusted_owner_mode", return_value=True),
+            patch.object(
+                operator,
+                "_maulwurf_recovery_enabled",
+                side_effect=AssertionError("trusted-owner must not consult recovery mode"),
+            ),
+        ):
+            for name, arguments in (
+                ("grabowski_terminal_run", {"argv": ["true"]}),
+                ("grabowski_tmux_send", {"target": "ops:0", "text": "repair"}),
+                (
+                    "grabowski_user_service",
+                    {"unit": "example.service", "action": "restart"},
+                ),
+            ):
+                with self.subTest(name=name):
+                    operator._enforce_maulwurf_recovery_mode(name, arguments, tool)
+
+    def test_maulwurf_trusted_owner_skips_recovery_guard(self) -> None:
+        operator = _load_operator_module()
+        events: list[str] = []
+        fake_mole = types.SimpleNamespace(
+            acquire_recovery_mutation_guard=lambda: events.append("acquire") or 17,
+            release_recovery_mutation_guard=lambda _fd: events.append("release"),
+        )
+
+        async def domain_call(*_args, **_kwargs):
+            events.append("domain")
+            return {"called": True}
+
+        operator.mcp._tool_manager.call_tool = domain_call
+        operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
+            is_async=True,
+            context_kwarg=None,
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {"GRABOWSKI_MCP_BRANDING_VARIANT": "der-kleine-maulwurf"},
+            ),
+            patch.object(operator, "_trusted_owner_mode", return_value=True),
+            patch.object(operator, "_maulwurf_recovery_module", return_value=fake_mole),
+            patch.object(
+                operator.grabowski_effect_interceptor,
+                "fence_enforcement_required",
+                return_value=False,
+            ),
+            patch.object(operator, "_require_transport_roundtrip_for_tool", return_value=None),
+        ):
+            operator._configure_http_runtime()
+            result = operator.asyncio.run(operator.mcp._tool_manager.call_tool("write", {}))
+        self.assertTrue(result["called"])
+        self.assertEqual(["domain"], events)
+
     def test_maulwurf_mutation_holds_recovery_guard_through_domain_call(self) -> None:
         operator = _load_operator_module()
         events: list[str] = []

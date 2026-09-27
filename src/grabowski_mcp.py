@@ -500,6 +500,7 @@ AUDIT_SEGMENT_CACHE_LOCK = threading.RLock()
 AUDIT_SEGMENT_VERIFICATION_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 AUDIT_LOCK_TIMEOUT_SECONDS = 5.0
 AUDIT_LOCK_POLL_SECONDS = 0.02
+AUDIT_APPEND_CONTENTION_TIMEOUT_SECONDS = 10.0
 CAPTAIN_AUDIT_LOCK_TIMEOUT_ERROR = "Audit lock acquisition timed out"
 CAPTAIN_AUDIT_COMPLETION_LOCK_RETRY_DELAYS = (0.05, 0.20)
 BASE_CAPABILITIES = (
@@ -3359,6 +3360,17 @@ def _read_audit_descriptor(descriptor: int, path: Path) -> bytes:
     return data
 
 
+
+def _audit_descriptor_identity(descriptor: int, path: Path) -> tuple[int, ...]:
+    opened = os.fstat(descriptor)
+    linked = os.stat(path, follow_symlinks=False)
+    _validate_audit_file_contract(opened, linked)
+    opened_identity = _audit_file_identity(opened)
+    linked_identity = _audit_file_identity(linked)
+    if opened_identity != linked_identity:
+        raise RuntimeError("Audit log changed while being observed")
+    return opened_identity
+
 def _audit_parent(path: Path) -> Path:
     parent = path.parent
     if parent == STATE_DIR:
@@ -3680,16 +3692,29 @@ def _verify_audit_descriptor(path: Path, descriptor: int) -> dict[str, Any]:
     return _verify_audit_bytes(path, data, exists=True)
 
 
-def _read_audit_file_bytes(path: Path) -> tuple[bytes, bool]:
-    """Read one audit file through the hardened descriptor contract without parsing it."""
+
+def _read_audit_file_snapshot(
+    path: Path,
+) -> tuple[bytes, bool, tuple[int, ...] | None]:
+    """Copy the mutable audit head under its file lock, then release it.
+
+    Expensive JSON/hash verification is deliberately left to the caller so the
+    coordination lock never needs to cover active-segment parsing.
+    """
     descriptor = _open_audit_read_target(path)
     if descriptor is None:
-        return b"", False
+        return b"", False, None
     try:
-        return _read_audit_descriptor(descriptor, path), True
+        data = _read_audit_descriptor(descriptor, path)
+        return data, True, _audit_descriptor_identity(descriptor, path)
     finally:
         _close_audit_descriptor(descriptor)
 
+
+def _read_audit_file_bytes(path: Path) -> tuple[bytes, bool]:
+    """Read one audit file through the hardened descriptor contract without parsing it."""
+    data, exists, _identity = _read_audit_file_snapshot(path)
+    return data, exists
 
 def _read_audit_file(path: Path) -> tuple[bytes, dict[str, Any]]:
     data, exists = _read_audit_file_bytes(path)
@@ -4030,23 +4055,33 @@ def _validate_segment_manifest(
     raise ValueError("audit-segment-manifest-kind-invalid")
 
 
-def _read_audit_head_unlocked(
-    path: Path,
-) -> tuple[tuple[Path, bytes, dict[str, Any]], dict[str, Any] | None]:
-    """Verify the mutable audit head and return its predecessor binding.
 
-    Callers that need a stable snapshot can hold the coordination lock only for
-    this active segment, then verify immutable predecessors after releasing it.
-    """
-    data, status = _read_audit_file(path)
+
+def _capture_verified_audit_head(
+    path: Path,
+) -> tuple[
+    tuple[Path, bytes, dict[str, Any]],
+    dict[str, Any] | None,
+    tuple[int, ...] | None,
+]:
+    """Capture stable head bytes, then verify them outside the coordination lock."""
+    with _audit_coordination_lock(path, exclusive=False):
+        data, exists, identity = _read_audit_file_snapshot(path)
+    status = _verify_audit_bytes(path, data, exists=exists)
     if not status["valid"]:
         raise ValueError(str(status["error"]))
     observed_sha = hashlib.sha256(data).hexdigest()
     component_status = dict(status)
     component_status["segment_sha256"] = observed_sha
     predecessor = _audit_predecessor_binding(path, _first_audit_record(data))
-    return (path, data, component_status), predecessor
+    return (path, data, component_status), predecessor, identity
 
+def _read_audit_head_unlocked(
+    path: Path,
+) -> tuple[tuple[Path, bytes, dict[str, Any]], dict[str, Any] | None]:
+    """Compatibility helper returning one fully verified mutable audit head."""
+    head, predecessor, _identity = _capture_verified_audit_head(path)
+    return head, predecessor
 
 def _read_audit_chain_unlocked(
     path: Path,
@@ -4297,14 +4332,15 @@ def _verify_audit_log_unlocked(path: Path = AUDIT_LOG) -> dict[str, Any]:
         return status
 
 
+
+
 def _read_audit_status_snapshot(path: Path = AUDIT_LOG) -> dict[str, Any]:
     """Verify one coherent head plus its bound immutable predecessor history."""
     lock_path = _audit_storage_paths(path)["coordination_lock"]
     if not path.exists() and not lock_path.exists():
         return _verify_audit_log_unlocked(path)
     for _snapshot_attempt in range(4):
-        with _audit_coordination_lock(path, exclusive=False):
-            head, predecessor = _read_audit_head_unlocked(path)
+        head, predecessor, head_identity = _capture_verified_audit_head(path)
         head_path = head[0]
         head_status = head[2]
         del head
@@ -4324,27 +4360,29 @@ def _read_audit_status_snapshot(path: Path = AUDIT_LOG) -> dict[str, Any]:
             [(head_path, b"", head_status), *predecessors],
             compatibility_evidence,
         )
-        with _audit_coordination_lock(path, exclusive=False):
-            current_head, current_predecessor = _read_audit_head_unlocked(path)
+        try:
+            current_identity = _private_evidence_path_identity(
+                path,
+                max_bytes=MAX_AUDIT_BYTES,
+            )
+        except FileNotFoundError:
+            current_identity = None
+        if current_identity == head_identity:
+            return status
+
+        current_head, current_predecessor, _current_identity = (
+            _capture_verified_audit_head(path)
+        )
         current_head_path = current_head[0]
         current_head_status = current_head[2]
         del current_head
-
-        if current_predecessor != predecessor:
-            continue
-        if (
-            current_head_status.get("segment_sha256")
-            == head_status.get("segment_sha256")
-        ):
-            return status
-
-        return _audit_status_from_components(
-            path,
-            [(current_head_path, b"", current_head_status), *predecessors],
-            compatibility_evidence,
-        )
+        if current_predecessor == predecessor:
+            return _audit_status_from_components(
+                path,
+                [(current_head_path, b"", current_head_status), *predecessors],
+                compatibility_evidence,
+            )
     raise RuntimeError("audit-head-raced")
-
 
 def _verify_audit_log(path: Path = AUDIT_LOG) -> dict[str, Any]:
     try:
@@ -4696,17 +4734,37 @@ def _verify_audit_predecessor_snapshot(
         _raise_audit_verification_failure(exc)
 
 
+
 def _append_audit_with_digest(record: dict[str, Any]) -> str:
     with AUDIT_APPEND_LOCK:
         if AUDIT_LOG.is_symlink():
             raise PermissionError(f"Audit log may not be a symlink: {AUDIT_LOG}")
-        for _predecessor_attempt in range(4):
+        contention_deadline = (
+            time.monotonic() + AUDIT_APPEND_CONTENTION_TIMEOUT_SECONDS
+        )
+        contention_attempt = 0
+        while True:
+            if contention_attempt:
+                remaining = contention_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        "Audit append contention retry timed out"
+                    )
+                delay = min(
+                    AUDIT_LOCK_POLL_SECONDS
+                    * (2 ** min(contention_attempt - 1, 2)),
+                    remaining,
+                )
+                time.sleep(delay)
+            contention_attempt += 1
             try:
-                with _audit_coordination_lock(AUDIT_LOG, exclusive=False):
-                    head, predecessor = _read_audit_head_unlocked(AUDIT_LOG)
-                del head
+                head, predecessor, head_identity = _capture_verified_audit_head(
+                    AUDIT_LOG
+                )
             except (OSError, PermissionError, RuntimeError, ValueError) as exc:
                 _raise_audit_verification_failure(exc)
+            head_status = head[2]
+            del head
 
             predecessor_snapshot = _verify_bound_audit_predecessors(
                 AUDIT_LOG,
@@ -4714,35 +4772,33 @@ def _append_audit_with_digest(record: dict[str, Any]) -> str:
             )
 
             with _audit_coordination_lock(AUDIT_LOG, exclusive=True):
-                try:
-                    current_head, current_predecessor = (
-                        _read_audit_head_unlocked(AUDIT_LOG)
-                    )
-                    del current_head
-                except (OSError, PermissionError, RuntimeError, ValueError) as exc:
-                    _raise_audit_verification_failure(exc)
-
-                if current_predecessor != predecessor:
-                    continue
-
-                # The full predecessor walk happened outside the coordination
-                # lock. Revalidate only the per-call verified identities here;
-                # correctness must not depend on the smaller global cache.
-                _verify_audit_predecessor_snapshot(
-                    predecessor,
-                    predecessor_snapshot,
-                )
-
                 descriptor: int | None = None
                 try:
-                    descriptor, _created = _open_audit_append_target(AUDIT_LOG)
-                    status = _verify_audit_descriptor(AUDIT_LOG, descriptor)
-                    if not status["valid"]:
-                        raise RuntimeError(
-                            f"Audit log verification failed: {status['error']}"
-                        )
+                    descriptor, created = _open_audit_append_target(AUDIT_LOG)
+                    current_identity = _audit_descriptor_identity(
+                        descriptor,
+                        AUDIT_LOG,
+                    )
+                    if head_identity is None:
+                        if not created:
+                            continue
+                    elif created or current_identity != head_identity:
+                        continue
+
+                    # Full active-head and predecessor verification happened
+                    # outside the coordination lock. The exact mutable-file
+                    # identity plus immutable predecessor identities are the
+                    # cheap CAS readback immediately before the effect.
+                    _verify_audit_predecessor_snapshot(
+                        predecessor,
+                        predecessor_snapshot,
+                    )
+
+                    status = dict(head_status)
                     _enriched, payload = _enriched_audit_record(record, status)
                     current_size = os.fstat(descriptor).st_size
+                    if current_size != int(status.get("active_bytes") or 0):
+                        continue
                     needs_rotation = (
                         current_size > 0
                         and current_size
@@ -4814,8 +4870,6 @@ def _append_audit_with_digest(record: dict[str, Any]) -> str:
                 finally:
                     if descriptor is not None:
                         _close_audit_descriptor(descriptor)
-        raise RuntimeError("Audit predecessor changed repeatedly during append")
-
 
 def _append_audit(record: dict[str, Any]) -> None:
     _append_audit_with_digest(record)
@@ -4850,16 +4904,22 @@ def _audit_records_from_components(
     return records
 
 
+
 def _audit_records_snapshot() -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    with _audit_coordination_lock(AUDIT_LOG, exclusive=False):
-        components, compatibility = _read_audit_chain_unlocked(
+    head, predecessor, _identity = _capture_verified_audit_head(AUDIT_LOG)
+    predecessors: list[tuple[Path, bytes, dict[str, Any]]] = []
+    compatibility = False
+    if predecessor is not None:
+        predecessors, compatibility = _read_audit_chain_unlocked(
             AUDIT_LOG,
             use_segment_cache=False,
+            retain_verified_segment_data=True,
+            initial_expected=predecessor,
         )
-        status = _audit_status_from_components(AUDIT_LOG, components, compatibility)
-        records = _audit_records_from_components(components)
-        return records, status
-
+    components = [head, *predecessors]
+    status = _audit_status_from_components(AUDIT_LOG, components, compatibility)
+    records = _audit_records_from_components(components)
+    return records, status
 
 def _audit_records() -> list[dict[str, Any]]:
     records, _status = _audit_records_snapshot()

@@ -254,6 +254,72 @@ class AuditSignalTests(unittest.TestCase):
         self.assertEqual(uncertain["severity"], "critical")
         self.assertEqual(uncertain["count"], 1)
 
+    def test_incomplete_audit_window_fails_closed_for_audit_signals(self) -> None:
+        now = 1_800_000_000
+        record = {
+            "operation": "runtime-state-retention-intent",
+            "record_sha256": "a" * 64,
+        }
+        with patch.dict(sys.modules, {"grabowski_friction": None}, clear=False):
+            result = signal.build_projection(
+                [(record, now - signal.AUDIT_SIGNAL_GRACE_SECONDS - 1)],
+                as_of_unix=now,
+                audit_source_binding={},
+                audit_window_complete=False,
+            )
+
+        by_id = {item["id"]: item for item in result["signals"]}
+        uncertain = by_id["uncertain_outcome"]
+        self.assertEqual(uncertain["status"], "indeterminate")
+        self.assertEqual(uncertain["severity"], "unknown")
+        self.assertIsNone(uncertain["count"])
+        self.assertFalse(uncertain["details"]["audit_window_complete"])
+
+        transition = by_id["transition_gap"]
+        self.assertEqual(transition["status"], "observed")
+        self.assertEqual(transition["severity"], "high")
+        self.assertEqual(transition["count"], 1)
+        self.assertEqual(transition["observed_count"], 1)
+        self.assertEqual(
+            transition["evidence_quality"],
+            "partial_verified_audit_window_positive_evidence",
+        )
+        self.assertFalse(transition["details"]["audit_window_complete"])
+        self.assertEqual(transition["details"]["partial_status"], "observed")
+        self.assertEqual(transition["details"]["partial_count"], 1)
+        self.assertEqual(
+            transition["recommended_action"],
+            "trace each unmatched intent and read the exact target state before retry",
+        )
+        self.assertIn(
+            "absence_of_additional_transition_gaps_outside_the_verified_scan",
+            transition["does_not_establish"],
+        )
+
+    def test_incomplete_audit_window_keeps_clear_transition_gap_indeterminate(self) -> None:
+        now = 1_800_000_000
+        with patch.dict(sys.modules, {"grabowski_friction": None}, clear=False):
+            result = signal.build_projection(
+                [],
+                as_of_unix=now,
+                audit_source_binding={},
+                audit_window_complete=False,
+            )
+
+        by_id = {item["id"]: item for item in result["signals"]}
+        transition = by_id["transition_gap"]
+        self.assertEqual(transition["status"], "indeterminate")
+        self.assertEqual(transition["severity"], "unknown")
+        self.assertIsNone(transition["count"])
+        self.assertEqual(transition["observed_count"], 0)
+        self.assertFalse(transition["details"]["audit_window_complete"])
+        self.assertEqual(transition["details"]["partial_status"], "clear")
+        self.assertEqual(transition["details"]["partial_count"], 0)
+        self.assertIn(
+            "absence_or_presence_of_transition_gaps_across_the_scan_boundary",
+            transition["does_not_establish"],
+        )
+
     def test_contract_contradiction_requires_conflict_language(self) -> None:
         normal = {
             "failure_class": "contract_error",

@@ -567,17 +567,27 @@ def _validate_outcome_receipt(
             "recovered_after_revocation",
         }:
             raise TaskAttentionIntegrityError("task lifecycle recovery status is invalid")
-        task_projection = {
-            "task_id": record["task_id"],
-            "state": record["state"],
-            "updated_at_unix": record["updated_at_unix"],
-            "launcher_json": record["launcher_json"],
-            "last_observation_json": record.get("last_observation_json"),
-            "unit": record["unit"],
-            "authoritative_unit": tasks._authoritative_unit(record),
-            "attempt": int(record["attempt"]),
-        }
-        if terminalization["task_projection_sha256"] != _sha256_json(task_projection):
+        task_projection_sha256 = record.get("_task_projection_sha256")
+        if task_projection_sha256 is None:
+            task_projection = {
+                "task_id": record["task_id"],
+                "state": record["state"],
+                "updated_at_unix": record["updated_at_unix"],
+                "launcher_json": record["launcher_json"],
+                "last_observation_json": record.get("last_observation_json"),
+                "unit": record["unit"],
+                "authoritative_unit": tasks._authoritative_unit(record),
+                "attempt": int(record["attempt"]),
+            }
+            task_projection_sha256 = _sha256_json(task_projection)
+        elif (
+            not isinstance(task_projection_sha256, str)
+            or SHA256_RE.fullmatch(task_projection_sha256) is None
+        ):
+            raise TaskAttentionIntegrityError(
+                "task lifecycle projected task hash is invalid"
+            )
+        if terminalization["task_projection_sha256"] != task_projection_sha256:
             raise TaskAttentionIntegrityError("task lifecycle task projection hash is invalid")
         transition_material = {
             "schema_version": 1,
@@ -3327,11 +3337,13 @@ def reconcile_attention(parameters: dict[str, Any] | None = None) -> dict[str, A
         if created_at is not None and task_id is not None:
             where.append("(created_at_unix < ? OR (created_at_unix = ? AND task_id < ?))")
             values.extend([created_at, created_at, task_id])
-        return connection.execute(
-            f"SELECT * FROM tasks WHERE {' AND '.join(where)} "
-            "ORDER BY created_at_unix DESC, task_id DESC LIMIT ?",
-            (*values, batch_limit),
-        ).fetchall()
+        return tasks._task_attention_records(
+            connection.execute(
+                f"SELECT * FROM tasks WHERE {' AND '.join(where)} "
+                "ORDER BY created_at_unix DESC, task_id DESC LIMIT ?",
+                (*values, batch_limit),
+            )
+        )
 
     scanned_raw = 0
     filtered_counts = {
@@ -3395,11 +3407,13 @@ def reconcile_attention(parameters: dict[str, Any] | None = None) -> dict[str, A
                 convergence_status = "degraded"
                 convergence_error = "attention_convergence_scan_limit_exceeded"
             else:
-                convergence_rows = connection.execute(
-                    f"SELECT * FROM tasks WHERE state IN ({placeholders}) "
-                    "ORDER BY created_at_unix DESC, task_id DESC LIMIT ?",
-                    (*ATTENTION_STATES, MAX_CURRENT_CONVERGENCE_ROWS + 1),
-                ).fetchall()
+                convergence_rows = tasks._task_attention_records(
+                    connection.execute(
+                        f"SELECT * FROM tasks WHERE state IN ({placeholders}) "
+                        "ORDER BY created_at_unix DESC, task_id DESC LIMIT ?",
+                        (*ATTENTION_STATES, MAX_CURRENT_CONVERGENCE_ROWS + 1),
+                    )
+                )
                 if len(convergence_rows) != raw_total_attention:
                     convergence_status = "degraded"
                     convergence_error = "attention_convergence_snapshot_count_mismatch"

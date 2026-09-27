@@ -306,7 +306,9 @@ class AuditQueryTests(unittest.TestCase):
         self.assertEqual(module.base.read_chain_calls, [
             {"use_segment_cache": True, "retain_verified_segment_data": False}
         ])
-        self.assertEqual(module.base.head_lock_states, [True])
+        # The hardened base helper owns the short active-head lock; audit_query
+        # must not add a coordination lock around _read_audit_head_unlocked().
+        self.assertEqual(module.base.head_lock_states, [False])
         self.assertEqual(module.base.read_chain_lock_states, [False])
         self.assertEqual(projection["source"]["total_records"], 4)
         self.assertEqual(projection["items"][0]["record"]["operation"], "resource-acquire")
