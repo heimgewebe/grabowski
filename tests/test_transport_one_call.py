@@ -1397,7 +1397,6 @@ class OperatorSignedTransportTests(unittest.TestCase):
             {"argv": ["sed", "-n", "1,2001p", "file.txt"], "cwd": "/tmp"},
             {"argv": ["sed", "-n", "10,20p", "-i"], "cwd": "/tmp"},
             {"argv": ["sed", "-n", "10,20p", "file.txt", "extra"], "cwd": "/tmp"},
-            {"argv": ["sed", "-n", "10,20p", "file.txt"]},
             {"argv": ["cat", "file.txt"], "cwd": "/tmp"},
         ]
         for arguments in unsafe:
@@ -1419,6 +1418,63 @@ class OperatorSignedTransportTests(unittest.TestCase):
         assert single_line is not None
         self.assertEqual(single_line["typed_arguments"]["start_line"], 7)
         self.assertEqual(single_line["typed_arguments"]["max_lines"], 1)
+
+        literal_tilde = operator._terminal_typed_read_redirect(
+            "grabowski_terminal_run",
+            {
+                "argv": ["sed", "-n", "1p", "~/literal.txt"],
+                "cwd": "/tmp",
+            },
+        )
+        self.assertIsNotNone(literal_tilde)
+        assert literal_tilde is not None
+        self.assertEqual(
+            literal_tilde["typed_arguments"]["path"],
+            "/tmp/~/literal.txt",
+        )
+
+        unknown_tilde = operator._terminal_typed_read_redirect(
+            "grabowski_terminal_run",
+            {
+                "argv": ["sed", "-n", "1p", "~definitely-no-such-user/literal.txt"],
+                "cwd": "/tmp",
+            },
+        )
+        self.assertIsNotNone(unknown_tilde)
+        assert unknown_tilde is not None
+        self.assertEqual(
+            unknown_tilde["typed_arguments"]["path"],
+            "/tmp/~definitely-no-such-user/literal.txt",
+        )
+
+        default_cwd = operator._terminal_typed_read_redirect(
+            "grabowski_terminal_run",
+            {"argv": ["sed", "-n", "1p", "~/literal.txt"]},
+        )
+        self.assertIsNotNone(default_cwd)
+        assert default_cwd is not None
+        self.assertEqual(
+            default_cwd["typed_arguments"]["path"],
+            str(operator._resolve_cwd(None) / "~" / "literal.txt"),
+        )
+
+        with mock.patch.object(
+            operator, "_resolve_cwd", return_value=operator.Path("/resolved/cwd")
+        ) as resolve_cwd:
+            relative_cwd = operator._terminal_typed_read_redirect(
+                "grabowski_terminal_run",
+                {
+                    "argv": ["sed", "-n", "1p", "literal.txt"],
+                    "cwd": "relative",
+                },
+            )
+        self.assertIsNotNone(relative_cwd)
+        assert relative_cwd is not None
+        self.assertEqual(
+            relative_cwd["typed_arguments"]["path"],
+            "/resolved/cwd/literal.txt",
+        )
+        resolve_cwd.assert_called_once_with("relative")
 
     def test_typed_read_can_repeat_without_signed_replay_state(self) -> None:
         tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=True))

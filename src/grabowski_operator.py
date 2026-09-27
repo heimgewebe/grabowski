@@ -1621,14 +1621,13 @@ def _terminal_typed_read_redirect(
     if max_lines > 2000 or path.startswith("-"):
         return None
 
-    typed_path = Path(path).expanduser()
     cwd = arguments.get("cwd")
+    try:
+        typed_cwd = _resolve_cwd(cwd)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    typed_path = Path(path)
     if not typed_path.is_absolute():
-        if not isinstance(cwd, str) or not cwd or "\x00" in cwd:
-            return None
-        typed_cwd = Path(cwd).expanduser()
-        if not typed_cwd.is_absolute():
-            return None
         typed_path = typed_cwd / typed_path
 
     return {
