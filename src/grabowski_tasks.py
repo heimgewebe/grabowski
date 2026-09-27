@@ -8741,7 +8741,7 @@ def grabowski_task_start(
         and operation_retry_binding is None
         and _retry_context is None
     ):
-        if not task_resources:
+        if mutating_agent_workspace is None:
             execution_reuse = _resolve_active_execution_reuse(
                 execution_identity,
                 resume_policy=policy,

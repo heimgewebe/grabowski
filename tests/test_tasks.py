@@ -10876,7 +10876,7 @@ class TaskTests(unittest.TestCase):
         rows = tasks.grabowski_task_list(limit=20, view="evidence")
         self.assertEqual(1, rows["total_matching"])
 
-    def test_recent_completed_execution_identity_with_resources_is_reused(
+    def test_resource_bound_active_execution_refreshes_completed_before_reacquire(
         self,
     ) -> None:
         common = {
@@ -10896,29 +10896,41 @@ class TaskTests(unittest.TestCase):
         ):
             first = tasks.grabowski_task_start(**common)
         task_id = str(first["task"]["task_id"])
-        tasks._set_state(
-            task_id,
-            "completed",
-            observation={"state": "completed", "observed_at_unix": tasks._now()},
-        )
-        self.assertIsNone(tasks.resources.inspect_resource("port:9222"))
+        self.assertIn(first["task"]["state"], tasks.TASK_STATE_PROJECTIONS["active"])
+        self.assertIsNotNone(tasks.resources.inspect_resource("port:9222"))
+
+        completed_observation = {
+            "state": "completed",
+            "observed_at_unix": tasks._now(),
+            "properties": {
+                "ActiveState": "inactive",
+                "SubState": "dead",
+                "Result": "success",
+                "ExecMainCode": "exited",
+                "ExecMainStatus": "0",
+            },
+        }
         with (
             patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_observe", return_value=completed_observation) as observe,
             patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
-            patch.object(tasks.resources, "acquire_resources") as acquire,
             patch.object(tasks.base, "_append_audit"),
             patch.object(
                 tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
             ),
         ):
             second = tasks.grabowski_task_start(**common)
+        observe.assert_called_once()
         dispatch.assert_not_called()
-        acquire.assert_not_called()
         self.assertEqual(task_id, second["task"]["task_id"])
+        self.assertEqual("completed", second["task"]["state"])
         self.assertEqual(
             "recent_completed_execution_identity",
             second["deduplicated_reuse"]["reason"],
         )
+        self.assertIsNone(tasks.resources.inspect_resource("port:9222"))
+        rows = tasks.grabowski_task_list(limit=20, view="evidence")
+        self.assertEqual(1, rows["total_matching"])
 
     def test_operation_bound_completion_does_not_shadow_recent_unbound_reuse(
         self,
