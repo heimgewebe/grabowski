@@ -3231,6 +3231,8 @@ def _repoground_source_tree_snapshot(
             "RepoGround manifest generator commit does not match source object format"
         )
 
+    launcher_relative = Path("scripts/repoground-mcp-stdio.py")
+
     def verify_source() -> None:
         try:
             git_root = Path(
@@ -3238,9 +3240,8 @@ def _repoground_source_tree_snapshot(
                     ["git", "-c", "core.fsmonitor=false", "rev-parse", "--show-toplevel"], cwd=source_root
                 )
             ).resolve(strict=True)
-            head = base._run_checked(["git", "-c", "core.fsmonitor=false", "rev-parse", "HEAD"], cwd=source_root)
-            status = base._run_checked(
-                ["git", "-c", "core.fsmonitor=false", "status", "--porcelain", "--untracked-files=normal"],
+            head = base._run_checked(
+                ["git", "-c", "core.fsmonitor=false", "rev-parse", "HEAD"],
                 cwd=source_root,
             )
         except (base.RunnerError, OSError) as exc:
@@ -3251,10 +3252,27 @@ def _repoground_source_tree_snapshot(
             raise RunnerError(
                 "RepoGround MCP source commit does not match the bundle generator commit"
             )
-        if status:
+        try:
+            index_changes = base._run_checked(
+                [
+                    "git", "-c", "core.fsmonitor=false",
+                    "diff-index", "--cached", "--name-only", commit, "--",
+                    "merger", str(launcher_relative),
+                ],
+                cwd=source_root,
+            )
+            untracked = base._run_checked(
+                [
+                    "git", "-c", "core.fsmonitor=false",
+                    "ls-files", "--others", "--exclude-standard", "--",
+                    "merger", str(launcher_relative),
+                ],
+                cwd=source_root,
+            )
+        except base.RunnerError as exc:
+            raise RunnerError("RepoGround MCP source checkout is unavailable") from exc
+        if index_changes or untracked:
             raise RunnerError("RepoGround MCP source checkout is dirty")
-
-    launcher_relative = Path("scripts/repoground-mcp-stdio.py")
     try:
         if script.resolve(strict=True) != (source_root / launcher_relative).resolve(strict=True):
             raise RunnerError("RepoGround MCP launcher path is invalid")
