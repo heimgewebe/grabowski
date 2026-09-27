@@ -46,6 +46,7 @@ class DurableSystemdContractTests(unittest.TestCase):
         self.assertIn(
             "Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus", text
         )
+        self.assertIn("Environment=MALLOC_ARENA_MAX=8", text)
         self.assertIn("WantedBy=multi-user.target", text)
         self.assertNotIn("%h", text)
         self.assertNotIn("tunnel-client", text)
