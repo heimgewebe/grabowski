@@ -2865,6 +2865,55 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         "",
                     )
 
+            original_source_read = runner._read_bound_regular_file
+            transient_payload = b"def main():\n    return 9\n"
+
+            def transient_source_read(path, *, label, max_bytes):
+                candidate = Path(path).resolve()
+                if (
+                    candidate == implementation.resolve()
+                    and label
+                    == f"RepoGround MCP source tree file {implementation_relative}"
+                ):
+                    original_payload = implementation.read_bytes()
+                    implementation.write_bytes(transient_payload)
+                    try:
+                        return original_source_read(
+                            path,
+                            label=label,
+                            max_bytes=max_bytes,
+                        )
+                    finally:
+                        implementation.write_bytes(original_payload)
+                return original_source_read(
+                    path,
+                    label=label,
+                    max_bytes=max_bytes,
+                )
+
+            with patch.object(
+                runner,
+                "_read_bound_regular_file",
+                side_effect=transient_source_read,
+            ):
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "source tree file does not match generator commit",
+                ):
+                    runner.stage_mcp_upstream(
+                        state_root,
+                        upstream,
+                        manifest,
+                        authorized,
+                    )
+            self.assertEqual(
+                git(
+                    ["status", "--porcelain", "--untracked-files=normal"],
+                    source,
+                ),
+                "",
+            )
+
     def test_mcp_absolute_interpreter_symlink_resolves_to_bound_target(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

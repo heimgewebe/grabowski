@@ -3263,6 +3263,45 @@ def _repoground_source_tree_snapshot(
     ):
         raise RunnerError("RepoGround MCP source tree is incomplete")
 
+    try:
+        object_format = base._run_checked(
+            ["git", "rev-parse", "--show-object-format"], cwd=source_root
+        )
+        committed_tree = base._run_checked(
+            ["git", "ls-tree", "-rz", "--full-tree", commit, "--", "merger"],
+            cwd=source_root,
+        )
+    except base.RunnerError as exc:
+        raise RunnerError(
+            "RepoGround MCP generator tree cannot be verified"
+        ) from exc
+    if object_format not in {"sha1", "sha256"}:
+        raise RunnerError("RepoGround MCP generator object format is unsupported")
+    oid_length = 40 if object_format == "sha1" else 64
+    committed_blobs: dict[Path, str] = {}
+    for item in committed_tree.split("\0"):
+        if not item:
+            continue
+        metadata, separator, path_text = item.partition("\t")
+        fields = metadata.split()
+        if (
+            separator != "\t"
+            or len(fields) != 3
+            or fields[0] not in {"100644", "100755"}
+            or fields[1] != "blob"
+            or re.fullmatch(rf"[0-9a-f]{{{oid_length}}}", fields[2]) is None
+            or not path_text
+        ):
+            raise RunnerError("RepoGround MCP generator tree entry is unsafe")
+        relative = Path(path_text)
+        if relative in committed_blobs:
+            raise RunnerError("RepoGround MCP generator tree contains duplicate paths")
+        committed_blobs[relative] = fields[2]
+    if set(committed_blobs) != set(relatives):
+        raise RunnerError(
+            "RepoGround MCP source tree does not match the generator commit tree"
+        )
+
     entries: list[dict[str, Any]] = []
     total_bytes = 0
     for relative in relatives:
@@ -3290,6 +3329,16 @@ def _repoground_source_tree_snapshot(
             label=f"RepoGround MCP source tree file {relative}",
             max_bytes=MAX_PROVIDER_EXECUTABLE_BYTES,
         )
+        git_object = b"blob " + str(len(raw)).encode("ascii") + b"\0" + raw
+        blob_oid = (
+            hashlib.sha1(git_object).hexdigest()
+            if object_format == "sha1"
+            else hashlib.sha256(git_object).hexdigest()
+        )
+        if blob_oid != committed_blobs[relative]:
+            raise RunnerError(
+                "RepoGround MCP source tree file does not match generator commit"
+            )
         total_bytes += len(raw)
         if total_bytes > MAX_MCP_SOURCE_TREE_BYTES:
             raise RunnerError("RepoGround MCP source tree exceeds its byte budget")
