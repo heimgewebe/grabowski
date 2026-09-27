@@ -114,7 +114,7 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "goal-fidelity-before-continuation",
-        "User outcome outranks strategy. Use minimum sufficient mechanism; persistent complexity requires proof of benefit. Compare a simpler path with fresh evidence; choose CONTINUE/CHANGE/PARK-STOP. A tool failure alone is not strategic evidence. Managed dirty checkout after ensure: continue from exact lane/lifecycle/checkout evidence with fresh Git preimage; never reset/clean/stash merely to satisfy ensure.",
+        "User outcome outranks strategy. Use minimum sufficient mechanism; persistent complexity requires proof of benefit. Compare a simpler path with fresh evidence; choose CONTINUE/CHANGE/PARK-STOP. A tool failure alone is not strategic evidence. Managed dirty checkout after ensure: continue only from exact lane/lifecycle/checkout evidence with fresh Git preimage; never reset/clean/stash merely to satisfy ensure.",
     ),
     (
         "operator-obligation-lifecycle",
