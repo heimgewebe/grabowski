@@ -666,6 +666,96 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual("completed_retained", current["phase"])
         self.assertEqual({}, checkouts._latest_archives([checkout_key]))
 
+    def test_archive_rejects_followup_evidence_drift_after_resource_acquisition(self) -> None:
+        lane_id = "d" * 32
+        binding = self._managed_binding(
+            source_kind="work_lane",
+            source_id=lane_id,
+        )
+        checkout_key = str(binding["checkout_key"])
+        checkouts._mark_checkout_completed_retained(
+            checkout_key=checkout_key,
+            owner_id="owner-a",
+            expected_head=self.head,
+            expected_branch="topic",
+        )
+        lane_receipt = "1" * 64
+        assessment = "2" * 64
+        audit_record = "3" * 64
+        followup_id = "GRABOWSKI-FOLLOWUP-T001"
+
+        def terminal_evidence(task_revision: int, task_spec_sha256: str) -> dict[str, object]:
+            reproduction = {
+                "lane_id": lane_id,
+                "lane_receipt_sha256": lane_receipt,
+                "lane_assessment_sha256": assessment,
+                "lane_terminal_audit_sha256": audit_record,
+                "lane_terminal_head": self.head,
+                "checkout_key": checkout_key,
+            }
+            binding_core = {
+                "kind": "bureau_current_task_spec_reproduction",
+                "task_id": followup_id,
+                "task_revision": task_revision,
+                "task_spec_sha256": task_spec_sha256,
+                "task_state": "verified",
+                "reproduction": reproduction,
+                "does_not_establish": [
+                    "followup_completion",
+                    "lease_release_authority",
+                    "archive_or_cleanup_authority",
+                    "branch_or_ref_deletion_authority",
+                ],
+            }
+            durable_binding = {
+                **binding_core,
+                "binding_sha256": checkouts._sha256_json(binding_core),
+            }
+            core = {
+                "schema_version": 1,
+                "kind": "work_lane",
+                "source_id": lane_id,
+                "terminal_state": "blocked_with_durable_followup",
+                "checkout_key": checkout_key,
+                "lane_receipt_sha256": lane_receipt,
+                "assessment_sha256": assessment,
+                "terminal_head_sha": self.head,
+                "lease_release_ready": False,
+                "terminal_closeout_audit_record_sha256": audit_record,
+                "durable_followup_id": followup_id,
+                "durable_followup_binding": durable_binding,
+            }
+            return {
+                **core,
+                "evidence_sha256": checkouts._sha256_json(core),
+            }
+
+        evidence_before = terminal_evidence(3, "a" * 64)
+        evidence_after = terminal_evidence(4, "b" * 64)
+        with (
+            patch(
+                "grabowski_checkout_terminal_sources.source_terminal_evidence",
+                side_effect=[evidence_before, evidence_after],
+            ) as source_evidence,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "archive authority changed during archive preflight",
+            ),
+        ):
+            checkouts.grabowski_checkout_archive(
+                str(self.repo),
+                str(self.checkout),
+                "owner-a",
+                "followup authority changed after lease acquisition",
+                int(time.time()) + 3600,
+                self.head,
+                "topic",
+            )
+        self.assertEqual(2, source_evidence.call_count)
+        current = checkouts._lifecycle_bindings([checkout_key])[checkout_key]
+        self.assertEqual("completed_retained", current["phase"])
+        self.assertEqual({}, checkouts._latest_archives([checkout_key]))
+
     def test_archive_converges_managed_binding_to_terminal_identity(self) -> None:
         self._managed_binding()
         (self.checkout / "README.md").write_text("terminal head\n", encoding="utf-8")

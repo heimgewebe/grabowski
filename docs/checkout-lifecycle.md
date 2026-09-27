@@ -79,7 +79,10 @@ trennt Inventar, Archivierung und Cleanup.
   auch diese Ausnahme. Der Bureau-StateStore-Reader pinnt dabei den
   Coordination-Root über einen no-follow Directory-Descriptor und prüft Datenbank,
   WAL und SHM als ownergebundene, nicht gruppen-/weltbeschreibbare reguläre Dateien
-  vor und nach der read-only SQLite-Transaktion. Historische Lane-Receipts ohne
+  vor und nach der read-only SQLite-Transaktion. Diese Prüfungen etablieren ausdrücklich
+  keine Resistenz gegen kompromittierten same-UID-Code, der private ownergebundene
+  StateStore-Dateien gezielt austauschen kann; die Authority setzt die Integrität des
+  Benutzerkontexts voraus. Historische Lane-Receipts ohne
   gespeicherten `checkout_key` dürfen ausschließlich den bereits separat
   lifecycle-gebundenen Checkout-Key übernehmen; ein vorhandener abweichender Key
   bleibt blockierend.
