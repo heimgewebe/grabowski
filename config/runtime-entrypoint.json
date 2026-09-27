@@ -143,6 +143,7 @@
     "grabowski_host_capability_resolve",
     "grabowski_systemkatalog_query",
     "grabowski_operational_guidance",
+    "grabowski_bureau_acceptance_authenticate",
     "grabowski_bureau_candidate_record",
     "grabowski_bureau_candidate_assess",
     "grabowski_bureau_task_propose",
