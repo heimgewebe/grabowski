@@ -3244,11 +3244,17 @@ def _repoground_source_tree_snapshot(
     verify_source()
     try:
         tracked = base._run_checked(
-            ["git", "ls-files", "-z", "--", "merger"], cwd=source_root
+            ["git", "ls-files", "-v", "-z", "--", "merger"], cwd=source_root
         )
     except base.RunnerError as exc:
         raise RunnerError("RepoGround MCP source tree cannot be enumerated") from exc
-    relatives = [Path(item) for item in tracked.split("\0") if item]
+    tracked_entries = [item for item in tracked.split("\0") if item]
+    if any(
+        len(item) < 3 or item[1] != " " or item[0] != "H"
+        for item in tracked_entries
+    ):
+        raise RunnerError("RepoGround MCP source tree index flags are unsafe")
+    relatives = [Path(item[2:]) for item in tracked_entries]
     required = Path("merger/repoground/cli/mcp_stdio.py")
     if (
         not relatives

@@ -2813,6 +2813,58 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     dirty_authorized,
                 )
 
+            implementation.write_text(
+                "def main():\n    return 0\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                git(
+                    ["status", "--porcelain", "--untracked-files=normal"],
+                    source,
+                ),
+                "",
+            )
+            implementation_relative = "merger/repoground/cli/mcp_stdio.py"
+            for set_flag, clear_flag in (
+                ("--assume-unchanged", "--no-assume-unchanged"),
+                ("--skip-worktree", "--no-skip-worktree"),
+            ):
+                with self.subTest(index_flag=set_flag):
+                    git(["update-index", set_flag, implementation_relative], source)
+                    implementation.write_text(
+                        "def main():\n    return 2\n",
+                        encoding="utf-8",
+                    )
+                    self.assertEqual(
+                        git(
+                            ["status", "--porcelain", "--untracked-files=normal"],
+                            source,
+                        ),
+                        "",
+                    )
+                    with self.assertRaisesRegex(
+                        runner.RunnerError,
+                        "source tree index flags are unsafe",
+                    ):
+                        runner.stage_mcp_upstream(
+                            state_root,
+                            upstream,
+                            manifest,
+                            authorized,
+                        )
+                    implementation.write_text(
+                        "def main():\n    return 0\n",
+                        encoding="utf-8",
+                    )
+                    git(["update-index", clear_flag, implementation_relative], source)
+                    self.assertEqual(
+                        git(
+                            ["status", "--porcelain", "--untracked-files=normal"],
+                            source,
+                        ),
+                        "",
+                    )
+
     def test_mcp_absolute_interpreter_symlink_resolves_to_bound_target(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
