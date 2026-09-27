@@ -33,6 +33,7 @@ MAX_REVIEW_ROLE_MODULE_BYTES = 1024 * 1024
 REVIEW_ROLE_MODULE = "grabowski_agent_role"
 REVIEW_ROLE_SANDBOX = "bubblewrap-minimal-root-read-only-worktree-v1"
 REVIEW_ROLE_PYTHON = os.path.abspath(sys.executable)
+REVIEW_ROLE_STABLE_PYTHON = Path.home() / ".local/share/grabowski-mcp/.venv/bin/python"
 REVIEW_ROLE_RELEASE_ROOT = Path.home() / ".local/share/grabowski-mcp-releases"
 REVIEW_ROLE_LAUNCHER_PREFIX = (
     REVIEW_ROLE_PYTHON,
@@ -177,6 +178,67 @@ def _historical_review_role_module_matches(
     ):
         return False
     return hmac.compare_digest(hashlib.sha256(payload).hexdigest(), expected_sha256)
+
+
+def _historical_review_role_python_matches(value: Any) -> bool:
+    """Accept only canonical historical runner paths to the current interpreter."""
+
+    if not isinstance(value, str) or not value:
+        return False
+    path = Path(value)
+    if not path.is_absolute():
+        return False
+    try:
+        stable_allowed = path == REVIEW_ROLE_STABLE_PYTHON.expanduser()
+        release_allowed = False
+        if not stable_allowed:
+            root_path = REVIEW_ROLE_RELEASE_ROOT.expanduser()
+            if root_path.is_symlink():
+                return False
+            root_metadata = root_path.stat()
+            if (
+                not stat.S_ISDIR(root_metadata.st_mode)
+                or root_metadata.st_uid != os.getuid()
+            ):
+                return False
+            root = root_path.resolve(strict=True)
+            relative = path.relative_to(root)
+            parts = relative.parts
+            release_allowed = (
+                len(parts) == 4
+                and _REVIEW_ROLE_RELEASE_ID_RE.fullmatch(parts[0]) is not None
+                and parts[1:] == (".venv", "bin", "python")
+            )
+        if not (stable_allowed or release_allowed):
+            return False
+
+        parent = path.parent
+        if not stable_allowed and parent.resolve(strict=True) != parent:
+            return False
+        link_metadata = path.lstat()
+        if (
+            not (
+                stat.S_ISLNK(link_metadata.st_mode)
+                or stat.S_ISREG(link_metadata.st_mode)
+            )
+            or link_metadata.st_uid != os.getuid()
+        ):
+            return False
+
+        resolved = path.resolve(strict=True)
+        expected = Path(REVIEW_ROLE_PYTHON).resolve(strict=True)
+        resolved_metadata = resolved.stat()
+        expected_metadata = expected.stat()
+    except (FileNotFoundError, OSError, RuntimeError, ValueError):
+        return False
+
+    return (
+        stat.S_ISREG(resolved_metadata.st_mode)
+        and stat.S_ISREG(expected_metadata.st_mode)
+        and resolved == expected
+        and resolved_metadata.st_dev == expected_metadata.st_dev
+        and resolved_metadata.st_ino == expected_metadata.st_ino
+    )
 
 
 def normalize_binding(value: Any) -> dict[str, Any]:
@@ -623,6 +685,11 @@ def _normalize_review_role_provenance(
     if module_identity is None:
         raise ValueError("trusted decision review role module is unavailable")
     runner_module_path, runner_module_sha256 = module_identity
+    recorded_runner_python = value.get("runner_python")
+    runner_python_matches = (
+        recorded_runner_python == REVIEW_ROLE_PYTHON
+        or _historical_review_role_python_matches(recorded_runner_python)
+    )
     recorded_module_path = value.get("runner_module_path")
     recorded_module_sha256 = value.get("runner_module_sha256")
     module_identity_matches = (
@@ -639,7 +706,7 @@ def _normalize_review_role_provenance(
         value.get("schema_version") != 1
         or value.get("kind") != "grabowski_decision_review_provenance"
         or value.get("role") != "review"
-        or value.get("runner_python") != REVIEW_ROLE_PYTHON
+        or not runner_python_matches
         or value.get("runner_isolated") is not True
         or value.get("runner_module") != REVIEW_ROLE_MODULE
         or not module_identity_matches

@@ -481,6 +481,156 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
                                 cwd="/tmp/review",
                             )
 
+    def test_historical_review_role_python_rotation_accepts_same_interpreter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jobs = root / "jobs"
+            jobs.mkdir()
+            directory = make_job(
+                jobs,
+                suffix="a00000000052",
+                slot="independent-reviewer",
+                terminal_status="succeeded",
+                review_result=None,
+                review_role=True,
+            )
+            metadata = json.loads(
+                (directory / "metadata.json").read_text(encoding="utf-8")
+            )
+            original = dict(metadata["scope"]["decision_review_provenance"])
+            current_python = root / "current-python"
+            current_python.write_text("#!/bin/sh\n", encoding="utf-8")
+            current_python.chmod(0o700)
+            release_root = root / "releases"
+            release_python = (
+                release_root
+                / (
+                    "0123456789ab-srcset0123456789ab-lock0123456789ab-"
+                    "contract0123456789ab"
+                )
+                / ".venv"
+                / "bin"
+                / "python"
+            )
+            release_python.parent.mkdir(parents=True)
+            release_python.symlink_to(current_python)
+            stable_root = root / "stable"
+            stable_root.mkdir()
+            (stable_root / ".venv").symlink_to(
+                release_python.parents[1],
+                target_is_directory=True,
+            )
+            stable_python = stable_root / ".venv" / "bin" / "python"
+
+            def rotated(path: Path) -> dict:
+                provenance = dict(original)
+                provenance["runner_python"] = str(path)
+                material = {
+                    key: value
+                    for key, value in provenance.items()
+                    if key != "provenance_sha256"
+                }
+                provenance["provenance_sha256"] = reviews.sha256_json(material)
+                return provenance
+
+            with (
+                mock.patch.object(reviews, "REVIEW_ROLE_PYTHON", str(current_python)),
+                mock.patch.object(reviews, "REVIEW_ROLE_STABLE_PYTHON", stable_python),
+                mock.patch.object(reviews, "REVIEW_ROLE_RELEASE_ROOT", release_root),
+            ):
+                for provenance in (
+                    rotated(stable_python),
+                    rotated(release_python),
+                ):
+                    with self.subTest(path=provenance["runner_python"]):
+                        normalized = reviews._normalize_review_role_provenance(
+                            provenance,
+                            reviews.normalize_binding(
+                                binding("independent-reviewer")
+                            ),
+                            cwd="/tmp/review",
+                        )
+                        self.assertEqual(normalized, provenance)
+
+    def test_historical_review_role_python_rotation_rejects_alias_or_other_interpreter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jobs = root / "jobs"
+            jobs.mkdir()
+            directory = make_job(
+                jobs,
+                suffix="a00000000053",
+                slot="independent-reviewer",
+                terminal_status="succeeded",
+                review_result=None,
+                review_role=True,
+            )
+            metadata = json.loads(
+                (directory / "metadata.json").read_text(encoding="utf-8")
+            )
+            original = dict(metadata["scope"]["decision_review_provenance"])
+            current_python = root / "current-python"
+            current_python.write_text("#!/bin/sh\n", encoding="utf-8")
+            current_python.chmod(0o700)
+            other_python = root / "other-python"
+            other_python.write_text("#!/bin/sh\n", encoding="utf-8")
+            other_python.chmod(0o700)
+            stable_python = root / "stable" / ".venv" / "bin" / "python"
+            stable_python.parent.mkdir(parents=True)
+            stable_python.symlink_to(current_python)
+            release_root = root / "releases"
+            release_id = (
+                "0123456789ab-srcset0123456789ab-lock0123456789ab-"
+                "contract0123456789ab"
+            )
+            bad_release_python = (
+                release_root / release_id / ".venv" / "bin" / "python"
+            )
+            bad_release_python.parent.mkdir(parents=True)
+            bad_release_python.symlink_to(other_python)
+            outside_python = root / "outside" / "python"
+            outside_python.parent.mkdir()
+            outside_python.symlink_to(current_python)
+            malformed_release_python = (
+                release_root / "not-a-release" / ".venv" / "bin" / "python"
+            )
+            malformed_release_python.parent.mkdir(parents=True)
+            malformed_release_python.symlink_to(current_python)
+
+            def rotated(path: Path) -> dict:
+                provenance = dict(original)
+                provenance["runner_python"] = str(path)
+                material = {
+                    key: value
+                    for key, value in provenance.items()
+                    if key != "provenance_sha256"
+                }
+                provenance["provenance_sha256"] = reviews.sha256_json(material)
+                return provenance
+
+            with (
+                mock.patch.object(reviews, "REVIEW_ROLE_PYTHON", str(current_python)),
+                mock.patch.object(reviews, "REVIEW_ROLE_STABLE_PYTHON", stable_python),
+                mock.patch.object(reviews, "REVIEW_ROLE_RELEASE_ROOT", release_root),
+            ):
+                for provenance in (
+                    rotated(outside_python),
+                    rotated(malformed_release_python),
+                    rotated(bad_release_python),
+                ):
+                    with self.subTest(path=provenance["runner_python"]):
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            "decision review provenance binding mismatch",
+                        ):
+                            reviews._normalize_review_role_provenance(
+                                provenance,
+                                reviews.normalize_binding(
+                                    binding("independent-reviewer")
+                                ),
+                                cwd="/tmp/review",
+                            )
+
     def test_reviewer_provenance_requires_server_python_and_isolated_module(self) -> None:
         normalized = reviews.normalize_binding(binding("independent-reviewer"))
         receipt = "/tmp/review/review-role-receipt.json"
