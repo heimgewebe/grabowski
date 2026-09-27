@@ -57,6 +57,92 @@ def write_private(path: Path, payload: str) -> None:
     os.chmod(path, 0o600)
 
 
+def python_rotation_fixture(
+    root: Path, *, historical_module_bytes: bytes | None = None
+) -> dict[str, Path]:
+    current_python = root / "current-python"
+    current_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    current_python.chmod(0o700)
+    release_root = root / "releases"
+
+    def release_python(release_id: str) -> Path:
+        path = release_root / release_id / ".venv" / "bin" / "python"
+        path.parent.mkdir(parents=True)
+        path.symlink_to(current_python)
+        return path
+
+    current_release_python = release_python(
+        "111111111111-srcset111111111111-lock111111111111-contract111111111111"
+    )
+    historical_release_python = release_python(
+        "0123456789ab-srcset0123456789ab-lock0123456789ab-contract0123456789ab"
+    )
+    current_release_venv = current_release_python.parents[1]
+
+    stable_root = root / "stable"
+    stable_root.mkdir()
+    (stable_root / ".venv").symlink_to(
+        current_release_venv,
+        target_is_directory=True,
+    )
+    stable_python = stable_root / ".venv" / "bin" / "python"
+
+    historical_module = (
+        historical_release_python.parents[1]
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+        / f"{reviews.REVIEW_ROLE_MODULE}.py"
+    )
+    if historical_module_bytes is not None:
+        historical_module.parent.mkdir(parents=True)
+        historical_module.write_bytes(historical_module_bytes)
+
+    return {
+        "current_python": current_python,
+        "release_root": release_root,
+        "current_release_python": current_release_python,
+        "current_release_venv": current_release_venv,
+        "historical_release_python": historical_release_python,
+        "historical_module": historical_module,
+        "stable_python": stable_python,
+    }
+
+
+def rotated_runner_provenance(provenance: dict, runner_python: Path) -> dict:
+    rotated = dict(provenance)
+    rotated["runner_python"] = str(runner_python)
+    material = {
+        key: value
+        for key, value in rotated.items()
+        if key != "provenance_sha256"
+    }
+    rotated["provenance_sha256"] = reviews.sha256_json(material)
+    return rotated
+
+
+def patch_rotation(
+    fixture: dict[str, Path],
+    runner_python: Path,
+    *,
+    bind_launcher: bool = False,
+):
+    values = {
+        "REVIEW_ROLE_PYTHON": str(runner_python),
+        "REVIEW_ROLE_STABLE_PYTHON": fixture["stable_python"],
+        "REVIEW_ROLE_STABLE_VENV_TARGET": fixture["current_release_venv"],
+        "REVIEW_ROLE_RELEASE_ROOT": fixture["release_root"],
+    }
+    if bind_launcher:
+        values["REVIEW_ROLE_LAUNCHER_PREFIX"] = (
+            str(runner_python),
+            "-I",
+            "-m",
+            reviews.REVIEW_ROLE_MODULE,
+        )
+    return mock.patch.multiple(reviews, **values)
+
+
 def make_job(
     jobs: Path,
     *,
@@ -498,59 +584,52 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
                 (directory / "metadata.json").read_text(encoding="utf-8")
             )
             original = dict(metadata["scope"]["decision_review_provenance"])
-            current_python = root / "current-python"
-            current_python.write_text("#!/bin/sh\n", encoding="utf-8")
-            current_python.chmod(0o700)
-            release_root = root / "releases"
-            release_python = (
-                release_root
-                / (
-                    "0123456789ab-srcset0123456789ab-lock0123456789ab-"
-                    "contract0123456789ab"
-                )
-                / ".venv"
-                / "bin"
-                / "python"
-            )
-            release_python.parent.mkdir(parents=True)
-            release_python.symlink_to(current_python)
-            stable_root = root / "stable"
-            stable_root.mkdir()
-            (stable_root / ".venv").symlink_to(
-                release_python.parents[1],
-                target_is_directory=True,
-            )
-            stable_python = stable_root / ".venv" / "bin" / "python"
+            fixture = python_rotation_fixture(root)
 
-            def rotated(path: Path) -> dict:
-                provenance = dict(original)
-                provenance["runner_python"] = str(path)
-                material = {
-                    key: value
-                    for key, value in provenance.items()
-                    if key != "provenance_sha256"
-                }
-                provenance["provenance_sha256"] = reviews.sha256_json(material)
-                return provenance
-
-            with (
-                mock.patch.object(reviews, "REVIEW_ROLE_PYTHON", str(current_python)),
-                mock.patch.object(reviews, "REVIEW_ROLE_STABLE_PYTHON", stable_python),
-                mock.patch.object(reviews, "REVIEW_ROLE_RELEASE_ROOT", release_root),
+            with patch_rotation(
+                fixture,
+                fixture["stable_python"],
             ):
-                for provenance in (
-                    rotated(stable_python),
-                    rotated(release_python),
+                for candidate in (
+                    fixture["stable_python"],
+                    fixture["historical_release_python"],
                 ):
-                    with self.subTest(path=provenance["runner_python"]):
+                    with self.subTest(path=candidate):
                         normalized = reviews._normalize_review_role_provenance(
-                            provenance,
+                            rotated_runner_provenance(original, candidate),
                             reviews.normalize_binding(
                                 binding("independent-reviewer")
                             ),
                             cwd="/tmp/review",
                         )
-                        self.assertEqual(normalized, provenance)
+                        self.assertEqual(
+                            normalized,
+                            rotated_runner_provenance(original, candidate),
+                        )
+
+                other_venv = root / "other-venv"
+                (other_venv / "bin").mkdir(parents=True)
+                (other_venv / "bin" / "python").symlink_to(
+                    fixture["current_python"]
+                )
+                stable_venv = fixture["stable_python"].parents[1]
+                stable_venv.unlink()
+                stable_venv.symlink_to(
+                    other_venv, target_is_directory=True
+                )
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "decision review provenance binding mismatch",
+                ):
+                    reviews._normalize_review_role_provenance(
+                        rotated_runner_provenance(
+                            original, fixture["stable_python"]
+                        ),
+                        reviews.normalize_binding(
+                            binding("independent-reviewer")
+                        ),
+                        cwd="/tmp/review",
+                    )
 
     def test_historical_review_role_python_rotation_rejects_alias_or_other_interpreter(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -625,6 +704,116 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
                         ):
                             reviews._normalize_review_role_provenance(
                                 provenance,
+                                reviews.normalize_binding(
+                                    binding("independent-reviewer")
+                                ),
+                                cwd="/tmp/review",
+                            )
+
+
+    def test_historical_review_role_python_rotation_rejects_noncanonical_release_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jobs = root / "jobs"
+            jobs.mkdir()
+            directory = make_job(
+                jobs,
+                suffix="a00000000055",
+                slot="independent-reviewer",
+                terminal_status="succeeded",
+                review_result=None,
+                review_role=True,
+            )
+            metadata = json.loads(
+                (directory / "metadata.json").read_text(encoding="utf-8")
+            )
+            original = dict(metadata["scope"]["decision_review_provenance"])
+            fixture = python_rotation_fixture(root)
+            release_root = fixture["release_root"]
+
+            symlink_parent_root = (
+                release_root
+                / (
+                    "222222222222-srcset222222222222-lock222222222222-"
+                    "contract222222222222"
+                )
+            )
+            symlink_parent_root.mkdir(parents=True)
+            actual_venv = root / "actual-venv"
+            (actual_venv / "bin").mkdir(parents=True)
+            (actual_venv / "bin" / "python").symlink_to(
+                fixture["current_python"]
+            )
+            (symlink_parent_root / ".venv").symlink_to(
+                actual_venv,
+                target_is_directory=True,
+            )
+            symlink_parent_python = (
+                symlink_parent_root / ".venv" / "bin" / "python"
+            )
+
+            python3_path = (
+                release_root
+                / (
+                    "333333333333-srcset333333333333-lock333333333333-"
+                    "contract333333333333"
+                )
+                / ".venv"
+                / "bin"
+                / "python3"
+            )
+            python3_path.parent.mkdir(parents=True)
+            python3_path.symlink_to(fixture["current_python"])
+
+            copied_python = (
+                release_root
+                / (
+                    "444444444444-srcset444444444444-lock444444444444-"
+                    "contract444444444444"
+                )
+                / ".venv"
+                / "bin"
+                / "python"
+            )
+            copied_python.parent.mkdir(parents=True)
+            copied_python.write_bytes(fixture["current_python"].read_bytes())
+            copied_python.chmod(0o700)
+            self.assertNotEqual(
+                copied_python.stat().st_ino,
+                fixture["current_python"].stat().st_ino,
+            )
+
+            release_root_alias = root / "release-root-alias"
+            release_root_alias.symlink_to(
+                release_root, target_is_directory=True
+            )
+            aliased_release_python = (
+                release_root_alias
+                / fixture["historical_release_python"].relative_to(release_root)
+            )
+
+            cases = (
+                (aliased_release_python, release_root_alias),
+                (symlink_parent_python, release_root),
+                (python3_path, release_root),
+                (copied_python, release_root),
+            )
+            for candidate, candidate_root in cases:
+                with self.subTest(path=candidate):
+                    case_fixture = dict(fixture)
+                    case_fixture["release_root"] = candidate_root
+                    with patch_rotation(
+                        case_fixture,
+                        fixture["current_release_python"],
+                    ):
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            "decision review provenance binding mismatch",
+                        ):
+                            reviews._normalize_review_role_provenance(
+                                rotated_runner_provenance(
+                                    original, candidate
+                                ),
                                 reviews.normalize_binding(
                                     binding("independent-reviewer")
                                 ),
@@ -735,6 +924,77 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
         self.assertEqual(reconciled["status"], "settled")
         self.assertEqual(reconciled["slots"][0]["independent_pass_count"], 1)
         self.assertTrue(reconciled["attempts"][0]["independence_verified"])
+
+    def test_historical_immutable_runner_bootstraps_missing_provenance_after_rotation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jobs = root / "jobs"
+            jobs.mkdir()
+            fixture = python_rotation_fixture(
+                root,
+                historical_module_bytes=Path(agent_role.__file__).read_bytes(),
+            )
+
+            with patch_rotation(
+                fixture, fixture["historical_release_python"]
+            ):
+                make_job(
+                    jobs,
+                    suffix="a00000000026",
+                    slot="independent-reviewer",
+                    terminal_status="succeeded",
+                    review_result=None,
+                    review_role=True,
+                    origin_provenance=False,
+                )
+
+            with patch_rotation(fixture, fixture["stable_python"], bind_launcher=True):
+                reconciled = self.reconcile(jobs)
+            self.assertEqual(reconciled["status"], "settled")
+            self.assertEqual(reconciled["slots"][0]["independent_pass_count"], 1)
+            self.assertEqual(reconciled["attempts"][0]["classification"], "pass")
+            self.assertTrue(reconciled["attempts"][0]["independence_verified"])
+
+            fixture["historical_module"].write_text(
+                "# mismatched historical role module\n",
+                encoding="utf-8",
+            )
+            with patch_rotation(fixture, fixture["stable_python"], bind_launcher=True):
+                rejected = self.reconcile(jobs)
+            self.assertEqual(rejected["status"], "blocked")
+            self.assertEqual(rejected["slots"][0]["independent_pass_count"], 0)
+            self.assertIn(
+                "decision_review_slot_without_pass:independent-reviewer",
+                rejected["errors"],
+            )
+
+    def test_missing_provenance_stable_alias_does_not_bootstrap_independence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jobs = root / "jobs"
+            jobs.mkdir()
+            fixture = python_rotation_fixture(root)
+
+            with patch_rotation(fixture, fixture["stable_python"], bind_launcher=True):
+                make_job(
+                    jobs,
+                    suffix="a00000000028",
+                    slot="independent-reviewer",
+                    terminal_status="succeeded",
+                    review_result=None,
+                    review_role=True,
+                    origin_provenance=False,
+                )
+                reconciled = self.reconcile(jobs)
+
+        self.assertEqual(reconciled["status"], "blocked")
+        self.assertEqual(
+            reconciled["slots"][0]["independent_pass_count"], 0
+        )
+        self.assertIn(
+            "decision_review_slot_without_pass:independent-reviewer",
+            reconciled["errors"],
+        )
 
     def test_redacted_or_changed_metadata_argv_cannot_bootstrap_independence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

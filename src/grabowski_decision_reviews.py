@@ -34,6 +34,7 @@ REVIEW_ROLE_MODULE = "grabowski_agent_role"
 REVIEW_ROLE_SANDBOX = "bubblewrap-minimal-root-read-only-worktree-v1"
 REVIEW_ROLE_PYTHON = os.path.abspath(sys.executable)
 REVIEW_ROLE_STABLE_PYTHON = Path.home() / ".local/share/grabowski-mcp/.venv/bin/python"
+REVIEW_ROLE_STABLE_VENV_TARGET = REVIEW_ROLE_STABLE_PYTHON.parent.parent.resolve(strict=False)
 REVIEW_ROLE_RELEASE_ROOT = Path.home() / ".local/share/grabowski-mcp-releases"
 REVIEW_ROLE_LAUNCHER_PREFIX = (
     REVIEW_ROLE_PYTHON,
@@ -189,20 +190,25 @@ def _historical_review_role_python_matches(value: Any) -> bool:
     if not path.is_absolute():
         return False
     try:
-        stable_allowed = path == REVIEW_ROLE_STABLE_PYTHON.expanduser()
+        stable_python = REVIEW_ROLE_STABLE_PYTHON.expanduser()
+        stable_allowed = path == stable_python
+
+        root_path = REVIEW_ROLE_RELEASE_ROOT.expanduser()
+        if root_path.is_symlink():
+            return False
+        root_metadata = root_path.stat()
+        if (
+            not stat.S_ISDIR(root_metadata.st_mode)
+            or root_metadata.st_uid != os.getuid()
+        ):
+            return False
+        root = root_path.resolve(strict=True)
+        if root != root_path:
+            return False
+
         release_allowed = False
         if not stable_allowed:
-            root_path = REVIEW_ROLE_RELEASE_ROOT.expanduser()
-            if root_path.is_symlink():
-                return False
-            root_metadata = root_path.stat()
-            if (
-                not stat.S_ISDIR(root_metadata.st_mode)
-                or root_metadata.st_uid != os.getuid()
-            ):
-                return False
-            root = root_path.resolve(strict=True)
-            relative = path.relative_to(root)
+            relative = path.relative_to(root_path)
             parts = relative.parts
             release_allowed = (
                 len(parts) == 4
@@ -213,8 +219,24 @@ def _historical_review_role_python_matches(value: Any) -> bool:
             return False
 
         parent = path.parent
-        if not stable_allowed and parent.resolve(strict=True) != parent:
+        if stable_allowed:
+            trusted_venv = Path(REVIEW_ROLE_STABLE_VENV_TARGET)
+            trusted_relative = trusted_venv.relative_to(root)
+            trusted_parts = trusted_relative.parts
+            trusted_metadata = trusted_venv.stat()
+            if (
+                len(trusted_parts) != 2
+                or _REVIEW_ROLE_RELEASE_ID_RE.fullmatch(trusted_parts[0]) is None
+                or trusted_parts[1] != ".venv"
+                or trusted_venv.resolve(strict=True) != trusted_venv
+                or not stat.S_ISDIR(trusted_metadata.st_mode)
+                or trusted_metadata.st_uid != os.getuid()
+                or parent.resolve(strict=True) != trusted_venv / "bin"
+            ):
+                return False
+        elif parent.resolve(strict=True) != parent:
             return False
+
         link_metadata = path.lstat()
         if (
             not (
@@ -439,9 +461,15 @@ def _validated_origin_binding(directory: Path) -> tuple[dict[str, Any], dict[str
             and all(isinstance(item, str) for item in exact_argv)
             and sha256_json(exact_argv) == origin.get("argv_sha256")
         ):
-            provenance = review_role_provenance(
-                exact_argv, binding, cwd=Path(origin_cwd)
-            )
+            stable_python = str(REVIEW_ROLE_STABLE_PYTHON.expanduser())
+            if exact_argv and exact_argv[0] != stable_python:
+                provenance = review_role_provenance(
+                    exact_argv, binding, cwd=Path(origin_cwd)
+                )
+                if provenance is None:
+                    provenance = _historical_review_role_provenance(
+                        exact_argv, binding, cwd=Path(origin_cwd)
+                    )
     return metadata, binding, provenance
 
 
@@ -661,6 +689,79 @@ def review_role_provenance(
     return {**material, "provenance_sha256": sha256_json(material)}
 
 
+def _historical_review_role_module_path_for_python(
+    runner_python: Any, *, expected_sha256: str
+) -> str | None:
+    """Bind one historical immutable runner to its same-release role module."""
+
+    if not isinstance(runner_python, str) or not runner_python:
+        return None
+    if runner_python == str(REVIEW_ROLE_STABLE_PYTHON.expanduser()):
+        # A historical stable alias has no time-bound target without stored
+        # launch provenance. Never reconstruct that missing fact from today's
+        # alias target.
+        return None
+    if not _historical_review_role_python_matches(runner_python):
+        return None
+    runner_path = Path(runner_python)
+    try:
+        venv = runner_path.parents[1]
+    except IndexError:
+        return None
+    module_path = (
+        venv
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+        / f"{REVIEW_ROLE_MODULE}.py"
+    )
+    if not _historical_review_role_module_matches(
+        str(module_path), expected_sha256=expected_sha256
+    ):
+        return None
+    try:
+        return str(module_path.resolve(strict=True))
+    except (FileNotFoundError, OSError, RuntimeError):
+        return None
+
+
+def _historical_review_role_provenance(
+    argv: list[str], binding: dict[str, Any], *, cwd: Path
+) -> dict[str, Any] | None:
+    """Reconstruct legacy provenance only from one immutable historical release."""
+
+    if (
+        not isinstance(argv, list)
+        or any(not isinstance(item, str) for item in argv)
+        or len(argv) < 4
+        or tuple(argv[1:4]) != ("-I", "-m", REVIEW_ROLE_MODULE)
+    ):
+        return None
+    module_identity = _review_role_module_identity()
+    if module_identity is None:
+        return None
+    _current_module_path, current_module_sha256 = module_identity
+    historical_module_path = _historical_review_role_module_path_for_python(
+        argv[0], expected_sha256=current_module_sha256
+    )
+    if historical_module_path is None:
+        return None
+
+    current_shape = [REVIEW_ROLE_PYTHON, *argv[1:]]
+    provenance = review_role_provenance(current_shape, binding, cwd=cwd)
+    if provenance is None:
+        return None
+    material = {
+        key: item
+        for key, item in provenance.items()
+        if key != "provenance_sha256"
+    }
+    material["runner_python"] = argv[0]
+    material["runner_module_path"] = historical_module_path
+    material["runner_module_sha256"] = current_module_sha256
+    return {**material, "provenance_sha256": sha256_json(material)}
+
+
 def _normalize_review_role_provenance(
     value: Any, binding: dict[str, Any], *, cwd: str
 ) -> dict[str, Any] | None:
@@ -686,10 +787,11 @@ def _normalize_review_role_provenance(
         raise ValueError("trusted decision review role module is unavailable")
     runner_module_path, runner_module_sha256 = module_identity
     recorded_runner_python = value.get("runner_python")
+    stable_python = str(REVIEW_ROLE_STABLE_PYTHON.expanduser())
     runner_python_matches = (
         recorded_runner_python == REVIEW_ROLE_PYTHON
-        or _historical_review_role_python_matches(recorded_runner_python)
-    )
+        and recorded_runner_python != stable_python
+    ) or _historical_review_role_python_matches(recorded_runner_python)
     recorded_module_path = value.get("runner_module_path")
     recorded_module_sha256 = value.get("runner_module_sha256")
     module_identity_matches = (
