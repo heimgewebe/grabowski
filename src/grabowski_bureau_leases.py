@@ -31,15 +31,6 @@ BUREAU_CONTROL_LOCK_PATH = (
 BUREAU_RUNTIME_ROOT = Path("/home/alex/.local/share/bureau")
 BUREAU_MANAGED_LAUNCHER = Path("/home/alex/.local/bin/bureau")
 BUREAU_CONTRACT_EXECUTABLE = BUREAU_RUNTIME_ROOT / "venv/bin/bureau"
-BUREAU_LEGACY_COORDINATION_ROOT = Path(
-    os.environ.get("BUREAU_STATE_DIR", "~/.local/state/bureau")
-).expanduser()
-BUREAU_COORDINATION_ROOT = Path(
-    os.environ.get(
-        "GRABOWSKI_BUREAU_COORDINATION_ROOT",
-        str(BUREAU_LEGACY_COORDINATION_ROOT),
-    )
-).expanduser()
 BROAD_BUREAU_REPOSITORY_KEY = f"repo:{BUREAU_REPOSITORY_ROOT}"
 BUREAU_MERGE_GATE_KEY = f"path:{BUREAU_REPOSITORY_ROOT}/.bureau-scopes/merge-main"
 BUREAU_WORKTREE_ADMIN_KEY = (

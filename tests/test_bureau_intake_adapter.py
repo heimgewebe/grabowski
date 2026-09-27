@@ -1437,11 +1437,29 @@ class BureauIntakeAdapterTests(unittest.TestCase):
             invoke.call_args.kwargs["required_readback"],
         )
 
+    def test_configured_bureau_state_roots_match_pickup_environment_contract(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"BUREAU_STATE_DIR": "/tmp/legacy-bureau-state"},
+            clear=True,
+        ):
+            legacy, current = intake._configured_bureau_state_roots()
+        self.assertEqual(Path("/tmp/legacy-bureau-state"), legacy)
+        self.assertEqual(legacy, current)
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "BUREAU_STATE_DIR": "/tmp/legacy-bureau-state",
+                "GRABOWSKI_BUREAU_COORDINATION_ROOT": "/tmp/current-bureau-state",
+            },
+            clear=True,
+        ):
+            legacy, current = intake._configured_bureau_state_roots()
+        self.assertEqual(Path("/tmp/legacy-bureau-state"), legacy)
+        self.assertEqual(Path("/tmp/current-bureau-state"), current)
+
     def test_acceptance_authenticate_binds_canonical_state_root_gate_and_audit(self) -> None:
-        self.assertEqual(
-            intake.BUREAU_STATE_ROOT,
-            intake.bureau_runtime.BUREAU_COORDINATION_ROOT,
-        )
         expected_sha256 = "b" * 64
         state_root = self.root / "configured-bureau-state"
         result_payload = {

@@ -43,7 +43,21 @@ ARTIFACT_ROOT = Path(
     )
 ).expanduser()
 BUREAU_ROOT = bureau_runtime.BUREAU_CONTROL_ROOT
-BUREAU_STATE_ROOT = bureau_runtime.BUREAU_COORDINATION_ROOT
+
+def _configured_bureau_state_roots() -> tuple[Path, Path]:
+    legacy_root = Path(
+        os.environ.get("BUREAU_STATE_DIR", "~/.local/state/bureau")
+    ).expanduser()
+    state_root = Path(
+        os.environ.get(
+            "GRABOWSKI_BUREAU_COORDINATION_ROOT",
+            str(legacy_root),
+        )
+    ).expanduser()
+    return legacy_root, state_root
+
+
+BUREAU_LEGACY_STATE_ROOT, BUREAU_STATE_ROOT = _configured_bureau_state_roots()
 MAX_INPUT_BYTES = 1024 * 1024
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 COMMAND_TIMEOUT_SECONDS = 30

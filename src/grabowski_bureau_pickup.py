@@ -38,8 +38,8 @@ STATE_ROOT = Path(
         str(operator.STATE_DIR / "bureau-pickup"),
     )
 ).expanduser()
-LEGACY_COORDINATION_ROOT = bureau_leases.BUREAU_LEGACY_COORDINATION_ROOT
-COORDINATION_ROOT = bureau_leases.BUREAU_COORDINATION_ROOT
+LEGACY_COORDINATION_ROOT = bureau.BUREAU_LEGACY_STATE_ROOT
+COORDINATION_ROOT = bureau.BUREAU_STATE_ROOT
 RUN_ID_RE = re.compile(r"^BUR-RUN-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{10}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$")
