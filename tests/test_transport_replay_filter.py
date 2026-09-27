@@ -178,6 +178,35 @@ class ReplayFilterTests(unittest.TestCase):
         )
         self.assertEqual(consumed["state"], "consumed")
 
+    def test_sessionful_task_start_same_body_is_independent_across_sessions(
+        self,
+    ) -> None:
+        first_session = "task-start-session-a"
+        second_session = "task-start-session-b"
+        first = _task_start_evidence(
+            now=301,
+            session_id=first_session,
+            rpc_request_id="same-task-start-rpc",
+        )
+        second = _task_start_evidence(
+            now=301,
+            session_id=second_session,
+            rpc_request_id="same-task-start-rpc",
+        )
+        self.assertNotEqual(first["request_id"], second["request_id"])
+
+        assertion.consume_assertion(
+            **first,
+            session_id=first_session,
+            now_unix=301,
+        )
+        consumed = assertion.consume_assertion(
+            **second,
+            session_id=second_session,
+            now_unix=301,
+        )
+        self.assertEqual(consumed["state"], "consumed")
+
     def test_sessionful_task_start_request_id_remains_single_use_after_window(
         self,
     ) -> None:
