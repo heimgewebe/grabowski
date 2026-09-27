@@ -6747,7 +6747,14 @@ class TaskTests(unittest.TestCase):
         with (
             patch.object(tasks.operator, "_require_operator_mutation"),
             patch.object(tasks, "_reconcile_observation", side_effect=observe),
-            patch.object(tasks, "_dispatch", side_effect=dispatch),
+            patch.object(
+                tasks,
+                "_resolve_task_dispatch_host",
+                return_value=("local", {"transport": "local"}, False),
+            ),
+            patch.object(
+                tasks.operator, "_run_mutating_user_systemd_unit", side_effect=dispatch
+            ),
             patch.object(tasks.base, "_append_audit"),
         ):
             refresh_thread = threading.Thread(target=run_refresh)

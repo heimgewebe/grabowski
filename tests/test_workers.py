@@ -70,6 +70,29 @@ class WorkerTests(unittest.TestCase):
         ]
         for item in self.patches:
             item.start()
+
+        def coordinated_user_systemd_stub(
+            unit: str,
+            action: str,
+            *,
+            mutation_timeout_seconds: int = 120,
+            max_output_bytes: int = workers.operator.DEFAULT_OUTPUT_BYTES,
+        ):
+            return workers.operator._run(
+                ["systemctl", "--user", action, unit],
+                cwd=workers.operator.HOME,
+                timeout_seconds=mutation_timeout_seconds,
+                max_output_bytes=max_output_bytes,
+            )
+
+        mutation_patch = patch.object(
+            workers.operator,
+            "_run_mutating_user_systemd_unit",
+            side_effect=coordinated_user_systemd_stub,
+        )
+        self.user_systemd_mutation = mutation_patch.start()
+        self.patches.append(mutation_patch)
+
         self.binary = self.root / "google-chrome"
         self.binary.write_text("#!/bin/sh\nexit 0\n")
         self.binary.chmod(0o755)
