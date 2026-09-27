@@ -14,6 +14,9 @@ from unittest import mock
 import grabowski_bureau_intake as intake
 
 
+REAL_REQUIRE_OPERATOR_MUTATION = intake.operator._require_operator_mutation
+
+
 class BureauIntakeAdapterTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -1479,18 +1482,95 @@ class BureauIntakeAdapterTests(unittest.TestCase):
                 expected_sha256,
                 "reviewer-a",
             )
-        resolved = state_root.expanduser().resolve()
+        normalized_root = Path(
+            os.path.abspath(os.fspath(state_root.expanduser()))
+        )
         self.assertEqual(result_payload, result)
         intake.operator._require_operator_mutation.assert_called_once_with(
-            "bureau_mutation", path=str(resolved)
+            "bureau_mutation", path=str(normalized_root)
         )
         arguments = invoke.call_args.args[0]
         self.assertEqual(
             arguments[arguments.index("--state-root") + 1],
-            str(resolved),
+            str(normalized_root),
         )
         intake._audit.assert_called_once()
         self.assertEqual(intake._audit.call_args.kwargs["reviewer"], "reviewer-a")
+
+    def test_acceptance_authenticate_rejects_symlinked_state_root_before_gate(self) -> None:
+        target = self.root / "real-bureau-state"
+        target.mkdir()
+        state_root = self.root / "bureau-state-link"
+        state_root.symlink_to(target, target_is_directory=True)
+        with (
+            mock.patch.object(intake, "BUREAU_STATE_ROOT", state_root),
+            mock.patch.object(intake, "_invoke_bureau") as invoke,
+        ):
+            with self.assertRaisesRegex(
+                intake.bureau_runtime.BureauLeaseContractError,
+                "bureau-state-root-symlink-component",
+            ):
+                intake.grabowski_bureau_acceptance_authenticate(
+                    "BUR-RUN-20260927T000000Z-0123456789",
+                    "production-boundary",
+                    "c" * 64,
+                    "reviewer-a",
+                )
+        intake.operator._require_operator_mutation.assert_not_called()
+        invoke.assert_not_called()
+
+    def test_acceptance_authenticate_honors_matching_path_blockade(self) -> None:
+        state_root = self.root / "configured-bureau-state"
+        state_root.mkdir()
+        other_root = self.root / "other-state"
+        other_root.mkdir()
+        record = intake.base.blockade_policy.BlockadeRecord(
+            blockade_id="acceptance-state-root-freeze",
+            posture="mutation_freeze",
+            scope=intake.base.blockade_policy.Scope("path", str(state_root)),
+            reason="Test Acceptance StateStore blockade.",
+            trigger_class="manual_path_freeze",
+            engaged_at=intake.base.datetime.now(intake.base.timezone.utc),
+            evidence_refs=("test:acceptance-state-root",),
+            provenance=intake.base.blockade_policy.Provenance(
+                tool="test",
+                request_id="request-1",
+                session_id="session-1",
+                task_id="task-1",
+                owner_id="owner-1",
+            ),
+        )
+
+        def real_gate(capability: str, **kwargs: object) -> None:
+            REAL_REQUIRE_OPERATOR_MUTATION(capability, **kwargs)
+
+        intake.operator._require_operator_mutation.side_effect = real_gate
+        with (
+            mock.patch.object(intake, "BUREAU_STATE_ROOT", state_root),
+            mock.patch.object(intake.operator, "_require_operator_capability"),
+            mock.patch.object(
+                intake.base,
+                "_operator_blockade_records",
+                return_value=((record,), {"marker_source": "test"}),
+            ),
+            mock.patch.object(intake.base, "_require_valid_audit_chain"),
+            mock.patch.object(intake, "_invoke_bureau") as invoke,
+        ):
+            with self.assertRaisesRegex(
+                PermissionError,
+                "mutation_blocked_by_mutation_freeze",
+            ):
+                intake.grabowski_bureau_acceptance_authenticate(
+                    "BUR-RUN-20260927T000000Z-0123456789",
+                    "production-boundary",
+                    "d" * 64,
+                    "reviewer-a",
+                )
+            REAL_REQUIRE_OPERATOR_MUTATION(
+                "bureau_mutation",
+                path=str(other_root),
+            )
+        invoke.assert_not_called()
 
     def test_acceptance_authenticate_rejects_invalid_bindings_before_dispatch(self) -> None:
         invalid = (

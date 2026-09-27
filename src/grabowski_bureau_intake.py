@@ -58,6 +58,36 @@ def _configured_bureau_state_roots() -> tuple[Path, Path]:
 
 
 BUREAU_LEGACY_STATE_ROOT, BUREAU_STATE_ROOT = _configured_bureau_state_roots()
+
+
+def _absolute_bureau_state_root(path: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(Path(path).expanduser())))
+
+
+def _assert_bureau_state_root_has_no_symlink_components(path: Path) -> None:
+    normalized = _absolute_bureau_state_root(path)
+    current = Path(normalized.anchor)
+    for component_index, component in enumerate(normalized.parts[1:], start=1):
+        current = current / component
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            break
+        except OSError as exc:
+            raise bureau_runtime.BureauLeaseContractError(
+                "bureau-state-root-path-unavailable",
+                details={
+                    "component_index": component_index,
+                    "error_type": type(exc).__name__,
+                },
+            ) from None
+        if stat.S_ISLNK(metadata.st_mode):
+            raise bureau_runtime.BureauLeaseContractError(
+                "bureau-state-root-symlink-component",
+                details={"component_index": component_index},
+            )
+
+
 MAX_INPUT_BYTES = 1024 * 1024
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 COMMAND_TIMEOUT_SECONDS = 30
@@ -1472,7 +1502,8 @@ def grabowski_bureau_acceptance_authenticate(
     reviewer: str,
 ) -> dict[str, Any]:
     """Authenticate one exact manual Bureau acceptance item through Bureau's canonical contract."""
-    state_root = Path(BUREAU_STATE_ROOT).expanduser().resolve()
+    state_root = _absolute_bureau_state_root(BUREAU_STATE_ROOT)
+    _assert_bureau_state_root_has_no_symlink_components(state_root)
     operator._require_operator_mutation("bureau_mutation", path=str(state_root))
     normalized: dict[str, str] = {}
     for label, value, maximum in (
