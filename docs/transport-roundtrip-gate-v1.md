@@ -42,9 +42,21 @@ itself reconcile repetition safely.
   the durable replay filter. Its replay policy is domain_delegated.
 - The durable task layer is authoritative for repeated task starts. Task
   mutations are serialized, the task row is committed before _launch() can
-  start a process, active execution identities are reused, and terminal or
-  outcome-unknown predecessors remain subject to the task retry/reconcile
-  contract.
+  start a process, active execution identities are reused, and a completed
+  unbound execution identity is reused inside the existing bounded
+  successful-operation window. This covers response-loss retries even after a
+  fast task has already completed, using the fully normalized execution
+  identity rather than raw transport arguments. After the bounded window an
+  identical execution may start again; a distinct explicit operation identity
+  remains an immediate discriminator for intentionally different work.
+  Operation-bound rows do not shadow the latest unbound base execution when a
+  transport response is retried. Among unbound base executions, the newest
+  lifecycle state stays authoritative: active work follows active-task reuse or
+  lease serialization; completed work is reused for 600 seconds; failed,
+  interrupted, timed-out, signalled or outcome-unknown work stays under the
+  task retry/reconcile contract; cancelled work is not reused. After the
+  completed-work window expires, an identical unbound execution may start a
+  new unit.
 - Other mutating tools remain on durable_transport_replay by default. Their
   exact request id and stable body identity stay fail-closed until a narrower
   domain-specific idempotency/readback path proves re-entry safe.

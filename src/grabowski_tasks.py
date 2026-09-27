@@ -4617,6 +4617,99 @@ def _resolve_active_execution_reuse(
     return None
 
 
+def _latest_matching_unbound_execution_record(
+    identity: dict[str, Any],
+) -> dict[str, Any] | None:
+    with _database_connection() as connection:
+        rows = connection.execute(
+            "SELECT * FROM tasks WHERE host=? AND argv_sha256=? AND cwd=? "
+            "AND resource_keys_json=? AND runtime_seconds=? AND cpu_weight=? "
+            "AND io_weight=? AND memory_max_bytes IS ? "
+            "AND chronik_outbox_enabled=? AND chronik_outbox_state_root IS ? "
+            "AND chronik_context_json IS ? AND execution_backend=? AND systemd_scope=? "
+            "ORDER BY created_at_unix DESC, rowid DESC LIMIT 50001",
+            (
+                identity["host"],
+                identity["argv_sha256"],
+                identity["cwd"],
+                _canonical_json(identity["resource_keys"]),
+                identity["runtime_seconds"],
+                identity["cpu_weight"],
+                identity["io_weight"],
+                identity["memory_max_bytes"],
+                int(identity["chronik_outbox_enabled"]),
+                identity["chronik_outbox_state_root"],
+                (
+                    _canonical_json(identity["chronik_context"])
+                    if identity["chronik_context"] is not None
+                    else None
+                ),
+                identity["execution_backend"],
+                identity["systemd_scope"],
+            ),
+        ).fetchall()
+    if len(rows) > 50000:
+        raise RuntimeError("unbound execution identity scan limit exceeded")
+    for row in rows:
+        record = dict(row)
+        if (
+            _record_execution_identity(record)["identity_sha256"]
+            != identity["identity_sha256"]
+        ):
+            raise RuntimeError("stored task execution identity is inconsistent")
+        if _persisted_task_operation_identity(record) is not None:
+            continue
+        if (
+            _persisted_retry_binding_or_raise(record) is not None
+            or _persisted_interrupted_recovery_binding_or_raise(record) is not None
+        ):
+            continue
+        return record
+    return None
+
+
+def _resolve_recent_completed_execution_reuse(
+    identity: dict[str, Any],
+    *,
+    resume_policy: ResumePolicy,
+) -> dict[str, Any] | None:
+    latest = _latest_matching_unbound_execution_record(identity)
+    if latest is None:
+        return None
+    if _persisted_task_operation_identity(latest) is not None:
+        return None
+    if (
+        _persisted_retry_binding_or_raise(latest) is not None
+        or _persisted_interrupted_recovery_binding_or_raise(latest) is not None
+    ):
+        return None
+    if str(latest["state"]) != "completed":
+        return None
+    if str(latest["resume_policy"]) != resume_policy:
+        raise RuntimeError(
+            "recent completed execution identity has a different resume policy; "
+            "use a distinct operation identity for intentional new work"
+        )
+    now = _now()
+    completed_at = latest.get("terminalized_at_unix")
+    if not isinstance(completed_at, int) or isinstance(completed_at, bool):
+        completed_at = latest.get("updated_at_unix")
+    if not isinstance(completed_at, int) or isinstance(completed_at, bool):
+        raise RuntimeError("recent completed execution identity timestamp is invalid")
+    age = now - completed_at
+    if age < 0:
+        raise RuntimeError("recent completed execution identity timestamp is in the future")
+    if age > TASK_OPERATION_REUSE_WINDOW_SECONDS:
+        return None
+    receipt = latest.get("lifecycle_receipt_sha256")
+    if not isinstance(receipt, str) or SHA256.fullmatch(receipt) is None:
+        raise RuntimeError(
+            "recent completed execution identity lacks a valid lifecycle receipt; "
+            f"reconcile task {latest['task_id']} before another start"
+        )
+    return latest
+
+
 def _matching_attention_execution_records(
     identity: dict[str, Any],
 ) -> list[dict[str, Any]]:
@@ -8310,7 +8403,11 @@ def grabowski_task_start(
     deterministic; it does not invoke an external checkout sensor. Every task-owned broad
     repository lease carries a complete whole-repository scope manifest.
     An exact already-active execution identity is reused instead of launching
-    another process, even when no explicit operation identity was supplied. For
+    another process, even when no explicit operation identity was supplied.
+    A recently completed unbound execution identity is also reused within the
+    existing successful-operation reuse window so response-loss retries cannot
+    relaunch a fast completed effect. After that bounded window, the same
+    execution may start again. For
     short effect-free direct reads, prefer an existing typed read surface. A
     server-verified local Git read classified as avoidable_bounded_read returns
     before task persistence with a structured reroute to grabowski_git; task_start
@@ -8637,28 +8734,40 @@ def grabowski_task_start(
         execution_backend=execution_backend,
         systemd_scope=systemd_scope,
     )
-    active_execution_reuse = None
+    execution_reuse = None
+    execution_reuse_reason = None
     if (
         normalized_operation_identity is None
         and operation_retry_binding is None
         and _retry_context is None
-        and not task_resources
     ):
-        active_execution_reuse = _resolve_active_execution_reuse(
-            execution_identity,
-            resume_policy=policy,
-        )
-    if active_execution_reuse is not None:
+        if not task_resources:
+            execution_reuse = _resolve_active_execution_reuse(
+                execution_identity,
+                resume_policy=policy,
+            )
+            if execution_reuse is not None:
+                execution_reuse_reason = "active_execution_identity"
+        if execution_reuse is None:
+            execution_reuse = _resolve_recent_completed_execution_reuse(
+                execution_identity,
+                resume_policy=policy,
+            )
+            if execution_reuse is not None:
+                execution_reuse_reason = "recent_completed_execution_identity"
+    if execution_reuse is not None:
+        if execution_reuse_reason is None:
+            raise RuntimeError("execution reuse reason is missing")
         reused_classification = _project_task_effect_classification(
-            _record_task_effect_classification(active_execution_reuse),
+            _record_task_effect_classification(execution_reuse),
             fallback=task_effect_classification,
         )
         reuse_audit = {
             "timestamp_unix": _now(),
             "operation": "task-start-execution-deduplicated",
             "requested_task_id": task_id,
-            "reused_task_id": str(active_execution_reuse["task_id"]),
-            "reuse_reason": "active_execution_identity",
+            "reused_task_id": str(execution_reuse["task_id"]),
+            "reuse_reason": execution_reuse_reason,
             "execution_identity_sha256": execution_identity["identity_sha256"],
             "effect_profile": reused_classification["effect_profile"],
             "surface": reused_classification["surface"],
@@ -8669,20 +8778,18 @@ def grabowski_task_start(
         }
         base._append_audit(reuse_audit)
         return {
-            "task": _public(active_execution_reuse),
+            "task": _public(execution_reuse),
             "audit": reuse_audit,
             "execution_identity": execution_identity,
-            "retry_binding": _persisted_retry_binding_or_raise(
-                active_execution_reuse
-            ),
+            "retry_binding": _persisted_retry_binding_or_raise(execution_reuse),
             "routing_shadow_capture": None,
             "operation_identity": None,
             "operation_retry_binding": None,
             "task_effect_classification": reused_classification,
             "deduplicated_reuse": {
                 "reused": True,
-                "task_id": str(active_execution_reuse["task_id"]),
-                "reason": "active_execution_identity",
+                "task_id": str(execution_reuse["task_id"]),
+                "reason": execution_reuse_reason,
             },
         }
     read_routing_advisory = (

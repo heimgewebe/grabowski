@@ -10820,10 +10820,164 @@ class TaskTests(unittest.TestCase):
         rows = tasks.grabowski_task_list(limit=20, view="evidence")
         self.assertEqual(1, rows["total_matching"])
 
-    def test_completed_execution_identity_allows_new_start(self) -> None:
-        common = {
+    def test_recent_completed_execution_identity_reuses_default_equivalent_start(
+        self,
+    ) -> None:
+        minimal = {
             "host": "local",
             "argv": ["/bin/echo", "completed-execution"],
+            "cwd": str(self.root),
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
+            ),
+        ):
+            first = tasks.grabowski_task_start(**minimal)
+        task_id = str(first["task"]["task_id"])
+        tasks._set_state(
+            task_id,
+            "completed",
+            observation={"state": "completed", "observed_at_unix": tasks._now()},
+        )
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
+            ),
+        ):
+            second = tasks.grabowski_task_start(
+                **minimal,
+                runtime_seconds=tasks.operator.DEFAULT_JOB_RUNTIME,
+                resume_policy="verify-then-retry",
+                cpu_weight=100,
+                io_weight=100,
+                memory_max_bytes=None,
+                resource_keys=None,
+            )
+        dispatch.assert_not_called()
+        self.assertEqual(task_id, second["task"]["task_id"])
+        self.assertEqual(
+            "recent_completed_execution_identity",
+            second["deduplicated_reuse"]["reason"],
+        )
+        rows = tasks.grabowski_task_list(limit=20, view="evidence")
+        self.assertEqual(1, rows["total_matching"])
+
+    def test_recent_completed_execution_identity_with_resources_is_reused(
+        self,
+    ) -> None:
+        common = {
+            "host": "local",
+            "argv": ["/bin/echo", "completed-resource-execution"],
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "resource_keys": ["port:9222"],
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
+            ),
+        ):
+            first = tasks.grabowski_task_start(**common)
+        task_id = str(first["task"]["task_id"])
+        tasks._set_state(
+            task_id,
+            "completed",
+            observation={"state": "completed", "observed_at_unix": tasks._now()},
+        )
+        self.assertIsNone(tasks.resources.inspect_resource("port:9222"))
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks.resources, "acquire_resources") as acquire,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
+            ),
+        ):
+            second = tasks.grabowski_task_start(**common)
+        dispatch.assert_not_called()
+        acquire.assert_not_called()
+        self.assertEqual(task_id, second["task"]["task_id"])
+        self.assertEqual(
+            "recent_completed_execution_identity",
+            second["deduplicated_reuse"]["reason"],
+        )
+
+    def test_operation_bound_completion_does_not_shadow_recent_unbound_reuse(
+        self,
+    ) -> None:
+        common = {
+            "host": "local",
+            "argv": ["/bin/echo", "completed-shadowed-execution"],
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
+            ),
+        ):
+            first = tasks.grabowski_task_start(**common)
+        first_id = str(first["task"]["task_id"])
+        tasks._set_state(
+            first_id,
+            "completed",
+            observation={"state": "completed", "observed_at_unix": tasks._now()},
+        )
+
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
+            ),
+        ):
+            distinct = tasks.grabowski_task_start(
+                **common,
+                operation_identity=self._operation_identity_fixture(source="e"),
+            )
+        tasks._set_state(
+            str(distinct["task"]["task_id"]),
+            "completed",
+            observation={"state": "completed", "observed_at_unix": tasks._now()},
+        )
+
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 125}
+            ),
+        ):
+            repeated = tasks.grabowski_task_start(**common)
+        dispatch.assert_not_called()
+        self.assertEqual(first_id, repeated["task"]["task_id"])
+        self.assertEqual(
+            "recent_completed_execution_identity",
+            repeated["deduplicated_reuse"]["reason"],
+        )
+
+    def test_completed_execution_identity_allows_new_start_after_reuse_window(
+        self,
+    ) -> None:
+        common = {
+            "host": "local",
+            "argv": ["/bin/echo", "completed-expired-execution"],
             "cwd": str(self.root),
             "runtime_seconds": 60,
             "resume_policy": "verify-then-retry",
@@ -10840,14 +10994,19 @@ class TaskTests(unittest.TestCase):
             ),
         ):
             first = tasks.grabowski_task_start(**common)
+        first_id = str(first["task"]["task_id"])
         tasks._set_state(
-            str(first["task"]["task_id"]),
+            first_id,
             "completed",
-            observation={
-                "state": "completed",
-                "observed_at_unix": tasks._now(),
-            },
+            observation={"state": "completed", "observed_at_unix": tasks._now()},
         )
+        expired = tasks._now() - tasks.TASK_OPERATION_REUSE_WINDOW_SECONDS - 1
+        with tasks._database() as connection:
+            connection.execute(
+                "UPDATE tasks SET updated_at_unix=?, terminalized_at_unix=? "
+                "WHERE task_id=?",
+                (expired, expired, first_id),
+            )
         with (
             patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
             patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
@@ -10858,7 +11017,47 @@ class TaskTests(unittest.TestCase):
         ):
             second = tasks.grabowski_task_start(**common)
         self.assertTrue(dispatch.called)
-        self.assertNotEqual(first["task"]["task_id"], second["task"]["task_id"])
+        self.assertNotEqual(first_id, second["task"]["task_id"])
+        self.assertIsNone(second["deduplicated_reuse"])
+
+    def test_recent_completed_execution_identity_distinct_operation_starts_new_work(
+        self,
+    ) -> None:
+        common = {
+            "host": "local",
+            "argv": ["/bin/echo", "completed-distinct-operation"],
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
+            ),
+        ):
+            first = tasks.grabowski_task_start(**common)
+        first_id = str(first["task"]["task_id"])
+        tasks._set_state(
+            first_id,
+            "completed",
+            observation={"state": "completed", "observed_at_unix": tasks._now()},
+        )
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
+            ),
+        ):
+            second = tasks.grabowski_task_start(
+                **common,
+                operation_identity=self._operation_identity_fixture(source="f"),
+            )
+        self.assertTrue(dispatch.called)
+        self.assertNotEqual(first_id, second["task"]["task_id"])
         self.assertIsNone(second["deduplicated_reuse"])
 
     def test_operation_identity_attention_retry_requires_bound_supersession(self) -> None:
