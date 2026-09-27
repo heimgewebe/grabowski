@@ -3024,6 +3024,196 @@ class WorkAcquireTests(unittest.TestCase):
             work_acquire.resources.LEASE_SNAPSHOT_KEYS,
         )
 
+    def test_continuation_authorization_guard_rejects_lifecycle_drift(self) -> None:
+        lifecycle = {
+            "checkout_key": "a" * 64,
+            "owner_id": "lane:" + "a" * 32,
+            "retention_until_unix": self.retention,
+        }
+        continuation_preimage = {
+            "checkout_key": lifecycle["checkout_key"],
+            "lifecycle_sha256": work_acquire._sha(lifecycle),
+            "lifecycle_retention_until_unix": self.retention,
+        }
+        drifted = {**lifecycle, "owner_id": "lane:" + "b" * 32}
+
+        @contextmanager
+        def lifecycle_guard(_timeout_seconds: float):
+            yield
+
+        with (
+            patch.object(
+                work_acquire,
+                "_continuation_lifecycle_guard",
+                lifecycle_guard,
+            ),
+            patch.object(
+                work_acquire.checkouts,
+                "_strict_lifecycle_binding",
+                return_value=drifted,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "lifecycle authority changed before authorization",
+            ),
+        ):
+            with work_acquire._continuation_authorization_guard(
+                continuation_preimage
+            ):
+                self.fail("drifted lifecycle must not authorize continuation")
+
+    def test_continuation_writer_authorization_is_persisted_under_guard(self) -> None:
+        params = self.parameters()
+        params["scoped_writer_argv"] = ["writer", "--once"]
+        params["scoped_writer_runtime_seconds"] = 600
+        inputs, stored = self.store_lane(params)
+        checkout_key = "a" * 64
+        worktree_receipt = {
+            "result_state": "CREATED",
+            "durable_receipt_sha256": "b" * 64,
+            "post_state": {
+                "target_registered": True,
+                "target_path_exists": True,
+            },
+            "lifecycle": {
+                "checkout_key": checkout_key,
+                "physical_checkout": PHYSICAL,
+            },
+        }
+        receipt_path = self.state / f"{inputs['lane_id']}.json"
+        work_acquire._write_state(
+            receipt_path,
+            {**stored, "worktree_receipt": worktree_receipt},
+        )
+        continuation_preimage = {
+            "checkout_key": checkout_key,
+            "lifecycle_sha256": "c" * 64,
+            "lifecycle_retention_until_unix": self.retention,
+            "preimage_sha256": "d" * 64,
+        }
+        state = {"guarded": False}
+        original_write_state = work_acquire._write_state
+
+        @contextmanager
+        def authorization_guard(_preimage: dict[str, object] | None):
+            self.assertFalse(state["guarded"])
+            state["guarded"] = True
+            try:
+                yield
+            finally:
+                state["guarded"] = False
+
+        def tracked_write_state(path: Path, payload: dict[str, object]):
+            if payload.get("state") == "writer_starting":
+                self.assertTrue(state["guarded"])
+            return original_write_state(path, payload)
+
+        start = Mock(return_value=self.writer_result(self.target))
+        with (
+            patch.object(
+                work_acquire,
+                "_continuation_preimage",
+                return_value=continuation_preimage,
+            ),
+            patch.object(
+                work_acquire,
+                "_continuation_authorization_guard",
+                authorization_guard,
+            ),
+            patch.object(
+                work_acquire,
+                "_write_state",
+                side_effect=tracked_write_state,
+            ),
+        ):
+            result = work_acquire.acquire_work(
+                params,
+                acquire_resources_fn=self.acquire,
+                release_resources_fn=Mock(),
+                inspect_resource_fn=Mock(),
+                ensure_worktree_fn=Mock(),
+                runner=Mock(),
+                start_writer_fn=start,
+            )
+
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(result["decision"], "CONTINUE_EXISTING")
+        self.assertFalse(state["guarded"])
+        start.assert_called_once()
+
+    def test_continuation_authorization_conflict_compensates_before_writer_start(self) -> None:
+        params = self.parameters()
+        params["scoped_writer_argv"] = ["writer", "--once"]
+        params["scoped_writer_runtime_seconds"] = 600
+        inputs, stored = self.store_lane(params)
+        checkout_key = "a" * 64
+        receipt_path = self.state / f"{inputs['lane_id']}.json"
+        work_acquire._write_state(
+            receipt_path,
+            {
+                **stored,
+                "worktree_receipt": {
+                    "result_state": "CREATED",
+                    "durable_receipt_sha256": "b" * 64,
+                    "post_state": {
+                        "target_registered": True,
+                        "target_path_exists": True,
+                    },
+                    "lifecycle": {
+                        "checkout_key": checkout_key,
+                        "physical_checkout": PHYSICAL,
+                    },
+                },
+            },
+        )
+        continuation_preimage = {
+            "checkout_key": checkout_key,
+            "lifecycle_sha256": "c" * 64,
+            "lifecycle_retention_until_unix": self.retention,
+            "preimage_sha256": "d" * 64,
+        }
+        acquire = Mock(side_effect=self.acquire)
+        release = Mock(side_effect=self.release)
+        ensure = Mock()
+        start = Mock()
+
+        with (
+            patch.object(
+                work_acquire,
+                "_continuation_preimage",
+                return_value=continuation_preimage,
+            ),
+            patch.object(
+                work_acquire,
+                "_continuation_authorization_guard",
+                side_effect=RuntimeError(
+                    "managed worktree continuation lifecycle authority changed before authorization"
+                ),
+            ),
+        ):
+            result = work_acquire.acquire_work(
+                params,
+                acquire_resources_fn=acquire,
+                release_resources_fn=release,
+                inspect_resource_fn=Mock(),
+                ensure_worktree_fn=ensure,
+                runner=Mock(),
+                start_writer_fn=start,
+            )
+
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["decision"], "HARD_BLOCK")
+        self.assertEqual(
+            result["error_class"],
+            "WORKTREE_CONTINUATION_CONFLICT",
+        )
+        self.assertEqual(result["compensation"]["state"], "complete")
+        self.assertIn("before authorization", result["error"])
+        acquire.assert_called_once()
+        release.assert_called_once()
+        ensure.assert_not_called()
+        start.assert_not_called()
+
     def test_continuation_conflict_after_reacquire_compensates_fresh_leases(self) -> None:
         params = self.parameters()
         self.store_lane(params)

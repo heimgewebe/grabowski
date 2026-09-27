@@ -2177,6 +2177,52 @@ def _continuation_lifecycle_guard(timeout_seconds: float) -> Iterator[None]:
         connection.close()
 
 
+@contextmanager
+def _continuation_authorization_guard(
+    continuation_preimage: dict[str, Any] | None,
+    *,
+    timeout_seconds: float = 10.0,
+) -> Iterator[None]:
+    """Revalidate lifecycle authority while the first continuation effect is persisted."""
+
+    if continuation_preimage is None:
+        yield
+        return
+    checkout_key = continuation_preimage.get("checkout_key")
+    expected_lifecycle_sha256 = continuation_preimage.get("lifecycle_sha256")
+    expected_retention_until_unix = continuation_preimage.get(
+        "lifecycle_retention_until_unix"
+    )
+    if (
+        not isinstance(checkout_key, str)
+        or not isinstance(expected_lifecycle_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_lifecycle_sha256) is None
+        or isinstance(expected_retention_until_unix, bool)
+        or not isinstance(expected_retention_until_unix, int)
+    ):
+        raise RuntimeError(
+            "managed worktree continuation authorization evidence is invalid"
+        )
+    with _continuation_lifecycle_guard(timeout_seconds):
+        lifecycle = checkouts._strict_lifecycle_binding(checkout_key)
+        if (
+            not isinstance(lifecycle, dict)
+            or _sha(lifecycle) != expected_lifecycle_sha256
+        ):
+            raise RuntimeError(
+                "managed worktree continuation lifecycle authority changed before authorization"
+            )
+        retention_until_unix = lifecycle.get("retention_until_unix")
+        if (
+            retention_until_unix != expected_retention_until_unix
+            or retention_until_unix <= int(time.time())
+        ):
+            raise RuntimeError(
+                "managed worktree continuation lifecycle retention expired before authorization"
+            )
+        yield
+
+
 def _continuation_preimage(
     existing: dict[str, Any] | None,
     inputs: dict[str, Any],
@@ -3137,11 +3183,10 @@ def acquire_work(
         )
         group_evidence = _group_evidence_fields(acquisition_plan, acquisitions)
 
-        try:
-            continuation_preimage = _continuation_preimage(
-                existing, inputs, lifecycle_source, runner
-            )
-        except Exception as exc:
+        def continuation_conflict(
+            exc: Exception,
+            worktree_receipt: dict[str, Any] | None,
+        ) -> dict[str, Any]:
             compensation, compensation_complete = _compensate_acquisitions(
                 owner_id=inputs["lease_owner_id"],
                 plan=acquisition_plan,
@@ -3160,7 +3205,7 @@ def acquire_work(
                     "decision": "HARD_BLOCK",
                     "lease_receipt": acquired,
                     **group_evidence,
-                    "worktree_receipt": existing.get("worktree_receipt"),
+                    "worktree_receipt": worktree_receipt,
                     "error_class": "WORKTREE_CONTINUATION_CONFLICT",
                     "error": str(exc)[:2048],
                     "effect_observed": False,
@@ -3188,6 +3233,21 @@ def acquire_work(
                 "durable_receipt_path": str(receipt_path),
                 "replayed": existing is not None,
             }
+
+        try:
+            continuation_preimage = _continuation_preimage(
+                existing, inputs, lifecycle_source, runner
+            )
+        except Exception as exc:
+            return continuation_conflict(
+                exc,
+                (
+                    existing.get("worktree_receipt")
+                    if isinstance(existing, dict)
+                    else None
+                ),
+            )
+
         ensure_parameters = {
             "repo": inputs["repo"],
             "target_path": inputs["target_path"],
@@ -3338,6 +3398,7 @@ def acquire_work(
                 ],
                 "single_writer_scope": "overlapping-resource-lane",
             }
+            continuation_authorized = continuation_preimage is None
             writer_job = existing_writer_job
             writer_start: dict[str, Any] | None = None
             if writer_job is not None:
@@ -3346,21 +3407,30 @@ def acquire_work(
                     "job_receipt_sha256": writer_job.get("receipt_sha256"),
                 }
             elif writer_argv is not None:
-                _write_state(
-                    receipt_path,
-                    {
-                        **base_record,
-                        "state": "writer_starting",
-                        "decision": decision,
-                        "lease_receipt": acquired,
-                        **group_evidence,
-                        "worktree_receipt": output,
-                        **({"continuation_preimage": continuation_preimage} if continuation_preimage is not None else {}),
-                        "authority": authority,
-                        "writer_start": {"state": "starting"},
-                        "next_action": "start_scoped_writer",
-                    },
-                )
+                try:
+                    with _continuation_authorization_guard(continuation_preimage):
+                        _write_state(
+                            receipt_path,
+                            {
+                                **base_record,
+                                "state": "writer_starting",
+                                "decision": decision,
+                                "lease_receipt": acquired,
+                                **group_evidence,
+                                "worktree_receipt": output,
+                                **(
+                                    {"continuation_preimage": continuation_preimage}
+                                    if continuation_preimage is not None
+                                    else {}
+                                ),
+                                "authority": authority,
+                                "writer_start": {"state": "starting"},
+                                "next_action": "start_scoped_writer",
+                            },
+                        )
+                    continuation_authorized = True
+                except Exception as exc:
+                    return continuation_conflict(exc, output)
                 try:
                     writer_result = start_writer_fn(
                         writer_argv,
@@ -3475,28 +3545,38 @@ def acquire_work(
                     "state": "started",
                     "job_receipt_sha256": writer_job["receipt_sha256"],
                 }
-            record = _write_state(
-                receipt_path,
-                {
-                    **base_record,
-                    "state": "ready",
-                    "decision": decision,
-                    "lease_receipt": acquired,
-                    **group_evidence,
-                    "worktree_receipt": output,
-                    **({"continuation_preimage": continuation_preimage} if continuation_preimage is not None else {}),
-                    "authority": authority,
-                    **({"writer_job": writer_job} if writer_job is not None else {}),
-                    **({"writer_start": writer_start} if writer_start is not None else {}),
-                    "next_action": (
-                        "writer_started"
-                        if writer_job is not None
-                        else "start_scoped_writer"
-                        if inputs["scoped_writer"]
-                        else "controller_execute"
-                    ),
-                },
-            )
+            ready_payload = {
+                **base_record,
+                "state": "ready",
+                "decision": decision,
+                "lease_receipt": acquired,
+                **group_evidence,
+                "worktree_receipt": output,
+                **(
+                    {"continuation_preimage": continuation_preimage}
+                    if continuation_preimage is not None
+                    else {}
+                ),
+                "authority": authority,
+                **({"writer_job": writer_job} if writer_job is not None else {}),
+                **({"writer_start": writer_start} if writer_start is not None else {}),
+                "next_action": (
+                    "writer_started"
+                    if writer_job is not None
+                    else "start_scoped_writer"
+                    if inputs["scoped_writer"]
+                    else "controller_execute"
+                ),
+            }
+            try:
+                if continuation_authorized:
+                    record = _write_state(receipt_path, ready_payload)
+                else:
+                    with _continuation_authorization_guard(continuation_preimage):
+                        record = _write_state(receipt_path, ready_payload)
+                    continuation_authorized = True
+            except Exception as exc:
+                return continuation_conflict(exc, output)
             if audit_fn is not None:
                 audit_fn({"operation": "work-acquire", "lane_id": lane_id, "state": "ready", "decision": decision, "inputs_sha256": inputs_sha256, "worktree_receipt_sha256": output.get("durable_receipt_sha256")})
             return {**record, "durable_receipt_path": str(receipt_path), "replayed": existing is not None}
