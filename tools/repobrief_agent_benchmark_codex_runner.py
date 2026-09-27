@@ -233,6 +233,8 @@ STDERR_POLICY_VERSION = "codex-stderr-v1"
 MAX_TRANSCRIPT_BYTES = 16 * 1024 * 1024
 MAX_STDERR_BYTES = 256 * 1024
 MAX_PROVIDER_EXECUTABLE_BYTES = 512 * 1024 * 1024
+MAX_MCP_SOURCE_TREE_FILES = 4096
+MAX_MCP_SOURCE_TREE_BYTES = 64 * 1024 * 1024
 MAX_AUTH_BYTES = 64 * 1024
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_DISPATCH_AUTHORIZATION_BYTES = 16 * 1024 * 1024
@@ -3193,6 +3195,115 @@ def cleanup_staged_repoground_manifest(binding: Mapping[str, Any]) -> str | None
     return None
 
 
+def _repoground_source_tree_snapshot(
+    script: Path, manifest: Path
+) -> dict[str, Any] | None:
+    if script.name != "repoground-mcp-stdio.py":
+        return None
+    manifest_raw = _read_bound_regular_file(
+        manifest, label="RepoGround manifest", max_bytes=MAX_MANIFEST_BYTES
+    )
+    document = base._load_object_bytes(manifest_raw, label="RepoGround manifest")
+    generator = document.get("generator")
+    runtime = generator.get("runtime") if isinstance(generator, dict) else None
+    commit = runtime.get("git_commit") if isinstance(runtime, dict) else None
+    if (
+        not isinstance(commit, str)
+        or re.fullmatch(r"[0-9a-f]{40}", commit) is None
+        or runtime.get("git_dirty") is not False
+    ):
+        raise RunnerError("RepoGround manifest generator commit is invalid")
+    try:
+        source_root = script.resolve(strict=True).parent.parent
+    except OSError as exc:
+        raise RunnerError("RepoGround MCP source root is unavailable") from exc
+
+    def verify_source() -> None:
+        try:
+            git_root = Path(
+                base._run_checked(
+                    ["git", "rev-parse", "--show-toplevel"], cwd=source_root
+                )
+            ).resolve(strict=True)
+            head = base._run_checked(["git", "rev-parse", "HEAD"], cwd=source_root)
+            status = base._run_checked(
+                ["git", "status", "--porcelain", "--untracked-files=normal"],
+                cwd=source_root,
+            )
+        except (base.RunnerError, OSError) as exc:
+            raise RunnerError("RepoGround MCP source checkout is unavailable") from exc
+        if git_root != source_root:
+            raise RunnerError("RepoGround MCP source root is not the Git checkout root")
+        if head != commit:
+            raise RunnerError(
+                "RepoGround MCP source commit does not match the bundle generator commit"
+            )
+        if status:
+            raise RunnerError("RepoGround MCP source checkout is dirty")
+
+    verify_source()
+    try:
+        tracked = base._run_checked(
+            ["git", "ls-files", "-z", "--", "merger"], cwd=source_root
+        )
+    except base.RunnerError as exc:
+        raise RunnerError("RepoGround MCP source tree cannot be enumerated") from exc
+    relatives = [Path(item) for item in tracked.split("\0") if item]
+    required = Path("merger/repoground/cli/mcp_stdio.py")
+    if (
+        not relatives
+        or len(relatives) > MAX_MCP_SOURCE_TREE_FILES
+        or required not in relatives
+    ):
+        raise RunnerError("RepoGround MCP source tree is incomplete")
+
+    entries: list[dict[str, Any]] = []
+    total_bytes = 0
+    for relative in relatives:
+        if (
+            relative.is_absolute()
+            or not relative.parts
+            or relative.parts[0] != "merger"
+            or any(part in {"", ".", ".."} for part in relative.parts)
+        ):
+            raise RunnerError("RepoGround MCP source tree path is unsafe")
+        source = source_root / relative
+        try:
+            metadata = source.lstat()
+        except OSError as exc:
+            raise RunnerError("RepoGround MCP source tree file is unavailable") from exc
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & 0o022
+        ):
+            raise RunnerError("RepoGround MCP source tree file is unsafe")
+        raw = _read_bound_regular_file(
+            source,
+            label=f"RepoGround MCP source tree file {relative}",
+            max_bytes=MAX_PROVIDER_EXECUTABLE_BYTES,
+        )
+        total_bytes += len(raw)
+        if total_bytes > MAX_MCP_SOURCE_TREE_BYTES:
+            raise RunnerError("RepoGround MCP source tree exceeds its byte budget")
+        entries.append(
+            {
+                "relative": relative,
+                "raw": raw,
+                "sha256": sha_bytes(raw),
+            }
+        )
+    verify_source()
+    return {
+        "root": source_root,
+        "commit": commit,
+        "entries": entries,
+        "file_count": len(entries),
+        "total_bytes": total_bytes,
+    }
+
+
 def _bind_mcp_upstream(
     upstream: Sequence[str],
     manifest: Path,
@@ -3233,14 +3344,36 @@ def _bind_mcp_upstream(
         script_binding = _bind_mcp_file(script, label="MCP script", executable=False)
         argv[1] = str(script)
         bindings.append(script_binding)
-    current = [_mcp_authorization_identity(binding) for binding in bindings]
-    if canonical(current) != canonical(expected):
-        raise RunnerError("MCP program does not match preflight-authorized file identities")
     if "--bundle-root" not in argv:
         raise RunnerError("MCP upstream must declare --bundle-root")
     index = argv.index("--bundle-root")
     if index + 1 >= len(argv) or argv.count("--bundle-root") != 1:
         raise RunnerError("MCP upstream bundle root is invalid")
+    current = [_mcp_authorization_identity(binding) for binding in bindings]
+    if canonical(current) != canonical(expected):
+        program_expected = expected[: len(current)]
+        manifest_expected = expected[len(current) :]
+        bundle_source = Path(argv[index + 1]).expanduser().resolve(strict=False)
+        if (
+            canonical(current) != canonical(program_expected)
+            or len(manifest_expected) != 1
+            or manifest_expected[0]["path"] != str(bundle_source)
+        ):
+            raise RunnerError("MCP program does not match preflight-authorized file identities")
+        staged_manifest = _mcp_authorization_identity(
+            _bind_mcp_file(
+                manifest,
+                label="staged MCP bundle manifest",
+                executable=False,
+            )
+        )
+        if (
+            staged_manifest["bytes"] != manifest_expected[0]["bytes"]
+            or staged_manifest["sha256"] != manifest_expected[0]["sha256"]
+        ):
+            raise RunnerError(
+                "MCP bundle manifest does not match preflight-authorized file identity"
+            )
     argv[index + 1] = str(manifest)
     return argv, bindings
 
@@ -3253,6 +3386,11 @@ def stage_mcp_upstream(
 ) -> dict[str, Any]:
     bound_argv, source_bindings = _bind_mcp_upstream(
         upstream, manifest, authorized_files
+    )
+    source_tree = (
+        _repoground_source_tree_snapshot(Path(source_bindings[1]["path"]), manifest)
+        if len(source_bindings) > 1
+        else None
     )
     stage_root: Path | None = None
     stage_fd: int | None = None
@@ -3294,10 +3432,40 @@ def stage_mcp_upstream(
                 raise RunnerError(f"staged {label} SHA mismatch")
             staged_bindings.append(staged)
             staged_argv[index] = str(staged_path)
+
+        source_tree_bindings: list[dict[str, Any]] = []
+        if source_tree is not None:
+            for entry in source_tree["entries"]:
+                relative = entry["relative"]
+                raw = entry["raw"]
+                _write_private_relative_file(stage_fd, relative, raw, mode=0o600)
+                staged_path = stage_root / relative
+                staged = _bind_mcp_file(
+                    staged_path,
+                    label=f"staged RepoGround MCP source {relative}",
+                    executable=False,
+                )
+                if staged["sha256"] != entry["sha256"]:
+                    raise RunnerError("staged RepoGround MCP source SHA mismatch")
+                source_tree_bindings.append(staged)
+            if Path(staged_argv[0]).name.startswith("python"):
+                staged_argv[1:1] = ["-I", "-B"]
+
         _directory_fd_matches(stage_root, stage_fd)
         return {
             "argv": staged_argv,
             "bindings": staged_bindings,
+            "source_tree": (
+                None
+                if source_tree is None
+                else {
+                    "root": str(source_tree["root"]),
+                    "commit": source_tree["commit"],
+                    "file_count": source_tree["file_count"],
+                    "total_bytes": source_tree["total_bytes"],
+                }
+            ),
+            "source_tree_bindings": source_tree_bindings,
             "runtime_dir": stage_root,
             "runtime_identity": _private_directory_identity(os.fstat(stage_fd)),
         }
@@ -3315,10 +3483,14 @@ def stage_mcp_upstream(
         if stage_fd is not None:
             os.close(stage_fd)
 
-
 def _revalidate_staged_mcp_upstream(binding: Mapping[str, Any]) -> None:
     bindings = binding.get("bindings")
-    if not isinstance(bindings, list) or not bindings:
+    source_tree_bindings = binding.get("source_tree_bindings")
+    if (
+        not isinstance(bindings, list)
+        or not bindings
+        or not isinstance(source_tree_bindings, list)
+    ):
         raise RunnerError("staged MCP upstream binding is invalid")
     for index, file_binding in enumerate(bindings):
         label = "MCP executable" if index == 0 else "MCP script"
@@ -3332,20 +3504,35 @@ def _revalidate_staged_mcp_upstream(binding: Mapping[str, Any]) -> None:
             or current["sha256"] != file_binding["sha256"]
         ):
             raise RunnerError(f"staged {label} changed during execution")
-    _revalidate_private_stage_tree(binding, bindings)
+    for file_binding in source_tree_bindings:
+        current = _bind_mcp_file(
+            Path(file_binding["path"]),
+            label="staged RepoGround MCP source",
+            executable=False,
+        )
+        if (
+            current["identity"] != file_binding["identity"]
+            or current["sha256"] != file_binding["sha256"]
+        ):
+            raise RunnerError("staged RepoGround MCP source changed during execution")
+    _revalidate_private_stage_tree(
+        binding, [*bindings, *source_tree_bindings]
+    )
 
 
 def cleanup_staged_mcp_upstream(binding: Mapping[str, Any]) -> str | None:
     try:
         _revalidate_staged_mcp_upstream(binding)
         runtime_dir = Path(binding["runtime_dir"])
-        for file_binding in binding["bindings"]:
+        for file_binding in [
+            *binding["bindings"],
+            *binding["source_tree_bindings"],
+        ]:
             Path(file_binding["path"]).relative_to(runtime_dir)
         shutil.rmtree(runtime_dir)
     except BaseException as exc:
         return type(exc).__name__
     return None
-
 
 def _pin_treatment_arguments(message: dict[str, Any], manifest: Path) -> None:
     params = message.get("params")
