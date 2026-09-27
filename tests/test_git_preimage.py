@@ -63,5 +63,134 @@ class GitPreimageOperationStateTests(unittest.TestCase):
             self.assertNotIn("STATE:BISECT_START", settled["operation_refs"])
 
 
+    def test_conflicted_notes_merge_in_linked_worktree_is_bound_into_branch_preimage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            worktree = root / "linked"
+            self._init_repo(repo)
+            original_head = self._run(repo, "rev-parse", "HEAD").stdout.strip()
+            self._run(
+                repo,
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked",
+                str(worktree),
+                "HEAD",
+            )
+            self._run(
+                worktree,
+                "notes",
+                "--ref=left",
+                "add",
+                "-m",
+                "left",
+                original_head.decode("ascii"),
+            )
+            self._run(
+                worktree,
+                "notes",
+                "--ref=right",
+                "add",
+                "-m",
+                "right",
+                original_head.decode("ascii"),
+            )
+            merge = self._run(
+                worktree,
+                "notes",
+                "--ref=left",
+                "merge",
+                "-s",
+                "manual",
+                "refs/notes/right",
+                check=False,
+            )
+            self.assertNotEqual(merge.returncode, 0)
+            self.assertEqual(b"", self._run(worktree, "status", "--porcelain").stdout)
+            self.assertEqual(
+                original_head,
+                self._run(worktree, "rev-parse", "HEAD").stdout.strip(),
+            )
+
+            preimage = git_preimage.capture_branch_preimage(
+                worktree,
+                self._probe,
+            )
+            self.assertEqual(
+                "present",
+                preimage["operation_refs"].get("STATE:NOTES_MERGE_REF"),
+            )
+            self.assertEqual(
+                "present",
+                preimage["operation_refs"].get("STATE:NOTES_MERGE_PARTIAL"),
+            )
+            self.assertEqual(
+                "present",
+                preimage["operation_refs"].get("STATE:NOTES_MERGE_WORKTREE"),
+            )
+
+            self._run(worktree, "notes", "--ref=left", "merge", "--abort")
+            settled = git_preimage.capture_branch_preimage(
+                worktree,
+                self._probe,
+            )
+            self.assertNotIn(
+                "STATE:NOTES_MERGE_REF",
+                settled["operation_refs"],
+            )
+            self.assertNotIn(
+                "STATE:NOTES_MERGE_PARTIAL",
+                settled["operation_refs"],
+            )
+            self.assertNotIn(
+                "STATE:NOTES_MERGE_WORKTREE",
+                settled["operation_refs"],
+            )
+
+
+    def test_core_worktree_redirection_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            worktree = root / "linked"
+            redirected = root / "redirected"
+            redirected.mkdir()
+            self._init_repo(repo)
+            self._run(
+                repo,
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked",
+                str(worktree),
+                "HEAD",
+            )
+            self._run(repo, "config", "extensions.worktreeConfig", "true")
+            self._run(
+                worktree,
+                "config",
+                "--worktree",
+                "core.worktree",
+                str(redirected),
+            )
+            self.assertEqual(
+                str(redirected).encode("utf-8"),
+                self._run(worktree, "rev-parse", "--show-toplevel").stdout.strip(),
+            )
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "effective worktree root does not match",
+            ):
+                git_preimage.capture_branch_preimage(
+                    worktree,
+                    self._probe,
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

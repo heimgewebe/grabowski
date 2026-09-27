@@ -544,6 +544,9 @@ def _git_operation_state_markers(
             ("BISECT_LOG", "regular"),
             ("BISECT_TERMS", "regular"),
             ("BISECT_NAMES", "regular"),
+            ("NOTES_MERGE_REF", "regular"),
+            ("NOTES_MERGE_PARTIAL", "regular"),
+            ("NOTES_MERGE_WORKTREE", "directory"),
         ):
             _deadline_guard(deadline_monotonic, "Git operation-state observation")
             try:
@@ -566,6 +569,27 @@ def _git_operation_state_markers(
                 raise RuntimeError(
                     f"Git operation-state marker has unexpected type: {name}"
                 )
+            if name == "NOTES_MERGE_WORKTREE":
+                child = os.open(name, directory_flags, dir_fd=descriptor)
+                try:
+                    opened = os.fstat(child)
+                    if not _same_open_file(observed, opened):
+                        raise RuntimeError(
+                            "Git notes-merge worktree changed during observation"
+                        )
+                    with os.scandir(child) as entries:
+                        has_entries = next(entries, None) is not None
+                    current = os.stat(
+                        name, dir_fd=descriptor, follow_symlinks=False
+                    )
+                    if not _same_open_file(observed, current):
+                        raise RuntimeError(
+                            "Git notes-merge worktree changed during observation"
+                        )
+                finally:
+                    os.close(child)
+                if not has_entries:
+                    continue
             markers[f"STATE:{name}"] = "present"
         after = os.fstat(descriptor)
         if not _same_open_file(before, after):
@@ -575,6 +599,39 @@ def _git_operation_state_markers(
         return markers
     finally:
         os.close(descriptor)
+
+
+def _require_effective_git_toplevel(
+    repo: Path,
+    probe: Callable[[Path, list[str]], subprocess.CompletedProcess[bytes]],
+    *,
+    deadline_monotonic: float | None = None,
+) -> str:
+    """Require Git command semantics to remain bound to the managed checkout root."""
+
+    _deadline_guard(deadline_monotonic, "Git effective worktree observation")
+    observed = probe(repo, ["rev-parse", "--show-toplevel"])
+    if observed.returncode != 0:
+        raise RuntimeError("Git effective worktree observation failed")
+    try:
+        payload = observed.stdout.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("Git effective worktree root is not valid UTF-8") from exc
+    root_text = payload.rstrip("\r\n")
+    if (
+        not root_text
+        or "\x00" in root_text
+        or "\n" in root_text
+        or "\r" in root_text
+        or not os.path.isabs(root_text)
+    ):
+        raise RuntimeError("Git effective worktree root is invalid")
+    effective = Path(os.path.abspath(os.path.normpath(root_text)))
+    if effective != repo:
+        raise RuntimeError(
+            "Git effective worktree root does not match the managed checkout"
+        )
+    return str(effective)
 
 
 def capture_branch_preimage(
@@ -598,6 +655,11 @@ def capture_branch_preimage(
     _deadline_guard(deadline_monotonic, "branch preimage capture")
     physical_before = physical_checkout.capture_physical_checkout_identity(requested_repo)
     repo = Path(physical_before["root"]["path"])
+    _require_effective_git_toplevel(
+        repo,
+        probe,
+        deadline_monotonic=deadline_monotonic,
+    )
     branch_probe = probe(repo, ["symbolic-ref", "--quiet", "--short", "HEAD"])
     branch: str | None = None
     if branch_probe.returncode == 0:
@@ -657,6 +719,11 @@ def capture_branch_preimage(
         elif ref_probe.returncode != 1:
             raise RuntimeError(f"Git operation-state observation failed: {name}")
 
+    _require_effective_git_toplevel(
+        repo,
+        probe,
+        deadline_monotonic=deadline_monotonic,
+    )
     try:
         physical_checkout.verify_physical_checkout_identity(physical_before)
     except physical_checkout.PhysicalCheckoutIdentityError as exc:
