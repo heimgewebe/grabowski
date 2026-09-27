@@ -673,7 +673,7 @@ def _converge_terminal_checkout_lifecycle(
     repo_value = inputs.get("repo")
     if not isinstance(repo_value, str) or not repo_value:
         raise RuntimeError("terminal Work Lane repository identity is missing")
-    top_level, _, worktree = checkouts._worktree_for_path(
+    top_level, common_dir, worktree = checkouts._worktree_for_path(
         Path(repo_value), Path(checkout_path)
     )
     if worktree.get("checkout_key") != checkout_key:
@@ -688,6 +688,20 @@ def _converge_terminal_checkout_lifecycle(
         if current_lifecycle.get("expected_head") != head:
             raise RuntimeError(
                 "terminal Work Lane archived lifecycle head drifted"
+            )
+        retention = checkouts._retention_records([checkout_key]).get(checkout_key)
+        if (
+            not isinstance(retention, dict)
+            or retention.get("checkout_key") != checkout_key
+            or retention.get("repo_common_dir") != str(common_dir)
+            or retention.get("repo_path") != str(top_level)
+            or retention.get("checkout_path") != checkout_path
+            or retention.get("owner_id") != owner_id
+            or retention.get("expected_head") != head
+            or retention.get("expected_branch") != expected_branch
+        ):
+            raise RuntimeError(
+                "terminal Work Lane archived lifecycle retention evidence drifted"
             )
         archive = checkouts._latest_archive_for_key(checkout_key)
         if (

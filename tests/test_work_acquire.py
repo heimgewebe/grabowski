@@ -2662,6 +2662,15 @@ class WorkAcquireTests(unittest.TestCase):
             "cleanup_plan_id": None,
             "recovery_refs": recovery_refs,
         }
+        retention = {
+            "checkout_key": checkout_key,
+            "repo_common_dir": str(self.repo / ".git"),
+            "repo_path": str(self.repo),
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "expected_head": SHA,
+            "expected_branch": "feat/authority-p0",
+        }
         with (
             patch.object(
                 work_acquire.checkouts,
@@ -2678,6 +2687,11 @@ class WorkAcquireTests(unittest.TestCase):
                 "_require_clean_linked",
                 return_value={"dirty": False},
             ),
+            patch.object(
+                work_acquire.checkouts,
+                "_retention_records",
+                return_value={checkout_key: retention},
+            ) as retention_records,
             patch.object(
                 work_acquire.checkouts,
                 "_latest_archive_for_key",
@@ -2709,9 +2723,126 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertTrue(result["active_capacity_released"])
         self.assertTrue(result["retention_preserved"])
         self.assertTrue(result["archive_preserved"])
+        retention_records.assert_called_once_with([checkout_key])
         latest_archive.assert_called_once_with(checkout_key)
         verify_refs.assert_called_once_with(self.repo, recovery_refs)
         mark.assert_not_called()
+
+    def test_terminal_checkout_lifecycle_convergence_rejects_archived_retention_drift(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        inputs.pop("_scoped_writer_argv")
+        checkout_key = "7" * 64
+        lifecycle_source = {"kind": "work_lane", "id": "c" * 32}
+        lifecycle = {
+            "checkout_key": checkout_key,
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "expected_branch": "feat/authority-p0",
+            "source": lifecycle_source,
+        }
+        record = {
+            "inputs": inputs,
+            "worktree_receipt": {"lifecycle": lifecycle},
+        }
+        current_lifecycle = {
+            **lifecycle,
+            "expected_head": SHA,
+            "phase": "archived",
+        }
+        observed = {
+            "checkout_key": checkout_key,
+            "head": SHA,
+            "branch": "feat/authority-p0",
+        }
+        valid_retention = {
+            "checkout_key": checkout_key,
+            "repo_common_dir": str(self.repo / ".git"),
+            "repo_path": str(self.repo),
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "expected_head": SHA,
+            "expected_branch": "feat/authority-p0",
+        }
+        cases = {
+            "missing": {},
+            "owner_drift": {
+                checkout_key: {**valid_retention, "owner_id": "lane:" + "f" * 32}
+            },
+            "common_dir_drift": {
+                checkout_key: {
+                    **valid_retention,
+                    "repo_common_dir": str(self.root / "other.git"),
+                }
+            },
+            "repo_drift": {
+                checkout_key: {
+                    **valid_retention,
+                    "repo_path": str(self.root / "other-repo"),
+                }
+            },
+            "path_drift": {
+                checkout_key: {
+                    **valid_retention,
+                    "checkout_path": str(self.root / "different-worktree"),
+                }
+            },
+            "head_drift": {
+                checkout_key: {**valid_retention, "expected_head": "b" * 40}
+            },
+            "branch_drift": {
+                checkout_key: {**valid_retention, "expected_branch": "feat/other"}
+            },
+        }
+        for label, retention_rows in cases.items():
+            with (
+                patch.object(
+                    work_acquire.checkouts,
+                    "_lifecycle_bindings",
+                    return_value={checkout_key: current_lifecycle},
+                ),
+                patch.object(
+                    work_acquire.checkouts,
+                    "_worktree_for_path",
+                    return_value=(self.repo, self.repo / ".git", observed),
+                ),
+                patch.object(
+                    work_acquire.checkouts,
+                    "_require_clean_linked",
+                    return_value={"dirty": False},
+                ),
+                patch.object(
+                    work_acquire.checkouts,
+                    "_retention_records",
+                    return_value=retention_rows,
+                ),
+                patch.object(
+                    work_acquire.checkouts,
+                    "_latest_archive_for_key",
+                ) as latest_archive,
+                patch.object(
+                    work_acquire.checkouts,
+                    "_verify_recovery_refs",
+                ) as verify_refs,
+                patch.object(
+                    work_acquire.checkouts,
+                    "_mark_checkout_completed_retained",
+                ) as mark,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "retention evidence drifted"
+                ):
+                    work_acquire._converge_terminal_checkout_lifecycle(
+                        record,
+                        assessment={
+                            "phase": "terminal",
+                            "lease_release_ready": True,
+                            "terminal_head_sha": SHA,
+                        },
+                    )
+                latest_archive.assert_not_called()
+                verify_refs.assert_not_called()
+                mark.assert_not_called()
 
     def test_terminal_checkout_lifecycle_convergence_rejects_archived_archive_drift(self) -> None:
         params = self.parameters()
@@ -2758,6 +2889,15 @@ class WorkAcquireTests(unittest.TestCase):
                 }
             ],
         }
+        retention = {
+            "checkout_key": checkout_key,
+            "repo_common_dir": str(self.repo / ".git"),
+            "repo_path": str(self.repo),
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "expected_head": SHA,
+            "expected_branch": "feat/authority-p0",
+        }
         with (
             patch.object(
                 work_acquire.checkouts,
@@ -2773,6 +2913,11 @@ class WorkAcquireTests(unittest.TestCase):
                 work_acquire.checkouts,
                 "_require_clean_linked",
                 return_value={"dirty": False},
+            ),
+            patch.object(
+                work_acquire.checkouts,
+                "_retention_records",
+                return_value={checkout_key: retention},
             ),
             patch.object(
                 work_acquire.checkouts,
