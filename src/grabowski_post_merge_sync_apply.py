@@ -8,6 +8,7 @@ import secrets
 from typing import Any, Callable
 
 import grabowski_resources as resources
+import grabowski_physical_checkout as physical_checkout
 
 
 CommandRunner = Callable[[Path, list[str]], dict[str, Any]]
@@ -26,6 +27,10 @@ class PostMergeSyncApplyError(RuntimeError):
 
 
 class PostMergeSyncNonFastForward(PostMergeSyncApplyError):
+    pass
+
+
+class PostMergeSyncPhysicalIdentityDrift(PostMergeSyncApplyError):
     pass
 
 
@@ -55,6 +60,76 @@ def _run(
             f"git {' '.join(argv)} failed with {returncode}: {message}"
         )
     return result
+
+
+def _physical_node_resource_key(
+    identity: dict[str, Any],
+    *,
+    node_name: str,
+    resource_kind: str,
+) -> str:
+    node = identity.get(node_name)
+    if not isinstance(node, dict):
+        raise PostMergeSyncApplyError(
+            f"physical checkout {node_name} identity is missing"
+        )
+    device = node.get("device")
+    inode = node.get("inode")
+    if (
+        type(device) is not int
+        or device < 0
+        or type(inode) is not int
+        or inode < 0
+    ):
+        raise PostMergeSyncApplyError(
+            f"physical checkout {node_name} identity is invalid"
+        )
+    return f"component:{resource_kind}:{device}:{inode}"
+
+
+def _physical_checkout_resource_keys(identity: dict[str, Any]) -> tuple[str, str]:
+    git_dir = identity.get("git_dir")
+    common_dir = identity.get("common_dir")
+    if not isinstance(git_dir, dict) or not isinstance(common_dir, dict):
+        raise PostMergeSyncApplyError(
+            "physical Git/common directory identity is missing"
+        )
+    if (
+        git_dir.get("device") != common_dir.get("device")
+        or git_dir.get("inode") != common_dir.get("inode")
+    ):
+        raise PostMergeSyncApplyError(
+            "physical Git/common directory identity does not describe one node"
+        )
+    return (
+        _physical_node_resource_key(
+            identity,
+            node_name="root",
+            resource_kind="physical-checkout-root",
+        ),
+        _physical_node_resource_key(
+            identity,
+            node_name="common_dir",
+            resource_kind="physical-git-common-dir",
+        ),
+    )
+
+
+def _fd_bound_runner(
+    runner: CommandRunner,
+    bound: physical_checkout.BoundPhysicalCheckout,
+) -> CommandRunner:
+    def run(_repo: Path, argv: list[str]) -> dict[str, Any]:
+        return runner(
+            bound.effect_root,
+            [
+                f"--git-dir={bound.effect_git_dir}",
+                f"--work-tree={bound.effect_root}",
+                *argv,
+            ],
+        )
+
+    return run
 
 
 def _stdout(result: dict[str, Any]) -> str:
@@ -187,10 +262,15 @@ def _snapshot(
     target_branch: str,
     remote: str,
     sha_length: int,
+    identity_override: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     clean, status_sha256 = _status(repo, runner)
     return {
-        "identity": _checkout_identity(repo, runner),
+        "identity": (
+            _checkout_identity(repo, runner)
+            if identity_override is None
+            else identity_override
+        ),
         "branch": _current_branch(repo, runner),
         "head": _head(repo, runner),
         "clean": clean,
@@ -243,6 +323,7 @@ def apply(
     target_branch: str,
     expected_local_head: str,
     expected_remote_head: str,
+    expected_physical_identity_sha256: str,
     remote: str,
     remote_target: str,
     confirmation: str,
@@ -250,22 +331,63 @@ def apply(
     remote_head_reader: RemoteHeadReader,
     pinned_target_factory: PinnedTargetFactory,
 ) -> dict[str, Any]:
-    repo = repo.expanduser().resolve(strict=True)
     expected_local_head = expected_local_head.lower()
     expected_remote_head = expected_remote_head.lower()
+    expected_physical_identity_sha256 = expected_physical_identity_sha256.lower()
+    if re.fullmatch(r"[0-9a-f]{64}", expected_physical_identity_sha256) is None:
+        return _blocked(
+            "invalid_physical_checkout_identity",
+            physical_identity_verified=False,
+        )
+    try:
+        initial_physical = physical_checkout.capture_physical_checkout_identity(
+            repo.expanduser()
+        )
+    except (OSError, ValueError, physical_checkout.PhysicalCheckoutIdentityError) as exc:
+        return _blocked(
+            "physical_checkout_identity_unreadable",
+            physical_identity_verified=False,
+            error_class=type(exc).__name__,
+        )
+    if (
+        initial_physical.get("physical_identity_sha256")
+        != expected_physical_identity_sha256
+    ):
+        return _blocked(
+            "physical_checkout_identity_mismatch",
+            physical_identity_verified=False,
+            observed_physical_identity_sha256=initial_physical.get(
+                "physical_identity_sha256"
+            ),
+        )
+    repo = Path(str(initial_physical["root"]["path"]))
+    physical_identity_verified = True
 
     if target_branch not in PROTECTED_BRANCHES:
-        return _blocked("unsupported_target_branch", target_branch=target_branch)
+        return _blocked(
+            "unsupported_target_branch",
+            target_branch=target_branch,
+            physical_identity_verified=True,
+        )
     if confirmation != CONFIRMATION:
-        return _blocked("confirmation_mismatch")
+        return _blocked(
+            "confirmation_mismatch",
+            physical_identity_verified=True,
+        )
     if (
         SHA_RE.fullmatch(expected_local_head) is None
         or SHA_RE.fullmatch(expected_remote_head) is None
         or len(expected_local_head) != len(expected_remote_head)
     ):
-        return _blocked("invalid_bound_heads")
+        return _blocked(
+            "invalid_bound_heads",
+            physical_identity_verified=True,
+        )
     if REMOTE_RE.fullmatch(remote) is None or remote.startswith("-"):
-        return _blocked("invalid_remote")
+        return _blocked(
+            "invalid_remote",
+            physical_identity_verified=True,
+        )
 
     sha_length = len(expected_remote_head)
     expected_upstream = f"{remote}/{target_branch}"
@@ -284,13 +406,26 @@ def apply(
         return _blocked(
             "canonical_checkout_mismatch",
             before=initial,
+            physical_identity_verified=True,
         )
     if initial.get("clean") is not True:
-        return _blocked("dirty_checkout", before=initial)
+        return _blocked(
+            "dirty_checkout",
+            before=initial,
+            physical_identity_verified=True,
+        )
     if initial.get("head") not in {expected_local_head, expected_remote_head}:
-        return _blocked("local_head_mismatch", before=initial)
+        return _blocked(
+            "local_head_mismatch",
+            before=initial,
+            physical_identity_verified=True,
+        )
     if initial.get("upstream") != expected_upstream:
-        return _blocked("upstream_mismatch", before=initial)
+        return _blocked(
+            "upstream_mismatch",
+            before=initial,
+            physical_identity_verified=True,
+        )
 
     remote_head_verified = False
 
@@ -310,6 +445,7 @@ def apply(
         return _blocked(
             "remote_read_failed",
             before=initial,
+            physical_identity_verified=True,
             error_class=type(exc).__name__,
         )
     if remote_before != expected_remote_head:
@@ -317,6 +453,7 @@ def apply(
             "remote_head_mismatch",
             before=initial,
             actual_remote_head=remote_before,
+            physical_identity_verified=True,
         )
     remote_head_verified = True
 
@@ -327,6 +464,7 @@ def apply(
             "local_preimage_commit_unreadable",
             before=initial,
             remote_head_verified=remote_head_verified,
+            physical_identity_verified=True,
             error=str(exc),
         )
 
@@ -336,19 +474,158 @@ def apply(
                 "tracking_ref_mismatch_on_replay",
                 before=initial,
                 remote_head_verified=remote_head_verified,
+                physical_identity_verified=True,
+            )
+        try:
+            with physical_checkout.bind_physical_checkout(repo) as replay_bound:
+                rebound_physical = replay_bound.identity
+                if (
+                    rebound_physical.get("physical_identity_sha256")
+                    != expected_physical_identity_sha256
+                ):
+                    physical_identity_verified = False
+                    return _blocked(
+                        "physical_checkout_identity_drift_before_replay_success",
+                        before=initial,
+                        remote_head_verified=remote_head_verified,
+                        physical_identity_verified=False,
+                        observed_physical_identity_sha256=rebound_physical.get(
+                            "physical_identity_sha256"
+                        ),
+                    )
+                replay_runner = _fd_bound_runner(runner, replay_bound)
+                rebound = _snapshot(
+                    repo,
+                    replay_runner,
+                    target_branch=target_branch,
+                    remote=remote,
+                    sha_length=sha_length,
+                    identity_override=identity,
+                )
+                if not _final_exact(
+                    rebound,
+                    repo=repo,
+                    target_branch=target_branch,
+                    remote=remote,
+                    expected_remote_head=expected_remote_head,
+                ):
+                    return _blocked(
+                        "replay_readback_drift_before_success",
+                        before=initial,
+                        rebound=rebound,
+                        remote_head_verified=remote_head_verified,
+                        physical_identity_verified=True,
+                    )
+                try:
+                    replay_remote_final = read_remote_head("replay-final", False)
+                except Exception as exc:
+                    return _blocked(
+                        "remote_read_failed",
+                        before=initial,
+                        rebound=rebound,
+                        remote_head_verified=False,
+                        physical_identity_verified=False,
+                        error_class=type(exc).__name__,
+                    )
+                if replay_remote_final != expected_remote_head:
+                    return _blocked(
+                        "remote_head_mismatch",
+                        before=initial,
+                        rebound=rebound,
+                        actual_remote_head=replay_remote_final,
+                        remote_head_verified=False,
+                        physical_identity_verified=False,
+                    )
+                rebound = _snapshot(
+                    repo,
+                    replay_runner,
+                    target_branch=target_branch,
+                    remote=remote,
+                    sha_length=sha_length,
+                    identity_override=identity,
+                )
+                if not _final_exact(
+                    rebound,
+                    repo=repo,
+                    target_branch=target_branch,
+                    remote=remote,
+                    expected_remote_head=expected_remote_head,
+                ):
+                    return _blocked(
+                        "replay_readback_drift_before_success",
+                        before=initial,
+                        rebound=rebound,
+                        remote_head_verified=remote_head_verified,
+                        physical_identity_verified=True,
+                    )
+                replay_final_physical = (
+                    physical_checkout.capture_physical_checkout_identity(repo)
+                )
+                if (
+                    replay_final_physical.get("physical_identity_sha256")
+                    != expected_physical_identity_sha256
+                ):
+                    physical_identity_verified = False
+                    return _blocked(
+                        "physical_checkout_identity_drift_before_replay_success",
+                        before=initial,
+                        rebound=rebound,
+                        remote_head_verified=remote_head_verified,
+                        physical_identity_verified=False,
+                        observed_physical_identity_sha256=(
+                            replay_final_physical.get("physical_identity_sha256")
+                        ),
+                    )
+                rebound = _snapshot(
+                    repo,
+                    replay_runner,
+                    target_branch=target_branch,
+                    remote=remote,
+                    sha_length=sha_length,
+                    identity_override=identity,
+                )
+                if not _final_exact(
+                    rebound,
+                    repo=repo,
+                    target_branch=target_branch,
+                    remote=remote,
+                    expected_remote_head=expected_remote_head,
+                ):
+                    return _blocked(
+                        "replay_readback_drift_before_success",
+                        before=initial,
+                        rebound=rebound,
+                        remote_head_verified=remote_head_verified,
+                        physical_identity_verified=True,
+                    )
+        except (
+            OSError,
+            ValueError,
+            physical_checkout.PhysicalCheckoutIdentityError,
+        ) as exc:
+            physical_identity_verified = False
+            return _blocked(
+                "physical_checkout_identity_drift_before_replay_success",
+                before=initial,
+                remote_head_verified=remote_head_verified,
+                physical_identity_verified=False,
+                error_class=type(exc).__name__,
             )
         return {
             "receipt_status": "passed",
             "state": "already_synced",
             "effect_started": False,
             "preimage_verified": True,
-            "remote_head_verified": remote_head_verified,
+            "remote_head_verified": False,
+            "remote_head_bound_observed": True,
+            "remote_head_observation_stage": "replay-final",
+            "physical_identity_verified": physical_identity_verified,
             "idempotent": True,
             "retry_authorized": False,
             "old_head": expected_remote_head,
             "new_head": expected_remote_head,
             "remote_head": expected_remote_head,
-            "post_state": initial,
+            "post_state": rebound,
             "post_state_verified": True,
             "merge_commit_created": False,
         }
@@ -359,6 +636,7 @@ def apply(
         "remote": remote,
         "expected_local_head": expected_local_head,
         "expected_remote_head": expected_remote_head,
+        "expected_physical_identity_sha256": expected_physical_identity_sha256,
         "identity": identity,
         "upstream": expected_upstream,
         "tracking_head": initial.get("tracking_head"),
@@ -373,6 +651,7 @@ def apply(
             f"repo:{repo}",
             f"path:{repo}",
             f"path:{identity['git_common_dir']}",
+            *_physical_checkout_resource_keys(initial_physical),
         ]
     )
     try:
@@ -394,6 +673,7 @@ def apply(
             lease_owner_id=owner_id,
             resource_keys=resource_keys,
             remote_head_verified=remote_head_verified,
+            physical_identity_verified=physical_identity_verified,
             error_class=type(exc).__name__,
         )
 
@@ -408,6 +688,7 @@ def apply(
             "state": "lease_snapshot_invalid",
             "effect_started": False,
             "remote_head_verified": remote_head_verified,
+            "physical_identity_verified": physical_identity_verified,
             "retry_authorized": False,
             "preimage_sha256": preimage_sha256,
             "lease_owner_id": owner_id,
@@ -447,32 +728,71 @@ def apply(
     preimage_verified = False
     fast_forward_verified = False
     release_error: Exception | None = None
+    bound_checkout: physical_checkout.BoundPhysicalCheckout | None = None
+    effect_runner = runner
     try:
-        live = resources.inspect_resources(resource_keys)
-        if (
-            set(live) != set(resource_keys)
-            or any(
-                not isinstance(value, dict)
-                or value.get("owner_id") != owner_id
-                for value in live.values()
-            )
-        ):
+        try:
+            bound_checkout = physical_checkout.bind_physical_checkout(repo)
+            locked_physical = bound_checkout.identity
+            effect_runner = _fd_bound_runner(runner, bound_checkout)
+        except (
+            OSError,
+            ValueError,
+            physical_checkout.PhysicalCheckoutIdentityError,
+        ) as exc:
+            physical_identity_verified = False
             output = _blocked(
-                "lease_preimage_drift",
+                "physical_checkout_identity_drift_after_lease",
                 before=initial,
                 preimage_sha256=preimage_sha256,
                 resource_keys=resource_keys,
-                serialization_verified=False,
+                physical_identity_verified=False,
+                error_class=type(exc).__name__,
             )
+        else:
+            if (
+                locked_physical.get("physical_identity_sha256")
+                != expected_physical_identity_sha256
+            ):
+                physical_identity_verified = False
+                output = _blocked(
+                    "physical_checkout_identity_drift_after_lease",
+                    before=initial,
+                    preimage_sha256=preimage_sha256,
+                    resource_keys=resource_keys,
+                    physical_identity_verified=False,
+                    observed_physical_identity_sha256=locked_physical.get(
+                        "physical_identity_sha256"
+                    ),
+                )
+
+        if output is None:
+            live = resources.inspect_resources(resource_keys)
+            if (
+                set(live) != set(resource_keys)
+                or any(
+                    not isinstance(value, dict)
+                    or value.get("owner_id") != owner_id
+                    for value in live.values()
+                )
+            ):
+                output = _blocked(
+                    "lease_preimage_drift",
+                    before=initial,
+                    preimage_sha256=preimage_sha256,
+                    resource_keys=resource_keys,
+                    serialization_verified=False,
+                )
 
         if output is None:
             serialization_verified = True
             locked = _snapshot(
                 repo,
-                runner,
+                effect_runner,
                 target_branch=target_branch,
                 remote=remote,
                 sha_length=sha_length,
+                identity_override=identity,
             )
             if locked != initial or locked.get("head") != expected_local_head:
                 output = _blocked(
@@ -518,7 +838,7 @@ def apply(
                 effect_started = True
                 _run(
                     repo,
-                    runner,
+                    effect_runner,
                     [
                         "-c",
                         fetch_pin_config,
@@ -541,7 +861,7 @@ def apply(
                         expected_remote_head,
                     ],
                 )
-                _commit_head(repo, runner, expected_remote_head)
+                _commit_head(repo, effect_runner, expected_remote_head)
                 if read_remote_head("after_fetch", True) != expected_remote_head:
                     raise PostMergeSyncApplyError(
                         "remote branch advanced during exact-head materialization"
@@ -549,7 +869,7 @@ def apply(
 
                 ancestry = _run(
                     repo,
-                    runner,
+                    effect_runner,
                     [
                         "--no-replace-objects",
                         "merge-base",
@@ -568,14 +888,14 @@ def apply(
                 tracking_ref = f"refs/remotes/{remote}/{target_branch}"
                 tracking_before = _ref_head(
                     repo,
-                    runner,
+                    effect_runner,
                     tracking_ref,
                     sha_length=sha_length,
                 )
                 if tracking_before != expected_remote_head:
                     _run(
                         repo,
-                        runner,
+                        effect_runner,
                         [
                             "update-ref",
                             tracking_ref,
@@ -586,7 +906,7 @@ def apply(
                 if (
                     _ref_head(
                         repo,
-                        runner,
+                        effect_runner,
                         tracking_ref,
                         sha_length=sha_length,
                     )
@@ -598,10 +918,11 @@ def apply(
 
                 ready = _snapshot(
                     repo,
-                    runner,
+                    effect_runner,
                     target_branch=target_branch,
                     remote=remote,
                     sha_length=sha_length,
+                    identity_override=identity,
                 )
                 if (
                     ready.get("identity") != identity
@@ -619,7 +940,7 @@ def apply(
                 if (
                     _ref_head(
                         repo,
-                        runner,
+                        effect_runner,
                         branch_ref,
                         sha_length=sha_length,
                     )
@@ -632,7 +953,7 @@ def apply(
                 worktree_effect_started = True
                 _run(
                     repo,
-                    runner,
+                    effect_runner,
                     [
                         "-c",
                         "core.hooksPath=/dev/null",
@@ -647,11 +968,11 @@ def apply(
                         expected_remote_head,
                     ],
                 )
-                target_tree = _tree(repo, runner, expected_remote_head)
-                index_tree = _stdout(_run(repo, runner, ["write-tree"])).lower()
+                target_tree = _tree(repo, effect_runner, expected_remote_head)
+                index_tree = _stdout(_run(repo, effect_runner, ["write-tree"])).lower()
                 unstaged = _run(
                     repo,
-                    runner,
+                    effect_runner,
                     ["diff", "--quiet", "--"],
                     allowed_returncodes=(0, 1),
                 )
@@ -665,7 +986,7 @@ def apply(
                 if (
                     _ref_head(
                         repo,
-                        runner,
+                        effect_runner,
                         branch_ref,
                         sha_length=sha_length,
                     )
@@ -678,7 +999,7 @@ def apply(
                 branch_cas_started = True
                 _run(
                     repo,
-                    runner,
+                    effect_runner,
                     [
                         "update-ref",
                         branch_ref,
@@ -687,15 +1008,38 @@ def apply(
                     ],
                 )
 
+                try:
+                    final_physical = physical_checkout.capture_physical_checkout_identity(
+                        repo
+                    )
+                except (
+                    OSError,
+                    ValueError,
+                    physical_checkout.PhysicalCheckoutIdentityError,
+                ) as exc:
+                    physical_identity_verified = False
+                    raise PostMergeSyncPhysicalIdentityDrift(
+                        "physical checkout identity became unreadable during effect"
+                    ) from exc
+                if (
+                    final_physical.get("physical_identity_sha256")
+                    != expected_physical_identity_sha256
+                ):
+                    physical_identity_verified = False
+                    raise PostMergeSyncPhysicalIdentityDrift(
+                        "physical checkout identity changed during effect"
+                    )
+
+                remote_final = read_remote_head("final", True)
                 final = _snapshot(
                     repo,
-                    runner,
+                    effect_runner,
                     target_branch=target_branch,
                     remote=remote,
                     sha_length=sha_length,
+                    identity_override=identity,
                 )
-                remote_final = read_remote_head("final", True)
-                final_tree = _stdout(_run(repo, runner, ["write-tree"])).lower()
+                final_tree = _stdout(_run(repo, effect_runner, ["write-tree"])).lower()
                 if (
                     not _final_exact(
                         final,
@@ -710,6 +1054,51 @@ def apply(
                     raise PostMergeSyncApplyError(
                         "terminal readback does not match the exact final state"
                     )
+                try:
+                    terminal_physical = (
+                        physical_checkout.capture_physical_checkout_identity(repo)
+                    )
+                except (
+                    OSError,
+                    ValueError,
+                    physical_checkout.PhysicalCheckoutIdentityError,
+                ) as exc:
+                    physical_identity_verified = False
+                    raise PostMergeSyncPhysicalIdentityDrift(
+                        "physical checkout identity became unreadable after terminal readback"
+                    ) from exc
+                if (
+                    terminal_physical.get("physical_identity_sha256")
+                    != expected_physical_identity_sha256
+                ):
+                    physical_identity_verified = False
+                    raise PostMergeSyncPhysicalIdentityDrift(
+                        "physical checkout identity changed after terminal readback"
+                    )
+                final = _snapshot(
+                    repo,
+                    effect_runner,
+                    target_branch=target_branch,
+                    remote=remote,
+                    sha_length=sha_length,
+                    identity_override=identity,
+                )
+                final_tree = _stdout(
+                    _run(repo, effect_runner, ["write-tree"])
+                ).lower()
+                if (
+                    not _final_exact(
+                        final,
+                        repo=repo,
+                        target_branch=target_branch,
+                        remote=remote,
+                        expected_remote_head=expected_remote_head,
+                    )
+                    or final_tree != target_tree
+                ):
+                    raise PostMergeSyncApplyError(
+                        "terminal local recheck does not match the exact final state"
+                    )
                 output = {
                     "receipt_status": "passed",
                     "state": "synced",
@@ -718,6 +1107,10 @@ def apply(
                     "branch_cas_started": True,
                     "serialization_verified": serialization_verified,
                     "fast_forward_verified": fast_forward_verified,
+                    "physical_identity_verified": physical_identity_verified,
+                    "remote_head_verified": False,
+                    "remote_head_bound_observed": True,
+                    "remote_head_observation_stage": "final",
                     "retry_authorized": False,
                     "preimage_sha256": preimage_sha256,
                     "resource_keys": resource_keys,
@@ -736,10 +1129,11 @@ def apply(
                 try:
                     readback = _snapshot(
                         repo,
-                        runner,
+                        effect_runner,
                         target_branch=target_branch,
                         remote=remote,
                         sha_length=sha_length,
+                        identity_override=identity,
                     )
                 except Exception as read_exc:
                     readback = {"readback_error_type": type(read_exc).__name__}
@@ -755,7 +1149,11 @@ def apply(
                 )
                 remote_readback: str | None = None
                 remote_readback_error_type: str | None = None
-                if local_final_exact:
+                recovery_physical_drift = False
+                if (
+                    local_final_exact
+                    and not isinstance(exc, PostMergeSyncPhysicalIdentityDrift)
+                ):
                     try:
                         remote_readback = read_remote_head(
                             "error_readback",
@@ -763,9 +1161,73 @@ def apply(
                         )
                     except Exception as remote_exc:
                         remote_readback_error_type = type(remote_exc).__name__
+                    try:
+                        readback = _snapshot(
+                            repo,
+                            effect_runner,
+                            target_branch=target_branch,
+                            remote=remote,
+                            sha_length=sha_length,
+                            identity_override=identity,
+                        )
+                    except Exception as read_exc:
+                        readback = {
+                            "readback_error_type": type(read_exc).__name__
+                        }
+                        local_final_exact = False
+                    else:
+                        local_final_exact = _final_exact(
+                            readback,
+                            repo=repo,
+                            target_branch=target_branch,
+                            remote=remote,
+                            expected_remote_head=expected_remote_head,
+                        )
+                    try:
+                        recovery_physical = (
+                            physical_checkout.capture_physical_checkout_identity(repo)
+                        )
+                    except (
+                        OSError,
+                        ValueError,
+                        physical_checkout.PhysicalCheckoutIdentityError,
+                    ):
+                        physical_identity_verified = False
+                        recovery_physical_drift = True
+                    else:
+                        if (
+                            recovery_physical.get("physical_identity_sha256")
+                            != expected_physical_identity_sha256
+                        ):
+                            physical_identity_verified = False
+                            recovery_physical_drift = True
+                    if not recovery_physical_drift:
+                        try:
+                            readback = _snapshot(
+                                repo,
+                                effect_runner,
+                                target_branch=target_branch,
+                                remote=remote,
+                                sha_length=sha_length,
+                                identity_override=identity,
+                            )
+                        except Exception as read_exc:
+                            readback = {
+                                "readback_error_type": type(read_exc).__name__
+                            }
+                            local_final_exact = False
+                        else:
+                            local_final_exact = _final_exact(
+                                readback,
+                                repo=repo,
+                                target_branch=target_branch,
+                                remote=remote,
+                                expected_remote_head=expected_remote_head,
+                            )
                 remote_final_exact = (
                     local_final_exact
                     and remote_readback == expected_remote_head
+                    and not recovery_physical_drift
                 )
                 old_exact = bool(
                     isinstance(readback, dict)
@@ -780,6 +1242,13 @@ def apply(
                 )
                 local_post_verified = bool(local_final_exact)
                 if (
+                    isinstance(exc, PostMergeSyncPhysicalIdentityDrift)
+                    or recovery_physical_drift
+                ):
+                    state = "physical_checkout_identity_drift_final"
+                    receipt_status = "failed"
+                    post_verified = False
+                elif (
                     isinstance(exc, PostMergeSyncNonFastForward)
                     and not worktree_effect_started
                     and not branch_cas_started
@@ -811,11 +1280,27 @@ def apply(
                 output = {
                     "receipt_status": receipt_status,
                     "state": state,
+                    "remote_head_verified": (
+                        False
+                        if state == "effect_confirmed_after_error"
+                        else remote_head_verified
+                    ),
+                    "remote_head_bound_observed": (
+                        True
+                        if state == "effect_confirmed_after_error"
+                        else remote_head_verified
+                    ),
+                    "remote_head_observation_stage": (
+                        "error_readback"
+                        if state == "effect_confirmed_after_error"
+                        else None
+                    ),
                     "effect_started": effect_started,
                     "worktree_effect_started": worktree_effect_started,
                     "branch_cas_started": branch_cas_started,
                     "serialization_verified": serialization_verified,
                     "fast_forward_verified": fast_forward_verified,
+                    "physical_identity_verified": physical_identity_verified,
                     "retry_authorized": False,
                     "preimage_sha256": preimage_sha256,
                     "resource_keys": resource_keys,
@@ -830,25 +1315,31 @@ def apply(
                         "outcome_unknown",
                         "effect_confirmed_remote_drift",
                         "effect_confirmed_remote_unreadable",
+                        "physical_checkout_identity_drift_final",
                     },
                     "next_action": (
-                        "authoritative local and remote readback before any new intent"
-                        if state in {
-                            "outcome_unknown",
-                            "effect_confirmed_remote_drift",
-                            "effect_confirmed_remote_unreadable",
-                        }
-                        else "form a fresh apply intent from current authoritative state"
+                        "authoritative physical, local and remote readback before any new intent"
+                        if state == "physical_checkout_identity_drift_final"
+                        else (
+                            "authoritative local and remote readback before any new intent"
+                            if state in {
+                                "outcome_unknown",
+                                "effect_confirmed_remote_drift",
+                                "effect_confirmed_remote_unreadable",
+                            }
+                            else "form a fresh apply intent from current authoritative state"
+                        )
                     ),
                 }
     except Exception as exc:
         try:
             readback = _snapshot(
                 repo,
-                runner,
+                effect_runner,
                 target_branch=target_branch,
                 remote=remote,
                 sha_length=sha_length,
+                identity_override=identity if bound_checkout is not None else None,
             )
         except Exception as read_exc:
             readback = {"readback_error_type": type(read_exc).__name__}
@@ -860,6 +1351,7 @@ def apply(
             "branch_cas_started": branch_cas_started,
             "serialization_verified": serialization_verified,
             "fast_forward_verified": fast_forward_verified,
+            "physical_identity_verified": physical_identity_verified,
             "retry_authorized": False,
             "readback_required": True,
             "preimage_sha256": preimage_sha256,
@@ -874,6 +1366,49 @@ def apply(
             ),
         }
     finally:
+        if bound_checkout is not None:
+            try:
+                bound_checkout.close()
+            except physical_checkout.PhysicalCheckoutIdentityError:
+                close_next_action = (
+                    "authoritative physical, local and remote readback before any new intent"
+                )
+                physical_identity_verified = False
+                if output is None:
+                    output = {
+                        "receipt_status": "failed",
+                        "state": "bound_checkout_release_failed",
+                        "effect_started": effect_started,
+                        "worktree_effect_started": worktree_effect_started,
+                        "branch_cas_started": branch_cas_started,
+                        "serialization_verified": serialization_verified,
+                        "fast_forward_verified": fast_forward_verified,
+                        "physical_identity_verified": False,
+                        "post_state_verified": False,
+                        "bound_checkout_release_failed": True,
+                        "retry_authorized": False,
+                        "readback_required": True,
+                        "preimage_sha256": preimage_sha256,
+                        "resource_keys": resource_keys,
+                        "next_action": close_next_action,
+                    }
+                else:
+                    prior_next_action = output.get("next_action")
+                    output["bound_checkout_release_failed"] = True
+                    output["physical_identity_verified"] = False
+                    output["post_state_verified"] = False
+                    output["retry_authorized"] = False
+                    output["readback_required"] = True
+                    if output.get("receipt_status") == "passed":
+                        output["receipt_status"] = "failed"
+                        output["state"] = "bound_checkout_release_failed"
+                    if (
+                        isinstance(prior_next_action, str)
+                        and prior_next_action.strip()
+                        and close_next_action not in prior_next_action
+                    ):
+                        output["effect_next_action"] = prior_next_action
+                    output["next_action"] = close_next_action
         try:
             released = resources.release_resources(
                 owner_id,
@@ -898,13 +1433,16 @@ def apply(
             "branch_cas_started": branch_cas_started,
             "serialization_verified": serialization_verified,
             "fast_forward_verified": fast_forward_verified,
+            "physical_identity_verified": physical_identity_verified,
             "retry_authorized": False,
             "readback_required": True,
             "preimage_sha256": preimage_sha256,
             "resource_keys": resource_keys,
         }
     output.setdefault("remote_head_verified", remote_head_verified)
+    output.setdefault("remote_head_bound_observed", remote_head_verified)
     output.setdefault("preimage_verified", preimage_verified)
+    output.setdefault("physical_identity_verified", physical_identity_verified)
     output.setdefault("lease_owner_id", owner_id)
     if release_error is not None:
         cleanup_next_action = (

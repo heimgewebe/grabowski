@@ -344,6 +344,143 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
         self.assertEqual(attempt["review_route_id"], "claude-opus-5-high")
         self.assertEqual(attempt["review_provider_family"], "anthropic")
 
+    def test_historical_review_role_path_rotation_accepts_identical_immutable_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jobs = root / "jobs"
+            jobs.mkdir()
+            directory = make_job(
+                jobs,
+                suffix="a00000000050",
+                slot="independent-reviewer",
+                terminal_status="succeeded",
+                review_result=None,
+                review_role=True,
+            )
+            metadata = json.loads(
+                (directory / "metadata.json").read_text(encoding="utf-8")
+            )
+            provenance = dict(
+                metadata["scope"]["decision_review_provenance"]
+            )
+            release_root = root / "releases"
+            historical_module = (
+                release_root
+                / (
+                    "0123456789ab-srcset0123456789ab-lock0123456789ab-"
+                    "contract0123456789ab"
+                )
+                / ".venv"
+                / "lib"
+                / "python3.10"
+                / "site-packages"
+                / f"{reviews.REVIEW_ROLE_MODULE}.py"
+            )
+            historical_module.parent.mkdir(parents=True)
+            current_module = Path(reviews.__file__).with_name(
+                f"{reviews.REVIEW_ROLE_MODULE}.py"
+            )
+            historical_module.write_bytes(current_module.read_bytes())
+            provenance["runner_module_path"] = str(historical_module)
+            material = {
+                key: value
+                for key, value in provenance.items()
+                if key != "provenance_sha256"
+            }
+            provenance["provenance_sha256"] = reviews.sha256_json(material)
+
+            with mock.patch.object(
+                reviews, "REVIEW_ROLE_RELEASE_ROOT", release_root
+            ):
+                normalized = reviews._normalize_review_role_provenance(
+                    provenance,
+                    reviews.normalize_binding(binding("independent-reviewer")),
+                    cwd="/tmp/review",
+                )
+
+            self.assertEqual(normalized, provenance)
+
+    def test_historical_review_role_path_rotation_rejects_untrusted_or_changed_module(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jobs = root / "jobs"
+            jobs.mkdir()
+            directory = make_job(
+                jobs,
+                suffix="a00000000051",
+                slot="independent-reviewer",
+                terminal_status="succeeded",
+                review_result=None,
+                review_role=True,
+            )
+            metadata = json.loads(
+                (directory / "metadata.json").read_text(encoding="utf-8")
+            )
+            original = dict(
+                metadata["scope"]["decision_review_provenance"]
+            )
+            release_root = root / "releases"
+            release_id = (
+                "0123456789ab-srcset0123456789ab-lock0123456789ab-"
+                "contract0123456789ab"
+            )
+            historical_module = (
+                release_root
+                / release_id
+                / ".venv"
+                / "lib"
+                / "python3.10"
+                / "site-packages"
+                / f"{reviews.REVIEW_ROLE_MODULE}.py"
+            )
+            historical_module.parent.mkdir(parents=True)
+            current_module = Path(reviews.__file__).with_name(
+                f"{reviews.REVIEW_ROLE_MODULE}.py"
+            )
+            historical_module.write_bytes(current_module.read_bytes())
+
+            def rotated(path: Path) -> dict:
+                provenance = dict(original)
+                provenance["runner_module_path"] = str(path)
+                material = {
+                    key: value
+                    for key, value in provenance.items()
+                    if key != "provenance_sha256"
+                }
+                provenance["provenance_sha256"] = reviews.sha256_json(material)
+                return provenance
+
+            outside = root / "outside" / f"{reviews.REVIEW_ROLE_MODULE}.py"
+            outside.parent.mkdir()
+            outside.write_bytes(current_module.read_bytes())
+            historical_module.write_bytes(b"changed-review-role-module")
+            loop_a = release_root / "loop-a"
+            loop_b = release_root / "loop-b"
+            loop_a.symlink_to(loop_b)
+            loop_b.symlink_to(loop_a)
+
+            with mock.patch.object(
+                reviews, "REVIEW_ROLE_RELEASE_ROOT", release_root
+            ):
+                for provenance in (
+                    rotated(Path("~missing-user/grabowski_agent_role.py")),
+                    rotated(outside),
+                    rotated(historical_module),
+                    rotated(loop_a),
+                ):
+                    with self.subTest(path=provenance["runner_module_path"]):
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            "decision review provenance binding mismatch",
+                        ):
+                            reviews._normalize_review_role_provenance(
+                                provenance,
+                                reviews.normalize_binding(
+                                    binding("independent-reviewer")
+                                ),
+                                cwd="/tmp/review",
+                            )
+
     def test_reviewer_provenance_requires_server_python_and_isolated_module(self) -> None:
         normalized = reviews.normalize_binding(binding("independent-reviewer"))
         receipt = "/tmp/review/review-role-receipt.json"

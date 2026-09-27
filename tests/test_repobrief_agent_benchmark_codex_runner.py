@@ -492,6 +492,8 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "AZURE_OPENAI_API_KEY": "must-not-leak",
                 "ANTHROPIC_API_KEY": "must-not-leak",
                 "CODEX_ACCESS_TOKEN": "must-not-leak",
+                "BASH_ENV": "/tmp/must-not-load",
+                "ENV": "/tmp/must-not-load",
             },
             clear=True,
         ):
@@ -501,6 +503,8 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertNotIn("AZURE_OPENAI_API_KEY", environment)
         self.assertNotIn("ANTHROPIC_API_KEY", environment)
         self.assertNotIn("CODEX_ACCESS_TOKEN", environment)
+        self.assertNotIn("BASH_ENV", environment)
+        self.assertNotIn("ENV", environment)
         self.assertEqual(environment["PATH"], "/usr/bin:/bin")
 
     def test_direct_runner_rejects_unbootstrapped_start(self) -> None:
@@ -800,6 +804,24 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertEqual(runner.command_kind("rg --regexp=example src"), "grep")
         self.assertEqual(runner.command_kind("cat src/example.py"), "read_file")
         self.assertEqual(runner.command_kind("sed -n '1,2p' src/example.py"), "read_file")
+        self.assertEqual(
+            runner.command_kind(
+                "/bin/bash -c \"rg -n 'finaliz|Finaliz' "
+                "--glob '*.py' --glob '*.md'\""
+            ),
+            "grep",
+        )
+        self.assertEqual(
+            runner.command_kind(
+                "/bin/bash -c \"sed -n '62,177p' "
+                "src/grabowski_job_finalizer.py\""
+            ),
+            "read_file",
+        )
+        self.assertEqual(
+            runner.command_kind("/bin/bash -c 'cat src/example.py'"),
+            "read_file",
+        )
         for command in (
             "ls",
             "git status",
@@ -822,6 +844,17 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             "/usr/bin/cat src/example.py",
             "sh -lc 'cat src/example.py'",
             "bash -lc 'cat src/example.py'",
+            "/bin/sh -lc 'cat src/example.py'",
+            "/usr/bin/bash -lc 'cat src/example.py'",
+            "/bin/bash -lc 'cat src/example.py'",
+            "/bin/bash -c 'cat src/example.py' extra",
+            "/bin/bash -c 'cat src/example.py | head'",
+            "/bin/bash -c 'cat src/example.py && cat src/example.py'",
+            "/bin/bash -c 'cat src/example.py > output'",
+            "/bin/bash -c 'cat $HOME/file'",
+            "/bin/bash -c 'python -c \"print(1)\"'",
+            "/bin/bash -c \"/bin/bash -c 'cat src/example.py'\"",
+            "/bin/bash -c ''",
             "rg needle src\ncat secret",
             "cat src/example.py\r\nrg needle src",
             "rg needle src |& id",
@@ -838,6 +871,25 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             with self.subTest(command=command):
                 with self.assertRaises(runner.RunnerError):
                     runner.command_kind(command)
+
+    def test_treatment_prompt_requires_successful_repoground_use(self) -> None:
+        baseline = runner.prompt_for(request())
+        treatment = runner.prompt_for(request(condition="treatment"))
+
+        requirement = (
+            "must successfully use at least one of these RepoGround MCP tools "
+            "before answering"
+        )
+        self.assertNotIn(requirement, baseline)
+        self.assertIn(requirement, treatment)
+        self.assertNotIn("may additionally use only these RepoGround MCP tools", treatment)
+        for name in (
+            "ask_context",
+            "grounding_verify",
+            "live_freshness",
+            "repobrief_resource_read",
+        ):
+            self.assertIn(name, treatment)
 
     def test_build_commands_isolates_baseline_and_treatment(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -874,7 +926,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertIn(flag, baseline)
         self.assertNotIn("--sandbox", baseline)
         self.assertIn(f'default_permissions="{runner.PERMISSION_PROFILE}"', baseline)
+        self.assertIn("allow_login_shell=false", baseline)
+        self.assertIn("allow_login_shell=false", treatment)
         self.assertIn("features.network_proxy=true", baseline)
+        self.assertFalse(any("credential_broker" in item for item in baseline))
         self.assertTrue(any("domains={}" in item for item in baseline))
         self.assertTrue(any(":workspace_roots" in item for item in baseline))
         self.assertIn('web_search="disabled"', baseline)
@@ -892,6 +947,21 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertEqual(treatment_disabled, ["apps", "plugins"])
         self.assertNotIn("mcp_servers.repobrief", baseline_joined)
         self.assertIn("mcp_servers.repobrief", treatment_joined)
+        self.assertIn("mcp_servers.repobrief.enabled=true", treatment)
+        self.assertIn("mcp_servers.repobrief.required=true", treatment)
+        expected_enabled_tools = (
+            "mcp_servers.repobrief.enabled_tools="
+            + runner.canonical(sorted(runner.ALLOWED_MCP))
+        )
+        self.assertIn(expected_enabled_tools, treatment)
+        self.assertEqual(
+            [
+                item
+                for item in treatment
+                if item.startswith("mcp_servers.repobrief.enabled_tools=")
+            ],
+            [expected_enabled_tools],
+        )
         self.assertIn("--codex-mcp-proxy", treatment_joined)
 
 
@@ -933,6 +1003,27 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     path,
                     owner_uid=os.geteuid(),
                 )
+
+    def test_validate_toolchain_binds_exact_bash_wrapper_path(self) -> None:
+        with (
+            patch.object(
+                runner,
+                "_validate_support_executable",
+                return_value="/validated",
+            ) as validate,
+            patch.object(
+                runner,
+                "_validated_mcp_proxy_python",
+                return_value="/usr/bin/python3",
+            ),
+        ):
+            self.assertEqual(
+                runner.validate_toolchain("/opt/codex/bin/codex"),
+                "/opt/codex/codex-path:/usr/bin:/bin",
+            )
+        validated_paths = [entry.args[0] for entry in validate.call_args_list]
+        self.assertIn(Path("/bin/bash"), validated_paths)
+        self.assertNotIn(Path("/usr/bin/bash"), validated_paths)
 
     def test_mcp_executable_rejects_special_permission_bits(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

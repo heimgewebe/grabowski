@@ -786,6 +786,17 @@ class FakeGh:
                 payload = state.get("review") if isinstance(state, dict) else None
                 return {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""}
         if argv[:1] == ["api"]:
+            jq = (
+                argv[argv.index("--jq") + 1]
+                if "--jq" in argv and argv.index("--jq") + 1 < len(argv)
+                else None
+            )
+            if jq == ".delete_branch_on_merge":
+                return {
+                    "returncode": 0,
+                    "stdout": json.dumps(self.repo_settings.get("delete_branch_on_merge")),
+                    "stderr": "",
+                }
             if self.repo_settings_returncode != 0:
                 return {"returncode": self.repo_settings_returncode, "stdout": "", "stderr": "repo policy failed"}
             if self.repo_settings_invalid_json:
@@ -795,6 +806,9 @@ class FakeGh:
                 if self.repo_settings_sequence
                 else self.repo_settings
             )
+            if isinstance(jq, str) and jq.startswith("{") and jq.endswith("}"):
+                keys = [key for key in jq[1:-1].split(",") if key]
+                settings = {key: settings[key] for key in keys if key in settings}
             return {"returncode": 0, "stdout": json.dumps(settings), "stderr": ""}
         if argv[:2] == ["pr", "create"]:
             return {"returncode": 0, "stdout": str(self.view["url"]), "stderr": ""}
@@ -1497,6 +1511,7 @@ class GripFoundationTests(unittest.TestCase):
             "expected_local_head": "1" * 40,
             "expected_remote_head": "2" * 40,
             "confirmation": "apply-protected-post-merge-sync",
+            "expected_physical_identity_sha256": "f" * 64,
         }
         cases = {
             "confirmation_mismatch": {
@@ -1541,6 +1556,11 @@ class GripFoundationTests(unittest.TestCase):
                 with (
                     patch.object(
                         grips,
+                        "_physical_checkout_identity",
+                        return_value={"physical_identity_sha256": "f" * 64},
+                    ),
+                    patch.object(
+                        grips,
                         "_validate_remote_materialization_target",
                         return_value="https://example.invalid/grabowski.git",
                     ),
@@ -1550,6 +1570,7 @@ class GripFoundationTests(unittest.TestCase):
                             "receipt_status": "blocked",
                             "state": state,
                             "retry_authorized": False,
+                            "physical_identity_verified": True,
                         },
                     ),
                 ):
@@ -1564,8 +1585,173 @@ class GripFoundationTests(unittest.TestCase):
                     item["id"]: item["status"]
                     for item in receipt["checks"]
                 }
+                self.assertEqual("pass", statuses["physical-checkout-bound"])
                 for check_id, status in expected.items():
                     self.assertEqual(status, statuses[check_id])
+
+    def test_post_merge_sync_apply_initial_physical_failure_skips_unobserved_canonical_check(
+        self,
+    ) -> None:
+        parameters = {
+            "repo": "/tmp/grabowski-pr1318-initial-physical-failure-test",
+            "target_branch": "main",
+            "expected_local_head": "1" * 40,
+            "expected_remote_head": "2" * 40,
+            "confirmation": "apply-protected-post-merge-sync",
+            "expected_physical_identity_sha256": "f" * 64,
+        }
+        for state in (
+            "invalid_physical_checkout_identity",
+            "physical_checkout_identity_unreadable",
+            "physical_checkout_identity_mismatch",
+        ):
+            with self.subTest(state=state):
+                receipt: dict[str, object] = {"checks": []}
+                with (
+                    patch.object(
+                        grips,
+                        "_physical_checkout_identity",
+                        return_value={"physical_identity_sha256": "f" * 64},
+                    ),
+                    patch.object(
+                        grips,
+                        "_validate_remote_materialization_target",
+                        return_value="https://example.invalid/grabowski.git",
+                    ),
+                    patch(
+                        "grabowski_post_merge_sync_apply.apply",
+                        return_value={
+                            "receipt_status": "blocked",
+                            "state": state,
+                            "retry_authorized": False,
+                            "physical_identity_verified": False,
+                        },
+                    ),
+                ):
+                    output = grips._run_post_merge_sync_apply(
+                        grips.GRIP_SPECS["post-merge-sync-apply"],
+                        parameters,
+                        receipt,
+                        FakeGit(),
+                    )
+                self.assertEqual(state, output["state"])
+                statuses = {
+                    item["id"]: item["status"]
+                    for item in receipt["checks"]
+                }
+                self.assertEqual("fail", statuses["physical-checkout-bound"])
+                self.assertEqual("skip", statuses["protected-canonical-checkout"])
+                self.assertEqual("skip", statuses["clean-exact-preimage"])
+                self.assertEqual("skip", statuses["remote-head-bound"])
+
+    def test_post_merge_sync_apply_replay_identity_drift_fails_physical_check(
+        self,
+    ) -> None:
+        parameters = {
+            "repo": "/tmp/grabowski-pr1318-replay-drift-test",
+            "target_branch": "main",
+            "expected_local_head": "1" * 40,
+            "expected_remote_head": "2" * 40,
+            "confirmation": "apply-protected-post-merge-sync",
+            "expected_physical_identity_sha256": "f" * 64,
+        }
+        receipt: dict[str, object] = {"checks": []}
+        with (
+            patch.object(
+                grips,
+                "_physical_checkout_identity",
+                return_value={"physical_identity_sha256": "f" * 64},
+            ),
+            patch.object(
+                grips,
+                "_validate_remote_materialization_target",
+                return_value="https://example.invalid/grabowski.git",
+            ),
+            patch(
+                "grabowski_post_merge_sync_apply.apply",
+                return_value={
+                    "receipt_status": "blocked",
+                    "state": "physical_checkout_identity_drift_before_replay_success",
+                    "retry_authorized": False,
+                    "physical_identity_verified": False,
+                    "effect_started": False,
+                },
+            ),
+        ):
+            output = grips._run_post_merge_sync_apply(
+                grips.GRIP_SPECS["post-merge-sync-apply"],
+                parameters,
+                receipt,
+                FakeGit(),
+            )
+
+        self.assertEqual(
+            "physical_checkout_identity_drift_before_replay_success",
+            output["state"],
+        )
+        statuses = {
+            item["id"]: item["status"]
+            for item in receipt["checks"]
+        }
+        self.assertEqual("fail", statuses["physical-checkout-bound"])
+
+    def test_post_merge_sync_apply_bound_checkout_close_failure_fails_physical_check(
+        self,
+    ) -> None:
+        parameters = {
+            "repo": "/tmp/grabowski-pr1318-close-failure-test",
+            "target_branch": "main",
+            "expected_local_head": "1" * 40,
+            "expected_remote_head": "2" * 40,
+            "confirmation": "apply-protected-post-merge-sync",
+            "expected_physical_identity_sha256": "f" * 64,
+        }
+        cases = (
+            {
+                "receipt_status": "failed",
+                "state": "bound_checkout_release_failed",
+                "retry_authorized": False,
+                "physical_identity_verified": False,
+                "bound_checkout_release_failed": True,
+            },
+            {
+                "receipt_status": "blocked",
+                "state": "remote_head_drift_after_lease",
+                "retry_authorized": False,
+                "physical_identity_verified": False,
+                "bound_checkout_release_failed": True,
+            },
+        )
+        for output_value in cases:
+            with self.subTest(state=output_value["state"]):
+                receipt: dict[str, object] = {"checks": []}
+                with (
+                    patch.object(
+                        grips,
+                        "_physical_checkout_identity",
+                        return_value={"physical_identity_sha256": "f" * 64},
+                    ),
+                    patch.object(
+                        grips,
+                        "_validate_remote_materialization_target",
+                        return_value="https://example.invalid/grabowski.git",
+                    ),
+                    patch(
+                        "grabowski_post_merge_sync_apply.apply",
+                        return_value=output_value,
+                    ),
+                ):
+                    grips._run_post_merge_sync_apply(
+                        grips.GRIP_SPECS["post-merge-sync-apply"],
+                        parameters,
+                        receipt,
+                        FakeGit(),
+                    )
+                statuses = {
+                    item["id"]: item["status"]
+                    for item in receipt["checks"]
+                }
+                self.assertEqual("fail", statuses["physical-checkout-bound"])
 
     def test_post_merge_sync_apply_fast_forward_requires_explicit_verification(
         self,
@@ -1576,6 +1762,7 @@ class GripFoundationTests(unittest.TestCase):
             "expected_local_head": "1" * 40,
             "expected_remote_head": "2" * 40,
             "confirmation": "apply-protected-post-merge-sync",
+            "expected_physical_identity_sha256": "f" * 64,
         }
         cases = (
             ({"state": "outcome_unknown", "resource_keys": ["repo:/tmp/x"]}, "skip"),
@@ -1598,6 +1785,11 @@ class GripFoundationTests(unittest.TestCase):
                     **output_patch,
                 }
                 with (
+                    patch.object(
+                        grips,
+                        "_physical_checkout_identity",
+                        return_value={"physical_identity_sha256": "f" * 64},
+                    ),
                     patch.object(
                         grips,
                         "_validate_remote_materialization_target",
@@ -1629,6 +1821,7 @@ class GripFoundationTests(unittest.TestCase):
             "expected_local_head": "1" * 40,
             "expected_remote_head": "2" * 40,
             "confirmation": "apply-protected-post-merge-sync",
+            "expected_physical_identity_sha256": "f" * 64,
         }
         cases = (
             ({"state": "outcome_unknown", "resource_keys": ["repo:/tmp/x"]}, "skip"),
@@ -1637,6 +1830,15 @@ class GripFoundationTests(unittest.TestCase):
                     "state": "outcome_unknown",
                     "resource_keys": ["repo:/tmp/x"],
                     "remote_head_verified": True,
+                },
+                "pass",
+            ),
+            (
+                {
+                    "state": "synced",
+                    "resource_keys": ["repo:/tmp/x"],
+                    "remote_head_verified": False,
+                    "remote_head_bound_observed": True,
                 },
                 "pass",
             ),
@@ -1693,6 +1895,11 @@ class GripFoundationTests(unittest.TestCase):
                 with (
                     patch.object(
                         grips,
+                        "_physical_checkout_identity",
+                        return_value={"physical_identity_sha256": "f" * 64},
+                    ),
+                    patch.object(
+                        grips,
                         "_validate_remote_materialization_target",
                         return_value="https://example.invalid/grabowski.git",
                     ),
@@ -1722,6 +1929,7 @@ class GripFoundationTests(unittest.TestCase):
             "expected_local_head": "1" * 40,
             "expected_remote_head": "2" * 40,
             "confirmation": "apply-protected-post-merge-sync",
+            "expected_physical_identity_sha256": "f" * 64,
         }
         cases = (
             ({"state": "outcome_unknown", "resource_keys": ["repo:/tmp/x"]}, "skip"),
@@ -1764,6 +1972,11 @@ class GripFoundationTests(unittest.TestCase):
                 with (
                     patch.object(
                         grips,
+                        "_physical_checkout_identity",
+                        return_value={"physical_identity_sha256": "f" * 64},
+                    ),
+                    patch.object(
+                        grips,
                         "_validate_remote_materialization_target",
                         return_value="https://example.invalid/grabowski.git",
                     ),
@@ -1792,9 +2005,15 @@ class GripFoundationTests(unittest.TestCase):
             "expected_local_head": "1" * 40,
             "expected_remote_head": "2" * 40,
             "confirmation": "apply-protected-post-merge-sync",
+            "expected_physical_identity_sha256": "f" * 64,
         }
         receipt: dict[str, object] = {"checks": []}
         with (
+            patch.object(
+                grips,
+                "_physical_checkout_identity",
+                return_value={"physical_identity_sha256": "f" * 64},
+            ),
             patch.object(
                 grips,
                 "_validate_remote_materialization_target",
@@ -5456,7 +5675,6 @@ class GripFoundationTests(unittest.TestCase):
 
         self.assertEqual("blocked", result["receipt"]["status"])
         self.assertIn("profile observer cannot run mutating grips", result["output"]["error"])
-
     def test_mechanic_loop_runs_normal_actions_with_visible_scope_and_receipts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             result = grips.run_grip(
@@ -6679,6 +6897,71 @@ class GripFoundationTests(unittest.TestCase):
         checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
         self.assertEqual("fail", checks["expected_branch"])
         self.assertEqual(64, len(result["receipt"]["receipt_sha256"]))
+
+    def test_post_merge_sync_emits_physical_checkout_binding(self) -> None:
+        physical = {
+            "schema_version": 1,
+            "kind": "grabowski.physical_checkout_identity",
+            "root": {"path": "/tmp/repo", "device": 1, "inode": 2},
+            "git_dir": {"path": "/tmp/repo/.git", "device": 1, "inode": 3},
+            "common_dir": {"path": "/tmp/repo/.git", "device": 1, "inode": 3},
+            "physical_identity_sha256": "f" * 64,
+        }
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "grabowski_physical_checkout.capture_physical_checkout_identity",
+            return_value=physical,
+        ):
+            result = grips.run_grip(
+                "post-merge-sync",
+                {"repo": tmp, "target_branch": "main"},
+                command_runner=FakeGit(branch="main", dirty=False),
+            )
+
+        self.assertEqual("passed", result["status"])
+        self.assertEqual(
+            "f" * 64,
+            result["output"]["expected_physical_identity_sha256"],
+        )
+
+    def test_post_merge_sync_apply_rejects_symlink_repository_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            alias = root / "repo-alias"
+            subprocess.run(
+                ["git", "init", "-q", "-b", "main", str(repo)],
+                check=True,
+            )
+            alias.symlink_to(repo, target_is_directory=True)
+            physical = grips.grabowski_physical_checkout.capture_physical_checkout_identity(
+                repo
+            )
+            fake = FakeGit(branch="main", head="1" * 40)
+            result = grips.run_grip(
+                "post-merge-sync-apply",
+                {
+                    "repo": str(alias),
+                    "target_branch": "main",
+                    "expected_local_head": "1" * 40,
+                    "expected_remote_head": "2" * 40,
+                    "expected_physical_identity_sha256": physical[
+                        "physical_identity_sha256"
+                    ],
+                    "confirmation": "apply-protected-post-merge-sync",
+                },
+                allow_mutation=True,
+                command_runner=fake,
+            )
+
+        self.assertEqual("blocked", result["status"])
+        self.assertEqual("preflight", result["receipt"]["phase"])
+        self.assertIn("physical identity", result["output"]["error"])
+        checks = {
+            item["id"]: item["status"]
+            for item in result["receipt"]["checks"]
+        }
+        self.assertEqual("fail", checks["physical-checkout-bound"])
+        self.assertEqual([], fake.calls)
 
     def test_post_merge_sync_validates_target_branch_before_orienting(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -13231,7 +13514,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual("merge", execution["merge_policy"]["selected_method"])
         self.assertEqual(["merge", "squash", "rebase"], execution["merge_policy"]["allowed_methods"])
         self.assertEqual([], execution["automatic_platform_effects"])
-        self.assertEqual("passed", execution["effect_scope_decision"]["decision"])
+        self.assertEqual("not_evaluated", execution["effect_scope_decision"]["decision"])
 
     def test_captain_run_treats_exact_merge_queue_entry_as_scheduled_after_dispatch(self) -> None:
         parameters = authorized_captain_run_parameters()
@@ -13900,7 +14183,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertIn("--squash", merge_call)
         self.assertNotIn("--merge", merge_call)
 
-    def test_captain_run_blocks_forbidden_automatic_branch_deletion(self) -> None:
+    def test_captain_run_ignores_repository_configured_branch_deletion_for_scope(self) -> None:
         action = captain_action(
             scope={
                 "allowed_effects": ["merge pull request 96 into main"],
@@ -13946,44 +14229,49 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             github_runner=gh,
         )
 
-        self.assertEqual("blocked", result["receipt"]["status"])
-        self.assertEqual("blocked", result["output"]["decision"])
+        self.assertEqual("passed", result["receipt"]["status"])
         execution = result["output"]["executions"][0]
-        self.assertFalse(execution["execution_invoked"])
-        self.assertFalse(execution["execution_attempted"])
+        self.assertTrue(execution["execution_invoked"])
+        configured_effects = execution["configured_automatic_platform_effects"]
         self.assertEqual(
-            ["automatic_effect_forbidden:branch-deletion"],
+            ["branch-deletion"],
+            [effect["effect"] for effect in configured_effects],
+        )
+        self.assertEqual(configured_effects, execution["automatic_platform_effects"])
+        self.assertEqual("not_evaluated", execution["effect_scope_decision"]["decision"])
+        self.assertTrue(
+            execution["automatic_platform_effect_observation"]["observed"]
+        )
+        self.assertTrue(
+            execution["automatic_platform_effect_observation"]["delete_branch_on_merge"]
+        )
+        self.assertEqual(
+            ["repository_configured_automatic_effects_are_observational"],
             execution["effect_scope_decision"]["reasons"],
         )
-        effect_target = execution["automatic_platform_effects"][0]["target"]
         self.assertEqual(
-            {
-                "base_repository": "heimgewebe/grabowski",
-                "pull_request": 96,
-                "repository": "heimgewebe/grabowski",
-                "ref": "refs/heads/feat/captain",
-                "head_branch": "feat/captain",
-                "head_oid": CAPTAIN_HEAD,
-                "cross_repository": False,
-            },
-            effect_target,
+            [],
+            execution["effect_scope_decision"]["required_effect_authorizations"],
         )
-        self.assertEqual(
-            execution["configured_automatic_platform_effects"],
-            execution["automatic_platform_effects"],
+        self.assertNotIn("delete_branch_on_merge", execution["merge_policy"]["settings"])
+        policy_call = next(
+            call
+            for call in gh.calls
+            if call[:2] == ("api", "repos/heimgewebe/grabowski")
+            and call[-1] != ".delete_branch_on_merge"
         )
-        action_receipt = result["output"]["actions"][0]["captain_receipt"]
-        self.assertEqual(
-            execution["automatic_platform_effects"],
-            action_receipt["automatic_platform_effects"],
+        self.assertNotIn("delete_branch_on_merge", " ".join(policy_call))
+        self.assertTrue(
+            any(
+                call[:2] == ("api", "repos/heimgewebe/grabowski")
+                and call[-1] == ".delete_branch_on_merge"
+                for call in gh.calls
+            )
         )
-        self.assertEqual(
-            execution["effect_scope_decision"],
-            action_receipt["effect_scope_decision"],
-        )
-        self.assertFalse(any(call[:2] == ("pr", "merge") for call in gh.calls))
+        self.assertTrue(any(call[:2] == ("pr", "merge") for call in gh.calls))
 
-    def test_captain_run_blocks_unapproved_automatic_branch_deletion(self) -> None:
+
+    def test_captain_run_blocks_relevant_repository_merge_policy_drift_before_dispatch(self) -> None:
         action = captain_action(
             scope={
                 "allowed_effects": ["merge pull request 96 into main"],
@@ -13992,6 +14280,16 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 "max_targets": 1,
             }
         )
+        policy_before = {
+            "allow_merge_commit": True,
+            "allow_squash_merge": True,
+            "allow_rebase_merge": True,
+            "delete_branch_on_merge": False,
+        }
+        policy_after = {
+            **policy_before,
+            "allow_squash_merge": False,
+        }
         parameters = captain_parameters(
             [action],
             trusted_owner_mode=True,
@@ -14012,12 +14310,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 "mergeable": "MERGEABLE",
                 "mergeStateStatus": "CLEAN",
             },
-            repo_settings={
-                "allow_merge_commit": True,
-                "allow_squash_merge": True,
-                "allow_rebase_merge": True,
-                "delete_branch_on_merge": True,
-            },
+            repo_settings_sequence=[policy_before, policy_after],
         )
 
         result = grips.grip_run(
@@ -14031,25 +14324,39 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
         self.assertEqual("blocked", result["receipt"]["status"])
         execution = result["output"]["executions"][0]
-        self.assertEqual(
-            ["automatic_effect_authorization_missing:branch-deletion"],
-            execution["effect_scope_decision"]["reasons"],
-        )
         self.assertFalse(execution["execution_invoked"])
+        self.assertFalse(execution["execution_attempted"])
+        self.assertFalse(execution["verification_passed"])
+        self.assertIn(
+            "merge_guard_repository_policy_drift",
+            execution["merge_lease_guard"]["errors"],
+        )
+        self.assertEqual(
+            "blocked_after_guard_revalidation_released",
+            execution["merge_lease_guard"]["status"],
+        )
         self.assertFalse(any(call[:2] == ("pr", "merge") for call in gh.calls))
 
-    def test_captain_run_allows_explicitly_authorized_automatic_branch_deletion(self) -> None:
+
+    def test_captain_run_does_not_block_on_auto_delete_only_repository_drift(self) -> None:
         action = captain_action(
             scope={
-                "allowed_effects": [
-                    "merge pull request 96 into main",
-                    "branch-deletion",
-                ],
-                "forbidden_effects": ["force-push"],
+                "allowed_effects": ["merge pull request 96 into main"],
+                "forbidden_effects": ["force-push", "branch-deletion"],
                 "boundaries": "single pull request in heimgewebe/grabowski",
                 "max_targets": 1,
             }
         )
+        policy_before = {
+            "allow_merge_commit": True,
+            "allow_squash_merge": True,
+            "allow_rebase_merge": True,
+            "delete_branch_on_merge": False,
+        }
+        policy_after = {
+            **policy_before,
+            "delete_branch_on_merge": True,
+        }
         parameters = captain_parameters(
             [action],
             trusted_owner_mode=True,
@@ -14070,12 +14377,8 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 "mergeable": "MERGEABLE",
                 "mergeStateStatus": "CLEAN",
             },
-            repo_settings={
-                "allow_merge_commit": True,
-                "allow_squash_merge": True,
-                "allow_rebase_merge": True,
-                "delete_branch_on_merge": True,
-            },
+            repo_settings=policy_after,
+            repo_settings_sequence=[policy_before, policy_after],
         )
 
         result = grips.grip_run(
@@ -14089,144 +14392,13 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
         self.assertEqual("passed", result["receipt"]["status"])
         execution = result["output"]["executions"][0]
-        self.assertEqual("passed", execution["effect_scope_decision"]["decision"])
-        self.assertEqual(
-            ["branch-deletion"],
-            execution["effect_scope_decision"]["required_effect_authorizations"],
+        self.assertTrue(execution["execution_invoked"])
+        self.assertEqual("completed", execution["merge_lease_guard"]["status"])
+        self.assertTrue(
+            execution["automatic_platform_effect_observation"]["delete_branch_on_merge"]
         )
         self.assertTrue(any(call[:2] == ("pr", "merge") for call in gh.calls))
 
-    def test_captain_run_blocks_unbound_automatic_branch_deletion_target(self) -> None:
-        action = captain_action(
-            scope={
-                "allowed_effects": [
-                    "merge pull request 96 into main",
-                    "branch-deletion",
-                ],
-                "forbidden_effects": ["force-push"],
-                "boundaries": "single pull request in heimgewebe/grabowski",
-                "max_targets": 1,
-            }
-        )
-        parameters = captain_parameters(
-            [action],
-            trusted_owner_mode=True,
-            autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
-            allow_execution=True,
-        )
-        parameters.pop("human_authorization")
-        parameters.pop("execution_authority")
-        parameters["execution_intent"] = captain_execution_intent(parameters)
-        gh = FakeGh(
-            view={
-                "number": 96,
-                "state": "OPEN",
-                "baseRefName": "main",
-                "headRefName": "feat/captain",
-                "headRefOid": CAPTAIN_HEAD,
-                "headRepository": None,
-                "isCrossRepository": False,
-                "isDraft": False,
-                "mergeable": "MERGEABLE",
-                "mergeStateStatus": "CLEAN",
-            },
-            repo_settings={
-                "allow_merge_commit": True,
-                "allow_squash_merge": True,
-                "allow_rebase_merge": True,
-                "delete_branch_on_merge": True,
-            },
-        )
-
-        result = grips.grip_run(
-            "captain-run",
-            parameters,
-            profile="captain",
-            allow_mutation=True,
-            command_runner=FakeGit(),
-            github_runner=gh,
-        )
-
-        self.assertEqual("blocked", result["receipt"]["status"])
-        execution = result["output"]["executions"][0]
-        self.assertIn(
-            "automatic_effect_target_unbound:branch-deletion",
-            execution["effect_scope_decision"]["reasons"],
-        )
-        self.assertFalse(any(call[:2] == ("pr", "merge") for call in gh.calls))
-
-    def test_captain_run_blocks_repository_policy_drift_before_merge_dispatch(self) -> None:
-        action = captain_action(
-            scope={
-                "allowed_effects": [
-                    "merge pull request 96 into main",
-                    "branch-deletion",
-                ],
-                "forbidden_effects": ["force-push"],
-                "boundaries": "single pull request in heimgewebe/grabowski",
-                "max_targets": 1,
-            }
-        )
-        policy_false = {
-            "allow_merge_commit": True,
-            "allow_squash_merge": True,
-            "allow_rebase_merge": True,
-            "delete_branch_on_merge": False,
-        }
-        policy_true = {**policy_false, "delete_branch_on_merge": True}
-        for initial, final in ((policy_false, policy_true), (policy_true, policy_false)):
-            with self.subTest(
-                initial_delete=initial["delete_branch_on_merge"],
-                final_delete=final["delete_branch_on_merge"],
-            ):
-                parameters = captain_parameters(
-                    [action],
-                    trusted_owner_mode=True,
-                    autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
-                    allow_execution=True,
-                )
-                parameters.pop("human_authorization")
-                parameters.pop("execution_authority")
-                parameters["execution_intent"] = captain_execution_intent(parameters)
-                gh = FakeGh(
-                    view={
-                        "number": 96,
-                        "state": "OPEN",
-                        "baseRefName": "main",
-                        "headRefName": "feat/captain",
-                        "headRefOid": CAPTAIN_HEAD,
-                        "isDraft": False,
-                        "mergeable": "MERGEABLE",
-                        "mergeStateStatus": "CLEAN",
-                    },
-                    repo_settings_sequence=[initial, final],
-                )
-
-                result = grips.grip_run(
-                    "captain-run",
-                    parameters,
-                    profile="captain",
-                    allow_mutation=True,
-                    command_runner=FakeGit(),
-                    github_runner=gh,
-                )
-
-                self.assertEqual("blocked", result["receipt"]["status"])
-                execution = result["output"]["executions"][0]
-                self.assertFalse(execution["execution_invoked"])
-                self.assertFalse(execution["execution_attempted"])
-                self.assertFalse(execution["verification_passed"])
-                self.assertIn(
-                    "merge_guard_repository_policy_drift",
-                    execution["merge_lease_guard"]["errors"],
-                )
-                self.assertEqual(
-                    "blocked_after_guard_revalidation_released",
-                    execution["merge_lease_guard"]["status"],
-                )
-                self.assertFalse(
-                    any(call[:2] == ("pr", "merge") for call in gh.calls)
-                )
 
     def test_captain_run_blocks_when_repository_merge_policy_is_unusable(self) -> None:
         matching_view = {

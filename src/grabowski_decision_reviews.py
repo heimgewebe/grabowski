@@ -29,9 +29,11 @@ MAX_METADATA_BYTES = 256 * 1024
 MAX_FINALIZATION_BYTES = 256 * 1024
 MAX_STDOUT_TAIL_BYTES = 256 * 1024
 MAX_ROLE_RECEIPT_BYTES = 4 * 1024 * 1024
+MAX_REVIEW_ROLE_MODULE_BYTES = 1024 * 1024
 REVIEW_ROLE_MODULE = "grabowski_agent_role"
 REVIEW_ROLE_SANDBOX = "bubblewrap-minimal-root-read-only-worktree-v1"
 REVIEW_ROLE_PYTHON = os.path.abspath(sys.executable)
+REVIEW_ROLE_RELEASE_ROOT = Path.home() / ".local/share/grabowski-mcp-releases"
 REVIEW_ROLE_LAUNCHER_PREFIX = (
     REVIEW_ROLE_PYTHON,
     "-I",
@@ -43,6 +45,11 @@ _SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _SLOT_RE = re.compile(r"[A-Za-z0-9._:-]{1,64}\Z")
 _UNIT_RE = re.compile(r"grabowski-job-([0-9a-f]{12})\Z")
+_REVIEW_ROLE_RELEASE_ID_RE = re.compile(
+    r"[0-9a-f]{12}-srcset[0-9a-f]{12}-lock[0-9a-f]{12}-contract[0-9a-f]{12}"
+    r"(?:-attempt[1-9][0-9]{0,2})?\Z"
+)
+_REVIEW_ROLE_PYTHON_DIR_RE = re.compile(r"python[0-9]+\.[0-9]+\Z")
 _BINDING_FIELDS = frozenset(
     {
         "schema_version",
@@ -116,6 +123,60 @@ def _review_role_module_identity() -> tuple[str, str] | None:
         str(module_path.resolve(strict=False)),
         hashlib.sha256(payload).hexdigest(),
     )
+
+
+def _historical_review_role_module_matches(
+    value: Any, *, expected_sha256: str
+) -> bool:
+    """Accept immutable prior-release role modules only when bytes still match."""
+
+    if (
+        not isinstance(value, str)
+        or not value
+        or not isinstance(expected_sha256, str)
+        or _SHA256_RE.fullmatch(expected_sha256) is None
+    ):
+        return False
+    path = Path(value)
+    if not path.is_absolute():
+        return False
+    try:
+        root_path = REVIEW_ROLE_RELEASE_ROOT.expanduser()
+        if root_path.is_symlink():
+            return False
+        root_metadata = root_path.stat()
+        if (
+            not stat.S_ISDIR(root_metadata.st_mode)
+            or root_metadata.st_uid != os.getuid()
+        ):
+            return False
+        root = root_path.resolve(strict=True)
+        resolved = path.resolve(strict=True)
+        if resolved != path:
+            return False
+        relative = resolved.relative_to(root)
+        metadata = resolved.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != os.getuid()
+            or metadata.st_size > MAX_REVIEW_ROLE_MODULE_BYTES
+        ):
+            return False
+        payload = resolved.read_bytes()
+    except (FileNotFoundError, OSError, RuntimeError, ValueError):
+        return False
+
+    parts = relative.parts
+    if (
+        len(parts) != 6
+        or _REVIEW_ROLE_RELEASE_ID_RE.fullmatch(parts[0]) is None
+        or parts[1:3] != (".venv", "lib")
+        or _REVIEW_ROLE_PYTHON_DIR_RE.fullmatch(parts[3]) is None
+        or parts[4:] != ("site-packages", f"{REVIEW_ROLE_MODULE}.py")
+    ):
+        return False
+    return hmac.compare_digest(hashlib.sha256(payload).hexdigest(), expected_sha256)
 
 
 def normalize_binding(value: Any) -> dict[str, Any]:
@@ -562,6 +623,18 @@ def _normalize_review_role_provenance(
     if module_identity is None:
         raise ValueError("trusted decision review role module is unavailable")
     runner_module_path, runner_module_sha256 = module_identity
+    recorded_module_path = value.get("runner_module_path")
+    recorded_module_sha256 = value.get("runner_module_sha256")
+    module_identity_matches = (
+        recorded_module_sha256 == runner_module_sha256
+        and (
+            recorded_module_path == runner_module_path
+            or _historical_review_role_module_matches(
+                recorded_module_path,
+                expected_sha256=runner_module_sha256,
+            )
+        )
+    )
     if (
         value.get("schema_version") != 1
         or value.get("kind") != "grabowski_decision_review_provenance"
@@ -569,8 +642,7 @@ def _normalize_review_role_provenance(
         or value.get("runner_python") != REVIEW_ROLE_PYTHON
         or value.get("runner_isolated") is not True
         or value.get("runner_module") != REVIEW_ROLE_MODULE
-        or value.get("runner_module_path") != runner_module_path
-        or value.get("runner_module_sha256") != runner_module_sha256
+        or not module_identity_matches
         or value.get("sandbox") != REVIEW_ROLE_SANDBOX
         or value.get("head_sha") != normalized["head_sha"]
         or value.get("base_sha") != normalized["base_sha"]
