@@ -2048,7 +2048,7 @@
     },
     {
       "category": "resource",
-      "description": "Atomically acquire typed resource leases for one owner.\n\nPublic broad repository resources require a complete exact scope manifest.\nEmergency-recovery mode is derived only from a validated Bureau recovery\ncontract; caller-supplied lease-mode metadata is not an authority surface.\nSelf-scoped branch and operation keys are authoritative and reject scope\nmanifests. Work Lane identity metadata is server-owned and can only be\ncreated through the Work Lane acquisition path.",
+      "description": "Atomically acquire typed resource leases for one owner.\n\nPublic broad repository resources require a complete exact scope manifest.\nEmergency-recovery mode is derived only from a validated Bureau recovery\ncontract; caller-supplied lease-mode metadata is not an authority surface.\nSelf-scoped branch and operation keys are authoritative and reject scope\nmanifests. Work Lane identity metadata and user-systemd subtree authority\nmetadata are server-owned and can only be created through their internal\nacquisition paths.",
       "effects": [
         "lease-create",
         "possible-expired-lease-reclaim"
@@ -3722,7 +3722,7 @@
       "src/grabowski_recovery.py": "0ed22cef9bc1f41b18e4f40b4cedf0492a78469b9d02ffd2747481c337b43013",
       "src/grabowski_repobrief.py": "1e842a9f310c967012914afbaf2dbbc4af3a29c222734f14f902421773713ded",
       "src/grabowski_repoground_catalog.py": "b8ea8d611a37bb287ae8836790c6aa7abf29c08dcccf252492fb355c9f9ba58f",
-      "src/grabowski_resources.py": "8d548a506111961be313af96f25917b2b25c15582c032626814f0965436aeb58",
+      "src/grabowski_resources.py": "4c6fa4fff67425607702a23bbdf33fb2deeb6da43430b844a6bb12d1e54fac57",
       "src/grabowski_runtime.py": "832c895ec4660801dc63f4e68dfa4d75ee80a4646f22fa99d0d7a4ead8432582",
       "src/grabowski_runtime_contract.py": "4528ec08c1019a2b773a7e05250f4842ca2403d1c9171b19ef98a63c6e588054",
       "src/grabowski_runtime_extensions.py": "4bbaabe4120acc6879297e85d3664c69193fe0a9850e48522d1839b7844b2297",
