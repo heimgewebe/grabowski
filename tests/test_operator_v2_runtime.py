@@ -1992,11 +1992,15 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             ]
         }
         summary = status["capability_requirements"]
-        self.assertEqual(summary["registered_tool_requirements"], 198)
-        self.assertEqual(summary["known_tool_requirements"], 199)
+        self.assertEqual(summary["registered_tool_requirements"], 199)
+        self.assertEqual(summary["known_tool_requirements"], 200)
         self.assertEqual(
             summary["staged_unpublished_tools"],
             ["grabowski_agent_workspace_adopt"],
+        )
+        self.assertEqual(
+            missing["grabowski_bureau_acceptance_authenticate"],
+            ["bureau_mutation"],
         )
         self.assertEqual(missing["grabowski_remove_path"], ["file_delete"])
         self.assertEqual(missing["grabowski_restore_removed_path"], ["file_delete"])

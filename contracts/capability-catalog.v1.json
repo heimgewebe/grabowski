@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "d372f005e8d2c10ab43eca49832071b32d24a2d4bbbc9e7c13829d21913db2e4",
+  "capability_source_sha256": "177efc86ed2c43354072d54b0d680f556726ec2a875f2b23af285a93f2636aa7",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "03ebb6191f56cf3eaf8e966ab4208fc6dabeb1d63c1c2c8ec587b688245d0f46",
+  "contract_sha256": "903f961d255993b8d66571935884cdf1724aef2d9236a28a71b47dbf86cfffcb",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1808,6 +1808,19 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_operational_guidance"
+    },
+    {
+      "category": "bureau",
+      "description": "Authenticate one exact manual Bureau acceptance item through Bureau's canonical contract.",
+      "effects": [
+        "bureau_acceptance_authentication_event"
+      ],
+      "id": "grabowski_bureau_acceptance_authenticate",
+      "purpose": "Authenticate one exact digest- and revision-bound manual Bureau acceptance item through Bureau's canonical StateStore journal contract.",
+      "read_only": false,
+      "reversibility": "append-only-idempotent-attestation",
+      "risk_class": "medium",
+      "tool": "grabowski_bureau_acceptance_authenticate"
     },
     {
       "category": "bureau",
