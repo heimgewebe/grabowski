@@ -288,6 +288,50 @@ class UserServiceCoordinationTests(unittest.TestCase):
                 self.assertEqual(prepared.kwargs["unit"], "demo.service")
                 self.assertEqual(prepared.kwargs["action"], action)
 
+    def test_enable_canonicalizes_symlinked_user_unit_config_scope(self) -> None:
+        fragment = "/usr/lib/systemd/user/demo.service"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            real_config = root / "real-config"
+            real_config.mkdir()
+            linked_config = root / "linked-config"
+            linked_config.symlink_to(real_config, target_is_directory=True)
+            config_root = (real_config / "systemd" / "user").resolve(strict=False)
+            resources = _fake_resources()
+            action_result = _result(stdout="enable")
+            with (
+                patch.dict(
+                    operator.os.environ,
+                    {"XDG_CONFIG_HOME": str(linked_config)},
+                    clear=False,
+                ),
+                patch.dict(sys.modules, {"grabowski_resources": resources}),
+                patch.object(operator, "_require_operator_capability"),
+                patch.object(operator, "_require_operator_mutation"),
+                patch.object(
+                    operator,
+                    "_run",
+                    side_effect=[
+                        _result(stdout=fragment + "\n"),
+                        _result(stdout=_reconciliation(fragment=fragment)),
+                        action_result,
+                    ],
+                ),
+            ):
+                result = operator.grabowski_user_service("demo.service", "enable")
+
+            self.assertIs(result, action_result)
+            resource_keys = resources.acquire_resources.call_args.args[1]
+            lexical_root = linked_config / "systemd" / "user"
+            self.assertIn(f"path:{config_root}", resource_keys)
+            self.assertNotIn(f"path:{lexical_root}", resource_keys)
+            self.assertEqual(
+                str(config_root),
+                resources.acquire_resources.call_args.kwargs["metadata"][
+                    "unit_file_config_root"
+                ],
+            )
+
     def test_non_unit_file_actions_keep_narrow_authority(self) -> None:
         fragment = "/usr/lib/systemd/user/demo.service"
         xdg_config = Path("/tmp/grabowski-user-systemd-xdg")

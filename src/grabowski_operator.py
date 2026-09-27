@@ -7980,7 +7980,10 @@ def _user_systemd_unit_config_root() -> Path:
             raise RuntimeError("XDG_CONFIG_HOME for user systemd must be absolute")
     else:
         config_home = HOME / ".config"
-    return Path(os.path.normpath(str(config_home / "systemd" / "user")))
+    try:
+        return (config_home / "systemd" / "user").resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError("Unable to resolve user systemd config root") from exc
 
 
 def _normalize_user_systemd_fragment_path(name: str, value: str) -> Path | None:
