@@ -10950,6 +10950,164 @@ class TaskTests(unittest.TestCase):
         rows = tasks.grabowski_task_list(limit=20, view="evidence")
         self.assertEqual(1, rows["total_matching"])
 
+    def _completed_execution_reuse_validation_fixture(
+        self,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        common = {
+            "host": "local",
+            "argv": ["/bin/echo", "completed-validation-execution"],
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "resume_policy": "verify-then-retry",
+            "cpu_weight": 50,
+            "io_weight": 25,
+            "memory_max_bytes": 64 * 1024 * 1024,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
+            ),
+        ):
+            first = tasks.grabowski_task_start(**common)
+        task_id = str(first["task"]["task_id"])
+        tasks._set_state(
+            task_id,
+            "completed",
+            observation={"state": "completed", "observed_at_unix": tasks._now()},
+        )
+        record = tasks._row_raw(task_id)
+        return record, tasks._record_execution_identity(record)
+
+    def test_recent_completed_execution_identity_resume_policy_mismatch_fails_closed(
+        self,
+    ) -> None:
+        record, identity = self._completed_execution_reuse_validation_fixture()
+        with (
+            patch.object(
+                tasks,
+                "_latest_matching_unbound_execution_record",
+                return_value=record,
+            ),
+            self.assertRaisesRegex(RuntimeError, "different resume policy"),
+        ):
+            tasks._resolve_recent_completed_execution_reuse(
+                identity,
+                resume_policy="never",
+            )
+
+    def test_recent_completed_execution_identity_invalid_timestamp_fails_closed(
+        self,
+    ) -> None:
+        record, identity = self._completed_execution_reuse_validation_fixture()
+        invalid = dict(record)
+        invalid["terminalized_at_unix"] = None
+        invalid["updated_at_unix"] = "invalid"
+        with (
+            patch.object(
+                tasks,
+                "_latest_matching_unbound_execution_record",
+                return_value=invalid,
+            ),
+            self.assertRaisesRegex(RuntimeError, "timestamp is invalid"),
+        ):
+            tasks._resolve_recent_completed_execution_reuse(
+                identity,
+                resume_policy="verify-then-retry",
+            )
+
+    def test_recent_completed_execution_identity_future_timestamp_fails_closed(
+        self,
+    ) -> None:
+        record, identity = self._completed_execution_reuse_validation_fixture()
+        future = dict(record)
+        future["terminalized_at_unix"] = tasks._now() + 1
+        with (
+            patch.object(
+                tasks,
+                "_latest_matching_unbound_execution_record",
+                return_value=future,
+            ),
+            self.assertRaisesRegex(RuntimeError, "timestamp is in the future"),
+        ):
+            tasks._resolve_recent_completed_execution_reuse(
+                identity,
+                resume_policy="verify-then-retry",
+            )
+
+    def test_recent_completed_execution_identity_missing_lifecycle_receipt_fails_closed(
+        self,
+    ) -> None:
+        record, identity = self._completed_execution_reuse_validation_fixture()
+        missing_receipt = dict(record)
+        missing_receipt["lifecycle_receipt_sha256"] = None
+        with (
+            patch.object(
+                tasks,
+                "_latest_matching_unbound_execution_record",
+                return_value=missing_receipt,
+            ),
+            self.assertRaisesRegex(RuntimeError, "lacks a valid lifecycle receipt"),
+        ):
+            tasks._resolve_recent_completed_execution_reuse(
+                identity,
+                resume_policy="verify-then-retry",
+            )
+
+    def test_unbound_execution_identity_inconsistent_record_fails_closed(self) -> None:
+        record, identity = self._completed_execution_reuse_validation_fixture()
+        inconsistent = dict(record)
+        inconsistent["argv_sha256"] = "0" * 64
+
+        class FakeCursor:
+            def fetchall(self) -> list[dict[str, object]]:
+                return [inconsistent]
+
+        class FakeConnection:
+            def __enter__(self) -> "FakeConnection":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def execute(self, *_args: object) -> FakeCursor:
+                return FakeCursor()
+
+        with (
+            patch.object(tasks, "_database_connection", return_value=FakeConnection()),
+            self.assertRaisesRegex(
+                RuntimeError, "stored task execution identity is inconsistent"
+            ),
+        ):
+            tasks._latest_matching_unbound_execution_record(identity)
+
+    def test_unbound_execution_identity_scan_limit_fails_closed(self) -> None:
+        _record, identity = self._completed_execution_reuse_validation_fixture()
+
+        class FakeCursor:
+            def fetchall(self) -> list[None]:
+                return [None] * 50001
+
+        class FakeConnection:
+            def __enter__(self) -> "FakeConnection":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def execute(self, *_args: object) -> FakeCursor:
+                return FakeCursor()
+
+        with (
+            patch.object(tasks, "_database_connection", return_value=FakeConnection()),
+            self.assertRaisesRegex(
+                RuntimeError, "unbound execution identity scan limit exceeded"
+            ),
+        ):
+            tasks._latest_matching_unbound_execution_record(identity)
+
     def test_resource_bound_active_execution_refreshes_completed_before_reacquire(
         self,
     ) -> None:
