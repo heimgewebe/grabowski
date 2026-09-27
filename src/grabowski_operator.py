@@ -8411,7 +8411,12 @@ def _user_systemd_reconcile_durable_uncertainty(
             "clearance_error_class": None,
         }
 
-    if _user_systemd_job_pending(reconciliation["Job"]):
+    effective_action = (
+        "stop" if fence["phase"] == "stop_recovery" else fence["action"]
+    )
+    if not _user_systemd_reconciliation_terminal(
+        reconciliation, action=effective_action
+    ):
         return {
             "blocked": True,
             "fence": fence,
@@ -8506,6 +8511,65 @@ def _require_fully_qualified_user_systemd_unit(name: str) -> str:
     return name
 
 
+def _user_systemd_reconciliation_terminal(
+    reconciliation: dict[str, str],
+    *,
+    action: str,
+) -> bool:
+    if _user_systemd_job_pending(reconciliation["Job"]):
+        return False
+    if action == "stop":
+        return reconciliation["ActiveState"] in {"inactive", "failed"}
+    return True
+
+
+def _user_systemd_stop_recovery_eligible(prior: dict[str, Any]) -> bool:
+    reconciliation = prior.get("reconciliation")
+    fence = prior.get("fence")
+    if not isinstance(reconciliation, dict) or not isinstance(fence, dict):
+        return False
+    if (
+        prior.get("reconciliation_error_class") is not None
+        or prior.get("lease_readback_error_class") is not None
+        or prior.get("clearance_error_class") is not None
+        or bool(prior.get("live_lease_resource_keys") or [])
+    ):
+        return False
+    return (
+        not _user_systemd_reconciliation_terminal(reconciliation, action="stop")
+        and (
+            _user_systemd_job_pending(reconciliation["Job"])
+            or fence.get("action") == "stop"
+            or fence.get("phase") == "stop_recovery"
+        )
+    )
+
+
+def _abort_user_systemd_stop_recovery_pre_effect(
+    resources: Any,
+    primary_error: Exception,
+    *,
+    owner_id: str,
+    resource_keys: list[str],
+    lease_snapshots: list[dict[str, Any]],
+) -> None:
+    try:
+        resources.release_resources(
+            owner_id,
+            resource_keys,
+            expected_leases=lease_snapshots,
+        )
+    except Exception as release_error:
+        _raise_pre_effect_release_failure(
+            primary_error,
+            release_error,
+            owner_id=owner_id,
+            resource_keys=resource_keys,
+            lease_snapshots=lease_snapshots,
+        )
+    raise primary_error
+
+
 def _run_mutating_user_systemd_unit(
     name: str,
     action: str,
@@ -8520,74 +8584,101 @@ def _run_mutating_user_systemd_unit(
     prior = _user_systemd_reconcile_durable_uncertainty(
         resources, [unit_resource_key]
     )
-    if prior is not None and prior["blocked"]:
+    recovering_prior_fence = bool(
+        prior is not None
+        and prior["blocked"]
+        and action == "stop"
+        and _user_systemd_stop_recovery_eligible(prior)
+    )
+    if prior is not None and prior["blocked"] and not recovering_prior_fence:
         return _user_systemd_durable_fence_block_result(prior)
 
+    recovery_fence = prior["fence"] if recovering_prior_fence else None
     fragment_before = _user_systemd_fragment_path(name)
     unit_file_config_root = (
         _user_systemd_unit_config_root()
         if action in _USER_SYSTEMD_UNIT_FILE_ACTIONS
         else None
     )
-    resource_keys = [unit_resource_key]
-    if fragment_before is not None:
-        resource_keys.append(f"path:{fragment_before}")
-    if unit_file_config_root is not None:
-        resource_keys.append(f"path:{unit_file_config_root}")
+    if recovering_prior_fence:
+        assert recovery_fence is not None
+        resource_keys = list(recovery_fence["resource_keys"])
+        if fragment_before is not None:
+            resource_keys.append(f"path:{fragment_before}")
+        resource_keys = sorted(set(resource_keys))
+    else:
+        resource_keys = [unit_resource_key]
+        if fragment_before is not None:
+            resource_keys.append(f"path:{fragment_before}")
+        if unit_file_config_root is not None:
+            resource_keys.append(f"path:{unit_file_config_root}")
+
     lease_metadata = {"unit": name, "action": action}
     if unit_file_config_root is not None:
         lease_metadata["unit_file_config_root"] = str(unit_file_config_root)
     owner_id = f"operator:user-systemd-{uuid.uuid4().hex}"
+    acquire_kwargs: dict[str, Any] = {}
+    if recovering_prior_fence:
+        acquire_kwargs["_user_systemd_stop_recovery_fence_id"] = recovery_fence[
+            "fence_id"
+        ]
     lease = resources.acquire_resources(
         owner_id,
         resource_keys,
         purpose=f"user systemd {action} {name}",
         ttl_seconds=_user_systemd_lease_ttl_seconds(mutation_timeout_seconds),
         metadata=lease_metadata,
+        **acquire_kwargs,
     )
     lease_snapshots = list(lease["leases"])
 
-    try:
-        fence = resources.prepare_user_systemd_uncertainty_fence(
-            owner_id,
-            resource_keys,
-            expected_leases=lease_snapshots,
-            unit=name,
-            action=action,
-        )
-    except Exception as primary_error:
+    if recovering_prior_fence:
+        fence = recovery_fence
+    else:
         try:
-            resources.release_resources(
+            fence = resources.prepare_user_systemd_uncertainty_fence(
                 owner_id,
                 resource_keys,
                 expected_leases=lease_snapshots,
+                unit=name,
+                action=action,
             )
-        except Exception as release_error:
-            _raise_pre_effect_release_failure(
-                primary_error,
-                release_error,
-                owner_id=owner_id,
-                resource_keys=resource_keys,
-                lease_snapshots=lease_snapshots,
-            )
-        raise
+        except Exception as primary_error:
+            try:
+                resources.release_resources(
+                    owner_id,
+                    resource_keys,
+                    expected_leases=lease_snapshots,
+                )
+            except Exception as release_error:
+                _raise_pre_effect_release_failure(
+                    primary_error,
+                    release_error,
+                    owner_id=owner_id,
+                    resource_keys=resource_keys,
+                    lease_snapshots=lease_snapshots,
+                )
+            raise
 
     pre_action_state: dict[str, str] | None = None
+    preexisting_job_pending = False
     try:
         pre_action_state = _user_systemd_reconciliation_state(name)
         fragment_after = _normalize_user_systemd_fragment_path(
             name, pre_action_state["FragmentPath"]
         )
         if fragment_after != fragment_before:
-            resources.clear_user_systemd_uncertainty_fence(
-                fence["fence_id"],
-                outcome="pre_effect_abort",
-                evidence_sha256=_user_systemd_evidence_sha256(pre_action_state),
-            )
+            if not recovering_prior_fence:
+                resources.clear_user_systemd_uncertainty_fence(
+                    fence["fence_id"],
+                    outcome="pre_effect_abort",
+                    evidence_sha256=_user_systemd_evidence_sha256(pre_action_state),
+                )
             raise RuntimeError(
                 f"FragmentPath changed after coordination lease acquisition for user unit {name}"
             )
-        if _user_systemd_job_pending(pre_action_state["Job"]):
+        preexisting_job_pending = _user_systemd_job_pending(pre_action_state["Job"])
+        if preexisting_job_pending and action != "stop":
             resources.update_user_systemd_uncertainty_fence(
                 fence["fence_id"],
                 phase="preexisting_job",
@@ -8614,6 +8705,14 @@ def _run_mutating_user_systemd_unit(
                 coordination=blocked["user_service_coordination"],
             )
     except Exception as primary_error:
+        if recovering_prior_fence:
+            _abort_user_systemd_stop_recovery_pre_effect(
+                resources,
+                primary_error,
+                owner_id=owner_id,
+                resource_keys=resource_keys,
+                lease_snapshots=lease_snapshots,
+            )
         _abort_user_systemd_pre_effect(
             resources,
             primary_error,
@@ -8630,12 +8729,23 @@ def _run_mutating_user_systemd_unit(
             },
         )
 
+    replace_pending_job = action == "stop" and (
+        recovering_prior_fence or preexisting_job_pending
+    )
     try:
         resources.update_user_systemd_uncertainty_fence(
             fence["fence_id"],
-            phase="dispatching",
+            phase="stop_recovery" if recovering_prior_fence else "dispatching",
         )
     except Exception as primary_error:
+        if recovering_prior_fence:
+            _abort_user_systemd_stop_recovery_pre_effect(
+                resources,
+                primary_error,
+                owner_id=owner_id,
+                resource_keys=resource_keys,
+                lease_snapshots=lease_snapshots,
+            )
         _abort_user_systemd_pre_effect(
             resources,
             primary_error,
@@ -8652,11 +8762,16 @@ def _run_mutating_user_systemd_unit(
             },
         )
 
+    action_argv = ["systemctl", "--user", action]
+    if replace_pending_job:
+        action_argv.append("--job-mode=replace")
+    action_argv.append(name)
+
     action_result: dict[str, Any] | None = None
     action_error: Exception | None = None
     try:
         action_result = _run(
-            ["systemctl", "--user", action, name],
+            action_argv,
             cwd=HOME,
             timeout_seconds=mutation_timeout_seconds,
             max_output_bytes=max_output_bytes,
@@ -8670,7 +8785,8 @@ def _run_mutating_user_systemd_unit(
         or action_result.get("timed_out") is True
         or action_result.get("returncode") != 0
     )
-    if not uncertain_transport:
+    requires_terminal_reconciliation = uncertain_transport or replace_pending_job
+    if not requires_terminal_reconciliation:
         assert action_result is not None
         coordination: dict[str, Any] | None = None
         try:
@@ -8700,14 +8816,15 @@ def _run_mutating_user_systemd_unit(
             coordination=coordination,
         )
 
-    try:
-        resources.update_user_systemd_uncertainty_fence(
-            fence["fence_id"],
-            phase="outcome_unknown",
-        )
-    except Exception:
-        # The already-persisted prepared/dispatching fence still blocks overlap.
-        pass
+    if uncertain_transport and not recovering_prior_fence:
+        try:
+            resources.update_user_systemd_uncertainty_fence(
+                fence["fence_id"],
+                phase="outcome_unknown",
+            )
+        except Exception:
+            # The already-persisted prepared/dispatching fence still blocks overlap.
+            pass
 
     renewal_error_class: str | None = None
     try:
@@ -8734,7 +8851,9 @@ def _run_mutating_user_systemd_unit(
             reconciliation = None
             reconciliation_error_class = type(exc).__name__
         else:
-            if not _user_systemd_job_pending(reconciliation["Job"]):
+            if _user_systemd_reconciliation_terminal(
+                reconciliation, action=action
+            ):
                 break
 
         if attempt + 1 < _USER_SYSTEMD_RECONCILIATION_MAX_ATTEMPTS:
@@ -8758,11 +8877,13 @@ def _run_mutating_user_systemd_unit(
         ),
         "durable_fence_active": True,
         "uncertainty_fence_id": fence["fence_id"],
+        "stop_replaced_pending_job": replace_pending_job,
+        "recovered_prior_uncertainty_fence": recovering_prior_fence,
     }
 
     terminal_readback = (
         reconciliation is not None
-        and not _user_systemd_job_pending(reconciliation["Job"])
+        and _user_systemd_reconciliation_terminal(reconciliation, action=action)
     )
     if not terminal_readback:
         handoff = {
@@ -8823,9 +8944,11 @@ def _run_mutating_user_systemd_unit(
     coordination = {
         **common_coordination,
         "status": (
-            "reconciled_after_transport_uncertainty"
-            if fence_clearance_error_class is None
-            else "durable_fence_clear_unknown_after_terminal_readback"
+            "durable_fence_clear_unknown_after_terminal_readback"
+            if fence_clearance_error_class is not None
+            else "reconciled_stop_replacement"
+            if replace_pending_job
+            else "reconciled_after_transport_uncertainty"
         ),
         "requires_readback_before_next_attempt": fence_clearance_error_class is not None,
         "lease_retained": False,

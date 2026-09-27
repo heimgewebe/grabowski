@@ -120,7 +120,13 @@ USER_SYSTEMD_UNCERTAINTY_METADATA_PREFIX = "user_systemd_uncertainty_fence_v1:"
 USER_SYSTEMD_UNCERTAINTY_HISTORY_METADATA_PREFIX = "user_systemd_uncertainty_history_v1:"
 USER_SYSTEMD_UNCERTAINTY_KIND = "grabowski_user_systemd_uncertainty_fence"
 USER_SYSTEMD_UNCERTAINTY_PHASES = frozenset(
-    {"prepared", "dispatching", "outcome_unknown", "preexisting_job"}
+    {
+        "prepared",
+        "dispatching",
+        "outcome_unknown",
+        "preexisting_job",
+        "stop_recovery",
+    }
 )
 USER_SYSTEMD_UNIT_FILE_ACTIONS = frozenset({"enable", "disable"})
 RECONCILIATION_NON_CLAIMS = [
@@ -5678,7 +5684,8 @@ def _check_user_systemd_uncertainty_conflicts(
     keys: list[str],
     owner: str | None = None,
     metadata: dict[str, Any] | None = None,
-) -> None:
+    allowed_stop_recovery_fence_id: str | None = None,
+) -> bool:
     requested = set(keys)
     requested_exact_paths = [
         key.removeprefix("path:") for key in keys if key.startswith("path:")
@@ -5688,8 +5695,27 @@ def _check_user_systemd_uncertainty_conflicts(
         if owner is not None and metadata is not None
         else None
     )
+    allowed_stop_recovery_seen = False
     for _, fence in _user_systemd_uncertainties_from_connection(connection):
         if fence["cleared_at_unix"] is not None:
+            continue
+        stop_recovery_allowed = (
+            allowed_stop_recovery_fence_id is not None
+            and fence["fence_id"] == allowed_stop_recovery_fence_id
+            and owner is not None
+            and DIRECT_OPERATOR_OWNER_RE.fullmatch(owner) is not None
+            and metadata is not None
+            and metadata.get("unit") == fence["unit"]
+            and metadata.get("action") == "stop"
+            and set(fence["resource_keys"]).issubset(requested)
+            and all(
+                key == f"service:user-systemd:{fence['unit']}"
+                or key.startswith("path:")
+                for key in requested
+            )
+        )
+        if stop_recovery_allowed:
+            allowed_stop_recovery_seen = True
             continue
         overlap = sorted(requested.intersection(fence["resource_keys"]))
         if overlap:
@@ -5722,6 +5748,7 @@ def _check_user_systemd_uncertainty_conflicts(
                         fence["unit"],
                         fence["phase"],
                     )
+    return allowed_stop_recovery_seen
 
 
 def prepare_user_systemd_uncertainty_fence(
@@ -5920,6 +5947,7 @@ def acquire_resources(
     _work_admission_mode: str = "normal",
     _preserve_live_same_owner: bool = False,
     _commit_precondition: Any | None = None,
+    _user_systemd_stop_recovery_fence_id: str | None = None,
 ) -> dict[str, Any]:
     owner = _owner(owner_id)
     task_owner_match = re.fullmatch(r"task:([0-9a-f]{24})", owner)
@@ -5937,6 +5965,26 @@ def acquire_resources(
     if _preserve_live_same_owner and task_owner_match is None:
         raise PermissionError("live lease preservation requires a task owner")
     normalized_metadata: dict[str, Any] = {} if metadata is None else dict(metadata)
+    if _user_systemd_stop_recovery_fence_id is not None:
+        if (
+            not isinstance(_user_systemd_stop_recovery_fence_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", _user_systemd_stop_recovery_fence_id)
+            is None
+        ):
+            raise ValueError("user-systemd stop recovery fence id is invalid")
+        if DIRECT_OPERATOR_OWNER_RE.fullmatch(owner) is None:
+            raise PermissionError(
+                "user-systemd stop recovery requires a direct Operator owner"
+            )
+        recovery_unit = normalized_metadata.get("unit")
+        if (
+            normalized_metadata.get("action") != "stop"
+            or not isinstance(recovery_unit, str)
+            or SERVICE_RE.fullmatch(recovery_unit) is None
+        ):
+            raise PermissionError(
+                "user-systemd stop recovery requires exact stop metadata"
+            )
     if "lease_mode" in normalized_metadata:
         raise ValueError("metadata.lease_mode is not an authority surface")
     if "work_admission" in normalized_metadata:
@@ -6127,12 +6175,22 @@ def acquire_resources(
                 ).fetchone()
                 if terminalization is not None:
                     raise ValueError("terminalized task owner cannot acquire resources")
-            _check_user_systemd_uncertainty_conflicts(
+            stop_recovery_fence_matched = _check_user_systemd_uncertainty_conflicts(
                 connection,
                 keys=keys,
                 owner=owner,
                 metadata=sanitized_metadata,
+                allowed_stop_recovery_fence_id=(
+                    _user_systemd_stop_recovery_fence_id
+                ),
             )
+            if (
+                _user_systemd_stop_recovery_fence_id is not None
+                and not stop_recovery_fence_matched
+            ):
+                raise RuntimeError(
+                    "user-systemd stop recovery fence changed before acquisition"
+                )
             merge_guard_nonconflicts = _check_active_merge_guard_conflicts(
                 connection, keys=keys, metadata=sanitized_metadata, now=now
             )

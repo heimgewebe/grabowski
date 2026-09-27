@@ -53,11 +53,16 @@ def _result(*, stdout: str = "", returncode: int = 0, timed_out: bool = False) -
     }
 
 
-def _reconciliation(*, fragment: str, job: str = "") -> str:
+def _reconciliation(
+    *,
+    fragment: str,
+    job: str = "",
+    active_state: str = "active",
+) -> str:
     return "\n".join(
         [
             "LoadState=loaded",
-            "ActiveState=active",
+            f"ActiveState={active_state}",
             "SubState=running",
             "UnitFileState=enabled",
             f"Job={job}",
@@ -511,6 +516,113 @@ class UserServiceCoordinationTests(unittest.TestCase):
         resources.renew_resources.assert_not_called()
         resources.release_resources.assert_called_once()
         self.assertIsNotNone(resources._fence_state["active"])
+
+    def test_job_cancel_replaces_pending_job_and_reconciles_stop(self) -> None:
+        job = "grabowski-job-pending-cancel"
+        unit = f"{job}.service"
+        fragment = f"/home/alex/.config/systemd/user/{unit}"
+        resources = _fake_resources()
+        action_result = _result(stdout="stop queued")
+        with (
+            patch.dict(sys.modules, {"grabowski_resources": resources}),
+            patch.object(operator, "_require_operator_mutation"),
+            patch.object(
+                operator,
+                "_run",
+                side_effect=[
+                    _result(stdout=fragment + "\n"),
+                    _result(stdout=_reconciliation(fragment=fragment, job="77")),
+                    action_result,
+                    _result(
+                        stdout=_reconciliation(
+                            fragment=fragment,
+                            active_state="inactive",
+                        )
+                    ),
+                ],
+            ) as run,
+        ):
+            result = operator.grabowski_job_cancel(job)
+
+        self.assertEqual(result["returncode"], 0)
+        self.assertEqual(
+            run.call_args_list[2].args[0],
+            ["systemctl", "--user", "stop", "--job-mode=replace", unit],
+        )
+        resources.renew_resources.assert_called_once()
+        resources.clear_user_systemd_uncertainty_fence.assert_called_once()
+        self.assertEqual(
+            resources.clear_user_systemd_uncertainty_fence.call_args.kwargs[
+                "outcome"
+            ],
+            "terminal_readback",
+        )
+        coordination = result["user_service_coordination"]
+        self.assertEqual(coordination["status"], "reconciled_stop_replacement")
+        self.assertTrue(coordination["stop_replaced_pending_job"])
+        self.assertFalse(coordination["recovered_prior_uncertainty_fence"])
+        self.assertEqual(coordination["reconciliation"]["ActiveState"], "inactive")
+        self.assertFalse(coordination["durable_fence_active"])
+
+    def test_job_cancel_recovers_pending_prior_fence_with_exclusive_lease(self) -> None:
+        job = "grabowski-job-prior-fence-cancel"
+        unit = f"{job}.service"
+        service_key = f"service:user-systemd:{unit}"
+        fragment = f"/home/alex/.config/systemd/user/{unit}"
+        resources = _fake_resources()
+        resources._fence_state["active"] = {
+            "fence_id": "f" * 32,
+            "owner_id": "operator:user-systemd-prior",
+            "unit": unit,
+            "action": "start",
+            "phase": "outcome_unknown",
+            "resource_keys": [service_key, f"path:{fragment}"],
+            "lease_snapshots": [],
+            "cleared_at_unix": None,
+        }
+        action_result = _result(stdout="stop queued")
+        with (
+            patch.dict(sys.modules, {"grabowski_resources": resources}),
+            patch.object(operator, "_require_operator_mutation"),
+            patch.object(
+                operator,
+                "_run",
+                side_effect=[
+                    _result(stdout=_reconciliation(fragment=fragment, job="77")),
+                    _result(stdout=fragment + "\n"),
+                    _result(stdout=_reconciliation(fragment=fragment, job="77")),
+                    action_result,
+                    _result(
+                        stdout=_reconciliation(
+                            fragment=fragment,
+                            active_state="inactive",
+                        )
+                    ),
+                ],
+            ) as run,
+        ):
+            result = operator.grabowski_job_cancel(job)
+
+        self.assertEqual(
+            run.call_args_list[3].args[0],
+            ["systemctl", "--user", "stop", "--job-mode=replace", unit],
+        )
+        acquire = resources.acquire_resources.call_args
+        self.assertEqual(
+            acquire.kwargs["_user_systemd_stop_recovery_fence_id"],
+            "f" * 32,
+        )
+        resources.prepare_user_systemd_uncertainty_fence.assert_not_called()
+        self.assertIn(
+            call("f" * 32, phase="stop_recovery"),
+            resources.update_user_systemd_uncertainty_fence.call_args_list,
+        )
+        coordination = result["user_service_coordination"]
+        self.assertEqual(coordination["status"], "reconciled_stop_replacement")
+        self.assertTrue(coordination["stop_replaced_pending_job"])
+        self.assertTrue(coordination["recovered_prior_uncertainty_fence"])
+        self.assertEqual(coordination["reconciliation"]["ActiveState"], "inactive")
+        self.assertIsNone(resources._fence_state["active"])
 
     def test_fragment_path_drift_preserves_primary_error(self) -> None:
         resources = _fake_resources()
@@ -1237,6 +1349,76 @@ class UserServiceCoordinationTests(unittest.TestCase):
                     replacement["owner_id"],
                     [service_key],
                     expected_leases=replacement["leases"],
+                )
+
+    def test_real_resource_fence_allows_exact_stop_recovery_lease(self) -> None:
+        unit = "grabowski-durable-stop-recovery.service"
+        service_key = f"service:user-systemd:{unit}"
+        keys = [service_key]
+        owner = "operator:user-systemd-durable-stop-source"
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "resources.sqlite3"
+            with patch.object(real_resources, "RESOURCE_DB", database):
+                lease = real_resources.acquire_resources(
+                    owner,
+                    keys,
+                    purpose="prepare stop recovery fence",
+                    ttl_seconds=120,
+                    metadata={"unit": unit, "action": "start"},
+                )
+                fence = real_resources.prepare_user_systemd_uncertainty_fence(
+                    owner,
+                    keys,
+                    expected_leases=lease["leases"],
+                    unit=unit,
+                    action="start",
+                )
+                with self.assertRaises(real_resources.ResourceConflict):
+                    real_resources.acquire_resources(
+                        "operator:user-systemd-stop-recovery",
+                        keys,
+                        purpose="stop recovery cannot steal live authority",
+                        ttl_seconds=120,
+                        metadata={"unit": unit, "action": "stop"},
+                        _user_systemd_stop_recovery_fence_id=fence["fence_id"],
+                    )
+                real_resources.release_resources(
+                    owner,
+                    keys,
+                    expected_leases=lease["leases"],
+                )
+
+                with self.assertRaises(PermissionError):
+                    real_resources.acquire_resources(
+                        "operator:user-systemd-stop-recovery",
+                        keys,
+                        purpose="wrong action cannot bypass fence",
+                        ttl_seconds=120,
+                        metadata={"unit": unit, "action": "restart"},
+                        _user_systemd_stop_recovery_fence_id=fence["fence_id"],
+                    )
+
+                recovery = real_resources.acquire_resources(
+                    "operator:user-systemd-stop-recovery",
+                    keys,
+                    purpose="bound stop recovery may cross exact fence",
+                    ttl_seconds=120,
+                    metadata={"unit": unit, "action": "stop"},
+                    _user_systemd_stop_recovery_fence_id=fence["fence_id"],
+                )
+                self.assertEqual(
+                    [item["resource_key"] for item in recovery["leases"]],
+                    keys,
+                )
+                real_resources.release_resources(
+                    recovery["owner_id"],
+                    keys,
+                    expected_leases=recovery["leases"],
+                )
+                real_resources.clear_user_systemd_uncertainty_fence(
+                    fence["fence_id"],
+                    outcome="terminal_readback",
+                    evidence_sha256="e" * 64,
                 )
 
     def test_real_resource_fence_allows_disjoint_unit_and_second_fence(self) -> None:
