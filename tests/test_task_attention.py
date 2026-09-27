@@ -2537,6 +2537,508 @@ class TaskAttentionTests(unittest.TestCase):
         )
         self.assertEqual(0, reconciled["convergence_excluded_attention_count"])
 
+    def test_bounded_current_reconciliation_matches_global_for_failed_retry_successor(
+        self,
+    ) -> None:
+        source, successor = self._verified_retry_pair()
+
+        global_page = attention.reconcile_attention({"limit": 20, "view": "current"})
+        bounded_page = attention.reconcile_attention(
+            {"limit": 20, "view": "current"},
+            _bounded_current_projection=True,
+        )
+
+        self.assertEqual(
+            [
+                (item["task_id"], item["classification"])
+                for item in global_page["records"]
+            ],
+            [
+                (item["task_id"], item["classification"])
+                for item in bounded_page["records"]
+            ],
+        )
+        self.assertNotIn(
+            source["task_id"], {item["task_id"] for item in bounded_page["records"]}
+        )
+        self.assertIn(
+            successor["task_id"], {item["task_id"] for item in bounded_page["records"]}
+        )
+        self.assertEqual(global_page["pagination"], bounded_page["pagination"])
+        self.assertEqual(
+            "verified_bounded",
+            bounded_page["attention_convergence_status"],
+        )
+        self.assertFalse(bounded_page["current_attention_exact"])
+        self.assertIsNone(bounded_page["current_attention_count"])
+
+    def test_bounded_current_reconciliation_matches_global_for_running_retry_successor(
+        self,
+    ) -> None:
+        source, successor = self._verified_retry_pair(successor_state="running")
+        global_page = attention.reconcile_attention({"limit": 20, "view": "current"})
+        bounded_page = attention.reconcile_attention(
+            {"limit": 20, "view": "current"},
+            _bounded_current_projection=True,
+        )
+        self.assertEqual(
+            [item["task_id"] for item in global_page["records"]],
+            [item["task_id"] for item in bounded_page["records"]],
+        )
+        self.assertNotIn(
+            source["task_id"], {item["task_id"] for item in bounded_page["records"]}
+        )
+        self.assertNotIn(
+            successor["task_id"], {item["task_id"] for item in bounded_page["records"]}
+        )
+
+    def test_bounded_current_reconciliation_matches_global_for_completed_retry_successor(
+        self,
+    ) -> None:
+        source, successor = self._verified_retry_pair(successor_state="completed")
+        global_page = attention.reconcile_attention({"limit": 20, "view": "current"})
+        bounded_page = attention.reconcile_attention(
+            {"limit": 20, "view": "current"},
+            _bounded_current_projection=True,
+        )
+        self.assertEqual(
+            [item["task_id"] for item in global_page["records"]],
+            [item["task_id"] for item in bounded_page["records"]],
+        )
+        self.assertNotIn(
+            source["task_id"], {item["task_id"] for item in bounded_page["records"]}
+        )
+        self.assertNotIn(
+            successor["task_id"], {item["task_id"] for item in bounded_page["records"]}
+        )
+
+    def test_bounded_current_reconciliation_keeps_source_visible_on_invalid_retry_binding(
+        self,
+    ) -> None:
+        source, successor = self._verified_retry_pair(successor_state="running")
+        successor_row = tasks._row_raw(str(successor["task_id"]))
+        launcher = json.loads(str(successor_row["launcher_json"]))
+        launcher["retry_binding"]["context_sha256"] = "0" * 64
+        with tasks._database() as connection:
+            connection.execute(
+                "UPDATE tasks SET launcher_json=? WHERE task_id=?",
+                (
+                    json.dumps(
+                        launcher,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    successor["task_id"],
+                ),
+            )
+        bounded_page = attention.reconcile_attention(
+            {"limit": 20, "view": "current"},
+            _bounded_current_projection=True,
+        )
+        self.assertIn(
+            source["task_id"], {item["task_id"] for item in bounded_page["records"]}
+        )
+        self.assertEqual("degraded", bounded_page["attention_convergence_status"])
+        self.assertEqual(
+            "TerminalConvergenceError", bounded_page["attention_convergence_error"]
+        )
+
+    def test_bounded_current_reconciliation_real_retry_regression_ids(self) -> None:
+        source_id = "8c4f3695d4ee45d5860db920"
+        successor_id = "a0e657d90365447aa32a908c"
+        ids = [
+            types.SimpleNamespace(hex=source_id + "00000000"),
+            types.SimpleNamespace(hex=successor_id + "00000000"),
+        ]
+        with patch.object(tasks.uuid, "uuid4", side_effect=ids):
+            source, successor = self._verified_retry_pair(successor_state="completed")
+        self.assertEqual(source_id, source["task_id"])
+        self.assertEqual(successor_id, successor["task_id"])
+        bounded_page = attention.reconcile_attention(
+            {"limit": 20, "view": "current"},
+            _bounded_current_projection=True,
+        )
+        self.assertNotIn(
+            source_id, {item["task_id"] for item in bounded_page["records"]}
+        )
+        self.assertNotIn(
+            successor_id, {item["task_id"] for item in bounded_page["records"]}
+        )
+
+    def test_bounded_current_reconciliation_does_not_use_global_projection(
+        self,
+    ) -> None:
+        self._failed_task()
+        with patch.object(
+            attention,
+            "current_attention_projection",
+            side_effect=AssertionError("global projection called"),
+        ):
+            page = attention.reconcile_attention(
+                {"limit": 1, "view": "current"},
+                _bounded_current_projection=True,
+            )
+        self.assertEqual(1, len(page["records"]))
+
+    def _retry_binding_for_source(self, source: dict[str, object]) -> dict[str, object]:
+        import hashlib
+
+        identity = terminal_convergence.attention_execution_identity(source)
+        assert identity is not None
+        observed_at = int(
+            source.get("terminalized_at_unix")
+            or source.get("updated_at_unix")
+            or source["created_at_unix"]
+        )
+        material = {
+            "schema_version": 1,
+            "kind": "grabowski_named_terminal_retry",
+            "source_task_id": source["task_id"],
+            "source_attempt": source["attempt"],
+            "source_state": source["state"],
+            "source_resume_policy": source["resume_policy"],
+            "source_lifecycle_receipt_sha256": source["lifecycle_receipt_sha256"],
+            "source_terminalization_sha256": source["terminalization_sha256"],
+            "source_execution_identity_sha256": identity,
+            "named_state_change": "bounded convergence regression",
+            "observed_at_unix": observed_at,
+            "does_not_establish": [
+                "that_the_named_change_is_sufficient",
+                "that_the_retry_will_succeed",
+                "automatic_retry_authority",
+            ],
+        }
+        return {
+            **material,
+            "context_sha256": hashlib.sha256(
+                json.dumps(
+                    material,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+        }
+
+    def test_bounded_current_reconciliation_crosses_raw_batch_boundary(self) -> None:
+        source, successor = self._verified_retry_pair()
+
+        with patch.object(attention, "MAX_PAGE_LIMIT", 1):
+            global_page = attention.reconcile_attention({"limit": 1, "view": "current"})
+            bounded_page = attention.reconcile_attention(
+                {"limit": 1, "view": "current"},
+                _bounded_current_projection=True,
+            )
+
+        self.assertEqual(
+            [
+                (item["task_id"], item["classification"])
+                for item in global_page["records"]
+            ],
+            [
+                (item["task_id"], item["classification"])
+                for item in bounded_page["records"]
+            ],
+        )
+        self.assertEqual(global_page["pagination"], bounded_page["pagination"])
+        self.assertNotIn(
+            source["task_id"],
+            {item["task_id"] for item in bounded_page["records"]},
+        )
+        self.assertIn(
+            successor["task_id"],
+            {item["task_id"] for item in bounded_page["records"]},
+        )
+
+    def test_bounded_current_retry_support_count_is_unique_across_raw_batches(
+        self,
+    ) -> None:
+        visible = self._failed_task()
+        source, middle = self._verified_retry_pair(successor_state="failed")
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 125},
+            ),
+        ):
+            resumed = tasks.reconcile_tasks_resume(
+                task_id=str(middle["task_id"]),
+                max_resumes=1,
+                reason="second verified retry in chain",
+            )
+        tail_id = str(resumed["resumed"][0]["task_id"])
+
+        with patch.object(attention, "MAX_PAGE_LIMIT", 1):
+            global_page = attention.reconcile_attention(
+                {"limit": 1, "view": "current"}
+            )
+            bounded_page = attention.reconcile_attention(
+                {"limit": 1, "view": "current"},
+                _bounded_current_projection=True,
+            )
+
+        self.assertEqual(
+            [visible["task_id"]],
+            [item["task_id"] for item in bounded_page["records"]],
+        )
+        self.assertEqual(
+            [item["task_id"] for item in global_page["records"]],
+            [item["task_id"] for item in bounded_page["records"]],
+        )
+        self.assertEqual(
+            global_page["pagination"],
+            bounded_page["pagination"],
+        )
+        self.assertEqual(3, bounded_page["pagination"]["scanned_raw"])
+        self.assertEqual(1, global_page["retry_successor_record_count"])
+        self.assertEqual(
+            global_page["retry_successor_record_count"],
+            bounded_page["retry_successor_record_count"],
+        )
+        self.assertNotIn(
+            source["task_id"],
+            {item["task_id"] for item in bounded_page["records"]},
+        )
+        self.assertNotIn(
+            middle["task_id"],
+            {item["task_id"] for item in bounded_page["records"]},
+        )
+        self.assertNotEqual(tail_id, visible["task_id"])
+
+    def test_bounded_current_reconciliation_budget_exhaustion_fails_visible(
+        self,
+    ) -> None:
+        source, _successor = self._verified_retry_pair()
+
+        with patch.object(attention, "MAX_CURRENT_LOCAL_CONVERGENCE_ROWS", 1):
+            bounded_page = attention.reconcile_attention(
+                {"limit": 20, "view": "current"},
+                _bounded_current_projection=True,
+            )
+
+        self.assertEqual("degraded", bounded_page["attention_convergence_status"])
+        self.assertEqual(
+            "bounded retry convergence row limit exceeded",
+            bounded_page["attention_convergence_error"],
+        )
+        self.assertIn(
+            source["task_id"],
+            {item["task_id"] for item in bounded_page["records"]},
+        )
+
+    def test_bounded_current_reconciliation_self_reference_fails_visible(self) -> None:
+        source, successor = self._verified_retry_pair()
+        row = tasks._row_raw(str(successor["task_id"]))
+        launcher = json.loads(str(row["launcher_json"]))
+        binding = dict(launcher["retry_binding"])
+        binding["source_task_id"] = successor["task_id"]
+        material = {
+            key: value for key, value in binding.items() if key != "context_sha256"
+        }
+        import hashlib
+
+        binding["context_sha256"] = hashlib.sha256(
+            json.dumps(
+                material,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        launcher["retry_binding"] = binding
+        with tasks._database() as connection:
+            connection.execute(
+                "UPDATE tasks SET launcher_json=? WHERE task_id=?",
+                (
+                    json.dumps(
+                        launcher,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    successor["task_id"],
+                ),
+            )
+
+        page = attention.reconcile_attention(
+            {"limit": 20, "view": "current"},
+            _bounded_current_projection=True,
+        )
+
+        self.assertEqual("degraded", page["attention_convergence_status"])
+        self.assertEqual(
+            "TerminalConvergenceError", page["attention_convergence_error"]
+        )
+        self.assertIn(
+            source["task_id"],
+            {item["task_id"] for item in page["records"]},
+        )
+
+    def test_bounded_current_reconciliation_multiple_successors_fail_visible(
+        self,
+    ) -> None:
+        source, successor = self._verified_retry_pair()
+        common = {
+            "host": "local",
+            "argv": ["/bin/echo", "verified-retry"],
+            "cwd": str(self.root),
+            "runtime_seconds": 61,
+            "resume_policy": "retry-safe",
+            "cpu_weight": 50,
+            "io_weight": 25,
+            "memory_max_bytes": 64 * 1024 * 1024,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 124},
+            ),
+        ):
+            second_successor = tasks.grabowski_task_start(**common)["task"]
+        second_successor = tasks._set_state(
+            str(second_successor["task_id"]),
+            "failed",
+            observation={"state": "failed", "source": "second-successor"},
+        )
+        first_launcher = json.loads(
+            str(tasks._row_raw(str(successor["task_id"]))["launcher_json"])
+        )
+        first_row = tasks._row_raw(str(successor["task_id"]))
+        second_row = tasks._row_raw(str(second_successor["task_id"]))
+        second_launcher = json.loads(str(second_row["launcher_json"]))
+        second_launcher["retry_binding"] = dict(first_launcher["retry_binding"])
+        identity_columns = (
+            "host",
+            "argv_json",
+            "argv_sha256",
+            "cwd",
+            "resource_keys_json",
+            "runtime_seconds",
+            "cpu_weight",
+            "io_weight",
+            "memory_max_bytes",
+            "chronik_outbox_enabled",
+            "chronik_outbox_state_root",
+            "chronik_context_json",
+            "execution_backend",
+            "systemd_scope",
+        )
+        assignments = ", ".join(f"{column}=?" for column in identity_columns)
+        with tasks._database() as connection:
+            connection.execute(
+                f"UPDATE tasks SET launcher_json=?, {assignments} WHERE task_id=?",
+                (
+                    json.dumps(
+                        second_launcher,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    *(first_row[column] for column in identity_columns),
+                    second_successor["task_id"],
+                ),
+            )
+
+        page = attention.reconcile_attention(
+            {"limit": 20, "view": "current"},
+            _bounded_current_projection=True,
+        )
+
+        self.assertEqual("degraded", page["attention_convergence_status"])
+        self.assertEqual(
+            "TerminalConvergenceError", page["attention_convergence_error"]
+        )
+        self.assertIn(
+            source["task_id"],
+            {item["task_id"] for item in page["records"]},
+        )
+
+    def test_bounded_current_reconciliation_cycle_fails_visible(self) -> None:
+        source, successor = self._verified_retry_pair()
+        successor = tasks._row(str(successor["task_id"]))
+        reverse_binding = self._retry_binding_for_source(successor)
+        observed_at = int(reverse_binding["observed_at_unix"])
+        source_row = tasks._row_raw(str(source["task_id"]))
+        source_launcher = json.loads(str(source_row["launcher_json"]))
+        source_launcher["retry_binding"] = reverse_binding
+        with tasks._database() as connection:
+            connection.execute(
+                "UPDATE tasks SET launcher_json=?, created_at_unix=? WHERE task_id=?",
+                (
+                    json.dumps(
+                        source_launcher,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    observed_at + 1,
+                    source["task_id"],
+                ),
+            )
+
+        page = attention.reconcile_attention(
+            {"limit": 20, "view": "current"},
+            _bounded_current_projection=True,
+        )
+
+        self.assertEqual("degraded", page["attention_convergence_status"])
+        self.assertEqual(
+            "TerminalConvergenceError", page["attention_convergence_error"]
+        )
+        self.assertIn(
+            source["task_id"],
+            {item["task_id"] for item in page["records"]},
+        )
+
+    def test_attention_select_projection_excludes_bulk_columns(self) -> None:
+        self.assertNotIn("argv_json", attention._ATTENTION_SELECT_COLUMNS)
+        self.assertIn("launcher_json", attention._ATTENTION_SELECT_COLUMNS)
+        self.assertIn("last_observation_json", attention._ATTENTION_SELECT_COLUMNS)
+
+    def test_bounded_current_reconciliation_rejects_history_view(self) -> None:
+        with self.assertRaisesRegex(
+            attention.TaskAttentionInputError,
+            "bounded current projection requires current view",
+        ):
+            attention.reconcile_attention(
+                {"limit": 1, "view": "history"},
+                _bounded_current_projection=True,
+            )
+
+    def test_bounded_current_reconciliation_malformed_retry_json_fails_visible(
+        self,
+    ) -> None:
+        source, successor = self._verified_retry_pair(successor_state="running")
+        with tasks._database() as connection:
+            connection.execute(
+                "UPDATE tasks SET launcher_json=? WHERE task_id=?",
+                ('{"retry_binding":', successor["task_id"]),
+            )
+
+        page = attention.reconcile_attention(
+            {"limit": 20, "view": "current"},
+            _bounded_current_projection=True,
+        )
+
+        self.assertEqual("degraded", page["attention_convergence_status"])
+        self.assertEqual(
+            "TerminalConvergenceError",
+            page["attention_convergence_error"],
+        )
+        self.assertIn(
+            source["task_id"],
+            {item["task_id"] for item in page["records"]},
+        )
+
     def test_current_attention_projection_separates_operational_signal_from_raw_history(self) -> None:
         closed = self._failed_task()
         attention.record_decision(self._parameters(closed, decision="closed"))
