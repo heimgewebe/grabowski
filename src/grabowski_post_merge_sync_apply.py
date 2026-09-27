@@ -654,6 +654,24 @@ def apply(
             *_physical_checkout_resource_keys(initial_physical),
         ]
     )
+    scope_manifest = {
+        "schema_version": 1,
+        "repository": str(repo),
+        "task_id": f"post-merge-sync-{preimage_sha256[:16]}",
+        "base_head": expected_local_head,
+        "head": expected_remote_head,
+        "branch": target_branch,
+        "worktree": str(repo),
+        "effects": ["worktree-admin"],
+        "paths": [str(repo)],
+        "components": [],
+        "runtime_resources": [],
+        "processes": [],
+        "deployments": [],
+        "migrations": [],
+        "generated_artifacts": [],
+        "shared_gates": ["repository-worktree-admin"],
+    }
     try:
         acquisition = resources.acquire_resources(
             owner_id,
@@ -663,6 +681,7 @@ def apply(
                 f"{target_branch}@{expected_remote_head[:12]}"
             ),
             ttl_seconds=LEASE_TTL_SECONDS,
+            metadata={"scope_manifest": scope_manifest},
             _work_admission_mode="convergence",
         )
     except Exception as exc:

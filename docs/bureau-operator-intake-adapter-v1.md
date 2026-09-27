@@ -2,18 +2,23 @@
 
 ## Zweck
 
-Der Adapter stellt den in Bureau definierten Operator-Intake-Vertrag als schmale Grabowski-Werkzeuge bereit. Bureau bleibt alleinige Quelle für Kandidaten-, Bewertungs-, Proposal- und Publikationssemantik. Grabowski besitzt nur Transport, private Artefakte, Laufzeitbindung, Leases, Audit und begrenzten Ambiguitäts-Readback.
+Der Adapter stellt den in Bureau definierten Operator-Intake-Vertrag als schmale Grabowski-Werkzeuge bereit. Bureau bleibt alleinige Quelle für Acceptance-, Kandidaten-, Bewertungs-, Proposal- und Publikationssemantik. Grabowski besitzt nur Transport, private Artefakte, Laufzeitbindung, Leases, Audit und begrenzten Ambiguitäts-Readback.
 
 ## Werkzeuge
 
 | Werkzeug | Wirkung |
 |---|---|
+| `grabowski_bureau_acceptance_authenticate` | Authentifiziert genau ein run-/criterion-/digest-/reviewer-gebundenes manuelles Acceptance-Item über Bureaus kanonischen StateStore-Journalvertrag. |
 | `grabowski_bureau_candidate_record` | Hängt einen quellgebundenen Kandidaten oder eine append-only Korrektur idempotent an das Bureau Live Register an. |
 | `grabowski_bureau_candidate_assess` | Bewertet einen Kandidaten read-only gegen aktuelle Registry- und Live-Register-Wahrheit. |
 | `grabowski_bureau_task_propose` | Erzeugt ein digestgebundenes privates Proposal-Artefakt; Registry und Queue bleiben unverändert. |
 | `grabowski_bureau_task_review` | Prüft exakt den angegebenen Proposal-Digest und erzeugt `reviewed_plan`-Approval-Evidenz; Reviewzeitpunkt kommt ausschließlich aus Bureau. |
 | `grabowski_bureau_task_publish_preview` | Validiert ein Proposal und liefert die exakt benötigten Publikationsressourcen ohne Wirkung. |
 | `grabowski_bureau_task_publish` | Erwirbt zwei exakte Kurzleasen, publiziert Branch und Pull Request und gibt Leases nur nach eindeutigem Ausgang frei. |
+
+## Acceptance-Authentifizierung
+
+`grabowski_bureau_acceptance_authenticate` besitzt keine eigene Acceptance-Domänenlogik. Grabowski validiert nur die vier Transportfelder `run_id`, `criterion_id`, `expected_evidence_sha256` und `reviewer`, ruft den immutable Bureau-Launcher mit `acceptance-authenticate` und explizitem State-Root auf und behandelt Mutationsambiguität als rungebundene Readback-Pflicht. Current-run revision, Evidence-Digest, Observation-Scope, Reviewer-Trennung, Journal-Idempotenz und Authentifizierungswahrheit bleiben ausschließlich bei Bureau.
 
 ## Kandidaten-Refinement
 
