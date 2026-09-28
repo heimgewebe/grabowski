@@ -3156,6 +3156,7 @@ def stage_repoground_manifest(
             state_root / "repoground-manifest-runtime", prefix="bundle-"
         )
         artifact_bindings: list[dict[str, Any]] = []
+        artifact_bytes_staged = 0
         for relative, candidate, expected_bytes, expected_sha256 in artifact_paths:
             try:
                 metadata = candidate.lstat()
@@ -3165,10 +3166,21 @@ def stage_repoground_manifest(
                 raise RunnerError(
                     "RepoGround bundle artifact must be a regular non-symlink file"
                 )
+            remaining_bytes = (
+                MAX_MCP_MANIFEST_ARTIFACT_BYTES - artifact_bytes_staged
+            )
+            if (
+                remaining_bytes < 0
+                or metadata.st_size != expected_bytes
+                or expected_bytes > remaining_bytes
+            ):
+                raise RunnerError(
+                    "RepoGround bundle artifact size does not match its bounded manifest identity"
+                )
             _snapshot, artifact_raw = _runtime_file_snapshot(
                 candidate,
                 label=f"RepoGround bundle artifact {relative}",
-                max_bytes=MAX_PROVIDER_EXECUTABLE_BYTES,
+                max_bytes=min(expected_bytes, remaining_bytes),
             )
             if (
                 len(artifact_raw) != expected_bytes
@@ -3177,6 +3189,7 @@ def stage_repoground_manifest(
                 raise RunnerError(
                     "RepoGround bundle artifact changed after preflight authorization"
                 )
+            artifact_bytes_staged += len(artifact_raw)
             _write_private_relative_file(stage_fd, relative, artifact_raw)
             staged_artifact = stage_root / relative
             artifact_bound = _bind_mcp_file(
@@ -3782,6 +3795,7 @@ def stage_mcp_upstream(
             raise RunnerError("staged MCP bundle manifest SHA mismatch")
 
         manifest_artifact_bindings: list[dict[str, Any]] = []
+        manifest_artifact_bytes_staged = 0
         for relative, candidate, expected_bytes, expected_sha256 in manifest_artifacts:
             try:
                 metadata = candidate.lstat()
@@ -3789,16 +3803,29 @@ def stage_mcp_upstream(
                 raise RunnerError("MCP bundle artifact is unavailable") from exc
             if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
                 raise RunnerError("MCP bundle artifact must be a regular non-symlink file")
+            remaining_bytes = (
+                MAX_MCP_MANIFEST_ARTIFACT_BYTES
+                - manifest_artifact_bytes_staged
+            )
+            if (
+                remaining_bytes < 0
+                or metadata.st_size != expected_bytes
+                or expected_bytes > remaining_bytes
+            ):
+                raise RunnerError(
+                    "MCP bundle artifact size does not match its bounded manifest identity"
+                )
             _snapshot, artifact_raw = _runtime_file_snapshot(
                 candidate,
                 label=f"MCP bundle artifact {relative}",
-                max_bytes=MAX_PROVIDER_EXECUTABLE_BYTES,
+                max_bytes=min(expected_bytes, remaining_bytes),
             )
             if (
                 len(artifact_raw) != expected_bytes
                 or sha_bytes(artifact_raw) != expected_sha256
             ):
                 raise RunnerError("MCP bundle artifact changed before private staging")
+            manifest_artifact_bytes_staged += len(artifact_raw)
             staged_relative = Path("manifest") / relative
             _write_private_relative_file(
                 stage_fd,

@@ -5177,6 +5177,98 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     runner.stage_repoground_manifest(state_root, expected)
 
 
+    def test_manifest_stages_reject_declared_size_mismatch_before_content_read(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "state"
+            state_root.mkdir(mode=0o700)
+            bundle = root / "bundle"
+            bundle.mkdir()
+            artifact = bundle / "brief.md"
+            artifact.write_bytes(b"actual artifact bytes\n")
+            manifest = bundle / "chosen.bundle.manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "artifacts": [
+                            {
+                                "role": "canonical_md",
+                                "path": "brief.md",
+                                "bytes": 1,
+                                "sha256": hashlib.sha256(b"x").hexdigest(),
+                            }
+                        ]
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            original_snapshot = runner._runtime_file_snapshot
+
+            def reject_first_stage_artifact_read(path, *, label, max_bytes):
+                if label.startswith("RepoGround bundle artifact "):
+                    raise AssertionError(
+                        "first stage must reject actual size before artifact content read"
+                    )
+                return original_snapshot(
+                    path, label=label, max_bytes=max_bytes
+                )
+
+            with patch.object(
+                runner,
+                "_runtime_file_snapshot",
+                side_effect=reject_first_stage_artifact_read,
+            ):
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "artifact size does not match its bounded manifest identity",
+                ):
+                    runner.stage_repoground_manifest(
+                        state_root, file_identity(manifest)
+                    )
+
+            executable = Path(sys.executable).resolve()
+            script = root / "server.py"
+            script.write_text("pass\n", encoding="utf-8")
+            authorized = [
+                file_identity(executable),
+                file_identity(script),
+                file_identity(manifest),
+            ]
+            upstream = [
+                str(executable),
+                str(script),
+                "--bundle-root",
+                str(manifest),
+            ]
+
+            def reject_second_stage_artifact_read(path, *, label, max_bytes):
+                if label.startswith("MCP bundle artifact "):
+                    raise AssertionError(
+                        "second stage must reject actual size before artifact content read"
+                    )
+                return original_snapshot(
+                    path, label=label, max_bytes=max_bytes
+                )
+
+            with patch.object(
+                runner,
+                "_runtime_file_snapshot",
+                side_effect=reject_second_stage_artifact_read,
+            ):
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "artifact size does not match its bounded manifest identity",
+                ):
+                    runner.stage_mcp_upstream(
+                        state_root,
+                        upstream,
+                        manifest,
+                        authorized,
+                    )
+
     def test_staged_manifest_rejects_artifact_content_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -5206,7 +5298,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             expected = file_identity(manifest)
-            artifact.write_bytes(b"replaced after preflight\n")
+            artifact.write_bytes(b"x" * len(authorized))
 
             with self.assertRaisesRegex(
                 runner.RunnerError,
