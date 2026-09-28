@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 import os
 import shutil
@@ -149,6 +150,8 @@ class BureauControlCheckoutTests(unittest.TestCase):
         )
 
     def test_refresh_recreates_externally_deleted_control_checkout(self) -> None:
+        import grabowski_checkouts as checkout_store
+
         shared_head = self._git(self.shared, "rev-parse", "HEAD")
         (self.shared / "workbench-only.txt").write_text(
             "foreign work\n", encoding="utf-8"
@@ -156,10 +159,55 @@ class BureauControlCheckoutTests(unittest.TestCase):
         import shutil
         shutil.rmtree(self.control)
         expected = self._advance_remote()
+        state = {"held": False}
+        observed = {"remove": False, "add": False}
+        original_run = bureau._run_control_git
 
-        result = bureau.refresh_bureau_control_checkout()
+        @contextmanager
+        def operation_lock():
+            self.assertFalse(state["held"])
+            state["held"] = True
+            try:
+                yield
+            finally:
+                state["held"] = False
+
+        def observed_run(
+            repository: Path,
+            arguments: list[str],
+            *,
+            timeout_seconds: int = 60,
+        ) -> str:
+            if arguments[:2] == ["worktree", "remove"]:
+                observed["remove"] = True
+                self.assertTrue(state["held"])
+            if arguments[:2] == ["worktree", "add"]:
+                observed["add"] = True
+                self.assertTrue(state["held"])
+            return original_run(
+                repository,
+                arguments,
+                timeout_seconds=timeout_seconds,
+            )
+
+        with (
+            mock.patch.object(
+                checkout_store,
+                "_operation_lock",
+                operation_lock,
+            ),
+            mock.patch.object(
+                bureau,
+                "_run_control_git",
+                side_effect=observed_run,
+            ),
+        ):
+            result = bureau.refresh_bureau_control_checkout()
 
         self.assertTrue(result["recreated"])
+        self.assertTrue(observed["remove"])
+        self.assertTrue(observed["add"])
+        self.assertFalse(state["held"])
         self.assertTrue(result["updated"])
         self.assertIsNone(result["previous_head"])
         self.assertEqual(result["head"], expected)
