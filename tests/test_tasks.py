@@ -11418,6 +11418,76 @@ class TaskTests(unittest.TestCase):
         rows = tasks.grabowski_task_list(limit=20, view="evidence")
         self.assertEqual(1, rows["total_matching"])
 
+    def test_active_resource_execution_reuse_refreshes_lease_and_fails_closed(
+        self,
+    ) -> None:
+        key = "component:active-reuse-lease-conflict"
+        common = {
+            "host": "local",
+            "argv": ["/bin/echo", "active-resource-execution"],
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "resume_policy": "verify-then-retry",
+            "cpu_weight": 50,
+            "io_weight": 25,
+            "memory_max_bytes": 64 * 1024 * 1024,
+            "resource_keys": [key],
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
+            ),
+        ):
+            first = tasks.grabowski_task_start(**common)
+        task_id = str(first["task"]["task_id"])
+        tasks._set_state(
+            task_id,
+            "running",
+            observation={
+                "state": "running",
+                "observed_at_unix": tasks._now(),
+                "properties": {"ActiveState": "active", "SubState": "running"},
+            },
+        )
+        owner = str(first["task"]["lease_owner_id"])
+        tasks.resources.release_resources(owner, [key])
+        foreign_owner = "test:foreign-active-reuse"
+        tasks.resources.acquire_resources(
+            foreign_owner,
+            [key],
+            purpose="foreign active reuse conflict",
+            ttl_seconds=3600,
+        )
+        running = {
+            "state": "running",
+            "properties": {"ActiveState": "active", "SubState": "running"},
+            "probe": _launcher(),
+            "observer": {"kind": "test"},
+            "observed_at_unix": tasks._now(),
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks, "_observe", return_value=running) as observe,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
+            ),
+            self.assertRaisesRegex(
+                RuntimeError, "active execution resource lease maintenance failed"
+            ),
+        ):
+            tasks.grabowski_task_start(**common)
+        observe.assert_called_once()
+        dispatch.assert_not_called()
+        lease = tasks.resources.inspect_resource(key)
+        self.assertIsNotNone(lease)
+        assert lease is not None
+        self.assertEqual(foreign_owner, lease["owner_id"])
+
     def test_active_execution_identity_scan_skips_newer_operation_bound_rows(self) -> None:
         common = {
             "host": "local",
@@ -11699,11 +11769,18 @@ class TaskTests(unittest.TestCase):
             },
         )
 
+        running = {
+            "state": "running",
+            "properties": {"ActiveState": "active", "SubState": "running"},
+            "probe": _launcher(),
+            "observer": {"kind": "test"},
+            "observed_at_unix": tasks._now(),
+        }
         with (
             patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
             patch.object(tasks, "_chronik_context", return_value=host_context),
             patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
-            patch.object(tasks, "_observe") as observe,
+            patch.object(tasks, "_observe", return_value=running) as observe,
             patch.object(tasks.base, "_append_audit"),
             patch.object(
                 tasks, "_require_recovery_gate", return_value={"checked_at_unix": 200}
@@ -11711,7 +11788,7 @@ class TaskTests(unittest.TestCase):
         ):
             retried = tasks.grabowski_task_start(**common)
         dispatch.assert_not_called()
-        observe.assert_not_called()
+        observe.assert_called_once()
         self.assertEqual(task_id, retried["task"]["task_id"])
         self.assertEqual(
             "active_execution_identity",
@@ -11843,6 +11920,82 @@ class TaskTests(unittest.TestCase):
         ):
             tasks.grabowski_task_start(**common)
         dispatch.assert_not_called()
+
+    def test_attention_execution_scan_filters_stable_context_before_cap(
+        self,
+    ) -> None:
+        outbox_root = self.root / "chronik-attention-cap-state"
+        target_context = tasks._canonical_json(
+            {
+                "subject_scope": "repository",
+                "repo": "heimgewebe/grabowski",
+                "operation": "implement",
+                "task_class": "coding",
+                "component": "target",
+            }
+        )
+        common = {
+            "host": "local",
+            "argv": ["/bin/echo", "chronik-attention-cap"],
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "chronik_outbox": True,
+            "chronik_outbox_state_root": str(outbox_root),
+            "chronik_operation": "implement",
+            "chronik_component": "target",
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_chronik_context", return_value=target_context),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 207}
+            ),
+        ):
+            started = tasks.grabowski_task_start(**common)
+        relevant_id = str(started["task"]["task_id"])
+        tasks._set_state(
+            relevant_id,
+            "failed",
+            observation={"state": "failed", "observed_at_unix": tasks._now()},
+        )
+        relevant = tasks._row_raw(relevant_id)
+        columns = tuple(relevant)
+        with tasks._database() as connection:
+            for offset, (task_id, component) in enumerate(
+                (("e" * 24, "other-a"), ("f" * 24, "other-b")),
+                start=1,
+            ):
+                clone = dict(relevant)
+                clone["task_id"] = task_id
+                clone["unit"] = tasks._task_unit(task_id, 1)
+                clone["authoritative_unit"] = clone["unit"]
+                clone["lease_owner_id"] = f"task:{task_id}"
+                clone["created_at_unix"] = int(relevant["created_at_unix"]) + offset
+                clone["updated_at_unix"] = int(relevant["updated_at_unix"]) + offset
+                clone["chronik_context_json"] = tasks._canonical_json(
+                    {
+                        "subject_scope": "host",
+                        "host": "local",
+                        "operation": "implement",
+                        "task_class": "coding",
+                        "component": component,
+                    }
+                )
+                connection.execute(
+                    f"INSERT INTO tasks ({','.join(columns)}) VALUES "
+                    f"({','.join('?' for _ in columns)})",
+                    tuple(clone[column] for column in columns),
+                )
+            connection.commit()
+        identity = tasks._record_execution_identity(relevant)
+        with patch.object(tasks, "EXECUTION_ATTENTION_MATCH_LIMIT", 1):
+            records = tasks._matching_attention_execution_records(identity)
+        self.assertEqual(
+            [relevant_id],
+            [record["task_id"] for record in records],
+        )
 
     def test_chronik_stable_context_change_does_not_reuse_completed_execution(
         self,

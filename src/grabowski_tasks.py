@@ -114,6 +114,7 @@ JUST_TOKEN = re.compile(r"(?:^|[^A-Za-z0-9_])just(?:$|[^A-Za-z0-9_])")
 MAKE_TOKEN = re.compile(r"(?:^|[^A-Za-z0-9_])make(?:$|[^A-Za-z0-9_])")
 MAX_BUILD_SCRIPT_INSPECTION_BYTES = 256 * 1024
 MANAGED_CARGO_ATTENTION_MATCH_LIMIT = 50_000
+EXECUTION_ATTENTION_MATCH_LIMIT = 50_000
 DEFAULT_TASK_LIST_LIMIT = 20
 TASK_OUTPUT_ROOT = Path(operator.STATE_DIR) / "task-output"
 TASK_OUTPUT_LEGACY_ROOT = Path(operator.HOME)
@@ -4512,6 +4513,16 @@ def _chronik_retry_match_context(
     }
 
 
+CHRONIK_RETRY_CONTEXT_SQL_PREDICATE = (
+    "json_remove(chronik_context_json, '$.subject_scope', '$.host', '$.repo') IS ?"
+)
+
+
+def _chronik_retry_match_context_json(identity: dict[str, Any]) -> str | None:
+    context = _chronik_retry_match_context(identity.get("chronik_context"))
+    return _canonical_json(context) if context is not None else None
+
+
 def _execution_retry_match_projection(
     identity: dict[str, Any],
     *,
@@ -4573,6 +4584,7 @@ def _latest_matching_execution_record(
             "AND resource_keys_json=? AND runtime_seconds=? AND cpu_weight=? "
             "AND io_weight=? AND memory_max_bytes IS ? "
             "AND chronik_outbox_enabled=? AND chronik_outbox_state_root IS ? "
+            f"AND {CHRONIK_RETRY_CONTEXT_SQL_PREDICATE} "
             "AND execution_backend=? AND systemd_scope=? "
             "ORDER BY created_at_unix DESC, rowid DESC LIMIT 50001",
             (
@@ -4586,6 +4598,7 @@ def _latest_matching_execution_record(
                 identity["memory_max_bytes"],
                 int(identity["chronik_outbox_enabled"]),
                 identity["chronik_outbox_state_root"],
+                _chronik_retry_match_context_json(identity),
                 identity["execution_backend"],
                 identity["systemd_scope"],
             ),
@@ -4612,6 +4625,7 @@ def _latest_matching_active_execution_record(
             "AND resource_keys_json=? AND runtime_seconds=? AND cpu_weight=? "
             "AND io_weight=? AND memory_max_bytes IS ? "
             "AND chronik_outbox_enabled=? AND chronik_outbox_state_root IS ? "
+            f"AND {CHRONIK_RETRY_CONTEXT_SQL_PREDICATE} "
             "AND execution_backend=? AND systemd_scope=? "
             f"AND state IN ({placeholders}) "
             "ORDER BY created_at_unix DESC, rowid DESC LIMIT 50001",
@@ -4626,6 +4640,7 @@ def _latest_matching_active_execution_record(
                 identity["memory_max_bytes"],
                 int(identity["chronik_outbox_enabled"]),
                 identity["chronik_outbox_state_root"],
+                _chronik_retry_match_context_json(identity),
                 identity["execution_backend"],
                 identity["systemd_scope"],
                 *active_states,
@@ -4648,6 +4663,36 @@ def _latest_matching_active_execution_record(
     return matching[0] if matching else None
 
 
+def _refresh_active_execution_reuse_record(
+    latest: dict[str, Any],
+    *,
+    allow_active_reuse: bool,
+) -> dict[str, Any]:
+    now = _now()
+    resource_bound = bool(_record_resource_keys(latest))
+    if (
+        resource_bound
+        or not allow_active_reuse
+        or not _task_has_fresh_active_observation(latest, now=now)
+    ):
+        status = grabowski_task_status(str(latest["task_id"]))
+        latest = _row_raw(str(latest["task_id"]))
+        if (
+            resource_bound
+            and str(latest["state"]) in TASK_STATE_PROJECTIONS["active"]
+        ):
+            lease_maintenance = status.get("lease_maintenance")
+            if (
+                not isinstance(lease_maintenance, dict)
+                or lease_maintenance.get("maintained") is not True
+            ):
+                raise RuntimeError(
+                    "active execution resource lease maintenance failed; "
+                    f"reconcile task {latest['task_id']} before reuse"
+                )
+    return latest
+
+
 def _resolve_active_execution_reuse(
     identity: dict[str, Any],
     *,
@@ -4667,13 +4712,10 @@ def _resolve_active_execution_reuse(
             "active execution identity has a different resume policy; "
             f"reconcile task {latest['task_id']} before another start"
         )
-    now = _now()
-    if (
-        not allow_active_reuse
-        or not _task_has_fresh_active_observation(latest, now=now)
-    ):
-        grabowski_task_status(str(latest["task_id"]))
-        latest = _row_raw(str(latest["task_id"]))
+    latest = _refresh_active_execution_reuse_record(
+        latest,
+        allow_active_reuse=allow_active_reuse,
+    )
     if str(latest["state"]) in TASK_STATE_PROJECTIONS["active"]:
         return latest if allow_active_reuse else None
     return None
@@ -4696,6 +4738,7 @@ def _latest_matching_unbound_execution_record(
             "AND resource_keys_json=? AND runtime_seconds=? AND cpu_weight=? "
             "AND io_weight=? AND memory_max_bytes IS ? "
             "AND chronik_outbox_enabled=? AND chronik_outbox_state_root IS ? "
+            f"AND {CHRONIK_RETRY_CONTEXT_SQL_PREDICATE} "
             "AND execution_backend=? AND systemd_scope=? "
             "ORDER BY created_at_unix DESC, rowid DESC LIMIT 50001",
             (
@@ -4709,6 +4752,7 @@ def _latest_matching_unbound_execution_record(
                 identity["memory_max_bytes"],
                 int(identity["chronik_outbox_enabled"]),
                 identity["chronik_outbox_state_root"],
+                _chronik_retry_match_context_json(identity),
                 identity["execution_backend"],
                 identity["systemd_scope"],
             ),
@@ -4790,9 +4834,10 @@ def _matching_attention_execution_records(
             "AND resource_keys_json=? AND runtime_seconds=? AND cpu_weight=? "
             "AND io_weight=? AND memory_max_bytes IS ? "
             "AND chronik_outbox_enabled=? AND chronik_outbox_state_root IS ? "
+            f"AND {CHRONIK_RETRY_CONTEXT_SQL_PREDICATE} "
             "AND execution_backend=? AND systemd_scope=? "
             f"AND state IN ({placeholders}) "
-            "ORDER BY created_at_unix DESC, rowid DESC LIMIT 50001",
+            "ORDER BY created_at_unix DESC, rowid DESC LIMIT ?",
             (
                 identity["host"],
                 identity["argv_sha256"],
@@ -4804,12 +4849,14 @@ def _matching_attention_execution_records(
                 identity["memory_max_bytes"],
                 int(identity["chronik_outbox_enabled"]),
                 identity["chronik_outbox_state_root"],
+                _chronik_retry_match_context_json(identity),
                 identity["execution_backend"],
                 identity["systemd_scope"],
                 *attention_states,
+                EXECUTION_ATTENTION_MATCH_LIMIT + 1,
             ),
         ).fetchall()
-    if len(rows) > 50000:
+    if len(rows) > EXECUTION_ATTENTION_MATCH_LIMIT:
         raise RuntimeError("matching attention execution scan limit exceeded")
     return [
         record
@@ -5371,6 +5418,7 @@ def _latest_matching_unprepared_managed_cargo_record(
             "AND resource_keys_json=? AND runtime_seconds=? AND cpu_weight=? "
             "AND io_weight=? AND memory_max_bytes IS ? "
             "AND chronik_outbox_enabled=? AND chronik_outbox_state_root IS ? "
+            f"AND {CHRONIK_RETRY_CONTEXT_SQL_PREDICATE} "
             "AND execution_backend=? AND systemd_scope=? "
             f"AND {argv_predicate} "
             "ORDER BY created_at_unix DESC, rowid DESC",
@@ -5384,6 +5432,7 @@ def _latest_matching_unprepared_managed_cargo_record(
                 identity["memory_max_bytes"],
                 int(identity["chronik_outbox_enabled"]),
                 identity["chronik_outbox_state_root"],
+                _chronik_retry_match_context_json(identity),
                 identity["execution_backend"],
                 identity["systemd_scope"],
                 *argv_parameters,
@@ -5449,26 +5498,23 @@ def _resolve_unprepared_managed_cargo_execution_reuse(
                 "active execution identity has a different resume policy; "
                 f"reconcile task {latest['task_id']} before another start"
             )
-        now = _now()
+        latest = _refresh_active_execution_reuse_record(
+            latest,
+            allow_active_reuse=allow_active_reuse,
+        )
         if (
-            not allow_active_reuse
-            or not _task_has_fresh_active_observation(latest, now=now)
+            _execution_retry_match_projection(
+                _record_execution_identity(latest),
+                include_command=False,
+            )
+            != _execution_retry_match_projection(
+                identity,
+                include_command=False,
+            )
         ):
-            grabowski_task_status(str(latest["task_id"]))
-            latest = _row_raw(str(latest["task_id"]))
-            if (
-                _execution_retry_match_projection(
-                    _record_execution_identity(latest),
-                    include_command=False,
-                )
-                != _execution_retry_match_projection(
-                    identity,
-                    include_command=False,
-                )
-            ):
-                raise RuntimeError(
-                    "stored managed Cargo execution identity is inconsistent"
-                )
+            raise RuntimeError(
+                "stored managed Cargo execution identity is inconsistent"
+            )
         _guard_direct_terminal_retry_record(latest)
         if str(latest["state"]) in TASK_STATE_PROJECTIONS["active"]:
             return (
@@ -5506,6 +5552,7 @@ def _matching_attention_unprepared_managed_cargo_records(
             "AND resource_keys_json=? AND runtime_seconds=? AND cpu_weight=? "
             "AND io_weight=? AND memory_max_bytes IS ? "
             "AND chronik_outbox_enabled=? AND chronik_outbox_state_root IS ? "
+            f"AND {CHRONIK_RETRY_CONTEXT_SQL_PREDICATE} "
             "AND execution_backend=? AND systemd_scope=? "
             f"AND {argv_predicate} "
             f"AND state IN ({placeholders}) "
@@ -5520,6 +5567,7 @@ def _matching_attention_unprepared_managed_cargo_records(
                 identity["memory_max_bytes"],
                 int(identity["chronik_outbox_enabled"]),
                 identity["chronik_outbox_state_root"],
+                _chronik_retry_match_context_json(identity),
                 identity["execution_backend"],
                 identity["systemd_scope"],
                 *argv_parameters,
