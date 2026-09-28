@@ -5406,6 +5406,131 @@ class WorkAcquireTests(unittest.TestCase):
             work_acquire._terminal_assessment_replay_sha256(legacy),
         )
 
+    def test_terminal_assessment_replay_allows_legacy_followup_id_only_directionally(self) -> None:
+        lane_id = "a" * 32
+
+        def blocked(followup_id: str) -> dict[str, object]:
+            return closeout.assess(
+                closeout.LaneCloseoutObservation(
+                    lane_id=lane_id,
+                    repository=str(self.repo),
+                    workspace=str(self.target),
+                    branch="feat/authority-p0",
+                    base_revision=SHA,
+                    writer_state="outcome_unknown",
+                    task_active=False,
+                    process_active=False,
+                    lease_active=True,
+                    git_dirty=False,
+                    head_sha=SHA,
+                    remote_head_sha=SHA,
+                    ahead_commits=0,
+                    behind_commits=0,
+                    durable_followup_id=followup_id,
+                ),
+                observed_at_unix=200,
+            )
+
+        current = blocked("followup-1")
+        legacy = dict(current)
+        legacy.pop("durable_followup_id")
+        legacy["observation_sha256"] = "f" * 64
+        material = {
+            key: value
+            for key, value in legacy.items()
+            if key
+            not in {
+                "assessment_sha256",
+                "audit_record_sha256",
+                "does_not_establish",
+            }
+        }
+        legacy["assessment_sha256"] = closeout.sha256_json(material)
+        different = blocked("followup-2")
+
+        self.assertTrue(
+            work_acquire._terminal_assessment_replay_equivalent(
+                legacy,
+                current,
+            )
+        )
+        self.assertFalse(
+            work_acquire._terminal_assessment_replay_equivalent(
+                current,
+                different,
+            )
+        )
+        self.assertFalse(
+            work_acquire._terminal_assessment_replay_equivalent(
+                current,
+                legacy,
+            )
+        )
+
+    def test_terminal_pending_retry_allows_legacy_followup_id_only_directionally(self) -> None:
+        lane_id = "b" * 32
+
+        def blocked(followup_id: str) -> dict[str, object]:
+            return closeout.assess(
+                closeout.LaneCloseoutObservation(
+                    lane_id=lane_id,
+                    repository=str(self.repo),
+                    workspace=str(self.target),
+                    branch="feat/authority-p0",
+                    base_revision=SHA,
+                    writer_state="outcome_unknown",
+                    task_active=False,
+                    process_active=False,
+                    lease_active=True,
+                    git_dirty=False,
+                    head_sha=SHA,
+                    remote_head_sha=SHA,
+                    ahead_commits=0,
+                    behind_commits=0,
+                    durable_followup_id=followup_id,
+                ),
+                observed_at_unix=200,
+            )
+
+        current = blocked("followup-1")
+        legacy = dict(current)
+        legacy.pop("durable_followup_id")
+        legacy["observation_sha256"] = "e" * 64
+        material = {
+            key: value
+            for key, value in legacy.items()
+            if key
+            not in {
+                "assessment_sha256",
+                "audit_record_sha256",
+                "does_not_establish",
+            }
+        }
+        legacy["assessment_sha256"] = closeout.sha256_json(material)
+        different = blocked("followup-2")
+
+        self.assertTrue(
+            work_acquire._terminal_pending_retry_equivalent(
+                legacy,
+                current,
+                record={},
+            )
+        )
+        self.assertFalse(
+            work_acquire._terminal_pending_retry_equivalent(
+                current,
+                different,
+                record={},
+            )
+        )
+        self.assertFalse(
+            work_acquire._terminal_pending_retry_equivalent(
+                current,
+                legacy,
+                record={},
+            )
+        )
+
     def test_terminal_checkout_lifecycle_convergence_preserves_blocked_followup_capacity(self) -> None:
         inspect = Mock()
         with patch.object(work_acquire.checkouts, "_worktree_for_path", inspect):

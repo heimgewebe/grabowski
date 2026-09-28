@@ -288,9 +288,11 @@ def _closeout_inputs(parameters: dict[str, Any], lane_id: str) -> dict[str, Any]
     return inputs
 
 
-def _terminal_assessment_replay_sha256(assessment: dict[str, Any]) -> str:
+def _terminal_assessment_replay_projection(
+    assessment: dict[str, Any],
+) -> dict[str, Any]:
     validated = lane_closeout.validate_terminal_assessment(assessment)
-    material = {
+    return {
         key: item
         for key, item in validated.items()
         if key
@@ -302,7 +304,42 @@ def _terminal_assessment_replay_sha256(assessment: dict[str, Any]) -> str:
             "does_not_establish",
         }
     }
-    return _sha(material)
+
+
+def _terminal_assessment_replay_sha256(assessment: dict[str, Any]) -> str:
+    return _sha(_terminal_assessment_replay_projection(assessment))
+
+
+def _legacy_blocked_followup_id_transition(
+    stored: dict[str, Any],
+    current: dict[str, Any],
+) -> bool:
+    return (
+        stored.get("closeout_state") == "blocked_with_durable_followup"
+        and current.get("closeout_state") == "blocked_with_durable_followup"
+        and "durable_followup_id" not in stored
+        and isinstance(current.get("durable_followup_id"), str)
+        and bool(current.get("durable_followup_id"))
+    )
+
+
+def _terminal_assessment_replay_equivalent(
+    stored: dict[str, Any],
+    current: dict[str, Any],
+) -> bool:
+    stored_projection = _terminal_assessment_replay_projection(stored)
+    current_projection = _terminal_assessment_replay_projection(current)
+    if stored_projection == current_projection:
+        return True
+    if not _legacy_blocked_followup_id_transition(
+        lane_closeout.validate_terminal_assessment(stored),
+        lane_closeout.validate_terminal_assessment(current),
+    ):
+        return False
+    for field in ("durable_followup_id", "observation_sha256"):
+        stored_projection.pop(field, None)
+        current_projection.pop(field, None)
+    return stored_projection == current_projection
 
 
 def _terminal_pending_retry_projection(
@@ -333,11 +370,21 @@ def _terminal_pending_retry_equivalent(
     """Allow only the expected post-release observation transition on retry."""
     pending_validated = lane_closeout.validate_terminal_assessment(pending)
     current_validated = lane_closeout.validate_terminal_assessment(current)
-    if (
-        _terminal_pending_retry_projection(pending_validated)
-        != _terminal_pending_retry_projection(current_validated)
-    ):
-        return False
+    pending_projection = _terminal_pending_retry_projection(pending_validated)
+    current_projection = _terminal_pending_retry_projection(current_validated)
+    legacy_followup_transition = _legacy_blocked_followup_id_transition(
+        pending_validated,
+        current_validated,
+    )
+    if pending_projection != current_projection:
+        if not legacy_followup_transition:
+            return False
+        pending_projection.pop("durable_followup_id", None)
+        current_projection.pop("durable_followup_id", None)
+        if pending_projection != current_projection:
+            return False
+    if legacy_followup_transition:
+        return True
     if (
         pending_validated.get("observation_sha256")
         == current_validated.get("observation_sha256")
@@ -1206,10 +1253,7 @@ def _persist_terminal_closeout_impl(
 
         existing = _terminal_closeout_assessment(record)
         if existing is not None:
-            if (
-                _terminal_assessment_replay_sha256(existing)
-                != _terminal_assessment_replay_sha256(validated)
-            ):
+            if not _terminal_assessment_replay_equivalent(existing, validated):
                 raise RuntimeError("work-lane already records another terminal assessment")
             lifecycle = _converge_terminal_checkout_lifecycle(
                 record, assessment=existing
