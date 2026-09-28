@@ -105,7 +105,7 @@ class CheckoutTerminalSourcesTests(unittest.TestCase):
             ),
         )
 
-    def test_blocked_followup_terminal_evidence_preserves_direct_followup_binding(self) -> None:
+    def test_blocked_followup_terminal_evidence_preserves_lane_binding_without_bureau_lookup(self) -> None:
         lane_id = "2" * 32
         assessment = lane_closeout.assess(
             lane_closeout.LaneCloseoutObservation(
@@ -147,25 +147,6 @@ class CheckoutTerminalSourcesTests(unittest.TestCase):
                 "assessment": assessment,
             },
         }
-        bureau_binding = {
-            "checkout_key": "c" * 64,
-            "durable_followup_id": "GRABOWSKI-FOLLOWUP-T001",
-            "durable_followup_binding": {
-                "kind": "bureau_current_task_spec_reproduction",
-                "task_id": "GRABOWSKI-FOLLOWUP-T001",
-                "task_revision": 1,
-                "task_spec_sha256": "a" * 64,
-                "task_state": "ready",
-                "reproduction": {},
-                "does_not_establish": [
-                    "followup_completion",
-                    "lease_release_authority",
-                    "archive_or_cleanup_authority",
-                    "branch_or_ref_deletion_authority",
-                ],
-                "binding_sha256": "b" * 64,
-            },
-        }
         with (
             patch.object(work_acquire, "_read_state", return_value=record),
             patch.object(
@@ -176,7 +157,6 @@ class CheckoutTerminalSourcesTests(unittest.TestCase):
             patch.object(
                 sources,
                 "_bureau_blocked_followup_binding",
-                return_value=bureau_binding,
             ) as authoritative_binding,
         ):
             evidence = sources.work_lane_terminal_evidence(lane_id)
@@ -188,18 +168,9 @@ class CheckoutTerminalSourcesTests(unittest.TestCase):
         self.assertEqual(
             "GRABOWSKI-FOLLOWUP-T001", evidence["durable_followup_id"]
         )
-        self.assertEqual(
-            "bureau_current_task_spec_reproduction",
-            evidence["durable_followup_binding"]["kind"],
-        )
-        authoritative_binding.assert_called_once_with(
-            lane_id,
-            record=record,
-            assessment=assessment,
-            audit_record_sha256="f" * 64,
-            expected_followup_id="GRABOWSKI-FOLLOWUP-T001",
-            expected_checkout_key=None,
-        )
+        self.assertIn("durable_followup_bound", evidence["reason_codes"])
+        self.assertNotIn("durable_followup_binding", evidence)
+        authoritative_binding.assert_not_called()
 
     def test_work_lane_terminal_evidence_rejects_missing_original_source_binding(self) -> None:
         lane_id = "1" * 32

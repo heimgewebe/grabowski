@@ -393,50 +393,24 @@ class BlockedFollowupCheckoutLifecycleTests(unittest.TestCase):
             )
 
     @staticmethod
-    def _blocked_source_evidence(*, binding_sha256: str | None = None) -> dict[str, object]:
-        reproduction = {
-            "lane_id": LANE_ID,
-            "lane_receipt_sha256": LANE_RECEIPT,
-            "lane_assessment_sha256": ASSESSMENT,
-            "lane_terminal_audit_sha256": AUDIT,
-            "lane_terminal_head": TERMINAL_HEAD,
-            "checkout_key": CHECKOUT_KEY,
-        }
-        binding_core = {
-            "kind": "bureau_current_task_spec_reproduction",
-            "task_id": TASK_ID,
-            "task_revision": 3,
-            "task_spec_sha256": "a" * 64,
-            "task_state": "ready",
-            "reproduction": reproduction,
-            "does_not_establish": [
-                "followup_completion",
-                "lease_release_authority",
-                "archive_or_cleanup_authority",
-                "branch_or_ref_deletion_authority",
-            ],
-        }
-        binding = {
-            **binding_core,
-            "binding_sha256": (
-                binding_sha256
-                or sources.checkouts._sha256_json(binding_core)
-            ),
-        }
-        core = {
+    def _blocked_source_evidence(
+        *, followup_id: str | None = TASK_ID
+    ) -> dict[str, object]:
+        core: dict[str, object] = {
             "schema_version": 1,
             "kind": "work_lane",
             "source_id": LANE_ID,
             "terminal_state": "blocked_with_durable_followup",
             "checkout_key": CHECKOUT_KEY,
+            "reason_codes": ["durable_followup_bound"],
             "lane_receipt_sha256": LANE_RECEIPT,
             "assessment_sha256": ASSESSMENT,
             "terminal_head_sha": TERMINAL_HEAD,
             "lease_release_ready": False,
             "terminal_closeout_audit_record_sha256": AUDIT,
-            "durable_followup_id": TASK_ID,
-            "durable_followup_binding": binding,
         }
+        if followup_id is not None:
+            core["durable_followup_id"] = followup_id
         return {
             **core,
             "evidence_sha256": sources.checkouts._sha256_json(core),
@@ -495,68 +469,73 @@ class BlockedFollowupCheckoutLifecycleTests(unittest.TestCase):
 
     def test_archive_binding_requires_terminal_bureau_task_state(self) -> None:
         evidence = self._blocked_source_evidence()
-        self.assertTrue(
-            sources.blocked_followup_binding_valid(
-                evidence,
-                CHECKOUT_KEY,
-                require_terminal_task=False,
+
+        ready_temporary, ready_root = self._state_store([self._spec()])
+        self.addCleanup(ready_temporary.cleanup)
+        with patch.dict(
+            os.environ,
+            {
+                "BUREAU_STATE_DIR": str(ready_root),
+                "GRABOWSKI_BUREAU_COORDINATION_ROOT": str(ready_root),
+            },
+        ):
+            self.assertTrue(
+                sources.blocked_followup_binding_valid(
+                    evidence,
+                    CHECKOUT_KEY,
+                    require_terminal_task=False,
+                )
             )
-        )
-        self.assertFalse(
-            sources.blocked_followup_binding_valid(
+            self.assertFalse(
+                sources.blocked_followup_binding_valid(
+                    evidence,
+                    CHECKOUT_KEY,
+                    require_terminal_task=True,
+                )
+            )
+
+        verified_spec = self._spec()
+        verified_spec["state"] = "verified"
+        verified_temporary, verified_root = self._state_store([verified_spec])
+        self.addCleanup(verified_temporary.cleanup)
+        with patch.dict(
+            os.environ,
+            {
+                "BUREAU_STATE_DIR": str(verified_root),
+                "GRABOWSKI_BUREAU_COORDINATION_ROOT": str(verified_root),
+            },
+        ):
+            authority = sources.blocked_followup_binding_authority(
                 evidence,
                 CHECKOUT_KEY,
                 require_terminal_task=True,
             )
-        )
-        binding = dict(evidence["durable_followup_binding"])
-        binding["task_state"] = "verified"
-        material = {key: value for key, value in binding.items() if key != "binding_sha256"}
-        binding["binding_sha256"] = sources.checkouts._sha256_json(material)
-        evidence["durable_followup_binding"] = binding
-        evidence_core = {
-            key: value for key, value in evidence.items() if key != "evidence_sha256"
-        }
-        evidence["evidence_sha256"] = sources.checkouts._sha256_json(evidence_core)
-        self.assertTrue(
-            sources.blocked_followup_binding_valid(
-                evidence,
-                CHECKOUT_KEY,
-                require_terminal_task=True,
-            )
+        self.assertIsNotNone(authority)
+        assert authority is not None
+        self.assertEqual(
+            "verified",
+            authority["durable_followup_binding"]["task_state"],
         )
 
-    def test_string_only_terminal_assessment_binding_cannot_release_capacity(self) -> None:
-        evidence = self._blocked_source_evidence()
-        binding_core = {
-            "kind": "terminal_assessment",
-            "durable_followup_id": TASK_ID,
-            "assessment_sha256": ASSESSMENT,
-            "terminal_closeout_audit_record_sha256": AUDIT,
-            "does_not_establish": [
-                "followup_completion",
-                "lease_release_authority",
-                "archive_or_cleanup_authority",
-                "branch_or_ref_deletion_authority",
-            ],
-        }
-        evidence["durable_followup_binding"] = {
-            **binding_core,
-            "binding_sha256": sources.checkouts._sha256_json(binding_core),
-        }
-        evidence["evidence_sha256"] = sources.checkouts._sha256_json(
+    def test_unbacked_followup_id_cannot_release_capacity(self) -> None:
+        evidence = self._blocked_source_evidence(
+            followup_id="THIS-TASK-DOES-NOT-EXIST"
+        )
+        temporary, root = self._state_store([self._spec()])
+        self.addCleanup(temporary.cleanup)
+        with patch.dict(
+            os.environ,
             {
-                key: value
-                for key, value in evidence.items()
-                if key != "evidence_sha256"
-            }
-        )
-        self.assertFalse(
-            reconciliation._blocked_followup_capacity_release_ready(
-                evidence,
-                CHECKOUT_KEY,
+                "BUREAU_STATE_DIR": str(root),
+                "GRABOWSKI_BUREAU_COORDINATION_ROOT": str(root),
+            },
+        ):
+            self.assertFalse(
+                reconciliation._blocked_followup_capacity_release_ready(
+                    evidence,
+                    CHECKOUT_KEY,
+                )
             )
-        )
 
     def test_blocked_followup_capacity_release_requires_terminal_head(self) -> None:
         for terminal_head in (None, "not-a-git-object"):
@@ -612,7 +591,16 @@ class BlockedFollowupCheckoutLifecycleTests(unittest.TestCase):
             "processes": [],
         }
         evidence = self._blocked_source_evidence()
+        temporary, root = self._state_store([self._spec()])
+        self.addCleanup(temporary.cleanup)
         with (
+            patch.dict(
+                os.environ,
+                {
+                    "BUREAU_STATE_DIR": str(root),
+                    "GRABOWSKI_BUREAU_COORDINATION_ROOT": str(root),
+                },
+            ),
             patch.object(reconciliation, "_record", return_value=None),
             patch.object(reconciliation, "_snapshot", return_value=snapshot),
             patch.object(
@@ -637,13 +625,19 @@ class BlockedFollowupCheckoutLifecycleTests(unittest.TestCase):
         self.assertTrue(preview["safe_to_apply"])
         self.assertEqual([], preview["blockers"])
         self.assertFalse(preview["source_evidence"]["lease_release_ready"])
-        self.assertEqual(TASK_ID, preview["source_evidence"]["durable_followup_id"])
+        self.assertNotIn("durable_followup_binding", preview["source_evidence"])
+        authority = preview["blocked_followup_capacity_authority"]
+        self.assertEqual(TASK_ID, authority["durable_followup_id"])
+        self.assertEqual(
+            "bureau_current_task_spec_reproduction",
+            authority["durable_followup_binding"]["kind"],
+        )
         self.assertIn(
             "archive_or_cleanup_authority",
-            preview["source_evidence"]["durable_followup_binding"]["does_not_establish"],
+            authority["durable_followup_binding"]["does_not_establish"],
         )
 
-    def test_present_blocked_followup_preview_rejects_tampered_binding(self) -> None:
+    def test_present_blocked_followup_preview_rejects_unbacked_followup_id(self) -> None:
         binding = {
             "checkout_key": CHECKOUT_KEY,
             "phase": "active",
@@ -677,8 +671,19 @@ class BlockedFollowupCheckoutLifecycleTests(unittest.TestCase):
             "tasks": [],
             "processes": [],
         }
-        evidence = self._blocked_source_evidence(binding_sha256="f" * 64)
+        evidence = self._blocked_source_evidence(
+            followup_id="THIS-TASK-DOES-NOT-EXIST"
+        )
+        temporary, root = self._state_store([self._spec()])
+        self.addCleanup(temporary.cleanup)
         with (
+            patch.dict(
+                os.environ,
+                {
+                    "BUREAU_STATE_DIR": str(root),
+                    "GRABOWSKI_BUREAU_COORDINATION_ROOT": str(root),
+                },
+            ),
             patch.object(reconciliation, "_record", return_value=None),
             patch.object(reconciliation, "_snapshot", return_value=snapshot),
             patch.object(
@@ -705,6 +710,75 @@ class BlockedFollowupCheckoutLifecycleTests(unittest.TestCase):
             "work-lane-durable-followup-binding-missing",
             preview["blockers"],
         )
+        self.assertNotIn("blocked_followup_capacity_authority", preview)
+
+
+    def test_missing_blocked_followup_preview_does_not_require_bureau_binding(self) -> None:
+        binding = {
+            "checkout_key": CHECKOUT_KEY,
+            "phase": "active",
+            "repo_path": "/tmp/repo",
+            "checkout_path": "/tmp/worktree",
+            "expected_branch": "topic",
+            "expected_head": TERMINAL_HEAD,
+            "owner_id": "owner-a",
+            "source": {"kind": "work_lane", "id": LANE_ID},
+        }
+        snapshot = {
+            "binding": binding,
+            "binding_sha256": "1" * 64,
+            "retention": {
+                "expected_head": TERMINAL_HEAD,
+                "owner_id": "owner-a",
+            },
+            "retention_sha256": "2" * 64,
+            "identity_catchup": None,
+            "archive_count": 0,
+        }
+        checkout = {
+            "mode": "missing",
+            "branch_head": TERMINAL_HEAD,
+            "blockers": [],
+        }
+        coordination = {
+            "blocking": False,
+            "resource_leases": [],
+            "tasks": [],
+            "processes": [],
+        }
+        evidence = self._blocked_source_evidence(followup_id=None)
+        with (
+            patch.object(reconciliation, "_record", return_value=None),
+            patch.object(reconciliation, "_snapshot", return_value=snapshot),
+            patch.object(
+                sources,
+                "source_terminal_evidence",
+                return_value=evidence,
+            ),
+            patch.object(
+                reconciliation,
+                "_terminal_checkout_observation",
+                return_value=checkout,
+            ),
+            patch.object(
+                reconciliation,
+                "_coordination",
+                return_value=coordination,
+            ),
+            patch.object(
+                reconciliation,
+                "_blocked_followup_capacity_release_authority",
+                side_effect=AssertionError(
+                    "missing checkout must not resolve present-capacity authority"
+                ),
+            ) as capacity_authority,
+        ):
+            preview = reconciliation._preview_state(CHECKOUT_KEY)
+
+        self.assertEqual("ready", preview["status"])
+        self.assertTrue(preview["safe_to_apply"])
+        self.assertNotIn("blocked_followup_capacity_authority", preview)
+        capacity_authority.assert_not_called()
 
 
 if __name__ == "__main__":

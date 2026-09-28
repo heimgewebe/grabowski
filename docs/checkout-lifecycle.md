@@ -30,6 +30,10 @@ trennt Inventar, Archivierung und Cleanup.
   wenn zusätzlich ein gültiger `terminal_head_sha` gebunden ist und die Restpflicht
   durch die aktuelle, digest-validierte Bureau-TaskSpec-`metadata.reproduction`
   aus demselben konfigurierten Bureau-Coordination-Root autoritativ belegt wird.
+  Diese Bureau-Auflösung erfolgt ausschließlich für den Present-Capacity-Pfad;
+  die konkrete TaskSpec-Revision wird in dessen Preview-Digest gebunden. Der
+  generische `externally_terminal_missing`-Pfad bleibt davon unabhängig und
+  benötigt keine noch vorhandene Bureau-TaskSpec.
   Bei aktuellen Assessments muss die persistierte `durable_followup_id` exakt
   dieser TaskSpec entsprechen; historische Assessments ohne persistierte ID dürfen
   nur über genau einen eindeutigen Reproduction-Treffer aufgelöst werden. Diese

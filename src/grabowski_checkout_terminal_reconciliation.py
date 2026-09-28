@@ -996,13 +996,25 @@ def _coordination(
     return checkouts._coordination_result(leases, tasks, processes)
 
 
-def _blocked_followup_capacity_release_ready(
+def _blocked_followup_capacity_release_authority(
     source_evidence: dict[str, Any], checkout_key: str
-) -> bool:
-    return sources.blocked_followup_binding_valid(
+) -> dict[str, Any] | None:
+    return sources.blocked_followup_binding_authority(
         source_evidence,
         checkout_key,
         require_terminal_task=False,
+    )
+
+
+def _blocked_followup_capacity_release_ready(
+    source_evidence: dict[str, Any], checkout_key: str
+) -> bool:
+    return (
+        _blocked_followup_capacity_release_authority(
+            source_evidence,
+            checkout_key,
+        )
+        is not None
     )
 
 def _preview_state(
@@ -1058,15 +1070,20 @@ def _preview_state(
     source_is_thread_focus = (
         isinstance(source, dict) and source.get("kind") == "thread_focus"
     )
+    blocked_followup_capacity_authority: dict[str, Any] | None = None
     if checkout.get("mode") == "present":
         if binding["phase"] != "active":
             blockers.append("present-checkout-not-active")
         if source_is_work_lane:
             if source_evidence.get("lease_release_ready") is not True:
                 if source_evidence.get("terminal_state") == "blocked_with_durable_followup":
-                    if not _blocked_followup_capacity_release_ready(
-                        source_evidence, key
-                    ):
+                    blocked_followup_capacity_authority = (
+                        _blocked_followup_capacity_release_authority(
+                            source_evidence,
+                            key,
+                        )
+                    )
+                    if blocked_followup_capacity_authority is None:
                         blockers.append("work-lane-durable-followup-binding-missing")
                 else:
                     blockers.append("work-lane-lease-release-not-ready")
@@ -1105,6 +1122,15 @@ def _preview_state(
         "retention_sha256": snapshot["retention_sha256"],
         "identity_catchup": snapshot["identity_catchup"],
         "source_evidence": source_evidence,
+        **(
+            {
+                "blocked_followup_capacity_authority": (
+                    blocked_followup_capacity_authority
+                )
+            }
+            if blocked_followup_capacity_authority is not None
+            else {}
+        ),
         "checkout_observation": checkout,
         "coordination": coordination,
         "blockers": sorted(set(blockers)),

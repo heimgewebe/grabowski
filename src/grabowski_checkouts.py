@@ -5815,15 +5815,23 @@ def _require_completed_work_lane_archive_authority(
     evidence = terminal_sources.source_terminal_evidence(lifecycle)
     if evidence.get("terminal_state") != "blocked_with_durable_followup":
         return None
-    if not terminal_sources.blocked_followup_binding_valid(
+    followup_authority = terminal_sources.blocked_followup_binding_authority(
         evidence,
         checkout_key,
         require_terminal_task=True,
-    ):
+    )
+    if followup_authority is None:
         raise RuntimeError(
             "blocked durable followup capacity release does not authorize checkout archive"
         )
-    return evidence
+    core = {
+        "source_evidence": evidence,
+        "followup_authority": followup_authority,
+    }
+    return {
+        **core,
+        "authority_sha256": _sha256_json(core),
+    }
 
 
 @mcp.tool(name="grabowski_checkout_archive", annotations=MUTATING)

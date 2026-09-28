@@ -346,12 +346,12 @@ def _bureau_blocked_followup_binding(
 
 
 
-def blocked_followup_binding_valid(
+def blocked_followup_binding_authority(
     source_evidence: dict[str, Any],
     checkout_key: str,
     *,
     require_terminal_task: bool = False,
-) -> bool:
+) -> dict[str, Any] | None:
     if (
         not isinstance(checkout_key, str)
         or re.fullmatch(r"[0-9a-f]{64}", checkout_key) is None
@@ -359,7 +359,7 @@ def blocked_followup_binding_valid(
         or source_evidence.get("lease_release_ready") is not False
         or source_evidence.get("checkout_key") != checkout_key
     ):
-        return False
+        return None
     evidence_sha256 = source_evidence.get("evidence_sha256")
     evidence_core = {
         key: value
@@ -371,22 +371,28 @@ def blocked_followup_binding_valid(
         or re.fullmatch(r"[0-9a-f]{64}", evidence_sha256) is None
         or checkouts._sha256_json(evidence_core) != evidence_sha256
     ):
-        return False
+        return None
     source_id = source_evidence.get("source_id")
     terminal_head = source_evidence.get("terminal_head_sha")
     followup_id = source_evidence.get("durable_followup_id")
+    reason_codes = source_evidence.get("reason_codes")
     if (
         not isinstance(source_id, str)
         or re.fullmatch(r"[0-9a-f]{32}", source_id) is None
         or not isinstance(terminal_head, str)
         or checkouts.GIT_OBJECT_RE.fullmatch(terminal_head) is None
-        or not isinstance(followup_id, str)
+        or not isinstance(reason_codes, list)
+        or "durable_followup_bound" not in reason_codes
+    ):
+        return None
+    if followup_id is not None and (
+        not isinstance(followup_id, str)
         or followup_id != followup_id.strip()
         or not followup_id
         or len(followup_id) > 512
         or any(character in followup_id for character in "\r\n\x00")
     ):
-        return False
+        return None
     for field in (
         "lane_receipt_sha256",
         "assessment_sha256",
@@ -394,46 +400,79 @@ def blocked_followup_binding_valid(
     ):
         value = source_evidence.get(field)
         if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
-            return False
-    binding = source_evidence.get("durable_followup_binding")
-    if not isinstance(binding, dict):
-        return False
-    claimed = binding.get("binding_sha256")
-    if not isinstance(claimed, str) or re.fullmatch(r"[0-9a-f]{64}", claimed) is None:
-        return False
-    material = {key: value for key, value in binding.items() if key != "binding_sha256"}
-    if checkouts._sha256_json(material) != claimed:
-        return False
-    if binding.get("kind") != "bureau_current_task_spec_reproduction":
-        return False
-    revision = binding.get("task_revision")
-    spec_sha256 = binding.get("task_spec_sha256")
-    state = binding.get("task_state")
-    reproduction = binding.get("reproduction")
-    if (
-        binding.get("task_id") != followup_id
-        or isinstance(revision, bool)
-        or not isinstance(revision, int)
-        or revision < 1
-        or not isinstance(spec_sha256, str)
-        or re.fullmatch(r"[0-9a-f]{64}", spec_sha256) is None
-        or not isinstance(state, str)
-        or not state
-        or (require_terminal_task and state not in TERMINAL_TASK_STATES)
-        or not isinstance(reproduction, dict)
-    ):
-        return False
-    expected_reproduction = {
+            return None
+
+    record = {
         "lane_id": source_id,
-        "lane_receipt_sha256": source_evidence["lane_receipt_sha256"],
-        "lane_assessment_sha256": source_evidence["assessment_sha256"],
-        "lane_terminal_audit_sha256": source_evidence[
-            "terminal_closeout_audit_record_sha256"
-        ],
-        "lane_terminal_head": terminal_head,
-        "checkout_key": checkout_key,
+        "receipt_sha256": source_evidence["lane_receipt_sha256"],
+        "worktree_receipt": {
+            "lifecycle": {
+                "checkout_key": checkout_key,
+            }
+        },
     }
-    return reproduction == expected_reproduction
+    assessment = {
+        "closeout_state": "blocked_with_durable_followup",
+        "assessment_sha256": source_evidence["assessment_sha256"],
+        "terminal_head_sha": terminal_head,
+        "reason_codes": list(reason_codes),
+        "lease_release_ready": False,
+    }
+    if followup_id is not None:
+        assessment["durable_followup_id"] = followup_id
+    try:
+        resolved = _bureau_blocked_followup_binding(
+            source_id,
+            record=record,
+            assessment=assessment,
+            audit_record_sha256=source_evidence[
+                "terminal_closeout_audit_record_sha256"
+            ],
+            expected_followup_id=followup_id,
+            expected_checkout_key=checkout_key,
+        )
+    except (OSError, RuntimeError, ValueError, sqlite3.Error):
+        return None
+
+    binding = resolved.get("durable_followup_binding")
+    if (
+        not isinstance(binding, dict)
+        or (
+            require_terminal_task
+            and binding.get("task_state") not in TERMINAL_TASK_STATES
+        )
+    ):
+        return None
+    core = {
+        "schema_version": 1,
+        "kind": "work_lane_blocked_followup_authority",
+        "source_evidence_sha256": evidence_sha256,
+        "checkout_key": checkout_key,
+        "require_terminal_task": require_terminal_task,
+        "durable_followup_id": resolved["durable_followup_id"],
+        "durable_followup_binding": binding,
+    }
+    return {
+        **core,
+        "authority_sha256": checkouts._sha256_json(core),
+    }
+
+
+def blocked_followup_binding_valid(
+    source_evidence: dict[str, Any],
+    checkout_key: str,
+    *,
+    require_terminal_task: bool = False,
+) -> bool:
+    return (
+        blocked_followup_binding_authority(
+            source_evidence,
+            checkout_key,
+            require_terminal_task=require_terminal_task,
+        )
+        is not None
+    )
+
 
 def _bureau_json(
     arguments: list[str],
@@ -685,19 +724,38 @@ def work_lane_terminal_evidence(
 
     followup_projection: dict[str, Any] = {}
     if closeout_state == "blocked_with_durable_followup":
-        # Capacity release is a narrower authority than lane terminalization.
-        # A caller-supplied follow-up id is therefore not sufficient: resolve
-        # every capacity-release candidate against the current digest-bound
-        # Bureau TaskSpec reproduction. Legacy assessments without a persisted
-        # id may still resolve uniquely by their exact lane reproduction.
-        followup_projection = _bureau_blocked_followup_binding(
-            source_id,
-            record=record,
-            assessment=assessment,
-            audit_record_sha256=audit_record_sha256,
-            expected_followup_id=assessment.get("durable_followup_id"),
-            expected_checkout_key=expected_checkout_key,
-        )
+        # Generic lane terminality must remain independent of the narrower
+        # present-checkout capacity and archive authorities. Bind only the
+        # immutable lane-side inputs here; those stronger paths resolve the
+        # current Bureau TaskSpec separately and bind that live authority into
+        # their own CAS/audit evidence.
+        reason_codes = assessment.get("reason_codes")
+        if (
+            not isinstance(reason_codes, list)
+            or "durable_followup_bound" not in reason_codes
+        ):
+            raise RuntimeError("work lane durable followup reason evidence is invalid")
+        followup_projection = {
+            "checkout_key": _blocked_followup_checkout_key(
+                record,
+                expected_checkout_key=expected_checkout_key,
+            ),
+            "reason_codes": list(reason_codes),
+        }
+        durable_followup_id = assessment.get("durable_followup_id")
+        if durable_followup_id is not None:
+            if (
+                not isinstance(durable_followup_id, str)
+                or durable_followup_id != durable_followup_id.strip()
+                or not durable_followup_id
+                or len(durable_followup_id) > 512
+                or any(
+                    character in durable_followup_id
+                    for character in "\r\n\x00"
+                )
+            ):
+                raise RuntimeError("work lane durable followup id is invalid")
+            followup_projection["durable_followup_id"] = durable_followup_id
     successor_projection: dict[str, Any] = {}
     if closeout_state == "successor_handoff":
         binding = assessment.get("successor_handoff")
