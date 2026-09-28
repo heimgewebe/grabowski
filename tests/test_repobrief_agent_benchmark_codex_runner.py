@@ -2844,6 +2844,12 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "def main():\n    return 0\n",
                 encoding="utf-8",
             )
+            executable_helper = source / "merger" / "executable-helper.py"
+            executable_helper.write_text(
+                "#!/usr/bin/env python3\nprint('helper-ok')\n",
+                encoding="utf-8",
+            )
+            executable_helper.chmod(0o755)
             script = scripts / "repoground-mcp-stdio.py"
             script.write_text(
                 "from pathlib import Path\n"
@@ -2893,12 +2899,29 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "--bundle-root",
                 str(manifest),
             ]
-            staged = runner.stage_mcp_upstream(
-                state_root,
-                upstream,
-                manifest,
-                authorized,
-            )
+            original_source_read = runner._read_bound_regular_file
+            mcp_script_reads = 0
+
+            def count_mcp_script_reads(path, *, label, max_bytes):
+                nonlocal mcp_script_reads
+                if label == "MCP script":
+                    mcp_script_reads += 1
+                return original_source_read(
+                    path, label=label, max_bytes=max_bytes
+                )
+
+            with patch.object(
+                runner,
+                "_read_bound_regular_file",
+                side_effect=count_mcp_script_reads,
+            ):
+                staged = runner.stage_mcp_upstream(
+                    state_root,
+                    upstream,
+                    manifest,
+                    authorized,
+                )
+            self.assertEqual(mcp_script_reads, 1)
             runtime_dir = Path(staged["runtime_dir"])
             self.assertEqual(staged["source_tree"]["commit"], commit)
             self.assertGreater(staged["source_tree"]["file_count"], 0)
@@ -2906,6 +2929,16 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertTrue(
                 (runtime_dir / "merger" / "repoground" / "cli" / "mcp_stdio.py").is_file()
             )
+            staged_helper = runtime_dir / "merger" / "executable-helper.py"
+            self.assertEqual(stat.S_IMODE(staged_helper.stat().st_mode), 0o700)
+            helper_completed = subprocess.run(
+                [str(staged_helper)],
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            self.assertEqual(helper_completed.returncode, 0, helper_completed.stderr)
+            self.assertEqual(helper_completed.stdout, b"helper-ok\n")
             completed = subprocess.run(
                 staged["argv"],
                 capture_output=True,
@@ -3051,6 +3084,46 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     )
 
             original_source_read = runner._read_bound_regular_file
+            committed_launcher = original_launcher.encode("utf-8")
+            script.write_text(
+                original_launcher + "# attacker-bound launcher\n",
+                encoding="utf-8",
+            )
+            raced_authorized = [
+                file_identity(executable),
+                file_identity(script),
+                file_identity(manifest),
+            ]
+
+            def expose_only_committed_launcher(path, *, label, max_bytes):
+                if (
+                    Path(path).resolve() == script.resolve()
+                    and label == "RepoGround MCP launcher"
+                ):
+                    return committed_launcher
+                return original_source_read(
+                    path, label=label, max_bytes=max_bytes
+                )
+
+            try:
+                with patch.object(
+                    runner,
+                    "_read_bound_regular_file",
+                    side_effect=expose_only_committed_launcher,
+                ):
+                    with self.assertRaisesRegex(
+                        runner.RunnerError,
+                        "preflight-authorized MCP launcher does not match generator commit",
+                    ):
+                        runner.stage_mcp_upstream(
+                            state_root,
+                            upstream,
+                            manifest,
+                            raced_authorized,
+                        )
+            finally:
+                script.write_text(original_launcher, encoding="utf-8")
+
             transient_payload = b"def main():\n    return 9\n"
 
             def transient_source_read(path, *, label, max_bytes):

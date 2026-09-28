@@ -3531,6 +3531,7 @@ def _repoground_source_tree_snapshot(
         max_bytes=MAX_MCP_SOURCE_TREE_LISTING_BYTES,
     )
     committed_blobs: dict[Path, str] = {}
+    committed_modes: dict[Path, int] = {}
     for raw_item in committed_tree_records:
         try:
             item = raw_item.decode("utf-8")
@@ -3551,6 +3552,7 @@ def _repoground_source_tree_snapshot(
         if relative in committed_blobs:
             raise RunnerError("RepoGround MCP generator tree contains duplicate paths")
         committed_blobs[relative] = fields[2]
+        committed_modes[relative] = 0o700 if fields[0] == "100755" else 0o600
     if set(committed_blobs) != set(tracked_relatives):
         raise RunnerError(
             "RepoGround MCP source tree does not match the generator commit tree"
@@ -3604,6 +3606,7 @@ def _repoground_source_tree_snapshot(
                 "relative": relative,
                 "raw": raw,
                 "sha256": sha_bytes(raw),
+                "mode": committed_modes[relative],
             }
         )
 
@@ -3630,6 +3633,11 @@ def _repoground_source_tree_snapshot(
         "root": source_root,
         "commit": commit,
         "entries": entries,
+        "launcher": {
+            "raw": launcher_raw,
+            "sha256": sha_bytes(launcher_raw),
+            "mode": committed_modes[launcher_relative],
+        },
         "file_count": len(entries),
         "total_bytes": total_bytes,
     }
@@ -3746,24 +3754,42 @@ def stage_mcp_upstream(
         for index, source_binding in enumerate(source_bindings):
             label = "MCP executable" if index == 0 else "MCP script"
             source = Path(source_binding["path"])
-            raw = _read_bound_regular_file(
-                source, label=label, max_bytes=MAX_PROVIDER_EXECUTABLE_BYTES
-            )
-            current = _bind_mcp_file(
-                source, label=label, executable=index == 0
-            )
-            if (
-                current["identity"] != source_binding["identity"]
-                or current["sha256"] != source_binding["sha256"]
-                or sha_bytes(raw) != source_binding["sha256"]
-            ):
-                raise RunnerError(f"{label} changed before private staging")
+            if index == 1 and source_tree is not None:
+                launcher = source_tree.get("launcher")
+                if not isinstance(launcher, Mapping):
+                    raise RunnerError("RepoGround MCP launcher snapshot is invalid")
+                raw = launcher.get("raw")
+                stage_mode = launcher.get("mode")
+                if (
+                    not isinstance(raw, bytes)
+                    or stage_mode not in {0o600, 0o700}
+                    or launcher.get("sha256") != sha_bytes(raw)
+                ):
+                    raise RunnerError("RepoGround MCP launcher snapshot is invalid")
+                if sha_bytes(raw) != source_binding["sha256"]:
+                    raise RunnerError(
+                        "preflight-authorized MCP launcher does not match generator commit"
+                    )
+            else:
+                raw = _read_bound_regular_file(
+                    source, label=label, max_bytes=MAX_PROVIDER_EXECUTABLE_BYTES
+                )
+                current = _bind_mcp_file(
+                    source, label=label, executable=index == 0
+                )
+                if (
+                    current["identity"] != source_binding["identity"]
+                    or current["sha256"] != source_binding["sha256"]
+                    or sha_bytes(raw) != source_binding["sha256"]
+                ):
+                    raise RunnerError(f"{label} changed before private staging")
+                stage_mode = 0o700 if index == 0 else 0o600
             relative = Path("executable" if index == 0 else "script") / source.name
             _write_private_relative_file(
                 stage_fd,
                 relative,
                 raw,
-                mode=0o700 if index == 0 else 0o600,
+                mode=stage_mode,
             )
             staged_path = stage_root / relative
             staged = _bind_mcp_file(
@@ -3771,8 +3797,11 @@ def stage_mcp_upstream(
                 label=f"staged {label}",
                 executable=index == 0,
             )
-            if staged["sha256"] != source_binding["sha256"]:
-                raise RunnerError(f"staged {label} SHA mismatch")
+            if (
+                staged["sha256"] != source_binding["sha256"]
+                or stat.S_IMODE(int(staged["identity"][3])) != stage_mode
+            ):
+                raise RunnerError(f"staged {label} binding mismatch")
             staged_bindings.append(staged)
             staged_argv[index] = str(staged_path)
 
@@ -3850,15 +3879,23 @@ def stage_mcp_upstream(
             for entry in source_tree["entries"]:
                 relative = entry["relative"]
                 raw = entry["raw"]
-                _write_private_relative_file(stage_fd, relative, raw, mode=0o600)
+                stage_mode = entry.get("mode")
+                if stage_mode not in {0o600, 0o700}:
+                    raise RunnerError("RepoGround MCP source stage mode is invalid")
+                _write_private_relative_file(
+                    stage_fd, relative, raw, mode=stage_mode
+                )
                 staged_path = stage_root / relative
                 staged = _bind_mcp_file(
                     staged_path,
                     label=f"staged RepoGround MCP source {relative}",
-                    executable=False,
+                    executable=stage_mode == 0o700,
                 )
-                if staged["sha256"] != entry["sha256"]:
-                    raise RunnerError("staged RepoGround MCP source SHA mismatch")
+                if (
+                    staged["sha256"] != entry["sha256"]
+                    or stat.S_IMODE(int(staged["identity"][3])) != stage_mode
+                ):
+                    raise RunnerError("staged RepoGround MCP source binding mismatch")
                 source_tree_bindings.append(staged)
             if Path(staged_argv[0]).name.startswith("python"):
                 staged_argv[1:1] = ["-I", "-B"]
