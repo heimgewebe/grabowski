@@ -2596,12 +2596,22 @@ def _mutating_git_result(repository: Path, *arguments: str) -> dict[str, Any]:
         str(repository),
         *arguments,
     ]
-    return operator._run(
-        command,
-        cwd=repository,
-        timeout_seconds=60,
-        max_output_bytes=65_536,
-    )
+
+    def run() -> dict[str, Any]:
+        return operator._run(
+            command,
+            cwd=repository,
+            timeout_seconds=60,
+            max_output_bytes=65_536,
+        )
+
+    if arguments[:1] == ("worktree",):
+        # Import lazily to avoid the grabowski_mcp/self-deploy import cycle.
+        import grabowski_checkouts as checkouts
+
+        with checkouts._operation_lock():
+            return run()
+    return run()
 
 
 def _worktree_registration_present(repository: Path, target: Path) -> bool:

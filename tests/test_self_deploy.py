@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import hashlib
 import importlib.util
 import json
@@ -298,6 +298,50 @@ def _unpersisted_outcome_unknown_blue_green_result(
 
 
 class SelfDeployToolTests(unittest.TestCase):
+    def test_mutating_git_result_serializes_worktree_admin(self) -> None:
+        state = {"held": False}
+        fake_checkouts = types.ModuleType("grabowski_checkouts")
+
+        @contextmanager
+        def operation_lock():
+            self.assertFalse(state["held"])
+            state["held"] = True
+            try:
+                yield
+            finally:
+                state["held"] = False
+
+        fake_checkouts._operation_lock = operation_lock
+
+        def run(command, **kwargs):
+            del kwargs
+            self.assertTrue(state["held"])
+            self.assertIn("worktree", command)
+            return _result()
+
+        with (
+            patch.dict(
+                sys.modules,
+                {"grabowski_checkouts": fake_checkouts},
+                clear=False,
+            ),
+            patch.object(
+                SELF_DEPLOY.operator,
+                "_run",
+                side_effect=run,
+                create=True,
+            ),
+        ):
+            result = SELF_DEPLOY._mutating_git_result(
+                Path("/tmp/repository"),
+                "worktree",
+                "remove",
+                "/tmp/worktree",
+            )
+
+        self.assertEqual(result["returncode"], 0)
+        self.assertFalse(state["held"])
+
     def test_annotations_and_schema_bounds(self) -> None:
         self.assertFalse(SELF_DEPLOY.DEPLOY_MUTATING.readOnlyHint)
         self.assertFalse(SELF_DEPLOY.DEPLOY_MUTATING.destructiveHint)

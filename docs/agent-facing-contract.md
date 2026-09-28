@@ -74,7 +74,10 @@ The rendered contract requires the agent to:
 12. at material choices, keep the user outcome above the current strategy. Use
     the minimum sufficient mechanism; persistent complexity requires proof of benefit.
     Compare a simpler path against fresh evidence, then explicitly choose `CONTINUE`,
-    `CHANGE` or `PARK/STOP`; a tool failure alone is not strategic evidence;
+    `CHANGE` or `PARK/STOP`; a tool failure alone is not strategic evidence. After
+    successful worktree ensure, a managed dirty checkout may continue only from exact
+    lane, lifecycle and checkout evidence with a fresh Git preimage; never reset, clean
+    or stash merely to make ensure pass;
 13. for nontrivial operator work, use the durable operator-obligation lifecycle to
     resume matching unfinished work and end only with completed, explicitly blocked
     or durably delegated evidence, or with an evidence-bound direct v2

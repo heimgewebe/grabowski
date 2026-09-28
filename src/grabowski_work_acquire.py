@@ -7,13 +7,16 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import stat
+import subprocess
 import time
 import uuid
 from typing import Any, Callable, Iterator
 
 import grabowski_checkouts as checkouts
 import grabowski_execution_plan as execution_plan_contract
+import grabowski_git_preimage as git_preimage
 import grabowski_lane_closeout as lane_closeout
 import grabowski_operator_obligation as operator_obligation
 import grabowski_operator_core as operator
@@ -40,6 +43,9 @@ MAX_TERMINAL_OWNER_LEASES = 512
 MAX_RESOURCE_RELEASE_BATCH = 64
 SUCCESSOR_HANDOFF_MIN_LEASE_REMAINING_SECONDS = 30
 DEFERRED_RESOURCE_RELEASE_CLOSEOUT_STATES = frozenset({"candidate_adopted"})
+SYSTEMD_PROVEN_TERMINAL_SCOPED_WRITER_STATUSES = frozenset(
+    {"succeeded", "failed"}
+)
 
 
 class ScopedWriterStartPreflight(ValueError):
@@ -1924,6 +1930,61 @@ def _writer_job_receipt(result: dict[str, Any]) -> dict[str, Any]:
     return {**receipt, "receipt_sha256": _sha(receipt)}
 
 
+def _read_scoped_writer_status(unit: str) -> dict[str, Any]:
+    """Read one existing scoped writer through the canonical durable job contract."""
+
+    result = operator.grabowski_job_status(unit)
+    if not isinstance(result, dict):
+        raise RuntimeError("scoped writer durable status readback is invalid")
+    return result
+
+
+def _scoped_writer_liveness(
+    writer_job: dict[str, Any],
+    read_writer_status_fn: Callable[[str], dict[str, Any]],
+) -> dict[str, Any]:
+    """Project only exact durable evidence needed to exclude a concurrent writer."""
+
+    unit = writer_job.get("unit")
+    if not isinstance(unit, str) or not unit:
+        raise RuntimeError("scoped writer durable unit identity is invalid")
+    status = read_writer_status_fn(unit)
+    if not isinstance(status, dict) or status.get("unit") != unit:
+        raise RuntimeError("scoped writer durable status is bound to another unit")
+    final_status = status.get("final_status")
+    terminalization = status.get("terminalization_evidence")
+    systemd_visible = status.get("systemd_visible")
+    if (
+        not isinstance(final_status, str)
+        or not final_status
+        or not isinstance(systemd_visible, bool)
+        or not isinstance(terminalization, dict)
+        or terminalization.get("final_status") != final_status
+        or terminalization.get("systemd_visible") is not systemd_visible
+    ):
+        raise RuntimeError("scoped writer durable finalization evidence is invalid")
+
+    # Persisted runner receipts are intentionally not live-process evidence.
+    # Only a currently visible, already-terminal systemd unit proves writer
+    # quiescence. launch_failed is the one safe invisible case because the
+    # canonical job contract admits it only for a proven non-start.
+    terminal = (
+        systemd_visible
+        and final_status in SYSTEMD_PROVEN_TERMINAL_SCOPED_WRITER_STATUSES
+    ) or (not systemd_visible and final_status == "launch_failed")
+    material = {
+        "unit": unit,
+        "final_status": final_status,
+        "systemd_visible": systemd_visible,
+        "terminalization_evidence_sha256": _sha(terminalization),
+    }
+    return {
+        **material,
+        "terminal": terminal,
+        "status_sha256": _sha(material),
+    }
+
+
 def _normalize(
     parameters: dict[str, Any], *, require_fresh_retention: bool = True
 ) -> dict[str, Any]:
@@ -2055,16 +2116,87 @@ def _lifecycle_source(inputs: dict[str, Any]) -> dict[str, str]:
     return {"kind": kind, "id": source_id}
 
 
-def _git_runner(cwd: Path, arguments: list[str]) -> dict[str, Any]:
+def _git_runner(
+    cwd: Path,
+    arguments: list[str],
+    *,
+    timeout_seconds: int | float = 60,
+) -> dict[str, Any]:
     command = ["git", "-C", str(cwd), *arguments]
     command = operator._validate_argv(command, cwd=cwd)
     return operator._run(
         command,
         cwd=cwd,
-        timeout_seconds=60,
+        timeout_seconds=timeout_seconds,
         max_output_bytes=250_000,
         environment=operator._git_environment(),
     )
+
+
+def _bounded_raw_nul_git_probe(
+    cwd: Path,
+    arguments: list[str],
+    *,
+    max_records: int,
+    max_stdout_bytes: int,
+    timeout_seconds: int | float = 30,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run one byte-preserving Git read with pre-buffer record and byte bounds."""
+
+    if max_records < 1 or max_stdout_bytes < 1 or timeout_seconds < 1:
+        raise ValueError("bounded raw Git probe limits must be positive")
+    command = [
+        "git",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        *arguments,
+    ]
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=operator._git_environment(),
+    )
+    assert process.stdout is not None
+    output = bytearray()
+    record_count = 0
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("bounded raw Git probe timed out")
+            ready, _, _ = select.select([process.stdout], [], [], remaining)
+            if not ready:
+                raise RuntimeError("bounded raw Git probe timed out")
+            chunk = os.read(process.stdout.fileno(), 64 * 1024)
+            if not chunk:
+                break
+            output.extend(chunk)
+            record_count += chunk.count(b"\0")
+            if record_count > max_records:
+                raise RuntimeError("bounded raw Git probe record limit exceeded")
+            if len(output) > max_stdout_bytes:
+                raise RuntimeError("bounded raw Git probe byte limit exceeded")
+        remaining = max(0.001, deadline - time.monotonic())
+        returncode = process.wait(timeout=remaining)
+        return subprocess.CompletedProcess(
+            command,
+            returncode,
+            bytes(output),
+            b"",
+        )
+    except Exception:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+        raise
+    finally:
+        process.stdout.close()
 
 
 def _effect_observed(output: dict[str, Any]) -> bool:
@@ -2077,6 +2209,681 @@ def _effect_observed(output: dict[str, Any]) -> bool:
             or isinstance(post.get("branch_ref_head"), str)
         )
     )
+
+
+@contextmanager
+def _continuation_lifecycle_guard(timeout_seconds: float) -> Iterator[None]:
+    """Exclude managed checkout-registry and lifecycle writers through authorization."""
+
+    if timeout_seconds <= 0:
+        raise RuntimeError("managed worktree continuation preimage deadline exceeded")
+    guard_deadline = time.monotonic() + timeout_seconds
+    # Lock order is checkout operation lock -> lifecycle DB transaction. All
+    # supported Grabowski worktree-admin mutations use the same operation lock,
+    # so registry uniqueness stays stable through the guarded yield.
+    remaining = guard_deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError("managed worktree continuation preimage deadline exceeded")
+    with checkouts._operation_lock(deadline_monotonic=guard_deadline):
+        connection = checkouts._database()
+        try:
+            remaining = guard_deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("managed worktree continuation preimage deadline exceeded")
+            timeout_ms = max(1, min(10_000, int(remaining * 1000)))
+            connection.execute(f"PRAGMA busy_timeout={timeout_ms}")
+            connection.execute("BEGIN IMMEDIATE")
+            if time.monotonic() >= guard_deadline:
+                raise RuntimeError("managed worktree continuation preimage deadline exceeded")
+            yield
+        finally:
+            if connection.in_transaction:
+                connection.rollback()
+            connection.close()
+
+
+@contextmanager
+def _continuation_authorization_guard(
+    continuation_preimage: dict[str, Any] | None,
+    *,
+    timeout_seconds: float = 10.0,
+) -> Iterator[None]:
+    """Revalidate lifecycle and effective Git worktree through authorization."""
+
+    if continuation_preimage is None:
+        yield
+        return
+    checkout_key = continuation_preimage.get("checkout_key")
+    checkout_path = continuation_preimage.get("checkout_path")
+    expected_lifecycle_sha256 = continuation_preimage.get("lifecycle_sha256")
+    expected_retention_until_unix = continuation_preimage.get(
+        "lifecycle_retention_until_unix"
+    )
+    expected_branch_preimage_sha256 = continuation_preimage.get(
+        "branch_preimage_sha256"
+    )
+    expected_index_sha256 = continuation_preimage.get("index_sha256")
+    expected_tracked_worktree_sha256 = continuation_preimage.get(
+        "tracked_worktree_sha256"
+    )
+    expected_untracked_preimage_sha256 = continuation_preimage.get(
+        "untracked_preimage_sha256"
+    )
+    expected_untracked_worktree_sha256 = continuation_preimage.get(
+        "untracked_worktree_sha256"
+    )
+    expected_untracked_count = continuation_preimage.get("untracked_count")
+    expected_registered_git_dir = continuation_preimage.get("registered_git_dir")
+    expected_hashes = (
+        expected_branch_preimage_sha256,
+        expected_index_sha256,
+        expected_tracked_worktree_sha256,
+        expected_untracked_preimage_sha256,
+        expected_untracked_worktree_sha256,
+    )
+    if (
+        not isinstance(checkout_key, str)
+        or not isinstance(checkout_path, str)
+        or not checkout_path
+        or not Path(checkout_path).is_absolute()
+        or not isinstance(expected_lifecycle_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_lifecycle_sha256) is None
+        or any(
+            not isinstance(value, str)
+            or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for value in expected_hashes
+        )
+        or isinstance(expected_untracked_count, bool)
+        or not isinstance(expected_untracked_count, int)
+        or expected_untracked_count < 0
+        or not isinstance(expected_registered_git_dir, dict)
+        or not isinstance(expected_registered_git_dir.get("path"), str)
+        or not isinstance(expected_registered_git_dir.get("device"), int)
+        or not isinstance(expected_registered_git_dir.get("inode"), int)
+        or isinstance(expected_retention_until_unix, bool)
+        or not isinstance(expected_retention_until_unix, int)
+    ):
+        raise RuntimeError(
+            "managed worktree continuation authorization evidence is invalid"
+        )
+    authorization_deadline = time.monotonic() + timeout_seconds
+
+    def remaining_authorization_seconds() -> float:
+        remaining = authorization_deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                "managed worktree continuation authorization deadline exceeded"
+            )
+        return remaining
+
+    def authorization_probe(
+        cwd: Path, argv: list[str]
+    ) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            [
+                "git",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false",
+                *argv,
+            ],
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=remaining_authorization_seconds(),
+            env=operator._git_environment(),
+        )
+
+    def authorization_index_probe(
+        cwd: Path, argv: list[str]
+    ) -> subprocess.CompletedProcess[bytes]:
+        return _bounded_raw_nul_git_probe(
+            cwd,
+            argv,
+            max_records=100_000,
+            max_stdout_bytes=32 * 1024 * 1024,
+            timeout_seconds=remaining_authorization_seconds(),
+        )
+
+    def authorization_untracked_probe(
+        cwd: Path, argv: list[str]
+    ) -> subprocess.CompletedProcess[bytes]:
+        return _bounded_raw_nul_git_probe(
+            cwd,
+            argv,
+            max_records=100,
+            max_stdout_bytes=512 * 1024,
+            timeout_seconds=remaining_authorization_seconds(),
+        )
+
+    with _continuation_lifecycle_guard(remaining_authorization_seconds()):
+        lifecycle = checkouts._strict_lifecycle_binding(checkout_key)
+        if (
+            not isinstance(lifecycle, dict)
+            or _sha(lifecycle) != expected_lifecycle_sha256
+        ):
+            raise RuntimeError(
+                "managed worktree continuation lifecycle authority changed before authorization"
+            )
+        retention_until_unix = lifecycle.get("retention_until_unix")
+        if (
+            retention_until_unix != expected_retention_until_unix
+            or retention_until_unix <= int(time.time())
+        ):
+            raise RuntimeError(
+                "managed worktree continuation lifecycle retention expired before authorization"
+            )
+        checkout = Path(checkout_path)
+        try:
+            git_preimage._require_effective_git_toplevel(
+                checkout,
+                authorization_probe,
+                deadline_monotonic=authorization_deadline,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "managed worktree continuation effective Git worktree changed before authorization"
+            ) from exc
+        try:
+            current_branch_preimage = git_preimage.capture_branch_preimage(
+                checkout,
+                authorization_probe,
+                require_attached=True,
+                index_probe=authorization_index_probe,
+                max_tracked_paths=25_000,
+                max_tracked_bytes=1024 * 1024 * 1024,
+                deadline_monotonic=authorization_deadline,
+                reject_gitlinks=True,
+            )
+            current_untracked_preimage = git_preimage.capture_untracked_preimage(
+                checkout,
+                authorization_untracked_probe,
+                max_paths=100,
+                max_total_bytes=256 * 1024 * 1024,
+                deadline_monotonic=authorization_deadline,
+            )
+            index_flags = authorization_index_probe(
+                checkout, ["ls-files", "-v", "-z"]
+            )
+            if index_flags.returncode != 0:
+                raise RuntimeError(
+                    "managed worktree continuation index flags could not be revalidated"
+                )
+            index_flag_entries = [
+                entry for entry in index_flags.stdout.split(b"\0") if entry
+            ]
+            index_flag_tags = [
+                chr(entry[0]) for entry in index_flag_entries if entry
+            ]
+            if any(tag.islower() for tag in index_flag_tags):
+                raise RuntimeError(
+                    "managed worktree continuation has assume-unchanged index entries before authorization"
+                )
+            if any(tag.upper() == "S" for tag in index_flag_tags):
+                raise RuntimeError(
+                    "managed worktree continuation has skip-worktree index entries before authorization"
+                )
+            current_physical = current_branch_preimage.get("physical_checkout")
+            current_common_dir = (
+                current_physical.get("common_dir")
+                if isinstance(current_physical, dict)
+                else None
+            )
+            current_common_path = (
+                current_common_dir.get("path")
+                if isinstance(current_common_dir, dict)
+                else None
+            )
+            if not isinstance(current_common_path, str):
+                raise RuntimeError(
+                    "managed worktree continuation physical common directory is invalid before authorization"
+                )
+            current_registered_git_dir = (
+                physical_checkout.capture_registered_linked_worktree_git_dir(
+                    current_common_path, checkout
+                )
+            )
+            git_preimage._require_effective_git_toplevel(
+                checkout,
+                authorization_probe,
+                deadline_monotonic=authorization_deadline,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "managed worktree continuation Git state could not be revalidated before authorization"
+            ) from exc
+        if current_registered_git_dir != expected_registered_git_dir:
+            raise RuntimeError(
+                "managed worktree continuation registered Git directory changed before authorization"
+            )
+        current_git_state = (
+            current_branch_preimage.get("preimage_sha256"),
+            current_branch_preimage.get("index_sha256"),
+            current_branch_preimage.get("worktree_sha256"),
+            current_untracked_preimage.get("preimage_sha256"),
+            current_untracked_preimage.get("worktree_sha256"),
+            current_untracked_preimage.get("count"),
+        )
+        expected_git_state = (
+            expected_branch_preimage_sha256,
+            expected_index_sha256,
+            expected_tracked_worktree_sha256,
+            expected_untracked_preimage_sha256,
+            expected_untracked_worktree_sha256,
+            expected_untracked_count,
+        )
+        if current_git_state != expected_git_state:
+            raise RuntimeError(
+                "managed worktree continuation Git state changed before authorization"
+            )
+        try:
+            physical_checkout.verify_physical_checkout_identity(current_physical)
+        except Exception as exc:
+            raise RuntimeError(
+                "managed worktree continuation physical checkout changed before authorization"
+            ) from exc
+        remaining_authorization_seconds()
+        if retention_until_unix <= int(time.time()):
+            raise RuntimeError(
+                "managed worktree continuation lifecycle retention expired before authorization"
+            )
+        remaining_authorization_seconds()
+        yield
+
+
+def _continuation_preimage(
+    existing: dict[str, Any] | None,
+    inputs: dict[str, Any],
+    lifecycle_source: dict[str, str],
+    runner: Callable[[Path, list[str]], dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Bind live Git state when resuming an already prepared managed work lane."""
+
+    if not isinstance(existing, dict):
+        return None
+    resumable_continuation = existing.get("state") == "ready" or (
+        existing.get("state") == "blocked"
+        and existing.get("error_class") == "WORKTREE_CONTINUATION_CONFLICT"
+    )
+    if not resumable_continuation:
+        return None
+    prior = existing.get("worktree_receipt")
+    if not isinstance(prior, dict) or prior.get("result_state") not in SUCCESS_STATES:
+        return None
+    prior_lifecycle = prior.get("lifecycle")
+    if not isinstance(prior_lifecycle, dict):
+        return None
+    prior_physical = prior_lifecycle.get("physical_checkout")
+    if not isinstance(prior_physical, dict):
+        raise RuntimeError(
+            "managed worktree continuation lacks ensure-time physical identity"
+        )
+
+    target = Path(inputs["target_path"])
+    repo = Path(inputs["repo"])
+    _top_level, registered_common_dir, record = checkouts._worktree_for_path(repo, target)
+    checkouts._require_linked(record)
+    checkout_key = record.get("checkout_key")
+    if not isinstance(checkout_key, str) or checkout_key != prior_lifecycle.get("checkout_key"):
+        raise RuntimeError("managed worktree continuation checkout identity drifted")
+    try:
+        expected_physical = physical_checkout.verify_physical_checkout_identity(
+            prior_physical
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "managed worktree continuation differs from ensure-time physical identity"
+        ) from exc
+    physical_common = expected_physical.get("common_dir")
+    if (
+        not isinstance(physical_common, dict)
+        or physical_common.get("path") != str(registered_common_dir)
+    ):
+        raise RuntimeError(
+            "managed worktree continuation ensure-time identity is not bound to the registered Git common directory"
+        )
+    try:
+        current_registered_git_dir = (
+            physical_checkout.capture_registered_linked_worktree_git_dir(
+                registered_common_dir, target
+            )
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "managed worktree continuation registered Git directory could not be resolved"
+        ) from exc
+    if current_registered_git_dir != expected_physical.get("git_dir"):
+        raise RuntimeError(
+            "managed worktree continuation registered Git directory drifted"
+        )
+
+    expected_lifecycle = {
+        "checkout_path": str(target),
+        "owner_id": inputs["lease_owner_id"],
+        "source": lifecycle_source,
+        "artifact_class": inputs["artifact_class"],
+        "phase": "active",
+        "expected_branch": inputs["branch"],
+    }
+    if record.get("branch") != inputs["branch"] or record.get("detached"):
+        raise RuntimeError("managed worktree continuation branch identity drifted")
+
+    snapshot_deadline = time.monotonic() + 30.0
+
+    def remaining_snapshot_seconds() -> float:
+        remaining = snapshot_deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("managed worktree continuation preimage deadline exceeded")
+        return remaining
+
+    def capture_lifecycle() -> dict[str, Any]:
+        remaining_snapshot_seconds()
+        lifecycle = checkouts._strict_lifecycle_binding(checkout_key)
+        remaining_snapshot_seconds()
+        if not isinstance(lifecycle, dict) or any(
+            lifecycle.get(field) != value
+            for field, value in expected_lifecycle.items()
+        ):
+            raise RuntimeError(
+                "managed worktree continuation lifecycle authority drifted"
+            )
+        prior_head = lifecycle.get("expected_head")
+        if not isinstance(prior_head, str) or SHA40_RE.fullmatch(prior_head) is None:
+            raise RuntimeError(
+                "managed worktree continuation prior HEAD evidence is invalid"
+            )
+        require_active_lifecycle_retention(lifecycle)
+        return lifecycle
+
+    def require_active_lifecycle_retention(lifecycle: dict[str, Any]) -> int:
+        retention_until_unix = lifecycle.get("retention_until_unix")
+        if (
+            isinstance(retention_until_unix, bool)
+            or not isinstance(retention_until_unix, int)
+        ):
+            raise RuntimeError(
+                "managed worktree continuation lifecycle retention evidence is invalid"
+            )
+        if retention_until_unix <= int(time.time()):
+            raise RuntimeError(
+                "managed worktree continuation lifecycle retention expired"
+            )
+        return retention_until_unix
+
+    def raw_probe(cwd: Path, argv: list[str]) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *argv],
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=remaining_snapshot_seconds(),
+            env=operator._git_environment(),
+        )
+
+    def bounded_tracked_index_probe(
+        cwd: Path, argv: list[str]
+    ) -> subprocess.CompletedProcess[bytes]:
+        return _bounded_raw_nul_git_probe(
+            cwd,
+            argv,
+            max_records=100_000,
+            max_stdout_bytes=32 * 1024 * 1024,
+            timeout_seconds=remaining_snapshot_seconds(),
+        )
+
+    def bounded_untracked_probe(
+        cwd: Path, argv: list[str]
+    ) -> subprocess.CompletedProcess[bytes]:
+        return _bounded_raw_nul_git_probe(
+            cwd,
+            argv,
+            max_records=100,
+            max_stdout_bytes=512 * 1024,
+            timeout_seconds=remaining_snapshot_seconds(),
+        )
+
+    def snapshot_runner(arguments: list[str]) -> dict[str, Any]:
+        timeout_seconds = remaining_snapshot_seconds()
+        if runner is _git_runner:
+            result = _git_runner(
+                target,
+                arguments,
+                timeout_seconds=timeout_seconds,
+            )
+        else:
+            result = runner(target, arguments)
+        remaining_snapshot_seconds()
+        return result
+
+    def capture_snapshot() -> dict[str, Any]:
+        lifecycle = capture_lifecycle()
+        prior_head = lifecycle["expected_head"]
+        status = snapshot_runner(
+            ["status", "--short", "--branch", "--untracked-files=normal"]
+        )
+        head = snapshot_runner(["rev-parse", "--verify", "HEAD^{commit}"])
+        tracked_index = snapshot_runner(["diff-index", "--quiet", "HEAD", "--"])
+        tracked_files = snapshot_runner(["diff-files", "--quiet", "--"])
+        index_flags = snapshot_runner(["ls-files", "-v", "-z"])
+        preimage_reads = (status, head, index_flags)
+        if any(result.get("returncode") != 0 for result in preimage_reads):
+            raise RuntimeError("managed worktree continuation Git readback failed")
+        if (
+            tracked_index.get("returncode") not in (0, 1)
+            or tracked_files.get("returncode") not in (0, 1)
+        ):
+            raise RuntimeError("managed worktree continuation tracked state readback failed")
+        if any(
+            result.get("stdout_truncated") is True
+            or result.get("stderr_truncated") is True
+            for result in preimage_reads
+        ):
+            raise RuntimeError("managed worktree continuation Git readback was truncated")
+
+        status_lines = [
+            line for line in str(status.get("stdout") or "").splitlines() if line
+        ]
+        status_entries = status_lines[1:] if status_lines else []
+        head_sha = str(head.get("stdout") or "").strip().lower()
+        if SHA40_RE.fullmatch(head_sha) is None:
+            raise RuntimeError("managed worktree continuation HEAD is invalid")
+
+        try:
+            branch_preimage = git_preimage.capture_branch_preimage(
+                target,
+                raw_probe,
+                require_attached=True,
+                index_probe=bounded_tracked_index_probe,
+                max_tracked_paths=25_000,
+                max_tracked_bytes=1024 * 1024 * 1024,
+                deadline_monotonic=snapshot_deadline,
+                reject_gitlinks=True,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "managed worktree continuation raw Git preimage capture failed"
+            ) from exc
+        branch_physical = branch_preimage.get("physical_checkout")
+        if (
+            not isinstance(branch_physical, dict)
+            or branch_physical.get("physical_identity_sha256")
+            != expected_physical.get("physical_identity_sha256")
+        ):
+            raise RuntimeError("managed worktree continuation physical identity drifted")
+        if branch_preimage.get("branch") != inputs["branch"]:
+            raise RuntimeError("managed worktree continuation raw branch identity drifted")
+        if branch_preimage.get("head") != head_sha:
+            raise RuntimeError("managed worktree continuation raw HEAD identity drifted")
+        if branch_preimage.get("operation_refs"):
+            raise RuntimeError("managed worktree continuation has in-progress Git operation")
+
+        index_entries = [
+            entry for entry in str(index_flags.get("stdout") or "").split("\0") if entry
+        ]
+        tags = [entry[0] for entry in index_entries]
+        if any(tag.islower() for tag in tags):
+            raise RuntimeError(
+                "managed worktree continuation has assume-unchanged index entries"
+            )
+        if any(tag.upper() == "S" for tag in tags):
+            raise RuntimeError(
+                "managed worktree continuation has skip-worktree index entries"
+            )
+
+        ancestry = raw_probe(
+            target,
+            [
+                "--no-replace-objects",
+                "merge-base",
+                "--is-ancestor",
+                prior_head,
+                head_sha,
+            ],
+        )
+        if ancestry.returncode != 0:
+            raise RuntimeError(
+                "managed worktree continuation HEAD is not a descendant of ensure"
+            )
+        try:
+            untracked_preimage = git_preimage.capture_untracked_preimage(
+                target,
+                bounded_untracked_probe,
+                max_paths=100,
+                max_total_bytes=256 * 1024 * 1024,
+                deadline_monotonic=snapshot_deadline,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "managed worktree continuation untracked preimage capture failed"
+            ) from exc
+        try:
+            git_preimage._require_effective_git_toplevel(
+                target,
+                raw_probe,
+                deadline_monotonic=snapshot_deadline,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "managed worktree continuation effective Git worktree changed after untracked capture"
+            ) from exc
+        remaining_snapshot_seconds()
+        try:
+            snapshot_registered_git_dir = (
+                physical_checkout.capture_registered_linked_worktree_git_dir(
+                    registered_common_dir, target
+                )
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "managed worktree continuation registered Git directory changed during snapshot"
+            ) from exc
+        remaining_snapshot_seconds()
+        if snapshot_registered_git_dir != expected_physical.get("git_dir"):
+            raise RuntimeError(
+                "managed worktree continuation registered Git directory changed during snapshot"
+            )
+        remaining_snapshot_seconds()
+        try:
+            snapshot_physical = (
+                physical_checkout.verify_physical_checkout_identity(
+                    prior_physical
+                )
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "managed worktree continuation physical identity changed during preimage capture"
+            ) from exc
+        remaining_snapshot_seconds()
+
+        return {
+            "lifecycle": lifecycle,
+            "lifecycle_sha256": _sha(lifecycle),
+            "head": head_sha,
+            "status_header": status_lines[0] if status_lines else "",
+            "status_entries": status_entries[:100],
+            "branch_preimage_sha256": branch_preimage["preimage_sha256"],
+            "index_sha256": branch_preimage["index_sha256"],
+            "tracked_worktree_sha256": branch_preimage["worktree_sha256"],
+            "tracked_index_dirty": tracked_index.get("returncode") == 1,
+            "tracked_worktree_dirty": tracked_files.get("returncode") == 1,
+            "untracked_preimage_sha256": untracked_preimage["preimage_sha256"],
+            "untracked_worktree_sha256": untracked_preimage["worktree_sha256"],
+            "untracked_count": untracked_preimage["count"],
+            "registered_git_dir": snapshot_registered_git_dir,
+            "physical_identity_sha256": snapshot_physical[
+                "physical_identity_sha256"
+            ],
+        }
+
+    first_snapshot = capture_snapshot()
+    with _continuation_lifecycle_guard(remaining_snapshot_seconds()):
+        stable_snapshot = capture_snapshot()
+        authority_fields = (
+            "head",
+            "branch_preimage_sha256",
+            "index_sha256",
+            "tracked_worktree_sha256",
+            "tracked_index_dirty",
+            "tracked_worktree_dirty",
+            "untracked_preimage_sha256",
+            "untracked_worktree_sha256",
+            "untracked_count",
+            "registered_git_dir",
+            "physical_identity_sha256",
+        )
+        if any(
+            first_snapshot[field] != stable_snapshot[field]
+            for field in authority_fields
+        ):
+            raise RuntimeError(
+                "managed worktree continuation Git state changed during stable readback"
+            )
+
+        if first_snapshot["lifecycle_sha256"] != stable_snapshot["lifecycle_sha256"]:
+            raise RuntimeError(
+                "managed worktree continuation lifecycle authority changed during stable readback"
+            )
+
+        stable_retention_until_unix = require_active_lifecycle_retention(
+            stable_snapshot["lifecycle"]
+        )
+        material = {
+            "schema_version": 1,
+            "kind": "grabowski.work_lane_continuation_preimage",
+            "lane_id": inputs["lane_id"],
+            "checkout_key": checkout_key,
+            "checkout_path": str(target),
+            "physical_identity_sha256": expected_physical["physical_identity_sha256"],
+            "branch": inputs["branch"],
+            "head": stable_snapshot["head"],
+            "ensure_head": stable_snapshot["lifecycle"]["expected_head"],
+            "dirty": bool(stable_snapshot["status_entries"]),
+            "status_header": stable_snapshot["status_header"],
+            "status_entries": stable_snapshot["status_entries"],
+            "branch_preimage_sha256": stable_snapshot["branch_preimage_sha256"],
+            "index_sha256": stable_snapshot["index_sha256"],
+            "tracked_worktree_sha256": stable_snapshot["tracked_worktree_sha256"],
+            "tracked_index_dirty": stable_snapshot["tracked_index_dirty"],
+            "tracked_worktree_dirty": stable_snapshot["tracked_worktree_dirty"],
+            "untracked_preimage_sha256": stable_snapshot["untracked_preimage_sha256"],
+            "untracked_worktree_sha256": stable_snapshot["untracked_worktree_sha256"],
+            "untracked_count": stable_snapshot["untracked_count"],
+            "registered_git_dir": stable_snapshot["registered_git_dir"],
+            "prior_worktree_receipt_sha256": prior.get("durable_receipt_sha256"),
+            "lifecycle_sha256": stable_snapshot["lifecycle_sha256"],
+            "lifecycle_retention_until_unix": stable_retention_until_unix,
+            "lifecycle_updated_at_unix": stable_snapshot["lifecycle"].get(
+                "updated_at_unix"
+            ),
+        }
+        result = {**material, "preimage_sha256": _sha(material)}
+        require_active_lifecycle_retention(stable_snapshot["lifecycle"])
+        return result
 
 
 def _resource_acquisition_plan(resource_keys: list[str]) -> list[dict[str, Any]]:
@@ -2376,6 +3183,7 @@ def acquire_work(
     ensure_worktree_fn: Callable[..., dict[str, Any]] = worktree_ensure.ensure_worktree,
     runner: Callable[[Path, list[str]], dict[str, Any]] = _git_runner,
     start_writer_fn: Callable[..., dict[str, Any]] = _start_scoped_writer,
+    read_writer_status_fn: Callable[[str], dict[str, Any]] = _read_scoped_writer_status,
     audit_fn: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     inputs = _normalize(parameters)
@@ -2658,6 +3466,163 @@ def acquire_work(
         )
         group_evidence = _group_evidence_fields(acquisition_plan, acquisitions)
 
+        def continuation_conflict(
+            exc: Exception,
+            worktree_receipt: dict[str, Any] | None,
+            *,
+            error_class: str = "WORKTREE_CONTINUATION_CONFLICT",
+            writer_liveness: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            preserve_writer_authority = (
+                existing_writer_job is not None
+                and (
+                    writer_liveness is None
+                    or writer_liveness.get("terminal") is not True
+                )
+            )
+            if preserve_writer_authority:
+                record = _write_state(
+                    receipt_path,
+                    {
+                        **base_record,
+                        "state": "outcome_unknown",
+                        "decision": "HARD_BLOCK",
+                        "lease_receipt": acquired,
+                        **group_evidence,
+                        "worktree_receipt": worktree_receipt,
+                        "writer_job": existing_writer_job,
+                        **(
+                            {"writer_start": existing_writer_start}
+                            if isinstance(existing_writer_start, dict)
+                            else {}
+                        ),
+                        "error_class": error_class,
+                        "error": str(exc)[:2048],
+                        **(
+                            {"writer_liveness": writer_liveness}
+                            if writer_liveness is not None
+                            else {}
+                        ),
+                        "effect_observed": True,
+                        "compensation": None,
+                        "next_action": "readback_scoped_writer_before_retry",
+                    },
+                )
+                if audit_fn is not None:
+                    audit_fn(
+                        {
+                            "operation": "work-acquire",
+                            "lane_id": lane_id,
+                            "state": "outcome_unknown",
+                            "decision": "HARD_BLOCK",
+                            "inputs_sha256": inputs_sha256,
+                            "effect_observed": True,
+                        }
+                    )
+                return {
+                    **record,
+                    "durable_receipt_path": str(receipt_path),
+                    "replayed": existing is not None,
+                }
+
+            compensation, compensation_complete = _compensate_acquisitions(
+                owner_id=inputs["lease_owner_id"],
+                plan=acquisition_plan,
+                acquisitions=acquisitions,
+                release_resources_fn=release_resources_fn,
+                receipt_path=receipt_path,
+                base_record=base_record,
+                lease_receipt=acquired,
+            )
+            state = "blocked" if compensation_complete else "outcome_unknown"
+            record = _write_state(
+                receipt_path,
+                {
+                    **base_record,
+                    "state": state,
+                    "decision": "HARD_BLOCK",
+                    "lease_receipt": acquired,
+                    **group_evidence,
+                    "worktree_receipt": worktree_receipt,
+                    "error_class": error_class,
+                    "error": str(exc)[:2048],
+                    **(
+                        {"writer_liveness": writer_liveness}
+                        if writer_liveness is not None
+                        else {}
+                    ),
+                    "effect_observed": False,
+                    "compensation": compensation,
+                    "next_action": (
+                        "reconcile_managed_worktree_continuation"
+                        if compensation_complete
+                        else "reconcile_lease_compensation_before_retry"
+                    ),
+                },
+            )
+            if audit_fn is not None:
+                audit_fn(
+                    {
+                        "operation": "work-acquire",
+                        "lane_id": lane_id,
+                        "state": state,
+                        "decision": "HARD_BLOCK",
+                        "inputs_sha256": inputs_sha256,
+                        "effect_observed": False,
+                    }
+                )
+            return {
+                **record,
+                "durable_receipt_path": str(receipt_path),
+                "replayed": existing is not None,
+            }
+
+        writer_liveness: dict[str, Any] | None = None
+        if existing_writer_job is not None:
+            try:
+                writer_liveness = _scoped_writer_liveness(
+                    existing_writer_job, read_writer_status_fn
+                )
+            except Exception as exc:
+                return continuation_conflict(
+                    exc,
+                    (
+                        existing.get("worktree_receipt")
+                        if isinstance(existing, dict)
+                        else None
+                    ),
+                    error_class="SCOPED_WRITER_STATUS_UNCLEAR",
+                )
+            if writer_liveness["terminal"] is not True:
+                return continuation_conflict(
+                    RuntimeError(
+                        "existing scoped writer is not proven terminal: "
+                        + str(writer_liveness["final_status"])
+                    ),
+                    (
+                        existing.get("worktree_receipt")
+                        if isinstance(existing, dict)
+                        else None
+                    ),
+                    error_class="SCOPED_WRITER_NOT_TERMINAL",
+                    writer_liveness=writer_liveness,
+                )
+
+        try:
+            continuation_preimage = _continuation_preimage(
+                existing, inputs, lifecycle_source, runner
+            )
+        except Exception as exc:
+            return continuation_conflict(
+                exc,
+                (
+                    existing.get("worktree_receipt")
+                    if isinstance(existing, dict)
+                    else None
+                ),
+                writer_liveness=writer_liveness,
+            )
+
         ensure_parameters = {
             "repo": inputs["repo"],
             "target_path": inputs["target_path"],
@@ -2676,11 +3641,14 @@ def acquire_work(
             ],
         }
         try:
-            output = ensure_worktree_fn(
-                ensure_parameters,
-                runner,
-                inspect_resource_fn,
-            )
+            if continuation_preimage is not None:
+                output = existing["worktree_receipt"]
+            else:
+                output = ensure_worktree_fn(
+                    ensure_parameters,
+                    runner,
+                    inspect_resource_fn,
+                )
         except worktree_ensure.WorktreeEnsurePreflight as exc:
             compensation, compensation_complete = _compensate_acquisitions(
                 owner_id=inputs["lease_owner_id"],
@@ -2777,7 +3745,9 @@ def acquire_work(
         if result_state in SUCCESS_STATES:
             admission = output.get("work_admission")
             decision = (
-                "ISOLATE_AND_EXECUTE"
+                "CONTINUE_EXISTING"
+                if continuation_preimage is not None
+                else "ISOLATE_AND_EXECUTE"
                 if work_admission.has_verified_isolation_evidence(admission)
                 else "AUTO_PREPARE_AND_EXECUTE"
                 if result_state == "CREATED"
@@ -2803,6 +3773,7 @@ def acquire_work(
                 ],
                 "single_writer_scope": "overlapping-resource-lane",
             }
+            continuation_authorized = continuation_preimage is None
             writer_job = existing_writer_job
             writer_start: dict[str, Any] | None = None
             if writer_job is not None:
@@ -2811,20 +3782,30 @@ def acquire_work(
                     "job_receipt_sha256": writer_job.get("receipt_sha256"),
                 }
             elif writer_argv is not None:
-                _write_state(
-                    receipt_path,
-                    {
-                        **base_record,
-                        "state": "writer_starting",
-                        "decision": decision,
-                        "lease_receipt": acquired,
-                        **group_evidence,
-                        "worktree_receipt": output,
-                        "authority": authority,
-                        "writer_start": {"state": "starting"},
-                        "next_action": "start_scoped_writer",
-                    },
-                )
+                try:
+                    with _continuation_authorization_guard(continuation_preimage):
+                        _write_state(
+                            receipt_path,
+                            {
+                                **base_record,
+                                "state": "writer_starting",
+                                "decision": decision,
+                                "lease_receipt": acquired,
+                                **group_evidence,
+                                "worktree_receipt": output,
+                                **(
+                                    {"continuation_preimage": continuation_preimage}
+                                    if continuation_preimage is not None
+                                    else {}
+                                ),
+                                "authority": authority,
+                                "writer_start": {"state": "starting"},
+                                "next_action": "start_scoped_writer",
+                            },
+                        )
+                    continuation_authorized = True
+                except Exception as exc:
+                    return continuation_conflict(exc, output)
                 try:
                     writer_result = start_writer_fn(
                         writer_argv,
@@ -2843,6 +3824,7 @@ def acquire_work(
                             "lease_receipt": acquired,
                             **group_evidence,
                             "worktree_receipt": output,
+                            **({"continuation_preimage": continuation_preimage} if continuation_preimage is not None else {}),
                             "authority": authority,
                             "writer_start": {
                                 "state": "preflight_failed",
@@ -2867,6 +3849,7 @@ def acquire_work(
                             "lease_receipt": acquired,
                             **group_evidence,
                             "worktree_receipt": output,
+                            **({"continuation_preimage": continuation_preimage} if continuation_preimage is not None else {}),
                             "authority": authority,
                             "writer_start": {
                                 "state": "outcome_unknown",
@@ -2891,6 +3874,7 @@ def acquire_work(
                             "lease_receipt": acquired,
                             **group_evidence,
                             "worktree_receipt": output,
+                            **({"continuation_preimage": continuation_preimage} if continuation_preimage is not None else {}),
                             "authority": authority,
                             "writer_start": {
                                 "state": "outcome_unknown",
@@ -2917,6 +3901,7 @@ def acquire_work(
                             "lease_receipt": acquired,
                             **group_evidence,
                             "worktree_receipt": output,
+                            **({"continuation_preimage": continuation_preimage} if continuation_preimage is not None else {}),
                             "authority": authority,
                             "writer_start": {
                                 "state": "outcome_unknown",
@@ -2935,27 +3920,99 @@ def acquire_work(
                     "state": "started",
                     "job_receipt_sha256": writer_job["receipt_sha256"],
                 }
-            record = _write_state(
-                receipt_path,
-                {
-                    **base_record,
-                    "state": "ready",
-                    "decision": decision,
-                    "lease_receipt": acquired,
-                    **group_evidence,
-                    "worktree_receipt": output,
-                    "authority": authority,
-                    **({"writer_job": writer_job} if writer_job is not None else {}),
-                    **({"writer_start": writer_start} if writer_start is not None else {}),
-                    "next_action": (
-                        "writer_started"
-                        if writer_job is not None
-                        else "start_scoped_writer"
-                        if inputs["scoped_writer"]
-                        else "controller_execute"
-                    ),
-                },
-            )
+            ready_payload = {
+                **base_record,
+                "state": "ready",
+                "decision": decision,
+                "lease_receipt": acquired,
+                **group_evidence,
+                "worktree_receipt": output,
+                **(
+                    {"continuation_preimage": continuation_preimage}
+                    if continuation_preimage is not None
+                    else {}
+                ),
+                "authority": authority,
+                **(
+                    {"writer_liveness": writer_liveness}
+                    if writer_liveness is not None
+                    else {}
+                ),
+                **({"writer_job": writer_job} if writer_job is not None else {}),
+                **({"writer_start": writer_start} if writer_start is not None else {}),
+                "next_action": (
+                    "writer_started"
+                    if writer_job is not None
+                    else "start_scoped_writer"
+                    if inputs["scoped_writer"]
+                    else "controller_execute"
+                ),
+            }
+            try:
+                if continuation_authorized:
+                    record = _write_state(receipt_path, ready_payload)
+                else:
+                    with _continuation_authorization_guard(continuation_preimage):
+                        record = _write_state(receipt_path, ready_payload)
+                    continuation_authorized = True
+            except Exception as exc:
+                if existing_writer_job is not None:
+                    return continuation_conflict(
+                        exc,
+                        output,
+                        writer_liveness=writer_liveness,
+                    )
+                if writer_job is None:
+                    return continuation_conflict(exc, output)
+                record = _write_state(
+                    receipt_path,
+                    {
+                        **base_record,
+                        "state": "outcome_unknown",
+                        "decision": "HARD_BLOCK",
+                        "lease_receipt": acquired,
+                        **group_evidence,
+                        "worktree_receipt": output,
+                        **(
+                            {"continuation_preimage": continuation_preimage}
+                            if continuation_preimage is not None
+                            else {}
+                        ),
+                        "authority": authority,
+                        **(
+                            {"writer_liveness": writer_liveness}
+                            if writer_liveness is not None
+                            else {}
+                        ),
+                        "writer_job": writer_job,
+                        **(
+                            {"writer_start": writer_start}
+                            if writer_start is not None
+                            else {}
+                        ),
+                        "error_class": type(exc).__name__,
+                        "error": str(exc)[:2048],
+                        "effect_observed": True,
+                        "compensation": None,
+                        "next_action": "readback_scoped_writer_before_retry",
+                    },
+                )
+                if audit_fn is not None:
+                    audit_fn(
+                        {
+                            "operation": "work-acquire",
+                            "lane_id": lane_id,
+                            "state": "outcome_unknown",
+                            "decision": "HARD_BLOCK",
+                            "inputs_sha256": inputs_sha256,
+                            "effect_observed": True,
+                        }
+                    )
+                return {
+                    **record,
+                    "durable_receipt_path": str(receipt_path),
+                    "replayed": existing is not None,
+                }
             if audit_fn is not None:
                 audit_fn({"operation": "work-acquire", "lane_id": lane_id, "state": "ready", "decision": decision, "inputs_sha256": inputs_sha256, "worktree_receipt_sha256": output.get("durable_receipt_sha256")})
             return {**record, "durable_receipt_path": str(receipt_path), "replayed": existing is not None}
