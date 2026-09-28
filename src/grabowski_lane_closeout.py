@@ -708,9 +708,7 @@ def assess(
         and assessment.get("closeout_state") == "blocked_with_durable_followup"
         and data.get("durable_followup_id") is not None
     ):
-        legacy_data = dict(data)
-        legacy_data.pop("durable_followup_id", None)
-        material["legacy_observation_sha256"] = sha256_json(legacy_data)
+        material["legacy_observation_sha256"] = material["observation_sha256"]
     assessment_sha256 = sha256_json(material)
     audit_record_sha256: str | None = None
     if append_audit is not None:

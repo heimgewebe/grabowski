@@ -320,6 +320,10 @@ class LaneCloseoutTests(unittest.TestCase):
             assessment["legacy_observation_sha256"],
             r"^[0-9a-f]{64}$",
         )
+        self.assertEqual(
+            assessment["observation_sha256"],
+            assessment["legacy_observation_sha256"],
+        )
         self.assertFalse(assessment["lease_release_ready"])
         self.assertEqual(
             closeout.validate_terminal_assessment(assessment),
