@@ -2719,6 +2719,31 @@ def _archive_partial_completion_assessment(
             "reason": "archive-retention-preimage-mismatch",
             "verified_recovery_refs": verified_refs,
         }
+    expected_followup_authority = evidence.get(
+        "blocked_followup_archive_evidence"
+    )
+    try:
+        current_followup_authority = (
+            _require_completed_work_lane_archive_authority(
+                lifecycle,
+                str(evidence["checkout_key"]),
+            )
+        )
+    except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+        return {
+            "state": "foreign_or_ambiguous",
+            "reason": (
+                "archive-blocked-followup-authority-unavailable:"
+                + type(exc).__name__
+            ),
+            "verified_recovery_refs": verified_refs,
+        }
+    if current_followup_authority != expected_followup_authority:
+        return {
+            "state": "foreign_or_ambiguous",
+            "reason": "archive-blocked-followup-authority-drift",
+            "verified_recovery_refs": verified_refs,
+        }
     coordination = _linked_checkout_coordination(
         checkout,
         top_level,
@@ -2760,6 +2785,11 @@ def _archive_partial_completion_assessment(
         "retention_preimage_sha256": (
             None if retention_preimage is None else _sha256_json(retention_preimage)
         ),
+        "blocked_followup_archive_evidence_sha256": (
+            None
+            if current_followup_authority is None
+            else current_followup_authority.get("authority_sha256")
+        ),
     }
     return {
         **core,
@@ -2771,6 +2801,7 @@ def _archive_partial_completion_assessment(
         "metadata_binding": manifest_info["metadata_binding"],
         "lifecycle_preimage": lifecycle_preimage,
         "retention_preimage": retention_preimage,
+        "blocked_followup_archive_evidence": current_followup_authority,
     }
 
 
@@ -2843,6 +2874,20 @@ def _complete_partial_archive(
                 if retention_now != assessment["retention_preimage"]:
                     raise RuntimeError(
                         "Archive retention state changed during atomic completion"
+                    )
+                current_followup_authority = (
+                    _require_completed_work_lane_archive_authority(
+                        lifecycle_now,
+                        checkout_key,
+                    )
+                )
+                if (
+                    current_followup_authority
+                    != assessment.get("blocked_followup_archive_evidence")
+                ):
+                    raise RuntimeError(
+                        "blocked durable followup archive authority changed "
+                        "during recovery commit"
                     )
                 retention_created = (
                     completed
@@ -6095,6 +6140,34 @@ def grabowski_checkout_archive(
         created = _now()
         with _database() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            lifecycle_row = connection.execute(
+                "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
+                (record["checkout_key"],),
+            ).fetchone()
+            lifecycle_at_commit = (
+                None if lifecycle_row is None else _lifecycle_public(lifecycle_row)
+            )
+            if lifecycle_at_commit != lifecycle_before:
+                raise RuntimeError(
+                    "Checkout lifecycle binding changed at archive commit boundary"
+                )
+            blocked_followup_archive_evidence_at_commit = (
+                _require_completed_work_lane_archive_authority(
+                    lifecycle_at_commit,
+                    record["checkout_key"],
+                )
+            )
+            if (
+                blocked_followup_archive_evidence_at_commit
+                != blocked_followup_archive_evidence
+            ):
+                raise RuntimeError(
+                    "blocked durable followup archive authority changed "
+                    "at archive commit boundary"
+                )
+            blocked_followup_archive_evidence = (
+                blocked_followup_archive_evidence_at_commit
+            )
             retention = _upsert_retention_in_connection(
                 connection,
                 checkout_key=record["checkout_key"],

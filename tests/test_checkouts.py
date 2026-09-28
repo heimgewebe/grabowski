@@ -199,10 +199,24 @@ class CheckoutLifecycleTests(unittest.TestCase):
         managed: bool = True,
         retention_until_unix: int | None = None,
         advance_managed_checkout: bool = False,
+        source_kind: str = "bureau_task",
+        source_id: str = "GRABOWSKI-OPERATOR-SURFACE-V1-T095",
+        completed_retained: bool = False,
     ) -> dict[str, object]:
         archive_head = self.head
         if managed:
-            self._managed_binding(owner="owner-a")
+            managed_binding = self._managed_binding(
+                owner="owner-a",
+                source_kind=source_kind,
+                source_id=source_id,
+            )
+            if completed_retained:
+                checkouts._mark_checkout_completed_retained(
+                    checkout_key=str(managed_binding["checkout_key"]),
+                    owner_id="owner-a",
+                    expected_head=self.head,
+                    expected_branch="topic",
+                )
             if advance_managed_checkout:
                 self._git(
                     "commit",
@@ -647,7 +661,7 @@ class CheckoutLifecycleTests(unittest.TestCase):
                 self.head,
                 "topic",
             )
-        self.assertEqual(2, archive_gate.call_count)
+        self.assertEqual(3, archive_gate.call_count)
         for call in archive_gate.call_args_list:
             self.assertEqual(
                 call.args,
@@ -782,6 +796,78 @@ class CheckoutLifecycleTests(unittest.TestCase):
         current = checkouts._lifecycle_bindings([checkout_key])[checkout_key]
         self.assertEqual("completed_retained", current["phase"])
         self.assertEqual({}, checkouts._latest_archives([checkout_key]))
+
+    def test_archive_revalidates_followup_authority_at_commit_boundary(self) -> None:
+        lane_id = "e" * 32
+        binding = self._managed_binding(
+            source_kind="work_lane",
+            source_id=lane_id,
+        )
+        checkout_key = str(binding["checkout_key"])
+        checkouts._mark_checkout_completed_retained(
+            checkout_key=checkout_key,
+            owner_id="owner-a",
+            expected_head=self.head,
+            expected_branch="topic",
+        )
+        evidence = {
+            "terminal_state": "blocked_with_durable_followup",
+            "evidence_sha256": "e" * 64,
+        }
+        authority_before = {
+            "kind": "work_lane_blocked_followup_authority",
+            "durable_followup_binding": {
+                "task_revision": 3,
+                "task_spec_sha256": "a" * 64,
+                "task_state": "verified",
+            },
+            "authority_sha256": "1" * 64,
+        }
+        authority_at_commit = {
+            "kind": "work_lane_blocked_followup_authority",
+            "durable_followup_binding": {
+                "task_revision": 4,
+                "task_spec_sha256": "b" * 64,
+                "task_state": "verified",
+            },
+            "authority_sha256": "2" * 64,
+        }
+        with (
+            patch(
+                "grabowski_checkout_terminal_sources.source_terminal_evidence",
+                return_value=evidence,
+            ),
+            patch(
+                "grabowski_checkout_terminal_sources.blocked_followup_binding_authority",
+                side_effect=[
+                    authority_before,
+                    authority_before,
+                    authority_at_commit,
+                ],
+            ) as archive_authority,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "archive authority changed at archive commit boundary",
+            ),
+        ):
+            checkouts.grabowski_checkout_archive(
+                str(self.repo),
+                str(self.checkout),
+                "owner-a",
+                "followup changes during archive materialization",
+                int(time.time()) + 3600,
+                self.head,
+                "topic",
+            )
+
+        self.assertEqual(3, archive_authority.call_count)
+        current = checkouts._lifecycle_bindings([checkout_key])[checkout_key]
+        self.assertEqual("completed_retained", current["phase"])
+        self.assertEqual({}, checkouts._latest_archives([checkout_key]))
+        self.assertEqual(
+            1,
+            len(checkouts._active_checkout_operation_uncertainties()),
+        )
 
     def test_archive_converges_managed_binding_to_terminal_identity(self) -> None:
         self._managed_binding()
@@ -3414,6 +3500,86 @@ class CheckoutLifecycleTests(unittest.TestCase):
                 )
                 for owner in released_owners
             )
+        )
+
+    def test_partial_archive_recovery_revalidates_followup_authority_at_commit(self) -> None:
+        lane_id = "f" * 32
+        evidence = {
+            "terminal_state": "blocked_with_durable_followup",
+            "evidence_sha256": "e" * 64,
+        }
+        authority_before = {
+            "kind": "work_lane_blocked_followup_authority",
+            "durable_followup_binding": {
+                "task_revision": 3,
+                "task_spec_sha256": "a" * 64,
+                "task_state": "verified",
+            },
+            "authority_sha256": "1" * 64,
+        }
+        authority_at_commit = {
+            "kind": "work_lane_blocked_followup_authority",
+            "durable_followup_binding": {
+                "task_revision": 4,
+                "task_spec_sha256": "b" * 64,
+                "task_state": "verified",
+            },
+            "authority_sha256": "2" * 64,
+        }
+        with (
+            patch(
+                "grabowski_checkout_terminal_sources.source_terminal_evidence",
+                return_value=evidence,
+            ),
+            patch(
+                "grabowski_checkout_terminal_sources.blocked_followup_binding_authority",
+                return_value=authority_before,
+            ),
+        ):
+            fence = self._partial_archive_after_manifest_without_db(
+                source_kind="work_lane",
+                source_id=lane_id,
+                completed_retained=True,
+            )
+            assessment = checkouts._archive_partial_completion_assessment(fence)
+        self.assertEqual("recoverable_complete", assessment["state"])
+        self.assertEqual(
+            fence["evidence"]["blocked_followup_archive_evidence"],
+            assessment["blocked_followup_archive_evidence"],
+        )
+        self.assertEqual(
+            authority_before,
+            assessment["blocked_followup_archive_evidence"]["followup_authority"],
+        )
+
+        with (
+            patch(
+                "grabowski_checkout_terminal_sources.source_terminal_evidence",
+                return_value=evidence,
+            ),
+            patch(
+                "grabowski_checkout_terminal_sources.blocked_followup_binding_authority",
+                side_effect=[authority_before, authority_at_commit],
+            ) as archive_authority,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "archive authority changed during recovery commit",
+            ),
+        ):
+            checkouts._complete_partial_archive(
+                fence,
+                expected_assessment_sha256=assessment["assessment_sha256"],
+            )
+
+        self.assertEqual(2, archive_authority.call_count)
+        current = checkouts._lifecycle_bindings([fence["checkout_key"]])[
+            fence["checkout_key"]
+        ]
+        self.assertEqual("completed_retained", current["phase"])
+        self.assertEqual({}, checkouts._latest_archives([fence["checkout_key"]]))
+        self.assertEqual(
+            1,
+            len(checkouts._active_checkout_operation_uncertainties()),
         )
 
     def test_partial_archive_recovery_database_failure_rolls_back_and_retries(self) -> None:

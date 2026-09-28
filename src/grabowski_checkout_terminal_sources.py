@@ -150,7 +150,17 @@ def _open_bureau_state_root() -> tuple[Path, int]:
     return root, descriptor
 
 
-def _current_bureau_task_specs() -> list[dict[str, Any]]:
+def _current_bureau_task_specs(
+    expected_task_id: str | None = None,
+) -> list[dict[str, Any]]:
+    if expected_task_id is not None and (
+        not isinstance(expected_task_id, str)
+        or not expected_task_id
+        or expected_task_id != expected_task_id.strip()
+        or len(expected_task_id) > 512
+        or any(character in expected_task_id for character in "\r\n\x00")
+    ):
+        raise RuntimeError("Bureau TaskSpec id is invalid")
     _root, root_descriptor = _open_bureau_state_root()
     connection: sqlite3.Connection | None = None
     try:
@@ -172,18 +182,28 @@ def _current_bureau_task_specs() -> list[dict[str, Any]]:
             }
             if not required.issubset(observed):
                 raise RuntimeError("Bureau TaskSpec StateStore schema is incomplete")
-        rows = connection.execute(
+        select = (
             "SELECT p.task_id,p.current_revision,p.spec_sha256 AS pointer_sha256,"
             "r.revision,r.parent_revision,r.spec_sha256 AS revision_sha256,r.spec_json "
             "FROM task_specs p JOIN task_spec_revisions r "
             "ON r.task_id=p.task_id AND r.revision=p.current_revision "
-            "ORDER BY p.task_id LIMIT ?",
-            (BUREAU_TASK_SPEC_SCAN_LIMIT + 1,),
-        ).fetchall()
+        )
+        if expected_task_id is None:
+            rows = connection.execute(
+                select + "ORDER BY p.task_id LIMIT ?",
+                (BUREAU_TASK_SPEC_SCAN_LIMIT + 1,),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                select + "WHERE p.task_id=? LIMIT 2",
+                (expected_task_id,),
+            ).fetchall()
         if _bureau_state_store_snapshot(root_descriptor) != before:
             raise RuntimeError("Bureau TaskSpec StateStore identity changed")
-        if len(rows) > BUREAU_TASK_SPEC_SCAN_LIMIT:
+        if expected_task_id is None and len(rows) > BUREAU_TASK_SPEC_SCAN_LIMIT:
             raise RuntimeError("Bureau TaskSpec StateStore scan is incomplete")
+        if expected_task_id is not None and len(rows) > 1:
+            raise RuntimeError("Bureau TaskSpec current pointer is ambiguous")
         result: list[dict[str, Any]] = []
         for row in rows:
             task_id = row["task_id"]
@@ -290,7 +310,7 @@ def _bureau_blocked_followup_binding(
     if any(not isinstance(value, str) or not value for value in expected.values()):
         raise RuntimeError("legacy durable followup reproduction evidence is incomplete")
     matches: list[dict[str, Any]] = []
-    for current in _current_bureau_task_specs():
+    for current in _current_bureau_task_specs(expected_followup_id):
         if (
             expected_followup_id is not None
             and current["task_id"] != expected_followup_id

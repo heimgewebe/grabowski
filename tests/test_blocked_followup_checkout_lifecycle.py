@@ -457,6 +457,44 @@ class BlockedFollowupCheckoutLifecycleTests(unittest.TestCase):
             bound["durable_followup_binding"]["kind"],
         )
 
+    def test_current_followup_id_bypasses_legacy_full_scan_limit(self) -> None:
+        specs = [
+            self._spec(f"GRABOWSKI-UNRELATED-{index:04d}")
+            for index in range(sources.BUREAU_TASK_SPEC_SCAN_LIMIT)
+        ]
+        specs.append(self._spec())
+        temporary, root = self._state_store(specs)
+        self.addCleanup(temporary.cleanup)
+        current_assessment = {
+            **self._assessment(),
+            "durable_followup_id": TASK_ID,
+        }
+        with patch.dict(
+            os.environ,
+            {
+                "BUREAU_STATE_DIR": str(root),
+                "GRABOWSKI_BUREAU_COORDINATION_ROOT": str(root),
+            },
+        ):
+            result = sources._bureau_blocked_followup_binding(
+                LANE_ID,
+                record=self._record(),
+                assessment=current_assessment,
+                audit_record_sha256=AUDIT,
+                expected_followup_id=TASK_ID,
+            )
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "StateStore scan is incomplete",
+            ):
+                sources._current_bureau_task_specs()
+
+        self.assertEqual(TASK_ID, result["durable_followup_id"])
+        self.assertEqual(
+            "bureau_current_task_spec_reproduction",
+            result["durable_followup_binding"]["kind"],
+        )
+
     def test_capacity_binding_requires_valid_outer_evidence_digest(self) -> None:
         evidence = self._blocked_source_evidence()
         evidence["evidence_sha256"] = "f" * 64
