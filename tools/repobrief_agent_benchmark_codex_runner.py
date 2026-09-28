@@ -5554,7 +5554,9 @@ def command_kind(command: str) -> str:
     raise RunnerError(f"unapproved Codex command: {executable}")
 
 
-def _codex_mcp_result_is_success(value: Any) -> bool:
+def _codex_mcp_result_is_success(
+    value: Any, *, tool_name: str, arguments: Any
+) -> bool:
     if not isinstance(value, dict):
         return False
     if "isError" in value:
@@ -5570,11 +5572,29 @@ def _codex_mcp_result_is_success(value: Any) -> bool:
         or not item.get("text")
     ):
         return False
-    structured = value.get("structured_content")
-    if structured is not None:
-        if not isinstance(structured, dict) or structured.get("status") == "error":
+    if tool_name == "repobrief_resource_read":
+        if not isinstance(arguments, dict):
             return False
-    return True
+        try:
+            decoded = json.loads(item["text"])
+            action = arguments.get("action")
+            if action == "list":
+                frozen, _uris = _freeze_resource_result(decoded)
+                return canonical(decoded) == canonical(frozen)
+            if action == "read":
+                uri = arguments.get("uri")
+                if not isinstance(uri, str) or not uri:
+                    return False
+                validated = _validated_resource_read_result(decoded, expected_uri=uri)
+                return canonical(decoded) == canonical(validated)
+        except (json.JSONDecodeError, RunnerError):
+            return False
+        return False
+    structured = value.get("structured_content")
+    return (
+        isinstance(structured, dict)
+        and structured.get("status") != "error"
+    )
 
 
 def normalize(
@@ -5648,7 +5668,11 @@ def normalize(
             result_value = item.get("result")
             output_value = result_value if result_value is not None else item.get("error")
             output_bytes = len(canonical(output_value).encode("utf-8"))
-            result_is_success = _codex_mcp_result_is_success(result_value)
+            result_is_success = _codex_mcp_result_is_success(
+                result_value,
+                tool_name=name,
+                arguments=item.get("arguments"),
+            )
             status = (
                 "success"
                 if (

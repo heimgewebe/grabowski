@@ -4225,6 +4225,21 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     "content": [{"type": "text", "text": "{\"resources\":[]}"}],
                 },
             ),
+            (
+                "repobrief_resource_read",
+                {"action": "read", "uri": "repobrief://frozen/a"},
+                {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "{\"_meta\":{},\"contents\":[{\"mimeType\":\"text/plain\","
+                                "\"text\":\"ok\",\"uri\":\"repobrief://frozen/a\"}]}"
+                            ),
+                        }
+                    ],
+                },
+            ),
         )
         for tool, arguments, result in cases:
             with self.subTest(tool=tool):
@@ -4254,6 +4269,65 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 self.assertEqual([call["name"] for call in calls], [tool])
                 self.assertEqual(calls[0]["status"], "success")
                 self.assertEqual(normalized_answer, answer())
+
+    def test_normalize_rejects_codex_0158_resource_errors_without_iserror(self) -> None:
+        cases = (
+            (
+                {"action": "read", "uri": "repobrief://frozen/a"},
+                {"content": [{"type": "text", "text": "list frozen resources before reading"}]},
+            ),
+            (
+                {"action": "list"},
+                {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "{\"code\":-32000,\"message\":\"unavailable\"}",
+                        }
+                    ]
+                },
+            ),
+            (
+                {"action": "read", "uri": "repobrief://frozen/a"},
+                {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "{\"_meta\":{},\"contents\":[{\"mimeType\":\"text/plain\","
+                                "\"text\":\"wrong\",\"uri\":\"repobrief://frozen/other\"}]}"
+                            ),
+                        }
+                    ]
+                },
+            ),
+        )
+        for arguments, result in cases:
+            with self.subTest(arguments=arguments, result=result):
+                value = request(condition="treatment")
+                events = [json.loads(line) for line in stream(value).splitlines()]
+                command_event = next(
+                    event
+                    for event in events
+                    if event.get("type") == "item.completed"
+                    and isinstance(event.get("item"), dict)
+                    and event["item"].get("type") == "command_execution"
+                )
+                command_event["item"] = {
+                    "type": "mcp_tool_call",
+                    "server": "repobrief",
+                    "tool": "repobrief_resource_read",
+                    "arguments": arguments,
+                    "result": result,
+                    "error": None,
+                    "status": "completed",
+                }
+
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "treatment used no successful RepoBrief tool or resource",
+                ):
+                    runner.normalize(value, events)
 
     def test_normalize_requires_explicit_nonerror_treatment_result(self) -> None:
         cases = (
