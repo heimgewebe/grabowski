@@ -3075,6 +3075,38 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         authorized,
                     )
 
+            with patch.object(
+                runner,
+                "MAX_MCP_SOURCE_TREE_FILES",
+                2,
+            ):
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "source tree enumeration exceeds its file budget",
+                ):
+                    runner.stage_mcp_upstream(
+                        state_root,
+                        upstream,
+                        manifest,
+                        authorized,
+                    )
+
+            with patch.object(
+                runner,
+                "MAX_MCP_SOURCE_TREE_LISTING_BYTES",
+                8,
+            ):
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "source tree enumeration exceeds its byte budget",
+                ):
+                    runner.stage_mcp_upstream(
+                        state_root,
+                        upstream,
+                        manifest,
+                        authorized,
+                    )
+
             fsmonitor_marker = root / "fsmonitor-ran"
             fsmonitor_hook = root / "fsmonitor-hook.py"
             fsmonitor_hook.write_text(

@@ -235,6 +235,7 @@ MAX_STDERR_BYTES = 256 * 1024
 MAX_PROVIDER_EXECUTABLE_BYTES = 512 * 1024 * 1024
 MAX_MCP_SOURCE_TREE_FILES = 4096
 MAX_MCP_SOURCE_TREE_BYTES = 64 * 1024 * 1024
+MAX_MCP_SOURCE_TREE_LISTING_BYTES = 32 * 1024 * 1024
 MAX_AUTH_BYTES = 64 * 1024
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_DISPATCH_AUTHORIZATION_BYTES = 16 * 1024 * 1024
@@ -3195,6 +3196,143 @@ def cleanup_staged_repoground_manifest(binding: Mapping[str, Any]) -> str | None
     return None
 
 
+def _terminate_git_process_group(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        process.wait()
+
+
+def _run_git_bounded_nul_records(
+    command: Sequence[str],
+    *,
+    cwd: Path,
+    label: str,
+    max_records: int,
+    max_bytes: int,
+) -> list[bytes]:
+    if (
+        not command
+        or command[0] != "git"
+        or max_records <= 0
+        or max_bytes <= 0
+    ):
+        raise RunnerError(f"{label} bounds are invalid")
+    try:
+        process = subprocess.Popen(
+            list(command),
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+            env=base._git_environment(),
+            start_new_session=True,
+        )
+    except OSError as exc:
+        raise RunnerError(f"{label} could not be started") from exc
+    if process.stdout is None or process.stderr is None:
+        _terminate_git_process_group(process)
+        raise RunnerError(f"{label} pipes are unavailable")
+
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+    pending = bytearray()
+    stderr = bytearray()
+    records: list[bytes] = []
+    stdout_bytes = 0
+    deadline = time.monotonic() + 120
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _terminate_git_process_group(process)
+                raise RunnerError(f"{label} timed out")
+            for key, _mask in selector.select(timeout=min(remaining, 0.25)):
+                chunk = os.read(key.fileobj.fileno(), 65536)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                if key.data == "stderr":
+                    stderr.extend(chunk)
+                    if len(stderr) > MAX_STDERR_BYTES:
+                        _terminate_git_process_group(process)
+                        raise RunnerError(f"{label} stderr exceeds its bound")
+                    continue
+                stdout_bytes += len(chunk)
+                if stdout_bytes > max_bytes:
+                    _terminate_git_process_group(process)
+                    raise RunnerError(f"{label} exceeds its byte budget")
+                pending.extend(chunk)
+                while True:
+                    marker = pending.find(0)
+                    if marker < 0:
+                        break
+                    record = bytes(pending[:marker])
+                    del pending[: marker + 1]
+                    if not record:
+                        _terminate_git_process_group(process)
+                        raise RunnerError(f"{label} emitted an empty record")
+                    records.append(record)
+                    if len(records) > max_records:
+                        _terminate_git_process_group(process)
+                        raise RunnerError(f"{label} exceeds its file budget")
+        returncode = process.wait(timeout=5)
+        if pending:
+            raise RunnerError(f"{label} emitted an unterminated record")
+        if returncode != 0:
+            raise RunnerError(f"{label} command failed")
+        return records
+    finally:
+        selector.close()
+        if process.poll() is None:
+            _terminate_git_process_group(process)
+        process.stdout.close()
+        process.stderr.close()
+
+
+def _git_index_differs_from_commit(
+    commit: str, *, source_root: Path, launcher_relative: Path
+) -> bool:
+    try:
+        completed = subprocess.run(
+            [
+                "git", "-c", "core.fsmonitor=false",
+                "diff-index", "--cached", "--quiet", commit, "--",
+                "merger", str(launcher_relative),
+            ],
+            cwd=source_root,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            shell=False,
+            env=base._git_environment(),
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RunnerError("RepoGround MCP source index cannot be verified") from exc
+    if completed.returncode == 0:
+        return False
+    if completed.returncode == 1:
+        return True
+    raise RunnerError("RepoGround MCP source index cannot be verified")
+
+
 def _repoground_source_tree_snapshot(
     script: Path, manifest: Path
 ) -> dict[str, Any] | None:
@@ -3252,25 +3390,22 @@ def _repoground_source_tree_snapshot(
             raise RunnerError(
                 "RepoGround MCP source commit does not match the bundle generator commit"
             )
-        try:
-            index_changes = base._run_checked(
-                [
-                    "git", "-c", "core.fsmonitor=false",
-                    "diff-index", "--cached", "--name-only", commit, "--",
-                    "merger", str(launcher_relative),
-                ],
-                cwd=source_root,
-            )
-            untracked = base._run_checked(
-                [
-                    "git", "-c", "core.fsmonitor=false",
-                    "ls-files", "--others", "--exclude-standard", "--",
-                    "merger", str(launcher_relative),
-                ],
-                cwd=source_root,
-            )
-        except base.RunnerError as exc:
-            raise RunnerError("RepoGround MCP source checkout is unavailable") from exc
+        index_changes = _git_index_differs_from_commit(
+            commit,
+            source_root=source_root,
+            launcher_relative=launcher_relative,
+        )
+        untracked = _run_git_bounded_nul_records(
+            [
+                "git", "-c", "core.fsmonitor=false",
+                "ls-files", "--others", "--exclude-standard", "-z", "--",
+                "merger", str(launcher_relative),
+            ],
+            cwd=source_root,
+            label="RepoGround MCP untracked source enumeration",
+            max_records=MAX_MCP_SOURCE_TREE_FILES + 1,
+            max_bytes=MAX_MCP_SOURCE_TREE_LISTING_BYTES,
+        )
         if index_changes or untracked:
             raise RunnerError("RepoGround MCP source checkout is dirty")
     try:
@@ -3280,18 +3415,21 @@ def _repoground_source_tree_snapshot(
         raise RunnerError("RepoGround MCP launcher is unavailable") from exc
 
     verify_source()
+    tracked_records = _run_git_bounded_nul_records(
+        [
+            "git", "-c", "core.fsmonitor=false",
+            "ls-files", "-v", "-z", "--",
+            "merger", str(launcher_relative),
+        ],
+        cwd=source_root,
+        label="RepoGround MCP source tree enumeration",
+        max_records=MAX_MCP_SOURCE_TREE_FILES + 1,
+        max_bytes=MAX_MCP_SOURCE_TREE_LISTING_BYTES,
+    )
     try:
-        tracked = base._run_checked(
-            [
-                "git", "-c", "core.fsmonitor=false",
-                "ls-files", "-v", "-z", "--",
-                "merger", str(launcher_relative),
-            ],
-            cwd=source_root,
-        )
-    except base.RunnerError as exc:
-        raise RunnerError("RepoGround MCP source tree cannot be enumerated") from exc
-    tracked_entries = [item for item in tracked.split("\0") if item]
+        tracked_entries = [item.decode("utf-8") for item in tracked_records]
+    except UnicodeDecodeError as exc:
+        raise RunnerError("RepoGround MCP source tree path is not UTF-8") from exc
     if any(
         len(item) < 3 or item[1] != " " or item[0] != "H"
         for item in tracked_entries
@@ -3312,23 +3450,23 @@ def _repoground_source_tree_snapshot(
     ):
         raise RunnerError("RepoGround MCP source tree is incomplete")
 
-    try:
-        committed_tree = base._run_checked(
-            [
-                "git", "-c", "core.fsmonitor=false",
-                "ls-tree", "-rz", "--full-tree", commit, "--",
-                "merger", str(launcher_relative),
-            ],
-            cwd=source_root,
-        )
-    except base.RunnerError as exc:
-        raise RunnerError(
-            "RepoGround MCP generator tree cannot be verified"
-        ) from exc
+    committed_tree_records = _run_git_bounded_nul_records(
+        [
+            "git", "-c", "core.fsmonitor=false",
+            "ls-tree", "-rz", "--full-tree", commit, "--",
+            "merger", str(launcher_relative),
+        ],
+        cwd=source_root,
+        label="RepoGround MCP generator tree enumeration",
+        max_records=MAX_MCP_SOURCE_TREE_FILES + 1,
+        max_bytes=MAX_MCP_SOURCE_TREE_LISTING_BYTES,
+    )
     committed_blobs: dict[Path, str] = {}
-    for item in committed_tree.split("\0"):
-        if not item:
-            continue
+    for raw_item in committed_tree_records:
+        try:
+            item = raw_item.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RunnerError("RepoGround MCP generator tree path is not UTF-8") from exc
         metadata, separator, path_text = item.partition("\t")
         fields = metadata.split()
         if (
