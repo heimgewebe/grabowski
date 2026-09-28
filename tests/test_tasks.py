@@ -11420,6 +11420,80 @@ class TaskTests(unittest.TestCase):
             tasks._execution_retry_match_projection(changed),
         )
 
+    def test_active_execution_reuses_across_chronik_subject_projection_drift(
+        self,
+    ) -> None:
+        outbox_root = self.root / "chronik-active-state"
+        repo_context = tasks._canonical_json(
+            {
+                "subject_scope": "repository",
+                "repo": "heimgewebe/grabowski",
+                "operation": "implement",
+                "task_class": "coding",
+                "component": "task-runner",
+            }
+        )
+        host_context = tasks._canonical_json(
+            {
+                "subject_scope": "host",
+                "host": "local",
+                "operation": "implement",
+                "task_class": "coding",
+                "component": "task-runner",
+            }
+        )
+        common = {
+            "host": "local",
+            "argv": ["/bin/echo", "chronik-active"],
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "resource_keys": [f"repo:{self.root}"],
+            "chronik_outbox": True,
+            "chronik_outbox_state_root": str(outbox_root),
+            "chronik_operation": "implement",
+            "chronik_component": "task-runner",
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_chronik_context", return_value=repo_context),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 199}
+            ),
+        ):
+            first = tasks.grabowski_task_start(**common)
+        task_id = str(first["task"]["task_id"])
+        tasks._set_state(
+            task_id,
+            "running",
+            observation={
+                "state": "running",
+                "observed_at_unix": tasks._now(),
+                "properties": {"ActiveState": "active", "SubState": "running"},
+            },
+        )
+
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_chronik_context", return_value=host_context),
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks, "_observe") as observe,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 200}
+            ),
+        ):
+            retried = tasks.grabowski_task_start(**common)
+        dispatch.assert_not_called()
+        observe.assert_not_called()
+        self.assertEqual(task_id, retried["task"]["task_id"])
+        self.assertEqual(
+            "active_execution_identity",
+            retried["deduplicated_reuse"]["reason"],
+        )
+        self.assertEqual(1, tasks.grabowski_task_list(limit=20)["total_matching"])
+
     def test_recent_completed_execution_reuses_across_chronik_subject_projection_drift(
         self,
     ) -> None:
