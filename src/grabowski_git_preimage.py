@@ -839,6 +839,23 @@ def capture_branch_preimage(
     if final_index.stdout != index_result.stdout:
         raise RuntimeError("Git index changed during preimage capture")
 
+    terminal_worktree_sha256 = _tracked_worktree_sha256(
+        repo,
+        index_result.stdout,
+        max_paths=max_tracked_paths,
+        max_total_bytes=max_tracked_bytes,
+        deadline_monotonic=deadline_monotonic,
+    )
+    if terminal_worktree_sha256 != worktree_sha256:
+        raise RuntimeError("Git tracked worktree changed during preimage capture")
+
+    _deadline_guard(deadline_monotonic, "branch preimage capture")
+    terminal_index = index_reader(repo, ["ls-files", "--stage", "-z"])
+    if terminal_index.returncode != 0:
+        raise RuntimeError("Git terminal index observation failed")
+    if terminal_index.stdout != index_result.stdout:
+        raise RuntimeError("Git index changed during preimage capture")
+
     material: dict[str, Any] = {
         "schema_version": 2,
         "repository": str(repo),

@@ -3402,6 +3402,46 @@ def acquire_work(
             exc: Exception,
             worktree_receipt: dict[str, Any] | None,
         ) -> dict[str, Any]:
+            if existing_writer_job is not None:
+                record = _write_state(
+                    receipt_path,
+                    {
+                        **base_record,
+                        "state": "outcome_unknown",
+                        "decision": "HARD_BLOCK",
+                        "lease_receipt": acquired,
+                        **group_evidence,
+                        "worktree_receipt": worktree_receipt,
+                        "writer_job": existing_writer_job,
+                        **(
+                            {"writer_start": existing_writer_start}
+                            if isinstance(existing_writer_start, dict)
+                            else {}
+                        ),
+                        "error_class": "WORKTREE_CONTINUATION_CONFLICT",
+                        "error": str(exc)[:2048],
+                        "effect_observed": True,
+                        "compensation": None,
+                        "next_action": "readback_scoped_writer_before_retry",
+                    },
+                )
+                if audit_fn is not None:
+                    audit_fn(
+                        {
+                            "operation": "work-acquire",
+                            "lane_id": lane_id,
+                            "state": "outcome_unknown",
+                            "decision": "HARD_BLOCK",
+                            "inputs_sha256": inputs_sha256,
+                            "effect_observed": True,
+                        }
+                    )
+                return {
+                    **record,
+                    "durable_receipt_path": str(receipt_path),
+                    "replayed": existing is not None,
+                }
+
             compensation, compensation_complete = _compensate_acquisitions(
                 owner_id=inputs["lease_owner_id"],
                 plan=acquisition_plan,

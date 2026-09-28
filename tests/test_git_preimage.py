@@ -474,5 +474,40 @@ class GitPreimageOperationStateTests(unittest.TestCase):
             self.assertEqual(2, hash_calls)
 
 
+    def test_branch_preimage_rehashes_after_final_git_probes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            self._init_repo(repo)
+            tracked = repo / "tracked.txt"
+            tracked.write_text("stable before terminal race\n", encoding="utf-8")
+            original_hash = git_preimage._tracked_worktree_sha256
+            hash_calls = 0
+
+            def racing_hash(*args, **kwargs):
+                nonlocal hash_calls
+                digest = original_hash(*args, **kwargs)
+                hash_calls += 1
+                if hash_calls == 2:
+                    tracked.write_text(
+                        "changed after second hash\n",
+                        encoding="utf-8",
+                    )
+                return digest
+
+            with (
+                patch.object(
+                    git_preimage,
+                    "_tracked_worktree_sha256",
+                    side_effect=racing_hash,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "tracked worktree changed during preimage capture",
+                ),
+            ):
+                git_preimage.capture_branch_preimage(repo, self._probe)
+            self.assertEqual(3, hash_calls)
+
+
 if __name__ == "__main__":
     unittest.main()

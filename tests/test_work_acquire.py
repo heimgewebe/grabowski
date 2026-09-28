@@ -3897,6 +3897,79 @@ class WorkAcquireTests(unittest.TestCase):
             work_acquire.resources.LEASE_SNAPSHOT_KEYS,
         )
 
+    def test_continuation_conflict_preserves_reacquired_leases_for_existing_writer(self) -> None:
+        params = self.parameters()
+        params["scoped_writer_argv"] = ["writer", "--once"]
+        params["scoped_writer_runtime_seconds"] = 600
+        inputs, stored = self.store_lane(params)
+        writer_job = {
+            "job_id": "writer-job",
+            "unit": "writer-unit.service",
+            "owner": "uid:1000",
+            "argv_sha256": "a" * 64,
+            "cwd": str(self.target),
+            "runtime_seconds": 600,
+            "metadata_path": str(self.root / "writer-metadata.json"),
+            "expected_receipt": None,
+            "final_status": "launch_submitted",
+            "receipt_sha256": "b" * 64,
+        }
+        receipt_path = self.state / f"{inputs['lane_id']}.json"
+        work_acquire._write_state(
+            receipt_path,
+            {
+                **stored,
+                "writer_job": writer_job,
+                "writer_start": {
+                    "state": "started",
+                    "job_receipt_sha256": writer_job["receipt_sha256"],
+                },
+            },
+        )
+        acquire = Mock(side_effect=self.acquire)
+        release = Mock(side_effect=self.release)
+        ensure = Mock()
+
+        with patch.object(
+            work_acquire,
+            "_continuation_preimage",
+            side_effect=RuntimeError("continuation evidence drifted"),
+        ):
+            first = work_acquire.acquire_work(
+                params,
+                acquire_resources_fn=acquire,
+                release_resources_fn=release,
+                inspect_resource_fn=Mock(),
+                ensure_worktree_fn=ensure,
+                runner=Mock(),
+            )
+            second = work_acquire.acquire_work(
+                params,
+                acquire_resources_fn=acquire,
+                release_resources_fn=release,
+                inspect_resource_fn=Mock(),
+                ensure_worktree_fn=ensure,
+                runner=Mock(),
+            )
+
+        self.assertEqual(first["state"], "outcome_unknown")
+        self.assertEqual(first["decision"], "HARD_BLOCK")
+        self.assertEqual(
+            first["error_class"], "WORKTREE_CONTINUATION_CONFLICT"
+        )
+        self.assertTrue(first["effect_observed"])
+        self.assertIsNone(first["compensation"])
+        self.assertEqual(first["writer_job"], writer_job)
+        self.assertEqual(
+            first["next_action"], "readback_scoped_writer_before_retry"
+        )
+        self.assertTrue(first["replayed"])
+        self.assertEqual(second["state"], "outcome_unknown")
+        self.assertEqual(second["writer_job"], writer_job)
+        self.assertEqual(acquire.call_count, 1)
+        release.assert_not_called()
+        ensure.assert_not_called()
+
     def test_continuation_conflict_with_uncertain_compensation_is_outcome_unknown(self) -> None:
         params = self.parameters()
         self.store_lane(params)
