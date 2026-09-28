@@ -2414,6 +2414,16 @@ def _continuation_authorization_guard(
             raise RuntimeError(
                 "managed worktree continuation Git state changed before authorization"
             )
+        try:
+            physical_checkout.verify_physical_checkout_identity(current_physical)
+        except Exception as exc:
+            raise RuntimeError(
+                "managed worktree continuation physical checkout changed before authorization"
+            ) from exc
+        if retention_until_unix <= int(time.time()):
+            raise RuntimeError(
+                "managed worktree continuation lifecycle retention expired before authorization"
+            )
         yield
 
 

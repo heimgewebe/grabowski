@@ -3355,7 +3355,10 @@ class WorkAcquireTests(unittest.TestCase):
             top_level: Mock,
             flags: bytes = b"",
             registered_git_dir: dict[str, object] = PHYSICAL["git_dir"],
+            physical_verify: Mock | None = None,
         ):
+            if physical_verify is None:
+                physical_verify = Mock(return_value=PHYSICAL)
             with (
                 patch.object(
                     work_acquire,
@@ -3403,6 +3406,11 @@ class WorkAcquireTests(unittest.TestCase):
                     "capture_registered_linked_worktree_git_dir",
                     return_value=registered_git_dir,
                 ),
+                patch.object(
+                    work_acquire.physical_checkout,
+                    "verify_physical_checkout_identity",
+                    physical_verify,
+                ),
             ):
                 yield
 
@@ -3437,6 +3445,52 @@ class WorkAcquireTests(unittest.TestCase):
                     continuation_preimage
                 ):
                     self.fail("unregistered worktree must not authorize continuation")
+
+        physical_verify = Mock(
+            side_effect=work_acquire.physical_checkout.PhysicalCheckoutIdentityError(
+                "root replaced"
+            )
+        )
+        with guard_dependencies(
+            top_level=Mock(return_value=str(self.target)),
+            physical_verify=physical_verify,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "physical checkout changed before authorization",
+            ):
+                with work_acquire._continuation_authorization_guard(
+                    continuation_preimage
+                ):
+                    self.fail(
+                        "replaced physical checkout must not authorize continuation"
+                    )
+        physical_verify.assert_called_once_with(PHYSICAL)
+
+        with (
+            guard_dependencies(
+                top_level=Mock(return_value=str(self.target)),
+            ),
+            patch.object(
+                work_acquire.time,
+                "time",
+                side_effect=[
+                    float(self.retention - 1),
+                    float(self.retention),
+                ],
+            ) as observed_time,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "lifecycle retention expired before authorization",
+            ),
+        ):
+            with work_acquire._continuation_authorization_guard(
+                continuation_preimage
+            ):
+                self.fail(
+                    "expired lifecycle retention must not authorize continuation"
+                )
+        self.assertEqual(observed_time.call_count, 2)
 
         hidden_flags = (
             (b"h tracked.txt" + bytes([0]), "assume-unchanged"),
