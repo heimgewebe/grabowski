@@ -4493,17 +4493,88 @@ def _record_execution_identity(record: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+CHRONIK_RETRY_MUTABLE_PROJECTION_FIELDS = frozenset(
+    {"subject_scope", "host", "repo"}
+)
+
+
+def _chronik_retry_match_context(
+    context: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if context is None:
+        return None
+    if not isinstance(context, dict):
+        raise RuntimeError("task Chronik retry context is invalid")
+    return {
+        key: value
+        for key, value in context.items()
+        if key not in CHRONIK_RETRY_MUTABLE_PROJECTION_FIELDS
+    }
+
+
+def _execution_retry_match_projection(
+    identity: dict[str, Any],
+    *,
+    include_command: bool = True,
+) -> dict[str, Any]:
+    if not isinstance(identity, dict):
+        raise RuntimeError("task execution retry identity is invalid")
+    projection = {
+        key: value
+        for key, value in identity.items()
+        if key != "identity_sha256"
+        and (include_command or key != "argv_sha256")
+    }
+    projection["chronik_context"] = _chronik_retry_match_context(
+        identity.get("chronik_context")
+    )
+    return projection
+
+
+def _record_matches_execution_retry_identity(
+    record: dict[str, Any],
+    identity: dict[str, Any],
+    *,
+    include_command: bool = True,
+) -> bool:
+    stored_identity = _record_execution_identity(record)
+    stored_projection = _execution_retry_match_projection(
+        stored_identity,
+        include_command=include_command,
+    )
+    requested_projection = _execution_retry_match_projection(
+        identity,
+        include_command=include_command,
+    )
+    stored_stable = {
+        key: value
+        for key, value in stored_projection.items()
+        if key != "chronik_context"
+    }
+    requested_stable = {
+        key: value
+        for key, value in requested_projection.items()
+        if key != "chronik_context"
+    }
+    if stored_stable != requested_stable:
+        raise RuntimeError("stored task execution identity is inconsistent")
+    return (
+        stored_projection.get("chronik_context")
+        == requested_projection.get("chronik_context")
+    )
+
+
 def _latest_matching_execution_record(
     identity: dict[str, Any],
 ) -> dict[str, Any] | None:
     with _database_connection() as connection:
-        row = connection.execute(
+        rows = connection.execute(
             "SELECT * FROM tasks WHERE host=? AND argv_sha256=? AND cwd=? "
             "AND resource_keys_json=? AND runtime_seconds=? AND cpu_weight=? "
             "AND io_weight=? AND memory_max_bytes IS ? "
             "AND chronik_outbox_enabled=? AND chronik_outbox_state_root IS ? "
-            "AND chronik_context_json IS ? AND execution_backend=? AND systemd_scope=? "
-            "ORDER BY created_at_unix DESC, rowid DESC LIMIT 1",
+            "AND execution_backend=? AND systemd_scope=? "
+            "ORDER BY created_at_unix DESC, rowid DESC LIMIT 50001",
             (
                 identity["host"],
                 identity["argv_sha256"],
@@ -4515,24 +4586,17 @@ def _latest_matching_execution_record(
                 identity["memory_max_bytes"],
                 int(identity["chronik_outbox_enabled"]),
                 identity["chronik_outbox_state_root"],
-                (
-                    _canonical_json(identity["chronik_context"])
-                    if identity["chronik_context"] is not None
-                    else None
-                ),
                 identity["execution_backend"],
                 identity["systemd_scope"],
             ),
-        ).fetchone()
-    if row is None:
-        return None
-    record = dict(row)
-    if (
-        _record_execution_identity(record)["identity_sha256"]
-        != identity["identity_sha256"]
-    ):
-        raise RuntimeError("stored task execution identity is inconsistent")
-    return record
+        ).fetchall()
+    if len(rows) > 50000:
+        raise RuntimeError("execution retry identity scan limit exceeded")
+    for row in rows:
+        record = dict(row)
+        if _record_matches_execution_retry_identity(record, identity):
+            return record
+    return None
 
 
 def _latest_matching_active_execution_record(
@@ -4546,7 +4610,7 @@ def _latest_matching_active_execution_record(
             "AND resource_keys_json=? AND runtime_seconds=? AND cpu_weight=? "
             "AND io_weight=? AND memory_max_bytes IS ? "
             "AND chronik_outbox_enabled=? AND chronik_outbox_state_root IS ? "
-            "AND chronik_context_json IS ? AND execution_backend=? AND systemd_scope=? "
+            "AND execution_backend=? AND systemd_scope=? "
             f"AND state IN ({placeholders}) "
             "ORDER BY created_at_unix DESC, rowid DESC LIMIT 50001",
             (
@@ -4560,11 +4624,6 @@ def _latest_matching_active_execution_record(
                 identity["memory_max_bytes"],
                 int(identity["chronik_outbox_enabled"]),
                 identity["chronik_outbox_state_root"],
-                (
-                    _canonical_json(identity["chronik_context"])
-                    if identity["chronik_context"] is not None
-                    else None
-                ),
                 identity["execution_backend"],
                 identity["systemd_scope"],
                 *active_states,
@@ -4577,11 +4636,8 @@ def _latest_matching_active_execution_record(
         record = dict(row)
         if _persisted_task_operation_identity(record) is not None:
             continue
-        if (
-            _record_execution_identity(record)["identity_sha256"]
-            != identity["identity_sha256"]
-        ):
-            raise RuntimeError("stored active task execution identity is inconsistent")
+        if not _record_matches_execution_retry_identity(record, identity):
+            continue
         matching.append(record)
     if len(matching) > 1:
         raise RuntimeError(
@@ -4630,7 +4686,7 @@ def _latest_matching_unbound_execution_record(
             "AND resource_keys_json=? AND runtime_seconds=? AND cpu_weight=? "
             "AND io_weight=? AND memory_max_bytes IS ? "
             "AND chronik_outbox_enabled=? AND chronik_outbox_state_root IS ? "
-            "AND chronik_context_json IS ? AND execution_backend=? AND systemd_scope=? "
+            "AND execution_backend=? AND systemd_scope=? "
             "ORDER BY created_at_unix DESC, rowid DESC LIMIT 50001",
             (
                 identity["host"],
@@ -4643,11 +4699,6 @@ def _latest_matching_unbound_execution_record(
                 identity["memory_max_bytes"],
                 int(identity["chronik_outbox_enabled"]),
                 identity["chronik_outbox_state_root"],
-                (
-                    _canonical_json(identity["chronik_context"])
-                    if identity["chronik_context"] is not None
-                    else None
-                ),
                 identity["execution_backend"],
                 identity["systemd_scope"],
             ),
@@ -4656,11 +4707,6 @@ def _latest_matching_unbound_execution_record(
         raise RuntimeError("unbound execution identity scan limit exceeded")
     for row in rows:
         record = dict(row)
-        if (
-            _record_execution_identity(record)["identity_sha256"]
-            != identity["identity_sha256"]
-        ):
-            raise RuntimeError("stored task execution identity is inconsistent")
         if _persisted_task_operation_identity(record) is not None:
             continue
         if (
@@ -4668,7 +4714,8 @@ def _latest_matching_unbound_execution_record(
             or _persisted_interrupted_recovery_binding_or_raise(record) is not None
         ):
             continue
-        return record
+        if _record_matches_execution_retry_identity(record, identity):
+            return record
     return None
 
 
@@ -4735,7 +4782,7 @@ def _matching_attention_execution_records(
             "AND resource_keys_json=? AND runtime_seconds=? AND cpu_weight=? "
             "AND io_weight=? AND memory_max_bytes IS ? "
             "AND chronik_outbox_enabled=? AND chronik_outbox_state_root IS ? "
-            "AND chronik_context_json IS ? AND execution_backend=? AND systemd_scope=? "
+            "AND execution_backend=? AND systemd_scope=? "
             f"AND state IN ({placeholders}) "
             "ORDER BY created_at_unix DESC, rowid DESC LIMIT 50001",
             (
@@ -4749,11 +4796,6 @@ def _matching_attention_execution_records(
                 identity["memory_max_bytes"],
                 int(identity["chronik_outbox_enabled"]),
                 identity["chronik_outbox_state_root"],
-                (
-                    _canonical_json(identity["chronik_context"])
-                    if identity["chronik_context"] is not None
-                    else None
-                ),
                 identity["execution_backend"],
                 identity["systemd_scope"],
                 *attention_states,
@@ -4761,14 +4803,13 @@ def _matching_attention_execution_records(
         ).fetchall()
     if len(rows) > 50000:
         raise RuntimeError("matching attention execution scan limit exceeded")
-    records = [dict(row) for row in rows]
-    if any(
-        _record_execution_identity(record)["identity_sha256"]
-        != identity["identity_sha256"]
-        for record in records
-    ):
-        raise RuntimeError("stored task execution identity is inconsistent")
-    return records
+    return [
+        record
+        for row in rows
+        if _record_matches_execution_retry_identity(
+            record := dict(row), identity
+        )
+    ]
 
 
 def _build_terminal_retry_context(
@@ -5322,7 +5363,7 @@ def _latest_matching_unprepared_managed_cargo_record(
             "AND resource_keys_json=? AND runtime_seconds=? AND cpu_weight=? "
             "AND io_weight=? AND memory_max_bytes IS ? "
             "AND chronik_outbox_enabled=? AND chronik_outbox_state_root IS ? "
-            "AND chronik_context_json IS ? AND execution_backend=? AND systemd_scope=? "
+            "AND execution_backend=? AND systemd_scope=? "
             f"AND {argv_predicate} "
             "ORDER BY created_at_unix DESC, rowid DESC",
             (
@@ -5335,11 +5376,6 @@ def _latest_matching_unprepared_managed_cargo_record(
                 identity["memory_max_bytes"],
                 int(identity["chronik_outbox_enabled"]),
                 identity["chronik_outbox_state_root"],
-                (
-                    _canonical_json(identity["chronik_context"])
-                    if identity["chronik_context"] is not None
-                    else None
-                ),
                 identity["execution_backend"],
                 identity["systemd_scope"],
                 *argv_parameters,
@@ -5350,16 +5386,23 @@ def _latest_matching_unprepared_managed_cargo_record(
             rows = cursor.fetchmany(256)
             if not rows:
                 return None
-            if unbound_only:
-                scanned_rows += len(rows)
-                if scanned_rows > 50000:
-                    raise RuntimeError(
-                        "unprepared managed Cargo unbound scan limit exceeded"
-                    )
+            scanned_rows += len(rows)
+            if scanned_rows > 50000:
+                raise RuntimeError(
+                    "unprepared managed Cargo unbound scan limit exceeded"
+                    if unbound_only
+                    else "unprepared managed Cargo retry scan limit exceeded"
+                )
             for row in rows:
                 record = dict(row)
                 if not _record_matches_unprepared_managed_cargo_command(
                     record, command
+                ):
+                    continue
+                if not _record_matches_execution_retry_identity(
+                    record,
+                    identity,
+                    include_command=False,
                 ):
                     continue
                 if unbound_only and (
@@ -5387,8 +5430,14 @@ def _resolve_unprepared_managed_cargo_execution_reuse(
     if latest is None:
         return None, None
     if (
-        _execution_identity_without_command(_record_execution_identity(latest))
-        != _execution_identity_without_command(identity)
+        _execution_retry_match_projection(
+            _record_execution_identity(latest),
+            include_command=False,
+        )
+        != _execution_retry_match_projection(
+            identity,
+            include_command=False,
+        )
     ):
         raise RuntimeError("stored managed Cargo execution identity is inconsistent")
     if str(latest["state"]) in TASK_STATE_PROJECTIONS["active"]:
@@ -5405,10 +5454,14 @@ def _resolve_unprepared_managed_cargo_execution_reuse(
             grabowski_task_status(str(latest["task_id"]))
             latest = _row_raw(str(latest["task_id"]))
             if (
-                _execution_identity_without_command(
-                    _record_execution_identity(latest)
+                _execution_retry_match_projection(
+                    _record_execution_identity(latest),
+                    include_command=False,
                 )
-                != _execution_identity_without_command(identity)
+                != _execution_retry_match_projection(
+                    identity,
+                    include_command=False,
+                )
             ):
                 raise RuntimeError(
                     "stored managed Cargo execution identity is inconsistent"
@@ -5448,7 +5501,7 @@ def _matching_attention_unprepared_managed_cargo_records(
             "AND resource_keys_json=? AND runtime_seconds=? AND cpu_weight=? "
             "AND io_weight=? AND memory_max_bytes IS ? "
             "AND chronik_outbox_enabled=? AND chronik_outbox_state_root IS ? "
-            "AND chronik_context_json IS ? AND execution_backend=? AND systemd_scope=? "
+            "AND execution_backend=? AND systemd_scope=? "
             f"AND {argv_predicate} "
             f"AND state IN ({placeholders}) "
             "ORDER BY created_at_unix DESC, rowid DESC LIMIT ?",
@@ -5462,11 +5515,6 @@ def _matching_attention_unprepared_managed_cargo_records(
                 identity["memory_max_bytes"],
                 int(identity["chronik_outbox_enabled"]),
                 identity["chronik_outbox_state_root"],
-                (
-                    _canonical_json(identity["chronik_context"])
-                    if identity["chronik_context"] is not None
-                    else None
-                ),
                 identity["execution_backend"],
                 identity["systemd_scope"],
                 *argv_parameters,
@@ -5482,7 +5530,13 @@ def _matching_attention_unprepared_managed_cargo_records(
         if _record_matches_unprepared_managed_cargo_command(
             record := dict(row), command
         )
+        and _record_matches_execution_retry_identity(
+            record,
+            identity,
+            include_command=False,
+        )
     ]
+
 
 def _guard_direct_terminal_retry_record(record: dict[str, Any] | None) -> None:
     if record is None:
