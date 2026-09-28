@@ -1407,6 +1407,22 @@ class OperatorSignedTransportTests(unittest.TestCase):
                     )
                 )
 
+        with mock.patch.object(
+            operator,
+            "int",
+            side_effect=ValueError("simulated integer conversion limit"),
+            create=True,
+        ):
+            self.assertIsNone(
+                operator._terminal_typed_read_redirect(
+                    "grabowski_terminal_run",
+                    {
+                        "argv": ["sed", "-n", "999p", "file.txt"],
+                        "cwd": "/tmp",
+                    },
+                )
+            )
+
         single_line = operator._terminal_typed_read_redirect(
             "grabowski_terminal_run",
             {

@@ -1613,8 +1613,11 @@ def _terminal_typed_read_redirect(
     match = _TERMINAL_SED_RANGE_READ_RE.fullmatch(expression)
     if match is None:
         return None
-    start_line = int(match.group(1))
-    end_line = int(match.group(2) or match.group(1))
+    try:
+        start_line = int(match.group(1))
+        end_line = int(match.group(2) or match.group(1))
+    except ValueError:
+        return None
     if end_line < start_line:
         return None
     max_lines = end_line - start_line + 1
