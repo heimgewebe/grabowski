@@ -289,6 +289,7 @@ def proxy_command(upstream: Path, root: Path) -> list[str]:
         "--codex-mcp-proxy",
         json.dumps([str(Path(sys.executable).resolve()), str(upstream), "--bundle-root", str(root)]),
         str(manifest),
+        str(manifest),
         digest,
         json.dumps(authorized, sort_keys=True),
         str(runtime_root),
@@ -2592,6 +2593,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     runner.run_mcp_proxy(
                         command,
                         str(manifest),
+                        str(manifest),
                         hashlib.sha256(manifest.read_bytes()).hexdigest(),
                         authorized,
                         str(runtime_root),
@@ -2641,6 +2643,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 with self.assertRaises(KeyboardInterrupt):
                     runner.run_mcp_proxy(
                         command,
+                        str(manifest),
                         str(manifest),
                         hashlib.sha256(manifest.read_bytes()).hexdigest(),
                         authorized,
@@ -4295,6 +4298,15 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertEqual(proxy_args[:2], ["-I", "-c"])
             self.assertEqual(proxy_args[2], bootstrap_program())
             self.assertEqual(proxy_args[3], str(binding["path"]))
+            marker = proxy_args.index("--codex-mcp-proxy")
+            upstream = json.loads(proxy_args[marker + 1])
+            bundle_index = upstream.index("--bundle-root")
+            self.assertEqual(upstream[bundle_index + 1], str(staged_manifest.resolve()))
+            self.assertEqual(proxy_args[marker + 2], str(staged_manifest.resolve()))
+            self.assertEqual(
+                proxy_args[marker + 3],
+                request(condition="treatment")["repobrief"]["manifest"],
+            )
             self.assertNotIn(str(source), encoded)
             self.assertIsNone(runner.cleanup_staged_mcp_proxy(binding))
 
@@ -4393,6 +4405,55 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertIsNone(runner.cleanup_staged_repoground_manifest(binding))
             self.assertFalse(staged.exists())
 
+    def test_staged_manifest_rebinds_mcp_authorization_to_private_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "state"
+            state_root.mkdir(mode=0o700)
+            executable = root / "python3"
+            executable.write_bytes(Path(sys.executable).resolve().read_bytes())
+            executable.chmod(0o755)
+            script = root / "server.py"
+            script.write_text("pass\n", encoding="utf-8")
+            manifest = root / "chosen.bundle.manifest.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+            authorized = [
+                file_identity(executable),
+                file_identity(script),
+                file_identity(manifest),
+            ]
+
+            first_stage = runner.stage_repoground_manifest(
+                state_root, authorized[-1]
+            )
+            staged_manifest = Path(first_stage["path"])
+            rebound = runner._rebind_staged_manifest_authorization(
+                authorized, first_stage
+            )
+
+            self.assertEqual(rebound[-1]["path"], str(staged_manifest))
+            self.assertEqual(rebound[-1]["sha256"], authorized[-1]["sha256"])
+            self.assertEqual(rebound[-1]["mode"], "0o600")
+            second_stage = runner.stage_mcp_upstream(
+                state_root,
+                [
+                    str(executable),
+                    str(script),
+                    "--bundle-root",
+                    str(staged_manifest),
+                ],
+                staged_manifest,
+                rebound,
+            )
+            self.assertEqual(
+                Path(second_stage["manifest_binding"]["path"]).read_bytes(),
+                staged_manifest.read_bytes(),
+            )
+            self.assertIsNone(runner.cleanup_staged_mcp_upstream(second_stage))
+            self.assertIsNone(
+                runner.cleanup_staged_repoground_manifest(first_stage)
+            )
+
     def test_staged_manifest_preserves_relative_artifact_context(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -4439,6 +4500,87 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             runner._revalidate_staged_repoground_manifest(binding)
             self.assertIsNone(runner.cleanup_staged_repoground_manifest(binding))
             self.assertFalse(staged.parent.exists())
+
+    def test_second_mcp_stage_preserves_relative_manifest_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "state"
+            state_root.mkdir(mode=0o700)
+            bundle = root / "bundle"
+            (bundle / "nested").mkdir(parents=True)
+            artifact = bundle / "nested" / "brief.md"
+            artifact.write_text("authorized artifact\n", encoding="utf-8")
+            artifact_raw = artifact.read_bytes()
+            manifest = bundle / "chosen.bundle.manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "artifacts": [
+                            {
+                                "role": "canonical_md",
+                                "path": "nested/brief.md",
+                                "bytes": len(artifact_raw),
+                                "sha256": hashlib.sha256(artifact_raw).hexdigest(),
+                            }
+                        ]
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            executable = root / "python3"
+            executable.write_bytes(Path(sys.executable).resolve().read_bytes())
+            executable.chmod(0o755)
+            script = root / "server.py"
+            script.write_text(
+                "import json, pathlib, sys\n"
+                "args=sys.argv\n"
+                "manifest=pathlib.Path(args[args.index('--bundle-root')+1])\n"
+                "document=json.loads(manifest.read_text(encoding='utf-8'))\n"
+                "artifact=manifest.parent / document['artifacts'][0]['path']\n"
+                "sys.stdout.write(artifact.read_text(encoding='utf-8'))\n",
+                encoding="utf-8",
+            )
+            authorized = [
+                file_identity(executable),
+                file_identity(script),
+                file_identity(manifest),
+            ]
+            first_stage = runner.stage_repoground_manifest(
+                state_root, authorized[-1]
+            )
+            staged_manifest = Path(first_stage["path"])
+            artifact.write_text("drifted original\n", encoding="utf-8")
+            rebound = runner._rebind_staged_manifest_authorization(
+                authorized, first_stage
+            )
+            second_stage = runner.stage_mcp_upstream(
+                state_root,
+                [
+                    str(executable),
+                    str(script),
+                    "--bundle-root",
+                    str(staged_manifest),
+                ],
+                staged_manifest,
+                rebound,
+            )
+            second_manifest = Path(second_stage["manifest_binding"]["path"])
+            second_artifact = second_manifest.parent / "nested" / "brief.md"
+            self.assertEqual(second_artifact.read_bytes(), artifact_raw)
+            completed = subprocess.run(
+                second_stage["argv"],
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout, artifact_raw)
+            self.assertIsNone(runner.cleanup_staged_mcp_upstream(second_stage))
+            self.assertIsNone(
+                runner.cleanup_staged_repoground_manifest(first_stage)
+            )
 
     def test_live_dispatch_requires_terminal_success_before_second_condition(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
