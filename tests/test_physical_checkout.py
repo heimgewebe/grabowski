@@ -488,6 +488,69 @@ class PhysicalCheckoutIdentityTests(unittest.TestCase):
                     identity["common_dir"]["path"], worktree
                 )
 
+    def test_nonmatching_backlink_becoming_second_match_after_validation_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            worktree = root / "worktree"
+            other = root / "other"
+            self._init_committed_repo(repo, branch="main")
+            self._run(
+                "git",
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked-target",
+                str(worktree),
+                "HEAD",
+                cwd=repo,
+            )
+            self._run(
+                "git",
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked-other",
+                str(other),
+                "HEAD",
+                cwd=repo,
+            )
+
+            identity = physical_checkout.capture_physical_checkout_identity(worktree)
+            other_identity = physical_checkout.capture_physical_checkout_identity(other)
+            other_backlink = Path(other_identity["git_dir"]["path"]) / "gitdir"
+            original_open = physical_checkout._open_absolute_directory
+            drifted = False
+
+            def drift_after_selected_match_verification(path: Path, *, label: str):
+                nonlocal drifted
+                opened = original_open(path, label=label)
+                if label == "registered worktree git directory" and not drifted:
+                    other_backlink.write_text(
+                        str(worktree / ".git") + "\n",
+                        encoding="utf-8",
+                    )
+                    drifted = True
+                return opened
+
+            with (
+                patch.object(
+                    physical_checkout,
+                    "_open_absolute_directory",
+                    side_effect=drift_after_selected_match_verification,
+                ),
+                self.assertRaisesRegex(
+                    physical_checkout.PhysicalCheckoutIdentityError,
+                    "git worktree backlink changed during registered identity capture",
+                ),
+            ):
+                physical_checkout.capture_registered_linked_worktree_git_dir(
+                    identity["common_dir"]["path"], worktree
+                )
+            self.assertTrue(drifted)
+
     def test_new_registration_during_backlink_revalidation_is_detected_before_return(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -548,7 +611,7 @@ class PhysicalCheckoutIdentityTests(unittest.TestCase):
                     identity["common_dir"]["path"], worktree
                 )
 
-            self.assertEqual(2, target_admin_open_count)
+            self.assertEqual(3, target_admin_open_count)
 
     def test_untracked_hash_rejects_atomic_leaf_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

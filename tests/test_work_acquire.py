@@ -1125,6 +1125,31 @@ class WorkAcquireTests(unittest.TestCase):
             "final_status": "launch_submitted",
         }
 
+    @staticmethod
+    def writer_status(
+        unit: str,
+        final_status: str,
+        *,
+        systemd_visible: bool | None = None,
+    ) -> dict[str, object]:
+        if systemd_visible is None:
+            systemd_visible = final_status not in {
+                "launch_failed",
+                "missing_finalization_evidence",
+                "timed_out",
+                "signalled",
+            }
+        return {
+            "unit": unit,
+            "final_status": final_status,
+            "systemd_visible": systemd_visible,
+            "terminalization_evidence": {
+                "source": "test",
+                "final_status": final_status,
+                "systemd_visible": systemd_visible,
+            },
+        }
+
     def test_optional_scoped_writer_starts_and_binds_durable_job(self) -> None:
         params = self.parameters()
         params["scoped_writer_argv"] = ["writer", "--once"]
@@ -1164,6 +1189,9 @@ class WorkAcquireTests(unittest.TestCase):
         params["scoped_writer_argv"] = ["writer", "--once"]
         params["scoped_writer_runtime_seconds"] = 600
         start = Mock(return_value=self.writer_result(self.target))
+        read_status = Mock(
+            return_value=self.writer_status("grabowski-job-123456789abc", "succeeded")
+        )
         acquire = Mock(side_effect=self.acquire)
         ensure = Mock(
             side_effect=[
@@ -1192,6 +1220,7 @@ class WorkAcquireTests(unittest.TestCase):
             "ensure_worktree_fn": ensure,
             "runner": Mock(),
             "start_writer_fn": start,
+            "read_writer_status_fn": read_status,
         }
         first = work_acquire.acquire_work(params, **kwargs)
         second = work_acquire.acquire_work(params, **kwargs)
@@ -1199,8 +1228,230 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertEqual(second["writer_start"]["state"], "reused")
         self.assertTrue(second["replayed"])
         self.assertEqual(start.call_count, 1)
+        self.assertEqual(read_status.call_count, 1)
+        self.assertTrue(second["writer_liveness"]["terminal"])
+        self.assertEqual(second["writer_liveness"]["final_status"], "succeeded")
+        self.assertTrue(second["writer_liveness"]["systemd_visible"])
         self.assertEqual(acquire.call_count, 2)
         self.assertEqual(ensure.call_count, 2)
+
+    def test_running_existing_writer_blocks_before_continuation_snapshot_and_replay_is_inert(self) -> None:
+        params = self.parameters()
+        params["scoped_writer_argv"] = ["writer", "--once"]
+        params["scoped_writer_runtime_seconds"] = 600
+        start = Mock(return_value=self.writer_result(self.target))
+        read_status = Mock(
+            return_value=self.writer_status("grabowski-job-123456789abc", "running")
+        )
+        acquire = Mock(side_effect=self.acquire)
+        release = Mock()
+        ensure = Mock(
+            return_value={
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "post_state": {
+                    "target_registered": True,
+                    "target_path_exists": True,
+                },
+            }
+        )
+        kwargs = {
+            "acquire_resources_fn": acquire,
+            "release_resources_fn": release,
+            "inspect_resource_fn": Mock(),
+            "ensure_worktree_fn": ensure,
+            "runner": Mock(),
+            "start_writer_fn": start,
+            "read_writer_status_fn": read_status,
+        }
+        first = work_acquire.acquire_work(params, **kwargs)
+        self.assertEqual(first["state"], "ready")
+        preimage = Mock(side_effect=AssertionError("preimage must not run"))
+        with patch.object(work_acquire, "_continuation_preimage", preimage):
+            blocked = work_acquire.acquire_work(params, **kwargs)
+            acquire_calls_after_block = acquire.call_count
+            status_calls_after_block = read_status.call_count
+            start_calls_after_block = start.call_count
+            replay = work_acquire.acquire_work(params, **kwargs)
+
+        self.assertEqual(blocked["state"], "outcome_unknown")
+        self.assertEqual(blocked["decision"], "HARD_BLOCK")
+        self.assertEqual(blocked["error_class"], "SCOPED_WRITER_NOT_TERMINAL")
+        self.assertEqual(
+            blocked["next_action"], "readback_scoped_writer_before_retry"
+        )
+        self.assertEqual(blocked["writer_liveness"]["final_status"], "running")
+        self.assertTrue(blocked["writer_liveness"]["systemd_visible"])
+        self.assertFalse(blocked["writer_liveness"]["terminal"])
+        self.assertIsNone(blocked["compensation"])
+        self.assertTrue(blocked["effect_observed"])
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(replay["receipt_sha256"], blocked["receipt_sha256"])
+        self.assertEqual(acquire.call_count, acquire_calls_after_block)
+        self.assertEqual(read_status.call_count, status_calls_after_block)
+        self.assertEqual(start.call_count, start_calls_after_block)
+        self.assertEqual(acquire.call_count, 2)
+        self.assertEqual(read_status.call_count, 1)
+        self.assertEqual(start.call_count, 1)
+        self.assertEqual(ensure.call_count, 1)
+        release.assert_not_called()
+        preimage.assert_not_called()
+
+    def test_unclear_existing_writer_status_fails_closed_before_continuation_snapshot(self) -> None:
+        params = self.parameters()
+        params["scoped_writer_argv"] = ["writer", "--once"]
+        params["scoped_writer_runtime_seconds"] = 600
+        start = Mock(return_value=self.writer_result(self.target))
+        read_status = Mock(
+            return_value=self.writer_status(
+                "grabowski-job-123456789abc", "missing_finalization_evidence"
+            )
+        )
+        acquire = Mock(side_effect=self.acquire)
+        release = Mock()
+        ensure = Mock(
+            return_value={
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "post_state": {
+                    "target_registered": True,
+                    "target_path_exists": True,
+                },
+            }
+        )
+        kwargs = {
+            "acquire_resources_fn": acquire,
+            "release_resources_fn": release,
+            "inspect_resource_fn": Mock(),
+            "ensure_worktree_fn": ensure,
+            "runner": Mock(),
+            "start_writer_fn": start,
+            "read_writer_status_fn": read_status,
+        }
+        work_acquire.acquire_work(params, **kwargs)
+        preimage = Mock(side_effect=AssertionError("preimage must not run"))
+        with patch.object(work_acquire, "_continuation_preimage", preimage):
+            blocked = work_acquire.acquire_work(params, **kwargs)
+
+        self.assertEqual(blocked["state"], "outcome_unknown")
+        self.assertEqual(blocked["error_class"], "SCOPED_WRITER_NOT_TERMINAL")
+        self.assertEqual(
+            blocked["writer_liveness"]["final_status"],
+            "missing_finalization_evidence",
+        )
+        self.assertFalse(blocked["writer_liveness"]["systemd_visible"])
+        self.assertFalse(blocked["writer_liveness"]["terminal"])
+        self.assertIsNone(blocked["compensation"])
+        self.assertEqual(acquire.call_count, 2)
+        self.assertEqual(read_status.call_count, 1)
+        self.assertEqual(start.call_count, 1)
+        self.assertEqual(ensure.call_count, 1)
+        release.assert_not_called()
+        preimage.assert_not_called()
+
+    def test_persisted_terminal_receipt_does_not_establish_writer_quiescence(self) -> None:
+        params = self.parameters()
+        params["scoped_writer_argv"] = ["writer", "--once"]
+        params["scoped_writer_runtime_seconds"] = 600
+        start = Mock(return_value=self.writer_result(self.target))
+        persisted_status = self.writer_status(
+            "grabowski-job-123456789abc",
+            "succeeded",
+            systemd_visible=False,
+        )
+        persisted_status["terminalization_evidence"]["source"] = "persisted-runner-receipt"
+        persisted_status["terminalization_evidence"]["does_not_establish"] = [
+            "live_process_status"
+        ]
+        read_status = Mock(return_value=persisted_status)
+        acquire = Mock(side_effect=self.acquire)
+        release = Mock()
+        ensure = Mock(
+            return_value={
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "post_state": {
+                    "target_registered": True,
+                    "target_path_exists": True,
+                },
+            }
+        )
+        kwargs = {
+            "acquire_resources_fn": acquire,
+            "release_resources_fn": release,
+            "inspect_resource_fn": Mock(),
+            "ensure_worktree_fn": ensure,
+            "runner": Mock(),
+            "start_writer_fn": start,
+            "read_writer_status_fn": read_status,
+        }
+        work_acquire.acquire_work(params, **kwargs)
+        preimage = Mock(side_effect=AssertionError("preimage must not run"))
+        with patch.object(work_acquire, "_continuation_preimage", preimage):
+            blocked = work_acquire.acquire_work(params, **kwargs)
+
+        self.assertEqual(blocked["state"], "outcome_unknown")
+        self.assertEqual(blocked["error_class"], "SCOPED_WRITER_NOT_TERMINAL")
+        self.assertEqual(blocked["writer_liveness"]["final_status"], "succeeded")
+        self.assertFalse(blocked["writer_liveness"]["systemd_visible"])
+        self.assertFalse(blocked["writer_liveness"]["terminal"])
+        self.assertIsNone(blocked["compensation"])
+        self.assertEqual(acquire.call_count, 2)
+        self.assertEqual(read_status.call_count, 1)
+        self.assertEqual(start.call_count, 1)
+        self.assertEqual(ensure.call_count, 1)
+        release.assert_not_called()
+        preimage.assert_not_called()
+
+    def test_invalid_existing_writer_status_evidence_fails_closed(self) -> None:
+        params = self.parameters()
+        params["scoped_writer_argv"] = ["writer", "--once"]
+        params["scoped_writer_runtime_seconds"] = 600
+        start = Mock(return_value=self.writer_result(self.target))
+        read_status = Mock(
+            return_value={
+                "unit": "grabowski-job-123456789abc",
+                "final_status": "succeeded",
+                "systemd_visible": True,
+                "terminalization_evidence": {},
+            }
+        )
+        acquire = Mock(side_effect=self.acquire)
+        release = Mock()
+        ensure = Mock(
+            return_value={
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "post_state": {
+                    "target_registered": True,
+                    "target_path_exists": True,
+                },
+            }
+        )
+        kwargs = {
+            "acquire_resources_fn": acquire,
+            "release_resources_fn": release,
+            "inspect_resource_fn": Mock(),
+            "ensure_worktree_fn": ensure,
+            "runner": Mock(),
+            "start_writer_fn": start,
+            "read_writer_status_fn": read_status,
+        }
+        work_acquire.acquire_work(params, **kwargs)
+        preimage = Mock(side_effect=AssertionError("preimage must not run"))
+        with patch.object(work_acquire, "_continuation_preimage", preimage):
+            blocked = work_acquire.acquire_work(params, **kwargs)
+
+        self.assertEqual(blocked["state"], "outcome_unknown")
+        self.assertEqual(blocked["error_class"], "SCOPED_WRITER_STATUS_UNCLEAR")
+        self.assertIn("finalization evidence is invalid", blocked["error"])
+        self.assertIsNone(blocked["compensation"])
+        self.assertEqual(acquire.call_count, 2)
+        self.assertEqual(read_status.call_count, 1)
+        self.assertEqual(start.call_count, 1)
+        self.assertEqual(ensure.call_count, 1)
+        release.assert_not_called()
+        preimage.assert_not_called()
 
     def test_identical_dirty_lane_continues_without_rerunning_ensure(self) -> None:
         params = self.parameters()
@@ -3942,6 +4193,11 @@ class WorkAcquireTests(unittest.TestCase):
                 inspect_resource_fn=Mock(),
                 ensure_worktree_fn=ensure,
                 runner=Mock(),
+                read_writer_status_fn=Mock(
+                    return_value=self.writer_status(
+                        writer_job["unit"], "succeeded"
+                    )
+                ),
             )
             second = work_acquire.acquire_work(
                 params,
@@ -3950,6 +4206,11 @@ class WorkAcquireTests(unittest.TestCase):
                 inspect_resource_fn=Mock(),
                 ensure_worktree_fn=ensure,
                 runner=Mock(),
+                read_writer_status_fn=Mock(
+                    return_value=self.writer_status(
+                        writer_job["unit"], "succeeded"
+                    )
+                ),
             )
 
         self.assertEqual(first["state"], "outcome_unknown")

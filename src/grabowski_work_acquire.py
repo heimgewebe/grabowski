@@ -43,6 +43,9 @@ MAX_TERMINAL_OWNER_LEASES = 512
 MAX_RESOURCE_RELEASE_BATCH = 64
 SUCCESSOR_HANDOFF_MIN_LEASE_REMAINING_SECONDS = 30
 DEFERRED_RESOURCE_RELEASE_CLOSEOUT_STATES = frozenset({"candidate_adopted"})
+SYSTEMD_PROVEN_TERMINAL_SCOPED_WRITER_STATUSES = frozenset(
+    {"succeeded", "failed"}
+)
 
 
 class ScopedWriterStartPreflight(ValueError):
@@ -1927,6 +1930,61 @@ def _writer_job_receipt(result: dict[str, Any]) -> dict[str, Any]:
     return {**receipt, "receipt_sha256": _sha(receipt)}
 
 
+def _read_scoped_writer_status(unit: str) -> dict[str, Any]:
+    """Read one existing scoped writer through the canonical durable job contract."""
+
+    result = operator.grabowski_job_status(unit)
+    if not isinstance(result, dict):
+        raise RuntimeError("scoped writer durable status readback is invalid")
+    return result
+
+
+def _scoped_writer_liveness(
+    writer_job: dict[str, Any],
+    read_writer_status_fn: Callable[[str], dict[str, Any]],
+) -> dict[str, Any]:
+    """Project only exact durable evidence needed to exclude a concurrent writer."""
+
+    unit = writer_job.get("unit")
+    if not isinstance(unit, str) or not unit:
+        raise RuntimeError("scoped writer durable unit identity is invalid")
+    status = read_writer_status_fn(unit)
+    if not isinstance(status, dict) or status.get("unit") != unit:
+        raise RuntimeError("scoped writer durable status is bound to another unit")
+    final_status = status.get("final_status")
+    terminalization = status.get("terminalization_evidence")
+    systemd_visible = status.get("systemd_visible")
+    if (
+        not isinstance(final_status, str)
+        or not final_status
+        or not isinstance(systemd_visible, bool)
+        or not isinstance(terminalization, dict)
+        or terminalization.get("final_status") != final_status
+        or terminalization.get("systemd_visible") is not systemd_visible
+    ):
+        raise RuntimeError("scoped writer durable finalization evidence is invalid")
+
+    # Persisted runner receipts are intentionally not live-process evidence.
+    # Only a currently visible, already-terminal systemd unit proves writer
+    # quiescence. launch_failed is the one safe invisible case because the
+    # canonical job contract admits it only for a proven non-start.
+    terminal = (
+        systemd_visible
+        and final_status in SYSTEMD_PROVEN_TERMINAL_SCOPED_WRITER_STATUSES
+    ) or (not systemd_visible and final_status == "launch_failed")
+    material = {
+        "unit": unit,
+        "final_status": final_status,
+        "systemd_visible": systemd_visible,
+        "terminalization_evidence_sha256": _sha(terminalization),
+    }
+    return {
+        **material,
+        "terminal": terminal,
+        "status_sha256": _sha(material),
+    }
+
+
 def _normalize(
     parameters: dict[str, Any], *, require_fresh_retention: bool = True
 ) -> dict[str, Any]:
@@ -3116,6 +3174,7 @@ def acquire_work(
     ensure_worktree_fn: Callable[..., dict[str, Any]] = worktree_ensure.ensure_worktree,
     runner: Callable[[Path, list[str]], dict[str, Any]] = _git_runner,
     start_writer_fn: Callable[..., dict[str, Any]] = _start_scoped_writer,
+    read_writer_status_fn: Callable[[str], dict[str, Any]] = _read_scoped_writer_status,
     audit_fn: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     inputs = _normalize(parameters)
@@ -3401,6 +3460,9 @@ def acquire_work(
         def continuation_conflict(
             exc: Exception,
             worktree_receipt: dict[str, Any] | None,
+            *,
+            error_class: str = "WORKTREE_CONTINUATION_CONFLICT",
+            writer_liveness: dict[str, Any] | None = None,
         ) -> dict[str, Any]:
             if existing_writer_job is not None:
                 record = _write_state(
@@ -3418,8 +3480,13 @@ def acquire_work(
                             if isinstance(existing_writer_start, dict)
                             else {}
                         ),
-                        "error_class": "WORKTREE_CONTINUATION_CONFLICT",
+                        "error_class": error_class,
                         "error": str(exc)[:2048],
+                        **(
+                            {"writer_liveness": writer_liveness}
+                            if writer_liveness is not None
+                            else {}
+                        ),
                         "effect_observed": True,
                         "compensation": None,
                         "next_action": "readback_scoped_writer_before_retry",
@@ -3488,6 +3555,37 @@ def acquire_work(
                 "durable_receipt_path": str(receipt_path),
                 "replayed": existing is not None,
             }
+
+        writer_liveness: dict[str, Any] | None = None
+        if existing_writer_job is not None:
+            try:
+                writer_liveness = _scoped_writer_liveness(
+                    existing_writer_job, read_writer_status_fn
+                )
+            except Exception as exc:
+                return continuation_conflict(
+                    exc,
+                    (
+                        existing.get("worktree_receipt")
+                        if isinstance(existing, dict)
+                        else None
+                    ),
+                    error_class="SCOPED_WRITER_STATUS_UNCLEAR",
+                )
+            if writer_liveness["terminal"] is not True:
+                return continuation_conflict(
+                    RuntimeError(
+                        "existing scoped writer is not proven terminal: "
+                        + str(writer_liveness["final_status"])
+                    ),
+                    (
+                        existing.get("worktree_receipt")
+                        if isinstance(existing, dict)
+                        else None
+                    ),
+                    error_class="SCOPED_WRITER_NOT_TERMINAL",
+                    writer_liveness=writer_liveness,
+                )
 
         try:
             continuation_preimage = _continuation_preimage(
@@ -3813,6 +3911,11 @@ def acquire_work(
                     else {}
                 ),
                 "authority": authority,
+                **(
+                    {"writer_liveness": writer_liveness}
+                    if writer_liveness is not None
+                    else {}
+                ),
                 **({"writer_job": writer_job} if writer_job is not None else {}),
                 **({"writer_start": writer_start} if writer_start is not None else {}),
                 "next_action": (
@@ -3848,6 +3951,11 @@ def acquire_work(
                             else {}
                         ),
                         "authority": authority,
+                        **(
+                            {"writer_liveness": writer_liveness}
+                            if writer_liveness is not None
+                            else {}
+                        ),
                         "writer_job": writer_job,
                         **(
                             {"writer_start": writer_start}

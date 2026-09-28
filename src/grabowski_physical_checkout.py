@@ -675,6 +675,98 @@ def capture_registered_linked_worktree_git_dir(
             )
         finally:
             os.close(descriptor)
+
+        # The first validation pass proves that every backlink still has its
+        # observed inode/snapshot.  Re-evaluate the complete semantic backlink
+        # set after the selected match itself is verified so a formerly
+        # nonmatching backlink cannot become a second match in that final gap.
+        terminal_matches: list[dict[str, Any]] = []
+        for name, admin_snapshot, backlink_snapshot in observed_entries:
+            try:
+                current_admin = os.stat(
+                    name,
+                    dir_fd=worktrees_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise PhysicalCheckoutIdentityError(
+                    "git worktree admin entry changed during registered identity capture"
+                ) from exc
+            if (
+                not stat.S_ISDIR(current_admin.st_mode)
+                or stat.S_ISLNK(current_admin.st_mode)
+                or not _same_file_snapshot(admin_snapshot, current_admin)
+            ):
+                raise PhysicalCheckoutIdentityError(
+                    "git worktree admin entry changed during registered identity capture"
+                )
+            admin_descriptor, opened_admin = _open_relative_directory(
+                worktrees_descriptor,
+                name,
+                label="git worktree admin directory",
+            )
+            try:
+                if not _same_file_snapshot(admin_snapshot, opened_admin):
+                    raise PhysicalCheckoutIdentityError(
+                        "git worktree admin entry changed during registered identity capture"
+                    )
+                if backlink_snapshot is None:
+                    try:
+                        current_backlink = os.stat(
+                            "gitdir",
+                            dir_fd=admin_descriptor,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        continue
+                    except OSError as exc:
+                        raise PhysicalCheckoutIdentityError(
+                            "git worktree backlink changed during registered identity capture"
+                        ) from exc
+                    if stat.S_ISREG(
+                        current_backlink.st_mode
+                    ) and not stat.S_ISLNK(current_backlink.st_mode):
+                        raise PhysicalCheckoutIdentityError(
+                            "git worktree backlink changed during registered identity capture"
+                        )
+                    continue
+
+                try:
+                    payload, current_backlink = _read_relative_regular(
+                        admin_descriptor,
+                        "gitdir",
+                        label="git worktree backlink",
+                    )
+                except PhysicalCheckoutIdentityError as exc:
+                    raise PhysicalCheckoutIdentityError(
+                        "git worktree backlink changed during registered identity capture"
+                    ) from exc
+                if not _same_file_snapshot(backlink_snapshot, current_backlink):
+                    raise PhysicalCheckoutIdentityError(
+                        "git worktree backlink changed during registered identity capture"
+                    )
+                try:
+                    target = _single_line_pointer(
+                        payload,
+                        prefix="",
+                        label="git worktree backlink",
+                    )
+                except PhysicalCheckoutIdentityError:
+                    continue
+                admin_path = common_path / "worktrees" / name
+                pointer_path = _absolute_lexical(
+                    target if Path(target).is_absolute() else admin_path / target
+                )
+                if pointer_path == expected_pointer:
+                    terminal_matches.append(_identity(admin_path, opened_admin))
+            finally:
+                os.close(admin_descriptor)
+
+        if len(terminal_matches) != 1 or terminal_matches[0] != registered:
+            raise PhysicalCheckoutIdentityError(
+                "registered linked worktree git directory is missing or ambiguous"
+            )
+
         final = os.fstat(worktrees_descriptor)
         if not _same_file_snapshot(before, final):
             raise PhysicalCheckoutIdentityError(
