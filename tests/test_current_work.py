@@ -471,6 +471,27 @@ class CurrentWorkProjectionTests(unittest.TestCase):
             )
         )
 
+    def test_zombie_coding_agent_remains_visible_without_consuming_pool(self) -> None:
+        parsed = current_work.parse_processes(
+            {
+                "returncode": 0,
+                "lines": [
+                    "3389613 3753978 ZNs 205773 codex [codex] <defunct>",
+                ],
+            }
+        )
+
+        self.assertEqual(parsed["count"], 1)
+        process = parsed["processes"][0]
+        self.assertEqual(process["state"], "ZNs")
+        self.assertEqual(process["executable"], "codex")
+        self.assertEqual(process["command_class"], "other")
+        self.assertEqual(parsed["coding_agent_argv_partial_count"], 0)
+        self.assertEqual(parsed["provider_pool_sessions"], {})
+        self.assertEqual(
+            parsed["lifecycle_counts"],
+            {"active": 0, "protected": 0, "unbound": 0, "infrastructure": 0},
+        )
 
     def test_codex_prompt_text_cannot_spoof_app_server_or_model_selection(self) -> None:
         parsed = current_work.parse_processes(
