@@ -316,6 +316,10 @@ class LaneCloseoutTests(unittest.TestCase):
             "blocked_with_durable_followup", assessment["closeout_state"]
         )
         self.assertEqual("followup-1", assessment["durable_followup_id"])
+        self.assertRegex(
+            assessment["legacy_observation_sha256"],
+            r"^[0-9a-f]{64}$",
+        )
         self.assertFalse(assessment["lease_release_ready"])
         self.assertEqual(
             closeout.validate_terminal_assessment(assessment),
@@ -359,6 +363,7 @@ class LaneCloseoutTests(unittest.TestCase):
         )
         legacy = dict(assessment)
         legacy.pop("durable_followup_id")
+        legacy.pop("legacy_observation_sha256")
         material = {
             key: value
             for key, value in legacy.items()

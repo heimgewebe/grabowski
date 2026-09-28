@@ -299,6 +299,7 @@ def _terminal_assessment_replay_projection(
         not in {
             "observed_at_unix",
             "terminal_head_sha",
+            "legacy_observation_sha256",
             "assessment_sha256",
             "audit_record_sha256",
             "does_not_establish",
@@ -320,6 +321,7 @@ def _legacy_blocked_followup_id_transition(
         and "durable_followup_id" not in stored
         and isinstance(current.get("durable_followup_id"), str)
         and bool(current.get("durable_followup_id"))
+        and isinstance(current.get("legacy_observation_sha256"), str)
     )
 
 
@@ -331,12 +333,23 @@ def _terminal_assessment_replay_equivalent(
     current_projection = _terminal_assessment_replay_projection(current)
     if stored_projection == current_projection:
         return True
+    stored_validated = lane_closeout.validate_terminal_assessment(stored)
+    current_validated = lane_closeout.validate_terminal_assessment(current)
     if not _legacy_blocked_followup_id_transition(
-        lane_closeout.validate_terminal_assessment(stored),
-        lane_closeout.validate_terminal_assessment(current),
+        stored_validated,
+        current_validated,
     ):
         return False
-    for field in ("durable_followup_id", "observation_sha256"):
+    if (
+        stored_validated.get("observation_sha256")
+        != current_validated.get("legacy_observation_sha256")
+    ):
+        return False
+    for field in (
+        "durable_followup_id",
+        "observation_sha256",
+        "legacy_observation_sha256",
+    ):
         stored_projection.pop(field, None)
         current_projection.pop(field, None)
     return stored_projection == current_projection
@@ -354,6 +367,7 @@ def _terminal_pending_retry_projection(
         not in {
             "observed_at_unix",
             "observation_sha256",
+            "legacy_observation_sha256",
             "assessment_sha256",
             "audit_record_sha256",
             "does_not_establish",
@@ -384,7 +398,10 @@ def _terminal_pending_retry_equivalent(
         if pending_projection != current_projection:
             return False
     if legacy_followup_transition:
-        return True
+        return (
+            pending_validated.get("observation_sha256")
+            == current_validated.get("legacy_observation_sha256")
+        )
     if (
         pending_validated.get("observation_sha256")
         == current_validated.get("observation_sha256")
@@ -1319,10 +1336,19 @@ def _persist_terminal_closeout_impl(
                 raise RuntimeError(
                     "work-lane already records another terminal closeout intent"
                 )
-            # The pending wrapper is continuation/CAS evidence only.  Effects
-            # must use the caller's freshly recomputed terminal assessment so
-            # task/process/Git liveness cannot go stale across retries.
-            effective = validated
+            # The pending wrapper is continuation/CAS evidence only. Normally
+            # effects use the caller's freshly recomputed terminal assessment so
+            # task/process/Git liveness cannot go stale across retries. For the
+            # one format transition where legacy blocked-followup evidence lacks
+            # durable_followup_id, exact legacy-observation reproduction above
+            # proves the old pending assessment still describes the current
+            # observation. Preserve that assessment as the canonical terminal
+            # evidence so an already-created Bureau TaskSpec reproduction stays
+            # bound to the original lane_assessment_sha256.
+            if _legacy_blocked_followup_id_transition(pending, validated):
+                effective = pending
+            else:
+                effective = validated
         else:
             if record.get("receipt_sha256") != expected_receipt_sha256:
                 raise RuntimeError("work-lane terminal closeout CAS preimage changed")
