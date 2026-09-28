@@ -9823,6 +9823,212 @@ class TaskTests(unittest.TestCase):
         row.assert_not_called()
 
 
+    def test_managed_cargo_active_reuse_precedes_changed_environment_preparation(
+        self,
+    ) -> None:
+        raw_command = ["/usr/bin/cargo", "test"]
+
+        def bound(cache_key: str) -> list[str]:
+            target_dir = tasks.MANAGED_CARGO_CACHE_ROOT / cache_key / "target"
+            lifecycle_lock = tasks.MANAGED_CARGO_LOCK_ROOT / f"{cache_key}.lock"
+            return [
+                tasks.FLOCK_EXECUTABLE,
+                "--shared",
+                str(lifecycle_lock),
+                tasks.SYSTEMD_ENV_EXECUTABLE,
+                f"CARGO_TARGET_DIR={target_dir}",
+                *raw_command,
+            ]
+
+        common = {
+            "host": "local",
+            "argv": raw_command,
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "resume_policy": "retry-safe",
+            "cpu_weight": 50,
+            "io_weight": 25,
+            "memory_max_bytes": 64 * 1024 * 1024,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_managed_cargo_request_root", return_value=self.root),
+            patch.object(
+                tasks, "_bind_managed_cargo_environment", return_value=bound("a" * 64)
+            ),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
+            ),
+        ):
+            first = tasks.grabowski_task_start(**common)
+        task_id = str(first["task"]["task_id"])
+        running_observation = {
+            "state": "running",
+            "observed_at_unix": tasks._now(),
+            "properties": {"ActiveState": "active", "SubState": "running"},
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_managed_cargo_request_root", return_value=self.root),
+            patch.object(
+                tasks, "_bind_managed_cargo_environment", return_value=bound("b" * 64)
+            ) as prepare,
+            patch.object(tasks, "_observe", return_value=running_observation) as observe,
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
+            ),
+        ):
+            second = tasks.grabowski_task_start(**common)
+        observe.assert_called_once()
+        prepare.assert_not_called()
+        dispatch.assert_not_called()
+        self.assertEqual(task_id, second["task"]["task_id"])
+        self.assertEqual(
+            "active_unprepared_managed_cargo_identity",
+            second["deduplicated_reuse"]["reason"],
+        )
+        self.assertEqual(1, tasks.grabowski_task_list(limit=20)["total_matching"])
+
+    def test_managed_cargo_completed_reuse_precedes_changed_environment_preparation(
+        self,
+    ) -> None:
+        raw_command = ["/usr/bin/cargo", "test"]
+
+        def bound(cache_key: str) -> list[str]:
+            target_dir = tasks.MANAGED_CARGO_CACHE_ROOT / cache_key / "target"
+            lifecycle_lock = tasks.MANAGED_CARGO_LOCK_ROOT / f"{cache_key}.lock"
+            return [
+                tasks.FLOCK_EXECUTABLE,
+                "--shared",
+                str(lifecycle_lock),
+                tasks.SYSTEMD_ENV_EXECUTABLE,
+                f"CARGO_TARGET_DIR={target_dir}",
+                *raw_command,
+            ]
+
+        common = {
+            "host": "local",
+            "argv": raw_command,
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "resume_policy": "retry-safe",
+            "cpu_weight": 50,
+            "io_weight": 25,
+            "memory_max_bytes": 64 * 1024 * 1024,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_managed_cargo_request_root", return_value=self.root),
+            patch.object(
+                tasks, "_bind_managed_cargo_environment", return_value=bound("c" * 64)
+            ),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 125}
+            ),
+        ):
+            first = tasks.grabowski_task_start(**common)
+        task_id = str(first["task"]["task_id"])
+        tasks._set_state(
+            task_id,
+            "completed",
+            observation={"state": "completed", "observed_at_unix": tasks._now()},
+        )
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_managed_cargo_request_root", return_value=self.root),
+            patch.object(
+                tasks, "_bind_managed_cargo_environment", return_value=bound("d" * 64)
+            ) as prepare,
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 126}
+            ),
+        ):
+            second = tasks.grabowski_task_start(**common)
+        prepare.assert_not_called()
+        dispatch.assert_not_called()
+        self.assertEqual(task_id, second["task"]["task_id"])
+        self.assertEqual("completed", second["task"]["state"])
+        self.assertEqual(
+            "recent_completed_unprepared_managed_cargo_identity",
+            second["deduplicated_reuse"]["reason"],
+        )
+        self.assertEqual(1, tasks.grabowski_task_list(limit=20)["total_matching"])
+
+    def test_managed_cargo_distinct_operation_bypasses_unprepared_completed_reuse(
+        self,
+    ) -> None:
+        raw_command = ["/usr/bin/cargo", "test"]
+
+        def bound(cache_key: str) -> list[str]:
+            target_dir = tasks.MANAGED_CARGO_CACHE_ROOT / cache_key / "target"
+            lifecycle_lock = tasks.MANAGED_CARGO_LOCK_ROOT / f"{cache_key}.lock"
+            return [
+                tasks.FLOCK_EXECUTABLE,
+                "--shared",
+                str(lifecycle_lock),
+                tasks.SYSTEMD_ENV_EXECUTABLE,
+                f"CARGO_TARGET_DIR={target_dir}",
+                *raw_command,
+            ]
+
+        common = {
+            "host": "local",
+            "argv": raw_command,
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "resume_policy": "retry-safe",
+            "cpu_weight": 50,
+            "io_weight": 25,
+            "memory_max_bytes": 64 * 1024 * 1024,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_managed_cargo_request_root", return_value=self.root),
+            patch.object(
+                tasks, "_bind_managed_cargo_environment", return_value=bound("e" * 64)
+            ),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 127}
+            ),
+        ):
+            first = tasks.grabowski_task_start(**common)
+        first_id = str(first["task"]["task_id"])
+        tasks._set_state(
+            first_id,
+            "completed",
+            observation={"state": "completed", "observed_at_unix": tasks._now()},
+        )
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_managed_cargo_request_root", return_value=self.root),
+            patch.object(
+                tasks, "_bind_managed_cargo_environment", return_value=bound("f" * 64)
+            ) as prepare,
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 128}
+            ),
+        ):
+            second = tasks.grabowski_task_start(
+                **common,
+                operation_identity=self._operation_identity_fixture(source="d"),
+            )
+        prepare.assert_called_once()
+        dispatch.assert_called_once()
+        self.assertNotEqual(first_id, second["task"]["task_id"])
+        self.assertIsNone(second["deduplicated_reuse"])
+
     def test_managed_cargo_attention_limit_counts_only_command_matches(self) -> None:
         raw_command = ["/usr/bin/cargo", "test"]
 

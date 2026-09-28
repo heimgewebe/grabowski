@@ -4672,12 +4672,11 @@ def _latest_matching_unbound_execution_record(
     return None
 
 
-def _resolve_recent_completed_execution_reuse(
-    identity: dict[str, Any],
+def _resolve_recent_completed_record_reuse(
+    latest: dict[str, Any] | None,
     *,
     resume_policy: ResumePolicy,
 ) -> dict[str, Any] | None:
-    latest = _latest_matching_unbound_execution_record(identity)
     if latest is None:
         return None
     if _persisted_task_operation_identity(latest) is not None:
@@ -4712,6 +4711,17 @@ def _resolve_recent_completed_execution_reuse(
             f"reconcile task {latest['task_id']} before another start"
         )
     return latest
+
+
+def _resolve_recent_completed_execution_reuse(
+    identity: dict[str, Any],
+    *,
+    resume_policy: ResumePolicy,
+) -> dict[str, Any] | None:
+    return _resolve_recent_completed_record_reuse(
+        _latest_matching_unbound_execution_record(identity),
+        resume_policy=resume_policy,
+    )
 
 
 def _matching_attention_execution_records(
@@ -5302,6 +5312,8 @@ def _managed_cargo_command_sql_predicate(
 def _latest_matching_unprepared_managed_cargo_record(
     identity: dict[str, Any],
     command: list[str],
+    *,
+    unbound_only: bool = False,
 ) -> dict[str, Any] | None:
     argv_predicate, argv_parameters = _managed_cargo_command_sql_predicate(command)
     with _database_connection() as connection:
@@ -5339,10 +5351,52 @@ def _latest_matching_unprepared_managed_cargo_record(
                 return None
             for row in rows:
                 record = dict(row)
-                if _record_matches_unprepared_managed_cargo_command(
+                if not _record_matches_unprepared_managed_cargo_command(
                     record, command
                 ):
-                    return record
+                    continue
+                if unbound_only and (
+                    _persisted_task_operation_identity(record) is not None
+                    or _persisted_retry_binding_or_raise(record) is not None
+                    or _persisted_interrupted_recovery_binding_or_raise(record)
+                    is not None
+                ):
+                    continue
+                return record
+
+
+def _resolve_unprepared_managed_cargo_execution_reuse(
+    identity: dict[str, Any],
+    command: list[str],
+    *,
+    resume_policy: ResumePolicy,
+) -> tuple[dict[str, Any] | None, str | None]:
+    latest = _latest_matching_unprepared_managed_cargo_record(
+        identity,
+        command,
+        unbound_only=True,
+    )
+    if latest is None:
+        return None, None
+    if str(latest["state"]) in TASK_STATE_PROJECTIONS["active"]:
+        if str(latest["resume_policy"]) != resume_policy:
+            raise RuntimeError(
+                "active execution identity has a different resume policy; "
+                f"reconcile task {latest['task_id']} before another start"
+            )
+        now = _now()
+        if not _task_has_fresh_active_observation(latest, now=now):
+            grabowski_task_status(str(latest["task_id"]))
+            latest = _row_raw(str(latest["task_id"]))
+        if str(latest["state"]) in TASK_STATE_PROJECTIONS["active"]:
+            return latest, "active_unprepared_managed_cargo_identity"
+    completed = _resolve_recent_completed_record_reuse(
+        latest,
+        resume_policy=resume_policy,
+    )
+    if completed is not None:
+        return completed, "recent_completed_unprepared_managed_cargo_identity"
+    return None, None
 
 def _matching_attention_unprepared_managed_cargo_records(
     identity: dict[str, Any],
@@ -5435,7 +5489,7 @@ def _guard_unprepared_managed_cargo_retry(
     execution_backend: str,
     identity: dict[str, Any],
     retry_context: dict[str, Any] | None,
-) -> None:
+) -> bool:
     local_systemd = (
         target["transport"] == "local" and execution_backend == "systemd-user"
     )
@@ -5449,7 +5503,7 @@ def _guard_unprepared_managed_cargo_retry(
         _explicit_managed_cargo_target_dir(command) if local_systemd else None
     )
     if request_root is None and explicit_managed_target is None:
-        return
+        return False
     if retry_context is None:
         latest = _latest_matching_unprepared_managed_cargo_record(identity, command)
         _guard_direct_terminal_retry_record(latest)
@@ -5462,7 +5516,7 @@ def _guard_unprepared_managed_cargo_retry(
             if _retained_retry_successor_for_source(str(source["task_id"])) is not None:
                 continue
             _guard_direct_terminal_retry_record(source)
-        return
+        return True
     source_task_id = retry_context.get("source_task_id")
     if not isinstance(source_task_id, str):
         raise ValueError("terminal retry context source task is invalid")
@@ -5475,6 +5529,7 @@ def _guard_unprepared_managed_cargo_retry(
     if not _record_matches_unprepared_managed_cargo_command(source, command):
         raise ValueError("terminal retry context command binding is stale")
     _guard_unchanged_terminal_retry(source_identity, retry_context)
+    return True
 
 
 def _guard_unchanged_terminal_retry(
@@ -8708,7 +8763,7 @@ def grabowski_task_start(
         execution_backend=execution_backend,
         systemd_scope=systemd_scope,
     )
-    _guard_unprepared_managed_cargo_retry(
+    managed_cargo_request = _guard_unprepared_managed_cargo_retry(
         command,
         target=target,
         cwd=working_directory,
@@ -8716,49 +8771,61 @@ def grabowski_task_start(
         identity=unprepared_identity,
         retry_context=_retry_context,
     )
-    command = _bind_managed_cargo_environment(
-        command,
-        target=target,
-        cwd=working_directory,
-        execution_backend=execution_backend,
-    )
-    argv_sha256 = command_identity.argv_sha256(command)
-    execution_identity = _task_execution_identity(
-        host=host,
-        argv_sha256=argv_sha256,
-        cwd=working_directory,
-        resource_keys=task_resources,
-        runtime_seconds=runtime,
-        cpu_weight=cpu,
-        io_weight=io,
-        memory_max_bytes=memory,
-        chronik_outbox_enabled=bool(chronik_enabled),
-        chronik_outbox_state_root=chronik_state_root,
-        chronik_context_json=chronik_context_json,
-        execution_backend=execution_backend,
-        systemd_scope=systemd_scope,
-    )
     execution_reuse = None
     execution_reuse_reason = None
-    if (
+    execution_reuse_eligible = (
         normalized_operation_identity is None
         and operation_retry_binding is None
         and _retry_context is None
-    ):
-        execution_reuse = _resolve_active_execution_reuse(
-            execution_identity,
-            resume_policy=policy,
-            allow_active_reuse=mutating_agent_workspace is None,
-        )
-        if execution_reuse is not None:
-            execution_reuse_reason = "active_execution_identity"
-        if execution_reuse is None:
-            execution_reuse = _resolve_recent_completed_execution_reuse(
-                execution_identity,
+    )
+    if execution_reuse_eligible and managed_cargo_request:
+        execution_reuse, execution_reuse_reason = (
+            _resolve_unprepared_managed_cargo_execution_reuse(
+                unprepared_identity,
+                command,
                 resume_policy=policy,
             )
+        )
+    if execution_reuse is not None:
+        execution_identity = _record_execution_identity(execution_reuse)
+    else:
+        command = _bind_managed_cargo_environment(
+            command,
+            target=target,
+            cwd=working_directory,
+            execution_backend=execution_backend,
+        )
+        argv_sha256 = command_identity.argv_sha256(command)
+        execution_identity = _task_execution_identity(
+            host=host,
+            argv_sha256=argv_sha256,
+            cwd=working_directory,
+            resource_keys=task_resources,
+            runtime_seconds=runtime,
+            cpu_weight=cpu,
+            io_weight=io,
+            memory_max_bytes=memory,
+            chronik_outbox_enabled=bool(chronik_enabled),
+            chronik_outbox_state_root=chronik_state_root,
+            chronik_context_json=chronik_context_json,
+            execution_backend=execution_backend,
+            systemd_scope=systemd_scope,
+        )
+        if execution_reuse_eligible:
+            execution_reuse = _resolve_active_execution_reuse(
+                execution_identity,
+                resume_policy=policy,
+                allow_active_reuse=mutating_agent_workspace is None,
+            )
             if execution_reuse is not None:
-                execution_reuse_reason = "recent_completed_execution_identity"
+                execution_reuse_reason = "active_execution_identity"
+            if execution_reuse is None:
+                execution_reuse = _resolve_recent_completed_execution_reuse(
+                    execution_identity,
+                    resume_policy=policy,
+                )
+                if execution_reuse is not None:
+                    execution_reuse_reason = "recent_completed_execution_identity"
     if execution_reuse is not None:
         if execution_reuse_reason is None:
             raise RuntimeError("execution reuse reason is missing")
