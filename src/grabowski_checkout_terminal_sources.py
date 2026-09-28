@@ -183,6 +183,9 @@ def _current_bureau_task_specs(
             }
             if not required.issubset(observed):
                 raise RuntimeError("Bureau TaskSpec StateStore schema is incomplete")
+        transaction_snapshot = _bureau_state_store_snapshot(root_descriptor)
+        if transaction_snapshot["database"] != before["database"]:
+            raise RuntimeError("Bureau TaskSpec StateStore identity changed")
         select = (
             "SELECT p.task_id,p.current_revision,p.spec_sha256 AS pointer_sha256,"
             "r.revision,r.parent_revision,r.spec_sha256 AS revision_sha256,r.spec_json "
@@ -200,7 +203,7 @@ def _current_bureau_task_specs(
                 (expected_task_id,),
             ).fetchall()
         after_read = _bureau_state_store_snapshot(root_descriptor)
-        if after_read["database"] != before["database"]:
+        if after_read != transaction_snapshot:
             raise RuntimeError("Bureau TaskSpec StateStore identity changed")
         if expected_task_id is None and len(rows) > BUREAU_TASK_SPEC_SCAN_LIMIT:
             raise RuntimeError("Bureau TaskSpec StateStore scan is incomplete")

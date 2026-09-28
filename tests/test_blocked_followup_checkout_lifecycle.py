@@ -398,6 +398,55 @@ class BlockedFollowupCheckoutLifecycleTests(unittest.TestCase):
         ):
             sources._current_bureau_task_specs(TASK_ID)
 
+    def test_taskspec_state_store_rejects_sidecar_replacement_after_schema_read(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        database = root / "bureau.sqlite3"
+        connection = sqlite3.connect(database)
+        try:
+            self.assertEqual(
+                "wal",
+                connection.execute("PRAGMA journal_mode=WAL").fetchone()[0],
+            )
+            self._create_schema(connection)
+            self._insert_current(connection, self._spec())
+            connection.commit()
+        finally:
+            connection.close()
+
+        real_snapshot = sources._bureau_state_store_snapshot
+        calls = {"count": 0}
+
+        def replace_wal_after_transaction_snapshot(root_descriptor: int):
+            snapshot = real_snapshot(root_descriptor)
+            calls["count"] += 1
+            if calls["count"] == 3:
+                wal = root / "bureau.sqlite3-wal"
+                self.assertTrue(wal.exists())
+                replacement = root / "replacement-wal"
+                replacement.write_bytes(wal.read_bytes())
+                replacement.chmod(0o600)
+                os.replace(replacement, wal)
+            return snapshot
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "BUREAU_STATE_DIR": str(root),
+                    "GRABOWSKI_BUREAU_COORDINATION_ROOT": str(root),
+                },
+            ),
+            patch.object(
+                sources,
+                "_bureau_state_store_snapshot",
+                replace_wal_after_transaction_snapshot,
+            ),
+            self.assertRaisesRegex(RuntimeError, "StateStore identity changed"),
+        ):
+            sources._current_bureau_task_specs(TASK_ID)
+
     def test_taskspec_state_store_allows_wal_sidecars_to_recreate(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
