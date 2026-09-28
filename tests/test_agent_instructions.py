@@ -183,7 +183,9 @@ class AgentInstructionsTests(unittest.TestCase):
             "user outcome", "minimum sufficient mechanism",
             "persistent complexity", "proof of benefit", "simpler path",
             "fresh evidence", "continue", "change", "park-stop",
-            "tool failure", "strategic evidence",
+            "tool failure", "strategic evidence", "managed dirty checkout",
+            "lane/lifecycle/checkout evidence", "fresh git preimage",
+            "never reset/clean/stash",
         ):
             self.assertIn(phrase, direction)
         obligation = rules["operator-obligation-lifecycle"].lower()

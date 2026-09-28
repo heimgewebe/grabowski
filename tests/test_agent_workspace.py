@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import inspect
 import json
@@ -4464,11 +4465,40 @@ class AgentWorkspaceTests(unittest.TestCase):
         )
 
     def test_create_blocks_writer_when_exact_sandbox_preflight_fails(self) -> None:
+        state = {"held": False}
+        observed = {"add": False}
+        original_run = workspace._run
+
+        @contextmanager
+        def operation_lock():
+            self.assertFalse(state["held"])
+            state["held"] = True
+            try:
+                yield
+            finally:
+                state["held"] = False
+
+        def observed_run(cwd: Path, argv: list[str], *, timeout: int = 120):
+            if argv[:3] == ["git", "worktree", "add"]:
+                observed["add"] = True
+                self.assertTrue(state["held"])
+            return original_run(cwd, argv, timeout=timeout)
+
         with (
             mock.patch.object(workspace.operator, "_require_operator_mutation"),
             mock.patch.object(workspace, "_verify_bureau_binding", side_effect=binding_evidence),
             mock.patch.object(workspace.resources, "acquire_resources", return_value={"leases": []}),
             mock.patch.object(workspace.resources, "release_resources", return_value={"released": []}),
+            mock.patch.object(
+                workspace.checkouts,
+                "_operation_lock",
+                operation_lock,
+            ),
+            mock.patch.object(
+                workspace,
+                "_run",
+                side_effect=observed_run,
+            ),
             mock.patch.object(
                 workspace,
                 "_role_toolchain_preflight",
@@ -4500,6 +4530,8 @@ class AgentWorkspaceTests(unittest.TestCase):
                     runtime_seconds=600,
                 )
         start.assert_not_called()
+        self.assertTrue(observed["add"])
+        self.assertFalse(state["held"])
 
     def test_create_blocks_before_writer_when_read_only_role_preflight_fails(self) -> None:
         calls: list[str] = []
