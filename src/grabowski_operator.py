@@ -1602,7 +1602,7 @@ def _terminal_typed_read_redirect(
         return None
     executable, flag, expression, path = argv
     if (
-        executable not in {"sed", "/usr/bin/sed"}
+        executable not in {"sed", "/bin/sed", "/usr/bin/sed"}
         or flag != "-n"
         or not isinstance(expression, str)
         or not isinstance(path, str)

@@ -1542,6 +1542,22 @@ class OperatorSignedTransportTests(unittest.TestCase):
         self.assertEqual(single_line["typed_arguments"]["start_line"], 7)
         self.assertEqual(single_line["typed_arguments"]["max_lines"], 1)
 
+        bin_sed = operator._terminal_typed_read_redirect(
+            "grabowski_terminal_run",
+            {
+                "argv": ["/bin/sed", "-n", "7p", "src/grabowski_operator.py"],
+                "cwd": str(ROOT),
+            },
+        )
+        self.assertIsNotNone(bin_sed)
+        assert bin_sed is not None
+        self.assertEqual(
+            bin_sed["typed_arguments"]["path"],
+            str(ROOT / "src/grabowski_operator.py"),
+        )
+        self.assertEqual(bin_sed["typed_arguments"]["start_line"], 7)
+        self.assertEqual(bin_sed["typed_arguments"]["max_lines"], 1)
+
         literal_tilde = operator._terminal_typed_read_redirect(
             "grabowski_terminal_run",
             {
