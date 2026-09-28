@@ -5627,7 +5627,14 @@ def normalize(
             output_bytes = len(canonical(output_value).encode("utf-8"))
             result_is_success = (
                 isinstance(result_value, dict)
-                and result_value.get("isError") is False
+                and (
+                    result_value.get("isError") is False
+                    or (
+                        "isError" not in result_value
+                        and isinstance(result_value.get("structured_content"), dict)
+                        and result_value["structured_content"].get("status") == "ok"
+                    )
+                )
             )
             status = (
                 "success"

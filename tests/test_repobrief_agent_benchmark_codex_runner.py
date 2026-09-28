@@ -4192,6 +4192,37 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertEqual(calls[0]["status"], "success")
         self.assertEqual(normalized_answer, answer())
 
+    def test_normalize_accepts_codex_0158_repobrief_result_without_iserror(self) -> None:
+        value = request(condition="treatment")
+        events = [json.loads(line) for line in stream(value).splitlines()]
+        command_event = next(
+            event
+            for event in events
+            if event.get("type") == "item.completed"
+            and isinstance(event.get("item"), dict)
+            and event["item"].get("type") == "command_execution"
+        )
+        command_event["item"] = {
+            "type": "mcp_tool_call",
+            "server": "repobrief",
+            "tool": "ask_context",
+            "arguments": {"query": "finalizer"},
+            "result": {
+                "content": [{"type": "text", "text": "{\"status\":\"ok\"}"}],
+                "structured_content": {"status": "ok", "tool": "ask_context"},
+            },
+            "error": None,
+            "status": "completed",
+        }
+
+        _input_tokens, _output_tokens, calls, normalized_answer = runner.normalize(
+            value, events
+        )
+
+        self.assertEqual([call["name"] for call in calls], ["ask_context"])
+        self.assertEqual(calls[0]["status"], "success")
+        self.assertEqual(normalized_answer, answer())
+
     def test_normalize_requires_explicit_nonerror_treatment_result(self) -> None:
         cases = (
             {
@@ -4200,6 +4231,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "isError": True,
             },
             {},
+            {
+                "content": [{"type": "text", "text": "failed"}],
+                "structured_content": {"status": "error"},
+            },
             "malformed-result",
         )
         for result in cases:
