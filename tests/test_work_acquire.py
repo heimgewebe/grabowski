@@ -50,6 +50,13 @@ class WorkAcquireTests(unittest.TestCase):
         os.environ["GRABOWSKI_WORK_LANE_ROOT"] = str(self.state)
         self.previous_checkout_db = work_acquire.checkouts.CHECKOUT_DB
         work_acquire.checkouts.CHECKOUT_DB = self.state / "checkouts.sqlite3"
+        self.effective_toplevel_patcher = patch.object(
+            work_acquire.git_preimage,
+            "_require_effective_git_toplevel",
+            return_value=str(self.target),
+        )
+        self.effective_toplevel_patcher.start()
+        self.addCleanup(self.effective_toplevel_patcher.stop)
         self.addCleanup(self._restore_env)
 
     def _restore_env(self) -> None:
@@ -2393,6 +2400,118 @@ class WorkAcquireTests(unittest.TestCase):
 
         self.assertEqual(state["lifecycle_reads"], 2)
 
+    def test_continuation_rejects_effective_worktree_drift_after_untracked_capture(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        checkout_key = "a" * 64
+        prior = {
+            "state": "ready",
+            "worktree_receipt": {
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "lifecycle": {
+                    "checkout_key": checkout_key,
+                    "physical_checkout": PHYSICAL,
+                },
+            },
+        }
+        record = {
+            "checkout_key": checkout_key,
+            "branch": inputs["branch"],
+            "detached": False,
+        }
+        lifecycle = {
+            "checkout_key": checkout_key,
+            "physical_checkout": PHYSICAL,
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "source": lifecycle_source,
+            "artifact_class": inputs["artifact_class"],
+            "phase": "active",
+            "retention_until_unix": self.retention,
+            "expected_branch": inputs["branch"],
+            "expected_head": SHA,
+            "updated_at_unix": 123,
+        }
+
+        def runner(_cwd: Path, argv: list[str]) -> dict[str, object]:
+            if argv[0] == "status":
+                return {"returncode": 0, "stdout": "## feat/authority-p0\n"}
+            if argv[0] == "rev-parse":
+                return {"returncode": 0, "stdout": SHA + "\n"}
+            if argv[0] in ("diff-index", "diff-files"):
+                return {"returncode": 0, "stdout": ""}
+            if argv[0] == "ls-files":
+                return {"returncode": 0, "stdout": ""}
+            raise AssertionError(argv)
+
+        completed = __import__("subprocess").CompletedProcess([], 0, b"", b"")
+        with (
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                return_value=(
+                    self.repo,
+                    Path(PHYSICAL["common_dir"]["path"]),
+                    record,
+                ),
+            ),
+            patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.checkouts,
+                "_strict_lifecycle_binding",
+                return_value=lifecycle,
+            ),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                return_value=PHYSICAL["git_dir"],
+            ),
+            patch.object(
+                work_acquire.physical_checkout,
+                "verify_physical_checkout_identity",
+                return_value=PHYSICAL,
+            ),
+            patch.object(work_acquire.subprocess, "run", return_value=completed),
+            patch.object(
+                work_acquire.git_preimage,
+                "capture_branch_preimage",
+                return_value={
+                    "branch": inputs["branch"],
+                    "head": SHA,
+                    "operation_refs": {},
+                    "physical_checkout": PHYSICAL,
+                    "preimage_sha256": "c" * 64,
+                    "index_sha256": "d" * 64,
+                    "worktree_sha256": "e" * 64,
+                },
+            ),
+            patch.object(
+                work_acquire.git_preimage,
+                "capture_untracked_preimage",
+                return_value={
+                    "count": 0,
+                    "worktree_sha256": "1" * 64,
+                    "preimage_sha256": "2" * 64,
+                },
+            ),
+            patch.object(
+                work_acquire.git_preimage,
+                "_require_effective_git_toplevel",
+                side_effect=[None, RuntimeError("redirected")],
+            ) as top_level,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "effective Git worktree changed after untracked capture",
+            ),
+        ):
+            work_acquire._continuation_preimage(
+                prior, inputs, lifecycle_source, runner
+            )
+
+        self.assertEqual(top_level.call_count, 2)
+
     def test_continuation_lifecycle_guard_blocks_concurrent_checkout_db_writer(self) -> None:
         with work_acquire._continuation_lifecycle_guard(1.0):
             competitor = sqlite3.connect(
@@ -3032,6 +3151,7 @@ class WorkAcquireTests(unittest.TestCase):
         }
         continuation_preimage = {
             "checkout_key": lifecycle["checkout_key"],
+            "checkout_path": str(self.target),
             "lifecycle_sha256": work_acquire._sha(lifecycle),
             "lifecycle_retention_until_unix": self.retention,
         }
@@ -3061,6 +3181,51 @@ class WorkAcquireTests(unittest.TestCase):
                 continuation_preimage
             ):
                 self.fail("drifted lifecycle must not authorize continuation")
+
+    def test_continuation_authorization_guard_rejects_effective_worktree_drift(self) -> None:
+        lifecycle = {
+            "checkout_key": "a" * 64,
+            "owner_id": "lane:" + "a" * 32,
+            "retention_until_unix": self.retention,
+        }
+        continuation_preimage = {
+            "checkout_key": lifecycle["checkout_key"],
+            "checkout_path": str(self.target),
+            "lifecycle_sha256": work_acquire._sha(lifecycle),
+            "lifecycle_retention_until_unix": self.retention,
+        }
+
+        @contextmanager
+        def lifecycle_guard(_timeout_seconds: float):
+            yield
+
+        with (
+            patch.object(
+                work_acquire,
+                "_continuation_lifecycle_guard",
+                lifecycle_guard,
+            ),
+            patch.object(
+                work_acquire.checkouts,
+                "_strict_lifecycle_binding",
+                return_value=lifecycle,
+            ),
+            patch.object(
+                work_acquire.git_preimage,
+                "_require_effective_git_toplevel",
+                side_effect=RuntimeError("redirected"),
+            ) as top_level,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "effective Git worktree changed before authorization",
+            ),
+        ):
+            with work_acquire._continuation_authorization_guard(
+                continuation_preimage
+            ):
+                self.fail("redirected Git worktree must not authorize continuation")
+
+        top_level.assert_called_once()
 
     def test_continuation_writer_authorization_is_persisted_under_guard(self) -> None:
         params = self.parameters()

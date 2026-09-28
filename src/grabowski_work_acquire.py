@@ -2183,18 +2183,22 @@ def _continuation_authorization_guard(
     *,
     timeout_seconds: float = 10.0,
 ) -> Iterator[None]:
-    """Revalidate lifecycle authority while the first continuation effect is persisted."""
+    """Revalidate lifecycle and effective Git worktree through authorization."""
 
     if continuation_preimage is None:
         yield
         return
     checkout_key = continuation_preimage.get("checkout_key")
+    checkout_path = continuation_preimage.get("checkout_path")
     expected_lifecycle_sha256 = continuation_preimage.get("lifecycle_sha256")
     expected_retention_until_unix = continuation_preimage.get(
         "lifecycle_retention_until_unix"
     )
     if (
         not isinstance(checkout_key, str)
+        or not isinstance(checkout_path, str)
+        or not checkout_path
+        or not Path(checkout_path).is_absolute()
         or not isinstance(expected_lifecycle_sha256, str)
         or re.fullmatch(r"[0-9a-f]{64}", expected_lifecycle_sha256) is None
         or isinstance(expected_retention_until_unix, bool)
@@ -2203,7 +2207,38 @@ def _continuation_authorization_guard(
         raise RuntimeError(
             "managed worktree continuation authorization evidence is invalid"
         )
-    with _continuation_lifecycle_guard(timeout_seconds):
+    authorization_deadline = time.monotonic() + timeout_seconds
+
+    def remaining_authorization_seconds() -> float:
+        remaining = authorization_deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                "managed worktree continuation authorization deadline exceeded"
+            )
+        return remaining
+
+    def authorization_probe(
+        cwd: Path, argv: list[str]
+    ) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            [
+                "git",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false",
+                *argv,
+            ],
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=remaining_authorization_seconds(),
+            env=operator._git_environment(),
+        )
+
+    with _continuation_lifecycle_guard(remaining_authorization_seconds()):
         lifecycle = checkouts._strict_lifecycle_binding(checkout_key)
         if (
             not isinstance(lifecycle, dict)
@@ -2220,6 +2255,16 @@ def _continuation_authorization_guard(
             raise RuntimeError(
                 "managed worktree continuation lifecycle retention expired before authorization"
             )
+        try:
+            git_preimage._require_effective_git_toplevel(
+                Path(checkout_path),
+                authorization_probe,
+                deadline_monotonic=authorization_deadline,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "managed worktree continuation effective Git worktree changed before authorization"
+            ) from exc
         yield
 
 
@@ -2489,6 +2534,16 @@ def _continuation_preimage(
         except Exception as exc:
             raise RuntimeError(
                 "managed worktree continuation untracked preimage capture failed"
+            ) from exc
+        try:
+            git_preimage._require_effective_git_toplevel(
+                target,
+                raw_probe,
+                deadline_monotonic=snapshot_deadline,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "managed worktree continuation effective Git worktree changed after untracked capture"
             ) from exc
         remaining_snapshot_seconds()
         try:
