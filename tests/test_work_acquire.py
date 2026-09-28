@@ -3154,6 +3154,12 @@ class WorkAcquireTests(unittest.TestCase):
             "checkout_path": str(self.target),
             "lifecycle_sha256": work_acquire._sha(lifecycle),
             "lifecycle_retention_until_unix": self.retention,
+            "branch_preimage_sha256": "1" * 64,
+            "index_sha256": "2" * 64,
+            "tracked_worktree_sha256": "3" * 64,
+            "untracked_preimage_sha256": "4" * 64,
+            "untracked_worktree_sha256": "5" * 64,
+            "untracked_count": 0,
         }
         drifted = {**lifecycle, "owner_id": "lane:" + "b" * 32}
 
@@ -3193,6 +3199,12 @@ class WorkAcquireTests(unittest.TestCase):
             "checkout_path": str(self.target),
             "lifecycle_sha256": work_acquire._sha(lifecycle),
             "lifecycle_retention_until_unix": self.retention,
+            "branch_preimage_sha256": "1" * 64,
+            "index_sha256": "2" * 64,
+            "tracked_worktree_sha256": "3" * 64,
+            "untracked_preimage_sha256": "4" * 64,
+            "untracked_worktree_sha256": "5" * 64,
+            "untracked_count": 0,
         }
 
         @contextmanager
@@ -3226,6 +3238,73 @@ class WorkAcquireTests(unittest.TestCase):
                 self.fail("redirected Git worktree must not authorize continuation")
 
         top_level.assert_called_once()
+
+    def test_continuation_authorization_guard_rejects_full_git_state_drift(self) -> None:
+        lifecycle = {
+            "checkout_key": "a" * 64,
+            "owner_id": "lane:" + "a" * 32,
+            "retention_until_unix": self.retention,
+        }
+        continuation_preimage = {
+            "checkout_key": lifecycle["checkout_key"],
+            "checkout_path": str(self.target),
+            "lifecycle_sha256": work_acquire._sha(lifecycle),
+            "lifecycle_retention_until_unix": self.retention,
+            "branch_preimage_sha256": "1" * 64,
+            "index_sha256": "2" * 64,
+            "tracked_worktree_sha256": "3" * 64,
+            "untracked_preimage_sha256": "4" * 64,
+            "untracked_worktree_sha256": "5" * 64,
+            "untracked_count": 0,
+        }
+
+        @contextmanager
+        def lifecycle_guard(_timeout_seconds: float):
+            yield
+
+        with (
+            patch.object(
+                work_acquire,
+                "_continuation_lifecycle_guard",
+                lifecycle_guard,
+            ),
+            patch.object(
+                work_acquire.checkouts,
+                "_strict_lifecycle_binding",
+                return_value=lifecycle,
+            ),
+            patch.object(
+                work_acquire.git_preimage,
+                "_require_effective_git_toplevel",
+                return_value=str(self.target),
+            ),
+            patch.object(
+                work_acquire.git_preimage,
+                "capture_branch_preimage",
+                return_value={
+                    "preimage_sha256": "9" * 64,
+                    "index_sha256": "2" * 64,
+                    "worktree_sha256": "3" * 64,
+                },
+            ),
+            patch.object(
+                work_acquire.git_preimage,
+                "capture_untracked_preimage",
+                return_value={
+                    "preimage_sha256": "4" * 64,
+                    "worktree_sha256": "5" * 64,
+                    "count": 0,
+                },
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "Git state changed before authorization",
+            ),
+        ):
+            with work_acquire._continuation_authorization_guard(
+                continuation_preimage
+            ):
+                self.fail("stale continuation preimage must not authorize continuation")
 
     def test_continuation_writer_authorization_is_persisted_under_guard(self) -> None:
         params = self.parameters()

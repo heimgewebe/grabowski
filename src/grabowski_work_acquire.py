@@ -2194,6 +2194,27 @@ def _continuation_authorization_guard(
     expected_retention_until_unix = continuation_preimage.get(
         "lifecycle_retention_until_unix"
     )
+    expected_branch_preimage_sha256 = continuation_preimage.get(
+        "branch_preimage_sha256"
+    )
+    expected_index_sha256 = continuation_preimage.get("index_sha256")
+    expected_tracked_worktree_sha256 = continuation_preimage.get(
+        "tracked_worktree_sha256"
+    )
+    expected_untracked_preimage_sha256 = continuation_preimage.get(
+        "untracked_preimage_sha256"
+    )
+    expected_untracked_worktree_sha256 = continuation_preimage.get(
+        "untracked_worktree_sha256"
+    )
+    expected_untracked_count = continuation_preimage.get("untracked_count")
+    expected_hashes = (
+        expected_branch_preimage_sha256,
+        expected_index_sha256,
+        expected_tracked_worktree_sha256,
+        expected_untracked_preimage_sha256,
+        expected_untracked_worktree_sha256,
+    )
     if (
         not isinstance(checkout_key, str)
         or not isinstance(checkout_path, str)
@@ -2201,6 +2222,14 @@ def _continuation_authorization_guard(
         or not Path(checkout_path).is_absolute()
         or not isinstance(expected_lifecycle_sha256, str)
         or re.fullmatch(r"[0-9a-f]{64}", expected_lifecycle_sha256) is None
+        or any(
+            not isinstance(value, str)
+            or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for value in expected_hashes
+        )
+        or isinstance(expected_untracked_count, bool)
+        or not isinstance(expected_untracked_count, int)
+        or expected_untracked_count < 0
         or isinstance(expected_retention_until_unix, bool)
         or not isinstance(expected_retention_until_unix, int)
     ):
@@ -2238,6 +2267,28 @@ def _continuation_authorization_guard(
             env=operator._git_environment(),
         )
 
+    def authorization_index_probe(
+        cwd: Path, argv: list[str]
+    ) -> subprocess.CompletedProcess[bytes]:
+        return _bounded_raw_nul_git_probe(
+            cwd,
+            argv,
+            max_records=100_000,
+            max_stdout_bytes=32 * 1024 * 1024,
+            timeout_seconds=remaining_authorization_seconds(),
+        )
+
+    def authorization_untracked_probe(
+        cwd: Path, argv: list[str]
+    ) -> subprocess.CompletedProcess[bytes]:
+        return _bounded_raw_nul_git_probe(
+            cwd,
+            argv,
+            max_records=100,
+            max_stdout_bytes=512 * 1024,
+            timeout_seconds=remaining_authorization_seconds(),
+        )
+
     with _continuation_lifecycle_guard(remaining_authorization_seconds()):
         lifecycle = checkouts._strict_lifecycle_binding(checkout_key)
         if (
@@ -2255,9 +2306,10 @@ def _continuation_authorization_guard(
             raise RuntimeError(
                 "managed worktree continuation lifecycle retention expired before authorization"
             )
+        checkout = Path(checkout_path)
         try:
             git_preimage._require_effective_git_toplevel(
-                Path(checkout_path),
+                checkout,
                 authorization_probe,
                 deadline_monotonic=authorization_deadline,
             )
@@ -2265,6 +2317,48 @@ def _continuation_authorization_guard(
             raise RuntimeError(
                 "managed worktree continuation effective Git worktree changed before authorization"
             ) from exc
+        try:
+            current_branch_preimage = git_preimage.capture_branch_preimage(
+                checkout,
+                authorization_probe,
+                require_attached=True,
+                index_probe=authorization_index_probe,
+                max_tracked_paths=25_000,
+                max_tracked_bytes=1024 * 1024 * 1024,
+                deadline_monotonic=authorization_deadline,
+                reject_gitlinks=True,
+            )
+            current_untracked_preimage = git_preimage.capture_untracked_preimage(
+                checkout,
+                authorization_untracked_probe,
+                max_paths=100,
+                max_total_bytes=256 * 1024 * 1024,
+                deadline_monotonic=authorization_deadline,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "managed worktree continuation Git state could not be revalidated before authorization"
+            ) from exc
+        current_git_state = (
+            current_branch_preimage.get("preimage_sha256"),
+            current_branch_preimage.get("index_sha256"),
+            current_branch_preimage.get("worktree_sha256"),
+            current_untracked_preimage.get("preimage_sha256"),
+            current_untracked_preimage.get("worktree_sha256"),
+            current_untracked_preimage.get("count"),
+        )
+        expected_git_state = (
+            expected_branch_preimage_sha256,
+            expected_index_sha256,
+            expected_tracked_worktree_sha256,
+            expected_untracked_preimage_sha256,
+            expected_untracked_worktree_sha256,
+            expected_untracked_count,
+        )
+        if current_git_state != expected_git_state:
+            raise RuntimeError(
+                "managed worktree continuation Git state changed before authorization"
+            )
         yield
 
 
