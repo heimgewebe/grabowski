@@ -2691,7 +2691,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             sibling = root / "sibling.bundle.manifest.json"
             sibling.write_text("{}\n", encoding="utf-8")
             authorized = [file_identity(executable), file_identity(script)]
-            argv, bindings = runner._bind_mcp_upstream(
+            argv, bindings, _manifest_authorization = runner._bind_mcp_upstream(
                 [str(executable), str(script), "--bundle-root", str(root)],
                 manifest,
                 authorized,
@@ -2730,21 +2730,31 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             )
             manifest = root / "chosen.bundle.manifest.json"
             manifest.write_text("{}\n", encoding="utf-8")
-            authorized = [file_identity(executable), file_identity(script)]
+            authorized_manifest = manifest.read_bytes()
+            authorized = [
+                file_identity(executable),
+                file_identity(script),
+                file_identity(manifest),
+            ]
 
             staged = runner.stage_mcp_upstream(
                 state_root,
-                [str(executable), str(script), "--bundle-root", str(root)],
+                [str(executable), str(script), "--bundle-root", str(manifest)],
                 manifest,
                 authorized,
             )
             runtime_dir = Path(staged["runtime_dir"])
-            for file_binding in staged["bindings"]:
+            for file_binding in [*staged["bindings"], staged["manifest_binding"]]:
                 Path(file_binding["path"]).relative_to(runtime_dir)
             self.assertEqual(
                 stat.S_IMODE(Path(staged["bindings"][0]["path"]).stat().st_mode),
                 0o700,
             )
+            staged_manifest = Path(staged["manifest_binding"]["path"])
+            self.assertNotEqual(staged_manifest, manifest)
+            self.assertEqual(staged_manifest.read_bytes(), authorized_manifest)
+            bundle_index = staged["argv"].index("--bundle-root")
+            self.assertEqual(staged["argv"][bundle_index + 1], str(staged_manifest))
 
             executable.write_text("#!/bin/sh\nexit 97\n", encoding="utf-8")
             executable.chmod(0o755)
@@ -2752,13 +2762,61 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 f"open({str(marker_path)!r}, 'w', encoding='utf-8').write('replaced')\n",
                 encoding="utf-8",
             )
+            manifest.write_text('{"drifted": true}\n', encoding="utf-8")
             completed = subprocess.run(
                 staged["argv"], capture_output=True, check=False, timeout=5
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(marker_path.read_text(encoding="utf-8"), "authorized")
+            self.assertEqual(staged_manifest.read_bytes(), authorized_manifest)
             self.assertIsNone(runner.cleanup_staged_mcp_upstream(staged))
             self.assertFalse(runtime_dir.exists())
+
+    def test_mcp_manifest_drift_after_authorization_fails_before_private_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "state"
+            state_root.mkdir(mode=0o700)
+            executable = root / "python3"
+            executable.write_bytes(Path(sys.executable).resolve().read_bytes())
+            executable.chmod(0o755)
+            script = root / "server.py"
+            script.write_text("pass\n", encoding="utf-8")
+            manifest = root / "chosen.bundle.manifest.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+            upstream = [
+                str(executable),
+                str(script),
+                "--bundle-root",
+                str(manifest),
+            ]
+            authorized = [
+                file_identity(executable),
+                file_identity(script),
+                file_identity(manifest),
+            ]
+            original_bind = runner._bind_mcp_upstream
+
+            def bind_then_drift(*args, **kwargs):
+                result = original_bind(*args, **kwargs)
+                manifest.write_text('{"drifted": true}\n', encoding="utf-8")
+                return result
+
+            with patch.object(
+                runner,
+                "_bind_mcp_upstream",
+                side_effect=bind_then_drift,
+            ):
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "bundle manifest changed before private staging",
+                ):
+                    runner.stage_mcp_upstream(
+                        state_root,
+                        upstream,
+                        manifest,
+                        authorized,
+                    )
 
     def test_staged_repoground_mcp_upstream_binds_generator_source_tree(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3037,6 +3095,53 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 ),
                 "",
             )
+
+            untracked_source = source / "merger" / "untracked.py"
+            untracked_source.write_text("untracked\n", encoding="utf-8")
+            try:
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "source checkout is dirty",
+                ):
+                    runner.stage_mcp_upstream(
+                        state_root,
+                        upstream,
+                        manifest,
+                        authorized,
+                    )
+            finally:
+                untracked_source.unlink()
+
+            unsafe_link = source / "merger" / "unsafe-link.py"
+            unsafe_link.symlink_to("repoground/cli/mcp_stdio.py")
+            git(["add", str(unsafe_link.relative_to(source))], source)
+            git(["commit", "-m", "unsafe link fixture"], source)
+            unsafe_commit = git(["rev-parse", "HEAD"], source)
+            write_manifest(unsafe_commit)
+            unsafe_authorized = [
+                file_identity(executable),
+                file_identity(script),
+                file_identity(manifest),
+            ]
+            try:
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "generator tree entry is unsafe",
+                ):
+                    runner.stage_mcp_upstream(
+                        state_root,
+                        upstream,
+                        manifest,
+                        unsafe_authorized,
+                    )
+            finally:
+                git(["reset", "--hard", commit], source)
+                write_manifest(commit)
+                authorized = [
+                    file_identity(executable),
+                    file_identity(script),
+                    file_identity(manifest),
+                ]
 
             original_source_read = runner._read_bound_regular_file
 
@@ -3360,7 +3465,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             manifest.write_text("{}\n", encoding="utf-8")
 
             authorized = [file_identity(executable), file_identity(script)]
-            argv, bindings = runner._bind_mcp_upstream(
+            argv, bindings, _manifest_authorization = runner._bind_mcp_upstream(
                 [str(alias), str(script), "--bundle-root", str(root)],
                 manifest,
                 authorized,
@@ -3396,7 +3501,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             state_root = write_dispatch_authorization(root, value, authorized)
             loaded = runner._load_preflight_mcp_authorization(value, state_root)
             self.assertEqual(loaded, authorized)
-            argv, _bindings = runner._bind_mcp_upstream(
+            argv, _bindings, _manifest_authorization = runner._bind_mcp_upstream(
                 value["repobrief"]["mcp_command"], manifest, loaded
             )
             self.assertEqual(argv[0], str(executable.resolve()))
@@ -3914,8 +4019,21 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 runner.canonical(responses[2]["result"]["structuredContent"]),
             )
             self.assertNotEqual(responses[2]["result"]["content"][0]["text"], "ok")
+            logical_manifest = root / "bound.bundle.manifest.json"
+            self.assertEqual(
+                responses[2]["result"]["structuredContent"]["live_freshness"][
+                    "bundle_manifest"
+                ],
+                str(logical_manifest),
+            )
             arguments = json.loads(seen.read_text(encoding="utf-8"))
-            self.assertEqual(arguments["bundle_manifest"], str(root / "bound.bundle.manifest.json"))
+            staged_manifest = Path(arguments["bundle_manifest"])
+            self.assertNotEqual(staged_manifest, logical_manifest)
+            self.assertEqual(staged_manifest.name, logical_manifest.name)
+            self.assertIn(
+                root / "proxy-runtime" / "repoground-mcp-upstream-runtime",
+                staged_manifest.parents,
+            )
             self.assertIsNone(arguments["repo"])
             self.assertIsNone(arguments["stem"])
 
@@ -4889,7 +5007,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             manifest.write_text("{}\n", encoding="utf-8")
             authorized = [file_identity(executable), file_identity(script)]
             with patch.object(runner.Path, "cwd", side_effect=AssertionError("runtime cwd must not resolve an authorized relative script")):
-                argv, bindings = runner._bind_mcp_upstream(
+                argv, bindings, _manifest_authorization = runner._bind_mcp_upstream(
                     [str(executable), "server.py", "--bundle-root", str(root)],
                     manifest,
                     authorized,

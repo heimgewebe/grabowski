@@ -1416,7 +1416,11 @@ def _validated_treatment_structured_payload(
 
 
 def _validated_treatment_tool_result(
-    value: Any, *, tool_name: str, expected_manifest: Path
+    value: Any,
+    *,
+    tool_name: str,
+    expected_manifest: Path,
+    external_manifest: Path | None = None,
 ) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != {"content", "structuredContent", "isError"}:
         raise RunnerError("RepoGround treatment tool result is malformed")
@@ -1441,6 +1445,15 @@ def _validated_treatment_tool_result(
         expected_manifest=expected_manifest,
         is_error=is_error,
     )
+    if not is_error and external_manifest is not None:
+        freshness = (
+            structured
+            if tool_name == "live_freshness"
+            else structured.get("live_freshness")
+        )
+        if not isinstance(freshness, dict):
+            raise RunnerError("RepoGround treatment tool freshness binding is missing")
+        freshness["bundle_manifest"] = str(external_manifest)
     return {
         "content": [{"type": "text", "text": canonical(structured)}],
         "structuredContent": structured,
@@ -3334,13 +3347,10 @@ def _git_index_differs_from_commit(
 
 
 def _repoground_source_tree_snapshot(
-    script: Path, manifest: Path
+    script: Path, manifest_raw: bytes
 ) -> dict[str, Any] | None:
     if script.name != "repoground-mcp-stdio.py":
         return None
-    manifest_raw = _read_bound_regular_file(
-        manifest, label="RepoGround manifest", max_bytes=MAX_MANIFEST_BYTES
-    )
     document = base._load_object_bytes(manifest_raw, label="RepoGround manifest")
     generator = document.get("generator")
     runtime = generator.get("runtime") if isinstance(generator, dict) else None
@@ -3570,7 +3580,7 @@ def _bind_mcp_upstream(
     upstream: Sequence[str],
     manifest: Path,
     authorized_files: Sequence[Mapping[str, Any]],
-) -> tuple[list[str], list[dict[str, Any]]]:
+) -> tuple[list[str], list[dict[str, Any]], dict[str, Any] | None]:
     executable = Path(upstream[0])
     if not executable.is_absolute():
         resolved = shutil.which(upstream[0], path=provider_env().get("PATH"))
@@ -3612,6 +3622,7 @@ def _bind_mcp_upstream(
     if index + 1 >= len(argv) or argv.count("--bundle-root") != 1:
         raise RunnerError("MCP upstream bundle root is invalid")
     current = [_mcp_authorization_identity(binding) for binding in bindings]
+    manifest_authorization: dict[str, Any] | None = None
     if canonical(current) != canonical(expected):
         program_expected = expected[: len(current)]
         manifest_expected = expected[len(current) :]
@@ -3622,22 +3633,20 @@ def _bind_mcp_upstream(
             or manifest_expected[0]["path"] != str(bundle_source)
         ):
             raise RunnerError("MCP program does not match preflight-authorized file identities")
-        staged_manifest = _mcp_authorization_identity(
+        current_manifest = _mcp_authorization_identity(
             _bind_mcp_file(
                 manifest,
                 label="staged MCP bundle manifest",
                 executable=False,
             )
         )
-        if (
-            staged_manifest["bytes"] != manifest_expected[0]["bytes"]
-            or staged_manifest["sha256"] != manifest_expected[0]["sha256"]
-        ):
+        if canonical(current_manifest) != canonical(manifest_expected[0]):
             raise RunnerError(
                 "MCP bundle manifest does not match preflight-authorized file identity"
             )
+        manifest_authorization = dict(current_manifest)
     argv[index + 1] = str(manifest)
-    return argv, bindings
+    return argv, bindings, manifest_authorization
 
 
 def stage_mcp_upstream(
@@ -3646,11 +3655,23 @@ def stage_mcp_upstream(
     manifest: Path,
     authorized_files: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    bound_argv, source_bindings = _bind_mcp_upstream(
+    bound_argv, source_bindings, manifest_authorization = _bind_mcp_upstream(
         upstream, manifest, authorized_files
     )
+    manifest_snapshot, manifest_raw = _runtime_file_snapshot(
+        manifest,
+        label="RepoGround manifest",
+        max_bytes=MAX_MANIFEST_BYTES,
+    )
+    if (
+        manifest_authorization is not None
+        and canonical(manifest_snapshot) != canonical(manifest_authorization)
+    ):
+        raise RunnerError("MCP bundle manifest changed before private staging")
     source_tree = (
-        _repoground_source_tree_snapshot(Path(source_bindings[1]["path"]), manifest)
+        _repoground_source_tree_snapshot(
+            Path(source_bindings[1]["path"]), manifest_raw
+        )
         if len(source_bindings) > 1
         else None
     )
@@ -3695,6 +3716,26 @@ def stage_mcp_upstream(
             staged_bindings.append(staged)
             staged_argv[index] = str(staged_path)
 
+        manifest_relative = Path("manifest") / Path(
+            str(manifest_snapshot["path"])
+        ).name
+        _write_private_relative_file(
+            stage_fd,
+            manifest_relative,
+            manifest_raw,
+            mode=0o600,
+        )
+        staged_manifest_path = stage_root / manifest_relative
+        staged_manifest_binding = _bind_mcp_file(
+            staged_manifest_path,
+            label="staged MCP bundle manifest",
+            executable=False,
+        )
+        if staged_manifest_binding["sha256"] != manifest_snapshot["sha256"]:
+            raise RunnerError("staged MCP bundle manifest SHA mismatch")
+        bundle_index = staged_argv.index("--bundle-root")
+        staged_argv[bundle_index + 1] = str(staged_manifest_path)
+
         source_tree_bindings: list[dict[str, Any]] = []
         if source_tree is not None:
             for entry in source_tree["entries"]:
@@ -3717,6 +3758,7 @@ def stage_mcp_upstream(
         return {
             "argv": staged_argv,
             "bindings": staged_bindings,
+            "manifest_binding": staged_manifest_binding,
             "source_tree": (
                 None
                 if source_tree is None
@@ -3745,12 +3787,15 @@ def stage_mcp_upstream(
         if stage_fd is not None:
             os.close(stage_fd)
 
+
 def _revalidate_staged_mcp_upstream(binding: Mapping[str, Any]) -> None:
     bindings = binding.get("bindings")
+    manifest_binding = binding.get("manifest_binding")
     source_tree_bindings = binding.get("source_tree_bindings")
     if (
         not isinstance(bindings, list)
         or not bindings
+        or not isinstance(manifest_binding, Mapping)
         or not isinstance(source_tree_bindings, list)
     ):
         raise RunnerError("staged MCP upstream binding is invalid")
@@ -3766,6 +3811,16 @@ def _revalidate_staged_mcp_upstream(binding: Mapping[str, Any]) -> None:
             or current["sha256"] != file_binding["sha256"]
         ):
             raise RunnerError(f"staged {label} changed during execution")
+    current_manifest = _bind_mcp_file(
+        Path(manifest_binding["path"]),
+        label="staged MCP bundle manifest",
+        executable=False,
+    )
+    if (
+        current_manifest["identity"] != manifest_binding["identity"]
+        or current_manifest["sha256"] != manifest_binding["sha256"]
+    ):
+        raise RunnerError("staged MCP bundle manifest changed during execution")
     for file_binding in source_tree_bindings:
         current = _bind_mcp_file(
             Path(file_binding["path"]),
@@ -3778,7 +3833,7 @@ def _revalidate_staged_mcp_upstream(binding: Mapping[str, Any]) -> None:
         ):
             raise RunnerError("staged RepoGround MCP source changed during execution")
     _revalidate_private_stage_tree(
-        binding, [*bindings, *source_tree_bindings]
+        binding, [*bindings, manifest_binding, *source_tree_bindings]
     )
 
 
@@ -3788,6 +3843,7 @@ def cleanup_staged_mcp_upstream(binding: Mapping[str, Any]) -> str | None:
         runtime_dir = Path(binding["runtime_dir"])
         for file_binding in [
             *binding["bindings"],
+            binding["manifest_binding"],
             *binding["source_tree_bindings"],
         ]:
             Path(file_binding["path"]).relative_to(runtime_dir)
@@ -3795,6 +3851,7 @@ def cleanup_staged_mcp_upstream(binding: Mapping[str, Any]) -> str | None:
     except BaseException as exc:
         return type(exc).__name__
     return None
+
 
 def _pin_treatment_arguments(message: dict[str, Any], manifest: Path) -> None:
     params = message.get("params")
@@ -3837,6 +3894,7 @@ def run_mcp_proxy(
         Path(runtime_root_text), upstream, manifest, authorized_files
     )
     bound_upstream = [str(item) for item in upstream_stage["argv"]]
+    staged_manifest = Path(upstream_stage["manifest_binding"]["path"])
     process: subprocess.Popen[bytes] | None = None
     try:
         try:
@@ -4021,7 +4079,7 @@ def run_mcp_proxy(
                             if identifier is not None:
                                 _proxy_write(_proxy_error(identifier, "benchmark MCP tool is not authorized"), output_lock)
                             continue
-                        _pin_treatment_arguments(message, manifest)
+                        _pin_treatment_arguments(message, staged_manifest)
                         pending_kind = "tools/call"
                         pending_treatment_tool = str(name)
                     elif identifier is not None:
@@ -4164,7 +4222,8 @@ def run_mcp_proxy(
                     message["result"] = _validated_treatment_tool_result(
                         message["result"],
                         tool_name=treatment_tool,
-                        expected_manifest=manifest,
+                        expected_manifest=staged_manifest,
+                        external_manifest=manifest,
                     )
                 pending_requests.pop(identifier, None)
                 pending_treatment_tools.pop(identifier, None)
