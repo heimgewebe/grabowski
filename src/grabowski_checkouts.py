@@ -2719,6 +2719,31 @@ def _archive_partial_completion_assessment(
             "reason": "archive-retention-preimage-mismatch",
             "verified_recovery_refs": verified_refs,
         }
+    expected_followup_authority = evidence.get(
+        "blocked_followup_archive_evidence"
+    )
+    try:
+        current_followup_authority = (
+            _require_completed_work_lane_archive_authority(
+                lifecycle,
+                str(evidence["checkout_key"]),
+            )
+        )
+    except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+        return {
+            "state": "foreign_or_ambiguous",
+            "reason": (
+                "archive-blocked-followup-authority-unavailable:"
+                + type(exc).__name__
+            ),
+            "verified_recovery_refs": verified_refs,
+        }
+    if current_followup_authority != expected_followup_authority:
+        return {
+            "state": "foreign_or_ambiguous",
+            "reason": "archive-blocked-followup-authority-drift",
+            "verified_recovery_refs": verified_refs,
+        }
     coordination = _linked_checkout_coordination(
         checkout,
         top_level,
@@ -2760,6 +2785,11 @@ def _archive_partial_completion_assessment(
         "retention_preimage_sha256": (
             None if retention_preimage is None else _sha256_json(retention_preimage)
         ),
+        "blocked_followup_archive_evidence_sha256": (
+            None
+            if current_followup_authority is None
+            else current_followup_authority.get("authority_sha256")
+        ),
     }
     return {
         **core,
@@ -2771,6 +2801,7 @@ def _archive_partial_completion_assessment(
         "metadata_binding": manifest_info["metadata_binding"],
         "lifecycle_preimage": lifecycle_preimage,
         "retention_preimage": retention_preimage,
+        "blocked_followup_archive_evidence": current_followup_authority,
     }
 
 
@@ -2843,6 +2874,20 @@ def _complete_partial_archive(
                 if retention_now != assessment["retention_preimage"]:
                     raise RuntimeError(
                         "Archive retention state changed during atomic completion"
+                    )
+                current_followup_authority = (
+                    _require_completed_work_lane_archive_authority(
+                        lifecycle_now,
+                        checkout_key,
+                    )
+                )
+                if (
+                    current_followup_authority
+                    != assessment.get("blocked_followup_archive_evidence")
+                ):
+                    raise RuntimeError(
+                        "blocked durable followup archive authority changed "
+                        "during recovery commit"
                     )
                 retention_created = (
                     completed
@@ -5831,6 +5876,99 @@ def _terminal_detached_archive_transition(
     return {**core, "evidence_sha256": _sha256_json(core)}
 
 
+def _blocked_followup_archive_reconciliation_source(
+    lifecycle: dict[str, Any] | None,
+    checkout_key: str,
+) -> dict[str, Any] | None:
+    if (
+        not isinstance(lifecycle, dict)
+        or lifecycle.get("phase") != "completed_retained"
+    ):
+        return None
+    source = lifecycle.get("source")
+    if not isinstance(source, dict) or source.get("kind") != "work_lane":
+        return None
+
+    # The stronger archive authority is required only when completed_retained
+    # was reached through the blocked-followup present-capacity exception.
+    # That decision is already durably bound by terminal reconciliation; do
+    # not force ordinary Work Lane archives to reread historical lane state.
+    import grabowski_checkout_terminal_reconciliation as terminal_reconciliation
+
+    record = terminal_reconciliation._record(checkout_key)
+    if record is None:
+        return None
+    receipt = record.get("receipt")
+    persisted_source = record.get("source_evidence")
+    if not isinstance(receipt, dict) or not isinstance(persisted_source, dict):
+        raise RuntimeError("terminal reconciliation archive evidence is invalid")
+    if terminal_reconciliation._reconciliation_mode(receipt) != "present_retained":
+        return None
+    receipt_source = receipt.get("source_evidence")
+    if receipt_source != persisted_source:
+        raise RuntimeError("terminal reconciliation source evidence differs")
+    if receipt.get("checkout_key") != checkout_key:
+        raise RuntimeError("terminal reconciliation checkout binding differs")
+    if persisted_source.get("terminal_state") != "blocked_with_durable_followup":
+        return None
+    evidence_sha256 = persisted_source.get("evidence_sha256")
+    evidence_core = {
+        key: value
+        for key, value in persisted_source.items()
+        if key != "evidence_sha256"
+    }
+    if (
+        not isinstance(evidence_sha256, str)
+        or SHA256_RE.fullmatch(evidence_sha256) is None
+        or _sha256_json(evidence_core) != evidence_sha256
+        or persisted_source.get("kind") != "work_lane"
+        or persisted_source.get("source_id") != source.get("id")
+        or persisted_source.get("checkout_key") != checkout_key
+        or persisted_source.get("lease_release_ready") is not False
+    ):
+        raise RuntimeError(
+            "blocked durable followup reconciliation evidence is invalid"
+        )
+    return persisted_source
+
+
+def _require_completed_work_lane_archive_authority(
+    lifecycle: dict[str, Any] | None,
+    checkout_key: str,
+) -> dict[str, Any] | None:
+    persisted_source = _blocked_followup_archive_reconciliation_source(
+        lifecycle,
+        checkout_key,
+    )
+    if persisted_source is None:
+        return None
+
+    import grabowski_checkout_terminal_sources as terminal_sources
+
+    evidence = terminal_sources.source_terminal_evidence(lifecycle)
+    if evidence.get("terminal_state") != "blocked_with_durable_followup":
+        raise RuntimeError(
+            "blocked durable followup terminal evidence changed before checkout archive"
+        )
+    followup_authority = terminal_sources.blocked_followup_binding_authority(
+        evidence,
+        checkout_key,
+        require_terminal_task=True,
+    )
+    if followup_authority is None:
+        raise RuntimeError(
+            "blocked durable followup capacity release does not authorize checkout archive"
+        )
+    core = {
+        "source_evidence": evidence,
+        "followup_authority": followup_authority,
+    }
+    return {
+        **core,
+        "authority_sha256": _sha256_json(core),
+    }
+
+
 @mcp.tool(name="grabowski_checkout_archive", annotations=MUTATING)
 def grabowski_checkout_archive(
     repo: str,
@@ -5872,6 +6010,10 @@ def grabowski_checkout_archive(
     )
     if lifecycle_before is not None and lifecycle_before["owner_id"] != owner:
         raise PermissionError("Checkout lifecycle binding is owned by another owner")
+    blocked_followup_archive_evidence = _require_completed_work_lane_archive_authority(
+        lifecycle_before,
+        record["checkout_key"],
+    )
     lease_branch = record.get("branch")
     if lease_branch is None and lifecycle_before is not None:
         lease_branch = lifecycle_before.get("expected_branch")
@@ -5914,6 +6056,22 @@ def grabowski_checkout_archive(
         )
         if retention_now != retention_before:
             raise RuntimeError("Checkout retention changed during archive preflight")
+        blocked_followup_archive_evidence_after_lease = (
+            _require_completed_work_lane_archive_authority(
+                lifecycle,
+                record["checkout_key"],
+            )
+        )
+        if (
+            blocked_followup_archive_evidence_after_lease
+            != blocked_followup_archive_evidence
+        ):
+            raise RuntimeError(
+                "blocked durable followup archive authority changed during archive preflight"
+            )
+        blocked_followup_archive_evidence = (
+            blocked_followup_archive_evidence_after_lease
+        )
         terminal_detached_transition = None
         if lifecycle is not None:
             if lifecycle["expected_branch"] != record.get("branch"):
@@ -5957,6 +6115,7 @@ def grabowski_checkout_archive(
                 "archive_intent_validated_at_unix": archive_intent_validated_at_unix,
                 "lifecycle_preimage": lifecycle_before,
                 "retention_preimage": retention_before,
+                "blocked_followup_archive_evidence": blocked_followup_archive_evidence,
                 "planned_recovery_refs": planned_refs,
             },
         )
@@ -6038,6 +6197,34 @@ def grabowski_checkout_archive(
         created = _now()
         with _database() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            lifecycle_row = connection.execute(
+                "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
+                (record["checkout_key"],),
+            ).fetchone()
+            lifecycle_at_commit = (
+                None if lifecycle_row is None else _lifecycle_public(lifecycle_row)
+            )
+            if lifecycle_at_commit != lifecycle_before:
+                raise RuntimeError(
+                    "Checkout lifecycle binding changed at archive commit boundary"
+                )
+            blocked_followup_archive_evidence_at_commit = (
+                _require_completed_work_lane_archive_authority(
+                    lifecycle_at_commit,
+                    record["checkout_key"],
+                )
+            )
+            if (
+                blocked_followup_archive_evidence_at_commit
+                != blocked_followup_archive_evidence
+            ):
+                raise RuntimeError(
+                    "blocked durable followup archive authority changed "
+                    "at archive commit boundary"
+                )
+            blocked_followup_archive_evidence = (
+                blocked_followup_archive_evidence_at_commit
+            )
             retention = _upsert_retention_in_connection(
                 connection,
                 checkout_key=record["checkout_key"],
@@ -6101,6 +6288,7 @@ def grabowski_checkout_archive(
             "status": status,
             "coordination_checked": coordination["blocking_counts"],
             "terminal_detached_transition": terminal_detached_transition,
+            "blocked_followup_archive_evidence": blocked_followup_archive_evidence,
             "resource_keys": [
                 item["resource_key"] for item in lease["leases"]
             ],

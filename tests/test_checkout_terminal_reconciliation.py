@@ -1521,6 +1521,61 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
         self.assertFalse(preview["safe_to_apply"])
         self.assertIn("active-coordination", preview["blockers"])
 
+    def test_missing_blocked_followup_lane_applies_without_bureau_binding(self) -> None:
+        lane_id = "d" * 32
+        binding = self._missing_binding(
+            source_kind="work_lane",
+            source_id=lane_id,
+        )
+        checkout_key = str(binding["checkout_key"])
+        core = {
+            "schema_version": 1,
+            "kind": "work_lane",
+            "source_id": lane_id,
+            "terminal_state": "blocked_with_durable_followup",
+            "checkout_key": checkout_key,
+            "reason_codes": ["durable_followup_bound"],
+            "lane_receipt_sha256": "1" * 64,
+            "assessment_sha256": "2" * 64,
+            "terminal_head_sha": self.head,
+            "lease_release_ready": False,
+            "terminal_closeout_audit_record_sha256": "3" * 64,
+        }
+        evidence = {
+            **core,
+            "evidence_sha256": checkouts._sha256_json(core),
+        }
+        with (
+            patch.object(
+                sources,
+                "source_terminal_evidence",
+                return_value=evidence,
+            ),
+            patch.object(
+                sources,
+                "blocked_followup_binding_authority",
+                side_effect=AssertionError(
+                    "missing checkout must not resolve present-capacity authority"
+                ),
+            ) as capacity_authority,
+        ):
+            preview = reconciliation.preview(checkout_key)
+            self.assertTrue(preview["safe_to_apply"])
+            self.assertEqual("missing", preview["checkout_observation"]["mode"])
+            result = reconciliation.apply(
+                checkout_key,
+                "owner-a",
+                str(preview["preview_sha256"]),
+                int(preview["preview_created_at_unix"]),
+                reconciliation.CONFIRMATION,
+            )
+
+        self.assertEqual("applied", result["status"])
+        after = checkouts._lifecycle_bindings([checkout_key])[checkout_key]
+        self.assertEqual("externally_terminal_missing", after["phase"])
+        self.assertNotIn("blocked_followup_capacity_authority", preview)
+        capacity_authority.assert_not_called()
+
     def test_external_terminal_phase_never_becomes_cleanup_candidate(self) -> None:
         binding = self._missing_binding()
         preview = self._preview(binding)
