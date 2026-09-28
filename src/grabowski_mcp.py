@@ -106,7 +106,7 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "typed-operation-preference",
-        "Prefer typed operations to generic terminal/Git/GitHub; file-range reads use grabowski_read_text, never terminal_run/sed.",
+        "Typed operations first; ranges: grabowski_read_text, not terminal_run/sed; Git/GitHub last.",
     ),
     (
         "github-connector-first",

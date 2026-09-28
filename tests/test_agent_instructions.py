@@ -157,7 +157,7 @@ class AgentInstructionsTests(unittest.TestCase):
             "terminal",
             "git",
             "github",
-            "file-range reads",
+            "ranges",
             "grabowski_read_text",
             "terminal_run/sed",
         ):
