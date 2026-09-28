@@ -202,6 +202,7 @@ class CheckoutLifecycleTests(unittest.TestCase):
         source_kind: str = "bureau_task",
         source_id: str = "GRABOWSKI-OPERATOR-SURFACE-V1-T095",
         completed_retained: bool = False,
+        blocked_followup_reconciliation: bool = False,
     ) -> dict[str, object]:
         archive_head = self.head
         if managed:
@@ -217,6 +218,12 @@ class CheckoutLifecycleTests(unittest.TestCase):
                     expected_head=self.head,
                     expected_branch="topic",
                 )
+                if blocked_followup_reconciliation:
+                    self._record_terminal_reconciliation(
+                        managed_binding,
+                        terminal_state="blocked_with_durable_followup",
+                        lease_release_ready=False,
+                    )
             if advance_managed_checkout:
                 self._git(
                     "commit",
@@ -394,6 +401,84 @@ class CheckoutLifecycleTests(unittest.TestCase):
             expected_branch="topic",
         )
         return binding
+
+    def _record_terminal_reconciliation(
+        self,
+        binding: dict[str, object],
+        *,
+        terminal_state: str,
+        lease_release_ready: bool,
+    ) -> dict[str, object]:
+        checkout_key = str(binding["checkout_key"])
+        lifecycle = checkouts._strict_lifecycle_binding(checkout_key)
+        self.assertIsNotNone(lifecycle)
+        assert lifecycle is not None
+        retention = checkouts._retention_records([checkout_key])[checkout_key]
+        source = lifecycle["source"]
+        self.assertIsInstance(source, dict)
+        source_core = {
+            "schema_version": 1,
+            "kind": "work_lane",
+            "source_id": source["id"],
+            "terminal_state": terminal_state,
+            "lease_release_ready": lease_release_ready,
+        }
+        if terminal_state == "blocked_with_durable_followup":
+            source_core["checkout_key"] = checkout_key
+        source_evidence = {
+            **source_core,
+            "evidence_sha256": checkouts._sha256_json(source_core),
+        }
+        preview_sha256 = checkouts._sha256_json(
+            {"checkout_key": checkout_key, "terminal_state": terminal_state}
+        )
+        receipt_core = {
+            "schema_version": 1,
+            "kind": "checkout_terminal_reconciliation_receipt",
+            "checkout_key": checkout_key,
+            "reconciliation_mode": "present_retained",
+            "checkout_preserved": True,
+            "owner_id": lifecycle["owner_id"],
+            "binding_after": lifecycle,
+            "binding_after_sha256": checkouts._sha256_json(lifecycle),
+            "retention_after": retention,
+            "retention_after_sha256": checkouts._sha256_json(retention),
+            "source_evidence": source_evidence,
+            "source_evidence_sha256": source_evidence["evidence_sha256"],
+            "preview_sha256": preview_sha256,
+        }
+        receipt = {
+            **receipt_core,
+            "receipt_sha256": checkouts._sha256_json(receipt_core),
+        }
+        now = int(time.time())
+        with checkouts._database() as connection:
+            connection.execute(
+                """
+                INSERT INTO terminal_reconciliations(
+                    checkout_key, owner_id, binding_before_sha256,
+                    retention_sha256, source_evidence_json,
+                    source_evidence_sha256, preview_sha256,
+                    preview_created_at_unix, applied_at_unix,
+                    receipt_json, receipt_sha256
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    checkout_key,
+                    lifecycle["owner_id"],
+                    checkouts._sha256_json(lifecycle),
+                    checkouts._sha256_json(retention),
+                    checkouts._canonical_json(source_evidence),
+                    source_evidence["evidence_sha256"],
+                    preview_sha256,
+                    now,
+                    now,
+                    checkouts._canonical_json(receipt),
+                    receipt["receipt_sha256"],
+                ),
+            )
+            connection.commit()
+        return receipt
 
     def _repo_path_drift_managed_checkout(self) -> dict[str, object]:
         binding = self._managed_binding(owner="owner-a")
@@ -574,6 +659,46 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual(archive["audit"]["coordination_checked"]["processes"], 0)
 
 
+    def test_archive_ordinary_completed_work_lane_does_not_reread_terminal_source(self) -> None:
+        lane_id = "9" * 32
+        binding = self._managed_binding(
+            source_kind="work_lane",
+            source_id=lane_id,
+        )
+        checkouts._mark_checkout_completed_retained(
+            checkout_key=str(binding["checkout_key"]),
+            owner_id="owner-a",
+            expected_head=self.head,
+            expected_branch="topic",
+        )
+        self._record_terminal_reconciliation(
+            binding,
+            terminal_state="pr_opened",
+            lease_release_ready=True,
+        )
+        with (
+            patch(
+                "grabowski_checkout_terminal_sources.source_terminal_evidence",
+                side_effect=RuntimeError("historical lane unavailable"),
+            ) as source_evidence,
+            patch(
+                "grabowski_checkout_terminal_sources.blocked_followup_binding_authority",
+            ) as archive_authority,
+        ):
+            result = checkouts.grabowski_checkout_archive(
+                str(self.repo),
+                str(self.checkout),
+                "owner-a",
+                "ordinary terminal lane remains archivable",
+                int(time.time()) + 3600,
+                self.head,
+                "topic",
+            )
+        source_evidence.assert_not_called()
+        archive_authority.assert_not_called()
+        self.assertEqual("archived", result["lifecycle_binding"]["phase"])
+        self.assertIsNone(result["audit"]["blocked_followup_archive_evidence"])
+
     def test_archive_blocks_nonterminal_followup_after_capacity_release(self) -> None:
         lane_id = "a" * 32
         binding = self._managed_binding(
@@ -585,6 +710,11 @@ class CheckoutLifecycleTests(unittest.TestCase):
             owner_id="owner-a",
             expected_head=self.head,
             expected_branch="topic",
+        )
+        self._record_terminal_reconciliation(
+            binding,
+            terminal_state="blocked_with_durable_followup",
+            lease_release_ready=False,
         )
         evidence = {
             "terminal_state": "blocked_with_durable_followup",
@@ -634,6 +764,11 @@ class CheckoutLifecycleTests(unittest.TestCase):
             owner_id="owner-a",
             expected_head=self.head,
             expected_branch="topic",
+        )
+        self._record_terminal_reconciliation(
+            binding,
+            terminal_state="blocked_with_durable_followup",
+            lease_release_ready=False,
         )
         evidence = {
             "terminal_state": "blocked_with_durable_followup",
@@ -698,6 +833,11 @@ class CheckoutLifecycleTests(unittest.TestCase):
             expected_head=self.head,
             expected_branch="topic",
         )
+        self._record_terminal_reconciliation(
+            binding,
+            terminal_state="blocked_with_durable_followup",
+            lease_release_ready=False,
+        )
         evidence = {
             "terminal_state": "blocked_with_durable_followup",
         }
@@ -745,6 +885,11 @@ class CheckoutLifecycleTests(unittest.TestCase):
             owner_id="owner-a",
             expected_head=self.head,
             expected_branch="topic",
+        )
+        self._record_terminal_reconciliation(
+            binding,
+            terminal_state="blocked_with_durable_followup",
+            lease_release_ready=False,
         )
         evidence = {
             "terminal_state": "blocked_with_durable_followup",
@@ -809,6 +954,11 @@ class CheckoutLifecycleTests(unittest.TestCase):
             owner_id="owner-a",
             expected_head=self.head,
             expected_branch="topic",
+        )
+        self._record_terminal_reconciliation(
+            binding,
+            terminal_state="blocked_with_durable_followup",
+            lease_release_ready=False,
         )
         evidence = {
             "terminal_state": "blocked_with_durable_followup",
@@ -3540,6 +3690,7 @@ class CheckoutLifecycleTests(unittest.TestCase):
                 source_kind="work_lane",
                 source_id=lane_id,
                 completed_retained=True,
+                blocked_followup_reconciliation=True,
             )
             assessment = checkouts._archive_partial_completion_assessment(fence)
         self.assertEqual("recoverable_complete", assessment["state"])

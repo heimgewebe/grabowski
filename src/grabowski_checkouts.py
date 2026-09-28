@@ -5876,7 +5876,7 @@ def _terminal_detached_archive_transition(
     return {**core, "evidence_sha256": _sha256_json(core)}
 
 
-def _require_completed_work_lane_archive_authority(
+def _blocked_followup_archive_reconciliation_source(
     lifecycle: dict[str, Any] | None,
     checkout_key: str,
 ) -> dict[str, Any] | None:
@@ -5888,11 +5888,68 @@ def _require_completed_work_lane_archive_authority(
     source = lifecycle.get("source")
     if not isinstance(source, dict) or source.get("kind") != "work_lane":
         return None
+
+    # The stronger archive authority is required only when completed_retained
+    # was reached through the blocked-followup present-capacity exception.
+    # That decision is already durably bound by terminal reconciliation; do
+    # not force ordinary Work Lane archives to reread historical lane state.
+    import grabowski_checkout_terminal_reconciliation as terminal_reconciliation
+
+    record = terminal_reconciliation._record(checkout_key)
+    if record is None:
+        return None
+    receipt = record.get("receipt")
+    persisted_source = record.get("source_evidence")
+    if not isinstance(receipt, dict) or not isinstance(persisted_source, dict):
+        raise RuntimeError("terminal reconciliation archive evidence is invalid")
+    if terminal_reconciliation._reconciliation_mode(receipt) != "present_retained":
+        return None
+    receipt_source = receipt.get("source_evidence")
+    if receipt_source != persisted_source:
+        raise RuntimeError("terminal reconciliation source evidence differs")
+    if receipt.get("checkout_key") != checkout_key:
+        raise RuntimeError("terminal reconciliation checkout binding differs")
+    if persisted_source.get("terminal_state") != "blocked_with_durable_followup":
+        return None
+    evidence_sha256 = persisted_source.get("evidence_sha256")
+    evidence_core = {
+        key: value
+        for key, value in persisted_source.items()
+        if key != "evidence_sha256"
+    }
+    if (
+        not isinstance(evidence_sha256, str)
+        or SHA256_RE.fullmatch(evidence_sha256) is None
+        or _sha256_json(evidence_core) != evidence_sha256
+        or persisted_source.get("kind") != "work_lane"
+        or persisted_source.get("source_id") != source.get("id")
+        or persisted_source.get("checkout_key") != checkout_key
+        or persisted_source.get("lease_release_ready") is not False
+    ):
+        raise RuntimeError(
+            "blocked durable followup reconciliation evidence is invalid"
+        )
+    return persisted_source
+
+
+def _require_completed_work_lane_archive_authority(
+    lifecycle: dict[str, Any] | None,
+    checkout_key: str,
+) -> dict[str, Any] | None:
+    persisted_source = _blocked_followup_archive_reconciliation_source(
+        lifecycle,
+        checkout_key,
+    )
+    if persisted_source is None:
+        return None
+
     import grabowski_checkout_terminal_sources as terminal_sources
 
     evidence = terminal_sources.source_terminal_evidence(lifecycle)
     if evidence.get("terminal_state") != "blocked_with_durable_followup":
-        return None
+        raise RuntimeError(
+            "blocked durable followup terminal evidence changed before checkout archive"
+        )
     followup_authority = terminal_sources.blocked_followup_binding_authority(
         evidence,
         checkout_key,
