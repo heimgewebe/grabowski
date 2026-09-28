@@ -48,6 +48,9 @@ class RuntimeBootstrapRecoveryTests(unittest.TestCase):
         self.canonical = self.root / "canonical"
         self.recovery_root = self.root / "recovery-worktrees"
         self.recovery_root.mkdir(mode=0o700)
+        self.checkout_state_root = self.root / "state"
+        self.checkout_state_root.mkdir(mode=0o700)
+        self.checkout_operation_lock = self.checkout_state_root / "checkouts.lock"
         self._git("init", "--initial-branch=main", str(self.canonical), cwd=self.root)
         self._git("config", "user.email", "test@example.invalid", cwd=self.canonical)
         self._git("config", "user.name", "Bootstrap Test", cwd=self.canonical)
@@ -92,6 +95,7 @@ class RuntimeBootstrapRecoveryTests(unittest.TestCase):
             CANONICAL_REPOSITORY=self.canonical,
             CANONICAL_ORIGIN_URL=self.origin_url,
             RECOVERY_WORKTREE_ROOT=self.recovery_root,
+            CHECKOUT_OPERATION_LOCK=self.checkout_operation_lock,
             DEPLOY_UID=os.getuid(),
             DEPLOY_GID=os.getgid(),
         )
@@ -580,6 +584,11 @@ class RuntimeBootstrapRecoveryTests(unittest.TestCase):
             )
         self.assertTrue(path.is_dir())
         self.assertEqual(os.stat(path).st_mode & 0o777, 0o700)
+        self.assertTrue(self.checkout_operation_lock.is_file())
+        self.assertEqual(
+            os.stat(self.checkout_operation_lock).st_mode & 0o777,
+            0o600,
+        )
         self.assertEqual(self._git_output("rev-parse", "HEAD", cwd=path), self.head)
         branch = subprocess.run(
             ["/usr/bin/git", "symbolic-ref", "-q", "HEAD"],

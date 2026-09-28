@@ -2221,7 +2221,10 @@ def _continuation_lifecycle_guard(timeout_seconds: float) -> Iterator[None]:
     # Lock order is checkout operation lock -> lifecycle DB transaction. All
     # supported Grabowski worktree-admin mutations use the same operation lock,
     # so registry uniqueness stays stable through the guarded yield.
-    with checkouts._operation_lock():
+    remaining = guard_deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError("managed worktree continuation preimage deadline exceeded")
+    with checkouts._operation_lock(deadline_monotonic=guard_deadline):
         connection = checkouts._database()
         try:
             remaining = guard_deadline - time.monotonic()

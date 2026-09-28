@@ -2782,9 +2782,13 @@ class WorkAcquireTests(unittest.TestCase):
 
     def test_continuation_lifecycle_guard_holds_checkout_operation_lock_through_yield(self) -> None:
         state = {"held": False}
+        deadlines: list[float] = []
 
         @contextmanager
-        def operation_lock():
+        def operation_lock(*, deadline_monotonic: float | None = None):
+            self.assertIsInstance(deadline_monotonic, float)
+            assert deadline_monotonic is not None
+            deadlines.append(deadline_monotonic)
             self.assertFalse(state["held"])
             state["held"] = True
             try:
@@ -2800,6 +2804,7 @@ class WorkAcquireTests(unittest.TestCase):
             with work_acquire._continuation_lifecycle_guard(1.0):
                 self.assertTrue(state["held"])
         self.assertFalse(state["held"])
+        self.assertEqual(len(deadlines), 1)
 
     def test_continuation_rejects_retention_expiring_after_final_snapshot(self) -> None:
         params = self.parameters()
