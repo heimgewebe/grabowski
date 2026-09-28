@@ -1850,11 +1850,14 @@ def ensure_worktree(
                 replayed=recovering_intent,
                 recovered=False,
             )
-        mutation = _command(
-            runner,
-            Path(inputs["repo"]),
-            ["worktree", "add", "-b", inputs["branch"], inputs["target_path"], inputs["base_head"]],
-        )
+        import grabowski_checkouts as checkout_store
+
+        with checkout_store._operation_lock():
+            mutation = _command(
+                runner,
+                Path(inputs["repo"]),
+                ["worktree", "add", "-b", inputs["branch"], inputs["target_path"], inputs["base_head"]],
+            )
         _after_worktree_mutation()
 
         post_state = _observe_after_possible_effect(

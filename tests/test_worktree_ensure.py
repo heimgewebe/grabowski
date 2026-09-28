@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -630,6 +631,37 @@ class WorktreeEnsureTests(unittest.TestCase):
         self.assertEqual(created["result_state"], "CREATED")
         self.assertTrue(Path(str(second["target_path"])).is_dir())
         self.assertTrue(os.path.lexists(broken_symlink))
+
+    def test_creation_holds_checkout_operation_lock_during_worktree_add(self) -> None:
+        parameters = self._parameters(key="serialized-worktree-add")
+        state = {"held": False}
+        saw_add = {"value": False}
+
+        @contextmanager
+        def operation_lock():
+            self.assertFalse(state["held"])
+            state["held"] = True
+            try:
+                yield
+            finally:
+                state["held"] = False
+
+        def runner(cwd: Path, argv: list[str]) -> dict[str, object]:
+            if argv[:2] == ["worktree", "add"]:
+                saw_add["value"] = True
+                self.assertTrue(state["held"])
+            return grips._default_command_runner(cwd, argv)
+
+        with patch.object(
+            checkouts,
+            "_operation_lock",
+            operation_lock,
+        ):
+            created = self._ensure(parameters, runner=runner)
+
+        self.assertEqual(created["result_state"], "CREATED")
+        self.assertTrue(saw_add["value"])
+        self.assertFalse(state["held"])
 
     def test_creates_and_replays_same_durable_result(self) -> None:
         parameters = self._parameters()

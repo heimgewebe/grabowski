@@ -2780,6 +2780,27 @@ class WorkAcquireTests(unittest.TestCase):
             finally:
                 competitor.close()
 
+    def test_continuation_lifecycle_guard_holds_checkout_operation_lock_through_yield(self) -> None:
+        state = {"held": False}
+
+        @contextmanager
+        def operation_lock():
+            self.assertFalse(state["held"])
+            state["held"] = True
+            try:
+                yield
+            finally:
+                state["held"] = False
+
+        with patch.object(
+            work_acquire.checkouts,
+            "_operation_lock",
+            operation_lock,
+        ):
+            with work_acquire._continuation_lifecycle_guard(1.0):
+                self.assertTrue(state["held"])
+        self.assertFalse(state["held"])
+
     def test_continuation_rejects_retention_expiring_after_final_snapshot(self) -> None:
         params = self.parameters()
         inputs = work_acquire._normalize(params)
@@ -3718,6 +3739,34 @@ class WorkAcquireTests(unittest.TestCase):
                     )
         physical_verify.assert_called_once_with(PHYSICAL)
 
+        deadline_state = {"expired": False}
+
+        def expire_after_physical_verify(_expected):
+            deadline_state["expired"] = True
+            return PHYSICAL
+
+        with (
+            guard_dependencies(
+                top_level=Mock(return_value=str(self.target)),
+                physical_verify=Mock(side_effect=expire_after_physical_verify),
+            ),
+            patch.object(
+                work_acquire.time,
+                "monotonic",
+                side_effect=lambda: 11.0 if deadline_state["expired"] else 0.0,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "authorization deadline exceeded",
+            ),
+        ):
+            with work_acquire._continuation_authorization_guard(
+                continuation_preimage
+            ):
+                self.fail(
+                    "physical verification completing after the deadline must not authorize continuation"
+                )
+
         with (
             guard_dependencies(
                 top_level=Mock(return_value=str(self.target)),
@@ -4106,6 +4155,95 @@ class WorkAcquireTests(unittest.TestCase):
         ensure.assert_not_called()
         start.assert_not_called()
 
+    def test_terminal_existing_writer_authorization_conflict_compensates_reacquired_leases(self) -> None:
+        params = self.parameters()
+        params["scoped_writer_argv"] = ["writer", "--once"]
+        params["scoped_writer_runtime_seconds"] = 600
+        inputs, stored = self.store_lane(params)
+        writer_job = {
+            "job_id": "writer-job",
+            "unit": "writer-unit.service",
+            "owner": "uid:1000",
+            "argv_sha256": "a" * 64,
+            "cwd": str(self.target),
+            "runtime_seconds": 600,
+            "metadata_path": str(self.root / "writer-metadata.json"),
+            "expected_receipt": None,
+            "final_status": "launch_submitted",
+            "receipt_sha256": "b" * 64,
+        }
+        checkout_key = "a" * 64
+        receipt_path = self.state / f"{inputs['lane_id']}.json"
+        work_acquire._write_state(
+            receipt_path,
+            {
+                **stored,
+                "writer_job": writer_job,
+                "writer_start": {
+                    "state": "started",
+                    "job_receipt_sha256": writer_job["receipt_sha256"],
+                },
+                "worktree_receipt": {
+                    "result_state": "CREATED",
+                    "durable_receipt_sha256": "c" * 64,
+                    "post_state": {
+                        "target_registered": True,
+                        "target_path_exists": True,
+                    },
+                    "lifecycle": {
+                        "checkout_key": checkout_key,
+                        "physical_checkout": PHYSICAL,
+                    },
+                },
+            },
+        )
+        acquire = Mock(side_effect=self.acquire)
+        release = Mock(side_effect=self.release)
+        ensure = Mock()
+        continuation_preimage = {
+            "checkout_key": checkout_key,
+            "lifecycle_sha256": "d" * 64,
+            "lifecycle_retention_until_unix": self.retention,
+            "preimage_sha256": "e" * 64,
+        }
+
+        with (
+            patch.object(
+                work_acquire,
+                "_continuation_preimage",
+                return_value=continuation_preimage,
+            ),
+            patch.object(
+                work_acquire,
+                "_continuation_authorization_guard",
+                side_effect=RuntimeError(
+                    "managed worktree continuation registry authority changed before authorization"
+                ),
+            ),
+        ):
+            result = work_acquire.acquire_work(
+                params,
+                acquire_resources_fn=acquire,
+                release_resources_fn=release,
+                inspect_resource_fn=Mock(),
+                ensure_worktree_fn=ensure,
+                runner=Mock(),
+                read_writer_status_fn=Mock(
+                    return_value=self.writer_status(
+                        writer_job["unit"], "succeeded"
+                    )
+                ),
+            )
+
+        self.assertEqual(result["state"], "blocked")
+        self.assertFalse(result["effect_observed"])
+        self.assertEqual(result["compensation"]["state"], "complete")
+        self.assertTrue(result["writer_liveness"]["terminal"])
+        self.assertIn("before authorization", result["error"])
+        acquire.assert_called_once()
+        release.assert_called_once()
+        ensure.assert_not_called()
+
     def test_continuation_conflict_after_reacquire_compensates_fresh_leases(self) -> None:
         params = self.parameters()
         self.store_lane(params)
@@ -4148,7 +4286,7 @@ class WorkAcquireTests(unittest.TestCase):
             work_acquire.resources.LEASE_SNAPSHOT_KEYS,
         )
 
-    def test_continuation_conflict_preserves_reacquired_leases_for_existing_writer(self) -> None:
+    def test_continuation_conflict_compensates_reacquired_leases_for_terminal_existing_writer(self) -> None:
         params = self.parameters()
         params["scoped_writer_argv"] = ["writer", "--once"]
         params["scoped_writer_runtime_seconds"] = 600
@@ -4186,20 +4324,7 @@ class WorkAcquireTests(unittest.TestCase):
             "_continuation_preimage",
             side_effect=RuntimeError("continuation evidence drifted"),
         ):
-            first = work_acquire.acquire_work(
-                params,
-                acquire_resources_fn=acquire,
-                release_resources_fn=release,
-                inspect_resource_fn=Mock(),
-                ensure_worktree_fn=ensure,
-                runner=Mock(),
-                read_writer_status_fn=Mock(
-                    return_value=self.writer_status(
-                        writer_job["unit"], "succeeded"
-                    )
-                ),
-            )
-            second = work_acquire.acquire_work(
+            result = work_acquire.acquire_work(
                 params,
                 acquire_resources_fn=acquire,
                 release_resources_fn=release,
@@ -4213,22 +4338,21 @@ class WorkAcquireTests(unittest.TestCase):
                 ),
             )
 
-        self.assertEqual(first["state"], "outcome_unknown")
-        self.assertEqual(first["decision"], "HARD_BLOCK")
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["decision"], "HARD_BLOCK")
         self.assertEqual(
-            first["error_class"], "WORKTREE_CONTINUATION_CONFLICT"
+            result["error_class"], "WORKTREE_CONTINUATION_CONFLICT"
         )
-        self.assertTrue(first["effect_observed"])
-        self.assertIsNone(first["compensation"])
-        self.assertEqual(first["writer_job"], writer_job)
+        self.assertFalse(result["effect_observed"])
+        self.assertEqual(result["compensation"]["state"], "complete")
+        self.assertEqual(result["writer_job"], writer_job)
+        self.assertTrue(result["writer_liveness"]["terminal"])
         self.assertEqual(
-            first["next_action"], "readback_scoped_writer_before_retry"
+            result["next_action"], "reconcile_managed_worktree_continuation"
         )
-        self.assertTrue(first["replayed"])
-        self.assertEqual(second["state"], "outcome_unknown")
-        self.assertEqual(second["writer_job"], writer_job)
+        self.assertTrue(result["replayed"])
         self.assertEqual(acquire.call_count, 1)
-        release.assert_not_called()
+        release.assert_called_once()
         ensure.assert_not_called()
 
     def test_continuation_conflict_with_uncertain_compensation_is_outcome_unknown(self) -> None:

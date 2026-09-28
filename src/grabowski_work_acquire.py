@@ -2213,26 +2213,30 @@ def _effect_observed(output: dict[str, Any]) -> bool:
 
 @contextmanager
 def _continuation_lifecycle_guard(timeout_seconds: float) -> Iterator[None]:
-    """Prevent checkout lifecycle writers from racing the final continuation snapshot."""
+    """Exclude managed checkout-registry and lifecycle writers through authorization."""
 
     if timeout_seconds <= 0:
         raise RuntimeError("managed worktree continuation preimage deadline exceeded")
     guard_deadline = time.monotonic() + timeout_seconds
-    connection = checkouts._database()
-    try:
-        remaining = guard_deadline - time.monotonic()
-        if remaining <= 0:
-            raise RuntimeError("managed worktree continuation preimage deadline exceeded")
-        timeout_ms = max(1, min(10_000, int(remaining * 1000)))
-        connection.execute(f"PRAGMA busy_timeout={timeout_ms}")
-        connection.execute("BEGIN IMMEDIATE")
-        if time.monotonic() >= guard_deadline:
-            raise RuntimeError("managed worktree continuation preimage deadline exceeded")
-        yield
-    finally:
-        if connection.in_transaction:
-            connection.rollback()
-        connection.close()
+    # Lock order is checkout operation lock -> lifecycle DB transaction. All
+    # supported Grabowski worktree-admin mutations use the same operation lock,
+    # so registry uniqueness stays stable through the guarded yield.
+    with checkouts._operation_lock():
+        connection = checkouts._database()
+        try:
+            remaining = guard_deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("managed worktree continuation preimage deadline exceeded")
+            timeout_ms = max(1, min(10_000, int(remaining * 1000)))
+            connection.execute(f"PRAGMA busy_timeout={timeout_ms}")
+            connection.execute("BEGIN IMMEDIATE")
+            if time.monotonic() >= guard_deadline:
+                raise RuntimeError("managed worktree continuation preimage deadline exceeded")
+            yield
+        finally:
+            if connection.in_transaction:
+                connection.rollback()
+            connection.close()
 
 
 @contextmanager
@@ -2478,10 +2482,12 @@ def _continuation_authorization_guard(
             raise RuntimeError(
                 "managed worktree continuation physical checkout changed before authorization"
             ) from exc
+        remaining_authorization_seconds()
         if retention_until_unix <= int(time.time()):
             raise RuntimeError(
                 "managed worktree continuation lifecycle retention expired before authorization"
             )
+        remaining_authorization_seconds()
         yield
 
 
@@ -3464,7 +3470,14 @@ def acquire_work(
             error_class: str = "WORKTREE_CONTINUATION_CONFLICT",
             writer_liveness: dict[str, Any] | None = None,
         ) -> dict[str, Any]:
-            if existing_writer_job is not None:
+            preserve_writer_authority = (
+                existing_writer_job is not None
+                and (
+                    writer_liveness is None
+                    or writer_liveness.get("terminal") is not True
+                )
+            )
+            if preserve_writer_authority:
                 record = _write_state(
                     receipt_path,
                     {
@@ -3528,8 +3541,13 @@ def acquire_work(
                     "lease_receipt": acquired,
                     **group_evidence,
                     "worktree_receipt": worktree_receipt,
-                    "error_class": "WORKTREE_CONTINUATION_CONFLICT",
+                    "error_class": error_class,
                     "error": str(exc)[:2048],
+                    **(
+                        {"writer_liveness": writer_liveness}
+                        if writer_liveness is not None
+                        else {}
+                    ),
                     "effect_observed": False,
                     "compensation": compensation,
                     "next_action": (
@@ -3599,6 +3617,7 @@ def acquire_work(
                     if isinstance(existing, dict)
                     else None
                 ),
+                writer_liveness=writer_liveness,
             )
 
         ensure_parameters = {
@@ -3934,6 +3953,12 @@ def acquire_work(
                         record = _write_state(receipt_path, ready_payload)
                     continuation_authorized = True
             except Exception as exc:
+                if existing_writer_job is not None:
+                    return continuation_conflict(
+                        exc,
+                        output,
+                        writer_liveness=writer_liveness,
+                    )
                 if writer_job is None:
                     return continuation_conflict(exc, output)
                 record = _write_state(
