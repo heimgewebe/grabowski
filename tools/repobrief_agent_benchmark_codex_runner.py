@@ -5591,10 +5591,16 @@ def _codex_mcp_result_is_success(
             return False
         return False
     structured = value.get("structured_content")
-    return (
-        isinstance(structured, dict)
-        and structured.get("status") != "error"
-    )
+    if not isinstance(structured, dict):
+        return False
+    status = structured.get("status")
+    if tool_name == "ask_context":
+        return status == "ok"
+    if tool_name == "live_freshness":
+        return status in EXPECTED_REPOGROUND_FRESHNESS_VALUES
+    if tool_name == "grounding_verify":
+        return status in EXPECTED_GROUNDING_VERDICT_STATUSES
+    return False
 
 
 def normalize(

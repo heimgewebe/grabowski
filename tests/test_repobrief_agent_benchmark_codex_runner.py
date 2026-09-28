@@ -4270,6 +4270,43 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 self.assertEqual(calls[0]["status"], "success")
                 self.assertEqual(normalized_answer, answer())
 
+    def test_normalize_rejects_codex_0158_unknown_structured_status_without_iserror(self) -> None:
+        cases = (
+            ("ask_context", {"query": "finalizer"}, {}),
+            ("ask_context", {"query": "finalizer"}, {"status": "failed"}),
+            ("live_freshness", {}, {"status": "ok"}),
+            ("grounding_verify", {"declaration": {}}, {"status": "ok"}),
+        )
+        for tool, arguments, structured_content in cases:
+            with self.subTest(tool=tool, structured_content=structured_content):
+                value = request(condition="treatment")
+                events = [json.loads(line) for line in stream(value).splitlines()]
+                command_event = next(
+                    event
+                    for event in events
+                    if event.get("type") == "item.completed"
+                    and isinstance(event.get("item"), dict)
+                    and event["item"].get("type") == "command_execution"
+                )
+                command_event["item"] = {
+                    "type": "mcp_tool_call",
+                    "server": "repobrief",
+                    "tool": tool,
+                    "arguments": arguments,
+                    "result": {
+                        "content": [{"type": "text", "text": json.dumps(structured_content)}],
+                        "structured_content": structured_content,
+                    },
+                    "error": None,
+                    "status": "completed",
+                }
+
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "treatment used no successful RepoBrief tool or resource",
+                ):
+                    runner.normalize(value, events)
+
     def test_normalize_rejects_codex_0158_resource_errors_without_iserror(self) -> None:
         cases = (
             (
