@@ -29,6 +29,50 @@ If the process restarts, the retained target expires or is safely evicted, or th
 
 A stable client-declared scope may use `action=begin`, then `action=ack`, then invoke the exact mutation once. `action=ack` remains fail-closed for `shared_unlabeled` because a shared label is not caller identity.
 
+## Replay authority split
+
+Replay protection is not a global history of "this tool call has been seen
+before". The transport layer authenticates every signed one-call request and
+keeps durable replay state only where the downstream mutation surface cannot
+itself reconcile repetition safely.
+
+- Read-only tools never enter the mutation replay path.
+- grabowski_task_start validates connector capability, request MAC, freshness,
+  runtime binding and the exact raw argument digest. The exact signed request id
+  is consumed once in the bounded durable replay filter, but body identity and
+  MCP session are not quarantine keys. A newly signed logical retry therefore
+  reaches task semantics. Its replay policy is domain_delegated.
+- The durable task layer is authoritative for repeated task starts. Task
+  mutations are serialized, the task row is committed before _launch() can
+  start a process, active execution identities are reused, and a completed
+  unbound execution identity is reused inside the existing bounded
+  successful-operation window. This covers response-loss retries even after a
+  fast task has already completed, using the fully normalized execution
+  identity rather than raw transport arguments. After the bounded window an
+  identical execution may start again; a distinct explicit operation identity
+  remains an immediate discriminator for intentionally different work.
+  Operation-bound rows do not shadow the latest unbound base execution when a
+  transport response is retried. Among unbound base executions, the newest
+  lifecycle state stays authoritative: active work follows active-task reuse or
+  lease serialization; completed work is reused for 600 seconds; failed,
+  interrupted, timed-out, signalled or outcome-unknown work stays under the
+  task retry/reconcile contract; cancelled work is not reused. After the
+  completed-work window expires, an identical unbound execution may start a
+  new unit.
+- Other mutating tools remain on durable_transport_replay by default. Their
+  exact request id and stable body identity stay fail-closed until a narrower
+  domain-specific idempotency/readback path proves re-entry safe.
+- Existing intrinsic domain replay recovery remains valid for the small set of
+  mutations whose post-state preflight proves that a repeated effect is safe.
+
+This separation removes the permanent same-task-start veto without making one
+captured signed packet reusable. Replaying the exact signed request id is
+rejected, including after cancellation. A freshly signed task-start retry with
+a new request id reaches task semantics even if an earlier transport response
+was lost or an identical command was run previously. The transport receipt
+does not itself establish application-level duplicate suppression, retry
+authority, task success or permission to bypass task-state reconciliation.
+
 ## Bound evidence
 
 Each durable transport receipt binds the scope kind and hash, release id, full repository head, registered tool-name hash, agent-instruction hash, timestamps, receipt chain, and canonical receipt hash. The consumption receipt additionally binds the mutating tool name and canonical argument SHA-256. Release, head, catalog, instruction, time, receipt, file-owner, permission, symlink, or hardlink drift closes the gate.

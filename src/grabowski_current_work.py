@@ -553,7 +553,13 @@ def parse_processes(payload: dict[str, Any] | None) -> dict[str, Any]:
         command_class = "other"
         if workspace_id:
             command_class = "agent-workspace-pane"
-        elif executable.lower() in CODING_AGENT_EXECUTABLES:
+        # Zombies remain observable, but cannot execute provider work. Excluding
+        # them from coding-agent classification prevents unreadable zombie argv
+        # from making otherwise complete physical occupancy globally unavailable.
+        elif (
+            not state.startswith("Z")
+            and executable.lower() in CODING_AGENT_EXECUTABLES
+        ):
             command_class = "coding-agent"
         elif "grabowski_operator" in arguments:
             command_class = "operator-runtime"

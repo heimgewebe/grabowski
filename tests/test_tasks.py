@@ -3873,6 +3873,87 @@ class TaskTests(unittest.TestCase):
         )
         dispatch_mock.assert_not_called()
 
+    def test_avoidable_bounded_read_reroutes_before_recent_completed_reuse(
+        self,
+    ) -> None:
+        from tests.test_task_routing_shadow_capture import direct_route_evidence
+
+        argv = ["git", "status", "--short", "--branch"]
+        capture_result = {
+            "schema_version": 1,
+            "status": "created",
+            "binding_status": "created",
+            "binding_id": "b" * 64,
+            "no_effect": dict(routing_shadow.NO_EFFECT),
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_validate_command", return_value=argv),
+            patch.object(tasks.operator, "_guard_git"),
+            patch.object(tasks.operator, "_git_config_values", return_value=[]),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 157}
+            ),
+            patch.object(
+                routing_shadow,
+                "capture_direct_task_start_best_effort",
+                return_value=capture_result,
+            ),
+        ):
+            first = tasks.grabowski_task_start(
+                "local",
+                argv,
+                cwd=str(self.root),
+                runtime_seconds=30,
+                resume_policy="never",
+                effect_profile="read_only",
+                route_evidence=direct_route_evidence(),
+            )
+
+        first_id = str(first["task"]["task_id"])
+        tasks._set_state(
+            first_id,
+            "completed",
+            observation={"state": "completed", "observed_at_unix": tasks._now()},
+        )
+
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_validate_command", return_value=argv),
+            patch.object(tasks.operator, "_guard_git"),
+            patch.object(tasks.operator, "_git_config_values", return_value=[]),
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch_mock,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 158}
+            ),
+        ):
+            repeated = tasks.grabowski_task_start(
+                "local",
+                argv,
+                cwd=str(self.root),
+                runtime_seconds=30,
+                resume_policy="never",
+                effect_profile="read_only",
+            )
+
+        self.assertIsNone(repeated["task"])
+        self.assertIsNone(repeated["deduplicated_reuse"])
+        self.assertEqual(
+            "avoidable_bounded_read",
+            repeated["read_routing_advisory"]["classification"],
+        )
+        self.assertEqual(
+            "grabowski_git_status",
+            repeated["read_routing_reroute"]["recommended_route"],
+        )
+        dispatch_mock.assert_not_called()
+        with tasks._database_connection() as connection:
+            count = connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        self.assertEqual(1, count)
+
     def test_explicit_read_only_manual_resume_keeps_durable_route(self) -> None:
         argv = ["git", "status", "--short", "--branch"]
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
@@ -4401,9 +4482,23 @@ class TaskTests(unittest.TestCase):
 
     def test_mutating_agents_cannot_share_one_implicit_workspace(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
+        active_observation = {
+            "state": "running",
+            "observed_at_unix": tasks._now(),
+            "properties": {
+                "LoadState": "loaded",
+                "ActiveState": "active",
+                "SubState": "running",
+                "Result": "success",
+                "ExecMainCode": "exited",
+                "ExecMainStatus": "0",
+            },
+        }
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_validate_command", return_value=argv
-        ), patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch, patch.object(
+        ), patch.object(tasks, "_observe", return_value=active_observation) as observe, patch.object(
+            tasks, "_dispatch", return_value=_launcher()
+        ) as dispatch, patch.object(
             tasks.base, "_append_audit"
         ), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 151}
@@ -4415,8 +4510,68 @@ class TaskTests(unittest.TestCase):
                 tasks.grabowski_task_start(
                     "local", argv, cwd=str(self.root), runtime_seconds=60
                 )
+        observe.assert_called_once()
         self.assertEqual(dispatch.call_count, 1)
         self.assertEqual(tasks.grabowski_task_list()["count"], 1)
+
+    def test_completed_mutating_agent_retry_refreshes_before_workspace_reacquire(
+        self,
+    ) -> None:
+        argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_validate_command", return_value=argv),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 151}
+            ),
+        ):
+            first = tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root), runtime_seconds=60
+            )
+        task_id = str(first["task"]["task_id"])
+        self.assertIn(first["task"]["state"], tasks.TASK_STATE_PROJECTIONS["active"])
+        resource_keys = list(first["task"]["resource_keys"])
+        self.assertTrue(resource_keys)
+        for key in resource_keys:
+            self.assertIsNotNone(tasks.resources.inspect_resource(key))
+
+        completed_observation = {
+            "state": "completed",
+            "observed_at_unix": tasks._now(),
+            "properties": {
+                "ActiveState": "inactive",
+                "SubState": "dead",
+                "Result": "success",
+                "ExecMainCode": "exited",
+                "ExecMainStatus": "0",
+            },
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_validate_command", return_value=argv),
+            patch.object(tasks, "_observe", return_value=completed_observation) as observe,
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 152}
+            ),
+        ):
+            second = tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root), runtime_seconds=60
+            )
+        observe.assert_called_once()
+        dispatch.assert_not_called()
+        self.assertEqual(task_id, second["task"]["task_id"])
+        self.assertEqual("completed", second["task"]["state"])
+        self.assertEqual(
+            "recent_completed_execution_identity",
+            second["deduplicated_reuse"]["reason"],
+        )
+        for key in resource_keys:
+            self.assertIsNone(tasks.resources.inspect_resource(key))
+        self.assertEqual(1, tasks.grabowski_task_list()["count"])
 
     def test_explicit_file_scopes_do_not_replace_workspace_guard(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
@@ -6747,7 +6902,14 @@ class TaskTests(unittest.TestCase):
         with (
             patch.object(tasks.operator, "_require_operator_mutation"),
             patch.object(tasks, "_reconcile_observation", side_effect=observe),
-            patch.object(tasks, "_dispatch", side_effect=dispatch),
+            patch.object(
+                tasks,
+                "_resolve_task_dispatch_host",
+                return_value=("local", {"transport": "local"}, False),
+            ),
+            patch.object(
+                tasks.operator, "_run_mutating_user_systemd_unit", side_effect=dispatch
+            ),
             patch.object(tasks.base, "_append_audit"),
         ):
             refresh_thread = threading.Thread(target=run_refresh)
@@ -9742,6 +9904,563 @@ class TaskTests(unittest.TestCase):
         row.assert_not_called()
 
 
+    def test_managed_cargo_active_reuse_precedes_changed_environment_preparation(
+        self,
+    ) -> None:
+        raw_command = ["/usr/bin/cargo", "test"]
+
+        def bound(cache_key: str) -> list[str]:
+            target_dir = tasks.MANAGED_CARGO_CACHE_ROOT / cache_key / "target"
+            lifecycle_lock = tasks.MANAGED_CARGO_LOCK_ROOT / f"{cache_key}.lock"
+            return [
+                tasks.FLOCK_EXECUTABLE,
+                "--shared",
+                str(lifecycle_lock),
+                tasks.SYSTEMD_ENV_EXECUTABLE,
+                f"CARGO_TARGET_DIR={target_dir}",
+                *raw_command,
+            ]
+
+        common = {
+            "host": "local",
+            "argv": raw_command,
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "resume_policy": "retry-safe",
+            "cpu_weight": 50,
+            "io_weight": 25,
+            "memory_max_bytes": 64 * 1024 * 1024,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_managed_cargo_request_root", return_value=self.root),
+            patch.object(
+                tasks, "_bind_managed_cargo_environment", return_value=bound("a" * 64)
+            ),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
+            ),
+        ):
+            first = tasks.grabowski_task_start(**common)
+        task_id = str(first["task"]["task_id"])
+        running_observation = {
+            "state": "running",
+            "observed_at_unix": tasks._now(),
+            "properties": {"ActiveState": "active", "SubState": "running"},
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_managed_cargo_request_root", return_value=self.root),
+            patch.object(
+                tasks, "_bind_managed_cargo_environment", return_value=bound("b" * 64)
+            ) as prepare,
+            patch.object(tasks, "_observe", return_value=running_observation) as observe,
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
+            ),
+        ):
+            second = tasks.grabowski_task_start(**common)
+        observe.assert_called_once()
+        prepare.assert_not_called()
+        dispatch.assert_not_called()
+        self.assertEqual(task_id, second["task"]["task_id"])
+        self.assertEqual(
+            "active_unprepared_managed_cargo_identity",
+            second["deduplicated_reuse"]["reason"],
+        )
+        self.assertEqual(1, tasks.grabowski_task_list(limit=20)["total_matching"])
+
+    def test_managed_cargo_completed_reuse_precedes_changed_environment_preparation(
+        self,
+    ) -> None:
+        raw_command = ["/usr/bin/cargo", "test"]
+
+        def bound(cache_key: str) -> list[str]:
+            target_dir = tasks.MANAGED_CARGO_CACHE_ROOT / cache_key / "target"
+            lifecycle_lock = tasks.MANAGED_CARGO_LOCK_ROOT / f"{cache_key}.lock"
+            return [
+                tasks.FLOCK_EXECUTABLE,
+                "--shared",
+                str(lifecycle_lock),
+                tasks.SYSTEMD_ENV_EXECUTABLE,
+                f"CARGO_TARGET_DIR={target_dir}",
+                *raw_command,
+            ]
+
+        common = {
+            "host": "local",
+            "argv": raw_command,
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "resume_policy": "retry-safe",
+            "cpu_weight": 50,
+            "io_weight": 25,
+            "memory_max_bytes": 64 * 1024 * 1024,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_managed_cargo_request_root", return_value=self.root),
+            patch.object(
+                tasks, "_bind_managed_cargo_environment", return_value=bound("c" * 64)
+            ),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 125}
+            ),
+        ):
+            first = tasks.grabowski_task_start(**common)
+        task_id = str(first["task"]["task_id"])
+        tasks._set_state(
+            task_id,
+            "completed",
+            observation={"state": "completed", "observed_at_unix": tasks._now()},
+        )
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_managed_cargo_request_root", return_value=self.root),
+            patch.object(
+                tasks, "_bind_managed_cargo_environment", return_value=bound("d" * 64)
+            ) as prepare,
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 126}
+            ),
+        ):
+            second = tasks.grabowski_task_start(**common)
+        prepare.assert_not_called()
+        dispatch.assert_not_called()
+        self.assertEqual(task_id, second["task"]["task_id"])
+        self.assertEqual("completed", second["task"]["state"])
+        self.assertEqual(
+            "recent_completed_unprepared_managed_cargo_identity",
+            second["deduplicated_reuse"]["reason"],
+        )
+        self.assertEqual(1, tasks.grabowski_task_list(limit=20)["total_matching"])
+
+    def test_managed_cargo_distinct_operation_bypasses_unprepared_completed_reuse(
+        self,
+    ) -> None:
+        raw_command = ["/usr/bin/cargo", "test"]
+
+        def bound(cache_key: str) -> list[str]:
+            target_dir = tasks.MANAGED_CARGO_CACHE_ROOT / cache_key / "target"
+            lifecycle_lock = tasks.MANAGED_CARGO_LOCK_ROOT / f"{cache_key}.lock"
+            return [
+                tasks.FLOCK_EXECUTABLE,
+                "--shared",
+                str(lifecycle_lock),
+                tasks.SYSTEMD_ENV_EXECUTABLE,
+                f"CARGO_TARGET_DIR={target_dir}",
+                *raw_command,
+            ]
+
+        common = {
+            "host": "local",
+            "argv": raw_command,
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "resume_policy": "retry-safe",
+            "cpu_weight": 50,
+            "io_weight": 25,
+            "memory_max_bytes": 64 * 1024 * 1024,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_managed_cargo_request_root", return_value=self.root),
+            patch.object(
+                tasks, "_bind_managed_cargo_environment", return_value=bound("e" * 64)
+            ),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 127}
+            ),
+        ):
+            first = tasks.grabowski_task_start(**common)
+        first_id = str(first["task"]["task_id"])
+        tasks._set_state(
+            first_id,
+            "completed",
+            observation={"state": "completed", "observed_at_unix": tasks._now()},
+        )
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_managed_cargo_request_root", return_value=self.root),
+            patch.object(
+                tasks, "_bind_managed_cargo_environment", return_value=bound("f" * 64)
+            ) as prepare,
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 128}
+            ),
+        ):
+            second = tasks.grabowski_task_start(
+                **common,
+                operation_identity=self._operation_identity_fixture(source="d"),
+            )
+        prepare.assert_called_once()
+        dispatch.assert_called_once()
+        self.assertNotEqual(first_id, second["task"]["task_id"])
+        self.assertIsNone(second["deduplicated_reuse"])
+
+    def test_managed_cargo_unbound_reuse_skips_newer_failed_operation_bound_record(
+        self,
+    ) -> None:
+        raw_command = ["/usr/bin/cargo", "test"]
+
+        def bound(cache_key: str) -> list[str]:
+            target_dir = tasks.MANAGED_CARGO_CACHE_ROOT / cache_key / "target"
+            lifecycle_lock = tasks.MANAGED_CARGO_LOCK_ROOT / f"{cache_key}.lock"
+            return [
+                tasks.FLOCK_EXECUTABLE,
+                "--shared",
+                str(lifecycle_lock),
+                tasks.SYSTEMD_ENV_EXECUTABLE,
+                f"CARGO_TARGET_DIR={target_dir}",
+                *raw_command,
+            ]
+
+        common = {
+            "host": "local",
+            "argv": raw_command,
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "resume_policy": "retry-safe",
+            "cpu_weight": 50,
+            "io_weight": 25,
+            "memory_max_bytes": 64 * 1024 * 1024,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_managed_cargo_request_root", return_value=self.root),
+            patch.object(
+                tasks, "_bind_managed_cargo_environment", return_value=bound("7" * 64)
+            ),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 131}
+            ),
+        ):
+            base = tasks.grabowski_task_start(**common)
+        base_id = str(base["task"]["task_id"])
+        tasks._set_state(
+            base_id,
+            "completed",
+            observation={"state": "completed", "observed_at_unix": tasks._now()},
+        )
+
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_managed_cargo_request_root", return_value=self.root),
+            patch.object(
+                tasks, "_bind_managed_cargo_environment", return_value=bound("8" * 64)
+            ),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 132}
+            ),
+        ):
+            operation = tasks.grabowski_task_start(
+                **common,
+                operation_identity=self._operation_identity_fixture(source="e"),
+            )
+        operation_id = str(operation["task"]["task_id"])
+        self.assertNotEqual(base_id, operation_id)
+        tasks._set_state(
+            operation_id,
+            "failed",
+            observation={"state": "failed", "observed_at_unix": tasks._now()},
+        )
+
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_managed_cargo_request_root", return_value=self.root),
+            patch.object(
+                tasks, "_bind_managed_cargo_environment", return_value=bound("9" * 64)
+            ) as prepare,
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 133}
+            ),
+        ):
+            retried = tasks.grabowski_task_start(**common)
+        prepare.assert_not_called()
+        dispatch.assert_not_called()
+        self.assertEqual(base_id, retried["task"]["task_id"])
+        self.assertEqual(
+            "recent_completed_unprepared_managed_cargo_identity",
+            retried["deduplicated_reuse"]["reason"],
+        )
+        self.assertEqual(2, tasks.grabowski_task_list(limit=20)["total_matching"])
+
+    def test_managed_cargo_refresh_to_attention_blocks_before_repreparation(
+        self,
+    ) -> None:
+        raw_command = ["/usr/bin/cargo", "test"]
+
+        def bound(cache_key: str) -> list[str]:
+            target_dir = tasks.MANAGED_CARGO_CACHE_ROOT / cache_key / "target"
+            lifecycle_lock = tasks.MANAGED_CARGO_LOCK_ROOT / f"{cache_key}.lock"
+            return [
+                tasks.FLOCK_EXECUTABLE,
+                "--shared",
+                str(lifecycle_lock),
+                tasks.SYSTEMD_ENV_EXECUTABLE,
+                f"CARGO_TARGET_DIR={target_dir}",
+                *raw_command,
+            ]
+
+        common = {
+            "host": "local",
+            "argv": raw_command,
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "resume_policy": "retry-safe",
+            "cpu_weight": 50,
+            "io_weight": 25,
+            "memory_max_bytes": 64 * 1024 * 1024,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_managed_cargo_request_root", return_value=self.root),
+            patch.object(
+                tasks, "_bind_managed_cargo_environment", return_value=bound("1" * 64)
+            ),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 129}
+            ),
+        ):
+            first = tasks.grabowski_task_start(**common)
+        task_id = str(first["task"]["task_id"])
+        failed_observation = {
+            "state": "failed",
+            "properties": {"Result": "exit-code"},
+            "probe": _launcher(returncode=1),
+            "observer": {"kind": "test"},
+            "observed_at_unix": tasks._now(),
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_managed_cargo_request_root", return_value=self.root),
+            patch.object(
+                tasks, "_bind_managed_cargo_environment", return_value=bound("2" * 64)
+            ) as prepare,
+            patch.object(tasks, "_observe", return_value=failed_observation) as observe,
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 130}
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "unchanged terminal task retry blocked",
+            ),
+        ):
+            tasks.grabowski_task_start(**common)
+        observe.assert_called_once()
+        prepare.assert_not_called()
+        dispatch.assert_not_called()
+        self.assertEqual("failed", tasks._row_raw(task_id)["state"])
+
+    def test_execution_record_unbound_rejects_each_persisted_binding(self) -> None:
+        record = {"task_id": "bound-probe"}
+
+        with (
+            patch.object(tasks, "_persisted_task_operation_identity", return_value=None),
+            patch.object(tasks, "_persisted_retry_binding_or_raise", return_value=None),
+            patch.object(
+                tasks,
+                "_persisted_interrupted_recovery_binding_or_raise",
+                return_value=None,
+            ),
+        ):
+            self.assertTrue(tasks._execution_record_is_unbound(record))
+
+        bound_values = (
+            ("_persisted_task_operation_identity", {"operation_identity_sha256": "a" * 64}),
+            ("_persisted_retry_binding_or_raise", {"binding_sha256": "b" * 64}),
+            (
+                "_persisted_interrupted_recovery_binding_or_raise",
+                {"binding_sha256": "c" * 64},
+            ),
+        )
+        for helper_name, bound_value in bound_values:
+            with self.subTest(helper=helper_name):
+                with (
+                    patch.object(
+                        tasks,
+                        "_persisted_task_operation_identity",
+                        return_value=None,
+                    ),
+                    patch.object(
+                        tasks,
+                        "_persisted_retry_binding_or_raise",
+                        return_value=None,
+                    ),
+                    patch.object(
+                        tasks,
+                        "_persisted_interrupted_recovery_binding_or_raise",
+                        return_value=None,
+                    ),
+                    patch.object(tasks, helper_name, return_value=bound_value),
+                ):
+                    self.assertFalse(tasks._execution_record_is_unbound(record))
+
+    def test_unprepared_managed_cargo_scan_returns_match_before_limit_in_final_batch(
+        self,
+    ) -> None:
+        raw_command = ["/usr/bin/cargo", "test"]
+        identity = tasks._task_execution_identity(
+            host="local",
+            argv_sha256=tasks.command_identity.argv_sha256(raw_command),
+            cwd=str(self.root),
+            resource_keys=[],
+            runtime_seconds=60,
+            cpu_weight=50,
+            io_weight=25,
+            memory_max_bytes=None,
+            chronik_outbox_enabled=False,
+            chronik_outbox_state_root=None,
+            chronik_context_json=None,
+            execution_backend="systemd-user",
+            systemd_scope="user",
+        )
+        skipped = {"task_id": "operation-bound"}
+        matching = {"task_id": "matching-unbound"}
+
+        class FakeCursor:
+            def __init__(self) -> None:
+                self.offset = 0
+
+            def fetchmany(self, limit: int) -> list[dict[str, object]]:
+                if self.offset >= 50001:
+                    return []
+                count = min(limit, 50001 - self.offset)
+                rows = [skipped] * count
+                if self.offset <= 49920 < self.offset + count:
+                    rows[49920 - self.offset] = matching
+                self.offset += count
+                return rows
+
+        class FakeConnection:
+            def __enter__(self) -> "FakeConnection":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def execute(self, *_args: object) -> FakeCursor:
+                return FakeCursor()
+
+        with (
+            patch.object(tasks, "_database_connection", return_value=FakeConnection()),
+            patch.object(
+                tasks,
+                "_record_matches_unprepared_managed_cargo_command",
+                return_value=True,
+            ),
+            patch.object(
+                tasks,
+                "_record_matches_execution_retry_identity",
+                return_value=True,
+            ),
+            patch.object(
+                tasks,
+                "_persisted_task_operation_identity",
+                side_effect=lambda record: (
+                    None
+                    if record["task_id"] == "matching-unbound"
+                    else {"operation_identity_sha256": "f" * 64}
+                ),
+            ),
+            patch.object(tasks, "_persisted_retry_binding_or_raise", return_value=None),
+            patch.object(
+                tasks,
+                "_persisted_interrupted_recovery_binding_or_raise",
+                return_value=None,
+            ),
+        ):
+            selected = tasks._latest_matching_unprepared_managed_cargo_record(
+                identity,
+                raw_command,
+                unbound_only=True,
+            )
+
+        self.assertIsNotNone(selected)
+        self.assertEqual("matching-unbound", selected["task_id"])
+
+    def test_unprepared_managed_cargo_unbound_scan_is_bounded(self) -> None:
+        raw_command = ["/usr/bin/cargo", "test"]
+        identity = tasks._task_execution_identity(
+            host="local",
+            argv_sha256=tasks.command_identity.argv_sha256(raw_command),
+            cwd=str(self.root),
+            resource_keys=[],
+            runtime_seconds=60,
+            cpu_weight=50,
+            io_weight=25,
+            memory_max_bytes=None,
+            chronik_outbox_enabled=False,
+            chronik_outbox_state_root=None,
+            chronik_context_json=None,
+            execution_backend="systemd-user",
+            systemd_scope="user",
+        )
+
+        class FakeCursor:
+            def fetchmany(self, _limit: int) -> list[dict[str, object]]:
+                return [{}] * 50001
+
+        class FakeConnection:
+            def __enter__(self) -> "FakeConnection":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def execute(self, *_args: object) -> FakeCursor:
+                return FakeCursor()
+
+        with (
+            patch.object(tasks, "_database_connection", return_value=FakeConnection()),
+            patch.object(
+                tasks,
+                "_record_matches_unprepared_managed_cargo_command",
+                return_value=True,
+            ),
+            patch.object(
+                tasks,
+                "_record_matches_execution_retry_identity",
+                return_value=True,
+            ),
+            patch.object(
+                tasks,
+                "_persisted_task_operation_identity",
+                return_value={"operation_identity_sha256": "f" * 64},
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "unprepared managed Cargo unbound scan limit exceeded",
+            ),
+        ):
+            tasks._latest_matching_unprepared_managed_cargo_record(
+                identity,
+                raw_command,
+                unbound_only=True,
+            )
+
     def test_managed_cargo_attention_limit_counts_only_command_matches(self) -> None:
         raw_command = ["/usr/bin/cargo", "test"]
 
@@ -10699,6 +11418,76 @@ class TaskTests(unittest.TestCase):
         rows = tasks.grabowski_task_list(limit=20, view="evidence")
         self.assertEqual(1, rows["total_matching"])
 
+    def test_active_resource_execution_reuse_refreshes_lease_and_fails_closed(
+        self,
+    ) -> None:
+        key = "component:active-reuse-lease-conflict"
+        common = {
+            "host": "local",
+            "argv": ["/bin/echo", "active-resource-execution"],
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "resume_policy": "verify-then-retry",
+            "cpu_weight": 50,
+            "io_weight": 25,
+            "memory_max_bytes": 64 * 1024 * 1024,
+            "resource_keys": [key],
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
+            ),
+        ):
+            first = tasks.grabowski_task_start(**common)
+        task_id = str(first["task"]["task_id"])
+        tasks._set_state(
+            task_id,
+            "running",
+            observation={
+                "state": "running",
+                "observed_at_unix": tasks._now(),
+                "properties": {"ActiveState": "active", "SubState": "running"},
+            },
+        )
+        owner = str(first["task"]["lease_owner_id"])
+        tasks.resources.release_resources(owner, [key])
+        foreign_owner = "test:foreign-active-reuse"
+        tasks.resources.acquire_resources(
+            foreign_owner,
+            [key],
+            purpose="foreign active reuse conflict",
+            ttl_seconds=3600,
+        )
+        running = {
+            "state": "running",
+            "properties": {"ActiveState": "active", "SubState": "running"},
+            "probe": _launcher(),
+            "observer": {"kind": "test"},
+            "observed_at_unix": tasks._now(),
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks, "_observe", return_value=running) as observe,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
+            ),
+            self.assertRaisesRegex(
+                RuntimeError, "active execution resource lease maintenance failed"
+            ),
+        ):
+            tasks.grabowski_task_start(**common)
+        observe.assert_called_once()
+        dispatch.assert_not_called()
+        lease = tasks.resources.inspect_resource(key)
+        self.assertIsNotNone(lease)
+        assert lease is not None
+        self.assertEqual(foreign_owner, lease["owner_id"])
+
     def test_active_execution_identity_scan_skips_newer_operation_bound_rows(self) -> None:
         common = {
             "host": "local",
@@ -10820,10 +11609,468 @@ class TaskTests(unittest.TestCase):
         rows = tasks.grabowski_task_list(limit=20, view="evidence")
         self.assertEqual(1, rows["total_matching"])
 
-    def test_completed_execution_identity_allows_new_start(self) -> None:
-        common = {
+    def test_recent_completed_execution_identity_reuses_default_equivalent_start(
+        self,
+    ) -> None:
+        minimal = {
             "host": "local",
             "argv": ["/bin/echo", "completed-execution"],
+            "cwd": str(self.root),
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
+            ),
+        ):
+            first = tasks.grabowski_task_start(**minimal)
+        task_id = str(first["task"]["task_id"])
+        tasks._set_state(
+            task_id,
+            "completed",
+            observation={"state": "completed", "observed_at_unix": tasks._now()},
+        )
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
+            ),
+        ):
+            second = tasks.grabowski_task_start(
+                **minimal,
+                runtime_seconds=tasks.operator.DEFAULT_JOB_RUNTIME,
+                resume_policy="verify-then-retry",
+                cpu_weight=100,
+                io_weight=100,
+                memory_max_bytes=None,
+                resource_keys=None,
+            )
+        dispatch.assert_not_called()
+        self.assertEqual(task_id, second["task"]["task_id"])
+        self.assertEqual(
+            "recent_completed_execution_identity",
+            second["deduplicated_reuse"]["reason"],
+        )
+        rows = tasks.grabowski_task_list(limit=20, view="evidence")
+        self.assertEqual(1, rows["total_matching"])
+
+    def test_chronik_retry_match_projection_ignores_only_live_subject_projection(
+        self,
+    ) -> None:
+        base = {
+            "schema_version": 1,
+            "host": "local",
+            "argv_sha256": "a" * 64,
+            "cwd": str(self.root),
+            "resource_keys": [f"repo:{self.root}"],
+            "runtime_seconds": 60,
+            "cpu_weight": 100,
+            "io_weight": 100,
+            "memory_max_bytes": None,
+            "chronik_outbox_enabled": True,
+            "chronik_outbox_state_root": str(self.root / "chronik-state"),
+            "execution_backend": "systemd-user",
+            "systemd_scope": "user",
+            "identity_sha256": "b" * 64,
+        }
+        stable = {
+            "operation": "implement",
+            "task_class": "coding",
+            "component": "task-runner",
+            "future_field": {"v": 1},
+        }
+        repository = {
+            **base,
+            "chronik_context": {
+                **stable,
+                "subject_scope": "repository",
+                "repo": "heimgewebe/grabowski",
+            },
+        }
+        host = {
+            **base,
+            "chronik_context": {
+                **stable,
+                "subject_scope": "host",
+                "host": "local",
+            },
+        }
+        self.assertEqual(
+            tasks._execution_retry_match_projection(repository),
+            tasks._execution_retry_match_projection(host),
+        )
+        changed = {
+            **host,
+            "chronik_context": {
+                **host["chronik_context"],
+                "future_field": {"v": 2},
+            },
+        }
+        self.assertNotEqual(
+            tasks._execution_retry_match_projection(repository),
+            tasks._execution_retry_match_projection(changed),
+        )
+
+    def test_active_execution_reuses_across_chronik_subject_projection_drift(
+        self,
+    ) -> None:
+        outbox_root = self.root / "chronik-active-state"
+        repo_context = tasks._canonical_json(
+            {
+                "subject_scope": "repository",
+                "repo": "heimgewebe/grabowski",
+                "operation": "implement",
+                "task_class": "coding",
+                "component": "task-runner",
+            }
+        )
+        host_context = tasks._canonical_json(
+            {
+                "subject_scope": "host",
+                "host": "local",
+                "operation": "implement",
+                "task_class": "coding",
+                "component": "task-runner",
+            }
+        )
+        common = {
+            "host": "local",
+            "argv": ["/bin/echo", "chronik-active"],
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "resource_keys": [f"repo:{self.root}"],
+            "chronik_outbox": True,
+            "chronik_outbox_state_root": str(outbox_root),
+            "chronik_operation": "implement",
+            "chronik_component": "task-runner",
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_chronik_context", return_value=repo_context),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 199}
+            ),
+        ):
+            first = tasks.grabowski_task_start(**common)
+        task_id = str(first["task"]["task_id"])
+        tasks._set_state(
+            task_id,
+            "running",
+            observation={
+                "state": "running",
+                "observed_at_unix": tasks._now(),
+                "properties": {"ActiveState": "active", "SubState": "running"},
+            },
+        )
+
+        running = {
+            "state": "running",
+            "properties": {"ActiveState": "active", "SubState": "running"},
+            "probe": _launcher(),
+            "observer": {"kind": "test"},
+            "observed_at_unix": tasks._now(),
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_chronik_context", return_value=host_context),
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks, "_observe", return_value=running) as observe,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 200}
+            ),
+        ):
+            retried = tasks.grabowski_task_start(**common)
+        dispatch.assert_not_called()
+        observe.assert_called_once()
+        self.assertEqual(task_id, retried["task"]["task_id"])
+        self.assertEqual(
+            "active_execution_identity",
+            retried["deduplicated_reuse"]["reason"],
+        )
+        self.assertEqual(1, tasks.grabowski_task_list(limit=20)["total_matching"])
+
+    def test_recent_completed_execution_reuses_across_chronik_subject_projection_drift(
+        self,
+    ) -> None:
+        outbox_root = self.root / "chronik-retry-state"
+        repo_context = tasks._canonical_json(
+            {
+                "subject_scope": "repository",
+                "repo": "heimgewebe/grabowski",
+                "operation": "implement",
+                "task_class": "coding",
+                "component": "task-runner",
+            }
+        )
+        host_context = tasks._canonical_json(
+            {
+                "subject_scope": "host",
+                "host": "local",
+                "operation": "implement",
+                "task_class": "coding",
+                "component": "task-runner",
+            }
+        )
+        common = {
+            "host": "local",
+            "argv": ["/bin/echo", "chronik-retry"],
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "resource_keys": [f"repo:{self.root}"],
+            "chronik_outbox": True,
+            "chronik_outbox_state_root": str(outbox_root),
+            "chronik_operation": "implement",
+            "chronik_component": "task-runner",
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_chronik_context", return_value=repo_context),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 201}
+            ),
+        ):
+            first = tasks.grabowski_task_start(**common)
+        task_id = str(first["task"]["task_id"])
+        tasks._set_state(
+            task_id,
+            "completed",
+            observation={"state": "completed", "observed_at_unix": tasks._now()},
+        )
+
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_chronik_context", return_value=host_context),
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 202}
+            ),
+        ):
+            retried = tasks.grabowski_task_start(**common)
+        dispatch.assert_not_called()
+        self.assertEqual(task_id, retried["task"]["task_id"])
+        self.assertEqual(
+            "recent_completed_execution_identity",
+            retried["deduplicated_reuse"]["reason"],
+        )
+
+    def test_chronik_subject_projection_drift_does_not_bypass_attention_guard(
+        self,
+    ) -> None:
+        outbox_root = self.root / "chronik-attention-state"
+        repo_context = tasks._canonical_json(
+            {
+                "subject_scope": "repository",
+                "repo": "heimgewebe/grabowski",
+                "operation": "implement",
+                "task_class": "coding",
+            }
+        )
+        host_context = tasks._canonical_json(
+            {
+                "subject_scope": "host",
+                "host": "local",
+                "operation": "implement",
+                "task_class": "coding",
+            }
+        )
+        common = {
+            "host": "local",
+            "argv": ["/bin/echo", "chronik-attention"],
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "chronik_outbox": True,
+            "chronik_outbox_state_root": str(outbox_root),
+            "chronik_operation": "implement",
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_chronik_context", return_value=repo_context),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 203}
+            ),
+        ):
+            first = tasks.grabowski_task_start(**common)
+        tasks._set_state(
+            str(first["task"]["task_id"]),
+            "failed",
+            observation={"state": "failed", "observed_at_unix": tasks._now()},
+        )
+
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_chronik_context", return_value=host_context),
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 204}
+            ),
+            self.assertRaisesRegex(RuntimeError, "unchanged terminal task retry blocked"),
+        ):
+            tasks.grabowski_task_start(**common)
+        dispatch.assert_not_called()
+
+    def test_attention_execution_scan_filters_stable_context_before_cap(
+        self,
+    ) -> None:
+        outbox_root = self.root / "chronik-attention-cap-state"
+        target_context = tasks._canonical_json(
+            {
+                "subject_scope": "repository",
+                "repo": "heimgewebe/grabowski",
+                "operation": "implement",
+                "task_class": "coding",
+                "component": "target",
+            }
+        )
+        common = {
+            "host": "local",
+            "argv": ["/bin/echo", "chronik-attention-cap"],
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "chronik_outbox": True,
+            "chronik_outbox_state_root": str(outbox_root),
+            "chronik_operation": "implement",
+            "chronik_component": "target",
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_chronik_context", return_value=target_context),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 207}
+            ),
+        ):
+            started = tasks.grabowski_task_start(**common)
+        relevant_id = str(started["task"]["task_id"])
+        tasks._set_state(
+            relevant_id,
+            "failed",
+            observation={"state": "failed", "observed_at_unix": tasks._now()},
+        )
+        relevant = tasks._row_raw(relevant_id)
+        columns = tuple(relevant)
+        with tasks._database() as connection:
+            for offset, (task_id, component) in enumerate(
+                (("e" * 24, "other-a"), ("f" * 24, "other-b")),
+                start=1,
+            ):
+                clone = dict(relevant)
+                clone["task_id"] = task_id
+                clone["unit"] = tasks._task_unit(task_id, 1)
+                clone["authoritative_unit"] = clone["unit"]
+                clone["lease_owner_id"] = f"task:{task_id}"
+                clone["created_at_unix"] = int(relevant["created_at_unix"]) + offset
+                clone["updated_at_unix"] = int(relevant["updated_at_unix"]) + offset
+                clone["chronik_context_json"] = tasks._canonical_json(
+                    {
+                        "subject_scope": "host",
+                        "host": "local",
+                        "operation": "implement",
+                        "task_class": "coding",
+                        "component": component,
+                    }
+                )
+                connection.execute(
+                    f"INSERT INTO tasks ({','.join(columns)}) VALUES "
+                    f"({','.join('?' for _ in columns)})",
+                    tuple(clone[column] for column in columns),
+                )
+            connection.commit()
+        identity = tasks._record_execution_identity(relevant)
+        with patch.object(tasks, "EXECUTION_ATTENTION_MATCH_LIMIT", 1):
+            records = tasks._matching_attention_execution_records(identity)
+        self.assertEqual(
+            [relevant_id],
+            [record["task_id"] for record in records],
+        )
+
+    def test_chronik_stable_context_change_does_not_reuse_completed_execution(
+        self,
+    ) -> None:
+        outbox_root = self.root / "chronik-component-state"
+        first_context = tasks._canonical_json(
+            {
+                "subject_scope": "repository",
+                "repo": "heimgewebe/grabowski",
+                "operation": "implement",
+                "task_class": "coding",
+                "component": "component-a",
+            }
+        )
+        second_context = tasks._canonical_json(
+            {
+                "subject_scope": "host",
+                "host": "local",
+                "operation": "implement",
+                "task_class": "coding",
+                "component": "component-b",
+            }
+        )
+        base = {
+            "host": "local",
+            "argv": ["/bin/echo", "chronik-component"],
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "chronik_outbox": True,
+            "chronik_outbox_state_root": str(outbox_root),
+            "chronik_operation": "implement",
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_chronik_context", return_value=first_context),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 205}
+            ),
+        ):
+            first = tasks.grabowski_task_start(
+                **base,
+                chronik_component="component-a",
+            )
+        first_id = str(first["task"]["task_id"])
+        tasks._set_state(
+            first_id,
+            "completed",
+            observation={"state": "completed", "observed_at_unix": tasks._now()},
+        )
+
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_chronik_context", return_value=second_context),
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 206}
+            ),
+        ):
+            second = tasks.grabowski_task_start(
+                **base,
+                chronik_component="component-b",
+            )
+        dispatch.assert_called_once()
+        self.assertNotEqual(first_id, second["task"]["task_id"])
+        self.assertIsNone(second["deduplicated_reuse"])
+
+    def _completed_execution_reuse_validation_fixture(
+        self,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        common = {
+            "host": "local",
+            "argv": ["/bin/echo", "completed-validation-execution"],
             "cwd": str(self.root),
             "runtime_seconds": 60,
             "resume_policy": "verify-then-retry",
@@ -10840,14 +12087,376 @@ class TaskTests(unittest.TestCase):
             ),
         ):
             first = tasks.grabowski_task_start(**common)
+        task_id = str(first["task"]["task_id"])
         tasks._set_state(
-            str(first["task"]["task_id"]),
+            task_id,
             "completed",
-            observation={
-                "state": "completed",
-                "observed_at_unix": tasks._now(),
-            },
+            observation={"state": "completed", "observed_at_unix": tasks._now()},
         )
+        record = tasks._row_raw(task_id)
+        return record, tasks._record_execution_identity(record)
+
+    def test_recent_completed_execution_identity_resume_policy_mismatch_fails_closed(
+        self,
+    ) -> None:
+        record, identity = self._completed_execution_reuse_validation_fixture()
+        with (
+            patch.object(
+                tasks,
+                "_latest_matching_unbound_execution_record",
+                return_value=record,
+            ),
+            self.assertRaisesRegex(RuntimeError, "different resume policy"),
+        ):
+            tasks._resolve_recent_completed_execution_reuse(
+                identity,
+                resume_policy="never",
+            )
+
+    def test_recent_completed_execution_identity_invalid_timestamp_fails_closed(
+        self,
+    ) -> None:
+        record, identity = self._completed_execution_reuse_validation_fixture()
+        invalid = dict(record)
+        invalid["terminalized_at_unix"] = None
+        invalid["updated_at_unix"] = "invalid"
+        with (
+            patch.object(
+                tasks,
+                "_latest_matching_unbound_execution_record",
+                return_value=invalid,
+            ),
+            self.assertRaisesRegex(RuntimeError, "timestamp is invalid"),
+        ):
+            tasks._resolve_recent_completed_execution_reuse(
+                identity,
+                resume_policy="verify-then-retry",
+            )
+
+    def test_recent_completed_execution_identity_future_timestamp_fails_closed(
+        self,
+    ) -> None:
+        record, identity = self._completed_execution_reuse_validation_fixture()
+        future = dict(record)
+        future["terminalized_at_unix"] = tasks._now() + 1
+        with (
+            patch.object(
+                tasks,
+                "_latest_matching_unbound_execution_record",
+                return_value=future,
+            ),
+            self.assertRaisesRegex(RuntimeError, "timestamp is in the future"),
+        ):
+            tasks._resolve_recent_completed_execution_reuse(
+                identity,
+                resume_policy="verify-then-retry",
+            )
+
+    def test_recent_completed_execution_identity_missing_lifecycle_receipt_fails_closed(
+        self,
+    ) -> None:
+        record, identity = self._completed_execution_reuse_validation_fixture()
+        missing_receipt = dict(record)
+        missing_receipt["lifecycle_receipt_sha256"] = None
+        with (
+            patch.object(
+                tasks,
+                "_latest_matching_unbound_execution_record",
+                return_value=missing_receipt,
+            ),
+            self.assertRaisesRegex(RuntimeError, "lacks a valid lifecycle receipt"),
+        ):
+            tasks._resolve_recent_completed_execution_reuse(
+                identity,
+                resume_policy="verify-then-retry",
+            )
+
+    def test_unbound_execution_identity_inconsistent_record_fails_closed(self) -> None:
+        record, identity = self._completed_execution_reuse_validation_fixture()
+        inconsistent = dict(record)
+        inconsistent["argv_sha256"] = "0" * 64
+
+        class FakeCursor:
+            def fetchall(self) -> list[dict[str, object]]:
+                return [inconsistent]
+
+        class FakeConnection:
+            def __enter__(self) -> "FakeConnection":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def execute(self, *_args: object) -> FakeCursor:
+                return FakeCursor()
+
+        with (
+            patch.object(tasks, "_database_connection", return_value=FakeConnection()),
+            self.assertRaisesRegex(
+                RuntimeError, "stored task execution identity is inconsistent"
+            ),
+        ):
+            tasks._latest_matching_unbound_execution_record(identity)
+
+    def test_execution_identity_scan_limit_returns_newest_match(self) -> None:
+        record, identity = self._completed_execution_reuse_validation_fixture()
+
+        class FakeCursor:
+            def fetchall(self) -> list[dict[str, object]]:
+                return [record] * 50001
+
+        class FakeConnection:
+            def __enter__(self) -> "FakeConnection":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def execute(self, *_args: object) -> FakeCursor:
+                return FakeCursor()
+
+        with patch.object(
+            tasks, "_database_connection", return_value=FakeConnection()
+        ):
+            matching = tasks._latest_matching_execution_record(identity)
+
+        self.assertIsNotNone(matching)
+        self.assertEqual(record["task_id"], matching["task_id"])
+
+    def test_execution_identity_scan_limit_fails_closed(self) -> None:
+        record, identity = self._completed_execution_reuse_validation_fixture()
+
+        class FakeCursor:
+            def fetchall(self) -> list[dict[str, object]]:
+                return [record] * 50001
+
+        class FakeConnection:
+            def __enter__(self) -> "FakeConnection":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def execute(self, *_args: object) -> FakeCursor:
+                return FakeCursor()
+
+        with (
+            patch.object(tasks, "_database_connection", return_value=FakeConnection()),
+            patch.object(
+                tasks, "_record_matches_execution_retry_identity", return_value=False
+            ),
+            self.assertRaisesRegex(
+                RuntimeError, "execution retry identity scan limit exceeded"
+            ),
+        ):
+            tasks._latest_matching_execution_record(identity)
+
+    def test_unbound_execution_identity_scan_limit_returns_newest_match(self) -> None:
+        record, identity = self._completed_execution_reuse_validation_fixture()
+
+        class FakeCursor:
+            def fetchall(self) -> list[dict[str, object]]:
+                return [record] * 50001
+
+        class FakeConnection:
+            def __enter__(self) -> "FakeConnection":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def execute(self, *_args: object) -> FakeCursor:
+                return FakeCursor()
+
+        with patch.object(
+            tasks, "_database_connection", return_value=FakeConnection()
+        ):
+            matching = tasks._latest_matching_unbound_execution_record(identity)
+
+        self.assertIsNotNone(matching)
+        self.assertEqual(record["task_id"], matching["task_id"])
+
+    def test_unbound_execution_identity_scan_limit_fails_closed(self) -> None:
+        _record, identity = self._completed_execution_reuse_validation_fixture()
+        bound = {"task_id": "operation-bound"}
+
+        class FakeCursor:
+            def fetchall(self) -> list[dict[str, object]]:
+                return [bound] * 50001
+
+        class FakeConnection:
+            def __enter__(self) -> "FakeConnection":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def execute(self, *_args: object) -> FakeCursor:
+                return FakeCursor()
+
+        with (
+            patch.object(tasks, "_database_connection", return_value=FakeConnection()),
+            patch.object(
+                tasks,
+                "_persisted_task_operation_identity",
+                return_value={"operation_identity_sha256": "f" * 64},
+            ),
+            self.assertRaisesRegex(
+                RuntimeError, "unbound execution identity scan limit exceeded"
+            ),
+        ):
+            tasks._latest_matching_unbound_execution_record(identity)
+
+    def test_resource_bound_active_execution_refreshes_completed_before_reacquire(
+        self,
+    ) -> None:
+        common = {
+            "host": "local",
+            "argv": ["/bin/echo", "completed-resource-execution"],
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "resource_keys": ["port:9222"],
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
+            ),
+        ):
+            first = tasks.grabowski_task_start(**common)
+        task_id = str(first["task"]["task_id"])
+        self.assertIn(first["task"]["state"], tasks.TASK_STATE_PROJECTIONS["active"])
+        self.assertIsNotNone(tasks.resources.inspect_resource("port:9222"))
+
+        completed_observation = {
+            "state": "completed",
+            "observed_at_unix": tasks._now(),
+            "properties": {
+                "ActiveState": "inactive",
+                "SubState": "dead",
+                "Result": "success",
+                "ExecMainCode": "exited",
+                "ExecMainStatus": "0",
+            },
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_observe", return_value=completed_observation) as observe,
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
+            ),
+        ):
+            second = tasks.grabowski_task_start(**common)
+        observe.assert_called_once()
+        dispatch.assert_not_called()
+        self.assertEqual(task_id, second["task"]["task_id"])
+        self.assertEqual("completed", second["task"]["state"])
+        self.assertEqual(
+            "recent_completed_execution_identity",
+            second["deduplicated_reuse"]["reason"],
+        )
+        self.assertIsNone(tasks.resources.inspect_resource("port:9222"))
+        rows = tasks.grabowski_task_list(limit=20, view="evidence")
+        self.assertEqual(1, rows["total_matching"])
+
+    def test_operation_bound_completion_does_not_shadow_recent_unbound_reuse(
+        self,
+    ) -> None:
+        common = {
+            "host": "local",
+            "argv": ["/bin/echo", "completed-shadowed-execution"],
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
+            ),
+        ):
+            first = tasks.grabowski_task_start(**common)
+        first_id = str(first["task"]["task_id"])
+        tasks._set_state(
+            first_id,
+            "completed",
+            observation={"state": "completed", "observed_at_unix": tasks._now()},
+        )
+
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
+            ),
+        ):
+            distinct = tasks.grabowski_task_start(
+                **common,
+                operation_identity=self._operation_identity_fixture(source="e"),
+            )
+        tasks._set_state(
+            str(distinct["task"]["task_id"]),
+            "completed",
+            observation={"state": "completed", "observed_at_unix": tasks._now()},
+        )
+
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 125}
+            ),
+        ):
+            repeated = tasks.grabowski_task_start(**common)
+        dispatch.assert_not_called()
+        self.assertEqual(first_id, repeated["task"]["task_id"])
+        self.assertEqual(
+            "recent_completed_execution_identity",
+            repeated["deduplicated_reuse"]["reason"],
+        )
+
+    def test_completed_execution_identity_allows_new_start_after_reuse_window(
+        self,
+    ) -> None:
+        common = {
+            "host": "local",
+            "argv": ["/bin/echo", "completed-expired-execution"],
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "resume_policy": "verify-then-retry",
+            "cpu_weight": 50,
+            "io_weight": 25,
+            "memory_max_bytes": 64 * 1024 * 1024,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
+            ),
+        ):
+            first = tasks.grabowski_task_start(**common)
+        first_id = str(first["task"]["task_id"])
+        tasks._set_state(
+            first_id,
+            "completed",
+            observation={"state": "completed", "observed_at_unix": tasks._now()},
+        )
+        expired = tasks._now() - tasks.TASK_OPERATION_REUSE_WINDOW_SECONDS - 1
+        with tasks._database() as connection:
+            connection.execute(
+                "UPDATE tasks SET updated_at_unix=?, terminalized_at_unix=? "
+                "WHERE task_id=?",
+                (expired, expired, first_id),
+            )
         with (
             patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
             patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
@@ -10858,7 +12467,47 @@ class TaskTests(unittest.TestCase):
         ):
             second = tasks.grabowski_task_start(**common)
         self.assertTrue(dispatch.called)
-        self.assertNotEqual(first["task"]["task_id"], second["task"]["task_id"])
+        self.assertNotEqual(first_id, second["task"]["task_id"])
+        self.assertIsNone(second["deduplicated_reuse"])
+
+    def test_recent_completed_execution_identity_distinct_operation_starts_new_work(
+        self,
+    ) -> None:
+        common = {
+            "host": "local",
+            "argv": ["/bin/echo", "completed-distinct-operation"],
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
+            ),
+        ):
+            first = tasks.grabowski_task_start(**common)
+        first_id = str(first["task"]["task_id"])
+        tasks._set_state(
+            first_id,
+            "completed",
+            observation={"state": "completed", "observed_at_unix": tasks._now()},
+        )
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
+            ),
+        ):
+            second = tasks.grabowski_task_start(
+                **common,
+                operation_identity=self._operation_identity_fixture(source="f"),
+            )
+        self.assertTrue(dispatch.called)
+        self.assertNotEqual(first_id, second["task"]["task_id"])
         self.assertIsNone(second["deduplicated_reuse"])
 
     def test_operation_identity_attention_retry_requires_bound_supersession(self) -> None:
