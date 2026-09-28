@@ -202,6 +202,22 @@ def capture_untracked_preimage(
     rechecked_paths = [path for path in rechecked.stdout.split(b"\0") if path]
     if rechecked_paths != paths:
         raise RuntimeError("Git untracked path set changed during preimage capture")
+    rechecked_digest = _safe_worktree_paths_sha256(
+        repo,
+        paths,
+        max_paths=max_paths,
+        max_total_bytes=max_total_bytes,
+        deadline_monotonic=deadline_monotonic,
+    )
+    if rechecked_digest != digest:
+        raise RuntimeError("Git untracked worktree changed during preimage capture")
+    _deadline_guard(deadline_monotonic, "untracked preimage capture")
+    final = probe(repo, ["ls-files", "--others", "--exclude-standard", "-z"])
+    if final.returncode != 0:
+        raise RuntimeError("Git untracked final observation failed")
+    final_paths = [path for path in final.stdout.split(b"\0") if path]
+    if final_paths != paths:
+        raise RuntimeError("Git untracked path set changed during preimage capture")
     material = {"schema_version": 1, "count": len(paths), "worktree_sha256": digest}
     return {
         **material,
@@ -745,6 +761,82 @@ def capture_branch_preimage(
     if index_recheck.returncode != 0:
         raise RuntimeError("Git index re-observation failed")
     if index_recheck.stdout != index_result.stdout:
+        raise RuntimeError("Git index changed during preimage capture")
+
+    rechecked_worktree_sha256 = _tracked_worktree_sha256(
+        repo,
+        index_result.stdout,
+        max_paths=max_tracked_paths,
+        max_total_bytes=max_tracked_bytes,
+        deadline_monotonic=deadline_monotonic,
+    )
+    if rechecked_worktree_sha256 != worktree_sha256:
+        raise RuntimeError("Git tracked worktree changed during preimage capture")
+
+    _deadline_guard(deadline_monotonic, "branch preimage capture")
+    final_branch_probe = probe(
+        repo, ["symbolic-ref", "--quiet", "--short", "HEAD"]
+    )
+    if final_branch_probe.returncode == 0:
+        final_branch = final_branch_probe.stdout.decode(
+            "utf-8", errors="strict"
+        ).strip()
+        if not final_branch:
+            raise RuntimeError("Git final branch observation returned an empty branch")
+    elif final_branch_probe.returncode == 1:
+        final_branch = None
+    else:
+        raise RuntimeError("Git final branch observation failed")
+    if final_branch != branch:
+        raise RuntimeError("Git branch changed during preimage capture")
+
+    final_head_probe = probe(repo, ["rev-parse", "--verify", "--quiet", "HEAD"])
+    if final_head_probe.returncode == 0:
+        final_head = final_head_probe.stdout.decode("ascii", errors="strict").strip()
+        if re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", final_head) is None:
+            raise RuntimeError("Git final HEAD observation is not an object id")
+        final_head_state = "present"
+    elif final_head_probe.returncode == 1 and final_branch is not None:
+        final_head = None
+        final_head_state = "unborn"
+    else:
+        raise RuntimeError("Git final HEAD observation failed")
+    if final_head != head or final_head_state != head_state:
+        raise RuntimeError("Git HEAD changed during preimage capture")
+
+    final_operation_refs = _git_operation_state_markers(
+        Path(physical_before["git_dir"]["path"]),
+        deadline_monotonic=deadline_monotonic,
+    )
+    for name in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD"):
+        _deadline_guard(deadline_monotonic, "branch preimage capture")
+        ref_probe = probe(repo, ["rev-parse", "--verify", "--quiet", name])
+        if ref_probe.returncode == 0:
+            value = ref_probe.stdout.decode("ascii", errors="strict").strip()
+            if value:
+                final_operation_refs[name] = value
+        elif ref_probe.returncode != 1:
+            raise RuntimeError(f"Git final operation-state observation failed: {name}")
+    if final_operation_refs != operation_refs:
+        raise RuntimeError("Git operation state changed during preimage capture")
+
+    _require_effective_git_toplevel(
+        repo,
+        probe,
+        deadline_monotonic=deadline_monotonic,
+    )
+    try:
+        physical_checkout.verify_physical_checkout_identity(physical_before)
+    except physical_checkout.PhysicalCheckoutIdentityError as exc:
+        raise physical_checkout.PhysicalCheckoutIdentityError(
+            "physical checkout identity changed during preimage capture"
+        ) from exc
+
+    _deadline_guard(deadline_monotonic, "branch preimage capture")
+    final_index = index_reader(repo, ["ls-files", "--stage", "-z"])
+    if final_index.returncode != 0:
+        raise RuntimeError("Git final index observation failed")
+    if final_index.stdout != index_result.stdout:
         raise RuntimeError("Git index changed during preimage capture")
 
     material: dict[str, Any] = {
