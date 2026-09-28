@@ -236,6 +236,8 @@ MAX_PROVIDER_EXECUTABLE_BYTES = 512 * 1024 * 1024
 MAX_MCP_SOURCE_TREE_FILES = 4096
 MAX_MCP_SOURCE_TREE_BYTES = 64 * 1024 * 1024
 MAX_MCP_SOURCE_TREE_LISTING_BYTES = 32 * 1024 * 1024
+MAX_MCP_MANIFEST_ARTIFACTS = 4096
+MAX_MCP_MANIFEST_ARTIFACT_BYTES = 256 * 1024 * 1024
 MAX_AUTH_BYTES = 64 * 1024
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_DISPATCH_AUTHORIZATION_BYTES = 16 * 1024 * 1024
@@ -1586,9 +1588,14 @@ def _rebind_staged_manifest_authorization(
         for index, item in enumerate(expected)
         if canonical(item) == canonical(original_authorization)
     ]
+    if not matches:
+        # A directory --bundle-root is intentionally absent from preflight's
+        # command-file authorization. Preserve the program-only binding; the
+        # subsequent _bind_mcp_upstream call revalidates that exact shape.
+        return [dict(item) for item in expected]
     if len(matches) != 1:
         raise RunnerError(
-            "preflight MCP files do not bind the authorized RepoGround manifest exactly once"
+            "preflight MCP files bind the authorized RepoGround manifest ambiguously"
         )
     staged_authorization = _mcp_authorization_identity(manifest_binding)
     match = matches[0]
@@ -2896,6 +2903,7 @@ def _manifest_artifact_paths(
     root = manifest_source.parent
     result: list[tuple[Path, Path, int, str]] = []
     seen: dict[Path, tuple[int, str]] = {}
+    total_bytes = 0
     for artifact in artifacts:
         if not isinstance(artifact, dict):
             raise RunnerError("RepoGround manifest artifact entry is invalid")
@@ -2908,6 +2916,7 @@ def _manifest_artifact_paths(
             isinstance(expected_bytes, bool)
             or not isinstance(expected_bytes, int)
             or expected_bytes < 0
+            or expected_bytes > MAX_PROVIDER_EXECUTABLE_BYTES
             or not isinstance(expected_sha256, str)
             or re.fullmatch(r"[a-f0-9]{64}", expected_sha256) is None
         ):
@@ -2940,6 +2949,13 @@ def _manifest_artifact_paths(
                     "RepoGround manifest artifact path has conflicting identities"
                 )
             continue
+        if len(result) >= MAX_MCP_MANIFEST_ARTIFACTS:
+            raise RunnerError("RepoGround manifest artifact count exceeds its budget")
+        total_bytes += expected_bytes
+        if total_bytes > MAX_MCP_MANIFEST_ARTIFACT_BYTES:
+            raise RunnerError(
+                "RepoGround manifest artifacts exceed their aggregate byte budget"
+            )
         seen[relative] = identity
         result.append((relative, candidate, expected_bytes, expected_sha256))
     return result

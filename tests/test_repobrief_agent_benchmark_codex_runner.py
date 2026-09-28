@@ -4454,6 +4454,54 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 runner.cleanup_staged_repoground_manifest(first_stage)
             )
 
+    def test_staged_manifest_rebind_preserves_directory_bundle_authorization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "state"
+            state_root.mkdir(mode=0o700)
+            executable = root / "python3"
+            executable.write_bytes(Path(sys.executable).resolve().read_bytes())
+            executable.chmod(0o755)
+            script = root / "server.py"
+            script.write_text("pass\n", encoding="utf-8")
+            manifest = root / "chosen.bundle.manifest.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+            authorized = [
+                file_identity(executable),
+                file_identity(script),
+            ]
+            first_stage = runner.stage_repoground_manifest(
+                state_root, file_identity(manifest)
+            )
+            staged_manifest = Path(first_stage["path"])
+            directory_upstream = [
+                str(executable),
+                str(script),
+                "--bundle-root",
+                str(root),
+            ]
+
+            rebound = runner._rebind_staged_manifest_authorization(
+                authorized, first_stage
+            )
+            self.assertEqual(rebound, authorized)
+
+            second_stage = runner.stage_mcp_upstream(
+                state_root,
+                [
+                    str(executable),
+                    str(script),
+                    "--bundle-root",
+                    str(staged_manifest),
+                ],
+                staged_manifest,
+                rebound,
+            )
+            self.assertIsNone(runner.cleanup_staged_mcp_upstream(second_stage))
+            self.assertIsNone(
+                runner.cleanup_staged_repoground_manifest(first_stage)
+            )
+
     def test_staged_manifest_preserves_relative_artifact_context(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -5024,6 +5072,59 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertEqual(len(paths), 1)
             self.assertEqual(paths[0][0], Path("brief.md"))
 
+
+    def test_manifest_artifact_contract_enforces_aggregate_budgets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = root / "chosen.bundle.manifest.json"
+            artifacts = [
+                {
+                    "role": "canonical_md",
+                    "path": "a.md",
+                    "bytes": 4,
+                    "sha256": "a" * 64,
+                },
+                {
+                    "role": "canonical_md",
+                    "path": "b.md",
+                    "bytes": 4,
+                    "sha256": "b" * 64,
+                },
+            ]
+            manifest.write_text(
+                json.dumps({"artifacts": artifacts}, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            raw = manifest.read_bytes()
+
+            with patch.object(runner, "MAX_MCP_MANIFEST_ARTIFACTS", 1):
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "artifact count exceeds its budget",
+                ):
+                    runner._manifest_artifact_paths(manifest, raw)
+
+            with patch.object(runner, "MAX_MCP_MANIFEST_ARTIFACT_BYTES", 7):
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "aggregate byte budget",
+                ):
+                    runner._manifest_artifact_paths(manifest, raw)
+
+            duplicate = dict(artifacts[0])
+            manifest.write_text(
+                json.dumps(
+                    {"artifacts": [artifacts[0], duplicate]},
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with patch.object(runner, "MAX_MCP_MANIFEST_ARTIFACTS", 1):
+                paths = runner._manifest_artifact_paths(
+                    manifest, manifest.read_bytes()
+                )
+            self.assertEqual(len(paths), 1)
 
     def test_staged_manifest_rejects_missing_or_nonregular_identity_artifact(self) -> None:
         for mode in ("missing", "directory", "symlink"):
