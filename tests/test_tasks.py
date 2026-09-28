@@ -10029,6 +10029,97 @@ class TaskTests(unittest.TestCase):
         self.assertNotEqual(first_id, second["task"]["task_id"])
         self.assertIsNone(second["deduplicated_reuse"])
 
+    def test_managed_cargo_unbound_reuse_skips_newer_operation_bound_record(self) -> None:
+        raw_command = ["/usr/bin/cargo", "test"]
+
+        def bound(cache_key: str) -> list[str]:
+            target_dir = tasks.MANAGED_CARGO_CACHE_ROOT / cache_key / "target"
+            lifecycle_lock = tasks.MANAGED_CARGO_LOCK_ROOT / f"{cache_key}.lock"
+            return [
+                tasks.FLOCK_EXECUTABLE,
+                "--shared",
+                str(lifecycle_lock),
+                tasks.SYSTEMD_ENV_EXECUTABLE,
+                f"CARGO_TARGET_DIR={target_dir}",
+                *raw_command,
+            ]
+
+        common = {
+            "host": "local",
+            "argv": raw_command,
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "resume_policy": "retry-safe",
+            "cpu_weight": 50,
+            "io_weight": 25,
+            "memory_max_bytes": 64 * 1024 * 1024,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_managed_cargo_request_root", return_value=self.root),
+            patch.object(
+                tasks, "_bind_managed_cargo_environment", return_value=bound("7" * 64)
+            ),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 131}
+            ),
+        ):
+            base = tasks.grabowski_task_start(**common)
+        base_id = str(base["task"]["task_id"])
+        tasks._set_state(
+            base_id,
+            "completed",
+            observation={"state": "completed", "observed_at_unix": tasks._now()},
+        )
+
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_managed_cargo_request_root", return_value=self.root),
+            patch.object(
+                tasks, "_bind_managed_cargo_environment", return_value=bound("8" * 64)
+            ),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 132}
+            ),
+        ):
+            operation = tasks.grabowski_task_start(
+                **common,
+                operation_identity=self._operation_identity_fixture(source="e"),
+            )
+        operation_id = str(operation["task"]["task_id"])
+        self.assertNotEqual(base_id, operation_id)
+        tasks._set_state(
+            operation_id,
+            "completed",
+            observation={"state": "completed", "observed_at_unix": tasks._now()},
+        )
+
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_managed_cargo_request_root", return_value=self.root),
+            patch.object(
+                tasks, "_bind_managed_cargo_environment", return_value=bound("9" * 64)
+            ) as prepare,
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 133}
+            ),
+        ):
+            retried = tasks.grabowski_task_start(**common)
+        prepare.assert_not_called()
+        dispatch.assert_not_called()
+        self.assertEqual(base_id, retried["task"]["task_id"])
+        self.assertEqual(
+            "recent_completed_unprepared_managed_cargo_identity",
+            retried["deduplicated_reuse"]["reason"],
+        )
+        self.assertEqual(2, tasks.grabowski_task_list(limit=20)["total_matching"])
+
     def test_managed_cargo_refresh_to_attention_blocks_before_repreparation(
         self,
     ) -> None:
