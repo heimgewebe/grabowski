@@ -10272,6 +10272,89 @@ class TaskTests(unittest.TestCase):
         dispatch.assert_not_called()
         self.assertEqual("failed", tasks._row_raw(task_id)["state"])
 
+    def test_unprepared_managed_cargo_scan_returns_match_before_limit_in_final_batch(
+        self,
+    ) -> None:
+        raw_command = ["/usr/bin/cargo", "test"]
+        identity = tasks._task_execution_identity(
+            host="local",
+            argv_sha256=tasks.command_identity.argv_sha256(raw_command),
+            cwd=str(self.root),
+            resource_keys=[],
+            runtime_seconds=60,
+            cpu_weight=50,
+            io_weight=25,
+            memory_max_bytes=None,
+            chronik_outbox_enabled=False,
+            chronik_outbox_state_root=None,
+            chronik_context_json=None,
+            execution_backend="systemd-user",
+            systemd_scope="user",
+        )
+        skipped = {"task_id": "operation-bound"}
+        matching = {"task_id": "matching-unbound"}
+
+        class FakeCursor:
+            def __init__(self) -> None:
+                self.offset = 0
+
+            def fetchmany(self, limit: int) -> list[dict[str, object]]:
+                if self.offset >= 50001:
+                    return []
+                count = min(limit, 50001 - self.offset)
+                rows = [skipped] * count
+                if self.offset <= 49920 < self.offset + count:
+                    rows[49920 - self.offset] = matching
+                self.offset += count
+                return rows
+
+        class FakeConnection:
+            def __enter__(self) -> "FakeConnection":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def execute(self, *_args: object) -> FakeCursor:
+                return FakeCursor()
+
+        with (
+            patch.object(tasks, "_database_connection", return_value=FakeConnection()),
+            patch.object(
+                tasks,
+                "_record_matches_unprepared_managed_cargo_command",
+                return_value=True,
+            ),
+            patch.object(
+                tasks,
+                "_record_matches_execution_retry_identity",
+                return_value=True,
+            ),
+            patch.object(
+                tasks,
+                "_persisted_task_operation_identity",
+                side_effect=lambda record: (
+                    None
+                    if record["task_id"] == "matching-unbound"
+                    else {"operation_identity_sha256": "f" * 64}
+                ),
+            ),
+            patch.object(tasks, "_persisted_retry_binding_or_raise", return_value=None),
+            patch.object(
+                tasks,
+                "_persisted_interrupted_recovery_binding_or_raise",
+                return_value=None,
+            ),
+        ):
+            selected = tasks._latest_matching_unprepared_managed_cargo_record(
+                identity,
+                raw_command,
+                unbound_only=True,
+            )
+
+        self.assertIsNotNone(selected)
+        self.assertEqual("matching-unbound", selected["task_id"])
+
     def test_unprepared_managed_cargo_unbound_scan_is_bounded(self) -> None:
         raw_command = ["/usr/bin/cargo", "test"]
         identity = tasks._task_execution_identity(
@@ -10306,6 +10389,21 @@ class TaskTests(unittest.TestCase):
 
         with (
             patch.object(tasks, "_database_connection", return_value=FakeConnection()),
+            patch.object(
+                tasks,
+                "_record_matches_unprepared_managed_cargo_command",
+                return_value=True,
+            ),
+            patch.object(
+                tasks,
+                "_record_matches_execution_retry_identity",
+                return_value=True,
+            ),
+            patch.object(
+                tasks,
+                "_persisted_task_operation_identity",
+                return_value={"operation_identity_sha256": "f" * 64},
+            ),
             self.assertRaisesRegex(
                 RuntimeError,
                 "unprepared managed Cargo unbound scan limit exceeded",

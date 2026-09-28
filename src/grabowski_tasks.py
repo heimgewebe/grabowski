@@ -5388,14 +5388,14 @@ def _latest_matching_unprepared_managed_cargo_record(
             rows = cursor.fetchmany(256)
             if not rows:
                 return None
-            scanned_rows += len(rows)
-            if scanned_rows > 50000:
-                raise RuntimeError(
-                    "unprepared managed Cargo unbound scan limit exceeded"
-                    if unbound_only
-                    else "unprepared managed Cargo retry scan limit exceeded"
-                )
             for row in rows:
+                scanned_rows += 1
+                if scanned_rows > 50000:
+                    raise RuntimeError(
+                        "unprepared managed Cargo unbound scan limit exceeded"
+                        if unbound_only
+                        else "unprepared managed Cargo retry scan limit exceeded"
+                    )
                 record = dict(row)
                 if not _record_matches_unprepared_managed_cargo_command(
                     record, command
