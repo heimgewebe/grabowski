@@ -4590,12 +4590,14 @@ def _latest_matching_execution_record(
                 identity["systemd_scope"],
             ),
         ).fetchall()
-    if len(rows) > 50000:
-        raise RuntimeError("execution retry identity scan limit exceeded")
+    skipped = 0
     for row in rows:
         record = dict(row)
         if _record_matches_execution_retry_identity(record, identity):
             return record
+        skipped += 1
+        if skipped > 50000:
+            raise RuntimeError("execution retry identity scan limit exceeded")
     return None
 
 

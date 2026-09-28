@@ -11901,6 +11901,59 @@ class TaskTests(unittest.TestCase):
         ):
             tasks._latest_matching_unbound_execution_record(identity)
 
+    def test_execution_identity_scan_limit_returns_newest_match(self) -> None:
+        record, identity = self._completed_execution_reuse_validation_fixture()
+
+        class FakeCursor:
+            def fetchall(self) -> list[dict[str, object]]:
+                return [record] * 50001
+
+        class FakeConnection:
+            def __enter__(self) -> "FakeConnection":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def execute(self, *_args: object) -> FakeCursor:
+                return FakeCursor()
+
+        with patch.object(
+            tasks, "_database_connection", return_value=FakeConnection()
+        ):
+            matching = tasks._latest_matching_execution_record(identity)
+
+        self.assertIsNotNone(matching)
+        self.assertEqual(record["task_id"], matching["task_id"])
+
+    def test_execution_identity_scan_limit_fails_closed(self) -> None:
+        record, identity = self._completed_execution_reuse_validation_fixture()
+
+        class FakeCursor:
+            def fetchall(self) -> list[dict[str, object]]:
+                return [record] * 50001
+
+        class FakeConnection:
+            def __enter__(self) -> "FakeConnection":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def execute(self, *_args: object) -> FakeCursor:
+                return FakeCursor()
+
+        with (
+            patch.object(tasks, "_database_connection", return_value=FakeConnection()),
+            patch.object(
+                tasks, "_record_matches_execution_retry_identity", return_value=False
+            ),
+            self.assertRaisesRegex(
+                RuntimeError, "execution retry identity scan limit exceeded"
+            ),
+        ):
+            tasks._latest_matching_execution_record(identity)
+
     def test_unbound_execution_identity_scan_limit_returns_newest_match(self) -> None:
         record, identity = self._completed_execution_reuse_validation_fixture()
 
