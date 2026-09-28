@@ -1344,7 +1344,7 @@ class OperatorSignedTransportTests(unittest.TestCase):
     def test_simple_terminal_sed_range_read_redirects_before_replay_state(self) -> None:
         arguments = {
             "argv": ["sed", "-n", "10,20p", "src/grabowski_operator.py"],
-            "cwd": "/home/alex/repos/grabowski",
+            "cwd": str(ROOT),
         }
         redirect = operator._terminal_typed_read_redirect(
             "grabowski_terminal_run", arguments
@@ -1357,7 +1357,7 @@ class OperatorSignedTransportTests(unittest.TestCase):
                 "source_tool": "grabowski_terminal_run",
                 "typed_tool": "grabowski_read_text",
                 "typed_arguments": {
-                    "path": "/home/alex/repos/grabowski/src/grabowski_operator.py",
+                    "path": str(ROOT / "src/grabowski_operator.py"),
                     "start_line": 10,
                     "max_lines": 11,
                 },
@@ -1411,7 +1411,7 @@ class OperatorSignedTransportTests(unittest.TestCase):
             "grabowski_terminal_run",
             {
                 "argv": ["sed", "-n", "7p", "src/grabowski_operator.py"],
-                "cwd": "/home/alex/repos/grabowski",
+                "cwd": str(ROOT),
             },
         )
         self.assertIsNotNone(single_line)
@@ -1475,6 +1475,27 @@ class OperatorSignedTransportTests(unittest.TestCase):
             "/resolved/cwd/literal.txt",
         )
         resolve_cwd.assert_called_once_with("relative")
+
+        absolute_path = str(ROOT / "src/grabowski_operator.py")
+        with mock.patch.object(
+            operator,
+            "_resolve_cwd",
+            side_effect=AssertionError("absolute paths must not resolve cwd"),
+        ) as resolve_cwd:
+            absolute_cwd_ignored = operator._terminal_typed_read_redirect(
+                "grabowski_terminal_run",
+                {
+                    "argv": ["sed", "-n", "1p", absolute_path],
+                    "cwd": "/definitely/missing/cwd",
+                },
+            )
+        self.assertIsNotNone(absolute_cwd_ignored)
+        assert absolute_cwd_ignored is not None
+        self.assertEqual(
+            absolute_cwd_ignored["typed_arguments"]["path"],
+            absolute_path,
+        )
+        resolve_cwd.assert_not_called()
 
     def test_typed_read_can_repeat_without_signed_replay_state(self) -> None:
         tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=True))
