@@ -5554,6 +5554,55 @@ def command_kind(command: str) -> str:
     raise RunnerError(f"unapproved Codex command: {executable}")
 
 
+def _codex_mcp_result_is_success(
+    value: Any, *, tool_name: str, arguments: Any
+) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if "isError" in value:
+        return value.get("isError") is False
+    content = value.get("content")
+    if not isinstance(content, list) or len(content) != 1:
+        return False
+    item = content[0]
+    if (
+        not isinstance(item, dict)
+        or item.get("type") != "text"
+        or not isinstance(item.get("text"), str)
+        or not item.get("text")
+    ):
+        return False
+    if tool_name == "repobrief_resource_read":
+        if not isinstance(arguments, dict):
+            return False
+        try:
+            decoded = json.loads(item["text"])
+            action = arguments.get("action")
+            if action == "list":
+                frozen, _uris = _freeze_resource_result(decoded)
+                return canonical(decoded) == canonical(frozen)
+            if action == "read":
+                uri = arguments.get("uri")
+                if not isinstance(uri, str) or not uri:
+                    return False
+                validated = _validated_resource_read_result(decoded, expected_uri=uri)
+                return canonical(decoded) == canonical(validated)
+        except (json.JSONDecodeError, RunnerError):
+            return False
+        return False
+    structured = value.get("structured_content")
+    if not isinstance(structured, dict):
+        return False
+    status = structured.get("status")
+    if tool_name == "ask_context":
+        return status == "ok"
+    if tool_name == "live_freshness":
+        return status in EXPECTED_REPOGROUND_FRESHNESS_VALUES
+    if tool_name == "grounding_verify":
+        return status in EXPECTED_GROUNDING_VERDICT_STATUSES
+    return False
+
+
 def normalize(
     request: Mapping[str, Any], events: Sequence[Mapping[str, Any]]
 ) -> tuple[int, int, list[dict[str, Any]], dict[str, Any]]:
@@ -5625,9 +5674,10 @@ def normalize(
             result_value = item.get("result")
             output_value = result_value if result_value is not None else item.get("error")
             output_bytes = len(canonical(output_value).encode("utf-8"))
-            result_is_success = (
-                isinstance(result_value, dict)
-                and result_value.get("isError") is False
+            result_is_success = _codex_mcp_result_is_success(
+                result_value,
+                tool_name=name,
+                arguments=item.get("arguments"),
             )
             status = (
                 "success"
