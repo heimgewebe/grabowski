@@ -1585,6 +1585,74 @@ def _effect_admission_transport_inputs(
     return None, runtime_sha256
 
 
+_TERMINAL_SED_RANGE_READ_RE = re.compile(r"([1-9][0-9]*)(?:,([1-9][0-9]*))?p\Z")
+
+
+def _terminal_typed_read_redirect(
+    tool_name: Any, arguments: Any
+) -> dict[str, Any] | None:
+    """Route one exact effect-free terminal range-read to the existing typed surface."""
+
+    if tool_name != "grabowski_terminal_run" or not isinstance(arguments, dict):
+        return None
+    if set(arguments) - {"argv", "cwd"}:
+        return None
+    argv = arguments.get("argv")
+    if not isinstance(argv, list) or len(argv) != 4:
+        return None
+    executable, flag, expression, path = argv
+    if (
+        executable not in {"sed", "/bin/sed", "/usr/bin/sed"}
+        or flag != "-n"
+        or not isinstance(expression, str)
+        or not isinstance(path, str)
+        or not path
+        or "\x00" in path
+    ):
+        return None
+    match = _TERMINAL_SED_RANGE_READ_RE.fullmatch(expression)
+    if match is None:
+        return None
+    try:
+        start_line = int(match.group(1))
+        end_line = int(match.group(2) or match.group(1))
+    except ValueError:
+        return None
+    if end_line < start_line:
+        return None
+    max_lines = end_line - start_line + 1
+    if max_lines > 2000 or path.startswith("-"):
+        return None
+
+    typed_path = Path(path)
+    if not typed_path.is_absolute():
+        cwd = arguments.get("cwd")
+        try:
+            typed_cwd = _resolve_cwd(cwd)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return None
+        typed_path = typed_cwd / typed_path
+
+    return {
+        "schema_version": 1,
+        "code": "typed_read_route_required",
+        "source_tool": "grabowski_terminal_run",
+        "typed_tool": "grabowski_read_text",
+        "typed_arguments": {
+            "path": str(typed_path),
+            "start_line": start_line,
+            "max_lines": max_lines,
+        },
+        "reason": "exact simple sed range read has an existing typed read surface",
+        "transport_consumed": False,
+        "does_not_establish": [
+            "typed read success",
+            "path authorization",
+            "permission to retry the terminal command",
+        ],
+    }
+
+
 def _require_transport_roundtrip_for_tool(
     *,
     tool_name: Any,
@@ -1592,6 +1660,17 @@ def _require_transport_roundtrip_for_tool(
     context: Context | None,
     tool: Any,
 ) -> dict[str, Any] | None:
+    typed_read_redirect = _terminal_typed_read_redirect(tool_name, arguments)
+    if typed_read_redirect is not None:
+        raise RuntimeError(
+            "typed read route required before mutation transport: "
+            + json.dumps(
+                typed_read_redirect,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+        )
     if _transport_roundtrip_exempt_call(tool_name, arguments):
         return
     read_only_hint = _tool_read_only_hint(tool)

@@ -63,8 +63,8 @@ The rendered contract requires the agent to:
 9. use the normal mutating MCP call path and the server-owned transport-roundtrip
    continuation when a fresh challenge is returned; ambiguous mutation outcomes
    still require target readback before any retry;
-10. prefer typed operations to generic terminal, Git or GitHub calls when both can
-    express the effect;
+10. put typed operations first; use `grabowski_read_text` for ranges, not
+    `terminal_run`/`sed`; keep generic Git/GitHub calls last;
 11. use the platform GitHub connector as the normal control plane for PR reads and
     narrowly typed PR mutations. Local `gh` is a recovery fallback only after
     observed connector unavailability or authorization failure. A local `gh`
