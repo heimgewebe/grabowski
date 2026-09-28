@@ -152,6 +152,38 @@ def validate_terminal_assessment(value: Mapping[str, Any]) -> dict[str, Any]:
         not isinstance(terminal_head_sha, str) or SHA.fullmatch(terminal_head_sha) is None
     ):
         raise LaneCloseoutError("terminal closeout assessment head is invalid")
+    durable_followup_id = value.get("durable_followup_id")
+    if durable_followup_id is not None and (
+        not isinstance(durable_followup_id, str)
+        or durable_followup_id != durable_followup_id.strip()
+        or not durable_followup_id
+        or len(durable_followup_id) > MAX_IDENTITY_LENGTH
+        or any(character in durable_followup_id for character in "\r\n\x00")
+    ):
+        raise LaneCloseoutError("terminal closeout durable followup id is invalid")
+    if (
+        durable_followup_id is not None
+        and value.get("closeout_state") != "blocked_with_durable_followup"
+    ):
+        raise LaneCloseoutError(
+            "terminal closeout durable followup id requires blocked followup state"
+        )
+    legacy_observation_sha256 = value.get("legacy_observation_sha256")
+    if legacy_observation_sha256 is not None and (
+        not isinstance(legacy_observation_sha256, str)
+        or SHA256.fullmatch(legacy_observation_sha256) is None
+    ):
+        raise LaneCloseoutError(
+            "terminal closeout legacy observation digest is invalid"
+        )
+    if legacy_observation_sha256 is not None and (
+        value.get("closeout_state") != "blocked_with_durable_followup"
+        or durable_followup_id is None
+    ):
+        raise LaneCloseoutError(
+            "terminal closeout legacy observation digest requires "
+            "blocked followup state with persisted id"
+        )
     if value.get("closeout_state") == "successor_handoff":
         _validate_successor_handoff_assessment(value)
     elif "successor_handoff" in value:
@@ -317,7 +349,7 @@ def _terminal_result(
 ) -> dict[str, Any]:
     if closeout_state not in TERMINAL_CLOSEOUT_STATES:
         raise ValueError(f"invalid terminal closeout state: {closeout_state}")
-    return {
+    result = {
         "phase": "terminal",
         "closeout_state": closeout_state,
         "action_required": False,
@@ -327,6 +359,9 @@ def _terminal_result(
         "workspace_cleanup_ready": False,
         "lane_id": data["lane_id"],
     }
+    if closeout_state == "blocked_with_durable_followup":
+        result["durable_followup_id"] = data["durable_followup_id"]
+    return result
 
 
 def _rescue_result(
@@ -668,6 +703,12 @@ def assess(
         ),
         **assessment,
     }
+    if (
+        assessment.get("phase") == "terminal"
+        and assessment.get("closeout_state") == "blocked_with_durable_followup"
+        and data.get("durable_followup_id") is not None
+    ):
+        material["legacy_observation_sha256"] = material["observation_sha256"]
     assessment_sha256 = sha256_json(material)
     audit_record_sha256: str | None = None
     if append_audit is not None:

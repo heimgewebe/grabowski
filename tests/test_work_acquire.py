@@ -5406,6 +5406,219 @@ class WorkAcquireTests(unittest.TestCase):
             work_acquire._terminal_assessment_replay_sha256(legacy),
         )
 
+    def test_terminal_assessment_replay_allows_legacy_followup_id_only_directionally(self) -> None:
+        lane_id = "a" * 32
+
+        def blocked(followup_id: str) -> dict[str, object]:
+            return closeout.assess(
+                closeout.LaneCloseoutObservation(
+                    lane_id=lane_id,
+                    repository=str(self.repo),
+                    workspace=str(self.target),
+                    branch="feat/authority-p0",
+                    base_revision=SHA,
+                    writer_state="outcome_unknown",
+                    task_active=False,
+                    process_active=False,
+                    lease_active=True,
+                    git_dirty=False,
+                    head_sha=SHA,
+                    remote_head_sha=SHA,
+                    ahead_commits=0,
+                    behind_commits=0,
+                    durable_followup_id=followup_id,
+                ),
+                observed_at_unix=200,
+            )
+
+        current = blocked("followup-1")
+        legacy = dict(current)
+        legacy.pop("durable_followup_id")
+        legacy.pop("legacy_observation_sha256")
+        legacy["observation_sha256"] = current["legacy_observation_sha256"]
+        material = {
+            key: value
+            for key, value in legacy.items()
+            if key
+            not in {
+                "assessment_sha256",
+                "audit_record_sha256",
+                "does_not_establish",
+            }
+        }
+        legacy["assessment_sha256"] = closeout.sha256_json(material)
+        tampered_legacy = dict(legacy)
+        tampered_legacy["observation_sha256"] = "0" * 64
+        tampered_material = {
+            key: value
+            for key, value in tampered_legacy.items()
+            if key
+            not in {
+                "assessment_sha256",
+                "audit_record_sha256",
+                "does_not_establish",
+            }
+        }
+        tampered_legacy["assessment_sha256"] = closeout.sha256_json(
+            tampered_material
+        )
+        modern_without_compat = dict(current)
+        modern_without_compat.pop("legacy_observation_sha256")
+        modern_material = {
+            key: value
+            for key, value in modern_without_compat.items()
+            if key
+            not in {
+                "assessment_sha256",
+                "audit_record_sha256",
+                "does_not_establish",
+            }
+        }
+        modern_without_compat["assessment_sha256"] = closeout.sha256_json(
+            modern_material
+        )
+        different = blocked("followup-2")
+
+        self.assertTrue(
+            work_acquire._terminal_assessment_replay_equivalent(
+                legacy,
+                current,
+            )
+        )
+        self.assertTrue(
+            work_acquire._terminal_assessment_replay_equivalent(
+                modern_without_compat,
+                current,
+            )
+        )
+        self.assertFalse(
+            work_acquire._terminal_assessment_replay_equivalent(
+                current,
+                different,
+            )
+        )
+        self.assertFalse(
+            work_acquire._terminal_assessment_replay_equivalent(
+                current,
+                legacy,
+            )
+        )
+        self.assertFalse(
+            work_acquire._terminal_assessment_replay_equivalent(
+                tampered_legacy,
+                current,
+            )
+        )
+
+    def test_terminal_pending_retry_allows_legacy_followup_id_only_directionally(self) -> None:
+        lane_id = "b" * 32
+
+        def blocked(followup_id: str) -> dict[str, object]:
+            return closeout.assess(
+                closeout.LaneCloseoutObservation(
+                    lane_id=lane_id,
+                    repository=str(self.repo),
+                    workspace=str(self.target),
+                    branch="feat/authority-p0",
+                    base_revision=SHA,
+                    writer_state="outcome_unknown",
+                    task_active=False,
+                    process_active=False,
+                    lease_active=True,
+                    git_dirty=False,
+                    head_sha=SHA,
+                    remote_head_sha=SHA,
+                    ahead_commits=0,
+                    behind_commits=0,
+                    durable_followup_id=followup_id,
+                ),
+                observed_at_unix=200,
+            )
+
+        current = blocked("followup-1")
+        legacy = dict(current)
+        legacy.pop("durable_followup_id")
+        legacy.pop("legacy_observation_sha256")
+        legacy["observation_sha256"] = current["legacy_observation_sha256"]
+        material = {
+            key: value
+            for key, value in legacy.items()
+            if key
+            not in {
+                "assessment_sha256",
+                "audit_record_sha256",
+                "does_not_establish",
+            }
+        }
+        legacy["assessment_sha256"] = closeout.sha256_json(material)
+        tampered_legacy = dict(legacy)
+        tampered_legacy["observation_sha256"] = "0" * 64
+        tampered_material = {
+            key: value
+            for key, value in tampered_legacy.items()
+            if key
+            not in {
+                "assessment_sha256",
+                "audit_record_sha256",
+                "does_not_establish",
+            }
+        }
+        tampered_legacy["assessment_sha256"] = closeout.sha256_json(
+            tampered_material
+        )
+        modern_without_compat = dict(current)
+        modern_without_compat.pop("legacy_observation_sha256")
+        modern_material = {
+            key: value
+            for key, value in modern_without_compat.items()
+            if key
+            not in {
+                "assessment_sha256",
+                "audit_record_sha256",
+                "does_not_establish",
+            }
+        }
+        modern_without_compat["assessment_sha256"] = closeout.sha256_json(
+            modern_material
+        )
+        different = blocked("followup-2")
+
+        self.assertTrue(
+            work_acquire._terminal_pending_retry_equivalent(
+                legacy,
+                current,
+                record={},
+            )
+        )
+        self.assertTrue(
+            work_acquire._terminal_pending_retry_equivalent(
+                modern_without_compat,
+                current,
+                record={},
+            )
+        )
+        self.assertFalse(
+            work_acquire._terminal_pending_retry_equivalent(
+                current,
+                different,
+                record={},
+            )
+        )
+        self.assertFalse(
+            work_acquire._terminal_pending_retry_equivalent(
+                current,
+                legacy,
+                record={},
+            )
+        )
+        self.assertFalse(
+            work_acquire._terminal_pending_retry_equivalent(
+                tampered_legacy,
+                current,
+                record={},
+            )
+        )
+
     def test_terminal_checkout_lifecycle_convergence_preserves_blocked_followup_capacity(self) -> None:
         inspect = Mock()
         with patch.object(work_acquire.checkouts, "_worktree_for_path", inspect):
@@ -6034,6 +6247,101 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertEqual(replay["next_action"], "retry_terminal_closeout")
         acquire.assert_not_called()
         ensure.assert_not_called()
+
+    def test_legacy_blocked_pending_retry_preserves_original_assessment_binding(self) -> None:
+        params = self.parameters()
+        _, receipt = self.store_lane(params)
+        lane_id = str(receipt["lane_id"])
+        current = closeout.assess(
+            closeout.LaneCloseoutObservation(
+                lane_id=lane_id,
+                repository=str(self.repo),
+                workspace=str(self.target),
+                branch="feat/authority-p0",
+                base_revision=SHA,
+                writer_state="outcome_unknown",
+                task_active=False,
+                process_active=False,
+                lease_active=True,
+                git_dirty=False,
+                head_sha=SHA,
+                remote_head_sha=SHA,
+                ahead_commits=0,
+                behind_commits=0,
+                durable_followup_id="followup-1",
+            ),
+            observed_at_unix=200,
+        )
+        legacy = dict(current)
+        legacy.pop("durable_followup_id")
+        legacy.pop("legacy_observation_sha256")
+        legacy["observation_sha256"] = current["legacy_observation_sha256"]
+        material = {
+            key: value
+            for key, value in legacy.items()
+            if key
+            not in {
+                "assessment_sha256",
+                "audit_record_sha256",
+                "does_not_establish",
+            }
+        }
+        legacy["assessment_sha256"] = closeout.sha256_json(material)
+
+        with patch.object(
+            work_acquire,
+            "_converge_terminal_checkout_lifecycle",
+            side_effect=RuntimeError("lifecycle temporarily unavailable"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "lifecycle temporarily unavailable",
+            ):
+                work_acquire.persist_terminal_closeout(
+                    lane_id,
+                    legacy,
+                    expected_receipt_sha256=str(receipt["receipt_sha256"]),
+                )
+
+        pending_record = work_acquire._read_state(
+            self.state / f"{lane_id}.json"
+        )
+        self.assertIsNotNone(pending_record)
+        assert pending_record is not None
+        pending = pending_record["terminal_closeout_pending"]["assessment"]
+        self.assertEqual(legacy["assessment_sha256"], pending["assessment_sha256"])
+        self.assertNotIn("durable_followup_id", pending)
+
+        with (
+            patch.object(
+                work_acquire,
+                "_converge_terminal_checkout_lifecycle",
+                return_value=None,
+            ),
+            patch.object(
+                work_acquire,
+                "_converge_terminal_resource_leases",
+                return_value=None,
+            ),
+        ):
+            stored = work_acquire.persist_terminal_closeout(
+                lane_id,
+                current,
+                expected_receipt_sha256=str(pending_record["receipt_sha256"]),
+            )
+
+        final_assessment = stored["terminal_closeout"]["assessment"]
+        self.assertEqual(
+            legacy["assessment_sha256"],
+            final_assessment["assessment_sha256"],
+        )
+        self.assertEqual(
+            legacy["observation_sha256"],
+            final_assessment["observation_sha256"],
+        )
+        self.assertNotIn("durable_followup_id", final_assessment)
+        self.assertNotIn("legacy_observation_sha256", final_assessment)
+        self.assertNotIn("terminal_closeout_pending", stored)
 
     def test_terminal_closeout_persists_managed_checkout_physical_identity(self) -> None:
         params = self.parameters()
