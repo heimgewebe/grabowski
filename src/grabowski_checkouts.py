@@ -50,6 +50,7 @@ CHECKOUT_LOCK = Path(
         str(operator.STATE_DIR / "checkouts.lock"),
     )
 ).expanduser()
+CHECKOUT_OPERATION_LOCK_POLL_SECONDS = 0.05
 DRY_RUN_TTL_SECONDS = 15 * 60
 OPERATION_LEASE_TTL_SECONDS = 10 * 60
 OWNER_HANDOFF_PREVIEW_TTL_SECONDS = 5 * 60
@@ -343,7 +344,10 @@ def _git_read(
 
 
 @contextmanager
-def _operation_lock():
+def _operation_lock(
+    *,
+    deadline_monotonic: float | None = None,
+):
     parent = CHECKOUT_LOCK.parent
     if parent.is_symlink():
         raise PermissionError(f"Checkout lock directory may not be a symlink: {parent}")
@@ -351,11 +355,40 @@ def _operation_lock():
     if CHECKOUT_LOCK.is_symlink():
         raise PermissionError(f"Checkout lock may not be a symlink: {CHECKOUT_LOCK}")
     descriptor = os.open(CHECKOUT_LOCK, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    locked = False
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        if deadline_monotonic is None:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            locked = True
+        else:
+            if (
+                isinstance(deadline_monotonic, bool)
+                or not isinstance(deadline_monotonic, (int, float))
+                or not (0 < float(deadline_monotonic) < float("inf"))
+            ):
+                raise ValueError("deadline_monotonic must be a finite positive monotonic timestamp")
+            deadline = float(deadline_monotonic)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("Checkout operation lock deadline exceeded")
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                except BlockingIOError:
+                    time.sleep(
+                        min(CHECKOUT_OPERATION_LOCK_POLL_SECONDS, remaining)
+                    )
+                    continue
+                if time.monotonic() >= deadline:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    locked = False
+                    raise RuntimeError("Checkout operation lock deadline exceeded")
+                break
         yield
     finally:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        if locked:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
 
 

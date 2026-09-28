@@ -99,6 +99,37 @@ class CheckoutLifecycleTests(unittest.TestCase):
             text=True,
         )
 
+    def test_operation_lock_deadline_uses_nonblocking_bounded_wait(self) -> None:
+        lock_attempt = checkouts.fcntl.LOCK_EX | checkouts.fcntl.LOCK_NB
+        calls: list[int] = []
+
+        def flock(_descriptor: int, operation: int) -> None:
+            calls.append(operation)
+            if operation == lock_attempt:
+                raise BlockingIOError
+            self.fail(f"unexpected flock operation: {operation}")
+
+        with (
+            patch.object(checkouts.fcntl, "flock", side_effect=flock),
+            patch.object(
+                checkouts.time,
+                "monotonic",
+                side_effect=[0.0, 1.0],
+            ),
+            patch.object(checkouts.time, "sleep") as sleep,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "Checkout operation lock deadline exceeded",
+            ),
+        ):
+            with checkouts._operation_lock(deadline_monotonic=1.0):
+                self.fail("deadline-bounded checkout lock must not be acquired")
+
+        self.assertEqual(calls, [lock_attempt])
+        sleep.assert_called_once_with(
+            checkouts.CHECKOUT_OPERATION_LOCK_POLL_SECONDS
+        )
+
     def _publish_remote(self) -> None:
         """Make the current heads visible on local origin remote-tracking refs.
 
