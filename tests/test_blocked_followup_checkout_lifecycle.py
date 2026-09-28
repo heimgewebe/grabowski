@@ -364,6 +364,70 @@ class BlockedFollowupCheckoutLifecycleTests(unittest.TestCase):
             connection.close()
         self.assertEqual([TASK_ID], [item["task_id"] for item in observed])
 
+    def test_taskspec_state_store_rejects_database_replacement_during_read(self) -> None:
+        temporary, root = self._state_store([self._spec()])
+        self.addCleanup(temporary.cleanup)
+        database = root / "bureau.sqlite3"
+        real_snapshot = sources._bureau_state_store_snapshot
+        calls = {"count": 0}
+
+        def replace_database_after_first_snapshot(root_descriptor: int):
+            snapshot = real_snapshot(root_descriptor)
+            calls["count"] += 1
+            if calls["count"] == 1:
+                replacement = root / "replacement.sqlite3"
+                replacement.write_bytes(database.read_bytes())
+                replacement.chmod(0o600)
+                os.replace(replacement, database)
+            return snapshot
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "BUREAU_STATE_DIR": str(root),
+                    "GRABOWSKI_BUREAU_COORDINATION_ROOT": str(root),
+                },
+            ),
+            patch.object(
+                sources,
+                "_bureau_state_store_snapshot",
+                replace_database_after_first_snapshot,
+            ),
+            self.assertRaisesRegex(RuntimeError, "StateStore identity changed"),
+        ):
+            sources._current_bureau_task_specs(TASK_ID)
+
+    def test_taskspec_state_store_allows_wal_sidecars_to_recreate(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        database = root / "bureau.sqlite3"
+        connection = sqlite3.connect(database)
+        try:
+            self.assertEqual(
+                "wal",
+                connection.execute("PRAGMA journal_mode=WAL").fetchone()[0],
+            )
+            self._create_schema(connection)
+            self._insert_current(connection, self._spec())
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.assertFalse((root / "bureau.sqlite3-wal").exists())
+        self.assertFalse((root / "bureau.sqlite3-shm").exists())
+        with patch.dict(
+            os.environ,
+            {
+                "BUREAU_STATE_DIR": str(root),
+                "GRABOWSKI_BUREAU_COORDINATION_ROOT": str(root),
+            },
+        ):
+            observed = sources._current_bureau_task_specs(TASK_ID)
+
+        self.assertEqual([TASK_ID], [item["task_id"] for item in observed])
+
     def test_legacy_receipt_without_checkout_key_uses_bound_lifecycle_key(self) -> None:
         temporary, root = self._state_store([self._spec()])
         self.addCleanup(temporary.cleanup)
