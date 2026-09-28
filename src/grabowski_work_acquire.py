@@ -2208,6 +2208,7 @@ def _continuation_authorization_guard(
         "untracked_worktree_sha256"
     )
     expected_untracked_count = continuation_preimage.get("untracked_count")
+    expected_registered_git_dir = continuation_preimage.get("registered_git_dir")
     expected_hashes = (
         expected_branch_preimage_sha256,
         expected_index_sha256,
@@ -2230,6 +2231,10 @@ def _continuation_authorization_guard(
         or isinstance(expected_untracked_count, bool)
         or not isinstance(expected_untracked_count, int)
         or expected_untracked_count < 0
+        or not isinstance(expected_registered_git_dir, dict)
+        or not isinstance(expected_registered_git_dir.get("path"), str)
+        or not isinstance(expected_registered_git_dir.get("device"), int)
+        or not isinstance(expected_registered_git_dir.get("inode"), int)
         or isinstance(expected_retention_until_unix, bool)
         or not isinstance(expected_retention_until_unix, int)
     ):
@@ -2335,10 +2340,60 @@ def _continuation_authorization_guard(
                 max_total_bytes=256 * 1024 * 1024,
                 deadline_monotonic=authorization_deadline,
             )
+            index_flags = authorization_index_probe(
+                checkout, ["ls-files", "-v", "-z"]
+            )
+            if index_flags.returncode != 0:
+                raise RuntimeError(
+                    "managed worktree continuation index flags could not be revalidated"
+                )
+            index_flag_entries = [
+                entry for entry in index_flags.stdout.split(b"\0") if entry
+            ]
+            index_flag_tags = [
+                chr(entry[0]) for entry in index_flag_entries if entry
+            ]
+            if any(tag.islower() for tag in index_flag_tags):
+                raise RuntimeError(
+                    "managed worktree continuation has assume-unchanged index entries before authorization"
+                )
+            if any(tag.upper() == "S" for tag in index_flag_tags):
+                raise RuntimeError(
+                    "managed worktree continuation has skip-worktree index entries before authorization"
+                )
+            current_physical = current_branch_preimage.get("physical_checkout")
+            current_common_dir = (
+                current_physical.get("common_dir")
+                if isinstance(current_physical, dict)
+                else None
+            )
+            current_common_path = (
+                current_common_dir.get("path")
+                if isinstance(current_common_dir, dict)
+                else None
+            )
+            if not isinstance(current_common_path, str):
+                raise RuntimeError(
+                    "managed worktree continuation physical common directory is invalid before authorization"
+                )
+            current_registered_git_dir = (
+                physical_checkout.capture_registered_linked_worktree_git_dir(
+                    current_common_path, checkout
+                )
+            )
+            git_preimage._require_effective_git_toplevel(
+                checkout,
+                authorization_probe,
+                deadline_monotonic=authorization_deadline,
+            )
         except Exception as exc:
             raise RuntimeError(
                 "managed worktree continuation Git state could not be revalidated before authorization"
             ) from exc
+        if current_registered_git_dir != expected_registered_git_dir:
+            raise RuntimeError(
+                "managed worktree continuation registered Git directory changed before authorization"
+            )
         current_git_state = (
             current_branch_preimage.get("preimage_sha256"),
             current_branch_preimage.get("index_sha256"),
@@ -2741,6 +2796,7 @@ def _continuation_preimage(
             "untracked_preimage_sha256": stable_snapshot["untracked_preimage_sha256"],
             "untracked_worktree_sha256": stable_snapshot["untracked_worktree_sha256"],
             "untracked_count": stable_snapshot["untracked_count"],
+            "registered_git_dir": stable_snapshot["registered_git_dir"],
             "prior_worktree_receipt_sha256": prior.get("durable_receipt_sha256"),
             "lifecycle_sha256": stable_snapshot["lifecycle_sha256"],
             "lifecycle_retention_until_unix": stable_retention_until_unix,

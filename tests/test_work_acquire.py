@@ -1287,6 +1287,11 @@ class WorkAcquireTests(unittest.TestCase):
             patch.object(work_acquire.physical_checkout, "verify_physical_checkout_identity", return_value=PHYSICAL),
             patch.object(work_acquire.git_preimage, "capture_branch_preimage", return_value={"branch": inputs["branch"], "head": SHA, "operation_refs": {}, "physical_checkout": PHYSICAL, "preimage_sha256": "c" * 64, "index_sha256": "d" * 64, "worktree_sha256": "e" * 64}),
             patch.object(work_acquire.subprocess, "run", return_value=__import__("subprocess").CompletedProcess([], 0, b"", b"")),
+            patch.object(
+                work_acquire,
+                "_bounded_raw_nul_git_probe",
+                return_value=__import__("subprocess").CompletedProcess([], 0, b"", b""),
+            ),
             patch.object(work_acquire.git_preimage, "capture_untracked_preimage", return_value={"count": 0, "worktree_sha256": "1" * 64, "preimage_sha256": "2" * 64}),
             patch.object(
                 work_acquire.checkouts,
@@ -3160,6 +3165,7 @@ class WorkAcquireTests(unittest.TestCase):
             "untracked_preimage_sha256": "4" * 64,
             "untracked_worktree_sha256": "5" * 64,
             "untracked_count": 0,
+            "registered_git_dir": PHYSICAL["git_dir"],
         }
         drifted = {**lifecycle, "owner_id": "lane:" + "b" * 32}
 
@@ -3205,6 +3211,7 @@ class WorkAcquireTests(unittest.TestCase):
             "untracked_preimage_sha256": "4" * 64,
             "untracked_worktree_sha256": "5" * 64,
             "untracked_count": 0,
+            "registered_git_dir": PHYSICAL["git_dir"],
         }
 
         @contextmanager
@@ -3256,6 +3263,7 @@ class WorkAcquireTests(unittest.TestCase):
             "untracked_preimage_sha256": "4" * 64,
             "untracked_worktree_sha256": "5" * 64,
             "untracked_count": 0,
+            "registered_git_dir": PHYSICAL["git_dir"],
         }
 
         @contextmanager
@@ -3285,6 +3293,7 @@ class WorkAcquireTests(unittest.TestCase):
                     "preimage_sha256": "9" * 64,
                     "index_sha256": "2" * 64,
                     "worktree_sha256": "3" * 64,
+                    "physical_checkout": PHYSICAL,
                 },
             ),
             patch.object(
@@ -3296,6 +3305,16 @@ class WorkAcquireTests(unittest.TestCase):
                     "count": 0,
                 },
             ),
+            patch.object(
+                work_acquire,
+                "_bounded_raw_nul_git_probe",
+                return_value=__import__("subprocess").CompletedProcess([], 0, b"", b""),
+            ),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                return_value=PHYSICAL["git_dir"],
+            ),
             self.assertRaisesRegex(
                 RuntimeError,
                 "Git state changed before authorization",
@@ -3305,6 +3324,143 @@ class WorkAcquireTests(unittest.TestCase):
                 continuation_preimage
             ):
                 self.fail("stale continuation preimage must not authorize continuation")
+
+    def test_continuation_authorization_guard_revalidates_final_git_authority(self) -> None:
+        lifecycle = {
+            "checkout_key": "a" * 64,
+            "owner_id": "lane:" + "a" * 32,
+            "retention_until_unix": self.retention,
+        }
+        continuation_preimage = {
+            "checkout_key": lifecycle["checkout_key"],
+            "checkout_path": str(self.target),
+            "lifecycle_sha256": work_acquire._sha(lifecycle),
+            "lifecycle_retention_until_unix": self.retention,
+            "branch_preimage_sha256": "1" * 64,
+            "index_sha256": "2" * 64,
+            "tracked_worktree_sha256": "3" * 64,
+            "untracked_preimage_sha256": "4" * 64,
+            "untracked_worktree_sha256": "5" * 64,
+            "untracked_count": 0,
+            "registered_git_dir": PHYSICAL["git_dir"],
+        }
+
+        @contextmanager
+        def lifecycle_guard(_timeout_seconds: float):
+            yield
+
+        @contextmanager
+        def guard_dependencies(
+            *,
+            top_level: Mock,
+            flags: bytes = b"",
+            registered_git_dir: dict[str, object] = PHYSICAL["git_dir"],
+        ):
+            with (
+                patch.object(
+                    work_acquire,
+                    "_continuation_lifecycle_guard",
+                    lifecycle_guard,
+                ),
+                patch.object(
+                    work_acquire.checkouts,
+                    "_strict_lifecycle_binding",
+                    return_value=lifecycle,
+                ),
+                patch.object(
+                    work_acquire.git_preimage,
+                    "_require_effective_git_toplevel",
+                    top_level,
+                ),
+                patch.object(
+                    work_acquire.git_preimage,
+                    "capture_branch_preimage",
+                    return_value={
+                        "preimage_sha256": "1" * 64,
+                        "index_sha256": "2" * 64,
+                        "worktree_sha256": "3" * 64,
+                        "physical_checkout": PHYSICAL,
+                    },
+                ),
+                patch.object(
+                    work_acquire.git_preimage,
+                    "capture_untracked_preimage",
+                    return_value={
+                        "preimage_sha256": "4" * 64,
+                        "worktree_sha256": "5" * 64,
+                        "count": 0,
+                    },
+                ),
+                patch.object(
+                    work_acquire,
+                    "_bounded_raw_nul_git_probe",
+                    return_value=__import__("subprocess").CompletedProcess(
+                        [], 0, flags, b""
+                    ),
+                ),
+                patch.object(
+                    work_acquire.physical_checkout,
+                    "capture_registered_linked_worktree_git_dir",
+                    return_value=registered_git_dir,
+                ),
+            ):
+                yield
+
+        top_level = Mock(
+            side_effect=[str(self.target), RuntimeError("redirected")]
+        )
+        with guard_dependencies(top_level=top_level):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Git state could not be revalidated before authorization",
+            ):
+                with work_acquire._continuation_authorization_guard(
+                    continuation_preimage
+                ):
+                    self.fail("redirected Git worktree must not authorize continuation")
+        self.assertEqual(top_level.call_count, 2)
+
+        replacement_git_dir = {
+            "path": "/registered/common/worktrees/replacement",
+            "device": 1,
+            "inode": 99,
+        }
+        with guard_dependencies(
+            top_level=Mock(return_value=str(self.target)),
+            registered_git_dir=replacement_git_dir,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "registered Git directory changed before authorization",
+            ):
+                with work_acquire._continuation_authorization_guard(
+                    continuation_preimage
+                ):
+                    self.fail("unregistered worktree must not authorize continuation")
+
+        hidden_flags = (
+            (b"h tracked.txt" + bytes([0]), "assume-unchanged"),
+            (b"S tracked.txt" + bytes([0]), "skip-worktree"),
+        )
+        for flags, expected_error in hidden_flags:
+            with self.subTest(expected_error=expected_error):
+                with guard_dependencies(
+                    top_level=Mock(return_value=str(self.target)),
+                    flags=flags,
+                ):
+                    with self.assertRaises(RuntimeError) as caught:
+                        with work_acquire._continuation_authorization_guard(
+                            continuation_preimage
+                        ):
+                            self.fail(
+                                "hidden index flags must not authorize continuation"
+                            )
+                self.assertIn(
+                    "Git state could not be revalidated before authorization",
+                    str(caught.exception),
+                )
+                self.assertIsNotNone(caught.exception.__cause__)
+                self.assertIn(expected_error, str(caught.exception.__cause__))
 
     def test_continuation_writer_authorization_is_persisted_under_guard(self) -> None:
         params = self.parameters()
