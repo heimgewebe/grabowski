@@ -5345,10 +5345,17 @@ def _latest_matching_unprepared_managed_cargo_record(
                 *argv_parameters,
             ),
         )
+        scanned_rows = 0
         while True:
             rows = cursor.fetchmany(256)
             if not rows:
                 return None
+            if unbound_only:
+                scanned_rows += len(rows)
+                if scanned_rows > 50000:
+                    raise RuntimeError(
+                        "unprepared managed Cargo unbound scan limit exceeded"
+                    )
             for row in rows:
                 record = dict(row)
                 if not _record_matches_unprepared_managed_cargo_command(
@@ -5370,6 +5377,7 @@ def _resolve_unprepared_managed_cargo_execution_reuse(
     command: list[str],
     *,
     resume_policy: ResumePolicy,
+    allow_active_reuse: bool = True,
 ) -> tuple[dict[str, Any] | None, str | None]:
     latest = _latest_matching_unprepared_managed_cargo_record(
         identity,
@@ -5378,6 +5386,11 @@ def _resolve_unprepared_managed_cargo_execution_reuse(
     )
     if latest is None:
         return None, None
+    if (
+        _execution_identity_without_command(_record_execution_identity(latest))
+        != _execution_identity_without_command(identity)
+    ):
+        raise RuntimeError("stored managed Cargo execution identity is inconsistent")
     if str(latest["state"]) in TASK_STATE_PROJECTIONS["active"]:
         if str(latest["resume_policy"]) != resume_policy:
             raise RuntimeError(
@@ -5385,11 +5398,28 @@ def _resolve_unprepared_managed_cargo_execution_reuse(
                 f"reconcile task {latest['task_id']} before another start"
             )
         now = _now()
-        if not _task_has_fresh_active_observation(latest, now=now):
+        if (
+            not allow_active_reuse
+            or not _task_has_fresh_active_observation(latest, now=now)
+        ):
             grabowski_task_status(str(latest["task_id"]))
             latest = _row_raw(str(latest["task_id"]))
+            if (
+                _execution_identity_without_command(
+                    _record_execution_identity(latest)
+                )
+                != _execution_identity_without_command(identity)
+            ):
+                raise RuntimeError(
+                    "stored managed Cargo execution identity is inconsistent"
+                )
+        _guard_direct_terminal_retry_record(latest)
         if str(latest["state"]) in TASK_STATE_PROJECTIONS["active"]:
-            return latest, "active_unprepared_managed_cargo_identity"
+            return (
+                (latest, "active_unprepared_managed_cargo_identity")
+                if allow_active_reuse
+                else (None, None)
+            )
     completed = _resolve_recent_completed_record_reuse(
         latest,
         resume_policy=resume_policy,
@@ -8784,6 +8814,7 @@ def grabowski_task_start(
                 unprepared_identity,
                 command,
                 resume_policy=policy,
+                allow_active_reuse=mutating_agent_workspace is None,
             )
         )
     if execution_reuse is not None:

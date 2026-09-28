@@ -10029,6 +10029,122 @@ class TaskTests(unittest.TestCase):
         self.assertNotEqual(first_id, second["task"]["task_id"])
         self.assertIsNone(second["deduplicated_reuse"])
 
+    def test_managed_cargo_refresh_to_attention_blocks_before_repreparation(
+        self,
+    ) -> None:
+        raw_command = ["/usr/bin/cargo", "test"]
+
+        def bound(cache_key: str) -> list[str]:
+            target_dir = tasks.MANAGED_CARGO_CACHE_ROOT / cache_key / "target"
+            lifecycle_lock = tasks.MANAGED_CARGO_LOCK_ROOT / f"{cache_key}.lock"
+            return [
+                tasks.FLOCK_EXECUTABLE,
+                "--shared",
+                str(lifecycle_lock),
+                tasks.SYSTEMD_ENV_EXECUTABLE,
+                f"CARGO_TARGET_DIR={target_dir}",
+                *raw_command,
+            ]
+
+        common = {
+            "host": "local",
+            "argv": raw_command,
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "resume_policy": "retry-safe",
+            "cpu_weight": 50,
+            "io_weight": 25,
+            "memory_max_bytes": 64 * 1024 * 1024,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_managed_cargo_request_root", return_value=self.root),
+            patch.object(
+                tasks, "_bind_managed_cargo_environment", return_value=bound("1" * 64)
+            ),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 129}
+            ),
+        ):
+            first = tasks.grabowski_task_start(**common)
+        task_id = str(first["task"]["task_id"])
+        failed_observation = {
+            "state": "failed",
+            "properties": {"Result": "exit-code"},
+            "probe": _launcher(returncode=1),
+            "observer": {"kind": "test"},
+            "observed_at_unix": tasks._now(),
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_managed_cargo_request_root", return_value=self.root),
+            patch.object(
+                tasks, "_bind_managed_cargo_environment", return_value=bound("2" * 64)
+            ) as prepare,
+            patch.object(tasks, "_observe", return_value=failed_observation) as observe,
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 130}
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "unchanged terminal task retry blocked",
+            ),
+        ):
+            tasks.grabowski_task_start(**common)
+        observe.assert_called_once()
+        prepare.assert_not_called()
+        dispatch.assert_not_called()
+        self.assertEqual("failed", tasks._row_raw(task_id)["state"])
+
+    def test_unprepared_managed_cargo_unbound_scan_is_bounded(self) -> None:
+        raw_command = ["/usr/bin/cargo", "test"]
+        identity = tasks._task_execution_identity(
+            host="local",
+            argv_sha256=tasks.command_identity.argv_sha256(raw_command),
+            cwd=str(self.root),
+            resource_keys=[],
+            runtime_seconds=60,
+            cpu_weight=50,
+            io_weight=25,
+            memory_max_bytes=None,
+            chronik_outbox_enabled=False,
+            chronik_outbox_state_root=None,
+            chronik_context_json=None,
+            execution_backend="systemd-user",
+            systemd_scope="user",
+        )
+
+        class FakeCursor:
+            def fetchmany(self, _limit: int) -> list[dict[str, object]]:
+                return [{}] * 50001
+
+        class FakeConnection:
+            def __enter__(self) -> "FakeConnection":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def execute(self, *_args: object) -> FakeCursor:
+                return FakeCursor()
+
+        with (
+            patch.object(tasks, "_database_connection", return_value=FakeConnection()),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "unprepared managed Cargo unbound scan limit exceeded",
+            ),
+        ):
+            tasks._latest_matching_unprepared_managed_cargo_record(
+                identity,
+                raw_command,
+                unbound_only=True,
+            )
+
     def test_managed_cargo_attention_limit_counts_only_command_matches(self) -> None:
         raw_command = ["/usr/bin/cargo", "test"]
 
