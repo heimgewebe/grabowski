@@ -5554,6 +5554,29 @@ def command_kind(command: str) -> str:
     raise RunnerError(f"unapproved Codex command: {executable}")
 
 
+def _codex_mcp_result_is_success(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if "isError" in value:
+        return value.get("isError") is False
+    content = value.get("content")
+    if not isinstance(content, list) or len(content) != 1:
+        return False
+    item = content[0]
+    if (
+        not isinstance(item, dict)
+        or item.get("type") != "text"
+        or not isinstance(item.get("text"), str)
+        or not item.get("text")
+    ):
+        return False
+    structured = value.get("structured_content")
+    if structured is not None:
+        if not isinstance(structured, dict) or structured.get("status") == "error":
+            return False
+    return True
+
+
 def normalize(
     request: Mapping[str, Any], events: Sequence[Mapping[str, Any]]
 ) -> tuple[int, int, list[dict[str, Any]], dict[str, Any]]:
@@ -5625,17 +5648,7 @@ def normalize(
             result_value = item.get("result")
             output_value = result_value if result_value is not None else item.get("error")
             output_bytes = len(canonical(output_value).encode("utf-8"))
-            result_is_success = (
-                isinstance(result_value, dict)
-                and (
-                    result_value.get("isError") is False
-                    or (
-                        "isError" not in result_value
-                        and isinstance(result_value.get("structured_content"), dict)
-                        and result_value["structured_content"].get("status") == "ok"
-                    )
-                )
-            )
+            result_is_success = _codex_mcp_result_is_success(result_value)
             status = (
                 "success"
                 if (
