@@ -1629,7 +1629,7 @@ def _terminal_typed_read_redirect(
         cwd = arguments.get("cwd")
         try:
             typed_cwd = _resolve_cwd(cwd)
-        except (OSError, RuntimeError, ValueError):
+        except (OSError, RuntimeError, TypeError, ValueError):
             return None
         typed_path = typed_cwd / typed_path
 

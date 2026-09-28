@@ -1505,6 +1505,7 @@ class OperatorSignedTransportTests(unittest.TestCase):
             {"argv": ["sed", "-n", "10,20p", "-i"], "cwd": "/tmp"},
             {"argv": ["sed", "-n", "10,20p", "file.txt", "extra"], "cwd": "/tmp"},
             {"argv": ["cat", "file.txt"], "cwd": "/tmp"},
+            {"argv": ["sed", "-n", "1p", "file.txt"], "cwd": 123},
         ]
         for arguments in unsafe:
             with self.subTest(arguments=arguments):
