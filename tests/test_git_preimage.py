@@ -192,5 +192,71 @@ class GitPreimageOperationStateTests(unittest.TestCase):
                 )
 
 
+    def test_untracked_preimage_reenumerates_paths_after_hashing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            self._init_repo(repo)
+            listing_calls = 0
+
+            def racing_probe(
+                observed_repo: Path, arguments: list[str]
+            ) -> subprocess.CompletedProcess[bytes]:
+                nonlocal listing_calls
+                if arguments == [
+                    "ls-files",
+                    "--others",
+                    "--exclude-standard",
+                    "-z",
+                ]:
+                    listing_calls += 1
+                    if listing_calls == 2:
+                        (repo / "late.txt").write_text(
+                            "appeared during capture\n",
+                            encoding="utf-8",
+                        )
+                return self._probe(observed_repo, arguments)
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "untracked path set changed during preimage capture",
+            ):
+                git_preimage.capture_untracked_preimage(
+                    repo,
+                    racing_probe,
+                )
+            self.assertEqual(2, listing_calls)
+
+    def test_branch_preimage_rereads_index_after_tracked_hashing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            self._init_repo(repo)
+            index_calls = 0
+
+            def racing_index_probe(
+                observed_repo: Path, arguments: list[str]
+            ) -> subprocess.CompletedProcess[bytes]:
+                nonlocal index_calls
+                if arguments == ["ls-files", "--stage", "-z"]:
+                    index_calls += 1
+                    if index_calls == 2:
+                        (repo / "tracked.txt").write_text(
+                            "index changed during capture\n",
+                            encoding="utf-8",
+                        )
+                        self._run(repo, "add", "tracked.txt")
+                return self._probe(observed_repo, arguments)
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "index changed during preimage capture",
+            ):
+                git_preimage.capture_branch_preimage(
+                    repo,
+                    self._probe,
+                    index_probe=racing_index_probe,
+                )
+            self.assertEqual(2, index_calls)
+
+
 if __name__ == "__main__":
     unittest.main()

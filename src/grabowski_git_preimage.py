@@ -193,6 +193,15 @@ def capture_untracked_preimage(
         max_total_bytes=max_total_bytes,
         deadline_monotonic=deadline_monotonic,
     )
+    _deadline_guard(deadline_monotonic, "untracked preimage capture")
+    rechecked = probe(
+        repo, ["ls-files", "--others", "--exclude-standard", "-z"]
+    )
+    if rechecked.returncode != 0:
+        raise RuntimeError("Git untracked re-observation failed")
+    rechecked_paths = [path for path in rechecked.stdout.split(b"\0") if path]
+    if rechecked_paths != paths:
+        raise RuntimeError("Git untracked path set changed during preimage capture")
     material = {"schema_version": 1, "count": len(paths), "worktree_sha256": digest}
     return {
         **material,
@@ -730,6 +739,13 @@ def capture_branch_preimage(
         raise physical_checkout.PhysicalCheckoutIdentityError(
             "physical checkout identity changed during preimage capture"
         ) from exc
+
+    _deadline_guard(deadline_monotonic, "branch preimage capture")
+    index_recheck = index_reader(repo, ["ls-files", "--stage", "-z"])
+    if index_recheck.returncode != 0:
+        raise RuntimeError("Git index re-observation failed")
+    if index_recheck.stdout != index_result.stdout:
+        raise RuntimeError("Git index changed during preimage capture")
 
     material: dict[str, Any] = {
         "schema_version": 2,
