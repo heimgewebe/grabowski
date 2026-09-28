@@ -10110,7 +10110,9 @@ class TaskTests(unittest.TestCase):
         self.assertNotEqual(first_id, second["task"]["task_id"])
         self.assertIsNone(second["deduplicated_reuse"])
 
-    def test_managed_cargo_unbound_reuse_skips_newer_operation_bound_record(self) -> None:
+    def test_managed_cargo_unbound_reuse_skips_newer_failed_operation_bound_record(
+        self,
+    ) -> None:
         raw_command = ["/usr/bin/cargo", "test"]
 
         def bound(cache_key: str) -> list[str]:
@@ -10175,8 +10177,8 @@ class TaskTests(unittest.TestCase):
         self.assertNotEqual(base_id, operation_id)
         tasks._set_state(
             operation_id,
-            "completed",
-            observation={"state": "completed", "observed_at_unix": tasks._now()},
+            "failed",
+            observation={"state": "failed", "observed_at_unix": tasks._now()},
         )
 
         with (
@@ -10271,6 +10273,50 @@ class TaskTests(unittest.TestCase):
         prepare.assert_not_called()
         dispatch.assert_not_called()
         self.assertEqual("failed", tasks._row_raw(task_id)["state"])
+
+    def test_execution_record_unbound_rejects_each_persisted_binding(self) -> None:
+        record = {"task_id": "bound-probe"}
+
+        with (
+            patch.object(tasks, "_persisted_task_operation_identity", return_value=None),
+            patch.object(tasks, "_persisted_retry_binding_or_raise", return_value=None),
+            patch.object(
+                tasks,
+                "_persisted_interrupted_recovery_binding_or_raise",
+                return_value=None,
+            ),
+        ):
+            self.assertTrue(tasks._execution_record_is_unbound(record))
+
+        bound_values = (
+            ("_persisted_task_operation_identity", {"operation_identity_sha256": "a" * 64}),
+            ("_persisted_retry_binding_or_raise", {"binding_sha256": "b" * 64}),
+            (
+                "_persisted_interrupted_recovery_binding_or_raise",
+                {"binding_sha256": "c" * 64},
+            ),
+        )
+        for helper_name, bound_value in bound_values:
+            with self.subTest(helper=helper_name):
+                with (
+                    patch.object(
+                        tasks,
+                        "_persisted_task_operation_identity",
+                        return_value=None,
+                    ),
+                    patch.object(
+                        tasks,
+                        "_persisted_retry_binding_or_raise",
+                        return_value=None,
+                    ),
+                    patch.object(
+                        tasks,
+                        "_persisted_interrupted_recovery_binding_or_raise",
+                        return_value=None,
+                    ),
+                    patch.object(tasks, helper_name, return_value=bound_value),
+                ):
+                    self.assertFalse(tasks._execution_record_is_unbound(record))
 
     def test_unprepared_managed_cargo_scan_returns_match_before_limit_in_final_batch(
         self,

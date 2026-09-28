@@ -4679,6 +4679,14 @@ def _resolve_active_execution_reuse(
     return None
 
 
+def _execution_record_is_unbound(record: dict[str, Any]) -> bool:
+    return (
+        _persisted_task_operation_identity(record) is None
+        and _persisted_retry_binding_or_raise(record) is None
+        and _persisted_interrupted_recovery_binding_or_raise(record) is None
+    )
+
+
 def _latest_matching_unbound_execution_record(
     identity: dict[str, Any],
 ) -> dict[str, Any] | None:
@@ -4709,9 +4717,7 @@ def _latest_matching_unbound_execution_record(
     for row in rows:
         record = dict(row)
         if (
-            _persisted_task_operation_identity(record) is None
-            and _persisted_retry_binding_or_raise(record) is None
-            and _persisted_interrupted_recovery_binding_or_raise(record) is None
+            _execution_record_is_unbound(record)
             and _record_matches_execution_retry_identity(record, identity)
         ):
             return record
@@ -5407,12 +5413,7 @@ def _latest_matching_unprepared_managed_cargo_record(
                     include_command=False,
                 ):
                     continue
-                if unbound_only and (
-                    _persisted_task_operation_identity(record) is not None
-                    or _persisted_retry_binding_or_raise(record) is not None
-                    or _persisted_interrupted_recovery_binding_or_raise(record)
-                    is not None
-                ):
+                if unbound_only and not _execution_record_is_unbound(record):
                     continue
                 return record
 
@@ -5486,6 +5487,8 @@ def _resolve_unprepared_managed_cargo_execution_reuse(
 def _matching_attention_unprepared_managed_cargo_records(
     identity: dict[str, Any],
     command: list[str],
+    *,
+    unbound_only: bool = False,
 ) -> list[dict[str, Any]]:
     attention_states = tuple(TASK_STATE_PROJECTIONS["attention"])
     placeholders = ",".join("?" for _ in attention_states)
@@ -5537,6 +5540,7 @@ def _matching_attention_unprepared_managed_cargo_records(
             identity,
             include_command=False,
         )
+        and (not unbound_only or _execution_record_is_unbound(record))
     ]
 
 
@@ -5575,6 +5579,7 @@ def _guard_unprepared_managed_cargo_retry(
     execution_backend: str,
     identity: dict[str, Any],
     retry_context: dict[str, Any] | None,
+    unbound_only: bool = False,
 ) -> bool:
     local_systemd = (
         target["transport"] == "local" and execution_backend == "systemd-user"
@@ -5591,11 +5596,17 @@ def _guard_unprepared_managed_cargo_retry(
     if request_root is None and explicit_managed_target is None:
         return False
     if retry_context is None:
-        latest = _latest_matching_unprepared_managed_cargo_record(identity, command)
+        latest = _latest_matching_unprepared_managed_cargo_record(
+            identity,
+            command,
+            unbound_only=unbound_only,
+        )
         _guard_direct_terminal_retry_record(latest)
         latest_task_id = str(latest["task_id"]) if latest is not None else None
         for source in _matching_attention_unprepared_managed_cargo_records(
-            identity, command
+            identity,
+            command,
+            unbound_only=unbound_only,
         ):
             if str(source["task_id"]) == latest_task_id:
                 continue
@@ -8870,6 +8881,11 @@ def grabowski_task_start(
         execution_backend=execution_backend,
         systemd_scope=systemd_scope,
     )
+    execution_reuse_eligible = (
+        normalized_operation_identity is None
+        and operation_retry_binding is None
+        and _retry_context is None
+    )
     managed_cargo_request = _guard_unprepared_managed_cargo_retry(
         command,
         target=target,
@@ -8877,14 +8893,10 @@ def grabowski_task_start(
         execution_backend=execution_backend,
         identity=unprepared_identity,
         retry_context=_retry_context,
+        unbound_only=execution_reuse_eligible,
     )
     execution_reuse = None
     execution_reuse_reason = None
-    execution_reuse_eligible = (
-        normalized_operation_identity is None
-        and operation_retry_binding is None
-        and _retry_context is None
-    )
     if execution_reuse_eligible and managed_cargo_request:
         execution_reuse, execution_reuse_reason = (
             _resolve_unprepared_managed_cargo_execution_reuse(
