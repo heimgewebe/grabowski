@@ -4703,19 +4703,19 @@ def _latest_matching_unbound_execution_record(
                 identity["systemd_scope"],
             ),
         ).fetchall()
-    if len(rows) > 50000:
-        raise RuntimeError("unbound execution identity scan limit exceeded")
+    skipped = 0
     for row in rows:
         record = dict(row)
-        if _persisted_task_operation_identity(record) is not None:
-            continue
         if (
-            _persisted_retry_binding_or_raise(record) is not None
-            or _persisted_interrupted_recovery_binding_or_raise(record) is not None
+            _persisted_task_operation_identity(record) is None
+            and _persisted_retry_binding_or_raise(record) is None
+            and _persisted_interrupted_recovery_binding_or_raise(record) is None
+            and _record_matches_execution_retry_identity(record, identity)
         ):
-            continue
-        if _record_matches_execution_retry_identity(record, identity):
             return record
+        skipped += 1
+        if skipped > 50000:
+            raise RuntimeError("unbound execution identity scan limit exceeded")
     return None
 
 
@@ -8832,6 +8832,27 @@ def grabowski_task_start(
         host=host,
         opaque_command=True,
     )
+    read_routing_advisory = (
+        _task_read_routing_advisory(
+            target=target,
+            command=command,
+            working_directory=working_directory,
+            runtime_seconds=runtime,
+            resume_policy=policy,
+            task_resources=task_resources,
+            chronik_enabled=bool(chronik_enabled),
+            operation_identity=normalized_operation_identity,
+            route_evidence_present=normalized_route_evidence is not None,
+            retry_context_present=_retry_context is not None,
+            recovery_required=bool(recovery_gate.get("required", False)),
+            classification=task_effect_classification,
+        )
+        if (
+            task_effect_classification.get("effect_profile") == "read_only"
+            and task_effect_classification.get("agent_executable") is None
+        )
+        else None
+    )
     unprepared_identity = _task_execution_identity(
         host=host,
         argv_sha256=command_identity.argv_sha256(command),
@@ -8904,7 +8925,14 @@ def grabowski_task_start(
             )
             if execution_reuse is not None:
                 execution_reuse_reason = "active_execution_identity"
-            if execution_reuse is None:
+            if (
+                execution_reuse is None
+                and (
+                    read_routing_advisory is None
+                    or read_routing_advisory.get("classification")
+                    != "avoidable_bounded_read"
+                )
+            ):
                 execution_reuse = _resolve_recent_completed_execution_reuse(
                     execution_identity,
                     resume_policy=policy,
@@ -8948,27 +8976,6 @@ def grabowski_task_start(
                 "reason": execution_reuse_reason,
             },
         }
-    read_routing_advisory = (
-        _task_read_routing_advisory(
-            target=target,
-            command=command,
-            working_directory=working_directory,
-            runtime_seconds=runtime,
-            resume_policy=policy,
-            task_resources=task_resources,
-            chronik_enabled=bool(chronik_enabled),
-            operation_identity=normalized_operation_identity,
-            route_evidence_present=normalized_route_evidence is not None,
-            retry_context_present=_retry_context is not None,
-            recovery_required=bool(recovery_gate.get("required", False)),
-            classification=task_effect_classification,
-        )
-        if (
-            task_effect_classification.get("effect_profile") == "read_only"
-            and task_effect_classification.get("agent_executable") is None
-        )
-        else None
-    )
     if (
         read_routing_advisory is not None
         and read_routing_advisory.get("classification") == "avoidable_bounded_read"

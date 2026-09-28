@@ -3873,6 +3873,87 @@ class TaskTests(unittest.TestCase):
         )
         dispatch_mock.assert_not_called()
 
+    def test_avoidable_bounded_read_reroutes_before_recent_completed_reuse(
+        self,
+    ) -> None:
+        from tests.test_task_routing_shadow_capture import direct_route_evidence
+
+        argv = ["git", "status", "--short", "--branch"]
+        capture_result = {
+            "schema_version": 1,
+            "status": "created",
+            "binding_status": "created",
+            "binding_id": "b" * 64,
+            "no_effect": dict(routing_shadow.NO_EFFECT),
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_validate_command", return_value=argv),
+            patch.object(tasks.operator, "_guard_git"),
+            patch.object(tasks.operator, "_git_config_values", return_value=[]),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 157}
+            ),
+            patch.object(
+                routing_shadow,
+                "capture_direct_task_start_best_effort",
+                return_value=capture_result,
+            ),
+        ):
+            first = tasks.grabowski_task_start(
+                "local",
+                argv,
+                cwd=str(self.root),
+                runtime_seconds=30,
+                resume_policy="never",
+                effect_profile="read_only",
+                route_evidence=direct_route_evidence(),
+            )
+
+        first_id = str(first["task"]["task_id"])
+        tasks._set_state(
+            first_id,
+            "completed",
+            observation={"state": "completed", "observed_at_unix": tasks._now()},
+        )
+
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_validate_command", return_value=argv),
+            patch.object(tasks.operator, "_guard_git"),
+            patch.object(tasks.operator, "_git_config_values", return_value=[]),
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch_mock,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 158}
+            ),
+        ):
+            repeated = tasks.grabowski_task_start(
+                "local",
+                argv,
+                cwd=str(self.root),
+                runtime_seconds=30,
+                resume_policy="never",
+                effect_profile="read_only",
+            )
+
+        self.assertIsNone(repeated["task"])
+        self.assertIsNone(repeated["deduplicated_reuse"])
+        self.assertEqual(
+            "avoidable_bounded_read",
+            repeated["read_routing_advisory"]["classification"],
+        )
+        self.assertEqual(
+            "grabowski_git_status",
+            repeated["read_routing_reroute"]["recommended_route"],
+        )
+        dispatch_mock.assert_not_called()
+        with tasks._database_connection() as connection:
+            count = connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        self.assertEqual(1, count)
+
     def test_explicit_read_only_manual_resume_keeps_durable_route(self) -> None:
         argv = ["git", "status", "--short", "--branch"]
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
@@ -11820,12 +11901,38 @@ class TaskTests(unittest.TestCase):
         ):
             tasks._latest_matching_unbound_execution_record(identity)
 
-    def test_unbound_execution_identity_scan_limit_fails_closed(self) -> None:
-        _record, identity = self._completed_execution_reuse_validation_fixture()
+    def test_unbound_execution_identity_scan_limit_returns_newest_match(self) -> None:
+        record, identity = self._completed_execution_reuse_validation_fixture()
 
         class FakeCursor:
-            def fetchall(self) -> list[None]:
-                return [None] * 50001
+            def fetchall(self) -> list[dict[str, object]]:
+                return [record] * 50001
+
+        class FakeConnection:
+            def __enter__(self) -> "FakeConnection":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def execute(self, *_args: object) -> FakeCursor:
+                return FakeCursor()
+
+        with patch.object(
+            tasks, "_database_connection", return_value=FakeConnection()
+        ):
+            matching = tasks._latest_matching_unbound_execution_record(identity)
+
+        self.assertIsNotNone(matching)
+        self.assertEqual(record["task_id"], matching["task_id"])
+
+    def test_unbound_execution_identity_scan_limit_fails_closed(self) -> None:
+        _record, identity = self._completed_execution_reuse_validation_fixture()
+        bound = {"task_id": "operation-bound"}
+
+        class FakeCursor:
+            def fetchall(self) -> list[dict[str, object]]:
+                return [bound] * 50001
 
         class FakeConnection:
             def __enter__(self) -> "FakeConnection":
@@ -11839,6 +11946,11 @@ class TaskTests(unittest.TestCase):
 
         with (
             patch.object(tasks, "_database_connection", return_value=FakeConnection()),
+            patch.object(
+                tasks,
+                "_persisted_task_operation_identity",
+                return_value={"operation_identity_sha256": "f" * 64},
+            ),
             self.assertRaisesRegex(
                 RuntimeError, "unbound execution identity scan limit exceeded"
             ),
