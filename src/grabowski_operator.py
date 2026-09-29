@@ -109,6 +109,8 @@ _SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC = float("-inf")
 _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = False
 _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER: threading.Timer | None = None
 _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION = 0
+_SYNC_TOOL_ALLOCATOR_TRIM_RETRY_IN_FLIGHT = False
+_SYNC_TOOL_ALLOCATOR_TRIM_RETRY_COALESCED_DELAY_SECONDS: float | None = None
 _SYNC_TOOL_ALLOCATOR_LIBC: Any | None = None
 _SYNC_TOOL_ALLOCATOR_LIBC_UNAVAILABLE = False
 
@@ -2213,53 +2215,107 @@ def _sync_tool_allocator_libc() -> Any | None:
 
 def _cancel_sync_tool_allocator_trim_retry() -> None:
     """Cancel one pending allocator retry without holding the trim gate."""
+    global _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_COALESCED_DELAY_SECONDS
     global _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION
     global _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER
     with _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_LOCK:
         timer = _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER
         _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER = None
         _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION += 1
+        # A running allocator attempt cannot be cancelled. Preserve any retry
+        # request that arrived after it started; the runner will schedule that
+        # one coalesced follow-up after the attempt leaves the trim gate.
+        if not _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_IN_FLIGHT:
+            _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_COALESCED_DELAY_SECONDS = None
     if timer is not None:
         timer.cancel()
 
 
+def _start_sync_tool_allocator_trim_retry_timer(timer: threading.Timer) -> bool:
+    """Start one already-published retry timer and fail soft on thread refusal."""
+    global _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION
+    global _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER
+    try:
+        timer.start()
+    except RuntimeError:
+        with _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_LOCK:
+            if _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER is timer:
+                _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER = None
+                _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION += 1
+        return False
+    return True
+
+
+def _prepare_sync_tool_allocator_trim_retry_locked(
+    delay_seconds: float,
+) -> threading.Timer:
+    """Publish one pending retry while the retry-state lock is held."""
+    global _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION
+    global _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER
+    _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION += 1
+    generation = _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION
+    timer = threading.Timer(
+        max(0.0, delay_seconds),
+        _run_sync_tool_allocator_trim_retry,
+        args=(generation,),
+    )
+    timer.daemon = True
+    _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER = timer
+    return timer
+
+
 def _run_sync_tool_allocator_trim_retry(generation: int) -> None:
     """Re-enter the normal trim gate for one still-current allocator retry."""
+    global _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_COALESCED_DELAY_SECONDS
+    global _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_IN_FLIGHT
     global _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER
     with _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_LOCK:
         if (
             generation != _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION
             or _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER is None
+            or _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_IN_FLIGHT
         ):
             return
         _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER = None
-    _maybe_trim_sync_tool_allocator()
+        _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_IN_FLIGHT = True
+
+    follow_up_timer: threading.Timer | None = None
+    try:
+        _maybe_trim_sync_tool_allocator()
+    finally:
+        with _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_LOCK:
+            _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_IN_FLIGHT = False
+            follow_up_delay = (
+                _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_COALESCED_DELAY_SECONDS
+            )
+            _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_COALESCED_DELAY_SECONDS = None
+            if (
+                follow_up_delay is not None
+                and _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER is None
+            ):
+                follow_up_timer = _prepare_sync_tool_allocator_trim_retry_locked(
+                    follow_up_delay
+                )
+        if follow_up_timer is not None:
+            _start_sync_tool_allocator_trim_retry_timer(follow_up_timer)
 
 
 def _schedule_sync_tool_allocator_trim_retry(delay_seconds: float) -> bool:
     """Schedule at most one allocator retry without blocking the trim gate."""
-    global _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION
-    global _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER
+    global _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_COALESCED_DELAY_SECONDS
+    delay_seconds = max(0.0, delay_seconds)
     with _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_LOCK:
+        if _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_IN_FLIGHT:
+            current = _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_COALESCED_DELAY_SECONDS
+            if current is None or delay_seconds < current:
+                _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_COALESCED_DELAY_SECONDS = (
+                    delay_seconds
+                )
+            return False
         if _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER is not None:
             return False
-        _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION += 1
-        generation = _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION
-        timer = threading.Timer(
-            max(0.0, delay_seconds),
-            _run_sync_tool_allocator_trim_retry,
-            args=(generation,),
-        )
-        timer.daemon = True
-        _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER = timer
-        try:
-            timer.start()
-        except RuntimeError:
-            if _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER is timer:
-                _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER = None
-                _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION += 1
-            return False
-    return True
+        timer = _prepare_sync_tool_allocator_trim_retry_locked(delay_seconds)
+    return _start_sync_tool_allocator_trim_retry_timer(timer)
 
 
 def _maybe_trim_sync_tool_allocator() -> bool:

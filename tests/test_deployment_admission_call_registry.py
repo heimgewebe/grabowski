@@ -777,6 +777,122 @@ class SyncToolAllocatorTrimTests(unittest.TestCase):
         self.assertFalse(operator._SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED)
         self.assertIsNone(operator._SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER)
 
+    def test_trim_cooldown_retry_requested_in_flight_is_coalesced(self) -> None:
+        operator = _load_operator_module()
+        calls: list[int] = []
+        timers: list[object] = []
+
+        class FakeTimer:
+            def __init__(self, interval, function, args=()):
+                self.interval = interval
+                self.function = function
+                self.args = args
+                self.daemon = False
+                self.cancelled = False
+                timers.append(self)
+
+            def start(self):
+                pass
+
+            def cancel(self):
+                self.cancelled = True
+
+            def fire(self):
+                self.function(*self.args)
+
+        libc = self._libc(
+            operator.SYNC_TOOL_ALLOCATOR_TRIM_FREE_BYTES,
+            calls,
+        )
+        monotonic = [101.0]
+        with patch.object(operator.threading, "Timer", FakeTimer), patch.object(
+            operator, "_sync_tool_allocator_libc", return_value=libc
+        ), patch.object(
+            operator.time, "monotonic", side_effect=lambda: monotonic[0]
+        ), patch.object(
+            operator, "_SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC", 100.0
+        ):
+            self.assertTrue(operator._schedule_sync_tool_allocator_trim_retry(0.0))
+            self.assertEqual(1, len(timers))
+
+            timers[0].fire()
+
+            self.assertEqual([], calls)
+            self.assertFalse(operator._SYNC_TOOL_ALLOCATOR_TRIM_RETRY_IN_FLIGHT)
+            self.assertIsNone(
+                operator._SYNC_TOOL_ALLOCATOR_TRIM_RETRY_COALESCED_DELAY_SECONDS
+            )
+            self.assertEqual(2, len(timers))
+            self.assertEqual(29.0, timers[1].interval)
+            self.assertIs(
+                timers[1],
+                operator._SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER,
+            )
+
+            monotonic[0] = 130.0
+            timers[1].fire()
+
+        self.assertEqual([0], calls)
+        self.assertFalse(operator._SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED)
+        self.assertFalse(operator._SYNC_TOOL_ALLOCATOR_TRIM_RETRY_IN_FLIGHT)
+        self.assertIsNone(
+            operator._SYNC_TOOL_ALLOCATOR_TRIM_RETRY_COALESCED_DELAY_SECONDS
+        )
+        self.assertIsNone(operator._SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER)
+
+    def test_trim_retry_stale_callback_cannot_clear_replacement(self) -> None:
+        operator = _load_operator_module()
+        timers: list[object] = []
+        attempts: list[int] = []
+
+        class FakeTimer:
+            def __init__(self, interval, function, args=()):
+                self.interval = interval
+                self.function = function
+                self.args = args
+                self.daemon = False
+                self.cancelled = False
+                timers.append(self)
+
+            def start(self):
+                pass
+
+            def cancel(self):
+                self.cancelled = True
+
+            def fire(self):
+                self.function(*self.args)
+
+        with patch.object(operator.threading, "Timer", FakeTimer), patch.object(
+            operator,
+            "_maybe_trim_sync_tool_allocator",
+            side_effect=lambda: attempts.append(threading.get_ident()) or False,
+        ):
+            self.assertTrue(operator._schedule_sync_tool_allocator_trim_retry(10.0))
+            stale_timer = timers[0]
+            operator._cancel_sync_tool_allocator_trim_retry()
+            self.assertTrue(stale_timer.cancelled)
+
+            self.assertTrue(operator._schedule_sync_tool_allocator_trim_retry(20.0))
+            replacement = timers[1]
+            stale_timer.fire()
+
+            self.assertEqual([], attempts)
+            self.assertIs(
+                replacement,
+                operator._SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER,
+            )
+            self.assertFalse(operator._SYNC_TOOL_ALLOCATOR_TRIM_RETRY_IN_FLIGHT)
+
+            replacement.fire()
+
+        self.assertEqual(1, len(attempts))
+        self.assertIsNone(operator._SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER)
+        self.assertFalse(operator._SYNC_TOOL_ALLOCATOR_TRIM_RETRY_IN_FLIGHT)
+        self.assertIsNone(
+            operator._SYNC_TOOL_ALLOCATOR_TRIM_RETRY_COALESCED_DELAY_SECONDS
+        )
+
     def test_final_async_release_does_not_wait_for_in_progress_trim_gate(
         self,
     ) -> None:
@@ -1019,6 +1135,106 @@ class DeploymentAdmissionGateTests(unittest.TestCase):
 
         self.assertEqual(1, len(trim_threads))
         self.assertIsNone(operator._SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER)
+        self.assertEqual(0, operator._deployment_admission_active_tool_calls())
+
+    def test_gate_sync_completion_burst_coalesces_while_retry_is_in_flight(
+        self,
+    ) -> None:
+        operator = _load_operator_module()
+        timers: list[object] = []
+        attempt_entered = threading.Event()
+        release_attempt = threading.Event()
+        attempts: list[int] = []
+
+        class FakeTimer:
+            def __init__(self, interval, function, args=()):
+                self.interval = interval
+                self.function = function
+                self.args = args
+                self.daemon = False
+                timers.append(self)
+
+            def start(self):
+                pass
+
+            def cancel(self):
+                pass
+
+            def fire(self):
+                self.function(*self.args)
+
+        def completed_future(*_args, **_kwargs):
+            future = operator.concurrent.futures.Future()
+            future.set_result({"called": True})
+            return future
+
+        def blocked_trim_attempt() -> bool:
+            attempts.append(threading.get_ident())
+            attempt_entered.set()
+            self.assertTrue(release_attempt.wait(timeout=2.0))
+            return False
+
+        operator.mcp._tool_manager.get_tool = lambda _name: _sync_tool()
+        with patch.object(
+            operator, "_submit_sync_tool_call", side_effect=completed_future
+        ), patch.object(
+            operator.threading, "Timer", FakeTimer
+        ), patch.object(
+            operator,
+            "_maybe_trim_sync_tool_allocator",
+            side_effect=blocked_trim_attempt,
+        ):
+            operator._configure_http_runtime()
+            first = asyncio.run(operator.mcp._tool_manager.call_tool("read", {}))
+            self.assertTrue(first["called"])
+            self.assertEqual(1, len(timers))
+
+            retry_thread = threading.Thread(
+                target=timers[0].fire,
+                daemon=True,
+            )
+            retry_thread.start()
+            self.assertTrue(attempt_entered.wait(timeout=1.0))
+            self.assertTrue(operator._SYNC_TOOL_ALLOCATOR_TRIM_RETRY_IN_FLIGHT)
+
+            started = time.perf_counter()
+            for _ in range(32):
+                result = asyncio.run(
+                    operator.mcp._tool_manager.call_tool("read", {})
+                )
+                self.assertTrue(result["called"])
+            elapsed = time.perf_counter() - started
+
+            self.assertLess(elapsed, 1.0)
+            self.assertEqual(1, len(timers))
+            self.assertEqual(
+                0.0,
+                operator._SYNC_TOOL_ALLOCATOR_TRIM_RETRY_COALESCED_DELAY_SECONDS,
+            )
+            self.assertEqual(0, operator._deployment_admission_active_tool_calls())
+
+            release_attempt.set()
+            retry_thread.join(timeout=1.0)
+            self.assertFalse(retry_thread.is_alive())
+
+            self.assertFalse(operator._SYNC_TOOL_ALLOCATOR_TRIM_RETRY_IN_FLIGHT)
+            self.assertIsNone(
+                operator._SYNC_TOOL_ALLOCATOR_TRIM_RETRY_COALESCED_DELAY_SECONDS
+            )
+            self.assertEqual(2, len(timers))
+            self.assertIs(
+                timers[1],
+                operator._SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER,
+            )
+
+            timers[1].fire()
+
+        self.assertEqual(2, len(attempts))
+        self.assertIsNone(operator._SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER)
+        self.assertFalse(operator._SYNC_TOOL_ALLOCATOR_TRIM_RETRY_IN_FLIGHT)
+        self.assertIsNone(
+            operator._SYNC_TOOL_ALLOCATOR_TRIM_RETRY_COALESCED_DELAY_SECONDS
+        )
         self.assertEqual(0, operator._deployment_admission_active_tool_calls())
 
     def test_gate_concurrent_sync_status_calls_use_single_worker_status_lane(self) -> None:
