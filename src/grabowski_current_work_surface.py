@@ -250,7 +250,7 @@ def _task_checkout_presence(
     database_before = (
         reconciler.collect_lifecycle_bindings_from_db()
         if database_snapshot is None
-        else database_snapshot
+        else reconciler._validated_database_snapshot(database_snapshot)
     )
     if database_before.get("snapshot_sha256") != expected_database_sha256:
         raise RuntimeError(
