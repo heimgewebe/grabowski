@@ -69,6 +69,7 @@ MAX_RECORD_BYTES = 64 * 1024
 MAX_TEXT_BYTES = 2_048
 MAX_PAGE_LIMIT = 100
 MAX_CURRENT_SCAN_ROWS = 5 * MAX_PAGE_LIMIT
+MAX_CURRENT_DIRECT_SCAN_BATCH_ROWS = 10 * MAX_PAGE_LIMIT
 MAX_CURRENT_CONVERGENCE_ROWS = 50_000
 MAX_CURRENT_LOCAL_CONVERGENCE_ROWS = 4 * MAX_CURRENT_SCAN_ROWS
 MAX_CURRENT_LOCAL_CONVERGENCE_DEPTH = 32
@@ -3482,6 +3483,155 @@ def _bounded_current_retry_convergence(
     }
 
 
+def _current_work_direct_retry_convergence(
+    connection: Any,
+    *,
+    attention_task_ids: set[str],
+    retry_binding_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Converge only retry chains that can hide current-work attention.
+
+    The caller already loaded every row carrying retry evidence from one task
+    snapshot. Reuse that bounded evidence instead of rediscovering successors
+    through repeated database scans. Malformed retry evidence still fails the
+    whole direct scan visible before any orphan attention can be suppressed.
+    """
+
+    if not isinstance(attention_task_ids, set) or any(
+        not isinstance(task_id, str)
+        or tasks.TASK_ID.fullmatch(task_id) is None
+        for task_id in attention_task_ids
+    ):
+        raise TaskAttentionInputError(
+            "current_work attention task ids must be canonical"
+        )
+    if not isinstance(retry_binding_records, list):
+        raise TaskAttentionInputError(
+            "current_work retry binding records must be a list"
+        )
+
+    retry_states = set(ATTENTION_STATES) | set(
+        terminal_convergence.RETRY_SUCCESSOR_SUPPORT_STATES
+    )
+    binding_by_task: dict[str, dict[str, Any]] = {}
+    record_by_task: dict[str, dict[str, Any]] = {}
+    support_by_source: dict[str, list[dict[str, Any]]] = {}
+    direct_source_task_ids: set[str] = set()
+
+    for value in retry_binding_records:
+        if not isinstance(value, dict):
+            raise TaskAttentionInputError(
+                "current_work retry binding record must be an object"
+            )
+        record = dict(value)
+        task_id = tasks._validate_task_id(record.get("task_id"))
+        state = record.get("state")
+        if not isinstance(state, str) or state not in retry_states:
+            raise TaskAttentionIntegrityError(
+                "current_work retry binding state is unsupported"
+            )
+        if task_id in record_by_task:
+            raise TaskAttentionIntegrityError(
+                "current_work retry binding snapshot contains duplicate task ids"
+            )
+        retry_binding = terminal_convergence.persisted_retry_binding(record)
+        if retry_binding is None:
+            continue
+        record_by_task[task_id] = record
+        binding_by_task[task_id] = retry_binding
+        source_task_id = str(retry_binding["source_task_id"])
+        if state in terminal_convergence.RETRY_SUCCESSOR_SUPPORT_STATES:
+            support_by_source.setdefault(source_task_id, []).append(record)
+            if source_task_id in attention_task_ids:
+                direct_source_task_ids.add(source_task_id)
+
+    attention_by_task: dict[str, dict[str, Any]] = {}
+    support_by_task: dict[str, dict[str, Any]] = {}
+    frontier = set(direct_source_task_ids)
+    depth = 0
+
+    while frontier:
+        if depth >= MAX_CURRENT_LOCAL_CONVERGENCE_DEPTH:
+            raise RuntimeError("bounded retry convergence depth limit exceeded")
+
+        new_task_ids = frontier - set(attention_by_task)
+        frontier = set()
+        if new_task_ids:
+            remaining = (
+                MAX_CURRENT_LOCAL_CONVERGENCE_ROWS
+                - len(attention_by_task)
+                - len(support_by_task)
+            )
+            if remaining < len(new_task_ids):
+                raise RuntimeError("bounded retry convergence row limit exceeded")
+            source_rows = tasks._task_attention_records(
+                connection.execute(
+                    f"SELECT {_ATTENTION_SELECT_COLUMNS} FROM tasks "
+                    "WHERE task_id IN (SELECT value FROM json_each(?)) "
+                    "ORDER BY task_id DESC LIMIT ?",
+                    (
+                        json.dumps(
+                            sorted(new_task_ids),
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        len(new_task_ids) + 1,
+                    ),
+                )
+            )
+            source_by_task = {
+                str(record["task_id"]): dict(record)
+                for record in source_rows
+            }
+            if set(source_by_task) != new_task_ids:
+                raise terminal_convergence.TerminalConvergenceError(
+                    "persisted retry source task is unavailable"
+                )
+
+            for source_task_id in sorted(new_task_ids):
+                source_record = source_by_task[source_task_id]
+                if source_record.get("state") not in ATTENTION_STATES:
+                    raise terminal_convergence.TerminalConvergenceError(
+                        "persisted retry source task is not current attention"
+                    )
+                attention_by_task[source_task_id] = source_record
+
+                retry_binding = binding_by_task.get(source_task_id)
+                if retry_binding is not None:
+                    parent_task_id = str(retry_binding["source_task_id"])
+                    if parent_task_id in support_by_task:
+                        raise terminal_convergence.TerminalConvergenceError(
+                            "persisted retry source task is not current attention"
+                        )
+                    if parent_task_id not in attention_by_task:
+                        frontier.add(parent_task_id)
+
+                for support_record in support_by_source.get(
+                    source_task_id, []
+                ):
+                    support_task_id = str(support_record["task_id"])
+                    support_by_task[support_task_id] = support_record
+
+            if (
+                len(attention_by_task) + len(support_by_task)
+                > MAX_CURRENT_LOCAL_CONVERGENCE_ROWS
+            ):
+                raise RuntimeError("bounded retry convergence row limit exceeded")
+        depth += 1
+        if depth >= MAX_CURRENT_LOCAL_CONVERGENCE_DEPTH:
+            raise RuntimeError("bounded retry convergence depth limit exceeded")
+
+    convergence = terminal_convergence.converge_attention_records(
+        [*attention_by_task.values(), *support_by_task.values()],
+        attention_task_ids=set(attention_by_task),
+    )
+    return {
+        **convergence,
+        "_support_task_ids": tuple(sorted(support_by_task)),
+        "_direct_source_task_ids": tuple(sorted(direct_source_task_ids)),
+    }
+
+
 def reconcile_attention(
     parameters: dict[str, Any] | None = None,
     *,
@@ -3660,66 +3810,37 @@ def reconcile_attention(
                     raise RuntimeError(
                         "current_work retry validation scan limit exceeded"
                     )
-                for retry_candidate in retry_binding_rows:
-                    terminal_convergence.persisted_retry_binding(
-                        dict(retry_candidate)
-                    )
-
-                retry_successors = tasks._task_retry_successor_records(
+                retry_convergence = _current_work_direct_retry_convergence(
                     connection,
-                    source_task_ids=attention_task_ids,
-                    limit=MAX_CURRENT_CONVERGENCE_ROWS,
+                    attention_task_ids=attention_task_ids,
+                    retry_binding_records=[
+                        dict(row) for row in retry_binding_rows
+                    ],
                 )
-                for successor in retry_successors:
-                    retry_binding = terminal_convergence.persisted_retry_binding(
-                        successor
+                current_work_retry_source_task_ids.update(
+                    str(task_id)
+                    for task_id in retry_convergence[
+                        "_direct_source_task_ids"
+                    ]
+                )
+                current_work_retry_excluded_task_ids = {
+                    str(item["task_id"])
+                    for item in retry_convergence["historical"]
+                    if item.get("convergence_classification")
+                    == "superseded_by_verified_retry"
+                }
+                local_historical = list(retry_convergence["historical"])
+                for name in convergence_counts:
+                    convergence_counts[name] += sum(
+                        1
+                        for item in local_historical
+                        if item.get("convergence_classification") == name
                     )
-                    if retry_binding is None:
-                        raise TaskAttentionIntegrityError(
-                            "retry successor lacks persisted retry evidence"
-                        )
-                    source_task_id = str(retry_binding["source_task_id"])
-                    if source_task_id in attention_task_ids:
-                        current_work_retry_source_task_ids.add(source_task_id)
-                if current_work_retry_source_task_ids:
-                    retry_source_rows = tasks._task_attention_records(
-                        connection.execute(
-                            f"SELECT {_ATTENTION_SELECT_COLUMNS} FROM tasks "
-                            f"WHERE state IN ({placeholders}) "
-                            "AND task_id IN (SELECT value FROM json_each(?)) "
-                            "ORDER BY created_at_unix DESC, task_id DESC",
-                            (
-                                *ATTENTION_STATES,
-                                json.dumps(
-                                    sorted(current_work_retry_source_task_ids),
-                                    ensure_ascii=False,
-                                    separators=(",", ":"),
-                                ),
-                            ),
-                        )
-                    )
-                    retry_convergence = _bounded_current_retry_convergence(
-                        connection,
-                        [dict(row) for row in retry_source_rows],
-                    )
-                    current_work_retry_excluded_task_ids = {
-                        str(item["task_id"])
-                        for item in retry_convergence["historical"]
-                        if item.get("convergence_classification")
-                        == "superseded_by_verified_retry"
-                    }
-                    local_historical = list(retry_convergence["historical"])
-                    for name in convergence_counts:
-                        convergence_counts[name] += sum(
-                            1
-                            for item in local_historical
-                            if item.get("convergence_classification") == name
-                        )
-                    converged_attention_count += len(local_historical)
-                    bounded_retry_successor_task_ids.update(
-                        str(task_id)
-                        for task_id in retry_convergence["_support_task_ids"]
-                    )
+                converged_attention_count += len(local_historical)
+                bounded_retry_successor_task_ids.update(
+                    str(task_id)
+                    for task_id in retry_convergence["_support_task_ids"]
+                )
             except (
                 terminal_convergence.TerminalConvergenceError,
                 TaskAttentionError,
@@ -3927,7 +4048,11 @@ def reconcile_attention(
                 and scanned_raw < current_scan_limit
             ):
                 batch_limit = min(
-                    MAX_PAGE_LIMIT,
+                    (
+                        MAX_CURRENT_DIRECT_SCAN_BATCH_ROWS
+                        if current_work_direct_scan_mode
+                        else MAX_PAGE_LIMIT
+                    ),
                     current_scan_limit - scanned_raw,
                 )
                 rows = fetch_rows(
