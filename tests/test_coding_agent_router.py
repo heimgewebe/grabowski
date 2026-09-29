@@ -1142,7 +1142,7 @@ class CodingAgentRouterTests(unittest.TestCase):
             for model in router.grabowski_coding_agent_catalog(include_disabled=True)["models"]
             for route in model["routes"]
         }
-        opus = public["claude-opus-5-high"]
+        opus = public["claude-opus-5.5-high"]
         self.assertEqual(opus["permission_mode"], "plan")
         self.assertTrue(opus["review_only"])
         self.assertTrue(opus["review_capable"])
@@ -1152,7 +1152,7 @@ class CodingAgentRouterTests(unittest.TestCase):
     def test_learning_applies_to_review_routes_not_authoritative_writing(
         self,
     ) -> None:
-        route_id = "claude-opus-5-high"
+        route_id = "claude-opus-5.5-high"
         self.state["routes"] = {
             route_id: {
                 "by_task_class": {
@@ -1899,17 +1899,17 @@ class CodingAgentRouterTests(unittest.TestCase):
             verification_policy="independent_review",
         )
 
-        self.assertEqual("claude-opus-5-writer-high", result["writer_route"])
+        self.assertEqual("claude-opus-5.5-writer-high", result["writer_route"])
         writer = result["scoped_writer"]
         self.assertIsNotNone(writer)
         reviewer = result["reviewers"][0]
         self.assertEqual("antigravity-gemini-pro-review-high", reviewer["route"])
         self.assertNotEqual(writer["independence_group"], reviewer["independence_group"])
         self.assertNotEqual(writer["provider_family"], reviewer["provider_family"])
-        self.assertIn("reviewer:claude-opus-5-high", result["excluded"])
+        self.assertIn("reviewer:claude-opus-5.5-high", result["excluded"])
         self.assertIn(
             "reviewer shares the primary model lineage",
-            result["excluded"]["reviewer:claude-opus-5-high"],
+            result["excluded"]["reviewer:claude-opus-5.5-high"],
         )
 
     def test_codex_reviewer_preserves_provider_independence(self) -> None:
@@ -1943,7 +1943,7 @@ class CodingAgentRouterTests(unittest.TestCase):
             need_review=True,
             verification_policy="independent_review",
         )
-        self.assertEqual("claude-opus-5-writer-high", delegated["writer_route"])
+        self.assertEqual("claude-opus-5.5-writer-high", delegated["writer_route"])
         self.assertEqual(
             "codex-sol-review-high",
             delegated["reviewers"][0]["route"],
@@ -1971,12 +1971,12 @@ class CodingAgentRouterTests(unittest.TestCase):
             verification_policy="independent_review",
         )
 
-        self.assertEqual("claude-opus-5-writer-high", result["writer_route"])
+        self.assertEqual("claude-opus-5.5-writer-high", result["writer_route"])
         self.assertEqual([], result["reviewers"])
         self.assertEqual("no-independent-review-route", result["review_status"])
         self.assertIn(
             "reviewer shares the primary model lineage",
-            result["excluded"]["reviewer:claude-opus-5-high"],
+            result["excluded"]["reviewer:claude-opus-5.5-high"],
         )
 
     def test_fable_contrast_and_review_routes_never_become_primary_writer(self) -> None:

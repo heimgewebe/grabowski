@@ -60,7 +60,7 @@ Provider diversity is used only when it improves independence or technical cover
 
 ### Review routes
 
-- `claude-opus-5-high`: judgment-heavy, security, architecture, and critical review through the Claude Pro baseline.
+- `claude-opus-5.5-high`: judgment-heavy, security, architecture, and critical review through the Claude Pro baseline.
 - `antigravity-gemini-pro-review-high`: independent Google-family review through the Google AI baseline.
 - `grok-4.6-review-high`: independent xAI review through SuperGrok; one turn, no web search, no subagents, no memory, no tools, and schema-constrained structured output.
 - `codex-sol-review-high`: GPT-5.6 Sol review through the ChatGPT Pro Codex baseline; it is a real reviewer route, but same-OpenAI-provider work is excluded by the existing independence gate.

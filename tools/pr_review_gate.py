@@ -1595,7 +1595,7 @@ def _claude_packet_review_command_matches(command: Any) -> bool:
         "--no-session-persistence",
         "--safe-mode",
         "--model",
-        "opus",
+        "claude-opus-5-5",
         "--effort",
         "high",
         "--max-budget-usd",
@@ -1911,8 +1911,8 @@ def _claude_cli_external_review_failures(review: dict[str, Any], prompt_sha256: 
         failures.append("tool_version is missing")
     if not _claude_packet_review_command_matches(review.get("command")):
         failures.append("command is not the allowed Claude packet-review command")
-    if review.get("model") != "opus":
-        failures.append("model is not opus")
+    if review.get("model") != "claude-opus-5-5":
+        failures.append("model is not claude-opus-5-5")
     if review.get("effort") != "high":
         failures.append("effort is not high")
     stdin_sha256 = review.get("stdin_sha256")

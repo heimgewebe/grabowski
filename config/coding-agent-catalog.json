@@ -610,7 +610,7 @@
     "claude-opus-5": {
       "availability": "live-verified-via-claude-pro",
       "base_quality_rank": 92,
-      "evidence": "claude-pro-opus-alias-resolved-to-claude-opus-5-smoke-2026-07-29",
+      "evidence": "claude-code-2.1.284-explicit-claude-opus-5-smoke-2026-09-29",
       "family": "anthropic-opus",
       "identity_kind": "model",
       "name": "Claude Opus 5",
@@ -625,9 +625,30 @@
         "review": 10,
         "speed": 5
       },
+      "quality_prior_class": "A"
+    },
+    "claude-opus-5.5": {
+      "availability": "live-verified-via-claude-pro",
+      "base_quality_rank": 92,
+      "evidence": "claude-code-2.1.284-explicit-claude-opus-5-5-and-opus-alias-smoke-2026-09-29",
+      "family": "anthropic-opus",
+      "identity_kind": "model",
+      "name": "Claude Opus 5.5",
+      "provider_family": "anthropic",
+      "quality": {
+        "architecture": 10,
+        "autonomy": 8,
+        "coding": 9,
+        "context": 10,
+        "debugging": 10,
+        "reliability": 10,
+        "review": 10,
+        "speed": 5
+      },
       "quality_prior_class": "A",
+      "resolved_model": "claude-opus-5-5",
       "resolved_alias": "opus",
-      "resolved_model": "claude-opus-5"
+      "alias_resolution_observed_at": "2026-09-29T14:47:00Z"
     },
     "gemini-3.6-flash": {
       "availability": "live-listed",
@@ -779,7 +800,7 @@
     "frontier_model_policy": {
       "benchmark_prior_not_local_truth": true,
       "escalation_route": "codex-sol-xhigh",
-      "opus_role": "Upper-frontier Anthropic reviewer plus escalation-only scoped writer for architecture, deep-debug, migration and difficult complex-patch work through the shared Claude Pro baseline; Sonnet remains the routine Claude writer, Codex Sol remains the canonical top escalation, and Opus writer results require independent review.",
+      "opus_role": "Claude Opus 5.5 is the upper-frontier Anthropic reviewer plus escalation-only scoped writer for architecture, deep-debug, migration and difficult complex-patch work through the shared Claude Pro baseline; Sonnet remains the routine Claude writer, Codex Sol remains the canonical top escalation, and Opus writer results require independent review.",
       "principle": "The controller owns integration, merge, deployment, closeout and the final review verdict. Explicitly lane-bound scoped writers may implement and publish PRs. External reviewers may cover all catalogued review classes, including critical and security review, but remain advisory until controller verification.",
       "same_task_peer_use": true,
       "top_contrast_routes": [
@@ -788,7 +809,7 @@
       "upper_review_or_contrast_routes": [
         "codex-sol-review-high",
         "codex-sol-medium",
-        "claude-opus-5-high",
+        "claude-opus-5.5-high",
         "codex-terra-high",
         "claude-sonnet-5-high",
         "grok-4.6-review-high",
@@ -814,6 +835,7 @@
         "description": "strong frontier and upper work profiles",
         "models": [
           "claude-opus-5",
+          "claude-opus-5.5",
           "gpt-5.6-terra",
           "claude-sonnet-5",
           "grok-4.6"
@@ -1030,7 +1052,7 @@
       "cost_mode": "subscription_included",
       "marginal_cost_usd": 0,
       "max_concurrency": 1,
-      "note": "Sonnet 5 and Opus 5 share one Claude Pro baseline. Fable 5 returned usage-credits-required and remains explicit-paid only.",
+      "note": "Sonnet 5, Opus 5, and Opus 5.5 share one Claude Pro baseline. Opus 5 and Opus 5.5 were locally live-verified with exact model ids on Claude Code 2.1.284 on 2026-09-29; the opus alias resolved to 5.5. Fable 5 returned usage-credits-required and remains explicit-paid only.",
       "payg_fallback_allowed": false,
       "quota_mode": "shared-five-hour-and-weekly-plan-limits",
       "reserve_floor": 0.3,
@@ -1043,14 +1065,15 @@
       ],
       "included_models_live_verified": [
         "claude-sonnet-5",
-        "claude-opus-5"
+        "claude-opus-5",
+        "claude-opus-5.5"
       ],
       "included_surfaces": [
         "claude-code"
       ],
       "overage_action": "block_and_surface",
       "plan": "Claude Pro",
-      "plan_evidence": "claude-auth-status-subscriptionType-pro; sonnet-5-and-opus-5-smoke-2026-07-29"
+      "plan_evidence": "claude-auth-status-subscriptionType-pro; sonnet-5-and-opus-5-smoke-2026-07-29; claude-code-2.1.284-explicit-opus-5-explicit-opus-5.5-and-opus-alias-smokes-2026-09-29"
     },
     "cline-account": {
       "blocked_reason": "Exact FREE model entitlement not verified.",
@@ -2794,7 +2817,7 @@
       "argv_prefix": [
         "claude",
         "--model",
-        "opus",
+        "claude-opus-5",
         "--effort",
         "high",
         "--permission-mode",
@@ -2804,7 +2827,7 @@
       "burn_weight": 2.1,
       "delegation_overhead_minutes": 6,
       "effort": "high",
-      "enabled": true,
+      "enabled": false,
       "escalation_only": true,
       "harness": "claude",
       "harness_quality": 9,
@@ -2835,13 +2858,106 @@
         "deep-debug",
         "migration"
       ],
+      "tier": "critical",
+      "disabled_reason": "Superseded for new scoped-writer escalation by explicit Claude Opus 5.5 route; retained for historical provenance and exact Opus 5 compatibility."
+    },
+    {
+      "argv_prefix": [
+        "claude",
+        "--model",
+        "claude-opus-5-5",
+        "--effort",
+        "high",
+        "--permission-mode",
+        "acceptEdits"
+      ],
+      "base_quality_rank": 92,
+      "burn_weight": 2.1,
+      "delegation_overhead_minutes": 6,
+      "effort": "high",
+      "enabled": true,
+      "escalation_only": true,
+      "harness": "claude",
+      "harness_quality": 9,
+      "id": "claude-opus-5.5-writer-high",
+      "independence_group": "anthropic-claude-pro",
+      "min_duration_minutes": 20,
+      "model": "claude-opus-5.5",
+      "priority": 109,
+      "quality_class": "A",
+      "quota_pools": [
+        "claude-pro"
+      ],
+      "risk_affinity": {
+        "high-risk": 8,
+        "prior-attempt-failed": 12,
+        "root-cause": 10,
+        "uncertainty-heavy": 12
+      },
+      "task_affinity": {
+        "architecture": 14,
+        "complex-patch": 12,
+        "deep-debug": 16,
+        "migration": 18
+      },
+      "task_classes": [
+        "architecture",
+        "complex-patch",
+        "deep-debug",
+        "migration"
+      ],
       "tier": "critical"
     },
     {
       "argv_prefix": [
         "claude",
         "--model",
-        "opus",
+        "claude-opus-5",
+        "--effort",
+        "high",
+        "--permission-mode",
+        "plan"
+      ],
+      "base_quality_rank": 92,
+      "burn_weight": 2.1,
+      "delegation_overhead_minutes": 6,
+      "effort": "high",
+      "enabled": false,
+      "harness": "claude",
+      "harness_quality": 9,
+      "id": "claude-opus-5-high",
+      "independence_group": "anthropic-claude-pro",
+      "min_duration_minutes": 20,
+      "model": "claude-opus-5",
+      "priority": 110,
+      "quality_class": "A",
+      "quota_pools": [
+        "claude-pro"
+      ],
+      "review_only": true,
+      "risk_affinity": {
+        "judgment-critical": 14,
+        "root-cause": 10,
+        "uncertainty-heavy": 12
+      },
+      "task_affinity": {
+        "critical-review": 28,
+        "independent-review": 20,
+        "security-review": 25
+      },
+      "task_classes": [
+        "independent-review",
+        "critical-review",
+        "security-review"
+      ],
+      "tier": "critical",
+      "disabled_reason": "Superseded for new reviews by explicit Claude Opus 5.5 route; retained for historical provenance and exact Opus 5 compatibility."
+    },
+    {
+      "argv_prefix": [
+        "claude",
+        "--model",
+        "claude-opus-5-5",
         "--effort",
         "high",
         "--permission-mode",
@@ -2854,10 +2970,10 @@
       "enabled": true,
       "harness": "claude",
       "harness_quality": 9,
-      "id": "claude-opus-5-high",
+      "id": "claude-opus-5.5-high",
       "independence_group": "anthropic-claude-pro",
       "min_duration_minutes": 20,
-      "model": "claude-opus-5",
+      "model": "claude-opus-5.5",
       "priority": 110,
       "quality_class": "A",
       "quota_pools": [
