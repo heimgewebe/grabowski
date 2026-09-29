@@ -635,6 +635,10 @@ def collect_lifecycle_bindings_from_db(
                     "ORDER BY retention.checkout_key LIMIT ?",
                     (MAX_BINDINGS + 1,),
                 ).fetchall()
+                all_retention_rows = connection.execute(
+                    "SELECT * FROM retention ORDER BY checkout_key LIMIT ?",
+                    (MAX_BINDINGS + 1,),
+                ).fetchall()
                 archive_rows = connection.execute(
                     "SELECT archives.* FROM archives "
                     "INNER JOIN lifecycle_bindings "
@@ -653,13 +657,20 @@ def collect_lifecycle_bindings_from_db(
                 raise CheckoutBindingDatabaseError(
                     "checkout binding snapshot cannot be read"
                 ) from exc
-            if len(retention_rows) > MAX_BINDINGS or len(archive_rows) > MAX_BINDINGS:
+            if (
+                len(retention_rows) > MAX_BINDINGS
+                or len(all_retention_rows) > MAX_BINDINGS
+                or len(archive_rows) > MAX_BINDINGS
+            ):
                 raise CheckoutBindingDatabaseError(
                     "checkout evidence exceeds the bounded binding maximum"
                 )
             retentions = {
                 str(row["checkout_key"]): dict(row) for row in retention_rows
             }
+            retention_inventory = [
+                checkouts._retention_public(row) for row in all_retention_rows
+            ]
             archives = {
                 str(row["checkout_key"]): dict(row) for row in archive_rows
             }
@@ -673,6 +684,7 @@ def collect_lifecycle_bindings_from_db(
             snapshot_material = {
                 "database_schema_version": CHECKOUT_DATABASE_SCHEMA_VERSION,
                 "bindings": bindings,
+                "retentions": retention_inventory,
             }
             snapshot_sha256 = hashlib.sha256(
                 consumer_surface.canonical_json_bytes(snapshot_material)
@@ -682,6 +694,7 @@ def collect_lifecycle_bindings_from_db(
                 "database_schema_version": CHECKOUT_DATABASE_SCHEMA_VERSION,
                 "snapshot_sha256": snapshot_sha256,
                 "bindings": bindings,
+                "retentions": retention_inventory,
                 "read_only": True,
                 "snapshot_mode": (
                     "immutable-file"
