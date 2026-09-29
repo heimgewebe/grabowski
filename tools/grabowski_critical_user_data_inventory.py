@@ -19,96 +19,68 @@ SCHEMA_VERSION = 1
 RESULT_KIND = "grabowski.critical_user_data_inventory_result.v1"
 INVENTORY_KIND = "heim_pc.critical_user_data_aggregate_inventory.v1"
 INVENTORY_ALGORITHM = "member-inventory-sha256-v1"
-MEMBER_INVENTORY_KIND = "heim_pc.critical_user_data_inventory.v1"
-MEMBER_INVENTORY_ALGORITHM = "canonical-record-stream-sha256-v1"
 SCOPE_KIND = "heim_pc.critical_user_data_scope_contract"
-SCOPE_SEMANTICS = "explicit-root-set-default-include"
-SCANNER_SOURCE = Path(
+SCOPE_SEMANTICS = "explicit-positive-selection"
+SOURCE_STABILITY_MODE = "kernel-local-pci-nvme-readonly-mountinfo-v3"
+AGGREGATE_EXECUTION_MODE = "verified-payload-self-bootstrap-v1"
+SOURCE_ROOT = Path(
     "/home/alex/repos/.grabowski-worktrees/"
-    "heim-pc-critical-user-data-scope-20260928/"
-    "scripts/nixos_critical_user_data_inventory.py"
+    "heim-pc-critical-user-data-scope-20260928"
 )
-CONTRACT_SOURCE = Path(
-    "/home/alex/repos/.grabowski-worktrees/"
-    "heim-pc-critical-user-data-scope-20260928/"
-    "nixos/production/critical-user-data-contract-v1.json"
+SCANNER_SOURCE = SOURCE_ROOT / "scripts/nixos_critical_user_data_inventory.py"
+AGGREGATE_SCANNER_SOURCE = SOURCE_ROOT / "scripts/nixos_critical_data_inventory.py"
+CONTRACT_SOURCE = SOURCE_ROOT / "nixos/production/critical-user-data-contract-v1.json"
+HOME_CONTRACT_SOURCE = (
+    SOURCE_ROOT / "nixos/production/critical-user-home-data-contract-v1.json"
 )
+
+# These pins are authority, not observations supplied by the UID-1000 caller.
+# The installed helper artifact is itself commit-bound by the Rootbroker/runtime
+# operator-authority attestation.  A changed migration source therefore fails
+# closed until a new reviewed Grabowski commit updates these constants.
+AUTHORIZED_SCANNER_SHA256 = "a6efa2f9c5ada2146dace47c69b41e64d43306cc4ab300ea673ea703fd38f5f9"
+AUTHORIZED_AGGREGATE_SCANNER_SHA256 = "3a9ffd2ed7e2d2518cc150de50bbb7ca42320755e0482fbbdb1275bc29aeae1c"
+AUTHORIZED_CONTRACT_SHA256 = "e080c049f10e2398ae427a17bca2ffe9d275e8877665e62e224c84a2b1ba9c0e"
+AUTHORIZED_HOME_CONTRACT_SHA256 = "e3b976c8e945b276f47d201085fdeab853eef0f932b51f2016fe7df68f55d7ca"
+
 SCANNER_SHA256 = ""
 CONTRACT_SHA256 = ""
 HELPER = Path("/usr/local/libexec/grabowski-critical-user-data-inventory")
 PYTHON = Path("/usr/bin/python3")
-DOCKER = Path("/usr/bin/docker")
 SYSTEMD_RUN = Path("/usr/bin/systemd-run")
 SYSTEMCTL = Path("/usr/bin/systemctl")
 STATE_ROOT = Path("/var/lib/grabowski/critical-user-data-inventory")
 SNAPSHOT_ROOT = STATE_ROOT / "unbound"
-SCANNER_SNAPSHOT = SNAPSHOT_ROOT / "inventory.py"
+SCANNER_SNAPSHOT = SNAPSHOT_ROOT / "nixos_critical_user_data_inventory.py"
+AGGREGATE_SCANNER_SNAPSHOT = SNAPSHOT_ROOT / "nixos_critical_data_inventory.py"
 CONTRACT_SNAPSHOT = SNAPSHOT_ROOT / "critical-user-data-contract-v1.json"
+HOME_CONTRACT_SNAPSHOT = SNAPSHOT_ROOT / "critical-user-home-data-contract-v1.json"
 RESULT_PATH = SNAPSHOT_ROOT / "result.json"
 FAILED_ROOT = SNAPSHOT_ROOT / "failed-results"
 LOCK_PATH = SNAPSHOT_ROOT / "operation.lock"
 UNIT = "grabowski-critical-user-data-inventory-unbound.service"
 RUNTIME_SECONDS = 6 * 60 * 60
-SCANNER_TIMEOUT_SECONDS = (RUNTIME_SECONDS - 300) // 2
+SCANNER_TIMEOUT_SECONDS = RUNTIME_SECONDS - 300
 MAX_SCANNER_BYTES = 2 * 1024 * 1024
 MAX_CONTRACT_BYTES = 512 * 1024
-MAX_SCANNER_OUTPUT_BYTES = 128 * 1024
+MAX_SCANNER_OUTPUT_BYTES = 256 * 1024
 MAX_RESULT_BYTES = 256 * 1024
-MAX_DOCKER_EVENT_OUTPUT_BYTES = 64 * 1024
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
-CLASS_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
 SAFE_ENV = {
     "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
     "LANG": "C.UTF-8",
     "LC_ALL": "C.UTF-8",
 }
 
-MEMBER_IDENTITIES: dict[str, dict[str, Any]] = {
-    "home": {
-        "source": CONTRACT_SOURCE.with_name("critical-user-home-data-contract-v1.json"),
-        "snapshot_name": "critical-user-home-data-contract-v1.json",
-        "scope": "critical-user-data-home",
-        "scope_semantics": "whole-home-by-default",
-        "root": "/home/alex",
-        "destination": {
-            "nixos_storage_domain": "@home",
-            "logical_path": "/home/alex",
-        },
-        "restore_mode": "active-user-data",
-    },
-    "docker-volumes": {
-        "source": CONTRACT_SOURCE.with_name("critical-docker-volume-data-contract-v1.json"),
-        "snapshot_name": "critical-docker-volume-data-contract-v1.json",
-        "scope": "critical-user-data-docker-volumes",
-        "scope_semantics": "whole-root-by-default",
-        "root": "/var/lib/docker/volumes",
-        "destination": {
-            "nixos_storage_domain": "@data",
-            "logical_path": "/var/lib/heim-pc-data/legacy-docker-volumes",
-        },
-        "restore_mode": "staged-archive-not-active-docker-store",
-    },
-}
-
-MEMBER_INVENTORY_FIELDS = frozenset(
+MEMBER_SUMMARY_FIELDS = frozenset(
     {
-        "schema_version",
-        "kind",
+        "id",
         "scope",
-        "root",
-        "algorithm",
-        "critical_scope_sha256",
         "contract_sha256",
-        "authoritative_inventory",
         "inventory_sha256",
         "record_count",
-        "type_counts",
         "regular_file_bytes",
         "exclusion_boundary_count",
-        "exclusion_boundary_sha256",
-        "exclusion_class_counts",
-        "exclusion_samples",
-        "production_effects_authorized",
     }
 )
 INVENTORY_FIELDS = frozenset(
@@ -123,13 +95,10 @@ INVENTORY_FIELDS = frozenset(
         "authoritative_inventory",
         "inventory_sha256",
         "member_count",
+        "members",
         "record_count",
-        "type_counts",
         "regular_file_bytes",
         "exclusion_boundary_count",
-        "exclusion_boundary_sha256",
-        "exclusion_class_counts",
-        "exclusion_samples",
         "production_effects_authorized",
     }
 )
@@ -147,16 +116,24 @@ def _validate_digest(value: Any, label: str) -> str:
 
 def _apply_binding(scanner_sha256: str, contract_sha256: str) -> None:
     global SCANNER_SHA256, CONTRACT_SHA256
-    global SNAPSHOT_ROOT, SCANNER_SNAPSHOT, CONTRACT_SNAPSHOT
+    global SNAPSHOT_ROOT, SCANNER_SNAPSHOT, AGGREGATE_SCANNER_SNAPSHOT
+    global CONTRACT_SNAPSHOT, HOME_CONTRACT_SNAPSHOT
     global RESULT_PATH, FAILED_ROOT, LOCK_PATH, UNIT
 
     scanner = _validate_digest(scanner_sha256, "scanner_sha256")
     contract = _validate_digest(contract_sha256, "contract_sha256")
+    if (
+        scanner != AUTHORIZED_SCANNER_SHA256
+        or contract != AUTHORIZED_CONTRACT_SHA256
+    ):
+        raise InventoryHelperError("inventory source digest pair is not authorized")
     SCANNER_SHA256 = scanner
     CONTRACT_SHA256 = contract
     SNAPSHOT_ROOT = STATE_ROOT / f"source-{scanner}-{contract}"
-    SCANNER_SNAPSHOT = SNAPSHOT_ROOT / "inventory.py"
+    SCANNER_SNAPSHOT = SNAPSHOT_ROOT / "nixos_critical_user_data_inventory.py"
+    AGGREGATE_SCANNER_SNAPSHOT = SNAPSHOT_ROOT / "nixos_critical_data_inventory.py"
     CONTRACT_SNAPSHOT = SNAPSHOT_ROOT / "critical-user-data-contract-v1.json"
+    HOME_CONTRACT_SNAPSHOT = SNAPSHOT_ROOT / "critical-user-home-data-contract-v1.json"
     RESULT_PATH = SNAPSHOT_ROOT / "result.json"
     FAILED_ROOT = SNAPSHOT_ROOT / "failed-results"
     LOCK_PATH = SNAPSHOT_ROOT / "operation.lock"
@@ -329,14 +306,7 @@ def _write_create_only(path: Path, payload: bytes, *, mode: int) -> None:
     _fsync_directory(path.parent)
 
 
-def _member_snapshot(member_id: str) -> Path:
-    identity = MEMBER_IDENTITIES.get(member_id)
-    if identity is None:
-        raise InventoryHelperError("inventory member identity is invalid")
-    return SNAPSHOT_ROOT / str(identity["snapshot_name"])
-
-
-def _validate_contract(payload: bytes) -> dict[str, str]:
+def _validate_contract(payload: bytes) -> None:
     try:
         value = json.loads(payload.decode("utf-8", "strict"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -351,43 +321,24 @@ def _validate_contract(payload: bytes) -> dict[str, str]:
         raise InventoryHelperError("critical-user-data contract identity mismatch")
 
     members = value.get("members")
-    if not isinstance(members, list) or len(members) != len(MEMBER_IDENTITIES):
+    if not isinstance(members, list) or len(members) != 1:
         raise InventoryHelperError("critical-user-data member set is invalid")
-    observed: dict[str, dict[str, Any]] = {}
-    required_keys = {
-        "id",
-        "contract_file",
-        "contract_sha256",
-        "destination",
-        "restore_mode",
-    }
-    for item in members:
-        if not isinstance(item, dict) or set(item) != required_keys:
-            raise InventoryHelperError("critical-user-data member identity is invalid")
-        member_id = item.get("id")
-        if (
-            not isinstance(member_id, str)
-            or member_id not in MEMBER_IDENTITIES
-            or member_id in observed
-        ):
-            raise InventoryHelperError("critical-user-data member identity is invalid")
-        observed[member_id] = item
-    if set(observed) != set(MEMBER_IDENTITIES):
-        raise InventoryHelperError("critical-user-data member set is invalid")
-
-    member_digests: dict[str, str] = {}
-    for member_id, expected in MEMBER_IDENTITIES.items():
-        item = observed[member_id]
-        if (
-            item.get("contract_file") != expected["snapshot_name"]
-            or item.get("destination") != expected["destination"]
-            or item.get("restore_mode") != expected["restore_mode"]
-        ):
-            raise InventoryHelperError("critical-user-data member policy mismatch")
-        member_digests[member_id] = _validate_digest(
-            item.get("contract_sha256"),
-            f"{member_id} contract_sha256",
-        )
+    member = members[0]
+    if (
+        not isinstance(member, dict)
+        or set(member)
+        != {
+            "id",
+            "contract_file",
+            "contract_sha256",
+            "destination",
+            "restore_mode",
+        }
+        or member.get("id") != "home"
+        or member.get("contract_file") != HOME_CONTRACT_SOURCE.name
+        or member.get("contract_sha256") != AUTHORIZED_HOME_CONTRACT_SHA256
+    ):
+        raise InventoryHelperError("critical-user-data home member binding is invalid")
 
     implementation = value.get("inventory_implementation")
     required_implementation = {
@@ -396,319 +347,148 @@ def _validate_contract(payload: bytes) -> dict[str, str]:
         "root_inventory_script_sha256",
         "aggregate_inventory_script",
         "aggregate_inventory_script_sha256",
+        "aggregate_execution_mode",
         "member_contract_digest_bound",
         "source_and_restored_aggregate_inventory_sha256_must_match",
+        "authoritative_member_source_stability",
     }
-    if not isinstance(implementation, dict) or set(implementation) != required_implementation:
-        raise InventoryHelperError("critical-user-data inventory implementation is invalid")
-    aggregate_script_sha = _validate_digest(
-        implementation.get("aggregate_inventory_script_sha256"),
-        "aggregate inventory script sha256",
-    )
     if (
-        implementation.get("algorithm") != INVENTORY_ALGORITHM
+        not isinstance(implementation, dict)
+        or set(implementation) != required_implementation
+        or implementation.get("algorithm") != INVENTORY_ALGORITHM
         or implementation.get("root_inventory_script")
         != "scripts/nixos_critical_user_data_inventory.py"
-        or implementation.get("root_inventory_script_sha256") != SCANNER_SHA256
+        or implementation.get("root_inventory_script_sha256")
+        != AUTHORIZED_SCANNER_SHA256
         or implementation.get("aggregate_inventory_script")
         != "scripts/nixos_critical_data_inventory.py"
-        or aggregate_script_sha != implementation.get("aggregate_inventory_script_sha256")
+        or implementation.get("aggregate_inventory_script_sha256")
+        != AUTHORIZED_AGGREGATE_SCANNER_SHA256
+        or implementation.get("aggregate_execution_mode")
+        != AGGREGATE_EXECUTION_MODE
         or implementation.get("member_contract_digest_bound") is not True
         or implementation.get(
             "source_and_restored_aggregate_inventory_sha256_must_match"
         )
         is not True
+        or implementation.get("authoritative_member_source_stability")
+        != SOURCE_STABILITY_MODE
     ):
-        raise InventoryHelperError("critical-user-data inventory implementation mismatch")
-    return member_digests
+        raise InventoryHelperError(
+            "critical-user-data inventory implementation mismatch"
+        )
+
+    migration_policy = value.get("migration_policy")
+    if (
+        not isinstance(migration_policy, dict)
+        or migration_policy.get("selection_model") != "explicit-positive-allowlist"
+        or migration_policy.get("legacy_docker_volume_tree_migrated") is not False
+    ):
+        raise InventoryHelperError("critical-user-data migration policy mismatch")
 
 
-def _validate_member_contract(
-    member_id: str,
-    payload: bytes,
-    *,
-    expected_sha256: str,
-) -> None:
-    if _sha256(payload) != expected_sha256:
-        raise InventoryHelperError("critical-user-data member contract digest mismatch")
+def _validate_home_contract(payload: bytes) -> None:
     try:
         value = json.loads(payload.decode("utf-8", "strict"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise InventoryHelperError("critical-user-data member contract is invalid") from exc
-    identity = MEMBER_IDENTITIES.get(member_id)
-    if identity is None or not isinstance(value, dict):
-        raise InventoryHelperError("critical-user-data member contract identity is invalid")
+        raise InventoryHelperError("critical-user-data home contract is invalid") from exc
+    inventory = value.get("inventory") if isinstance(value, dict) else None
     if (
-        value.get("schema_version") != 1
+        not isinstance(value, dict)
+        or value.get("schema_version") != 1
         or value.get("kind") != SCOPE_KIND
-        or value.get("scope") != identity["scope"]
-        or value.get("scope_semantics") != identity["scope_semantics"]
-        or value.get("root") != identity["root"]
-        or value.get("logical_root") != identity["root"]
+        or value.get("scope") != "critical-user-data-home"
+        or value.get("scope_semantics") != "explicit-path-set"
+        or value.get("root") != "/home/alex"
+        or value.get("logical_root") != "/home/alex"
+        or not isinstance(inventory, dict)
+        or inventory.get("schema") != "heim_pc.critical_user_data_inventory.v1"
+        or inventory.get("algorithm") != "canonical-record-stream-sha256-v6"
+        or inventory.get("authoritative_source_stability")
+        != SOURCE_STABILITY_MODE
     ):
-        raise InventoryHelperError("critical-user-data member contract identity mismatch")
-    required_inventory = {
-        "schema": MEMBER_INVENTORY_KIND,
-        "algorithm": MEMBER_INVENTORY_ALGORITHM,
-        "same_filesystem_only": True,
-        "follow_symlinks": False,
-        "regular_file_content_sha256": True,
-        "directory_mode_bound": True,
-        "regular_file_mode_bound": True,
-        "symlink_target_bound": True,
-        "special_files": "excluded-runtime-only",
-        "unreadable_included_path": "fail",
-        "changed_during_hash": "fail",
-    }
-    if value.get("inventory") != required_inventory:
-        raise InventoryHelperError("critical-user-data member inventory policy is invalid")
-    exclusions = value.get("exclusions")
-    if not isinstance(exclusions, dict) or set(exclusions) != {
-        "top_level_prefixes",
-        "roots",
-        "directory_names_under",
-        "file_name_prefixes_under",
-        "file_name_prefix_suffixes_under",
-    }:
-        raise InventoryHelperError("critical-user-data member exclusions are invalid")
-    if member_id == "docker-volumes":
-        consistency = value.get("source_consistency")
-        if (
-            not isinstance(consistency, dict)
-            or consistency.get(
-                "full_authoritative_inventory_requires_docker_quiesced"
-            )
-            is not True
-        ):
-            raise InventoryHelperError("Docker inventory consistency contract is invalid")
+        raise InventoryHelperError("critical-user-data home contract identity mismatch")
 
 
-def _snapshot_sources() -> dict[str, str]:
+def _snapshot_sources() -> None:
     scanner = _read_stable_regular(SCANNER_SOURCE, max_bytes=MAX_SCANNER_BYTES)
-    contract = _read_stable_regular(CONTRACT_SOURCE, max_bytes=MAX_CONTRACT_BYTES)
-    if _sha256(scanner) != SCANNER_SHA256:
+    aggregate_scanner = _read_stable_regular(
+        AGGREGATE_SCANNER_SOURCE, max_bytes=MAX_SCANNER_BYTES
+    )
+    contract = _read_stable_regular(
+        CONTRACT_SOURCE, max_bytes=MAX_CONTRACT_BYTES
+    )
+    home_contract = _read_stable_regular(
+        HOME_CONTRACT_SOURCE, max_bytes=MAX_CONTRACT_BYTES
+    )
+    if _sha256(scanner) != AUTHORIZED_SCANNER_SHA256:
         raise InventoryHelperError("inventory scanner digest mismatch")
-    if _sha256(contract) != CONTRACT_SHA256:
+    if _sha256(aggregate_scanner) != AUTHORIZED_AGGREGATE_SCANNER_SHA256:
+        raise InventoryHelperError("aggregate inventory scanner digest mismatch")
+    if _sha256(contract) != AUTHORIZED_CONTRACT_SHA256:
         raise InventoryHelperError("critical-user-data contract digest mismatch")
-    member_digests = _validate_contract(contract)
-
-    member_payloads: dict[str, bytes] = {}
-    for member_id, identity in MEMBER_IDENTITIES.items():
-        source = identity["source"]
-        if not isinstance(source, Path):
-            raise InventoryHelperError("critical-user-data member source is invalid")
-        payload = _read_stable_regular(source, max_bytes=MAX_CONTRACT_BYTES)
-        _validate_member_contract(
-            member_id,
-            payload,
-            expected_sha256=member_digests[member_id],
-        )
-        member_payloads[member_id] = payload
+    if _sha256(home_contract) != AUTHORIZED_HOME_CONTRACT_SHA256:
+        raise InventoryHelperError("critical-user-data home contract digest mismatch")
+    _validate_contract(contract)
+    _validate_home_contract(home_contract)
 
     _ensure_private_directory(STATE_ROOT)
     _ensure_private_directory(SNAPSHOT_ROOT)
     _write_create_only(SCANNER_SNAPSHOT, scanner, mode=0o500)
+    _write_create_only(
+        AGGREGATE_SCANNER_SNAPSHOT, aggregate_scanner, mode=0o500
+    )
     _write_create_only(CONTRACT_SNAPSHOT, contract, mode=0o400)
-    for member_id, payload in member_payloads.items():
-        _write_create_only(_member_snapshot(member_id), payload, mode=0o400)
+    _write_create_only(HOME_CONTRACT_SNAPSHOT, home_contract, mode=0o400)
 
-    if _sha256(
-        _read_stable_regular(
-            SCANNER_SNAPSHOT,
-            max_bytes=MAX_SCANNER_BYTES,
-            require_root_owned=True,
-            required_mode=0o500,
-        )
-    ) != SCANNER_SHA256:
-        raise InventoryHelperError("inventory scanner snapshot mismatch")
-    if _sha256(
-        _read_stable_regular(
+    expected = (
+        (SCANNER_SNAPSHOT, AUTHORIZED_SCANNER_SHA256, MAX_SCANNER_BYTES, 0o500),
+        (
+            AGGREGATE_SCANNER_SNAPSHOT,
+            AUTHORIZED_AGGREGATE_SCANNER_SHA256,
+            MAX_SCANNER_BYTES,
+            0o500,
+        ),
+        (
             CONTRACT_SNAPSHOT,
-            max_bytes=MAX_CONTRACT_BYTES,
+            AUTHORIZED_CONTRACT_SHA256,
+            MAX_CONTRACT_BYTES,
+            0o400,
+        ),
+        (
+            HOME_CONTRACT_SNAPSHOT,
+            AUTHORIZED_HOME_CONTRACT_SHA256,
+            MAX_CONTRACT_BYTES,
+            0o400,
+        ),
+    )
+    for path, digest, maximum, mode in expected:
+        observed = _read_stable_regular(
+            path,
+            max_bytes=maximum,
             require_root_owned=True,
-            required_mode=0o400,
+            required_mode=mode,
         )
-    ) != CONTRACT_SHA256:
-        raise InventoryHelperError("inventory contract snapshot mismatch")
-    for member_id, expected_sha in member_digests.items():
-        if _sha256(
-            _read_stable_regular(
-                _member_snapshot(member_id),
-                max_bytes=MAX_CONTRACT_BYTES,
-                require_root_owned=True,
-                required_mode=0o400,
-            )
-        ) != expected_sha:
-            raise InventoryHelperError("inventory member contract snapshot mismatch")
-    return dict(member_digests)
+        if _sha256(observed) != digest:
+            raise InventoryHelperError("inventory source snapshot mismatch")
 
 
-def scanner_argv(member_id: str, contract_sha256: str) -> list[str]:
-    if member_id not in MEMBER_IDENTITIES:
-        raise InventoryHelperError("inventory member identity is invalid")
-    member_sha = _validate_digest(contract_sha256, "member contract sha256")
+def aggregate_argv() -> list[str]:
     return [
         str(PYTHON),
         "-B",
-        str(SCANNER_SNAPSHOT),
+        str(AGGREGATE_SCANNER_SNAPSHOT),
         "--contract",
-        str(_member_snapshot(member_id)),
+        str(CONTRACT_SNAPSHOT),
         "--max-exclusion-samples",
         "0",
         "--expected-script-sha256",
-        SCANNER_SHA256,
+        AUTHORIZED_AGGREGATE_SCANNER_SHA256,
         "--expected-contract-sha256",
-        member_sha,
+        CONTRACT_SHA256,
+        "--verified-payload-bootstrap",
+        AGGREGATE_EXECUTION_MODE,
     ]
-
-
-def _docker_quiesced() -> None:
-    if not DOCKER.is_file():
-        raise InventoryHelperError("Docker quiescence cannot be verified")
-    try:
-        completed = subprocess.run(
-            [str(DOCKER), "ps", "-q"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=SAFE_ENV,
-            check=False,
-            timeout=15,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise InventoryHelperError("Docker quiescence cannot be verified") from exc
-    if completed.returncode != 0:
-        raise InventoryHelperError("Docker quiescence cannot be verified")
-    if completed.stdout.strip():
-        raise InventoryHelperError(
-            "authoritative Docker-volume inventory requires all containers stopped"
-        )
-
-
-def _start_docker_event_monitor() -> subprocess.Popen[bytes]:
-    if not DOCKER.is_file():
-        raise InventoryHelperError("Docker quiescence cannot be verified")
-    # Start slightly before the subscription.  Docker replays events since this
-    # timestamp, closing the short subscription race before the initial ps check.
-    since = str(max(0, int(time.time()) - 1))
-    try:
-        monitor = subprocess.Popen(
-            [
-                str(DOCKER),
-                "events",
-                "--since",
-                since,
-                "--format",
-                "{{.Action}}",
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            env=SAFE_ENV,
-        )
-    except OSError as exc:
-        raise InventoryHelperError(
-            "Docker quiescence monitor cannot be started"
-        ) from exc
-    if monitor.stdout is None:
-        try:
-            monitor.terminate()
-        except OSError:
-            pass
-        raise InventoryHelperError("Docker quiescence monitor is unavailable")
-    return monitor
-
-
-def _close_docker_event_monitor(
-    monitor: subprocess.Popen[bytes],
-    *,
-    require_live: bool,
-) -> bytes:
-    was_live = monitor.poll() is None
-    if was_live:
-        try:
-            monitor.terminate()
-        except OSError as exc:
-            raise InventoryHelperError(
-                "Docker quiescence monitor cannot be stopped"
-            ) from exc
-    try:
-        stdout, _stderr = monitor.communicate(timeout=5)
-    except subprocess.TimeoutExpired as exc:
-        try:
-            monitor.kill()
-            stdout, _stderr = monitor.communicate(timeout=5)
-        except (OSError, subprocess.SubprocessError) as cleanup_exc:
-            raise InventoryHelperError(
-                "Docker quiescence monitor cannot be stopped"
-            ) from cleanup_exc
-        if require_live:
-            raise InventoryHelperError(
-                "Docker quiescence monitor did not terminate safely"
-            ) from exc
-    if require_live and not was_live:
-        raise InventoryHelperError(
-            "Docker quiescence monitor ended before the volume scan completed"
-        )
-    if (
-        not isinstance(stdout, bytes)
-        or len(stdout) > MAX_DOCKER_EVENT_OUTPUT_BYTES
-    ):
-        raise InventoryHelperError("Docker quiescence monitor output is invalid")
-    return stdout
-
-
-def _run_member_scanner(
-    member_id: str,
-    contract_sha256: str,
-) -> subprocess.CompletedProcess[bytes]:
-    argv = scanner_argv(member_id, contract_sha256)
-    if member_id != "docker-volumes":
-        return subprocess.run(
-            argv,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=SAFE_ENV,
-            check=False,
-            timeout=SCANNER_TIMEOUT_SECONDS,
-        )
-
-    monitor: subprocess.Popen[bytes] | None = _start_docker_event_monitor()
-    try:
-        _docker_quiesced()
-        if monitor.poll() is not None:
-            raise InventoryHelperError(
-                "Docker quiescence monitor ended before the volume scan started"
-            )
-        completed = subprocess.run(
-            argv,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=SAFE_ENV,
-            check=False,
-            timeout=SCANNER_TIMEOUT_SECONDS,
-        )
-        _docker_quiesced()
-        if monitor.poll() is not None:
-            raise InventoryHelperError(
-                "Docker quiescence monitor ended during the volume scan"
-            )
-        events = _close_docker_event_monitor(monitor, require_live=True)
-        monitor = None
-    except BaseException:
-        if monitor is not None:
-            try:
-                _close_docker_event_monitor(monitor, require_live=False)
-            except InventoryHelperError:
-                pass
-        raise
-    if events.strip():
-        raise InventoryHelperError(
-            "Docker activity occurred during authoritative Docker-volume inventory"
-        )
-    return completed
 
 
 def _request_json(operation: str) -> str:
@@ -819,153 +599,6 @@ def _validate_nonnegative_int(value: Any, label: str) -> int:
     return value
 
 
-def _normalize_counts(value: Any, label: str) -> dict[str, int]:
-    if not isinstance(value, dict):
-        raise InventoryHelperError(f"{label} is invalid")
-    normalized: dict[str, int] = {}
-    for key, item in value.items():
-        if not isinstance(key, str) or CLASS_RE.fullmatch(key) is None:
-            raise InventoryHelperError(f"{label} name is invalid")
-        normalized[key] = _validate_nonnegative_int(item, f"{label}.{key}")
-    return dict(sorted(normalized.items()))
-
-
-def _validate_member_inventory_output(
-    payload: bytes,
-    *,
-    member_id: str,
-    contract_sha256: str,
-) -> dict[str, Any]:
-    if not payload or len(payload) > MAX_SCANNER_OUTPUT_BYTES:
-        raise InventoryHelperError("inventory member output size is invalid")
-    try:
-        value = json.loads(payload.decode("utf-8", "strict"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise InventoryHelperError("inventory member output is invalid JSON") from exc
-    if not isinstance(value, dict) or set(value) != MEMBER_INVENTORY_FIELDS:
-        raise InventoryHelperError("inventory member output fields are invalid")
-    identity = MEMBER_IDENTITIES.get(member_id)
-    member_sha = _validate_digest(contract_sha256, "member contract sha256")
-    if identity is None:
-        raise InventoryHelperError("inventory member identity is invalid")
-    if (
-        value.get("schema_version") != 1
-        or value.get("kind") != MEMBER_INVENTORY_KIND
-        or value.get("scope") != identity["scope"]
-        or value.get("root") != identity["root"]
-        or value.get("algorithm") != MEMBER_INVENTORY_ALGORITHM
-        or value.get("critical_scope_sha256") != member_sha
-        or value.get("contract_sha256") != member_sha
-        or value.get("authoritative_inventory") is not True
-        or value.get("production_effects_authorized") is not False
-        or value.get("exclusion_samples") != []
-        or not isinstance(value.get("inventory_sha256"), str)
-        or SHA256_RE.fullmatch(value["inventory_sha256"]) is None
-        or not isinstance(value.get("exclusion_boundary_sha256"), str)
-        or SHA256_RE.fullmatch(value["exclusion_boundary_sha256"]) is None
-    ):
-        raise InventoryHelperError("inventory member output identity is invalid")
-    record_count = _validate_nonnegative_int(value.get("record_count"), "record_count")
-    regular_bytes = _validate_nonnegative_int(
-        value.get("regular_file_bytes"), "regular_file_bytes"
-    )
-    exclusion_count = _validate_nonnegative_int(
-        value.get("exclusion_boundary_count"), "exclusion_boundary_count"
-    )
-    type_counts = value.get("type_counts")
-    if (
-        not isinstance(type_counts, dict)
-        or set(type_counts) != {"directory", "regular", "symlink"}
-    ):
-        raise InventoryHelperError("inventory member type counts are invalid")
-    normalized_types = {
-        key: _validate_nonnegative_int(item, f"type_counts.{key}")
-        for key, item in type_counts.items()
-    }
-    if sum(normalized_types.values()) != record_count:
-        raise InventoryHelperError("inventory member record count is inconsistent")
-    normalized_classes = _normalize_counts(
-        value.get("exclusion_class_counts"),
-        "exclusion_class_counts",
-    )
-    if sum(normalized_classes.values()) != exclusion_count:
-        raise InventoryHelperError("inventory member exclusion count is inconsistent")
-    return {
-        **value,
-        "record_count": record_count,
-        "regular_file_bytes": regular_bytes,
-        "exclusion_boundary_count": exclusion_count,
-        "type_counts": dict(sorted(normalized_types.items())),
-        "exclusion_class_counts": normalized_classes,
-    }
-
-
-def _aggregate_member_inventories(
-    members: dict[str, dict[str, Any]],
-    member_digests: dict[str, str],
-) -> dict[str, Any]:
-    if set(members) != set(MEMBER_IDENTITIES) or set(member_digests) != set(MEMBER_IDENTITIES):
-        raise InventoryHelperError("inventory aggregate member set is invalid")
-    inventory_digest = hashlib.sha256()
-    exclusion_digest = hashlib.sha256()
-    type_counts = {"directory": 0, "regular": 0, "symlink": 0}
-    exclusion_classes: dict[str, int] = {}
-    record_count = 0
-    regular_file_bytes = 0
-    exclusion_boundary_count = 0
-    for member_id in sorted(MEMBER_IDENTITIES):
-        value = members[member_id]
-        member_sha = _validate_digest(
-            member_digests[member_id],
-            f"{member_id} contract sha256",
-        )
-        inventory_digest.update(
-            _canonical(
-                {
-                    "id": member_id,
-                    "contract_sha256": member_sha,
-                    "inventory_sha256": value["inventory_sha256"],
-                }
-            )
-        )
-        exclusion_digest.update(
-            _canonical(
-                {
-                    "id": member_id,
-                    "contract_sha256": member_sha,
-                    "exclusion_boundary_sha256": value["exclusion_boundary_sha256"],
-                }
-            )
-        )
-        record_count += value["record_count"]
-        regular_file_bytes += value["regular_file_bytes"]
-        exclusion_boundary_count += value["exclusion_boundary_count"]
-        for key, item in value["type_counts"].items():
-            type_counts[key] += item
-        for key, item in value["exclusion_class_counts"].items():
-            exclusion_classes[key] = exclusion_classes.get(key, 0) + item
-    return {
-        "schema_version": 1,
-        "kind": INVENTORY_KIND,
-        "scope": "critical-user-data",
-        "scope_semantics": SCOPE_SEMANTICS,
-        "algorithm": INVENTORY_ALGORITHM,
-        "critical_scope_sha256": CONTRACT_SHA256,
-        "contract_sha256": CONTRACT_SHA256,
-        "authoritative_inventory": True,
-        "inventory_sha256": inventory_digest.hexdigest(),
-        "member_count": len(MEMBER_IDENTITIES),
-        "record_count": record_count,
-        "type_counts": dict(sorted(type_counts.items())),
-        "regular_file_bytes": regular_file_bytes,
-        "exclusion_boundary_count": exclusion_boundary_count,
-        "exclusion_boundary_sha256": exclusion_digest.hexdigest(),
-        "exclusion_class_counts": dict(sorted(exclusion_classes.items())),
-        "exclusion_samples": [],
-        "production_effects_authorized": False,
-    }
-
-
 def _validate_inventory_output(payload: bytes) -> dict[str, Any]:
     if not payload or len(payload) > MAX_RESULT_BYTES:
         raise InventoryHelperError("inventory output size is invalid")
@@ -985,46 +618,71 @@ def _validate_inventory_output(payload: bytes) -> dict[str, Any]:
         or value.get("contract_sha256") != CONTRACT_SHA256
         or value.get("authoritative_inventory") is not True
         or value.get("production_effects_authorized") is not False
-        or value.get("exclusion_samples") != []
-        or value.get("member_count") != len(MEMBER_IDENTITIES)
-        or not isinstance(value.get("inventory_sha256"), str)
-        or SHA256_RE.fullmatch(value["inventory_sha256"]) is None
-        or not isinstance(value.get("exclusion_boundary_sha256"), str)
-        or SHA256_RE.fullmatch(value["exclusion_boundary_sha256"]) is None
+        or value.get("member_count") != 1
     ):
         raise InventoryHelperError("inventory output identity is invalid")
-    record_count = _validate_nonnegative_int(value.get("record_count"), "record_count")
+    inventory_sha = _validate_digest(
+        value.get("inventory_sha256"), "inventory_sha256"
+    )
+    members = value.get("members")
+    if (
+        not isinstance(members, list)
+        or len(members) != 1
+        or not isinstance(members[0], dict)
+        or set(members[0]) != MEMBER_SUMMARY_FIELDS
+    ):
+        raise InventoryHelperError("inventory member summary is invalid")
+    member = members[0]
+    if (
+        member.get("id") != "home"
+        or member.get("scope") != "critical-user-data-home"
+        or member.get("contract_sha256") != AUTHORIZED_HOME_CONTRACT_SHA256
+    ):
+        raise InventoryHelperError("inventory member binding is invalid")
+    member_inventory_sha = _validate_digest(
+        member.get("inventory_sha256"), "home inventory_sha256"
+    )
+    member_record_count = _validate_nonnegative_int(
+        member.get("record_count"), "home record_count"
+    )
+    member_regular_bytes = _validate_nonnegative_int(
+        member.get("regular_file_bytes"), "home regular_file_bytes"
+    )
+    member_exclusion_count = _validate_nonnegative_int(
+        member.get("exclusion_boundary_count"), "home exclusion_boundary_count"
+    )
+    record_count = _validate_nonnegative_int(
+        value.get("record_count"), "record_count"
+    )
     regular_bytes = _validate_nonnegative_int(
         value.get("regular_file_bytes"), "regular_file_bytes"
     )
     exclusion_count = _validate_nonnegative_int(
         value.get("exclusion_boundary_count"), "exclusion_boundary_count"
     )
-    type_counts = value.get("type_counts")
     if (
-        not isinstance(type_counts, dict)
-        or set(type_counts) != {"directory", "regular", "symlink"}
+        record_count != member_record_count
+        or regular_bytes != member_regular_bytes
+        or exclusion_count != member_exclusion_count
     ):
-        raise InventoryHelperError("inventory type counts are invalid")
-    normalized_types = {
-        key: _validate_nonnegative_int(item, f"type_counts.{key}")
-        for key, item in type_counts.items()
-    }
-    if sum(normalized_types.values()) != record_count:
-        raise InventoryHelperError("inventory record count is inconsistent")
-    normalized_classes = _normalize_counts(
-        value.get("exclusion_class_counts"),
-        "exclusion_class_counts",
+        raise InventoryHelperError("inventory aggregate counts are inconsistent")
+    expected_inventory_sha = _sha256(
+        _canonical(
+            {
+                "id": "home",
+                "contract_sha256": AUTHORIZED_HOME_CONTRACT_SHA256,
+                "inventory_sha256": member_inventory_sha,
+            }
+        )
     )
-    if sum(normalized_classes.values()) != exclusion_count:
-        raise InventoryHelperError("inventory exclusion count is inconsistent")
+    if inventory_sha != expected_inventory_sha:
+        raise InventoryHelperError("inventory aggregate digest is inconsistent")
     return {
         **value,
+        "members": [dict(member)],
         "record_count": record_count,
         "regular_file_bytes": regular_bytes,
         "exclusion_boundary_count": exclusion_count,
-        "type_counts": dict(sorted(normalized_types.items())),
-        "exclusion_class_counts": normalized_classes,
     }
 
 
@@ -1295,58 +953,54 @@ def _execute() -> int:
     try:
         if _read_result() is not None:
             raise InventoryHelperError("inventory result already exists")
-        member_digests = _snapshot_sources()
+        _snapshot_sources()
     finally:
         os.close(descriptor)
 
     stdout = b""
     stderr = b""
     try:
-        _docker_quiesced()
-        member_results: dict[str, dict[str, Any]] = {}
-        for member_id in sorted(MEMBER_IDENTITIES):
-            completed = _run_member_scanner(
-                member_id,
-                member_digests[member_id],
+        completed = subprocess.run(
+            aggregate_argv(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=SAFE_ENV,
+            check=False,
+            timeout=SCANNER_TIMEOUT_SECONDS,
+        )
+        stdout = completed.stdout
+        stderr = completed.stderr
+        if (
+            len(stdout) > MAX_SCANNER_OUTPUT_BYTES
+            or len(stderr) > MAX_SCANNER_OUTPUT_BYTES
+        ):
+            result = _unsigned_result(
+                status="failed",
+                failure_code="inventory-output-too-large",
+                returncode=completed.returncode,
+                stdout_sha256=_sha256(stdout),
+                stdout_bytes=len(stdout),
+                stderr_sha256=_sha256(stderr),
+                stderr_bytes=len(stderr),
             )
-            stdout = completed.stdout
-            stderr = completed.stderr
-            if (
-                len(stdout) > MAX_SCANNER_OUTPUT_BYTES
-                or len(stderr) > MAX_SCANNER_OUTPUT_BYTES
-            ):
-                result = _unsigned_result(
-                    status="failed",
-                    failure_code="inventory-output-too-large",
-                    returncode=completed.returncode,
-                    stdout_sha256=_sha256(stdout),
-                    stdout_bytes=len(stdout),
-                    stderr_sha256=_sha256(stderr),
-                    stderr_bytes=len(stderr),
-                )
-                _write_result(result)
-                print(json.dumps(_seal_result(result), sort_keys=True, separators=(",", ":")))
-                return 2
-            if completed.returncode != 0:
-                result = _unsigned_result(
-                    status="failed",
-                    failure_code="inventory-safety-check",
-                    returncode=completed.returncode,
-                    stdout_sha256=_sha256(stdout),
-                    stdout_bytes=len(stdout),
-                    stderr_sha256=_sha256(stderr),
-                    stderr_bytes=len(stderr),
-                )
-                _write_result(result)
-                print(json.dumps(_seal_result(result), sort_keys=True, separators=(",", ":")))
-                return 2
-            member_results[member_id] = _validate_member_inventory_output(
-                stdout,
-                member_id=member_id,
-                contract_sha256=member_digests[member_id],
+            _write_result(result)
+            print(json.dumps(_seal_result(result), sort_keys=True, separators=(",", ":")))
+            return 2
+        if completed.returncode != 0:
+            result = _unsigned_result(
+                status="failed",
+                failure_code="inventory-safety-check",
+                returncode=completed.returncode,
+                stdout_sha256=_sha256(stdout),
+                stdout_bytes=len(stdout),
+                stderr_sha256=_sha256(stderr),
+                stderr_bytes=len(stderr),
             )
-        inventory = _aggregate_member_inventories(member_results, member_digests)
-        inventory = _validate_inventory_output(_canonical(inventory))
+            _write_result(result)
+            print(json.dumps(_seal_result(result), sort_keys=True, separators=(",", ":")))
+            return 2
+        inventory = _validate_inventory_output(stdout)
         result = _unsigned_result(status="passed", inventory=inventory)
         _write_result(result)
         print(json.dumps(_seal_result(result), sort_keys=True, separators=(",", ":")))

@@ -1105,11 +1105,7 @@ def _critical_inventory_projection(
             or not unit
         ):
             raise RuntimeError("critical-user-data inventory start metadata is invalid")
-        return {
-            **base,
-            "unit": unit,
-            "runtime_seconds": runtime_seconds,
-        }
+        return {**base, "unit": unit, "runtime_seconds": runtime_seconds}
 
     if kind == "grabowski.critical_user_data_inventory_status.v1":
         expected = common_keys | {"unit", "unit_state", "result_sha256"}
@@ -1215,75 +1211,88 @@ def _critical_inventory_projection(
         "authoritative_inventory",
         "inventory_sha256",
         "member_count",
+        "members",
         "record_count",
-        "type_counts",
         "regular_file_bytes",
         "exclusion_boundary_count",
-        "exclusion_boundary_sha256",
-        "exclusion_class_counts",
-        "exclusion_samples",
         "production_effects_authorized",
     }
     if not isinstance(inventory, dict) or set(inventory) != required_inventory:
         raise RuntimeError("critical-user-data inventory aggregate is invalid")
+    members = inventory.get("members")
     if (
         inventory.get("schema_version") != 1
         or inventory.get("kind")
         != "heim_pc.critical_user_data_aggregate_inventory.v1"
         or inventory.get("scope") != "critical-user-data"
-        or inventory.get("scope_semantics") != "explicit-root-set-default-include"
+        or inventory.get("scope_semantics") != "explicit-positive-selection"
         or inventory.get("algorithm") != "member-inventory-sha256-v1"
         or inventory.get("critical_scope_sha256") != contract_sha256
         or inventory.get("contract_sha256") != contract_sha256
         or inventory.get("authoritative_inventory") is not True
         or inventory.get("production_effects_authorized") is not False
-        or inventory.get("exclusion_samples") != []
-        or inventory.get("member_count") != 2
+        or inventory.get("member_count") != 1
+        or not isinstance(members, list)
+        or len(members) != 1
+        or not isinstance(members[0], dict)
+        or set(members[0])
+        != {
+            "id",
+            "scope",
+            "contract_sha256",
+            "inventory_sha256",
+            "record_count",
+            "regular_file_bytes",
+            "exclusion_boundary_count",
+        }
+        or members[0].get("id") != "home"
+        or members[0].get("scope") != "critical-user-data-home"
     ):
         raise RuntimeError("critical-user-data inventory aggregate binding is invalid")
     inventory_sha256 = _critical_inventory_digest(
         inventory.get("inventory_sha256"), "inventory_sha256"
     )
-    exclusion_sha256 = _critical_inventory_digest(
-        inventory.get("exclusion_boundary_sha256"), "exclusion_boundary_sha256"
+    member_inventory_sha = _critical_inventory_digest(
+        members[0].get("inventory_sha256"), "home inventory_sha256"
     )
+    _critical_inventory_digest(
+        members[0].get("contract_sha256"), "home contract_sha256"
+    )
+    counts: dict[str, int] = {}
     for key in ("record_count", "regular_file_bytes", "exclusion_boundary_count"):
-        item = inventory.get(key)
-        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+        aggregate_item = inventory.get(key)
+        member_item = members[0].get(key)
+        if (
+            isinstance(aggregate_item, bool)
+            or not isinstance(aggregate_item, int)
+            or aggregate_item < 0
+            or aggregate_item != member_item
+        ):
             raise RuntimeError(f"critical-user-data inventory {key} is invalid")
-    type_counts = inventory.get("type_counts")
-    exclusion_classes = inventory.get("exclusion_class_counts")
-    if (
-        not isinstance(type_counts, dict)
-        or set(type_counts) != {"directory", "regular", "symlink"}
-        or not all(
-            isinstance(item, int) and not isinstance(item, bool) and item >= 0
-            for item in type_counts.values()
-        )
-        or sum(type_counts.values()) != inventory["record_count"]
-        or not isinstance(exclusion_classes, dict)
-        or not all(
-            isinstance(name, str)
-            and name
-            and isinstance(item, int)
-            and not isinstance(item, bool)
-            and item >= 0
-            for name, item in exclusion_classes.items()
-        )
-        or sum(exclusion_classes.values()) != inventory["exclusion_boundary_count"]
-    ):
-        raise RuntimeError("critical-user-data inventory counts are invalid")
+        counts[key] = aggregate_item
+    expected_inventory_sha = hashlib.sha256(
+        (
+            json.dumps(
+                {
+                    "id": "home",
+                    "contract_sha256": members[0]["contract_sha256"],
+                    "inventory_sha256": member_inventory_sha,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+    ).hexdigest()
+    if inventory_sha256 != expected_inventory_sha:
+        raise RuntimeError("critical-user-data inventory aggregate digest is invalid")
     return {
         **base,
         "completed_at_unix": completed_at,
         "result_sha256": result_sha256,
         "inventory_sha256": inventory_sha256,
-        "record_count": inventory["record_count"],
-        "type_counts": dict(sorted(type_counts.items())),
-        "regular_file_bytes": inventory["regular_file_bytes"],
-        "exclusion_boundary_count": inventory["exclusion_boundary_count"],
-        "exclusion_boundary_sha256": exclusion_sha256,
-        "exclusion_class_counts": dict(sorted(exclusion_classes.items())),
+        **counts,
     }
 
 
