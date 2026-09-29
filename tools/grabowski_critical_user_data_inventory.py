@@ -934,6 +934,9 @@ def _start() -> dict[str, Any]:
             raise InventoryHelperError("inventory systemd unit could not be started")
         state = _unit_state()
         if state["ActiveState"] != "active":
+            result = _read_result()
+            if result is not None:
+                return _public_result(result)
             raise InventoryHelperError("inventory systemd unit did not become active")
         return {
             "schema_version": SCHEMA_VERSION,

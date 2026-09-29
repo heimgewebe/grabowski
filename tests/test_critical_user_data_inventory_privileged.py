@@ -463,6 +463,30 @@ class CriticalUserDataInventoryPrivilegedTests(unittest.TestCase):
             request["contract_sha256"], helper.AUTHORIZED_CONTRACT_SHA256
         )
 
+    def test_start_accepts_fast_terminal_unit_with_sealed_result(self) -> None:
+        passed = self._passed_result()
+        inactive = {
+            "LoadState": "not-found",
+            "ActiveState": "inactive",
+            "SubState": "dead",
+            "Result": "success",
+        }
+        with (
+            mock.patch.object(helper, "_lock", return_value=19),
+            mock.patch.object(helper, "_snapshot_sources"),
+            mock.patch.object(helper, "_unit_state", side_effect=[inactive, inactive]),
+            mock.patch.object(helper, "_read_result", side_effect=[None, passed]) as read_result,
+            mock.patch.object(
+                helper.subprocess, "run", return_value=mock.Mock(returncode=0)
+            ) as run,
+            mock.patch.object(helper.os, "close"),
+        ):
+            result = helper._start()
+
+        self.assertEqual(result, passed)
+        self.assertEqual(read_result.call_count, 2)
+        run.assert_called_once()
+
     def _fixture(self) -> tuple[tempfile.TemporaryDirectory[str], dict[str, object]]:
         temporary = tempfile.TemporaryDirectory()
         root = Path(temporary.name)
