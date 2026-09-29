@@ -40,6 +40,69 @@ def task_payload() -> dict:
 
 
 class CurrentWorkSurfaceTests(unittest.TestCase):
+    def test_reconciliation_payload_adds_complete_task_checkout_presence(self) -> None:
+        database = {
+            "snapshot_sha256": "a" * 64,
+            "bindings": [
+                {
+                    "checkout_key": "checkout-bound",
+                    "repo_path": REPOSITORY,
+                    "owner_id": "task:bound-task",
+                },
+                {
+                    "checkout_key": "checkout-other-owner",
+                    "repo_path": REPOSITORY,
+                    "owner_id": "lane:example",
+                },
+            ],
+        }
+        reconciler = SimpleNamespace(
+            MAX_PAGE_LIMIT=100,
+            reconcile_checkout_bindings=lambda **_kwargs: {
+                "bindings": [],
+                "pagination": {"has_more": True},
+                "total_count": 101,
+                "source_snapshot": {
+                    "database_snapshot_sha256": "a" * 64,
+                },
+            },
+            collect_git_worktrees_for_repos=lambda *_args, **_kwargs: {
+                "worktrees": [
+                    {"checkout_key": "checkout-bound"},
+                    {"checkout_key": "checkout-retained"},
+                    {"checkout_key": "checkout-other-owner"},
+                ],
+                "observable_repo_paths": [REPOSITORY],
+                "errors": [],
+                "errors_truncated": False,
+            },
+            collect_lifecycle_bindings_from_db=lambda: database,
+        )
+        checkouts = SimpleNamespace(
+            _retention_records=lambda _keys: {
+                "checkout-retained": {"owner_id": "task:retained-task"},
+            }
+        )
+
+        def module(name: str) -> object:
+            if name == "grabowski_checkout_binding_reconciler":
+                return reconciler
+            if name == "grabowski_checkouts":
+                return checkouts
+            raise AssertionError(name)
+
+        with patch.object(surface, "_module", side_effect=module):
+            result = surface._reconciliation_payload([REPOSITORY])
+
+        self.assertTrue(result["task_checkout_presence_complete"])
+        self.assertEqual(
+            result["task_checkout_presence"],
+            {
+                "bound-task": ["checkout-bound"],
+                "retained-task": ["checkout-retained"],
+            },
+        )
+
     def test_attention_payload_uses_bounded_projection_only_for_current_work(
         self,
     ) -> None:
@@ -569,7 +632,11 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
             MAX_PAGE_LIMIT=100,
             reconcile_checkout_bindings=reconcile,
         )
-        with patch.object(surface, "_module", return_value=reconciler):
+        with patch.object(
+            surface, "_module", return_value=reconciler
+        ), patch.object(
+            surface, "_task_checkout_presence", return_value={}
+        ):
             result = surface._reconciliation_payload([REPOSITORY])
 
         self.assertEqual(result["bindings"], [])
