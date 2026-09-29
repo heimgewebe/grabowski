@@ -103,6 +103,7 @@ _SYNC_TOOL_STATUS_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
 SYNC_TOOL_ALLOCATOR_TRIM_FREE_BYTES = 128 * 1024 * 1024
 SYNC_TOOL_ALLOCATOR_TRIM_MIN_INTERVAL_SECONDS = 30.0
 _SYNC_TOOL_ALLOCATOR_TRIM_LOCK = threading.Lock()
+_SYNC_TOOL_ALLOCATOR_TRIM_RETRY_LOCK = threading.Lock()
 _SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC = float("-inf")
 _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = False
 _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER: threading.Timer | None = None
@@ -2038,13 +2039,19 @@ def _deployment_admission_release_tool_call(identity: Any) -> bool:
     if not isinstance(identity, str) or not identity:
         return False
     with _DEPLOYMENT_ADMISSION_LOCK:
-        released = (
-            _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY.pop(identity, None) is not None
+        entry = _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY.pop(identity, None)
+        released = entry is not None
+        retry_deferred_async = (
+            released
+            and entry.get("kind") == _DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC
+            and not _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY
+            and _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED
         )
-    if released and _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED:
-        # A synchronous completion may have deferred its process-wide trim
-        # behind another active tool. The final later release owns the retry.
-        _maybe_trim_sync_tool_allocator()
+    if retry_deferred_async:
+        # Async completions run on the event loop. Preserve the deferred trim
+        # obligation, but hand the blocking allocator gate to a daemon timer
+        # thread instead of stalling the releasing caller.
+        _schedule_sync_tool_allocator_trim_retry(0.0)
     return released
 
 
@@ -2190,21 +2197,22 @@ def _sync_tool_allocator_libc() -> Any | None:
     return libc
 
 
-def _cancel_sync_tool_allocator_trim_retry_locked() -> None:
-    """Cancel one pending cooldown retry while the allocator-trim lock is held."""
+def _cancel_sync_tool_allocator_trim_retry() -> None:
+    """Cancel one pending allocator retry without holding the trim gate."""
     global _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION
     global _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER
-    timer = _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER
-    _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER = None
-    _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION += 1
+    with _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_LOCK:
+        timer = _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER
+        _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER = None
+        _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION += 1
     if timer is not None:
         timer.cancel()
 
 
 def _run_sync_tool_allocator_trim_retry(generation: int) -> None:
-    """Re-enter the normal trim gate for one still-current cooldown retry."""
+    """Re-enter the normal trim gate for one still-current allocator retry."""
     global _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER
-    with _SYNC_TOOL_ALLOCATOR_TRIM_LOCK:
+    with _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_LOCK:
         if (
             generation != _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION
             or _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER is None
@@ -2214,28 +2222,29 @@ def _run_sync_tool_allocator_trim_retry(generation: int) -> None:
     _maybe_trim_sync_tool_allocator()
 
 
-def _schedule_sync_tool_allocator_trim_retry_locked(delay_seconds: float) -> bool:
-    """Schedule at most one cooldown retry while the allocator-trim lock is held."""
+def _schedule_sync_tool_allocator_trim_retry(delay_seconds: float) -> bool:
+    """Schedule at most one allocator retry without blocking the trim gate."""
     global _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION
     global _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER
-    if _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER is not None:
-        return False
-    _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION += 1
-    generation = _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION
-    timer = threading.Timer(
-        max(0.0, delay_seconds),
-        _run_sync_tool_allocator_trim_retry,
-        args=(generation,),
-    )
-    timer.daemon = True
-    _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER = timer
-    try:
-        timer.start()
-    except RuntimeError:
-        if _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER is timer:
-            _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER = None
-            _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION += 1
-        return False
+    with _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_LOCK:
+        if _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER is not None:
+            return False
+        _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION += 1
+        generation = _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION
+        timer = threading.Timer(
+            max(0.0, delay_seconds),
+            _run_sync_tool_allocator_trim_retry,
+            args=(generation,),
+        )
+        timer.daemon = True
+        _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER = timer
+        try:
+            timer.start()
+        except RuntimeError:
+            if _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER is timer:
+                _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER = None
+                _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION += 1
+            return False
     return True
 
 
@@ -2256,17 +2265,17 @@ def _maybe_trim_sync_tool_allocator() -> bool:
             libc = _sync_tool_allocator_libc()
             if libc is None:
                 _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = False
-                _cancel_sync_tool_allocator_trim_retry_locked()
+                _cancel_sync_tool_allocator_trim_retry()
                 return False
             try:
                 free_bytes = int(libc.mallinfo2().fordblks)
             except (AttributeError, OSError, TypeError, ValueError):
                 _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = False
-                _cancel_sync_tool_allocator_trim_retry_locked()
+                _cancel_sync_tool_allocator_trim_retry()
                 return False
             if free_bytes < SYNC_TOOL_ALLOCATOR_TRIM_FREE_BYTES:
                 _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = False
-                _cancel_sync_tool_allocator_trim_retry_locked()
+                _cancel_sync_tool_allocator_trim_retry()
                 return False
             elapsed = now - _SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC
             if elapsed < SYNC_TOOL_ALLOCATOR_TRIM_MIN_INTERVAL_SECONDS:
@@ -2274,13 +2283,13 @@ def _maybe_trim_sync_tool_allocator() -> bool:
                 # not leave retention stranded merely because no later tool
                 # release occurs after the cooldown expires.
                 _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = True
-                _schedule_sync_tool_allocator_trim_retry_locked(
+                _schedule_sync_tool_allocator_trim_retry(
                     SYNC_TOOL_ALLOCATOR_TRIM_MIN_INTERVAL_SECONDS - elapsed
                 )
                 return False
             # Record the attempt, not only a successful madvise, so an already
             # trimmed arena cannot cause a malloc_trim storm on every small read.
-            _cancel_sync_tool_allocator_trim_retry_locked()
+            _cancel_sync_tool_allocator_trim_retry()
             _SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC = now
             _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = False
             try:
