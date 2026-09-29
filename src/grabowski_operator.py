@@ -2041,16 +2041,15 @@ def _deployment_admission_release_tool_call(identity: Any) -> bool:
     with _DEPLOYMENT_ADMISSION_LOCK:
         entry = _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY.pop(identity, None)
         released = entry is not None
-        retry_deferred_async = (
+        retry_deferred_idle = (
             released
-            and entry.get("kind") == _DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC
             and not _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY
             and _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED
         )
-    if retry_deferred_async:
-        # Async completions run on the event loop. Preserve the deferred trim
-        # obligation, but hand the blocking allocator gate to a daemon timer
-        # thread instead of stalling the releasing caller.
+    if retry_deferred_idle:
+        # The final release can run on the event loop or on a sync path that
+        # never reached a completion callback. Preserve the deferred trim
+        # obligation by handing the blocking allocator gate to a daemon timer.
         _schedule_sync_tool_allocator_trim_retry(0.0)
     return released
 
