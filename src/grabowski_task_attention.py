@@ -3547,12 +3547,6 @@ def _current_work_direct_retry_convergence(
             if source_task_id in attention_task_ids:
                 direct_source_task_ids.add(source_task_id)
 
-    for source_task_id in direct_source_task_ids:
-        if len(successor_task_ids_by_source.get(source_task_id, ())) > 1:
-            raise terminal_convergence.TerminalConvergenceError(
-                "persisted retry source has multiple successors"
-            )
-
     attention_by_task: dict[str, dict[str, Any]] = {}
     support_by_task: dict[str, dict[str, Any]] = {}
     frontier = set(direct_source_task_ids)
@@ -3597,6 +3591,10 @@ def _current_work_direct_retry_convergence(
                 )
 
             for source_task_id in sorted(new_task_ids):
+                if len(successor_task_ids_by_source.get(source_task_id, ())) > 1:
+                    raise terminal_convergence.TerminalConvergenceError(
+                        "persisted retry source has multiple successors"
+                    )
                 source_record = source_by_task[source_task_id]
                 if source_record.get("state") not in ATTENTION_STATES:
                     raise terminal_convergence.TerminalConvergenceError(

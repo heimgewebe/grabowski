@@ -2914,6 +2914,111 @@ class TaskAttentionTests(unittest.TestCase):
             page["attention_convergence_error"],
         )
 
+    def test_current_work_attention_traversed_retry_ancestor_conflict_fails_visible(
+        self,
+    ) -> None:
+        source, middle = self._verified_retry_pair(successor_state="failed")
+        source_id = str(source["task_id"])
+        middle_id = str(middle["task_id"])
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 125},
+            ),
+        ):
+            resumed = tasks.reconcile_tasks_resume(
+                task_id=middle_id,
+                max_resumes=1,
+                reason="verified retry tail",
+            )
+        tail_id = str(resumed["resumed"][0]["task_id"])
+
+        common = {
+            "host": "local",
+            "argv": ["/bin/echo", "verified-retry"],
+            "cwd": str(self.root),
+            "runtime_seconds": 61,
+            "resume_policy": "retry-safe",
+            "cpu_weight": 50,
+            "io_weight": 25,
+            "memory_max_bytes": 64 * 1024 * 1024,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 126},
+            ),
+        ):
+            sibling = tasks.grabowski_task_start(**common)["task"]
+        sibling = tasks._set_state(
+            str(sibling["task_id"]),
+            "failed",
+            observation={"state": "failed", "source": "ancestor-conflict-sibling"},
+        )
+
+        middle_row = tasks._row_raw(middle_id)
+        sibling_row = tasks._row_raw(str(sibling["task_id"]))
+        middle_launcher = json.loads(str(middle_row["launcher_json"]))
+        sibling_launcher = json.loads(str(sibling_row["launcher_json"]))
+        sibling_launcher["retry_binding"] = dict(middle_launcher["retry_binding"])
+        identity_columns = (
+            "host",
+            "argv_json",
+            "argv_sha256",
+            "cwd",
+            "resource_keys_json",
+            "runtime_seconds",
+            "cpu_weight",
+            "io_weight",
+            "memory_max_bytes",
+            "chronik_outbox_enabled",
+            "chronik_outbox_state_root",
+            "chronik_context_json",
+            "execution_backend",
+            "systemd_scope",
+        )
+        assignments = ", ".join(f"{column}=?" for column in identity_columns)
+        with tasks._database() as connection:
+            connection.execute(
+                f"UPDATE tasks SET launcher_json=?, {assignments} WHERE task_id=?",
+                (
+                    json.dumps(
+                        sibling_launcher,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    *(middle_row[column] for column in identity_columns),
+                    sibling["task_id"],
+                ),
+            )
+
+        page = attention.reconcile_attention(
+            {"limit": 20, "view": "current"},
+            _bounded_current_projection=True,
+            _current_work_task_ids={middle_id},
+        )
+
+        returned = {item["task_id"] for item in page["records"]}
+        self.assertIn(source_id, returned)
+        self.assertIn(middle_id, returned)
+        self.assertIn(sibling["task_id"], returned)
+        self.assertNotIn(tail_id, returned)
+        self.assertFalse(page["current_work_orphan_filter_safe"])
+        self.assertEqual("degraded", page["attention_convergence_status"])
+        self.assertEqual(
+            "TerminalConvergenceError",
+            page["attention_convergence_error"],
+        )
+
     def test_current_work_attention_valid_json_malformed_retry_fails_visible(
         self,
     ) -> None:
