@@ -846,6 +846,66 @@ class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
                 ["key-a"],
             )
 
+    def test_reconciliation_reuses_validated_database_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "checkouts.sqlite3"
+            create_checkout_db(path)
+            insert_binding(path, checkout_key="key-a", checkout_path=CHECKOUT)
+            snapshot = collect_lifecycle_bindings_from_db(path)
+
+            with mock.patch(
+                "grabowski_checkout_binding_reconciler.collect_lifecycle_bindings_from_db",
+                side_effect=AssertionError("database snapshot should be reused"),
+            ), mock.patch(
+                "grabowski_checkout_binding_reconciler.collect_git_worktrees_for_repos",
+                return_value={
+                    "worktrees": [worktree()],
+                    "observable_repo_paths": [REPO],
+                    "observations": [
+                        {
+                            "requested_repo_path": REPO,
+                            "repo_path": REPO,
+                            "repo_common_dir": COMMON,
+                            "worktree_count": 1,
+                        }
+                    ],
+                    "errors": [],
+                    "errors_truncated": False,
+                },
+            ):
+                result = reconcile_checkout_bindings(
+                    db_path=path,
+                    repository_filters=[REPO],
+                    limit=20,
+                    _database_snapshot=snapshot,
+                )
+
+            self.assertEqual(1, result["total_count"])
+            self.assertEqual(
+                snapshot["snapshot_sha256"],
+                result["source_snapshot"]["database_snapshot_sha256"],
+            )
+
+    def test_reconciliation_rejects_tampered_database_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "checkouts.sqlite3"
+            create_checkout_db(path)
+            insert_binding(path, checkout_key="key-a", checkout_path=CHECKOUT)
+            snapshot = collect_lifecycle_bindings_from_db(path)
+            tampered = dict(snapshot)
+            tampered["snapshot_sha256"] = "0" * 64
+
+            with self.assertRaisesRegex(
+                CheckoutBindingDatabaseError,
+                "snapshot hash is invalid",
+            ):
+                reconcile_checkout_bindings(
+                    db_path=path,
+                    repository_filters=[REPO],
+                    limit=20,
+                    _database_snapshot=tampered,
+                )
+
     def test_database_collection_includes_retention_without_lifecycle_binding(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "checkouts.sqlite3"
