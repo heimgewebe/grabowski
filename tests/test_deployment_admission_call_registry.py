@@ -608,6 +608,65 @@ class SyncToolAllocatorTrimTests(unittest.TestCase):
         self.assertFalse(operator._SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED)
         self.assertIsNone(operator._SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER)
 
+    def test_final_release_waits_for_in_progress_trim_gate(self) -> None:
+        operator = _load_operator_module()
+        calls: list[int] = []
+        libc = self._libc(
+            operator.SYNC_TOOL_ALLOCATOR_TRIM_FREE_BYTES,
+            calls,
+        )
+        identity = operator._deployment_admission_register_tool_call(
+            "last-active", operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC
+        )
+        operator._SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = True
+        operator._SYNC_TOOL_ALLOCATOR_TRIM_LOCK.acquire()
+        done = threading.Event()
+        released: list[bool] = []
+
+        def release_last() -> None:
+            try:
+                released.append(
+                    operator._deployment_admission_release_tool_call(identity)
+                )
+            finally:
+                done.set()
+
+        thread = threading.Thread(target=release_last, daemon=True)
+        try:
+            with patch.object(
+                operator, "_sync_tool_allocator_libc", return_value=libc
+            ), patch.object(
+                operator.time, "monotonic", return_value=200.0
+            ), patch.object(
+                operator,
+                "_SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC",
+                float("-inf"),
+            ):
+                thread.start()
+                deadline = time.monotonic() + 1.0
+                while (
+                    operator._deployment_admission_active_tool_calls() != 0
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.001)
+                self.assertEqual(
+                    0, operator._deployment_admission_active_tool_calls()
+                )
+                self.assertFalse(done.wait(timeout=0.05))
+                self.assertEqual([], calls)
+
+                operator._SYNC_TOOL_ALLOCATOR_TRIM_LOCK.release()
+                self.assertTrue(done.wait(timeout=1.0))
+                thread.join(timeout=1.0)
+        finally:
+            if operator._SYNC_TOOL_ALLOCATOR_TRIM_LOCK.locked():
+                operator._SYNC_TOOL_ALLOCATOR_TRIM_LOCK.release()
+            thread.join(timeout=1.0)
+
+        self.assertEqual([True], released)
+        self.assertEqual([0], calls)
+        self.assertFalse(operator._SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED)
+
     def test_trim_is_fail_soft_when_glibc_allocator_api_is_unavailable(self) -> None:
         operator = _load_operator_module()
         with patch.object(

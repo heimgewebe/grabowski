@@ -2243,8 +2243,7 @@ def _maybe_trim_sync_tool_allocator() -> bool:
     """Return free glibc pages at a globally idle MCP-tool boundary."""
     global _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED
     global _SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC
-    if not _SYNC_TOOL_ALLOCATOR_TRIM_LOCK.acquire(blocking=False):
-        return False
+    _SYNC_TOOL_ALLOCATOR_TRIM_LOCK.acquire()
     try:
         # malloc_trim is process-wide. Hold admission closed through the
         # allocator probe and trim so no newly admitted MCP tool can start
