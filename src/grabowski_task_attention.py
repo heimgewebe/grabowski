@@ -3618,9 +3618,90 @@ def reconcile_attention(
             and raw_total_attention <= MAX_CURRENT_CONVERGENCE_ROWS
         )
         current_work_orphan_filter_safe = current_work_direct_scan_mode
+        current_work_retry_source_task_ids: set[str] = set()
+        current_work_retry_excluded_task_ids: set[str] = set()
+        if current_work_direct_scan_mode:
+            attention_task_ids = {
+                str(row["task_id"])
+                for row in connection.execute(
+                    f"SELECT task_id FROM tasks WHERE state IN ({placeholders})",
+                    ATTENTION_STATES,
+                )
+            }
+            try:
+                retry_successors = tasks._task_retry_successor_records(
+                    connection,
+                    source_task_ids=attention_task_ids,
+                    limit=MAX_CURRENT_CONVERGENCE_ROWS,
+                )
+                for successor in retry_successors:
+                    retry_binding = terminal_convergence.persisted_retry_binding(
+                        successor
+                    )
+                    if retry_binding is None:
+                        raise TaskAttentionIntegrityError(
+                            "retry successor lacks persisted retry evidence"
+                        )
+                    source_task_id = str(retry_binding["source_task_id"])
+                    if source_task_id in attention_task_ids:
+                        current_work_retry_source_task_ids.add(source_task_id)
+                if current_work_retry_source_task_ids:
+                    retry_source_rows = tasks._task_attention_records(
+                        connection.execute(
+                            f"SELECT {_ATTENTION_SELECT_COLUMNS} FROM tasks "
+                            f"WHERE state IN ({placeholders}) "
+                            "AND task_id IN (SELECT value FROM json_each(?)) "
+                            "ORDER BY created_at_unix DESC, task_id DESC",
+                            (
+                                *ATTENTION_STATES,
+                                json.dumps(
+                                    sorted(current_work_retry_source_task_ids),
+                                    ensure_ascii=False,
+                                    separators=(",", ":"),
+                                ),
+                            ),
+                        )
+                    )
+                    retry_convergence = _bounded_current_retry_convergence(
+                        connection,
+                        [dict(row) for row in retry_source_rows],
+                    )
+                    current_work_retry_excluded_task_ids = {
+                        str(item["task_id"])
+                        for item in retry_convergence["historical"]
+                        if item.get("convergence_classification")
+                        == "superseded_by_verified_retry"
+                    }
+                    local_historical = list(retry_convergence["historical"])
+                    for name in convergence_counts:
+                        convergence_counts[name] += sum(
+                            1
+                            for item in local_historical
+                            if item.get("convergence_classification") == name
+                        )
+                    converged_attention_count += len(local_historical)
+                    bounded_retry_successor_task_ids.update(
+                        str(task_id)
+                        for task_id in retry_convergence["_support_task_ids"]
+                    )
+            except (
+                terminal_convergence.TerminalConvergenceError,
+                TaskAttentionError,
+                TaskAttentionInputError,
+                RuntimeError,
+                OSError,
+                ValueError,
+            ) as exc:
+                current_work_orphan_filter_safe = False
+                convergence_status = "degraded"
+                convergence_error = (
+                    str(exc) or type(exc).__name__
+                    if type(exc) is RuntimeError
+                    else type(exc).__name__
+                )
         current_scan_limit = (
             MAX_CURRENT_CONVERGENCE_ROWS
-            if current_work_direct_scan_mode
+            if current_work_orphan_filter_safe
             else MAX_CURRENT_SCAN_ROWS
         )
         if view == "history":
@@ -3646,7 +3727,8 @@ def reconcile_attention(
         else:
             snapshot_status = str(decision_snapshot.get("status") or "degraded")
             if current_work_direct_scan_mode:
-                convergence_status = "current_work_direct_not_evaluated"
+                if convergence_status != "degraded":
+                    convergence_status = "current_work_direct_not_evaluated"
             elif _bounded_current_projection:
                 convergence_status = "bounded_not_evaluated"
             elif raw_total_attention > MAX_CURRENT_CONVERGENCE_ROWS:
@@ -3783,6 +3865,7 @@ def reconcile_attention(
                     and raw["state"] in TERMINAL_ATTENTION_STATES
                     and current_work_task_ids is not None
                     and task_id_value not in current_work_task_ids
+                    and task_id_value not in current_work_retry_source_task_ids
                 ):
                     try:
                         retry_binding = terminal_convergence.persisted_retry_binding(
@@ -3822,7 +3905,9 @@ def reconcile_attention(
                     break
 
                 batch_convergence_excluded_task_ids = (
-                    convergence_excluded_task_ids
+                    current_work_retry_excluded_task_ids
+                    if current_work_direct_scan_mode
+                    else convergence_excluded_task_ids
                 )
                 if _bounded_current_projection and not current_work_direct_scan_mode:
                     batch_candidate_ids = {str(row["task_id"]) for row in rows}

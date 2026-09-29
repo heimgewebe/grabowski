@@ -2761,7 +2761,7 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertTrue(page["current_work_orphan_filter_safe"])
         self.assertEqual(record["task_id"], str(record["task_id"]))
 
-    def test_current_work_attention_keeps_retry_bound_actionable_visible(
+    def test_current_work_attention_keeps_failed_retry_successor_visible(
         self,
     ) -> None:
         source, successor = self._verified_retry_pair(successor_state="failed")
@@ -2776,6 +2776,42 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertNotIn(source["task_id"], returned)
         self.assertIn(successor["task_id"], returned)
         self.assertTrue(page["current_work_orphan_filter_safe"])
+
+    def test_current_work_attention_malformed_retry_fails_visible(self) -> None:
+        source, successor = self._verified_retry_pair(successor_state="running")
+        successor_row = tasks._row_raw(str(successor["task_id"]))
+        launcher = json.loads(str(successor_row["launcher_json"]))
+        launcher["retry_binding"]["context_sha256"] = "0" * 64
+        with tasks._database() as connection:
+            connection.execute(
+                "UPDATE tasks SET launcher_json=? WHERE task_id=?",
+                (
+                    json.dumps(
+                        launcher,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    successor["task_id"],
+                ),
+            )
+
+        page = attention.reconcile_attention(
+            {"limit": 20, "view": "current"},
+            _bounded_current_projection=True,
+            _current_work_task_ids={str(successor["task_id"])},
+        )
+
+        self.assertIn(
+            source["task_id"],
+            {item["task_id"] for item in page["records"]},
+        )
+        self.assertFalse(page["current_work_orphan_filter_safe"])
+        self.assertEqual("degraded", page["attention_convergence_status"])
+        self.assertEqual(
+            "TerminalConvergenceError",
+            page["attention_convergence_error"],
+        )
 
     def test_current_work_attention_filter_fails_visible_above_scan_bound(
         self,

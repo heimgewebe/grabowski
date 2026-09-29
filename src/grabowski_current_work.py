@@ -1826,7 +1826,7 @@ def _finalize_groups(
     source_errors: list[dict[str, Any]],
     task_checkout_presence: dict[str, list[str]],
     task_checkout_presence_complete: bool,
-    attention_current_work_filter_safe: bool,
+    attention_current_work_filter_applied: bool,
 ) -> list[dict[str, Any]]:
     projected: list[dict[str, Any]] = []
     source_error_sources = {
@@ -1962,8 +1962,8 @@ def _finalize_groups(
             and not (current_binding_absence_sources & source_error_sources)
         )
         attention_page_safe_to_suppress = bool(
-            not source_truncation.get("attention", False)
-            or attention_current_work_filter_safe
+            not attention_current_work_filter_applied
+            and not source_truncation.get("attention", False)
         )
         attention_only_hygiene = (
             group["binding"]["kind"] == "task"
@@ -2307,14 +2307,15 @@ def build_current_work_projection(
 
     task_rows = _records(tasks_payload, "tasks", MAX_TASKS, "tasks")
     attention_rows = _attention_records(attention_payload)
-    attention_current_work_filter_safe = _boolean(
-        (
-            attention_payload.get("current_work_orphan_filter_safe", False)
-            if attention_payload
-            else False
-        ),
-        "attention.current_work_orphan_filter_safe",
+    attention_current_work_filter_applied = bool(
+        attention_payload
+        and "current_work_orphan_filter_safe" in attention_payload
     )
+    if attention_current_work_filter_applied:
+        _boolean(
+            attention_payload.get("current_work_orphan_filter_safe"),
+            "attention.current_work_orphan_filter_safe",
+        )
     lease_rows = _records(resources_payload, "leases", MAX_LEASES, "resources")
     browser_rows = _records(browser_payload, "workers", MAX_WORKERS, "browser")
     gui_rows = _records(gui_payload, "workers", MAX_WORKERS, "gui")
@@ -2406,7 +2407,7 @@ def build_current_work_projection(
         source_errors=errors,
         task_checkout_presence=task_checkout_presence,
         task_checkout_presence_complete=task_checkout_presence_complete,
-        attention_current_work_filter_safe=attention_current_work_filter_safe,
+        attention_current_work_filter_applied=attention_current_work_filter_applied,
     )
 
     _annotate_groups(

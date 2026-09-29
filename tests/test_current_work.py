@@ -1988,17 +1988,18 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertEqual(group["work_id"], f"task:{task_id}")
         self.assertEqual(group["projection_state"], "hygiene")
 
-    def test_refill_safe_attention_page_can_hide_orphaned_hygiene(self) -> None:
+    def test_current_work_filtered_attention_is_not_suppressed_again(self) -> None:
         task_id = "attention-refill-safe"
         result = project(
             attention_payload={
                 "records": [attention(task_id, "actionable", state="failed")],
-                "pagination": {"has_more": True},
+                "pagination": {"has_more": False},
                 "current_work_orphan_filter_safe": True,
             },
         )
 
-        self.assertEqual(result["total_projected"], 0)
+        self.assertEqual(result["total_projected"], 1)
+        self.assertEqual(result["work"][0]["work_id"], f"task:{task_id}")
 
     def test_attention_only_task_stays_current_when_task_absence_is_unproven(self) -> None:
         task_id = "attention-task-window-incomplete"
