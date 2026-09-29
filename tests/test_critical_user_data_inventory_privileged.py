@@ -80,13 +80,14 @@ def _home_contract() -> dict[str, object]:
         "logical_root": "/home/alex",
         "inventory": {
             "schema": "heim_pc.critical_user_data_inventory.v1",
-            "algorithm": "canonical-record-stream-sha256-v6",
+            "algorithm": "canonical-record-stream-sha256-v7",
             "same_filesystem_only": True,
             "follow_symlinks": False,
             "regular_file_content_sha256": True,
             "directory_mode_bound": True,
             "regular_file_mode_bound": True,
             "uid_gid_bound": True,
+            "explicit_ancestor_metadata_bound": True,
             "symlink_target_bound": True,
             "special_files": "excluded-runtime-only",
             "unreadable_included_path": "fail",
@@ -148,6 +149,20 @@ def _aggregate_contract(
         "migration_policy": {
             "selection_model": "explicit-positive-allowlist",
             "legacy_docker_volume_tree_migrated": False,
+        },
+    }
+
+
+def _recovery_contract(aggregate_sha: str) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "kind": "heim_pc.nixos_recovery_readiness_contract",
+        "critical_user_data_scope": {
+            "contract_kind": helper.SCOPE_KIND,
+            "scope": "critical-user-data",
+            "sha256": aggregate_sha,
+            "aggregate_member_contracts_bound": True,
+            "off_host_restore_inventory_sha256_equality_required": True,
         },
     }
 
@@ -292,10 +307,7 @@ class CriticalUserDataInventoryPrivilegedTests(unittest.TestCase):
 
 
     def test_source_paths_and_commit_authority_are_fixed(self) -> None:
-        expected_root = Path(
-            "/home/alex/repos/.grabowski-worktrees/"
-            "heim-pc-critical-user-data-scope-20260928"
-        )
+        expected_root = Path("/home/alex/repos/heim-pc")
         self.assertEqual(helper.SOURCE_ROOT, expected_root)
         self.assertEqual(
             helper.SCANNER_SOURCE,
@@ -314,11 +326,20 @@ class CriticalUserDataInventoryPrivilegedTests(unittest.TestCase):
             expected_root
             / "nixos/production/critical-user-home-data-contract-v1.json",
         )
+        self.assertEqual(
+            helper.RECOVERY_CONTRACT_SOURCE,
+            expected_root / "nixos/production/recovery-contract-v1.json",
+        )
+        self.assertEqual(
+            helper.STATE_ROOT,
+            Path("/run/grabowski/critical-user-data-inventory"),
+        )
         for digest in (
             helper.AUTHORIZED_SCANNER_SHA256,
             helper.AUTHORIZED_AGGREGATE_SCANNER_SHA256,
             helper.AUTHORIZED_CONTRACT_SHA256,
             helper.AUTHORIZED_HOME_CONTRACT_SHA256,
+            helper.AUTHORIZED_RECOVERY_CONTRACT_SHA256,
         ):
             self.assertRegex(digest, r"[0-9a-f]{64}\Z")
 
@@ -370,30 +391,62 @@ class CriticalUserDataInventoryPrivilegedTests(unittest.TestCase):
                 with self.assertRaises(helper.InventoryHelperError):
                     helper._validate_contract(_canonical(changed))
 
-    def test_aggregate_argv_is_authoritative_zero_sample_and_pinned(self) -> None:
+    def test_aggregate_argv_uses_internal_external_verified_executor(self) -> None:
         argv = helper.aggregate_argv()
+        self.assertEqual(argv[0], str(helper.HELPER))
+        self.assertEqual(len(argv), 2)
+        request = json.loads(argv[1])
+        self.assertEqual(request["operation"], "aggregate")
         self.assertEqual(
-            argv[:3],
-            ["/usr/bin/python3", "-B", str(helper.AGGREGATE_SCANNER_SNAPSHOT)],
-        )
-        self.assertNotIn("--classification-only", argv)
-        self.assertEqual(argv[argv.index("--max-exclusion-samples") + 1], "0")
-        self.assertEqual(
-            argv[argv.index("--expected-script-sha256") + 1],
-            helper.AUTHORIZED_AGGREGATE_SCANNER_SHA256,
+            request["scanner_sha256"], helper.AUTHORIZED_SCANNER_SHA256
         )
         self.assertEqual(
-            argv[argv.index("--expected-contract-sha256") + 1],
-            helper.AUTHORIZED_CONTRACT_SHA256,
+            request["contract_sha256"], helper.AUTHORIZED_CONTRACT_SHA256
         )
         self.assertEqual(
-            argv[argv.index("--verified-payload-bootstrap") + 1],
             helper.AGGREGATE_EXECUTION_MODE,
+            "external-verified-payload-exec-v1",
         )
-        self.assertEqual(
-            argv[argv.index("--contract") + 1],
-            str(helper.CONTRACT_SNAPSHOT),
-        )
+        self.assertNotIn("--verified-payload-bootstrap", argv)
+
+    def test_external_verified_payload_executor_sets_authoritative_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            aggregate_path = root / "nixos_critical_data_inventory.py"
+            contract_path = root / "critical-user-data-contract-v1.json"
+            aggregate_payload = b"""AGGREGATE_EXECUTION_MODE = "external-verified-payload-exec-v1"
+_VERIFIED_EXECUTION = False
+def collect_inventory(contract_path, *, classification_only=False, max_exclusion_samples=0, _contract_snapshot=None, _aggregate_script_bytes=None):
+    return {"verified": _VERIFIED_EXECUTION, "classification_only": classification_only}
+"""
+            contract_payload = b'{"schema_version":1}\n'
+            aggregate_path.write_bytes(aggregate_payload)
+            contract_path.write_bytes(contract_payload)
+            aggregate_path.chmod(0o500)
+            contract_path.chmod(0o400)
+
+            def read_snapshot(path: Path, **_kwargs: object) -> bytes:
+                return path.read_bytes()
+
+            with (
+                mock.patch.object(helper, "AGGREGATE_SCANNER_SNAPSHOT", aggregate_path),
+                mock.patch.object(helper, "CONTRACT_SNAPSHOT", contract_path),
+                mock.patch.object(
+                    helper,
+                    "AUTHORIZED_AGGREGATE_SCANNER_SHA256",
+                    _sha(aggregate_payload),
+                ),
+                mock.patch.object(
+                    helper, "AUTHORIZED_CONTRACT_SHA256", _sha(contract_payload)
+                ),
+                mock.patch.object(
+                    helper, "_read_stable_regular", side_effect=read_snapshot
+                ),
+            ):
+                value = helper._verified_aggregate_inventory()
+
+        self.assertTrue(value["verified"])
+        self.assertFalse(value["classification_only"])
 
     def test_lock_creates_digest_binding_directory_before_open(self) -> None:
         events: list[tuple[str, object]] = []
@@ -509,6 +562,9 @@ class CriticalUserDataInventoryPrivilegedTests(unittest.TestCase):
         )
         contract_path = source / "critical-user-data-contract-v1.json"
         contract_path.write_bytes(contract)
+        recovery_contract = _canonical(_recovery_contract(_sha(contract)))
+        recovery_path = source / "recovery-contract-v1.json"
+        recovery_path.write_bytes(recovery_contract)
         state = root / "state"
         state.mkdir(mode=0o700)
         return temporary, {
@@ -516,14 +572,17 @@ class CriticalUserDataInventoryPrivilegedTests(unittest.TestCase):
             "aggregate_scanner": aggregate_scanner,
             "contract": contract,
             "home_contract": home_contract,
+            "recovery_contract": recovery_contract,
             "scanner_path": scanner_path,
             "aggregate_path": aggregate_path,
             "contract_path": contract_path,
             "home_path": home_path,
+            "recovery_path": recovery_path,
             "scanner_sha": scanner_sha,
             "aggregate_sha": aggregate_sha,
             "contract_sha": _sha(contract),
             "home_sha": home_sha,
+            "recovery_sha": _sha(recovery_contract),
             "state": state,
         }
 
@@ -534,10 +593,12 @@ class CriticalUserDataInventoryPrivilegedTests(unittest.TestCase):
             ("AGGREGATE_SCANNER_SOURCE", fx["aggregate_path"]),
             ("CONTRACT_SOURCE", fx["contract_path"]),
             ("HOME_CONTRACT_SOURCE", fx["home_path"]),
+            ("RECOVERY_CONTRACT_SOURCE", fx["recovery_path"]),
             ("AUTHORIZED_SCANNER_SHA256", fx["scanner_sha"]),
             ("AUTHORIZED_AGGREGATE_SCANNER_SHA256", fx["aggregate_sha"]),
             ("AUTHORIZED_CONTRACT_SHA256", fx["contract_sha"]),
             ("AUTHORIZED_HOME_CONTRACT_SHA256", fx["home_sha"]),
+            ("AUTHORIZED_RECOVERY_CONTRACT_SHA256", fx["recovery_sha"]),
             ("STATE_ROOT", fx["state"]),
         ):
             stack.enter_context(mock.patch.object(helper, name, value))
@@ -563,6 +624,7 @@ class CriticalUserDataInventoryPrivilegedTests(unittest.TestCase):
         for key, message in (
             ("aggregate_path", "aggregate inventory scanner digest"),
             ("home_path", "home contract digest"),
+            ("recovery_path", "recovery contract digest"),
         ):
             temporary, fx = self._fixture()
             self.addCleanup(temporary.cleanup)
@@ -588,6 +650,7 @@ class CriticalUserDataInventoryPrivilegedTests(unittest.TestCase):
                 ),
                 helper.CONTRACT_SNAPSHOT: (fx["contract"], 0o400),
                 helper.HOME_CONTRACT_SNAPSHOT: (fx["home_contract"], 0o400),
+                helper.RECOVERY_CONTRACT_SNAPSHOT: (fx["recovery_contract"], 0o400),
             }
             for path, (payload, mode) in expected.items():
                 self.assertEqual(path.read_bytes(), payload)

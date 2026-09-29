@@ -1962,9 +1962,16 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
         )
         recovery_source = "/home/alex/.local/state/grabowski/recovery/last-server-recovery.json"
         legacy_kill_switch = "/home/alex/.local/state/grabowski/operator-kill-switch"
-        automatic_repo = "/home/alex/repos/grabowski"
-        expected_service_binds = tuple(sorted((recovery_source, legacy_kill_switch, automatic_repo, *mounted)))
-        expected_recovery_optional = tuple(sorted((legacy_kill_switch, automatic_repo, *mounted)))
+        automatic_repos = (
+            "/home/alex/repos/grabowski",
+            "/home/alex/repos/heim-pc",
+        )
+        expected_service_binds = tuple(
+            sorted((recovery_source, legacy_kill_switch, *automatic_repos, *mounted))
+        )
+        expected_recovery_optional = tuple(
+            sorted((legacy_kill_switch, *automatic_repos, *mounted))
+        )
 
         self.assertEqual(observer_roots, expected)
         self.assertEqual(observer_lexical_roots, lexical_only)
@@ -1972,10 +1979,11 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
         self.assertEqual(tuple(sorted(service_bind_roots)), expected_service_binds)
         self.assertEqual(tuple(sorted(recovery_optional_bind_roots)), expected_recovery_optional)
         self.assertEqual(recovery_mandatory_bind_roots, (recovery_source,))
-        self.assertEqual(automatic_cutover_roots, (automatic_repo,))
+        self.assertEqual(automatic_cutover_roots, automatic_repos)
         self.assertTrue(set(lexical_only).isdisjoint(service_bind_roots))
         self.assertTrue(set(lexical_only).isdisjoint(recovery_optional_bind_roots))
-        self.assertNotIn(automatic_repo, expected)
+        for automatic_repo in automatic_repos:
+            self.assertNotIn(automatic_repo, expected)
         self.assertNotIn("/home/alex/repos", expected)
 
     def test_process_reference_lexical_root_is_exact_on_client_side(self) -> None:

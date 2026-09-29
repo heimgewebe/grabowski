@@ -101,6 +101,7 @@ LOCAL_BACKUP_STORAGE_ACTIONS = (
 )
 AUTOMATIC_CUTOVER_BIND_PATHS = (
     "/home/alex/repos/grabowski",
+    "/home/alex/repos/heim-pc",
 )
 PROCESS_OBSERVER_BIND_PATHS = (
     "/home/alex/repos/.weltgewebe-audit-implementation",

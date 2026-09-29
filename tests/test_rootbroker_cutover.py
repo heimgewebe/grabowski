@@ -1513,7 +1513,10 @@ class RootbrokerCutoverTests(unittest.TestCase):
     def test_automatic_cutover_bind_paths_include_canonical_grabowski_repo(self) -> None:
         self.assertEqual(
             cutover.AUTOMATIC_CUTOVER_BIND_PATHS,
-            ("/home/alex/repos/grabowski",),
+            (
+                "/home/alex/repos/grabowski",
+                "/home/alex/repos/heim-pc",
+            ),
         )
         self.assertNotIn(
             "/home/alex/repos/grabowski",

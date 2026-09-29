@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import time
+import types
 from typing import Any
 
 SCHEMA_VERSION = 1
@@ -22,26 +23,25 @@ INVENTORY_ALGORITHM = "member-inventory-sha256-v1"
 SCOPE_KIND = "heim_pc.critical_user_data_scope_contract"
 SCOPE_SEMANTICS = "explicit-positive-selection"
 SOURCE_STABILITY_MODE = "kernel-local-pci-nvme-readonly-mountinfo-v3"
-AGGREGATE_EXECUTION_MODE = "verified-payload-self-bootstrap-v1"
-SOURCE_ROOT = Path(
-    "/home/alex/repos/.grabowski-worktrees/"
-    "heim-pc-critical-user-data-scope-20260928"
-)
+AGGREGATE_EXECUTION_MODE = "external-verified-payload-exec-v1"
+SOURCE_ROOT = Path("/home/alex/repos/heim-pc")
 SCANNER_SOURCE = SOURCE_ROOT / "scripts/nixos_critical_user_data_inventory.py"
 AGGREGATE_SCANNER_SOURCE = SOURCE_ROOT / "scripts/nixos_critical_data_inventory.py"
 CONTRACT_SOURCE = SOURCE_ROOT / "nixos/production/critical-user-data-contract-v1.json"
 HOME_CONTRACT_SOURCE = (
     SOURCE_ROOT / "nixos/production/critical-user-home-data-contract-v1.json"
 )
+RECOVERY_CONTRACT_SOURCE = SOURCE_ROOT / "nixos/production/recovery-contract-v1.json"
 
 # These pins are authority, not observations supplied by the UID-1000 caller.
 # The installed helper artifact is itself commit-bound by the Rootbroker/runtime
 # operator-authority attestation.  A changed migration source therefore fails
 # closed until a new reviewed Grabowski commit updates these constants.
-AUTHORIZED_SCANNER_SHA256 = "a6efa2f9c5ada2146dace47c69b41e64d43306cc4ab300ea673ea703fd38f5f9"
-AUTHORIZED_AGGREGATE_SCANNER_SHA256 = "3a9ffd2ed7e2d2518cc150de50bbb7ca42320755e0482fbbdb1275bc29aeae1c"
-AUTHORIZED_CONTRACT_SHA256 = "e080c049f10e2398ae427a17bca2ffe9d275e8877665e62e224c84a2b1ba9c0e"
-AUTHORIZED_HOME_CONTRACT_SHA256 = "e3b976c8e945b276f47d201085fdeab853eef0f932b51f2016fe7df68f55d7ca"
+AUTHORIZED_SCANNER_SHA256 = "5f3b9aa1e2ad49da932ac699023f7f020e562d1d6ec0584a8c9dafb6ffaef572"
+AUTHORIZED_AGGREGATE_SCANNER_SHA256 = "f71996ac1b3722a0785465e9504c2cfd23878d1b85597ddaff7a5bebf0a49d84"
+AUTHORIZED_CONTRACT_SHA256 = "d979b42a8a030ca37b5a3c57ac192c81324d72bf3ac292adbda427eeec2c8097"
+AUTHORIZED_HOME_CONTRACT_SHA256 = "385cf944e6a28c94a4593eeb1e6e5c87141cb26a4dc8a6cc96b783e21a623347"
+AUTHORIZED_RECOVERY_CONTRACT_SHA256 = "fcd9856f9038652469605b97818bb6904bf34bb54843b4e322e797dc3533a5b6"
 
 SCANNER_SHA256 = ""
 CONTRACT_SHA256 = ""
@@ -49,12 +49,13 @@ HELPER = Path("/usr/local/libexec/grabowski-critical-user-data-inventory")
 PYTHON = Path("/usr/bin/python3")
 SYSTEMD_RUN = Path("/usr/bin/systemd-run")
 SYSTEMCTL = Path("/usr/bin/systemctl")
-STATE_ROOT = Path("/var/lib/grabowski/critical-user-data-inventory")
+STATE_ROOT = Path("/run/grabowski/critical-user-data-inventory")
 SNAPSHOT_ROOT = STATE_ROOT / "unbound"
 SCANNER_SNAPSHOT = SNAPSHOT_ROOT / "nixos_critical_user_data_inventory.py"
 AGGREGATE_SCANNER_SNAPSHOT = SNAPSHOT_ROOT / "nixos_critical_data_inventory.py"
 CONTRACT_SNAPSHOT = SNAPSHOT_ROOT / "critical-user-data-contract-v1.json"
 HOME_CONTRACT_SNAPSHOT = SNAPSHOT_ROOT / "critical-user-home-data-contract-v1.json"
+RECOVERY_CONTRACT_SNAPSHOT = SNAPSHOT_ROOT / "recovery-contract-v1.json"
 RESULT_PATH = SNAPSHOT_ROOT / "result.json"
 FAILED_ROOT = SNAPSHOT_ROOT / "failed-results"
 LOCK_PATH = SNAPSHOT_ROOT / "operation.lock"
@@ -117,7 +118,7 @@ def _validate_digest(value: Any, label: str) -> str:
 def _apply_binding(scanner_sha256: str, contract_sha256: str) -> None:
     global SCANNER_SHA256, CONTRACT_SHA256
     global SNAPSHOT_ROOT, SCANNER_SNAPSHOT, AGGREGATE_SCANNER_SNAPSHOT
-    global CONTRACT_SNAPSHOT, HOME_CONTRACT_SNAPSHOT
+    global CONTRACT_SNAPSHOT, HOME_CONTRACT_SNAPSHOT, RECOVERY_CONTRACT_SNAPSHOT
     global RESULT_PATH, FAILED_ROOT, LOCK_PATH, UNIT
 
     scanner = _validate_digest(scanner_sha256, "scanner_sha256")
@@ -134,6 +135,7 @@ def _apply_binding(scanner_sha256: str, contract_sha256: str) -> None:
     AGGREGATE_SCANNER_SNAPSHOT = SNAPSHOT_ROOT / "nixos_critical_data_inventory.py"
     CONTRACT_SNAPSHOT = SNAPSHOT_ROOT / "critical-user-data-contract-v1.json"
     HOME_CONTRACT_SNAPSHOT = SNAPSHOT_ROOT / "critical-user-home-data-contract-v1.json"
+    RECOVERY_CONTRACT_SNAPSHOT = SNAPSHOT_ROOT / "recovery-contract-v1.json"
     RESULT_PATH = SNAPSHOT_ROOT / "result.json"
     FAILED_ROOT = SNAPSHOT_ROOT / "failed-results"
     LOCK_PATH = SNAPSHOT_ROOT / "operation.lock"
@@ -403,11 +405,33 @@ def _validate_home_contract(payload: bytes) -> None:
         or value.get("logical_root") != "/home/alex"
         or not isinstance(inventory, dict)
         or inventory.get("schema") != "heim_pc.critical_user_data_inventory.v1"
-        or inventory.get("algorithm") != "canonical-record-stream-sha256-v6"
+        or inventory.get("algorithm") != "canonical-record-stream-sha256-v7"
+        or inventory.get("explicit_ancestor_metadata_bound") is not True
         or inventory.get("authoritative_source_stability")
         != SOURCE_STABILITY_MODE
     ):
         raise InventoryHelperError("critical-user-data home contract identity mismatch")
+
+
+def _validate_recovery_contract(payload: bytes) -> None:
+    try:
+        value = json.loads(payload.decode("utf-8", "strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise InventoryHelperError("recovery contract is invalid") from exc
+    critical_scope = value.get("critical_user_data_scope") if isinstance(value, dict) else None
+    if (
+        not isinstance(value, dict)
+        or value.get("schema_version") != 1
+        or value.get("kind") != "heim_pc.nixos_recovery_readiness_contract"
+        or not isinstance(critical_scope, dict)
+        or critical_scope.get("contract_kind") != SCOPE_KIND
+        or critical_scope.get("scope") != "critical-user-data"
+        or critical_scope.get("sha256") != AUTHORIZED_CONTRACT_SHA256
+        or critical_scope.get("aggregate_member_contracts_bound") is not True
+        or critical_scope.get("off_host_restore_inventory_sha256_equality_required")
+        is not True
+    ):
+        raise InventoryHelperError("recovery contract critical-user-data binding mismatch")
 
 
 def _snapshot_sources() -> None:
@@ -421,6 +445,9 @@ def _snapshot_sources() -> None:
     home_contract = _read_stable_regular(
         HOME_CONTRACT_SOURCE, max_bytes=MAX_CONTRACT_BYTES
     )
+    recovery_contract = _read_stable_regular(
+        RECOVERY_CONTRACT_SOURCE, max_bytes=MAX_CONTRACT_BYTES
+    )
     if _sha256(scanner) != AUTHORIZED_SCANNER_SHA256:
         raise InventoryHelperError("inventory scanner digest mismatch")
     if _sha256(aggregate_scanner) != AUTHORIZED_AGGREGATE_SCANNER_SHA256:
@@ -429,8 +456,11 @@ def _snapshot_sources() -> None:
         raise InventoryHelperError("critical-user-data contract digest mismatch")
     if _sha256(home_contract) != AUTHORIZED_HOME_CONTRACT_SHA256:
         raise InventoryHelperError("critical-user-data home contract digest mismatch")
+    if _sha256(recovery_contract) != AUTHORIZED_RECOVERY_CONTRACT_SHA256:
+        raise InventoryHelperError("recovery contract digest mismatch")
     _validate_contract(contract)
     _validate_home_contract(home_contract)
+    _validate_recovery_contract(recovery_contract)
 
     _ensure_private_directory(STATE_ROOT)
     _ensure_private_directory(SNAPSHOT_ROOT)
@@ -440,6 +470,7 @@ def _snapshot_sources() -> None:
     )
     _write_create_only(CONTRACT_SNAPSHOT, contract, mode=0o400)
     _write_create_only(HOME_CONTRACT_SNAPSHOT, home_contract, mode=0o400)
+    _write_create_only(RECOVERY_CONTRACT_SNAPSHOT, recovery_contract, mode=0o400)
 
     expected = (
         (SCANNER_SNAPSHOT, AUTHORIZED_SCANNER_SHA256, MAX_SCANNER_BYTES, 0o500),
@@ -461,6 +492,12 @@ def _snapshot_sources() -> None:
             MAX_CONTRACT_BYTES,
             0o400,
         ),
+        (
+            RECOVERY_CONTRACT_SNAPSHOT,
+            AUTHORIZED_RECOVERY_CONTRACT_SHA256,
+            MAX_CONTRACT_BYTES,
+            0o400,
+        ),
     )
     for path, digest, maximum, mode in expected:
         observed = _read_stable_regular(
@@ -473,26 +510,80 @@ def _snapshot_sources() -> None:
             raise InventoryHelperError("inventory source snapshot mismatch")
 
 
+def _verified_aggregate_inventory() -> dict[str, Any]:
+    aggregate_payload = _read_stable_regular(
+        AGGREGATE_SCANNER_SNAPSHOT,
+        max_bytes=MAX_SCANNER_BYTES,
+        require_root_owned=True,
+        required_mode=0o500,
+    )
+    contract_payload = _read_stable_regular(
+        CONTRACT_SNAPSHOT,
+        max_bytes=MAX_CONTRACT_BYTES,
+        require_root_owned=True,
+        required_mode=0o400,
+    )
+    if _sha256(aggregate_payload) != AUTHORIZED_AGGREGATE_SCANNER_SHA256:
+        raise InventoryHelperError("aggregate inventory snapshot digest mismatch")
+    if _sha256(contract_payload) != AUTHORIZED_CONTRACT_SHA256:
+        raise InventoryHelperError("aggregate contract snapshot digest mismatch")
+    try:
+        contract_value = json.loads(contract_payload.decode("utf-8", "strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise InventoryHelperError("aggregate contract snapshot is invalid") from exc
+    if not isinstance(contract_value, dict):
+        raise InventoryHelperError("aggregate contract snapshot is invalid")
+
+    module = types.ModuleType("grabowski_verified_critical_data_inventory")
+    module.__file__ = str(AGGREGATE_SCANNER_SNAPSHOT)
+    try:
+        code = compile(
+            aggregate_payload,
+            str(AGGREGATE_SCANNER_SNAPSHOT),
+            "exec",
+        )
+        exec(code, module.__dict__)
+    except (SyntaxError, ValueError, RuntimeError, OSError) as exc:
+        raise InventoryHelperError("aggregate inventory payload is invalid") from exc
+    if module.__dict__.get("AGGREGATE_EXECUTION_MODE") != AGGREGATE_EXECUTION_MODE:
+        raise InventoryHelperError("aggregate inventory execution mode mismatch")
+    module.__dict__["_VERIFIED_EXECUTION"] = True
+    collect_inventory = module.__dict__.get("collect_inventory")
+    if not callable(collect_inventory):
+        raise InventoryHelperError("aggregate inventory entrypoint is unavailable")
+    try:
+        value = collect_inventory(
+            CONTRACT_SNAPSHOT,
+            classification_only=False,
+            max_exclusion_samples=0,
+            _contract_snapshot=(contract_value, contract_payload),
+            _aggregate_script_bytes=aggregate_payload,
+        )
+    except Exception as exc:
+        raise InventoryHelperError(
+            "aggregate inventory execution failed closed"
+        ) from exc
+    if not isinstance(value, dict):
+        raise InventoryHelperError("aggregate inventory result is invalid")
+    return value
+
+
+def _aggregate_payload_execute() -> int:
+    try:
+        inventory = _verified_aggregate_inventory()
+    except InventoryHelperError:
+        print("critical aggregate inventory blocked by a safety check", file=sys.stderr)
+        return 2
+    sys.stdout.buffer.write(_canonical(inventory))
+    return 0
+
+
 def aggregate_argv() -> list[str]:
-    return [
-        str(PYTHON),
-        "-B",
-        str(AGGREGATE_SCANNER_SNAPSHOT),
-        "--contract",
-        str(CONTRACT_SNAPSHOT),
-        "--max-exclusion-samples",
-        "0",
-        "--expected-script-sha256",
-        AUTHORIZED_AGGREGATE_SCANNER_SHA256,
-        "--expected-contract-sha256",
-        CONTRACT_SHA256,
-        "--verified-payload-bootstrap",
-        AGGREGATE_EXECUTION_MODE,
-    ]
+    return [str(HELPER), _request_json("aggregate")]
 
 
 def _request_json(operation: str) -> str:
-    if operation not in {"start", "status", "result", "execute"}:
+    if operation not in {"start", "status", "result", "execute", "aggregate"}:
         raise InventoryHelperError("inventory helper operation is invalid")
     return json.dumps(
         {
@@ -1062,7 +1153,7 @@ def _parse_request(raw: str) -> str:
             "contract_sha256",
         }
         or value.get("schema_version") != SCHEMA_VERSION
-        or value.get("operation") not in {"start", "status", "result", "execute"}
+        or value.get("operation") not in {"start", "status", "result", "execute", "aggregate"}
     ):
         raise InventoryHelperError("inventory helper request is invalid")
     _apply_binding(
@@ -1089,6 +1180,8 @@ def main(argv: list[str] | None = None) -> int:
     if operation == "result":
         print(json.dumps(_result(), sort_keys=True, separators=(",", ":")))
         return 0
+    if operation == "aggregate":
+        return _aggregate_payload_execute()
     return _execute()
 
 
