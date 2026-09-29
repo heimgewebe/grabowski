@@ -236,6 +236,7 @@ def _task_checkout_presence(
     *,
     reconciler: Any,
     reconciliation_payload: dict[str, Any],
+    database_snapshot: dict[str, Any] | None = None,
 ) -> tuple[dict[str, list[str]], bool]:
     source_snapshot = reconciliation_payload.get("source_snapshot")
     expected_database_sha256 = (
@@ -246,7 +247,11 @@ def _task_checkout_presence(
     if not isinstance(expected_database_sha256, str):
         raise RuntimeError("checkout reconciliation database snapshot is missing")
 
-    database_before = reconciler.collect_lifecycle_bindings_from_db()
+    database_before = (
+        reconciler.collect_lifecycle_bindings_from_db()
+        if database_snapshot is None
+        else database_snapshot
+    )
     if database_before.get("snapshot_sha256") != expected_database_sha256:
         raise RuntimeError(
             "checkout lifecycle database changed during current_work observation"
@@ -351,10 +356,12 @@ def _task_checkout_presence(
 
 def _reconciliation_payload(repositories: list[str]) -> dict[str, Any]:
     reconciler = _module("grabowski_checkout_binding_reconciler")
+    database_snapshot = reconciler.collect_lifecycle_bindings_from_db()
     payload = reconciler.reconcile_checkout_bindings(
         repository_filters=repositories,
         limit=reconciler.MAX_PAGE_LIMIT,
         git_timeout_seconds=CURRENT_WORK_GIT_TIMEOUT_SECONDS,
+        _database_snapshot=database_snapshot,
     )
     (
         task_checkout_presence,
@@ -363,6 +370,7 @@ def _reconciliation_payload(repositories: list[str]) -> dict[str, Any]:
         repositories,
         reconciler=reconciler,
         reconciliation_payload=payload,
+        database_snapshot=database_snapshot,
     )
     return {
         **payload,
