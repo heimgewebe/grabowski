@@ -96,7 +96,10 @@ _SYNC_TOOL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=SYNC_TOOL_EXECUTOR_MAX_WORKERS,
     thread_name_prefix="grabowski-sync-tool",
 )
-_SYNC_TOOL_STATUS_LOCK = threading.Lock()
+_SYNC_TOOL_STATUS_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="grabowski-status-tool",
+)
 SYNC_TOOL_ALLOCATOR_TRIM_FREE_BYTES = 128 * 1024 * 1024
 SYNC_TOOL_ALLOCATOR_TRIM_MIN_INTERVAL_SECONDS = 30.0
 _SYNC_TOOL_ALLOCATOR_TRIM_LOCK = threading.Lock()
@@ -2217,18 +2220,44 @@ def _maybe_trim_sync_tool_allocator() -> bool:
         _SYNC_TOOL_ALLOCATOR_TRIM_LOCK.release()
 
 
+def _sync_tool_executor(tool_name: Any) -> concurrent.futures.ThreadPoolExecutor:
+    if tool_name == "grabowski_status":
+        # Keep cold audit-chain serialization out of the shared sync-tool pool:
+        # queued status waiters must not occupy workers needed by unrelated tools.
+        return _SYNC_TOOL_STATUS_EXECUTOR
+    return _SYNC_TOOL_EXECUTOR
+
+
+def _trim_sync_tool_allocator_after_completion(_completed: Any) -> None:
+    _maybe_trim_sync_tool_allocator()
+
+
+def _submit_sync_tool_call(
+    call_runner: Any,
+    original: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *extra_args: Any,
+    tool_name: Any,
+    trim_on_completion: bool = False,
+) -> concurrent.futures.Future[Any]:
+    worker_future = _sync_tool_executor(tool_name).submit(
+        call_runner,
+        original,
+        args,
+        kwargs,
+        *extra_args,
+    )
+    if trim_on_completion:
+        worker_future.add_done_callback(_trim_sync_tool_allocator_after_completion)
+    return worker_future
+
+
 def _run_sync_tool_call(
     original: Any,
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> Any:
-    tool_name = args[0] if args and isinstance(args[0], str) else kwargs.get("name")
-    if tool_name == "grabowski_status":
-        # The status path verifies the audit chain. On a cold segment cache,
-        # concurrent status calls otherwise duplicate the same immutable-chain
-        # materialization in several long-lived allocator arenas.
-        with _SYNC_TOOL_STATUS_LOCK:
-            return asyncio.run(original(*args, **kwargs))
     return asyncio.run(original(*args, **kwargs))
 
 
@@ -2389,11 +2418,13 @@ def _install_deployment_admission_gate() -> None:
             ):
                 if tool is not None and getattr(tool, "is_async", True) is False:
                     loop = asyncio.get_running_loop()
-                    worker_future = _SYNC_TOOL_EXECUTOR.submit(
+                    worker_future = _submit_sync_tool_call(
                         _run_sync_tool_call,
                         original,
                         args,
                         kwargs,
+                        tool_name=tool_name,
+                        trim_on_completion=True,
                     )
                     return await asyncio.wrap_future(worker_future, loop=loop)
                 return await original(*args, **kwargs)
@@ -2411,11 +2442,13 @@ def _install_deployment_admission_gate() -> None:
             ):
                 if tool is not None and getattr(tool, "is_async", True) is False:
                     loop = asyncio.get_running_loop()
-                    worker_future = _SYNC_TOOL_EXECUTOR.submit(
+                    worker_future = _submit_sync_tool_call(
                         _run_sync_tool_call,
                         original,
                         args,
                         kwargs,
+                        tool_name=tool_name,
+                        trim_on_completion=True,
                     )
                     return await asyncio.wrap_future(worker_future, loop=loop)
                 return await original(*args, **kwargs)
@@ -2597,12 +2630,13 @@ def _install_deployment_admission_gate() -> None:
                     else:
                         call_runner = _run_sync_tool_call
                         call_extra_args = ()
-                    worker_future = _SYNC_TOOL_EXECUTOR.submit(
+                    worker_future = _submit_sync_tool_call(
                         call_runner,
                         original,
                         args,
                         kwargs,
                         *call_extra_args,
+                        tool_name=tool_name,
                     )
                 except BaseException as error:
                     # Submit never accepted work: no domain effect started. A

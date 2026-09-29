@@ -444,7 +444,7 @@ class DeploymentAdmissionGateTests(unittest.TestCase):
         self.assertEqual([0], observed_active_calls)
         self.assertEqual(0, operator._deployment_admission_active_tool_calls())
 
-    def test_gate_concurrent_sync_status_calls_serialize_domain_work(self) -> None:
+    def test_gate_concurrent_sync_status_calls_use_single_worker_status_lane(self) -> None:
         operator = _load_operator_module()
         state_lock = threading.Lock()
         active = 0
@@ -484,6 +484,62 @@ class DeploymentAdmissionGateTests(unittest.TestCase):
 
         self.assertEqual([{"called": True}] * 3, results)
         self.assertEqual(1, peak_active)
+        self.assertEqual(0, operator._deployment_admission_active_tool_calls())
+
+    def test_gate_status_backlog_does_not_starve_regular_sync_tool(self) -> None:
+        operator = _load_operator_module()
+        status_started = threading.Event()
+        status_release = threading.Event()
+        regular_ran = threading.Event()
+        shared_executor = ThreadPoolExecutor(max_workers=1)
+        status_executor = ThreadPoolExecutor(max_workers=1)
+
+        async def call_tool(name, _arguments, *args, **kwargs):
+            if name == "grabowski_status":
+                status_started.set()
+                if not status_release.wait(timeout=5):
+                    raise RuntimeError("status release timed out")
+                return {"called": True, "name": name}
+            regular_ran.set()
+            return {"called": True, "name": name}
+
+        operator.mcp._tool_manager.call_tool = call_tool
+        operator.mcp._tool_manager.get_tool = lambda _name: _sync_tool()
+        operator._SYNC_TOOL_EXECUTOR = shared_executor
+        operator._SYNC_TOOL_STATUS_EXECUTOR = status_executor
+        with patch.object(
+            operator, "_maybe_trim_sync_tool_allocator", return_value=False
+        ):
+            operator._configure_http_runtime()
+
+            async def exercise() -> None:
+                statuses = [
+                    asyncio.create_task(
+                        operator.mcp._tool_manager.call_tool(
+                            "grabowski_status", {"view": "minimal"}
+                        )
+                    )
+                    for _ in range(8)
+                ]
+                started = await asyncio.to_thread(status_started.wait, 2)
+                self.assertTrue(started)
+                regular = await asyncio.wait_for(
+                    operator.mcp._tool_manager.call_tool("read", {}),
+                    timeout=1,
+                )
+                self.assertEqual({"called": True, "name": "read"}, regular)
+                self.assertTrue(regular_ran.is_set())
+                status_release.set()
+                results = await asyncio.gather(*statuses)
+                self.assertEqual(8, len(results))
+
+            try:
+                asyncio.run(exercise())
+            finally:
+                status_release.set()
+                shared_executor.shutdown(wait=True, cancel_futures=True)
+                status_executor.shutdown(wait=True, cancel_futures=True)
+
         self.assertEqual(0, operator._deployment_admission_active_tool_calls())
 
     def test_gate_sync_repoground_consultation_logs_only_tool_name(self) -> None:
@@ -1048,6 +1104,36 @@ class DeploymentAdmissionGateTests(unittest.TestCase):
         )
         self.assertEqual(0, operator._deployment_admission_active_tool_calls())
 
+    def test_gate_sync_readiness_bypass_trims_after_worker_completion(self) -> None:
+        operator = _load_operator_module()
+        marker = {"state": "active", "active": True, "valid": True}
+        trimmed = threading.Event()
+
+        async def original(name, arguments, *args, **kwargs):
+            self.assertEqual("grabowski_status", name)
+            self.assertEqual({"view": "minimal"}, arguments)
+            return {"called": True}
+
+        operator.mcp._tool_manager.call_tool = original
+        operator.mcp._tool_manager.get_tool = lambda _name: _sync_tool()
+        with patch.object(
+            operator, "_read_deployment_admission_marker", return_value=marker
+        ), patch.object(
+            operator,
+            "_maybe_trim_sync_tool_allocator",
+            side_effect=lambda: trimmed.set() or False,
+        ):
+            operator._configure_http_runtime()
+            result = asyncio.run(
+                operator.mcp._tool_manager.call_tool(
+                    "grabowski_status", {"view": "minimal"}
+                )
+            )
+
+        self.assertTrue(result["called"])
+        self.assertTrue(trimmed.wait(timeout=1))
+        self.assertEqual(0, operator._deployment_admission_active_tool_calls())
+
     def test_gate_marker_bound_observer_call_is_drain_neutral(self) -> None:
         operator = _load_operator_module()
         marker = {
@@ -1074,6 +1160,40 @@ class DeploymentAdmissionGateTests(unittest.TestCase):
             )
             self.assertTrue(result["called"])
             self.assertEqual(0, operator._deployment_admission_active_tool_calls())
+
+    def test_gate_sync_observer_bypass_trims_after_worker_completion(self) -> None:
+        operator = _load_operator_module()
+        marker = {
+            "kind": "grabowski_deployment_admission_observation",
+            "state": "active",
+            "active": True,
+            "valid": True,
+        }
+        trimmed = threading.Event()
+        operator.mcp._tool_manager.get_tool = lambda _name: _sync_tool()
+        with patch.object(
+            operator,
+            "_read_deployment_admission_marker",
+            return_value=marker,
+        ), patch.object(
+            operator,
+            "_deployment_observer_request_evidence",
+            return_value={"marker_bound": True},
+        ), patch.object(
+            operator,
+            "_maybe_trim_sync_tool_allocator",
+            side_effect=lambda: trimmed.set() or False,
+        ):
+            operator._configure_http_runtime()
+            result = asyncio.run(
+                operator.mcp._tool_manager.call_tool(
+                    operator.deployment_observer.OPERATION, {}
+                )
+            )
+
+        self.assertTrue(result["called"])
+        self.assertTrue(trimmed.wait(timeout=1))
+        self.assertEqual(0, operator._deployment_admission_active_tool_calls())
 
     def test_gate_snapshot_never_exposes_tool_arguments(self) -> None:
         operator = _load_operator_module()
