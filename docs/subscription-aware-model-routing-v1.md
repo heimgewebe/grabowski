@@ -36,7 +36,7 @@ The user-facing phrase “Claude Plus” is normalized to the server-reported pr
 
 The live harness probes supersede stale catalog generations:
 
-- Claude alias `opus` resolves to Claude Opus 5.
+- Claude alias `opus` resolves to Claude Opus 5.5.
 - Claude alias `sonnet` resolves to Claude Sonnet 5.
 - Fable 5 returns `usage-credits-required`; it is not part of the Claude Pro baseline.
 - Antigravity exposes Gemini 3.1 Pro and Gemini 3.6 Flash.
