@@ -152,14 +152,20 @@ def _task_payload(
     }
 
 
-def _attention_payload(view: str) -> dict[str, Any]:
+def _attention_payload(
+    view: str,
+    *,
+    current_work_task_ids: set[str] | None = None,
+) -> dict[str, Any]:
     task_attention = _module("grabowski_task_attention")
     parameters = {"limit": task_attention.MAX_PAGE_LIMIT, "view": view}
     if view == "current":
-        return task_attention.reconcile_attention(
-            parameters,
-            _bounded_current_projection=True,
-        )
+        kwargs: dict[str, Any] = {"_bounded_current_projection": True}
+        if current_work_task_ids is not None:
+            kwargs["_current_work_task_ids"] = current_work_task_ids
+        return task_attention.reconcile_attention(parameters, **kwargs)
+    if current_work_task_ids is not None:
+        raise ValueError("current_work task ids are only valid for current view")
     return task_attention.reconcile_attention(parameters)
 
 
@@ -329,6 +335,53 @@ def _reconciliation_payload(repositories: list[str]) -> dict[str, Any]:
     }
 
 
+def _current_work_attention_task_ids(
+    tasks_payload: dict[str, Any],
+    resources_payload: dict[str, Any],
+    reconciliation_payload: dict[str, Any],
+    *,
+    lease_task_ids: list[str],
+    lease_task_ids_truncated: bool,
+) -> set[str] | None:
+    task_pagination = tasks_payload.get("pagination")
+    task_rows = tasks_payload.get("tasks")
+    leases = resources_payload.get("leases")
+    resource_count = resources_payload.get("count")
+    if (
+        not isinstance(task_pagination, dict)
+        or task_pagination.get("has_more") is not False
+        or not isinstance(task_rows, list)
+        or lease_task_ids_truncated
+        or resources_payload.get("truncated") is not False
+        or not isinstance(leases, list)
+        or isinstance(resource_count, bool)
+        or not isinstance(resource_count, int)
+        or resource_count != len(leases)
+        or reconciliation_payload.get("task_checkout_presence_complete") is not True
+    ):
+        return None
+
+    task_checkout_presence = reconciliation_payload.get(
+        "task_checkout_presence", {}
+    )
+    if not isinstance(task_checkout_presence, dict):
+        return None
+
+    task_ids = set(lease_task_ids)
+    for item in task_rows:
+        if not isinstance(item, dict):
+            return None
+        task_id = item.get("task_id")
+        if not isinstance(task_id, str):
+            return None
+        task_ids.add(task_id)
+    for task_id in task_checkout_presence:
+        if not isinstance(task_id, str):
+            return None
+        task_ids.add(task_id)
+    return task_ids
+
+
 def _tmux_payload() -> dict[str, Any]:
     return _operator().grabowski_tmux_list()
 
@@ -453,21 +506,10 @@ def grabowski_current_work(
             {"tasks": [], "pagination": {"has_more": True}},
         )
 
-        # Attention derives from the same task store. Preserve the historical
-        # tasks -> attention ordering so an older attention generation cannot
-        # be joined onto a newer task snapshot.
-        attention_result = _collect_independent_source(
-            "attention",
-            "durable_job",
-            lambda _errors: _attention_payload(view),
-            {"records": [], "pagination": {"has_more": True}},
-        )
-
         # Checkout inventory and binding reconciliation share checkout-binding
         # storage. Keep that pair ordered while still overlapping it with the
         # other independent read surfaces.
         independent_results = {
-            "attention": attention_result,
             "checkouts": futures["checkouts"].result(),
         }
         reconciliation_future = executor.submit(
@@ -487,6 +529,39 @@ def grabowski_current_work(
             independent_results[source] = future.result()
         independent_results["checkout_binding_reconciliation"] = (
             reconciliation_future.result()
+        )
+
+        reconciliation_payload_for_attention = independent_results[
+            "checkout_binding_reconciliation"
+        ][0]
+        current_work_task_ids = (
+            _current_work_attention_task_ids(
+                tasks_payload,
+                resources_payload,
+                reconciliation_payload_for_attention,
+                lease_task_ids=lease_task_ids,
+                lease_task_ids_truncated=lease_task_ids_truncated,
+            )
+            if view == "current"
+            else None
+        )
+        # Attention is collected last so orphan suppression is bound to the same
+        # complete task/lease/exact-checkout presence evidence used by current_work.
+        attention_loader = (
+            (lambda _errors: _attention_payload(view))
+            if current_work_task_ids is None
+            else (
+                lambda _errors: _attention_payload(
+                    view,
+                    current_work_task_ids=current_work_task_ids,
+                )
+            )
+        )
+        independent_results["attention"] = _collect_independent_source(
+            "attention",
+            "durable_job",
+            attention_loader,
+            {"records": [], "pagination": {"has_more": True}},
         )
 
     independent_payloads: dict[str, Any] = {}

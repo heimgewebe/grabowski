@@ -2666,6 +2666,136 @@ class TaskAttentionTests(unittest.TestCase):
             successor_id, {item["task_id"] for item in bounded_page["records"]}
         )
 
+    def test_current_work_attention_refills_past_orphan_hygiene_for_late_blocker(
+        self,
+    ) -> None:
+        blocker = self._failed_task()
+        (self.outcomes / f"{blocker['task_id']}.json").unlink()
+        orphan = self._failed_task()
+        with tasks._database() as connection:
+            connection.execute(
+                "UPDATE tasks SET created_at_unix=? WHERE task_id=?",
+                (200, orphan["task_id"]),
+            )
+            connection.execute(
+                "UPDATE tasks SET created_at_unix=? WHERE task_id=?",
+                (100, blocker["task_id"]),
+            )
+
+        with patch.object(attention, "MAX_PAGE_LIMIT", 1):
+            page = attention.reconcile_attention(
+                {"limit": 1, "view": "current"},
+                _bounded_current_projection=True,
+                _current_work_task_ids=set(),
+            )
+
+        self.assertEqual(
+            [blocker["task_id"]],
+            [item["task_id"] for item in page["records"]],
+        )
+        self.assertEqual("invalid_evidence", page["records"][0]["classification"])
+        self.assertEqual(
+            1,
+            page["filtered_classification_counts"][
+                "unbound_historical_attention"
+            ],
+        )
+        self.assertTrue(page["current_work_orphan_filter_safe"])
+
+    def test_current_work_attention_preserves_bound_terminal_actionable_task(
+        self,
+    ) -> None:
+        preserved = self._failed_task()
+        orphan = self._failed_task()
+        with tasks._database() as connection:
+            connection.execute(
+                "UPDATE tasks SET created_at_unix=? WHERE task_id=?",
+                (200, orphan["task_id"]),
+            )
+            connection.execute(
+                "UPDATE tasks SET created_at_unix=? WHERE task_id=?",
+                (100, preserved["task_id"]),
+            )
+
+        with patch.object(attention, "MAX_PAGE_LIMIT", 1):
+            page = attention.reconcile_attention(
+                {"limit": 1, "view": "current"},
+                _bounded_current_projection=True,
+                _current_work_task_ids={str(preserved["task_id"])},
+            )
+
+        self.assertEqual(
+            [preserved["task_id"]],
+            [item["task_id"] for item in page["records"]],
+        )
+        self.assertEqual("actionable", page["records"][0]["classification"])
+        self.assertTrue(page["current_work_orphan_filter_safe"])
+
+    def test_current_work_attention_direct_scan_skips_retry_graph(
+        self,
+    ) -> None:
+        record = self._failed_task()
+
+        with patch.object(
+            attention,
+            "_bounded_current_retry_convergence",
+            side_effect=AssertionError("retry graph should not run"),
+        ):
+            page = attention.reconcile_attention(
+                {"limit": 1, "view": "current"},
+                _bounded_current_projection=True,
+                _current_work_task_ids=set(),
+            )
+
+        self.assertEqual([], page["records"])
+        self.assertEqual(
+            1,
+            page["filtered_classification_counts"][
+                "unbound_historical_attention"
+            ],
+        )
+        self.assertEqual(
+            "current_work_direct_not_evaluated",
+            page["attention_convergence_status"],
+        )
+        self.assertTrue(page["current_work_orphan_filter_safe"])
+        self.assertEqual(record["task_id"], str(record["task_id"]))
+
+    def test_current_work_attention_keeps_retry_bound_actionable_visible(
+        self,
+    ) -> None:
+        source, successor = self._verified_retry_pair(successor_state="failed")
+
+        page = attention.reconcile_attention(
+            {"limit": 20, "view": "current"},
+            _bounded_current_projection=True,
+            _current_work_task_ids=set(),
+        )
+
+        returned = {item["task_id"] for item in page["records"]}
+        self.assertNotIn(source["task_id"], returned)
+        self.assertIn(successor["task_id"], returned)
+        self.assertTrue(page["current_work_orphan_filter_safe"])
+
+    def test_current_work_attention_filter_fails_visible_above_scan_bound(
+        self,
+    ) -> None:
+        record = self._failed_task()
+
+        with patch.object(attention, "MAX_CURRENT_CONVERGENCE_ROWS", 0):
+            page = attention.reconcile_attention(
+                {"limit": 1, "view": "current"},
+                _bounded_current_projection=True,
+                _current_work_task_ids=set(),
+            )
+
+        self.assertEqual(
+            [record["task_id"]],
+            [item["task_id"] for item in page["records"]],
+        )
+        self.assertEqual("actionable", page["records"][0]["classification"])
+        self.assertFalse(page["current_work_orphan_filter_safe"])
+
     def test_bounded_current_reconciliation_does_not_use_global_projection(
         self,
     ) -> None:

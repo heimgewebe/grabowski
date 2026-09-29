@@ -1826,6 +1826,7 @@ def _finalize_groups(
     source_errors: list[dict[str, Any]],
     task_checkout_presence: dict[str, list[str]],
     task_checkout_presence_complete: bool,
+    attention_current_work_filter_safe: bool,
 ) -> list[dict[str, Any]]:
     projected: list[dict[str, Any]] = []
     source_error_sources = {
@@ -1947,25 +1948,28 @@ def _finalize_groups(
                 if "managed-active-retention-expired" not in group["action_reasons"]:
                     group["action_reasons"].append("managed-active-retention-expired")
 
-        current_absence_sources = {
+        current_binding_absence_sources = {
             "tasks",
             "resources",
-            "tmux",
-            "processes",
+            "checkout_binding_reconciliation",
         }
-        current_absence_proven = (
+        current_binding_absence_proven = (
             task_checkout_presence_complete
             and not task_checkout_keys
             and not source_truncation.get("source_errors", False)
-            and not any(
-                source_truncation.get(source, False)
-                for source in current_absence_sources
-            )
-            and not (current_absence_sources & source_error_sources)
+            and not source_truncation.get("tasks", False)
+            and not source_truncation.get("resources", False)
+            and not (current_binding_absence_sources & source_error_sources)
         )
-        attention_only_task = (
+        attention_page_safe_to_suppress = bool(
+            not source_truncation.get("attention", False)
+            or attention_current_work_filter_safe
+        )
+        attention_only_hygiene = (
             group["binding"]["kind"] == "task"
             and task_item is None
+            and group["projection_state"] == "hygiene"
+            and "attention-actionable" in group["action_reasons"]
             and bool(group["authority_refs"])
             and all(
                 ref.get("source") == "task-attention-decision-evidence"
@@ -1975,9 +1979,10 @@ def _finalize_groups(
         )
         if (
             view == "current"
-            and attention_only_task
+            and attention_only_hygiene
             and not has_live_surface
-            and current_absence_proven
+            and current_binding_absence_proven
+            and attention_page_safe_to_suppress
         ):
             continue
 
@@ -2302,6 +2307,14 @@ def build_current_work_projection(
 
     task_rows = _records(tasks_payload, "tasks", MAX_TASKS, "tasks")
     attention_rows = _attention_records(attention_payload)
+    attention_current_work_filter_safe = _boolean(
+        (
+            attention_payload.get("current_work_orphan_filter_safe", False)
+            if attention_payload
+            else False
+        ),
+        "attention.current_work_orphan_filter_safe",
+    )
     lease_rows = _records(resources_payload, "leases", MAX_LEASES, "resources")
     browser_rows = _records(browser_payload, "workers", MAX_WORKERS, "browser")
     gui_rows = _records(gui_payload, "workers", MAX_WORKERS, "gui")
@@ -2393,6 +2406,7 @@ def build_current_work_projection(
         source_errors=errors,
         task_checkout_presence=task_checkout_presence,
         task_checkout_presence_complete=task_checkout_presence_complete,
+        attention_current_work_filter_safe=attention_current_work_filter_safe,
     )
 
     _annotate_groups(

@@ -3486,6 +3486,7 @@ def reconcile_attention(
     parameters: dict[str, Any] | None = None,
     *,
     _bounded_current_projection: bool = False,
+    _current_work_task_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     parameters = _validate_exact_keys(
         dict(parameters or {}),
@@ -3503,6 +3504,26 @@ def reconcile_attention(
         raise TaskAttentionInputError(
             "bounded current projection requires current view"
         )
+    current_work_task_ids: set[str] | None = None
+    if _current_work_task_ids is not None:
+        if not _bounded_current_projection or view != "current":
+            raise TaskAttentionInputError(
+                "current_work task preservation requires bounded current view"
+            )
+        if (
+            not isinstance(_current_work_task_ids, set)
+            or len(_current_work_task_ids) > MAX_CURRENT_CONVERGENCE_ROWS
+        ):
+            raise TaskAttentionInputError(
+                "current_work task ids must be a bounded set"
+            )
+        current_work_task_ids = set()
+        for task_id in _current_work_task_ids:
+            if not isinstance(task_id, str) or tasks.TASK_ID.fullmatch(task_id) is None:
+                raise TaskAttentionInputError(
+                    "current_work task ids must contain canonical task ids"
+                )
+            current_work_task_ids.add(task_id)
     cursor = parameters.get("cursor")
     if cursor is not None and not isinstance(cursor, str):
         raise TaskAttentionInputError("cursor must be a string when provided")
@@ -3556,6 +3577,8 @@ def reconcile_attention(
         classification: 0
         for classification in sorted(CURRENT_ATTENTION_EXCLUDED_CLASSIFICATIONS)
     }
+    if current_work_task_ids is not None:
+        filtered_counts["unbound_historical_attention"] = 0
     convergence_status = "not_applicable"
     convergence_error: str | None = None
     convergence_counts = {
@@ -3590,6 +3613,16 @@ def reconcile_attention(
                 ATTENTION_STATES,
             ).fetchone()[0]
         )
+        current_work_direct_scan_mode = bool(
+            current_work_task_ids is not None
+            and raw_total_attention <= MAX_CURRENT_CONVERGENCE_ROWS
+        )
+        current_work_orphan_filter_safe = current_work_direct_scan_mode
+        current_scan_limit = (
+            MAX_CURRENT_CONVERGENCE_ROWS
+            if current_work_direct_scan_mode
+            else MAX_CURRENT_SCAN_ROWS
+        )
         if view == "history":
             rows = fetch_rows(
                 connection,
@@ -3612,7 +3645,9 @@ def reconcile_attention(
                 )
         else:
             snapshot_status = str(decision_snapshot.get("status") or "degraded")
-            if _bounded_current_projection:
+            if current_work_direct_scan_mode:
+                convergence_status = "current_work_direct_not_evaluated"
+            elif _bounded_current_projection:
                 convergence_status = "bounded_not_evaluated"
             elif raw_total_attention > MAX_CURRENT_CONVERGENCE_ROWS:
                 convergence_status = "degraded"
@@ -3742,16 +3777,39 @@ def reconcile_attention(
                             target_filtered_counts.get("already_decided", 0) + 1
                         )
                     return
+                if (
+                    current_work_orphan_filter_safe
+                    and classification == "actionable"
+                    and raw["state"] in TERMINAL_ATTENTION_STATES
+                    and current_work_task_ids is not None
+                    and task_id_value not in current_work_task_ids
+                ):
+                    try:
+                        retry_binding = terminal_convergence.persisted_retry_binding(
+                            raw
+                        )
+                    except terminal_convergence.TerminalConvergenceError:
+                        retry_binding = {"uncertain": True}
+                    if retry_binding is None:
+                        target_filtered_counts[
+                            "unbound_historical_attention"
+                        ] = (
+                            target_filtered_counts.get(
+                                "unbound_historical_attention", 0
+                            )
+                            + 1
+                        )
+                        return
                 target_visible.append((raw, classified))
 
             while (
                 len(visible) <= limit
                 and not source_exhausted
-                and scanned_raw < MAX_CURRENT_SCAN_ROWS
+                and scanned_raw < current_scan_limit
             ):
                 batch_limit = min(
                     MAX_PAGE_LIMIT,
-                    MAX_CURRENT_SCAN_ROWS - scanned_raw,
+                    current_scan_limit - scanned_raw,
                 )
                 rows = fetch_rows(
                     connection,
@@ -3766,7 +3824,7 @@ def reconcile_attention(
                 batch_convergence_excluded_task_ids = (
                     convergence_excluded_task_ids
                 )
-                if _bounded_current_projection:
+                if _bounded_current_projection and not current_work_direct_scan_mode:
                     batch_candidate_ids = {str(row["task_id"]) for row in rows}
                     try:
                         local_convergence = _bounded_current_retry_convergence(
@@ -3775,6 +3833,7 @@ def reconcile_attention(
                         )
                     except terminal_convergence.TerminalConvergenceError as exc:
                         convergence_status = "degraded"
+                        current_work_orphan_filter_safe = False
                         if convergence_error is None:
                             convergence_error = type(exc).__name__
                         # Malformed retry evidence cannot be attributed safely to
@@ -3788,6 +3847,7 @@ def reconcile_attention(
                         OSError,
                     ) as exc:
                         convergence_status = "degraded"
+                        current_work_orphan_filter_safe = False
                         if convergence_error is None:
                             convergence_error = (
                                 str(exc) or type(exc).__name__
@@ -3867,6 +3927,8 @@ def reconcile_attention(
                         CURRENT_ATTENTION_EXCLUDED_CLASSIFICATIONS
                     )
                 }
+                if current_work_task_ids is not None:
+                    filtered_counts["unbound_historical_attention"] = 0
                 visible = []
                 for raw in bounded_scanned_rows:
                     _append_current_visible(raw, visible, filtered_counts)
@@ -3877,13 +3939,14 @@ def reconcile_attention(
                 )
             if (
                 _bounded_current_projection
+                and not current_work_direct_scan_mode
                 and convergence_status != "degraded"
                 and convergence_error is None
             ):
                 convergence_status = "verified_bounded"
 
             scan_budget_exhausted = False
-            if scanned_raw >= MAX_CURRENT_SCAN_ROWS and not source_exhausted:
+            if scanned_raw >= current_scan_limit and not source_exhausted:
                 scan_budget_exhausted = bool(
                     fetch_rows(
                         connection,
@@ -3939,6 +4002,11 @@ def reconcile_attention(
         "excluded_attention_count": excluded_attention_count,
         "current_attention_excluded_classifications": sorted(
             CURRENT_ATTENTION_EXCLUDED_CLASSIFICATIONS
+        ),
+        "current_work_orphan_filter_safe": bool(
+            view == "current"
+            and current_work_task_ids is not None
+            and current_work_orphan_filter_safe
         ),
         "filtered_classification_counts": filtered_counts,
         "filtered_classification_counts_scope": "scanned_raw_window",

@@ -118,6 +118,10 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
         )
         with patch.object(surface, "_module", return_value=fake_attention):
             surface._attention_payload("current")
+            surface._attention_payload(
+                "current",
+                current_work_task_ids={"abc123"},
+            )
             surface._attention_payload("history")
 
         self.assertEqual(
@@ -128,8 +132,73 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
             calls[0],
         )
         self.assertEqual(
-            ({"limit": 100, "view": "history"}, {}),
+            (
+                {"limit": 100, "view": "current"},
+                {
+                    "_bounded_current_projection": True,
+                    "_current_work_task_ids": {"abc123"},
+                },
+            ),
             calls[1],
+        )
+        self.assertEqual(
+            ({"limit": 100, "view": "history"}, {}),
+            calls[2],
+        )
+
+    def test_current_work_attention_task_ids_require_complete_binding_sources(
+        self,
+    ) -> None:
+        tasks_payload = task_payload()
+        resources_payload = {
+            "leases": [
+                {
+                    "owner_id": "task:lease-task",
+                    "resource_key": "path:/tmp/lease-task",
+                }
+            ],
+            "count": 1,
+            "truncated": False,
+        }
+        reconciliation_payload = {
+            "task_checkout_presence": {
+                "checkout-task": ["checkout-key"],
+            },
+            "task_checkout_presence_complete": True,
+        }
+
+        task_ids = surface._current_work_attention_task_ids(
+            tasks_payload,
+            resources_payload,
+            reconciliation_payload,
+            lease_task_ids=["lease-task"],
+            lease_task_ids_truncated=False,
+        )
+
+        self.assertEqual(
+            task_ids,
+            {"abc123", "lease-task", "checkout-task"},
+        )
+        self.assertIsNone(
+            surface._current_work_attention_task_ids(
+                tasks_payload,
+                {**resources_payload, "truncated": True},
+                reconciliation_payload,
+                lease_task_ids=["lease-task"],
+                lease_task_ids_truncated=False,
+            )
+        )
+        self.assertIsNone(
+            surface._current_work_attention_task_ids(
+                tasks_payload,
+                resources_payload,
+                {
+                    "task_checkout_presence": {},
+                    "task_checkout_presence_complete": False,
+                },
+                lease_task_ids=["lease-task"],
+                lease_task_ids_truncated=False,
+            )
         )
 
     def test_current_work_caps_parallel_source_workers(self) -> None:

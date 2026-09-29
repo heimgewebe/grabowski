@@ -1939,7 +1939,6 @@ class CurrentWorkProjectionTests(unittest.TestCase):
                 "records": [attention(task_id, "actionable", state="interrupted")],
                 "pagination": {"has_more": False},
             },
-            view="history",
         )
         group = result["work"][0]
         self.assertEqual(group["projection_state"], "resumable")
@@ -1954,11 +1953,52 @@ class CurrentWorkProjectionTests(unittest.TestCase):
                 "records": [attention(task_id, "outcome_unknown", state="failed")],
                 "pagination": {"has_more": False},
             },
-            view="history",
         )
         group = result["work"][0]
         self.assertEqual(group["projection_state"], "blocking")
         self.assertIn("attention-outcome_unknown", group["action_reasons"])
+
+    def test_attention_only_invalid_evidence_stays_blocking_in_current(self) -> None:
+        task_id = "attention-invalid-orphan"
+        result = project(
+            attention_payload={
+                "records": [attention(task_id, "invalid_evidence", state="failed")],
+                "pagination": {"has_more": False},
+            },
+        )
+
+        self.assertEqual(result["total_projected"], 1)
+        group = result["work"][0]
+        self.assertEqual(group["work_id"], f"task:{task_id}")
+        self.assertEqual(group["projection_state"], "blocking")
+        self.assertIn("attention-invalid_evidence", group["action_reasons"])
+
+    def test_truncated_attention_page_fails_visible_without_refill_proof(self) -> None:
+        task_id = "attention-page-incomplete"
+        result = project(
+            attention_payload={
+                "records": [attention(task_id, "actionable", state="failed")],
+                "pagination": {"has_more": True},
+            },
+        )
+
+        self.assertEqual(result["total_projected"], 1)
+        self.assertTrue(result["source_truncation"]["attention"])
+        group = result["work"][0]
+        self.assertEqual(group["work_id"], f"task:{task_id}")
+        self.assertEqual(group["projection_state"], "hygiene")
+
+    def test_refill_safe_attention_page_can_hide_orphaned_hygiene(self) -> None:
+        task_id = "attention-refill-safe"
+        result = project(
+            attention_payload={
+                "records": [attention(task_id, "actionable", state="failed")],
+                "pagination": {"has_more": True},
+                "current_work_orphan_filter_safe": True,
+            },
+        )
+
+        self.assertEqual(result["total_projected"], 0)
 
     def test_attention_only_task_stays_current_when_task_absence_is_unproven(self) -> None:
         task_id = "attention-task-window-incomplete"
@@ -1977,6 +2017,29 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertEqual(group["projection_state"], "hygiene")
         self.assertTrue(group["action_required"])
         self.assertEqual(group["observation"]["completeness"], "partial")
+
+    def test_attention_only_task_stays_current_when_checkout_presence_is_unproven(self) -> None:
+        task_id = "attention-checkout-window-incomplete"
+        result = project(
+            attention_payload={
+                "records": [attention(task_id, "actionable", state="failed")],
+                "pagination": {"has_more": False},
+            },
+            reconciliation_payload={
+                "bindings": [],
+                "pagination": {"has_more": True},
+                "total_count": 0,
+            },
+        )
+
+        self.assertEqual(result["total_projected"], 1)
+        self.assertTrue(
+            result["source_truncation"]["checkout_binding_reconciliation"]
+        )
+        group = result["work"][0]
+        self.assertEqual(group["work_id"], f"task:{task_id}")
+        self.assertEqual(group["projection_state"], "hygiene")
+        self.assertTrue(group["action_required"])
 
     def test_attention_only_task_with_exact_checkout_presence_stays_blocking(self) -> None:
         task_id = "attention-checkout-task"
