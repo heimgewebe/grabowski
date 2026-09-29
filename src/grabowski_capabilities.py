@@ -472,6 +472,21 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "grabowski_critical_user_data_inventory": {
+        "category": "privileged-execution",
+        "purpose": (
+            "Start or read one fixed-path SHA-pinned authoritative critical-user-data "
+            "inventory through the root-owned broker without arbitrary argv or paths."
+        ),
+        "risk_class": "high",
+        "effects": [
+            "root-read-only-home-traversal",
+            "root-read-only-docker-volume-traversal",
+            "root-systemd-task-start",
+            "root-owned-inventory-evidence-write",
+        ],
+        "reversibility": "no-user-data-mutation-root-owned-evidence-retained",
+    },
     "grabowski_power_run": {
         "category": "privileged-execution",
         "purpose": "Run one audited root command through the canonical root-owned broker.",

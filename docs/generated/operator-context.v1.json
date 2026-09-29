@@ -1091,6 +1091,22 @@
     },
     {
       "category": "privileged-execution",
+      "description": "Run or read one SHA-pinned authoritative critical-user-data inventory.",
+      "effects": [
+        "root-read-only-home-traversal",
+        "root-read-only-docker-volume-traversal",
+        "root-systemd-task-start",
+        "root-owned-inventory-evidence-write"
+      ],
+      "id": "grabowski_critical_user_data_inventory",
+      "purpose": "Start or read one fixed-path SHA-pinned authoritative critical-user-data inventory through the root-owned broker without arbitrary argv or paths.",
+      "read_only": false,
+      "reversibility": "no-user-data-mutation-root-owned-evidence-retained",
+      "risk_class": "high",
+      "tool": "grabowski_critical_user_data_inventory"
+    },
+    {
+      "category": "privileged-execution",
       "description": "Run one audited root command through the canonical root-owned broker.",
       "effects": [
         "root-command-dependent",
@@ -2933,6 +2949,7 @@
       "grabowski_ports",
       "grabowski_tailscale_status",
       "grabowski_privileged_action_reference",
+      "grabowski_critical_user_data_inventory",
       "grabowski_power_run",
       "grabowski_fleet_list",
       "grabowski_fleet_run",
@@ -3606,7 +3623,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "177efc86ed2c43354072d54b0d680f556726ec2a875f2b23af285a93f2636aa7"
+      "sha256": "e042dea331207f7be8e0b0240e1f2ba0db632b5cb6211f6f72d8aa116ebab82f"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3614,7 +3631,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "903f961d255993b8d66571935884cdf1724aef2d9236a28a71b47dbf86cfffcb"
+      "sha256": "1b6d9b6c3f80460941ab774ae72d14b627dfcf14834e4f6ad45a5d593dc14d58"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
@@ -3714,7 +3731,7 @@
       "src/grabowski_post_merge_sync_apply.py": "64588725ae973e0afbedf0066e580cc875e184a4470a3d65c32414025d30fd63",
       "src/grabowski_pr_diff.py": "cf6194a892b34f8f20ddafd3b293a76db57d73dbe6ec6e5324d2fdd39ce7f242",
       "src/grabowski_private_io.py": "6250c583bdc1614a6265123604161d3668587191b94932faf2912b03140e3d6f",
-      "src/grabowski_privileged.py": "dee9efff822ef2ec1fde16329807c6514595eb9678ff0604f0ddd17f2756c4ef",
+      "src/grabowski_privileged.py": "ed07d8574e22bd9e04153d86f61ec4aae3159513735e676c1e0b936d1669a016",
       "src/grabowski_privileged_broker.py": "d43c37ffa9fa154ae7ce53b6c3620b72cff62ecf0eabbf14f60639097f526829",
       "src/grabowski_provenance_recovery.py": "b507add38c5fdaf9ad4248f0e2cc5bf7570f1a62415a06e1bf171d44f26e0730",
       "src/grabowski_read_surface.py": "1df8cb96e2c84f52817bbb0f64832de0f66f376de37a683849d41f50e7b08e1f",

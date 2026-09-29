@@ -108,6 +108,20 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
             "allowed_peer_uid": 1000,
             "allowed_peer_unit": dual.OPERATOR_SERVICE,
         }
+        critical_user_data_inventory = {
+            "enabled": True,
+            "mode": "template",
+            "target_pattern": dual.CRITICAL_USER_DATA_INVENTORY_TARGET_PATTERN,
+            "argv": [
+                "/usr/local/libexec/grabowski-critical-user-data-inventory",
+                "{target}",
+            ],
+            "timeout_seconds": 90,
+            "kill_switch_path": "/var/lib/grabowski/operator-blockade/" + "operator-kill-switch",
+            "legacy_kill_switch_path": "/home/alex/.local/state/grabowski/" + "operator-kill-switch",
+            "allowed_peer_uid": 1000,
+            "allowed_peer_unit": dual.OPERATOR_SERVICE,
+        }
         config = {
             "schema_version": 2,
             "actions": {
@@ -116,6 +130,7 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
                 dual.ROOTBROKER_CUTOVER_ACTION: rootbroker_cutover,
                 dual.SECRET_PTY_ACTION: secret_pty,
                 dual.PLATFORM_CONNECTOR_CAPTURE_ACTION: platform_connector_capture,
+                dual.CRITICAL_USER_DATA_INVENTORY_ACTION: critical_user_data_inventory,
             },
         }
         artifact_sources = tuple(
@@ -151,6 +166,9 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
             "platform_connector_capture": __import__("hashlib").sha256(
                 blobs[Path("tools/grabowski_platform_connector_capture.py")]
             ).hexdigest(),
+            "critical_user_data_inventory": __import__("hashlib").sha256(
+                blobs[Path("tools/grabowski_critical_user_data_inventory.py")]
+            ).hexdigest(),
             "cutover_helper": __import__("hashlib").sha256(
                 blobs[Path("tools/grabowski_rootbroker_cutover.py")]
             ).hexdigest(),
@@ -179,6 +197,9 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
                 dual.SECRET_PTY_ACTION: dual._canonical_line_sha256(secret_pty),
                 dual.PLATFORM_CONNECTOR_CAPTURE_ACTION: dual._canonical_line_sha256(
                     platform_connector_capture
+                ),
+                dual.CRITICAL_USER_DATA_INVENTORY_ACTION: dual._canonical_line_sha256(
+                    critical_user_data_inventory
                 ),
             },
             "power_peer_binding": {
@@ -1498,7 +1519,6 @@ class SafetyObserverUnitTests(unittest.TestCase):
             )
             with self.subTest(name=name), self.assertRaises(core.DeployError):
                 dual._validate_observer_unit_bytes(candidate)
-
     def test_vertical_tab_before_after_directive_is_rejected(self) -> None:
         candidate = self.expected.replace(b"\nAfter=", b"\n\x0bAfter=")
         with self.assertRaises(core.DeployError):
