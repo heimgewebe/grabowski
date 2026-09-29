@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import concurrent.futures
+import ctypes
 import errno
 import faulthandler
 import fcntl
@@ -95,6 +96,30 @@ _SYNC_TOOL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=SYNC_TOOL_EXECUTOR_MAX_WORKERS,
     thread_name_prefix="grabowski-sync-tool",
 )
+_SYNC_TOOL_STATUS_LOCK = threading.Lock()
+SYNC_TOOL_ALLOCATOR_TRIM_FREE_BYTES = 128 * 1024 * 1024
+SYNC_TOOL_ALLOCATOR_TRIM_MIN_INTERVAL_SECONDS = 30.0
+_SYNC_TOOL_ALLOCATOR_TRIM_LOCK = threading.Lock()
+_SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC = float("-inf")
+_SYNC_TOOL_ALLOCATOR_LIBC: Any | None = None
+_SYNC_TOOL_ALLOCATOR_LIBC_UNAVAILABLE = False
+
+
+class _Mallinfo2(ctypes.Structure):
+    _fields_ = [
+        ("arena", ctypes.c_size_t),
+        ("ordblks", ctypes.c_size_t),
+        ("smblks", ctypes.c_size_t),
+        ("hblks", ctypes.c_size_t),
+        ("hblkhd", ctypes.c_size_t),
+        ("usmblks", ctypes.c_size_t),
+        ("fsmblks", ctypes.c_size_t),
+        ("uordblks", ctypes.c_size_t),
+        ("fordblks", ctypes.c_size_t),
+        ("keepcost", ctypes.c_size_t),
+    ]
+
+
 JOB_PREFIX = "grabowski-job-"
 
 #: Tools that may appear as the authorizing invoker in a durable job origin.
@@ -2133,11 +2158,77 @@ def _append_effect_audit(record: dict[str, Any]) -> str:
     return hashlib.sha256(_canonical_json_bytes(record)).hexdigest()
 
 
+def _sync_tool_allocator_libc() -> Any | None:
+    global _SYNC_TOOL_ALLOCATOR_LIBC, _SYNC_TOOL_ALLOCATOR_LIBC_UNAVAILABLE
+    if _SYNC_TOOL_ALLOCATOR_LIBC_UNAVAILABLE:
+        return None
+    if _SYNC_TOOL_ALLOCATOR_LIBC is not None:
+        return _SYNC_TOOL_ALLOCATOR_LIBC
+    try:
+        libc = ctypes.CDLL(None)
+        mallinfo2 = libc.mallinfo2
+        malloc_trim = libc.malloc_trim
+        mallinfo2.argtypes = []
+        mallinfo2.restype = _Mallinfo2
+        malloc_trim.argtypes = [ctypes.c_size_t]
+        malloc_trim.restype = ctypes.c_int
+    except (AttributeError, OSError, TypeError, ValueError):
+        _SYNC_TOOL_ALLOCATOR_LIBC_UNAVAILABLE = True
+        return None
+    _SYNC_TOOL_ALLOCATOR_LIBC = libc
+    return libc
+
+
+def _maybe_trim_sync_tool_allocator() -> bool:
+    """Return free glibc pages at a globally idle MCP-tool boundary."""
+    global _SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC
+    if not _SYNC_TOOL_ALLOCATOR_TRIM_LOCK.acquire(blocking=False):
+        return False
+    try:
+        # malloc_trim is process-wide. Hold admission closed through the
+        # allocator probe and trim so no newly admitted MCP tool can start
+        # allocating between the idle check and the global trim.
+        with _DEPLOYMENT_ADMISSION_LOCK:
+            if _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY:
+                return False
+            now = time.monotonic()
+            if (
+                now - _SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC
+                < SYNC_TOOL_ALLOCATOR_TRIM_MIN_INTERVAL_SECONDS
+            ):
+                return False
+            libc = _sync_tool_allocator_libc()
+            if libc is None:
+                return False
+            try:
+                free_bytes = int(libc.mallinfo2().fordblks)
+            except (AttributeError, OSError, TypeError, ValueError):
+                return False
+            if free_bytes < SYNC_TOOL_ALLOCATOR_TRIM_FREE_BYTES:
+                return False
+            # Record the attempt, not only a successful madvise, so an already
+            # trimmed arena cannot cause a malloc_trim storm on every small read.
+            _SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC = now
+            try:
+                return bool(libc.malloc_trim(0))
+            except (AttributeError, OSError, TypeError, ValueError):
+                return False
+    finally:
+        _SYNC_TOOL_ALLOCATOR_TRIM_LOCK.release()
+
+
 def _run_sync_tool_call(
     original: Any,
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> Any:
+    tool_name = args[0] if args and isinstance(args[0], str) else kwargs.get("name")
+    if tool_name == "grabowski_status":
+        # The status path verifies the audit chain. On a cold segment cache,
+        # concurrent status calls otherwise duplicate the same immutable-chain
+        # materialization in several long-lived allocator arenas.
+        with _SYNC_TOOL_STATUS_LOCK:
+            return asyncio.run(original(*args, **kwargs))
     return asyncio.run(original(*args, **kwargs))
 
 
@@ -2558,7 +2649,10 @@ def _install_deployment_admission_gate() -> None:
                                 guard_for_callback
                             )
                     finally:
-                        _deployment_admission_release_tool_call(identity)
+                        try:
+                            _deployment_admission_release_tool_call(identity)
+                        finally:
+                            _maybe_trim_sync_tool_allocator()
 
                 callback_registered = False
                 try:

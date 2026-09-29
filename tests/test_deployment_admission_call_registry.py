@@ -331,6 +331,83 @@ class DeploymentAdmissionCallRegistryTests(unittest.TestCase):
         self.assertEqual("older", oldest["tool_name"])
 
 
+class SyncToolAllocatorTrimTests(unittest.TestCase):
+    def _libc(self, free_bytes: int, calls: list[int]):
+        return types.SimpleNamespace(
+            mallinfo2=lambda: types.SimpleNamespace(fordblks=free_bytes),
+            malloc_trim=lambda pad: calls.append(pad) or 1,
+        )
+
+    def test_trim_waits_until_tool_registry_is_idle(self) -> None:
+        operator = _load_operator_module()
+        calls: list[int] = []
+        libc = self._libc(
+            operator.SYNC_TOOL_ALLOCATOR_TRIM_FREE_BYTES,
+            calls,
+        )
+        identity = operator._deployment_admission_register_tool_call(
+            "busy-async", operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC
+        )
+        with patch.object(
+            operator, "_sync_tool_allocator_libc", return_value=libc
+        ), patch.object(
+            operator.time, "monotonic", return_value=100.0
+        ), patch.object(
+            operator, "_SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC", float("-inf")
+        ):
+            self.assertFalse(operator._maybe_trim_sync_tool_allocator())
+            self.assertEqual([], calls)
+            operator._deployment_admission_release_tool_call(identity)
+            self.assertTrue(operator._maybe_trim_sync_tool_allocator())
+        self.assertEqual([0], calls)
+
+    def test_trim_requires_material_free_arena_bytes_and_respects_cooldown(
+        self,
+    ) -> None:
+        operator = _load_operator_module()
+        calls: list[int] = []
+        below = self._libc(
+            operator.SYNC_TOOL_ALLOCATOR_TRIM_FREE_BYTES - 1,
+            calls,
+        )
+        enough = self._libc(
+            operator.SYNC_TOOL_ALLOCATOR_TRIM_FREE_BYTES,
+            calls,
+        )
+        with patch.object(
+            operator, "_sync_tool_allocator_libc", return_value=below
+        ), patch.object(
+            operator.time, "monotonic", return_value=100.0
+        ), patch.object(
+            operator, "_SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC", float("-inf")
+        ):
+            self.assertFalse(operator._maybe_trim_sync_tool_allocator())
+        self.assertEqual([], calls)
+
+        with patch.object(
+            operator, "_sync_tool_allocator_libc", return_value=enough
+        ), patch.object(
+            operator.time, "monotonic", side_effect=[100.0, 101.0, 131.0]
+        ), patch.object(
+            operator, "_SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC", float("-inf")
+        ):
+            self.assertTrue(operator._maybe_trim_sync_tool_allocator())
+            self.assertFalse(operator._maybe_trim_sync_tool_allocator())
+            self.assertTrue(operator._maybe_trim_sync_tool_allocator())
+        self.assertEqual([0, 0], calls)
+
+    def test_trim_is_fail_soft_when_glibc_allocator_api_is_unavailable(self) -> None:
+        operator = _load_operator_module()
+        with patch.object(
+            operator, "_sync_tool_allocator_libc", return_value=None
+        ), patch.object(
+            operator.time, "monotonic", return_value=100.0
+        ), patch.object(
+            operator, "_SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC", float("-inf")
+        ):
+            self.assertFalse(operator._maybe_trim_sync_tool_allocator())
+
+
 class DeploymentAdmissionGateTests(unittest.TestCase):
     def test_gate_sync_tool_success_releases_by_identity(self) -> None:
         operator = _load_operator_module()
@@ -340,6 +417,73 @@ class DeploymentAdmissionGateTests(unittest.TestCase):
         result = asyncio.run(operator.mcp._tool_manager.call_tool("read", {}))
         self.assertTrue(result["called"])
         self.assertNotEqual(caller_thread, result["thread_id"])
+        self.assertEqual(0, operator._deployment_admission_active_tool_calls())
+
+    def test_gate_sync_allocator_trim_runs_after_admission_release(self) -> None:
+        operator = _load_operator_module()
+        observed_active_calls: list[int] = []
+
+        def observe_trim() -> bool:
+            observed_active_calls.append(
+                operator._deployment_admission_active_tool_calls()
+            )
+            return False
+
+        operator.mcp._tool_manager.get_tool = lambda _name: _sync_tool()
+        with patch.object(
+            operator,
+            "_maybe_trim_sync_tool_allocator",
+            side_effect=observe_trim,
+        ):
+            operator._configure_http_runtime()
+            result = asyncio.run(
+                operator.mcp._tool_manager.call_tool("read", {})
+            )
+
+        self.assertTrue(result["called"])
+        self.assertEqual([0], observed_active_calls)
+        self.assertEqual(0, operator._deployment_admission_active_tool_calls())
+
+    def test_gate_concurrent_sync_status_calls_serialize_domain_work(self) -> None:
+        operator = _load_operator_module()
+        state_lock = threading.Lock()
+        active = 0
+        peak_active = 0
+
+        async def status_call(name, _arguments, *args, **kwargs):
+            nonlocal active, peak_active
+            self.assertEqual("grabowski_status", name)
+            with state_lock:
+                active += 1
+                peak_active = max(peak_active, active)
+            try:
+                await asyncio.sleep(0.03)
+                return {"called": True}
+            finally:
+                with state_lock:
+                    active -= 1
+
+        operator.mcp._tool_manager.call_tool = status_call
+        operator.mcp._tool_manager.get_tool = lambda _name: _sync_tool()
+        with patch.object(
+            operator, "_maybe_trim_sync_tool_allocator", return_value=False
+        ):
+            operator._configure_http_runtime()
+
+            async def exercise() -> list[dict[str, bool]]:
+                return await asyncio.gather(
+                    *[
+                        operator.mcp._tool_manager.call_tool(
+                            "grabowski_status", {"view": "minimal"}
+                        )
+                        for _ in range(3)
+                    ]
+                )
+
+            results = asyncio.run(exercise())
+
+        self.assertEqual([{"called": True}] * 3, results)
+        self.assertEqual(1, peak_active)
         self.assertEqual(0, operator._deployment_admission_active_tool_calls())
 
     def test_gate_sync_repoground_consultation_logs_only_tool_name(self) -> None:
