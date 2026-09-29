@@ -2388,7 +2388,11 @@ async def _run_drain_neutral_tool_call(
         try:
             _deployment_admission_release_tool_call(identity)
         finally:
-            _maybe_trim_sync_tool_allocator()
+            # Future callbacks may run synchronously in add_done_callback() when
+            # the worker is already done/cancelled. Never let that caller
+            # (including the asyncio event loop) enter the blocking allocator
+            # gate or malloc_trim directly.
+            _schedule_sync_tool_allocator_trim_retry(0.0)
 
     callback_registered = False
     try:
@@ -2858,7 +2862,11 @@ def _install_deployment_admission_gate() -> None:
                         try:
                             _deployment_admission_release_tool_call(identity)
                         finally:
-                            _maybe_trim_sync_tool_allocator()
+                            # Future callbacks may run synchronously in
+                            # add_done_callback() when the worker is already
+                            # done/cancelled. Keep process-wide allocator work
+                            # off that caller, including the asyncio event loop.
+                            _schedule_sync_tool_allocator_trim_retry(0.0)
 
                 callback_registered = False
                 try:
