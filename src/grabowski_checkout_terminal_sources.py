@@ -173,7 +173,8 @@ def _current_bureau_task_specs(
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA query_only=ON")
         connection.execute("BEGIN")
-        if _bureau_state_store_snapshot(root_descriptor) != before:
+        after_begin = _bureau_state_store_snapshot(root_descriptor)
+        if after_begin["database"] != before["database"]:
             raise RuntimeError("Bureau TaskSpec StateStore identity changed")
         for table, required in BUREAU_TASK_SPEC_SCHEMA.items():
             observed = {
@@ -182,6 +183,9 @@ def _current_bureau_task_specs(
             }
             if not required.issubset(observed):
                 raise RuntimeError("Bureau TaskSpec StateStore schema is incomplete")
+        transaction_snapshot = _bureau_state_store_snapshot(root_descriptor)
+        if transaction_snapshot["database"] != before["database"]:
+            raise RuntimeError("Bureau TaskSpec StateStore identity changed")
         select = (
             "SELECT p.task_id,p.current_revision,p.spec_sha256 AS pointer_sha256,"
             "r.revision,r.parent_revision,r.spec_sha256 AS revision_sha256,r.spec_json "
@@ -198,7 +202,8 @@ def _current_bureau_task_specs(
                 select + "WHERE p.task_id=? LIMIT 2",
                 (expected_task_id,),
             ).fetchall()
-        if _bureau_state_store_snapshot(root_descriptor) != before:
+        after_read = _bureau_state_store_snapshot(root_descriptor)
+        if after_read != transaction_snapshot:
             raise RuntimeError("Bureau TaskSpec StateStore identity changed")
         if expected_task_id is None and len(rows) > BUREAU_TASK_SPEC_SCAN_LIMIT:
             raise RuntimeError("Bureau TaskSpec StateStore scan is incomplete")
