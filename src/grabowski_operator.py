@@ -104,6 +104,7 @@ SYNC_TOOL_ALLOCATOR_TRIM_FREE_BYTES = 128 * 1024 * 1024
 SYNC_TOOL_ALLOCATOR_TRIM_MIN_INTERVAL_SECONDS = 30.0
 _SYNC_TOOL_ALLOCATOR_TRIM_LOCK = threading.Lock()
 _SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC = float("-inf")
+_SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = False
 _SYNC_TOOL_ALLOCATOR_LIBC: Any | None = None
 _SYNC_TOOL_ALLOCATOR_LIBC_UNAVAILABLE = False
 
@@ -2035,9 +2036,14 @@ def _deployment_admission_release_tool_call(identity: Any) -> bool:
     if not isinstance(identity, str) or not identity:
         return False
     with _DEPLOYMENT_ADMISSION_LOCK:
-        return (
+        released = (
             _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY.pop(identity, None) is not None
         )
+    if released and _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED:
+        # A synchronous completion may have deferred its process-wide trim
+        # behind another active tool. The final later release owns the retry.
+        _maybe_trim_sync_tool_allocator()
+    return released
 
 
 def _deployment_admission_active_registry_snapshot() -> dict[str, dict[str, Any]]:
@@ -2184,6 +2190,7 @@ def _sync_tool_allocator_libc() -> Any | None:
 
 def _maybe_trim_sync_tool_allocator() -> bool:
     """Return free glibc pages at a globally idle MCP-tool boundary."""
+    global _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED
     global _SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC
     if not _SYNC_TOOL_ALLOCATOR_TRIM_LOCK.acquire(blocking=False):
         return False
@@ -2193,25 +2200,34 @@ def _maybe_trim_sync_tool_allocator() -> bool:
         # allocating between the idle check and the global trim.
         with _DEPLOYMENT_ADMISSION_LOCK:
             if _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY:
+                _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = True
                 return False
             now = time.monotonic()
             if (
                 now - _SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC
                 < SYNC_TOOL_ALLOCATOR_TRIM_MIN_INTERVAL_SECONDS
             ):
+                # A material sync workload can finish during the cooldown.
+                # Preserve one retry obligation so the next globally idle
+                # tool release can re-evaluate after the interval expires.
+                _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = True
                 return False
             libc = _sync_tool_allocator_libc()
             if libc is None:
+                _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = False
                 return False
             try:
                 free_bytes = int(libc.mallinfo2().fordblks)
             except (AttributeError, OSError, TypeError, ValueError):
+                _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = False
                 return False
             if free_bytes < SYNC_TOOL_ALLOCATOR_TRIM_FREE_BYTES:
+                _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = False
                 return False
             # Record the attempt, not only a successful madvise, so an already
             # trimmed arena cannot cause a malloc_trim storm on every small read.
             _SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC = now
+            _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = False
             try:
                 return bool(libc.malloc_trim(0))
             except (AttributeError, OSError, TypeError, ValueError):
@@ -2228,10 +2244,6 @@ def _sync_tool_executor(tool_name: Any) -> concurrent.futures.ThreadPoolExecutor
     return _SYNC_TOOL_EXECUTOR
 
 
-def _trim_sync_tool_allocator_after_completion(_completed: Any) -> None:
-    _maybe_trim_sync_tool_allocator()
-
-
 def _submit_sync_tool_call(
     call_runner: Any,
     original: Any,
@@ -2239,18 +2251,109 @@ def _submit_sync_tool_call(
     kwargs: dict[str, Any],
     *extra_args: Any,
     tool_name: Any,
-    trim_on_completion: bool = False,
 ) -> concurrent.futures.Future[Any]:
-    worker_future = _sync_tool_executor(tool_name).submit(
+    return _sync_tool_executor(tool_name).submit(
         call_runner,
         original,
         args,
         kwargs,
         *extra_args,
     )
-    if trim_on_completion:
-        worker_future.add_done_callback(_trim_sync_tool_allocator_after_completion)
-    return worker_future
+
+
+async def _run_drain_neutral_tool_call(
+    original: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    tool_name: Any,
+    tool: Any,
+) -> Any:
+    kind = (
+        _DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC
+        if tool is not None and getattr(tool, "is_async", True) is False
+        else _DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC
+    )
+    identity = _deployment_admission_register_tool_call(
+        tool_name,
+        kind,
+        drain_blocking=False,
+    )
+    if kind != _DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC:
+        try:
+            return await original(*args, **kwargs)
+        finally:
+            _deployment_admission_release_tool_call(identity)
+
+    try:
+        worker_future = _submit_sync_tool_call(
+            _run_sync_tool_call,
+            original,
+            args,
+            kwargs,
+            tool_name=tool_name,
+        )
+    except BaseException:
+        _deployment_admission_release_tool_call(identity)
+        raise
+
+    release_lock = threading.Lock()
+    release_done = False
+
+    def _release_when_worker_finishes(_completed: Any) -> None:
+        nonlocal release_done
+        with release_lock:
+            if release_done:
+                return
+            release_done = True
+        try:
+            _deployment_admission_release_tool_call(identity)
+        finally:
+            _maybe_trim_sync_tool_allocator()
+
+    callback_registered = False
+    try:
+        worker_future.add_done_callback(_release_when_worker_finishes)
+        callback_registered = True
+        wrapped = asyncio.wrap_future(
+            worker_future,
+            loop=asyncio.get_running_loop(),
+        )
+    except BaseException:
+        if not callback_registered:
+            try:
+                worker_future.add_done_callback(_release_when_worker_finishes)
+                callback_registered = True
+            except BaseException:
+                def _fallback_wait_and_release() -> None:
+                    try:
+                        try:
+                            worker_future.result()
+                        except BaseException:
+                            pass
+                    finally:
+                        _release_when_worker_finishes(worker_future)
+
+                try:
+                    threading.Thread(
+                        target=_fallback_wait_and_release,
+                        name="grabowski-drain-neutral-sync-release-fallback",
+                        daemon=True,
+                    ).start()
+                    callback_registered = True
+                except BaseException as fallback_error:
+                    logging.getLogger(__name__).error(
+                        "drain-neutral sync release handoff failed after submit; "
+                        "admission remains held until process lifecycle: %s",
+                        type(fallback_error).__name__,
+                        exc_info=fallback_error,
+                    )
+        raise
+    try:
+        return await wrapped
+    except asyncio.CancelledError:
+        worker_future.cancel()
+        raise
 
 
 def _run_sync_tool_call(
@@ -2416,18 +2519,13 @@ def _install_deployment_admission_gate() -> None:
                 current_observer_evidence is not None
                 and current_observer_evidence.get("marker_bound") is True
             ):
-                if tool is not None and getattr(tool, "is_async", True) is False:
-                    loop = asyncio.get_running_loop()
-                    worker_future = _submit_sync_tool_call(
-                        _run_sync_tool_call,
-                        original,
-                        args,
-                        kwargs,
-                        tool_name=tool_name,
-                        trim_on_completion=True,
-                    )
-                    return await asyncio.wrap_future(worker_future, loop=loop)
-                return await original(*args, **kwargs)
+                return await _run_drain_neutral_tool_call(
+                    original,
+                    args,
+                    kwargs,
+                    tool_name=tool_name,
+                    tool=tool,
+                )
 
         if (
             observer_marker.get("active") is True
@@ -2440,18 +2538,13 @@ def _install_deployment_admission_gate() -> None:
                 and current_marker.get("valid") is True
                 and _deployment_readiness_status_call(tool_name, arguments, tool)
             ):
-                if tool is not None and getattr(tool, "is_async", True) is False:
-                    loop = asyncio.get_running_loop()
-                    worker_future = _submit_sync_tool_call(
-                        _run_sync_tool_call,
-                        original,
-                        args,
-                        kwargs,
-                        tool_name=tool_name,
-                        trim_on_completion=True,
-                    )
-                    return await asyncio.wrap_future(worker_future, loop=loop)
-                return await original(*args, **kwargs)
+                return await _run_drain_neutral_tool_call(
+                    original,
+                    args,
+                    kwargs,
+                    tool_name=tool_name,
+                    tool=tool,
+                )
 
         read_only_hint = _tool_read_only_hint(tool)
         effective_read_only = _operator_gate_read_only(tool_name, arguments, tool)
