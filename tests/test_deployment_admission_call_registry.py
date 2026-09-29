@@ -90,6 +90,65 @@ class DeploymentAdmissionCallRegistryTests(unittest.TestCase):
                 operator._deployment_admission_release_tool_call(replacement)
             )
 
+    def test_drain_neutral_reserve_preserves_probe_capacity_at_blocking_limit(
+        self,
+    ) -> None:
+        operator = _load_operator_module()
+        with patch.object(
+            operator, "_DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY_MAX", 2
+        ), patch.object(
+            operator, "_DEPLOYMENT_ADMISSION_DRAIN_NEUTRAL_RESERVE", 1
+        ):
+            first = operator._deployment_admission_register_tool_call(
+                "first", operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC
+            )
+            second = operator._deployment_admission_register_tool_call(
+                "second", operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC
+            )
+            observer = operator._deployment_admission_register_tool_call(
+                "observer",
+                operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC,
+                drain_blocking=False,
+                drain_neutral=True,
+            )
+            snapshot = operator._deployment_admission_snapshot()
+            self.assertEqual(3, snapshot["active_tool_calls"])
+            self.assertEqual(2, snapshot["drain_blocking_tool_calls"])
+            self.assertEqual(1, snapshot["read_only_active_tool_calls"])
+            self.assertEqual(2, snapshot["active_tool_call_registry_max"])
+            self.assertEqual(1, snapshot["drain_neutral_tool_call_reserve"])
+            self.assertEqual(3, snapshot["active_tool_call_registry_hard_max"])
+
+            with self.assertRaisesRegex(RuntimeError, "registry is full"):
+                operator._deployment_admission_register_tool_call(
+                    "second-observer",
+                    operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC,
+                    drain_blocking=False,
+                    drain_neutral=True,
+                )
+            with self.assertRaisesRegex(RuntimeError, "registry is full"):
+                operator._deployment_admission_register_tool_call(
+                    "third-blocking",
+                    operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC,
+                )
+
+            self.assertTrue(operator._deployment_admission_release_tool_call(first))
+            with self.assertRaisesRegex(RuntimeError, "registry is full"):
+                operator._deployment_admission_register_tool_call(
+                    "replacement-before-observer-release",
+                    operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC,
+                )
+            self.assertTrue(operator._deployment_admission_release_tool_call(observer))
+            replacement = operator._deployment_admission_register_tool_call(
+                "replacement",
+                operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC,
+            )
+            self.assertEqual(2, operator._deployment_admission_active_tool_calls())
+            self.assertTrue(operator._deployment_admission_release_tool_call(second))
+            self.assertTrue(
+                operator._deployment_admission_release_tool_call(replacement)
+            )
+
     def test_registry_rejects_non_boolean_drain_classification(self) -> None:
         operator = _load_operator_module()
         with self.assertRaisesRegex(ValueError, "drain_blocking must be boolean"):
@@ -97,6 +156,25 @@ class DeploymentAdmissionCallRegistryTests(unittest.TestCase):
                 "read",
                 operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC,
                 drain_blocking=1,
+            )
+        self.assertEqual(0, operator._deployment_admission_active_tool_calls())
+
+    def test_registry_rejects_invalid_drain_neutral_classification(self) -> None:
+        operator = _load_operator_module()
+        with self.assertRaisesRegex(ValueError, "drain_neutral must be boolean"):
+            operator._deployment_admission_register_tool_call(
+                "read",
+                operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC,
+                drain_blocking=False,
+                drain_neutral=1,
+            )
+        with self.assertRaisesRegex(
+            ValueError, "drain_neutral calls must be drain_blocking=false"
+        ):
+            operator._deployment_admission_register_tool_call(
+                "read",
+                operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC,
+                drain_neutral=True,
             )
         self.assertEqual(0, operator._deployment_admission_active_tool_calls())
 
@@ -294,6 +372,15 @@ class DeploymentAdmissionCallRegistryTests(unittest.TestCase):
         self.assertEqual(
             operator._DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY_MAX,
             snapshot["active_tool_call_registry_max"],
+        )
+        self.assertEqual(
+            operator._DEPLOYMENT_ADMISSION_DRAIN_NEUTRAL_RESERVE,
+            snapshot["drain_neutral_tool_call_reserve"],
+        )
+        self.assertEqual(
+            operator._DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY_MAX
+            + operator._DEPLOYMENT_ADMISSION_DRAIN_NEUTRAL_RESERVE,
+            snapshot["active_tool_call_registry_hard_max"],
         )
         self.assertIsNone(snapshot["oldest_active_tool_call_age_seconds"])
         self.assertEqual({}, snapshot["active_tool_calls_by_kind"])
@@ -1533,6 +1620,58 @@ class DeploymentAdmissionGateTests(unittest.TestCase):
         self.assertEqual(
             [("grabowski_status", {"view": "minimal"})], calls
         )
+        self.assertEqual(0, operator._deployment_admission_active_tool_calls())
+
+    def test_gate_drain_neutral_readiness_uses_reserved_capacity_at_blocking_limit(
+        self,
+    ) -> None:
+        operator = _load_operator_module()
+        marker = {"state": "active", "active": True, "valid": True}
+        calls: list[tuple[str, object]] = []
+
+        async def original(name, arguments, *args, **kwargs):
+            snapshot = operator._deployment_admission_snapshot()
+            self.assertEqual(2, snapshot["active_tool_calls"])
+            self.assertEqual(1, snapshot["drain_blocking_tool_calls"])
+            self.assertEqual(1, snapshot["read_only_active_tool_calls"])
+            calls.append((name, arguments))
+            return {"called": True}
+
+        operator.mcp._tool_manager.call_tool = original
+        operator.mcp._tool_manager.get_tool = lambda name: types.SimpleNamespace(
+            is_async=True,
+            context_kwarg=None,
+            annotations=types.SimpleNamespace(
+                readOnlyHint=(name == "grabowski_status")
+            ),
+        )
+        with patch.object(
+            operator, "_DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY_MAX", 1
+        ), patch.object(
+            operator, "_DEPLOYMENT_ADMISSION_DRAIN_NEUTRAL_RESERVE", 1
+        ), patch.object(
+            operator, "_read_deployment_admission_marker", return_value=marker
+        ):
+            blocker = operator._deployment_admission_register_tool_call(
+                "queued-read", operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC
+            )
+            try:
+                operator._configure_http_runtime()
+                result = asyncio.run(
+                    operator.mcp._tool_manager.call_tool(
+                        "grabowski_status", {"view": "minimal"}
+                    )
+                )
+                self.assertTrue(result["called"])
+                self.assertEqual(
+                    [("grabowski_status", {"view": "minimal"})], calls
+                )
+                self.assertEqual(
+                    1, operator._deployment_admission_active_tool_calls()
+                )
+            finally:
+                operator._deployment_admission_release_tool_call(blocker)
+
         self.assertEqual(0, operator._deployment_admission_active_tool_calls())
 
     def test_gate_sync_readiness_bypass_is_drain_neutral_and_trims_after_release(

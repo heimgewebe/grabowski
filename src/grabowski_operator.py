@@ -81,6 +81,7 @@ DEPLOYMENT_ADMISSION_HEAD_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 _DEPLOYMENT_ADMISSION_LOCK = threading.Lock()
 _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY: dict[str, dict[str, Any]] = {}
 _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY_MAX = 4096
+_DEPLOYMENT_ADMISSION_DRAIN_NEUTRAL_RESERVE = 16
 _DEPLOYMENT_ADMISSION_IDENTITY_ATTEMPTS_MAX = 8
 _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_SAMPLE_MAX = 16
 _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_NAME_GROUP_MAX = 32
@@ -1995,6 +1996,7 @@ def _deployment_admission_register_tool_call(
     kind: str,
     *,
     drain_blocking: bool = True,
+    drain_neutral: bool = False,
 ) -> str:
     if kind not in {
         _DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC,
@@ -2003,13 +2005,19 @@ def _deployment_admission_register_tool_call(
         raise ValueError(f"unknown deployment admission execution kind: {kind!r}")
     if not isinstance(drain_blocking, bool):
         raise ValueError("deployment admission drain_blocking must be boolean")
+    if not isinstance(drain_neutral, bool):
+        raise ValueError("deployment admission drain_neutral must be boolean")
+    if drain_neutral and drain_blocking:
+        raise ValueError(
+            "deployment admission drain_neutral calls must be drain_blocking=false"
+        )
     name = tool_name if isinstance(tool_name, str) and tool_name else "unnamed"
     name = name[:_DEPLOYMENT_ADMISSION_MAX_TOOL_NAME_CHARS]
     with _DEPLOYMENT_ADMISSION_LOCK:
-        if (
-            len(_DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY)
-            >= _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY_MAX
-        ):
+        capacity_limit = _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY_MAX
+        if drain_neutral:
+            capacity_limit += _DEPLOYMENT_ADMISSION_DRAIN_NEUTRAL_RESERVE
+        if len(_DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY) >= capacity_limit:
             raise RuntimeError(
                 "Grabowski deployment admission active-call registry is full"
             )
@@ -2120,6 +2128,13 @@ def _deployment_admission_snapshot() -> dict[str, Any]:
         "effect_classification": _DEPLOYMENT_ADMISSION_EFFECT_CLASSIFICATION,
         "active_tool_call_registry_max": (
             _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY_MAX
+        ),
+        "drain_neutral_tool_call_reserve": (
+            _DEPLOYMENT_ADMISSION_DRAIN_NEUTRAL_RESERVE
+        ),
+        "active_tool_call_registry_hard_max": (
+            _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY_MAX
+            + _DEPLOYMENT_ADMISSION_DRAIN_NEUTRAL_RESERVE
         ),
         "admission_gate_installed": _DEPLOYMENT_ADMISSION_GATE_INSTALLED,
         "oldest_active_tool_call_age_seconds": oldest_age_seconds,
@@ -2341,6 +2356,7 @@ async def _run_drain_neutral_tool_call(
         tool_name,
         kind,
         drain_blocking=False,
+        drain_neutral=True,
     )
     if kind != _DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC:
         try:
