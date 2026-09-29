@@ -2282,6 +2282,87 @@ class DeploymentAdmissionGateTests(unittest.TestCase):
             self.assertTrue(result["called"])
             self.assertEqual(0, operator._deployment_admission_active_tool_calls())
 
+    def test_gate_sync_marker_bound_job_observer_bypasses_shared_backlog(self) -> None:
+        operator = _load_operator_module()
+        shared_started = threading.Event()
+        shared_release = threading.Event()
+        observer_ran = threading.Event()
+        shared_executor = ThreadPoolExecutor(max_workers=1)
+        drain_neutral_executor = ThreadPoolExecutor(max_workers=1)
+        marker_active = [False]
+
+        async def call_tool(name, _arguments, *args, **kwargs):
+            if name == "regular-read":
+                shared_started.set()
+                if not shared_release.wait(timeout=5):
+                    raise RuntimeError("shared release timed out")
+            elif name == operator.deployment_observer.OPERATION:
+                observer_ran.set()
+            return {"called": True}
+
+        def marker():
+            if marker_active[0]:
+                return {"state": "active", "active": True, "valid": True}
+            return {"state": "absent", "active": False, "valid": False}
+
+        def observer_evidence(name, *_args, **_kwargs):
+            if name == operator.deployment_observer.OPERATION and marker_active[0]:
+                return {"marker_bound": True}
+            return None
+
+        self.assertEqual(
+            "grabowski_job_status", operator.deployment_observer.OPERATION
+        )
+        operator.mcp._tool_manager.call_tool = call_tool
+        operator.mcp._tool_manager.get_tool = lambda _name: _sync_tool()
+        operator._SYNC_TOOL_EXECUTOR = shared_executor
+        operator._SYNC_TOOL_DRAIN_NEUTRAL_OBSERVER_EXECUTOR = drain_neutral_executor
+        with patch.object(
+            operator, "_read_deployment_admission_marker", side_effect=marker
+        ), patch.object(
+            operator,
+            "_deployment_observer_request_evidence",
+            side_effect=observer_evidence,
+        ), patch.object(
+            operator, "_schedule_sync_tool_allocator_trim_retry", return_value=True
+        ):
+            operator._configure_http_runtime()
+
+            async def exercise() -> None:
+                ordinary = asyncio.create_task(
+                    operator.mcp._tool_manager.call_tool("regular-read", {})
+                )
+                self.assertTrue(
+                    await asyncio.to_thread(shared_started.wait, 2)
+                )
+
+                marker_active[0] = True
+                observer = await asyncio.wait_for(
+                    operator.mcp._tool_manager.call_tool(
+                        operator.deployment_observer.OPERATION, {}
+                    ),
+                    timeout=1,
+                )
+                self.assertTrue(observer["called"])
+                self.assertTrue(observer_ran.is_set())
+                self.assertFalse(shared_release.is_set())
+
+                marker_active[0] = False
+                shared_release.set()
+                self.assertTrue((await ordinary)["called"])
+
+            try:
+                asyncio.run(exercise())
+            finally:
+                marker_active[0] = False
+                shared_release.set()
+                shared_executor.shutdown(wait=True, cancel_futures=True)
+                drain_neutral_executor.shutdown(
+                    wait=True, cancel_futures=True
+                )
+
+        self.assertEqual(0, operator._deployment_admission_active_tool_calls())
+
     def test_gate_overlapping_sync_bypasses_do_not_trim_until_global_idle(self) -> None:
         operator = _load_operator_module()
         marker = {

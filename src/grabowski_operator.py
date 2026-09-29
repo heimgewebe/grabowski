@@ -105,6 +105,10 @@ _SYNC_TOOL_DRAIN_NEUTRAL_STATUS_EXECUTOR = concurrent.futures.ThreadPoolExecutor
     max_workers=1,
     thread_name_prefix="grabowski-drain-neutral-status-tool",
 )
+_SYNC_TOOL_DRAIN_NEUTRAL_OBSERVER_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="grabowski-drain-neutral-observer-tool",
+)
 SYNC_TOOL_ALLOCATOR_TRIM_FREE_BYTES = 128 * 1024 * 1024
 SYNC_TOOL_ALLOCATOR_TRIM_MIN_INTERVAL_SECONDS = 30.0
 _SYNC_TOOL_ALLOCATOR_TRIM_LOCK = threading.Lock()
@@ -2379,11 +2383,19 @@ def _sync_tool_executor(
     *,
     drain_neutral: bool = False,
 ) -> concurrent.futures.ThreadPoolExecutor:
-    if tool_name == "grabowski_status":
-        if drain_neutral:
-            # Minimal deployment readiness must bypass the ordinary status
-            # backlog without allowing readiness probes to stampede each other.
+    if drain_neutral:
+        if tool_name == "grabowski_status":
+            # Minimal readiness must bypass the ordinary status backlog while
+            # readiness probes remain serialized with each other.
             return _SYNC_TOOL_DRAIN_NEUTRAL_STATUS_EXECUTOR
+        if tool_name == deployment_observer.OPERATION:
+            # Capability-bound job observers need an independent reserved lane:
+            # they must bypass shared work without blocking readiness probes.
+            return _SYNC_TOOL_DRAIN_NEUTRAL_OBSERVER_EXECUTOR
+        raise RuntimeError(
+            f"unsupported drain-neutral sync tool: {tool_name!r}"
+        )
+    if tool_name == "grabowski_status":
         # Keep cold audit-chain serialization out of the shared sync-tool pool:
         # queued status waiters must not occupy workers needed by unrelated tools.
         return _SYNC_TOOL_STATUS_EXECUTOR
