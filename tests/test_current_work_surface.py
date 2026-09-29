@@ -63,16 +63,28 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
                 }
             ],
         }
-        reconciler = SimpleNamespace(
-            MAX_PAGE_LIMIT=100,
-            reconcile_checkout_bindings=lambda **_kwargs: {
+        database_reads = 0
+        reconciliation_snapshots: list[object] = []
+
+        def collect_database() -> dict:
+            nonlocal database_reads
+            database_reads += 1
+            return database
+
+        def reconcile(**kwargs: object) -> dict:
+            reconciliation_snapshots.append(kwargs.get("_database_snapshot"))
+            return {
                 "bindings": [],
                 "pagination": {"has_more": True},
                 "total_count": 101,
                 "source_snapshot": {
                     "database_snapshot_sha256": "a" * 64,
                 },
-            },
+            }
+
+        reconciler = SimpleNamespace(
+            MAX_PAGE_LIMIT=100,
+            reconcile_checkout_bindings=reconcile,
             collect_git_worktrees_for_repos=lambda *_args, **_kwargs: {
                 "worktrees": [
                     {"checkout_key": "checkout-bound"},
@@ -83,12 +95,14 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
                 "errors": [],
                 "errors_truncated": False,
             },
-            collect_lifecycle_bindings_from_db=lambda: database,
+            collect_lifecycle_bindings_from_db=collect_database,
         )
 
         with patch.object(surface, "_module", return_value=reconciler):
             result = surface._reconciliation_payload([REPOSITORY])
 
+        self.assertEqual(2, database_reads)
+        self.assertEqual([database], reconciliation_snapshots)
         self.assertTrue(result["task_checkout_presence_complete"])
         self.assertEqual(
             result["task_checkout_presence"],
@@ -817,6 +831,9 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
         reconciler = SimpleNamespace(
             MAX_PAGE_LIMIT=100,
             reconcile_checkout_bindings=reconcile,
+            collect_lifecycle_bindings_from_db=lambda: {
+                "snapshot_sha256": "a" * 64,
+            },
         )
         with patch.object(
             surface, "_module", return_value=reconciler
