@@ -1335,6 +1335,146 @@ class DeploymentAdmissionGateTests(unittest.TestCase):
 
         self.assertEqual(0, operator._deployment_admission_active_tool_calls())
 
+    def test_gate_drain_neutral_sync_status_bypasses_status_backlog(self) -> None:
+        operator = _load_operator_module()
+        status_started = threading.Event()
+        status_release = threading.Event()
+        readiness_ran = threading.Event()
+        status_executor = ThreadPoolExecutor(max_workers=1)
+        readiness_status_executor = ThreadPoolExecutor(max_workers=1)
+        marker_active = [False]
+        call_lock = threading.Lock()
+        status_call_count = 0
+
+        async def call_tool(name, _arguments, *args, **kwargs):
+            nonlocal status_call_count
+            self.assertEqual("grabowski_status", name)
+            with call_lock:
+                status_call_count += 1
+                call_number = status_call_count
+            if call_number == 1:
+                status_started.set()
+                if not status_release.wait(timeout=5):
+                    raise RuntimeError("status release timed out")
+            elif marker_active[0]:
+                readiness_ran.set()
+            return {"called": True, "call_number": call_number}
+
+        def marker():
+            if marker_active[0]:
+                return {"state": "active", "active": True, "valid": True}
+            return {"state": "absent", "active": False, "valid": False}
+
+        operator.mcp._tool_manager.call_tool = call_tool
+        operator.mcp._tool_manager.get_tool = lambda _name: _sync_tool()
+        operator._SYNC_TOOL_STATUS_EXECUTOR = status_executor
+        operator._SYNC_TOOL_DRAIN_NEUTRAL_STATUS_EXECUTOR = readiness_status_executor
+        with patch.object(
+            operator, "_read_deployment_admission_marker", side_effect=marker
+        ), patch.object(
+            operator, "_schedule_sync_tool_allocator_trim_retry", return_value=True
+        ):
+            operator._configure_http_runtime()
+
+            async def exercise() -> None:
+                ordinary = [
+                    asyncio.create_task(
+                        operator.mcp._tool_manager.call_tool(
+                            "grabowski_status", {"view": "minimal"}
+                        )
+                    )
+                    for _ in range(2)
+                ]
+                started = await asyncio.to_thread(status_started.wait, 2)
+                self.assertTrue(started)
+                for _attempt in range(100):
+                    if operator._deployment_admission_active_tool_calls() == 2:
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertEqual(
+                    2, operator._deployment_admission_active_tool_calls()
+                )
+
+                marker_active[0] = True
+                readiness = await asyncio.wait_for(
+                    operator.mcp._tool_manager.call_tool(
+                        "grabowski_status", {"view": "minimal"}
+                    ),
+                    timeout=1,
+                )
+                self.assertTrue(readiness["called"])
+                self.assertTrue(readiness_ran.is_set())
+                self.assertFalse(status_release.is_set())
+
+                marker_active[0] = False
+                status_release.set()
+                results = await asyncio.gather(*ordinary)
+                self.assertEqual(2, len(results))
+
+            try:
+                asyncio.run(exercise())
+            finally:
+                status_release.set()
+                status_executor.shutdown(wait=True, cancel_futures=True)
+                readiness_status_executor.shutdown(wait=True, cancel_futures=True)
+
+        self.assertEqual(3, status_call_count)
+        self.assertEqual(0, operator._deployment_admission_active_tool_calls())
+
+    def test_gate_drain_neutral_status_calls_remain_serialized(self) -> None:
+        operator = _load_operator_module()
+        state_lock = threading.Lock()
+        active = 0
+        peak_active = 0
+        readiness_status_executor = ThreadPoolExecutor(max_workers=1)
+        marker = {"state": "active", "active": True, "valid": True}
+
+        async def status_call(name, _arguments, *args, **kwargs):
+            nonlocal active, peak_active
+            self.assertEqual("grabowski_status", name)
+            with state_lock:
+                active += 1
+                peak_active = max(peak_active, active)
+            try:
+                await asyncio.sleep(0.03)
+                return {"called": True}
+            finally:
+                with state_lock:
+                    active -= 1
+
+        operator.mcp._tool_manager.call_tool = status_call
+        operator.mcp._tool_manager.get_tool = lambda _name: _sync_tool()
+        operator._SYNC_TOOL_DRAIN_NEUTRAL_STATUS_EXECUTOR = (
+            readiness_status_executor
+        )
+        with patch.object(
+            operator, "_read_deployment_admission_marker", return_value=marker
+        ), patch.object(
+            operator, "_schedule_sync_tool_allocator_trim_retry", return_value=True
+        ):
+            operator._configure_http_runtime()
+
+            async def exercise() -> list[dict[str, bool]]:
+                return await asyncio.gather(
+                    *[
+                        operator.mcp._tool_manager.call_tool(
+                            "grabowski_status", {"view": "minimal"}
+                        )
+                        for _ in range(3)
+                    ]
+                )
+
+            try:
+                results = asyncio.run(exercise())
+            finally:
+                readiness_status_executor.shutdown(
+                    wait=True, cancel_futures=True
+                )
+
+        self.assertEqual([{"called": True}] * 3, results)
+        self.assertEqual(1, peak_active)
+        self.assertEqual(0, operator._deployment_admission_active_tool_calls())
+
     def test_gate_sync_repoground_consultation_logs_only_tool_name(self) -> None:
         operator = _load_operator_module()
         operator.mcp._tool_manager.get_tool = lambda _name: _sync_tool()

@@ -101,6 +101,10 @@ _SYNC_TOOL_STATUS_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=1,
     thread_name_prefix="grabowski-status-tool",
 )
+_SYNC_TOOL_DRAIN_NEUTRAL_STATUS_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="grabowski-drain-neutral-status-tool",
+)
 SYNC_TOOL_ALLOCATOR_TRIM_FREE_BYTES = 128 * 1024 * 1024
 SYNC_TOOL_ALLOCATOR_TRIM_MIN_INTERVAL_SECONDS = 30.0
 _SYNC_TOOL_ALLOCATOR_TRIM_LOCK = threading.Lock()
@@ -2370,8 +2374,16 @@ def _maybe_trim_sync_tool_allocator() -> bool:
         _SYNC_TOOL_ALLOCATOR_TRIM_LOCK.release()
 
 
-def _sync_tool_executor(tool_name: Any) -> concurrent.futures.ThreadPoolExecutor:
+def _sync_tool_executor(
+    tool_name: Any,
+    *,
+    drain_neutral: bool = False,
+) -> concurrent.futures.ThreadPoolExecutor:
     if tool_name == "grabowski_status":
+        if drain_neutral:
+            # Minimal deployment readiness must bypass the ordinary status
+            # backlog without allowing readiness probes to stampede each other.
+            return _SYNC_TOOL_DRAIN_NEUTRAL_STATUS_EXECUTOR
         # Keep cold audit-chain serialization out of the shared sync-tool pool:
         # queued status waiters must not occupy workers needed by unrelated tools.
         return _SYNC_TOOL_STATUS_EXECUTOR
@@ -2385,8 +2397,12 @@ def _submit_sync_tool_call(
     kwargs: dict[str, Any],
     *extra_args: Any,
     tool_name: Any,
+    drain_neutral: bool = False,
 ) -> concurrent.futures.Future[Any]:
-    return _sync_tool_executor(tool_name).submit(
+    return _sync_tool_executor(
+        tool_name,
+        drain_neutral=drain_neutral,
+    ).submit(
         call_runner,
         original,
         args,
@@ -2427,6 +2443,7 @@ async def _run_drain_neutral_tool_call(
             args,
             kwargs,
             tool_name=tool_name,
+            drain_neutral=True,
         )
     except BaseException:
         _deployment_admission_release_tool_call(identity)
