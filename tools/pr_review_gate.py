@@ -110,6 +110,7 @@ BOOTSTRAP_EXPECTED_CHECK_NAMES_BY_REPO = {
     "heimgewebe/hauski-audio": ("scan",),
     "hall-of-memory/hall-of-memory": ("verify",),
     "alexdermohr/livia": ("quality",),
+    "alexdermohr/mark-api": ("verify",),
     "heimgewebe/metarepo": ("ci (ubuntu-latest)", "ci (macos-latest)"),
     "heimgewebe/mitschreiber": ("ci / reusable-ci",),
     "heimgewebe/systemkatalog": ("Repository Contract", "Secret Scan"),
