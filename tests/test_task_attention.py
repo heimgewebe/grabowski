@@ -2830,6 +2830,90 @@ class TaskAttentionTests(unittest.TestCase):
             ],
         )
 
+    def test_current_work_attention_mixed_retry_successors_fail_visible(
+        self,
+    ) -> None:
+        source, running = self._verified_retry_pair(successor_state="running")
+        common = {
+            "host": "local",
+            "argv": ["/bin/echo", "verified-retry"],
+            "cwd": str(self.root),
+            "runtime_seconds": 61,
+            "resume_policy": "retry-safe",
+            "cpu_weight": 50,
+            "io_weight": 25,
+            "memory_max_bytes": 64 * 1024 * 1024,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 124},
+            ),
+        ):
+            failed = tasks.grabowski_task_start(**common)["task"]
+        failed = tasks._set_state(
+            str(failed["task_id"]),
+            "failed",
+            observation={"state": "failed", "source": "mixed-second-successor"},
+        )
+        running_row = tasks._row_raw(str(running["task_id"]))
+        failed_row = tasks._row_raw(str(failed["task_id"]))
+        running_launcher = json.loads(str(running_row["launcher_json"]))
+        failed_launcher = json.loads(str(failed_row["launcher_json"]))
+        failed_launcher["retry_binding"] = dict(running_launcher["retry_binding"])
+        identity_columns = (
+            "host",
+            "argv_json",
+            "argv_sha256",
+            "cwd",
+            "resource_keys_json",
+            "runtime_seconds",
+            "cpu_weight",
+            "io_weight",
+            "memory_max_bytes",
+            "chronik_outbox_enabled",
+            "chronik_outbox_state_root",
+            "chronik_context_json",
+            "execution_backend",
+            "systemd_scope",
+        )
+        assignments = ", ".join(f"{column}=?" for column in identity_columns)
+        with tasks._database() as connection:
+            connection.execute(
+                f"UPDATE tasks SET launcher_json=?, {assignments} WHERE task_id=?",
+                (
+                    json.dumps(
+                        failed_launcher,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    *(running_row[column] for column in identity_columns),
+                    failed["task_id"],
+                ),
+            )
+
+        page = attention.reconcile_attention(
+            {"limit": 20, "view": "current"},
+            _bounded_current_projection=True,
+            _current_work_task_ids=set(),
+        )
+
+        returned = {item["task_id"] for item in page["records"]}
+        self.assertIn(source["task_id"], returned)
+        self.assertIn(failed["task_id"], returned)
+        self.assertNotIn(running["task_id"], returned)
+        self.assertFalse(page["current_work_orphan_filter_safe"])
+        self.assertEqual("degraded", page["attention_convergence_status"])
+        self.assertEqual(
+            "TerminalConvergenceError",
+            page["attention_convergence_error"],
+        )
+
     def test_current_work_attention_valid_json_malformed_retry_fails_visible(
         self,
     ) -> None:

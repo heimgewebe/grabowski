@@ -3515,6 +3515,7 @@ def _current_work_direct_retry_convergence(
     )
     binding_by_task: dict[str, dict[str, Any]] = {}
     record_by_task: dict[str, dict[str, Any]] = {}
+    successor_task_ids_by_source: dict[str, set[str]] = {}
     support_by_source: dict[str, list[dict[str, Any]]] = {}
     direct_source_task_ids: set[str] = set()
 
@@ -3540,10 +3541,17 @@ def _current_work_direct_retry_convergence(
         record_by_task[task_id] = record
         binding_by_task[task_id] = retry_binding
         source_task_id = str(retry_binding["source_task_id"])
+        successor_task_ids_by_source.setdefault(source_task_id, set()).add(task_id)
         if state in terminal_convergence.RETRY_SUCCESSOR_SUPPORT_STATES:
             support_by_source.setdefault(source_task_id, []).append(record)
             if source_task_id in attention_task_ids:
                 direct_source_task_ids.add(source_task_id)
+
+    for source_task_id in direct_source_task_ids:
+        if len(successor_task_ids_by_source.get(source_task_id, ())) > 1:
+            raise terminal_convergence.TerminalConvergenceError(
+                "persisted retry source has multiple successors"
+            )
 
     attention_by_task: dict[str, dict[str, Any]] = {}
     support_by_task: dict[str, dict[str, Any]] = {}
