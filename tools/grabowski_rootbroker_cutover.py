@@ -30,6 +30,9 @@ COMMAND_IDENTITY_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_comman
 BROKER_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_privileged_broker.py")
 SECRET_PTY_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_secret_pty.py")
 BROKER_WRAPPER_TARGET = Path("/usr/local/libexec/grabowski-privileged-broker")
+CRITICAL_USER_DATA_INVENTORY_TARGET = Path(
+    "/usr/local/libexec/grabowski-critical-user-data-inventory"
+)
 PROCESS_OBSERVER_TARGET = Path("/usr/local/libexec/grabowski-process-reference-observer")
 PLATFORM_CONNECTOR_CAPTURE_TARGET = Path(
     "/usr/local/libexec/grabowski-platform-connector-capture"
@@ -72,6 +75,12 @@ ROOTBROKER_CUTOVER_ACTION = "operator_rootbroker_cutover"
 SECRET_PTY_ACTION = "operator_secret_pty_getpass_probe"
 BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
 ROOT_TASK_ACTION = "operator_root_task_systemd_unit"
+CRITICAL_USER_DATA_INVENTORY_ACTION = "critical_user_data_inventory"
+CRITICAL_USER_DATA_INVENTORY_TARGET_PATTERN = (
+    r'\{"contract_sha256":"[0-9a-f]{64}",'
+    r'"operation":"(?:start|status|result)",'
+    r'"scanner_sha256":"[0-9a-f]{64}","schema_version":1\}'
+)
 PROCESS_OBSERVER_ACTION = "observe_process_references"
 PLATFORM_CONNECTOR_CAPTURE_ACTION = "platform_connector_capture"
 BOOTSTRAP_RECOVERY_ACTION = "runtime_bootstrap_recover"
@@ -192,6 +201,12 @@ ARTIFACTS = (
     Artifact(
         "tools/grabowski_privileged_broker.py",
         BROKER_WRAPPER_TARGET,
+        0o755,
+        True,
+    ),
+    Artifact(
+        "tools/grabowski_critical_user_data_inventory.py",
+        CRITICAL_USER_DATA_INVENTORY_TARGET,
         0o755,
         True,
     ),
@@ -1466,6 +1481,58 @@ def _root_task_action_from_repository(
 
 
 
+def _critical_user_data_inventory_action_from_repository(
+    repository: Path,
+    *,
+    expected_head: str,
+    runner: RunCommand,
+) -> dict[str, Any]:
+    relative_path = "config/privileged-actions.example.json"
+    data = _repository_blob(
+        repository,
+        commit_id=expected_head,
+        relative_path=relative_path,
+        runner=runner,
+    )
+    example = _decode_json_object(data, label=relative_path)
+    actions = example.get("actions")
+    if not isinstance(actions, dict):
+        raise CutoverError("example privileged action catalog is malformed")
+    action = actions.get(CRITICAL_USER_DATA_INVENTORY_ACTION)
+    if not isinstance(action, dict):
+        raise CutoverError("example catalog has no critical-user-data inventory action")
+    required = {
+        "enabled", "mode", "target_pattern", "argv", "timeout_seconds",
+        "kill_switch_path", "legacy_kill_switch_path",
+        "allowed_peer_unit", "allowed_peer_uid",
+    }
+    if set(action) != required:
+        raise CutoverError("critical-user-data inventory action keys are invalid")
+    if action.get("enabled") is not True or action.get("mode") != "template":
+        raise CutoverError(
+            "critical-user-data inventory action must be an enabled template"
+        )
+    if action.get("target_pattern") != CRITICAL_USER_DATA_INVENTORY_TARGET_PATTERN:
+        raise CutoverError("critical-user-data inventory target pattern is invalid")
+    if action.get("argv") != [
+        str(CRITICAL_USER_DATA_INVENTORY_TARGET), "{target}",
+    ]:
+        raise CutoverError("critical-user-data inventory argv is invalid")
+    if action.get("timeout_seconds") != 90:
+        raise CutoverError("critical-user-data inventory broker timeout is invalid")
+    if (
+        action.get("kill_switch_path") != str(CANONICAL_KILL_SWITCH)
+        or action.get("legacy_kill_switch_path") != str(LEGACY_KILL_SWITCH)
+    ):
+        raise CutoverError("critical-user-data inventory blockade binding is invalid")
+    if (
+        action.get("allowed_peer_uid") != 1000
+        or action.get("allowed_peer_unit") != OPERATOR_UNIT
+    ):
+        raise CutoverError("critical-user-data inventory peer binding is invalid")
+    return json.loads(json.dumps(action))
+
+
 def _process_observer_action_from_repository(
     repository: Path,
     *,
@@ -1875,6 +1942,7 @@ def merge_privileged_config(
     power: dict[str, Any] | None = None,
     lifecycle: dict[str, Any] | None = None,
     root_task: dict[str, Any] | None = None,
+    critical_user_data_inventory: dict[str, Any] | None = None,
     process_observer: dict[str, Any] | None = None,
     platform_connector_capture: dict[str, Any] | None = None,
     bootstrap_recovery: dict[str, Any] | None = None,
@@ -2048,6 +2116,21 @@ def merge_privileged_config(
             )
         merged_actions[ROOT_TASK_ACTION] = json.loads(json.dumps(root_task))
 
+    critical_inventory_before = actions.get(CRITICAL_USER_DATA_INVENTORY_ACTION)
+    if critical_user_data_inventory is not None:
+        if (
+            not allow_controlled_updates
+            and critical_inventory_before is not None
+            and critical_inventory_before != critical_user_data_inventory
+        ):
+            raise CutoverError(
+                "installed critical-user-data inventory action differs "
+                "from commit-bound contract"
+            )
+        merged_actions[CRITICAL_USER_DATA_INVENTORY_ACTION] = json.loads(
+            json.dumps(critical_user_data_inventory)
+        )
+
     if merged_power != power:
         raise CutoverError("operator power action differs from commit-bound contract")
 
@@ -2056,6 +2139,8 @@ def merge_privileged_config(
         controlled.add(BLOCKADE_LIFECYCLE_ACTION)
     if root_task is not None:
         controlled.add(ROOT_TASK_ACTION)
+    if critical_user_data_inventory is not None:
+        controlled.add(CRITICAL_USER_DATA_INVENTORY_ACTION)
     if process_observer is not None:
         controlled.add(PROCESS_OBSERVER_ACTION)
     if platform_connector_capture is not None:
@@ -2082,6 +2167,15 @@ def merge_privileged_config(
             _sha256(_canonical_json(root_task)) if root_task is not None else None
         ),
         "root_task_preexisting": root_task_before is not None,
+        "critical_user_data_inventory_sha256": (
+            _sha256(_canonical_json(critical_user_data_inventory))
+            if critical_user_data_inventory is not None else None
+        ),
+        "critical_user_data_inventory_preexisting": critical_inventory_before is not None,
+        "critical_user_data_inventory_before_sha256": (
+            _sha256(_canonical_json(critical_inventory_before))
+            if isinstance(critical_inventory_before, dict) else None
+        ),
         "process_observer_sha256": (
             _sha256(_canonical_json(process_observer))
             if process_observer is not None else None
@@ -2166,6 +2260,7 @@ def _operator_authority_attestation(
         "broker_module": BROKER_MODULE_TARGET,
         "secret_pty_module": SECRET_PTY_MODULE_TARGET,
         "broker_wrapper": BROKER_WRAPPER_TARGET,
+        "critical_user_data_inventory": CRITICAL_USER_DATA_INVENTORY_TARGET,
         "platform_connector_capture": PLATFORM_CONNECTOR_CAPTURE_TARGET,
         "cutover_helper": CUTOVER_HELPER_TARGET,
         "operator_service": OPERATOR_SERVICE_TARGET,
@@ -2188,6 +2283,7 @@ def _operator_authority_attestation(
     rootbroker_cutover = actions.get(ROOTBROKER_CUTOVER_ACTION)
     secret_pty = actions.get(SECRET_PTY_ACTION)
     platform_connector_capture = actions.get(PLATFORM_CONNECTOR_CAPTURE_ACTION)
+    critical_user_data_inventory = actions.get(CRITICAL_USER_DATA_INVENTORY_ACTION)
     local_backup_storage = {
         name: actions.get(name) for name in LOCAL_BACKUP_STORAGE_ACTIONS
     }
@@ -2200,6 +2296,7 @@ def _operator_authority_attestation(
             rootbroker_cutover,
             secret_pty,
             platform_connector_capture,
+            critical_user_data_inventory,
         )
     ):
         raise CutoverError("operator authority attestation actions are incomplete")
@@ -2218,6 +2315,7 @@ def _operator_authority_attestation(
     assert isinstance(rootbroker_cutover, dict)
     assert isinstance(secret_pty, dict)
     assert isinstance(platform_connector_capture, dict)
+    assert isinstance(critical_user_data_inventory, dict)
     if (
         secret_pty.get("allowed_peer_uid") != 1000
         or secret_pty.get("allowed_peer_unit") != OPERATOR_UNIT
@@ -2232,6 +2330,23 @@ def _operator_authority_attestation(
         or platform_connector_capture.get("allowed_peer_unit") != OPERATOR_UNIT
     ):
         raise CutoverError("platform connector capture authority binding is incoherent")
+    if (
+        critical_user_data_inventory.get("allowed_peer_uid") != 1000
+        or critical_user_data_inventory.get("allowed_peer_unit") != OPERATOR_UNIT
+        or critical_user_data_inventory.get("mode") != "template"
+        or critical_user_data_inventory.get("target_pattern")
+        != CRITICAL_USER_DATA_INVENTORY_TARGET_PATTERN
+        or critical_user_data_inventory.get("argv")
+        != [str(CRITICAL_USER_DATA_INVENTORY_TARGET), "{target}"]
+        or critical_user_data_inventory.get("timeout_seconds") != 90
+        or critical_user_data_inventory.get("kill_switch_path")
+        != str(CANONICAL_KILL_SWITCH)
+        or critical_user_data_inventory.get("legacy_kill_switch_path")
+        != str(LEGACY_KILL_SWITCH)
+    ):
+        raise CutoverError(
+            "critical-user-data inventory authority binding is incoherent"
+        )
     peer_binding = {
         "allowed_peer_uid": power.get("allowed_peer_uid"),
         "allowed_peer_unit": power.get("allowed_peer_unit"),
@@ -2265,6 +2380,9 @@ def _operator_authority_attestation(
             SECRET_PTY_ACTION: _sha256(_canonical_json(secret_pty)),
             PLATFORM_CONNECTOR_CAPTURE_ACTION: _sha256(
                 _canonical_json(platform_connector_capture)
+            ),
+            CRITICAL_USER_DATA_INVENTORY_ACTION: _sha256(
+                _canonical_json(critical_user_data_inventory)
             ),
             **{
                 name: _sha256(_canonical_json(action))
@@ -2797,6 +2915,9 @@ def _apply_cutover_locked(
         runner=runner,
         automatic=automatic,
     )
+    critical_user_data_inventory = _critical_user_data_inventory_action_from_repository(
+        repository, expected_head=expected_head, runner=runner
+    )
     process_observer = _process_observer_action_from_repository(
         repository, expected_head=expected_head, runner=runner
     )
@@ -2838,6 +2959,7 @@ def _apply_cutover_locked(
         power=power,
         lifecycle=lifecycle,
         root_task=root_task,
+        critical_user_data_inventory=critical_user_data_inventory,
         process_observer=process_observer,
         platform_connector_capture=platform_connector_capture,
         bootstrap_recovery=bootstrap_recovery,
@@ -3162,6 +3284,9 @@ def build_plan(*, repository: Path, expected_head: str, runner: RunCommand = _ru
         expected_head=expected_head,
         runner=runner,
     )
+    critical_user_data_inventory = _critical_user_data_inventory_action_from_repository(
+        repository, expected_head=expected_head, runner=runner
+    )
     process_observer = _process_observer_action_from_repository(
         repository, expected_head=expected_head, runner=runner
     )
@@ -3195,6 +3320,7 @@ def build_plan(*, repository: Path, expected_head: str, runner: RunCommand = _ru
         power=power,
         lifecycle=lifecycle,
         root_task=root_task,
+        critical_user_data_inventory=critical_user_data_inventory,
         process_observer=process_observer,
         platform_connector_capture=platform_connector_capture,
         bootstrap_recovery=bootstrap_recovery,

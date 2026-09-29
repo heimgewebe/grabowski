@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "177efc86ed2c43354072d54b0d680f556726ec2a875f2b23af285a93f2636aa7",
+  "capability_source_sha256": "e042dea331207f7be8e0b0240e1f2ba0db632b5cb6211f6f72d8aa116ebab82f",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "903f961d255993b8d66571935884cdf1724aef2d9236a28a71b47dbf86cfffcb",
+  "contract_sha256": "1b6d9b6c3f80460941ab774ae72d14b627dfcf14834e4f6ad45a5d593dc14d58",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1028,6 +1028,22 @@
       "reversibility": "not-applicable",
       "risk_class": "medium",
       "tool": "grabowski_privileged_action_reference"
+    },
+    {
+      "category": "privileged-execution",
+      "description": "Run or read one SHA-pinned authoritative critical-user-data inventory.",
+      "effects": [
+        "root-read-only-home-traversal",
+        "root-read-only-docker-volume-traversal",
+        "root-systemd-task-start",
+        "root-owned-inventory-evidence-write"
+      ],
+      "id": "grabowski_critical_user_data_inventory",
+      "purpose": "Start or read one fixed-path SHA-pinned authoritative critical-user-data inventory through the root-owned broker without arbitrary argv or paths.",
+      "read_only": false,
+      "reversibility": "no-user-data-mutation-root-owned-evidence-retained",
+      "risk_class": "high",
+      "tool": "grabowski_critical_user_data_inventory"
     },
     {
       "category": "privileged-execution",

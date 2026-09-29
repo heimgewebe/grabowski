@@ -167,6 +167,7 @@ PROCESS_REFERENCE_LEXICAL_ROOTS = (
 BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
 ROOT_TASK_SYSTEMD_ACTION = "operator_root_task_systemd_unit"
 ROOTBROKER_CUTOVER_ACTION = "operator_rootbroker_cutover"
+CRITICAL_USER_DATA_INVENTORY_ACTION = "critical_user_data_inventory"
 OPERATOR_AUTHORITY_ATTESTATION_PATH = Path(
     "/var/lib/grabowski/operator-authority-attestation.v1.json"
 )
@@ -1038,6 +1039,321 @@ def observe_process_references(
         "reference_count": len(observation["path_references"]),
     })
     return observation
+
+
+def _critical_inventory_digest(value: Any, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{label} must be one lowercase SHA-256 digest")
+    return value
+
+
+def _critical_inventory_projection(
+    value: Any,
+    *,
+    scanner_sha256: str,
+    contract_sha256: str,
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or value.get("schema_version") != 1:
+        raise RuntimeError("critical-user-data inventory response is invalid")
+    kind = value.get("kind")
+    status = value.get("status")
+    observed_scanner = value.get("scanner_sha256")
+    observed_contract = value.get("contract_sha256")
+    if observed_scanner is not None and observed_scanner != scanner_sha256:
+        raise RuntimeError("critical-user-data inventory scanner binding drifted")
+    if observed_contract is not None and observed_contract != contract_sha256:
+        raise RuntimeError("critical-user-data inventory contract binding drifted")
+
+    base: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": kind,
+        "status": status,
+        "scanner_sha256": scanner_sha256,
+        "contract_sha256": contract_sha256,
+    }
+    common_keys = {
+        "schema_version",
+        "kind",
+        "status",
+        "scanner_sha256",
+        "contract_sha256",
+    }
+    if kind == "grabowski.critical_user_data_inventory_error.v1":
+        if (
+            status != "blocked"
+            or not {"schema_version", "kind", "status"}.issubset(value)
+            or not set(value).issubset(common_keys)
+        ):
+            raise RuntimeError("critical-user-data inventory error is malformed")
+        return base
+
+    if kind == "grabowski.critical_user_data_inventory_start.v1":
+        expected = common_keys | {"unit", "runtime_seconds"}
+        if set(value) != expected or status != "started":
+            raise RuntimeError("critical-user-data inventory start is malformed")
+        runtime_seconds = value.get("runtime_seconds")
+        unit = value.get("unit")
+        if (
+            isinstance(runtime_seconds, bool)
+            or not isinstance(runtime_seconds, int)
+            or runtime_seconds <= 0
+            or not isinstance(unit, str)
+            or not unit
+        ):
+            raise RuntimeError("critical-user-data inventory start metadata is invalid")
+        return {
+            **base,
+            "unit": unit,
+            "runtime_seconds": runtime_seconds,
+        }
+
+    if kind == "grabowski.critical_user_data_inventory_status.v1":
+        expected = common_keys | {"unit", "unit_state", "result_sha256"}
+        if (
+            set(value) != expected
+            or status not in {"running", "not-started", "passed", "failed"}
+        ):
+            raise RuntimeError("critical-user-data inventory status is malformed")
+        unit = value.get("unit")
+        unit_state = value.get("unit_state")
+        result_sha256 = value.get("result_sha256")
+        if (
+            not isinstance(unit, str)
+            or not unit
+            or not isinstance(unit_state, dict)
+            or set(unit_state) != {"load", "active", "sub", "result"}
+            or not all(isinstance(item, str) for item in unit_state.values())
+        ):
+            raise RuntimeError("critical-user-data inventory unit state is invalid")
+        if result_sha256 is not None:
+            _critical_inventory_digest(result_sha256, "result_sha256")
+        return {
+            **base,
+            "unit": unit,
+            "unit_state": dict(unit_state),
+            "result_sha256": result_sha256,
+        }
+
+    if kind != "grabowski.critical_user_data_inventory_result.v1":
+        raise RuntimeError("critical-user-data inventory response kind is invalid")
+    result_sha256 = _critical_inventory_digest(
+        value.get("result_sha256"), "result_sha256"
+    )
+    completed_at = value.get("completed_at_unix")
+    unit = value.get("unit")
+    if (
+        isinstance(completed_at, bool)
+        or not isinstance(completed_at, int)
+        or completed_at < 0
+        or not isinstance(unit, str)
+        or not unit
+        or status not in {"passed", "failed"}
+    ):
+        raise RuntimeError("critical-user-data inventory result metadata is invalid")
+
+    if status == "failed":
+        expected = common_keys | {
+            "unit",
+            "completed_at_unix",
+            "result_sha256",
+            "failure_code",
+            "returncode",
+            "stdout_sha256",
+            "stdout_bytes",
+            "stderr_sha256",
+            "stderr_bytes",
+        }
+        if set(value) != expected:
+            raise RuntimeError("critical-user-data inventory failure fields are invalid")
+        failure_code = value.get("failure_code")
+        returncode = value.get("returncode")
+        if (
+            not isinstance(failure_code, str)
+            or not failure_code
+            or isinstance(returncode, bool)
+            or not isinstance(returncode, int)
+        ):
+            raise RuntimeError("critical-user-data inventory failure is malformed")
+        digests: dict[str, Any] = {}
+        for key in ("stdout_sha256", "stderr_sha256"):
+            digests[key] = _critical_inventory_digest(value.get(key), key)
+        for key in ("stdout_bytes", "stderr_bytes"):
+            item = value.get(key)
+            if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+                raise RuntimeError("critical-user-data inventory failure size is invalid")
+            digests[key] = item
+        return {
+            **base,
+            "completed_at_unix": completed_at,
+            "result_sha256": result_sha256,
+            "failure_code": failure_code,
+            "returncode": returncode,
+            **digests,
+        }
+
+    expected_result = common_keys | {
+        "unit",
+        "completed_at_unix",
+        "result_sha256",
+        "inventory",
+    }
+    if set(value) != expected_result:
+        raise RuntimeError("critical-user-data inventory result fields are invalid")
+    inventory = value.get("inventory")
+    required_inventory = {
+        "schema_version",
+        "kind",
+        "scope",
+        "scope_semantics",
+        "algorithm",
+        "critical_scope_sha256",
+        "contract_sha256",
+        "authoritative_inventory",
+        "inventory_sha256",
+        "member_count",
+        "record_count",
+        "type_counts",
+        "regular_file_bytes",
+        "exclusion_boundary_count",
+        "exclusion_boundary_sha256",
+        "exclusion_class_counts",
+        "exclusion_samples",
+        "production_effects_authorized",
+    }
+    if not isinstance(inventory, dict) or set(inventory) != required_inventory:
+        raise RuntimeError("critical-user-data inventory aggregate is invalid")
+    if (
+        inventory.get("schema_version") != 1
+        or inventory.get("kind")
+        != "heim_pc.critical_user_data_aggregate_inventory.v1"
+        or inventory.get("scope") != "critical-user-data"
+        or inventory.get("scope_semantics") != "explicit-root-set-default-include"
+        or inventory.get("algorithm") != "member-inventory-sha256-v1"
+        or inventory.get("critical_scope_sha256") != contract_sha256
+        or inventory.get("contract_sha256") != contract_sha256
+        or inventory.get("authoritative_inventory") is not True
+        or inventory.get("production_effects_authorized") is not False
+        or inventory.get("exclusion_samples") != []
+        or inventory.get("member_count") != 2
+    ):
+        raise RuntimeError("critical-user-data inventory aggregate binding is invalid")
+    inventory_sha256 = _critical_inventory_digest(
+        inventory.get("inventory_sha256"), "inventory_sha256"
+    )
+    exclusion_sha256 = _critical_inventory_digest(
+        inventory.get("exclusion_boundary_sha256"), "exclusion_boundary_sha256"
+    )
+    for key in ("record_count", "regular_file_bytes", "exclusion_boundary_count"):
+        item = inventory.get(key)
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            raise RuntimeError(f"critical-user-data inventory {key} is invalid")
+    type_counts = inventory.get("type_counts")
+    exclusion_classes = inventory.get("exclusion_class_counts")
+    if (
+        not isinstance(type_counts, dict)
+        or set(type_counts) != {"directory", "regular", "symlink"}
+        or not all(
+            isinstance(item, int) and not isinstance(item, bool) and item >= 0
+            for item in type_counts.values()
+        )
+        or sum(type_counts.values()) != inventory["record_count"]
+        or not isinstance(exclusion_classes, dict)
+        or not all(
+            isinstance(name, str)
+            and name
+            and isinstance(item, int)
+            and not isinstance(item, bool)
+            and item >= 0
+            for name, item in exclusion_classes.items()
+        )
+        or sum(exclusion_classes.values()) != inventory["exclusion_boundary_count"]
+    ):
+        raise RuntimeError("critical-user-data inventory counts are invalid")
+    return {
+        **base,
+        "completed_at_unix": completed_at,
+        "result_sha256": result_sha256,
+        "inventory_sha256": inventory_sha256,
+        "record_count": inventory["record_count"],
+        "type_counts": dict(sorted(type_counts.items())),
+        "regular_file_bytes": inventory["regular_file_bytes"],
+        "exclusion_boundary_count": inventory["exclusion_boundary_count"],
+        "exclusion_boundary_sha256": exclusion_sha256,
+        "exclusion_class_counts": dict(sorted(exclusion_classes.items())),
+    }
+
+
+@mcp.tool(name="grabowski_critical_user_data_inventory", annotations=MUTATING)
+def grabowski_critical_user_data_inventory(
+    operation: str,
+    scanner_sha256: str,
+    contract_sha256: str,
+) -> dict[str, Any]:
+    """Run or read one SHA-pinned authoritative critical-user-data inventory."""
+    operator._require_operator_mutation("power_execute")
+    if operation not in {"start", "status", "result"}:
+        raise ValueError("operation must be start, status, or result")
+    scanner = _critical_inventory_digest(scanner_sha256, "scanner_sha256")
+    contract = _critical_inventory_digest(contract_sha256, "contract_sha256")
+    target = json.dumps(
+        {
+            "schema_version": 1,
+            "operation": operation,
+            "scanner_sha256": scanner,
+            "contract_sha256": contract,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    invoked = _invoke_privileged_reference(
+        action=CRITICAL_USER_DATA_INVENTORY_ACTION,
+        target=target,
+        justification=(
+            "Operate the fixed-path SHA-pinned read-only Heim-PC "
+            "critical-user-data authoritative inventory"
+        ),
+        timeout_seconds=90,
+        max_output_bytes=128 * 1024,
+    )
+    if invoked.get("broker_client_timed_out") is True:
+        raise RuntimeError("critical-user-data inventory broker request timed out")
+    outer = invoked.get("broker_response")
+    if not isinstance(outer, dict):
+        raise RuntimeError("critical-user-data inventory broker response is invalid")
+    raw = outer.get("stdout")
+    if not isinstance(raw, str) or not raw:
+        raise RuntimeError("critical-user-data inventory broker omitted safe output")
+    try:
+        inner = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "critical-user-data inventory broker output is invalid"
+        ) from exc
+    result = _critical_inventory_projection(
+        inner,
+        scanner_sha256=scanner,
+        contract_sha256=contract,
+    )
+    broker_returncode = outer.get("returncode")
+    timed_out = outer.get("timed_out")
+    if isinstance(broker_returncode, bool) or not isinstance(broker_returncode, int):
+        raise RuntimeError("critical-user-data inventory broker returncode is invalid")
+    if timed_out is not False:
+        raise RuntimeError("critical-user-data inventory broker execution timed out")
+    return {
+        "success": broker_returncode == 0 and result["status"] != "blocked",
+        "operation": operation,
+        "scanner_sha256": scanner,
+        "contract_sha256": contract,
+        "request_id": invoked["request_id"],
+        "reference_sha256": invoked["reference_sha256"],
+        "broker_returncode": broker_returncode,
+        "result": result,
+    }
 
 
 @mcp.tool(name="grabowski_power_run", annotations=MUTATING)
