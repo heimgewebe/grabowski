@@ -393,9 +393,12 @@ class SyncToolAllocatorTrimTests(unittest.TestCase):
             operator.time, "monotonic", side_effect=[100.0, 101.0, 131.0]
         ), patch.object(
             operator, "_SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC", float("-inf")
-        ):
+        ), patch.object(
+            operator, "_schedule_sync_tool_allocator_trim_retry_locked"
+        ) as schedule_retry:
             self.assertTrue(operator._maybe_trim_sync_tool_allocator())
             self.assertFalse(operator._maybe_trim_sync_tool_allocator())
+            schedule_retry.assert_called_once_with(29.0)
             self.assertTrue(operator._maybe_trim_sync_tool_allocator())
         self.assertEqual([0, 0], calls)
 
@@ -435,9 +438,12 @@ class SyncToolAllocatorTrimTests(unittest.TestCase):
             operator.time, "monotonic", return_value=101.0
         ), patch.object(
             operator, "_SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC", 100.0
-        ):
+        ), patch.object(
+            operator, "_schedule_sync_tool_allocator_trim_retry_locked"
+        ) as schedule_retry:
             self.assertFalse(operator._maybe_trim_sync_tool_allocator())
             self.assertTrue(operator._SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED)
+            schedule_retry.assert_called_once_with(29.0)
             self.assertEqual([], calls)
 
         identity = operator._deployment_admission_register_tool_call(
@@ -454,6 +460,153 @@ class SyncToolAllocatorTrimTests(unittest.TestCase):
 
         self.assertEqual([0], calls)
         self.assertFalse(operator._SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED)
+
+    def test_trim_cooldown_retry_runs_without_a_later_tool_release(self) -> None:
+        operator = _load_operator_module()
+        calls: list[int] = []
+        timers: list[object] = []
+
+        class FakeTimer:
+            def __init__(self, interval, function, args=()):
+                self.interval = interval
+                self.function = function
+                self.args = args
+                self.daemon = False
+                self.started = False
+                self.cancelled = False
+                timers.append(self)
+
+            def start(self):
+                self.started = True
+
+            def cancel(self):
+                self.cancelled = True
+
+            def fire(self):
+                self.function(*self.args)
+
+        libc = self._libc(
+            operator.SYNC_TOOL_ALLOCATOR_TRIM_FREE_BYTES,
+            calls,
+        )
+        monotonic = [101.0]
+        with patch.object(operator.threading, "Timer", FakeTimer), patch.object(
+            operator, "_sync_tool_allocator_libc", return_value=libc
+        ), patch.object(
+            operator.time, "monotonic", side_effect=lambda: monotonic[0]
+        ), patch.object(
+            operator, "_SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC", 100.0
+        ):
+            self.assertFalse(operator._maybe_trim_sync_tool_allocator())
+            self.assertEqual(1, len(timers))
+            timer = timers[0]
+            self.assertEqual(29.0, timer.interval)
+            self.assertTrue(timer.daemon)
+            self.assertTrue(timer.started)
+            self.assertTrue(operator._SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED)
+
+            monotonic[0] = 130.0
+            timer.fire()
+
+        self.assertEqual([0], calls)
+        self.assertFalse(operator._SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED)
+        self.assertIsNone(operator._SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER)
+
+    def test_trim_cooldown_retry_rechecks_global_idle(self) -> None:
+        operator = _load_operator_module()
+        calls: list[int] = []
+        timers: list[object] = []
+
+        class FakeTimer:
+            def __init__(self, interval, function, args=()):
+                self.function = function
+                self.args = args
+                self.daemon = False
+                timers.append(self)
+
+            def start(self):
+                pass
+
+            def cancel(self):
+                pass
+
+            def fire(self):
+                self.function(*self.args)
+
+        libc = self._libc(
+            operator.SYNC_TOOL_ALLOCATOR_TRIM_FREE_BYTES,
+            calls,
+        )
+        monotonic = [101.0]
+        with patch.object(operator.threading, "Timer", FakeTimer), patch.object(
+            operator, "_sync_tool_allocator_libc", return_value=libc
+        ), patch.object(
+            operator.time, "monotonic", side_effect=lambda: monotonic[0]
+        ), patch.object(
+            operator, "_SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC", 100.0
+        ):
+            self.assertFalse(operator._maybe_trim_sync_tool_allocator())
+            identity = operator._deployment_admission_register_tool_call(
+                "still-active", operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC
+            )
+            monotonic[0] = 130.0
+            timers[0].fire()
+            self.assertEqual([], calls)
+            self.assertTrue(operator._SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED)
+            self.assertTrue(operator._deployment_admission_release_tool_call(identity))
+
+        self.assertEqual([0], calls)
+        self.assertFalse(operator._SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED)
+
+    def test_trim_cooldown_retry_is_coalesced_and_stale_callback_is_ignored(
+        self,
+    ) -> None:
+        operator = _load_operator_module()
+        calls: list[int] = []
+        timers: list[object] = []
+
+        class FakeTimer:
+            def __init__(self, interval, function, args=()):
+                self.function = function
+                self.args = args
+                self.daemon = False
+                self.cancelled = False
+                timers.append(self)
+
+            def start(self):
+                pass
+
+            def cancel(self):
+                self.cancelled = True
+
+            def fire(self):
+                self.function(*self.args)
+
+        libc = self._libc(
+            operator.SYNC_TOOL_ALLOCATOR_TRIM_FREE_BYTES,
+            calls,
+        )
+        monotonic = [101.0]
+        with patch.object(operator.threading, "Timer", FakeTimer), patch.object(
+            operator, "_sync_tool_allocator_libc", return_value=libc
+        ), patch.object(
+            operator.time, "monotonic", side_effect=lambda: monotonic[0]
+        ), patch.object(
+            operator, "_SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC", 100.0
+        ):
+            self.assertFalse(operator._maybe_trim_sync_tool_allocator())
+            monotonic[0] = 102.0
+            self.assertFalse(operator._maybe_trim_sync_tool_allocator())
+            self.assertEqual(1, len(timers))
+
+            monotonic[0] = 131.0
+            self.assertTrue(operator._maybe_trim_sync_tool_allocator())
+            self.assertTrue(timers[0].cancelled)
+            timers[0].fire()
+
+        self.assertEqual([0], calls)
+        self.assertFalse(operator._SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED)
+        self.assertIsNone(operator._SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER)
 
     def test_trim_is_fail_soft_when_glibc_allocator_api_is_unavailable(self) -> None:
         operator = _load_operator_module()
