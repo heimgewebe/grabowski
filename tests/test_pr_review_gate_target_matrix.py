@@ -110,6 +110,7 @@ class PrReviewGateTargetMatrixTests(unittest.TestCase):
             "heimgewebe/hauski-audio": ("scan",),
             "Hall-of-Memory/Hall-of-Memory": ("verify",),
             "alexdermohr/livia": ("quality",),
+            "alexdermohr/mark-api": ("verify",),
             "heimgewebe/metarepo": ("ci (ubuntu-latest)", "ci (macos-latest)"),
             "heimgewebe/systemkatalog": ("Repository Contract", "Secret Scan"),
         }

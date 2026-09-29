@@ -63,6 +63,7 @@ class DurableSystemdContractTests(unittest.TestCase):
         self.assertIn("/home/alex/.local/state/bureau", read_write_paths)
         self.assertIn("/home/alex/repos", read_write_paths)
         self.assertIn("/home/alex/grabowski-workspace", read_write_paths)
+        self.assertIn("-/home/alex/worktrees", read_write_paths)
         self.assertNotIn("/home/alex/.local/state", read_write_paths)
         self.assertIn("ProtectSystem=strict", text)
         self.assertIn("ProtectHome=read-only", text)
