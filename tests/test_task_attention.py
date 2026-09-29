@@ -2811,6 +2811,50 @@ class TaskAttentionTests(unittest.TestCase):
             ],
         )
 
+    def test_current_work_attention_valid_json_malformed_retry_fails_visible(
+        self,
+    ) -> None:
+        unrelated = self._failed_task()
+        source, successor = self._verified_retry_pair(successor_state="running")
+        successor_row = tasks._row_raw(str(successor["task_id"]))
+        launcher = json.loads(str(successor_row["launcher_json"]))
+        launcher["retry_binding"] = {"junk": "still-present"}
+        with tasks._database() as connection:
+            connection.execute(
+                "UPDATE tasks SET launcher_json=? WHERE task_id=?",
+                (
+                    json.dumps(
+                        launcher,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    successor["task_id"],
+                ),
+            )
+
+        page = attention.reconcile_attention(
+            {"limit": 20, "view": "current"},
+            _bounded_current_projection=True,
+            _current_work_task_ids={str(successor["task_id"])},
+        )
+
+        returned = {item["task_id"] for item in page["records"]}
+        self.assertIn(unrelated["task_id"], returned)
+        self.assertIn(source["task_id"], returned)
+        self.assertFalse(page["current_work_orphan_filter_safe"])
+        self.assertEqual("degraded", page["attention_convergence_status"])
+        self.assertEqual(
+            "TerminalConvergenceError",
+            page["attention_convergence_error"],
+        )
+        self.assertEqual(
+            0,
+            page["filtered_classification_counts"][
+                "unbound_historical_attention"
+            ],
+        )
+
     def test_current_work_attention_malformed_retry_fails_visible(self) -> None:
         source, successor = self._verified_retry_pair(successor_state="running")
         successor_row = tasks._row_raw(str(successor["task_id"]))

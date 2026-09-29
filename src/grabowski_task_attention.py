@@ -3628,7 +3628,43 @@ def reconcile_attention(
                     ATTENTION_STATES,
                 )
             }
+            retry_validation_states = tuple(
+                sorted(
+                    set(ATTENTION_STATES)
+                    | set(terminal_convergence.RETRY_SUCCESSOR_SUPPORT_STATES)
+                )
+            )
+            retry_validation_placeholders = ",".join(
+                "?" for _ in retry_validation_states
+            )
             try:
+                retry_binding_rows = tasks._task_attention_records(
+                    connection.execute(
+                        f"SELECT {_ATTENTION_SELECT_COLUMNS} FROM tasks "
+                        f"WHERE state IN ({retry_validation_placeholders}) "
+                        "AND ("
+                        "(json_valid(launcher_json) "
+                        "AND json_type(launcher_json, '$.retry_binding') IS NOT NULL) "
+                        "OR (NOT json_valid(launcher_json) "
+                        "AND instr(launcher_json, ?) > 0)"
+                        ") "
+                        "ORDER BY created_at_unix DESC, task_id DESC LIMIT ?",
+                        (
+                            *retry_validation_states,
+                            '"retry_binding"',
+                            MAX_CURRENT_CONVERGENCE_ROWS + 1,
+                        ),
+                    )
+                )
+                if len(retry_binding_rows) > MAX_CURRENT_CONVERGENCE_ROWS:
+                    raise RuntimeError(
+                        "current_work retry validation scan limit exceeded"
+                    )
+                for retry_candidate in retry_binding_rows:
+                    terminal_convergence.persisted_retry_binding(
+                        dict(retry_candidate)
+                    )
+
                 retry_successors = tasks._task_retry_successor_records(
                     connection,
                     source_task_ids=attention_task_ids,
