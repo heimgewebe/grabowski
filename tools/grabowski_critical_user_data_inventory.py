@@ -54,6 +54,7 @@ MAX_SCANNER_BYTES = 2 * 1024 * 1024
 MAX_CONTRACT_BYTES = 512 * 1024
 MAX_SCANNER_OUTPUT_BYTES = 128 * 1024
 MAX_RESULT_BYTES = 256 * 1024
+MAX_DOCKER_EVENT_OUTPUT_BYTES = 64 * 1024
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 CLASS_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
 SAFE_ENV = {
@@ -582,6 +583,132 @@ def _docker_quiesced() -> None:
         raise InventoryHelperError(
             "authoritative Docker-volume inventory requires all containers stopped"
         )
+
+
+def _start_docker_event_monitor() -> subprocess.Popen[bytes]:
+    if not DOCKER.is_file():
+        raise InventoryHelperError("Docker quiescence cannot be verified")
+    # Start slightly before the subscription.  Docker replays events since this
+    # timestamp, closing the short subscription race before the initial ps check.
+    since = str(max(0, int(time.time()) - 1))
+    try:
+        monitor = subprocess.Popen(
+            [
+                str(DOCKER),
+                "events",
+                "--since",
+                since,
+                "--format",
+                "{{.Action}}",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=SAFE_ENV,
+        )
+    except OSError as exc:
+        raise InventoryHelperError(
+            "Docker quiescence monitor cannot be started"
+        ) from exc
+    if monitor.stdout is None:
+        try:
+            monitor.terminate()
+        except OSError:
+            pass
+        raise InventoryHelperError("Docker quiescence monitor is unavailable")
+    return monitor
+
+
+def _close_docker_event_monitor(
+    monitor: subprocess.Popen[bytes],
+    *,
+    require_live: bool,
+) -> bytes:
+    was_live = monitor.poll() is None
+    if was_live:
+        try:
+            monitor.terminate()
+        except OSError as exc:
+            raise InventoryHelperError(
+                "Docker quiescence monitor cannot be stopped"
+            ) from exc
+    try:
+        stdout, _stderr = monitor.communicate(timeout=5)
+    except subprocess.TimeoutExpired as exc:
+        try:
+            monitor.kill()
+            stdout, _stderr = monitor.communicate(timeout=5)
+        except (OSError, subprocess.SubprocessError) as cleanup_exc:
+            raise InventoryHelperError(
+                "Docker quiescence monitor cannot be stopped"
+            ) from cleanup_exc
+        if require_live:
+            raise InventoryHelperError(
+                "Docker quiescence monitor did not terminate safely"
+            ) from exc
+    if require_live and not was_live:
+        raise InventoryHelperError(
+            "Docker quiescence monitor ended before the volume scan completed"
+        )
+    if (
+        not isinstance(stdout, bytes)
+        or len(stdout) > MAX_DOCKER_EVENT_OUTPUT_BYTES
+    ):
+        raise InventoryHelperError("Docker quiescence monitor output is invalid")
+    return stdout
+
+
+def _run_member_scanner(
+    member_id: str,
+    contract_sha256: str,
+) -> subprocess.CompletedProcess[bytes]:
+    argv = scanner_argv(member_id, contract_sha256)
+    if member_id != "docker-volumes":
+        return subprocess.run(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=SAFE_ENV,
+            check=False,
+            timeout=SCANNER_TIMEOUT_SECONDS,
+        )
+
+    monitor: subprocess.Popen[bytes] | None = _start_docker_event_monitor()
+    try:
+        _docker_quiesced()
+        if monitor.poll() is not None:
+            raise InventoryHelperError(
+                "Docker quiescence monitor ended before the volume scan started"
+            )
+        completed = subprocess.run(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=SAFE_ENV,
+            check=False,
+            timeout=SCANNER_TIMEOUT_SECONDS,
+        )
+        _docker_quiesced()
+        if monitor.poll() is not None:
+            raise InventoryHelperError(
+                "Docker quiescence monitor ended during the volume scan"
+            )
+        events = _close_docker_event_monitor(monitor, require_live=True)
+        monitor = None
+    except BaseException:
+        if monitor is not None:
+            try:
+                _close_docker_event_monitor(monitor, require_live=False)
+            except InventoryHelperError:
+                pass
+        raise
+    if events.strip():
+        raise InventoryHelperError(
+            "Docker activity occurred during authoritative Docker-volume inventory"
+        )
+    return completed
 
 
 def _request_json(operation: str) -> str:
@@ -1178,14 +1305,9 @@ def _execute() -> int:
         _docker_quiesced()
         member_results: dict[str, dict[str, Any]] = {}
         for member_id in sorted(MEMBER_IDENTITIES):
-            completed = subprocess.run(
-                scanner_argv(member_id, member_digests[member_id]),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=SAFE_ENV,
-                check=False,
-                timeout=SCANNER_TIMEOUT_SECONDS,
+            completed = _run_member_scanner(
+                member_id,
+                member_digests[member_id],
             )
             stdout = completed.stdout
             stderr = completed.stderr

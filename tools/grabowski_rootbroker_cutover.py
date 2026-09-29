@@ -769,6 +769,7 @@ def _automatic_blockade_matches_cutover(value: Any) -> bool:
             REQUEST_CLIENT_TARGET,
             BOOTSTRAP_RECOVERY_TARGET,
             CUTOVER_HELPER_TARGET,
+            CRITICAL_USER_DATA_INVENTORY_TARGET,
             BROKER_SERVICE_TARGET,
             OPERATOR_SERVICE_TARGET,
             RECOVERY_SOURCE_DROPIN_TARGET,

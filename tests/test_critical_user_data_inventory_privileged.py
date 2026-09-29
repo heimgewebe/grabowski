@@ -741,6 +741,83 @@ class CriticalUserDataInventoryPrivilegedTests(unittest.TestCase):
         self.assertEqual(value["request_id"], "req-safe")
         self.assertEqual(value["reference_sha256"], "9" * 64)
 
+    def test_docker_volume_scan_requires_quiescence_before_and_after(self) -> None:
+        completed = mock.Mock(returncode=0, stdout=b"{}", stderr=b"")
+        monitor = mock.Mock()
+        monitor.poll.return_value = None
+        monitor.communicate.return_value = (b"", None)
+        with (
+            mock.patch.object(
+                helper, "_start_docker_event_monitor", return_value=monitor
+            ),
+            mock.patch.object(helper, "_docker_quiesced") as quiesced,
+            mock.patch.object(
+                helper.subprocess, "run", return_value=completed
+            ) as run,
+        ):
+            result = helper._run_member_scanner("docker-volumes", "a" * 64)
+
+        self.assertIs(result, completed)
+        self.assertEqual(quiesced.call_count, 2)
+        run.assert_called_once()
+        monitor.terminate.assert_called_once_with()
+
+    def test_docker_volume_scan_rejects_monitor_that_exits_early(self) -> None:
+        monitor = mock.Mock()
+        monitor.poll.return_value = 1
+        monitor.communicate.return_value = (b"", None)
+        with (
+            mock.patch.object(
+                helper, "_start_docker_event_monitor", return_value=monitor
+            ),
+            mock.patch.object(helper, "_docker_quiesced"),
+            mock.patch.object(helper.subprocess, "run") as run,
+        ):
+            with self.assertRaisesRegex(
+                helper.InventoryHelperError,
+                "monitor ended before the volume scan started",
+            ):
+                helper._run_member_scanner("docker-volumes", "a" * 64)
+
+        run.assert_not_called()
+
+    def test_docker_volume_scan_rejects_activity_seen_by_event_monitor(self) -> None:
+        completed = mock.Mock(returncode=0, stdout=b"{}", stderr=b"")
+        monitor = mock.Mock()
+        monitor.poll.return_value = None
+        monitor.communicate.return_value = (b"start\n", None)
+        with (
+            mock.patch.object(
+                helper, "_start_docker_event_monitor", return_value=monitor
+            ),
+            mock.patch.object(helper, "_docker_quiesced"),
+            mock.patch.object(helper.subprocess, "run", return_value=completed),
+        ):
+            with self.assertRaisesRegex(
+                helper.InventoryHelperError,
+                "Docker activity occurred",
+            ):
+                helper._run_member_scanner("docker-volumes", "a" * 64)
+
+    def test_docker_event_monitor_replays_subscription_race_window(self) -> None:
+        monitor = mock.Mock(stdout=mock.Mock())
+        with tempfile.TemporaryDirectory() as temporary:
+            docker = Path(temporary) / "docker"
+            docker.write_text("", encoding="utf-8")
+            with (
+                mock.patch.object(helper, "DOCKER", docker),
+                mock.patch.object(helper.time, "time", return_value=100.9),
+                mock.patch.object(
+                    helper.subprocess, "Popen", return_value=monitor
+                ) as popen,
+            ):
+                self.assertIs(helper._start_docker_event_monitor(), monitor)
+
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[:3], [str(docker), "events", "--since"])
+        self.assertEqual(argv[3], "99")
+        self.assertEqual(argv[-2:], ["--format", "{{.Action}}"])
+
     def test_docker_quiescence_is_fail_closed(self) -> None:
         completed = mock.Mock(returncode=0, stdout=b"container-id\n", stderr=b"")
         with tempfile.TemporaryDirectory() as temporary:

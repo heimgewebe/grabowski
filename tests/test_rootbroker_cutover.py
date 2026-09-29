@@ -599,6 +599,10 @@ class RootbrokerCutoverTests(unittest.TestCase):
             self._typed_blockade_marker(kind="path", value="/etc/grabowski"),
             self._typed_blockade_marker(
                 kind="path",
+                value=str(cutover.CRITICAL_USER_DATA_INVENTORY_TARGET),
+            ),
+            self._typed_blockade_marker(
+                kind="path",
                 value=str(cutover.AUTOMATIC_STAGING_ROOT / "future-helper.py"),
             ),
             self._typed_blockade_marker(
