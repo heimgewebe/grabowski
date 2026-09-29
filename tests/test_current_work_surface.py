@@ -84,6 +84,7 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
 
         reconciler = SimpleNamespace(
             MAX_PAGE_LIMIT=100,
+            _validated_database_snapshot=lambda snapshot: snapshot,
             reconcile_checkout_bindings=reconcile,
             collect_git_worktrees_for_repos=lambda *_args, **_kwargs: {
                 "worktrees": [
@@ -111,6 +112,52 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
                 "retained-task": ["checkout-retained"],
             },
         )
+
+    def test_task_checkout_presence_revalidates_injected_database_snapshot(
+        self,
+    ) -> None:
+        database = {
+            "snapshot_sha256": "a" * 64,
+            "bindings": [],
+            "retentions": [],
+        }
+        validation_calls: list[object] = []
+
+        def validate(snapshot: object) -> dict:
+            validation_calls.append(snapshot)
+            raise RuntimeError("tampered injected snapshot")
+
+        reconciler = SimpleNamespace(
+            _validated_database_snapshot=validate,
+            collect_lifecycle_bindings_from_db=lambda: (
+                (_ for _ in ()).throw(
+                    AssertionError(
+                        "database read must not precede snapshot validation"
+                    )
+                )
+            ),
+            collect_git_worktrees_for_repos=lambda *_args, **_kwargs: (
+                (_ for _ in ()).throw(
+                    AssertionError(
+                        "Git observation must not precede snapshot validation"
+                    )
+                )
+            ),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "tampered injected snapshot"):
+            surface._task_checkout_presence(
+                [REPOSITORY],
+                reconciler=reconciler,
+                reconciliation_payload={
+                    "source_snapshot": {
+                        "database_snapshot_sha256": "a" * 64,
+                    }
+                },
+                database_snapshot=database,
+            )
+
+        self.assertEqual(validation_calls, [database])
 
     def test_task_checkout_presence_observes_task_owned_repository_outside_scope(
         self,
