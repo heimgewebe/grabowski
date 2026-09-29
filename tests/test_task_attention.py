@@ -2776,6 +2776,40 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertNotIn(source["task_id"], returned)
         self.assertIn(successor["task_id"], returned)
         self.assertTrue(page["current_work_orphan_filter_safe"])
+        self.assertEqual(0, page["convergence_excluded_attention_count"])
+
+    def test_current_work_attention_reports_direct_retry_exclusion_count(
+        self,
+    ) -> None:
+        source, successor = self._verified_retry_pair(successor_state="running")
+
+        page = attention.reconcile_attention(
+            {"limit": 20, "view": "current"},
+            _bounded_current_projection=True,
+            _current_work_task_ids=set(),
+        )
+
+        self.assertNotIn(
+            source["task_id"],
+            {item["task_id"] for item in page["records"]},
+        )
+        self.assertNotIn(
+            successor["task_id"],
+            {item["task_id"] for item in page["records"]},
+        )
+        self.assertEqual(1, page["convergence_excluded_attention_count"])
+        self.assertEqual(
+            1,
+            page["attention_convergence_counts"][
+                "superseded_by_verified_retry"
+            ],
+        )
+        self.assertEqual(
+            1,
+            page["filtered_classification_counts"][
+                "superseded_by_verified_retry"
+            ],
+        )
 
     def test_current_work_attention_malformed_retry_fails_visible(self) -> None:
         source, successor = self._verified_retry_pair(successor_state="running")

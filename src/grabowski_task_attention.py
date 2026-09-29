@@ -4101,7 +4101,9 @@ def reconcile_attention(
         "converged_attention_count": converged_attention_count,
         "retry_successor_record_count": retry_successor_record_count,
         "convergence_excluded_attention_count": len(
-            convergence_excluded_task_ids
+            current_work_retry_excluded_task_ids
+            if current_work_direct_scan_mode
+            else convergence_excluded_task_ids
         ),
         "decision_snapshot_status": (
             str(decision_snapshot.get("status"))

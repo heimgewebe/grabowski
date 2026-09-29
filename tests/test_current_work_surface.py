@@ -55,6 +55,13 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
                     "owner_id": "lane:example",
                 },
             ],
+            "retentions": [
+                {
+                    "checkout_key": "checkout-retained",
+                    "repo_path": REPOSITORY,
+                    "owner_id": "task:retained-task",
+                }
+            ],
         }
         reconciler = SimpleNamespace(
             MAX_PAGE_LIMIT=100,
@@ -78,20 +85,8 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
             },
             collect_lifecycle_bindings_from_db=lambda: database,
         )
-        checkouts = SimpleNamespace(
-            _retention_records=lambda _keys: {
-                "checkout-retained": {"owner_id": "task:retained-task"},
-            }
-        )
 
-        def module(name: str) -> object:
-            if name == "grabowski_checkout_binding_reconciler":
-                return reconciler
-            if name == "grabowski_checkouts":
-                return checkouts
-            raise AssertionError(name)
-
-        with patch.object(surface, "_module", side_effect=module):
+        with patch.object(surface, "_module", return_value=reconciler):
             result = surface._reconciliation_payload([REPOSITORY])
 
         self.assertTrue(result["task_checkout_presence_complete"])
@@ -102,6 +97,128 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
                 "retained-task": ["checkout-retained"],
             },
         )
+
+    def test_task_checkout_presence_observes_task_owned_repository_outside_scope(
+        self,
+    ) -> None:
+        other_repository = "/home/alex/repos/other"
+        observed_targets: list[list[str]] = []
+        database = {
+            "snapshot_sha256": "b" * 64,
+            "bindings": [
+                {
+                    "checkout_key": "checkout-other",
+                    "repo_path": other_repository,
+                    "owner_id": "task:other-task",
+                }
+            ],
+            "retentions": [],
+        }
+        reconciler = SimpleNamespace(
+            collect_lifecycle_bindings_from_db=lambda: database,
+            collect_git_worktrees_for_repos=lambda targets, **_kwargs: (
+                observed_targets.append(list(targets))
+                or {
+                    "worktrees": [{"checkout_key": "checkout-other"}],
+                    "observable_repo_paths": [REPOSITORY, other_repository],
+                    "errors": [],
+                    "errors_truncated": False,
+                }
+            ),
+        )
+
+        presence, complete = surface._task_checkout_presence(
+            [REPOSITORY],
+            reconciler=reconciler,
+            reconciliation_payload={
+                "source_snapshot": {
+                    "database_snapshot_sha256": "b" * 64,
+                }
+            },
+        )
+
+        self.assertTrue(complete)
+        self.assertEqual(
+            observed_targets,
+            [[REPOSITORY, other_repository]],
+        )
+        self.assertEqual(presence, {"other-task": ["checkout-other"]})
+
+    def test_task_checkout_presence_fails_closed_when_combined_scope_exceeds_bound(
+        self,
+    ) -> None:
+        other_repository = "/home/alex/repos/other"
+        database = {
+            "snapshot_sha256": "d" * 64,
+            "bindings": [
+                {
+                    "checkout_key": "checkout-other",
+                    "repo_path": other_repository,
+                    "owner_id": "task:other-task",
+                }
+            ],
+            "retentions": [],
+        }
+        reconciler = SimpleNamespace(
+            collect_lifecycle_bindings_from_db=lambda: database,
+            collect_git_worktrees_for_repos=lambda *_args, **_kwargs: (
+                (_ for _ in ()).throw(
+                    AssertionError("Git observation must not exceed repository bound")
+                )
+            ),
+        )
+
+        with patch.object(surface.current_work, "MAX_REPOSITORIES", 1):
+            presence, complete = surface._task_checkout_presence(
+                [REPOSITORY],
+                reconciler=reconciler,
+                reconciliation_payload={
+                    "source_snapshot": {
+                        "database_snapshot_sha256": "d" * 64,
+                    }
+                },
+            )
+
+        self.assertEqual(presence, {})
+        self.assertFalse(complete)
+
+    def test_task_checkout_presence_accepts_repository_subpath_observation(
+        self,
+    ) -> None:
+        requested = REPOSITORY + "/src"
+        database = {
+            "snapshot_sha256": "c" * 64,
+            "bindings": [
+                {
+                    "checkout_key": "checkout-bound",
+                    "repo_path": REPOSITORY,
+                    "owner_id": "task:bound-task",
+                }
+            ],
+            "retentions": [],
+        }
+        reconciler = SimpleNamespace(
+            collect_lifecycle_bindings_from_db=lambda: database,
+            collect_git_worktrees_for_repos=lambda _targets, **_kwargs: {
+                "worktrees": [{"checkout_key": "checkout-bound"}],
+                "observable_repo_paths": [requested, REPOSITORY],
+                "errors": [],
+                "errors_truncated": False,
+            },
+        )
+
+        presence, complete = surface._task_checkout_presence(
+            [requested],
+            reconciler=reconciler,
+            reconciliation_payload={
+                "source_snapshot": {
+                    "database_snapshot_sha256": "c" * 64,
+                }
+            },
+        )
+
+        self.assertTrue(complete)
+        self.assertEqual(presence, {"bound-task": ["checkout-bound"]})
 
     def test_attention_payload_uses_bounded_projection_only_for_current_work(
         self,
@@ -704,7 +821,7 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
         with patch.object(
             surface, "_module", return_value=reconciler
         ), patch.object(
-            surface, "_task_checkout_presence", return_value={}
+            surface, "_task_checkout_presence", return_value=({}, True)
         ):
             result = surface._reconciliation_payload([REPOSITORY])
 

@@ -236,7 +236,7 @@ def _task_checkout_presence(
     *,
     reconciler: Any,
     reconciliation_payload: dict[str, Any],
-) -> dict[str, list[str]]:
+) -> tuple[dict[str, list[str]], bool]:
     source_snapshot = reconciliation_payload.get("source_snapshot")
     expected_database_sha256 = (
         source_snapshot.get("database_snapshot_sha256")
@@ -246,42 +246,77 @@ def _task_checkout_presence(
     if not isinstance(expected_database_sha256, str):
         raise RuntimeError("checkout reconciliation database snapshot is missing")
 
+    database_before = reconciler.collect_lifecycle_bindings_from_db()
+    if database_before.get("snapshot_sha256") != expected_database_sha256:
+        raise RuntimeError(
+            "checkout lifecycle database changed during current_work observation"
+        )
+    bindings = database_before.get("bindings")
+    retentions = database_before.get("retentions")
+    if not isinstance(bindings, list) or not isinstance(retentions, list):
+        raise RuntimeError("checkout lifecycle database snapshot is incomplete")
+
+    task_owned_repository_paths: set[str] = set()
+
+    def task_owner_repository(item: object) -> None:
+        if not isinstance(item, dict):
+            raise RuntimeError("checkout lifecycle database row is invalid")
+        owner_id = item.get("owner_id")
+        if (
+            not isinstance(owner_id, str)
+            or not owner_id.startswith("task:")
+            or owner_id == "task:"
+        ):
+            return
+        repo_path = item.get("repo_path")
+        if not isinstance(repo_path, str) or not repo_path:
+            raise RuntimeError("task-owned checkout repository is invalid")
+        task_owned_repository_paths.add(
+            str(Path(repo_path).expanduser().resolve(strict=False))
+        )
+
+    for binding in bindings:
+        task_owner_repository(binding)
+    for retention in retentions:
+        task_owner_repository(retention)
+
+    # The ordinary current_work checkout projection stays caller-scoped.  This
+    # extra observer exists only to prove the absence of task-owned checkouts
+    # before global attention may be pruned.
+    if len(task_owned_repository_paths) > current_work.MAX_REPOSITORIES:
+        return {}, False
+    observation_targets = sorted(
+        set(repositories) | task_owned_repository_paths
+    )
+    if len(observation_targets) > current_work.MAX_REPOSITORIES:
+        return {}, False
     git = reconciler.collect_git_worktrees_for_repos(
-        repositories,
+        observation_targets,
         git_timeout_seconds=CURRENT_WORK_GIT_TIMEOUT_SECONDS,
     )
     if git.get("errors") or git.get("errors_truncated"):
-        raise RuntimeError("task checkout presence Git observation is incomplete")
+        return {}, False
     observable = {
         str(Path(item).expanduser().resolve(strict=False))
         for item in git.get("observable_repo_paths", [])
         if isinstance(item, str)
     }
-    if observable != set(repositories):
-        raise RuntimeError("task checkout presence repository observation is incomplete")
+    required_observable = set(repositories) | task_owned_repository_paths
+    if not required_observable.issubset(observable):
+        return {}, False
     present_keys = {
         str(item.get("checkout_key"))
         for item in git.get("worktrees", [])
         if isinstance(item, dict) and isinstance(item.get("checkout_key"), str)
     }
 
-    database_before = reconciler.collect_lifecycle_bindings_from_db()
-    if database_before.get("snapshot_sha256") != expected_database_sha256:
-        raise RuntimeError("checkout lifecycle database changed during current_work observation")
-    checkouts = _module("grabowski_checkouts")
-    retention_before = checkouts._retention_records(sorted(present_keys))
-    database_after = reconciler.collect_lifecycle_bindings_from_db()
-    retention_after = checkouts._retention_records(sorted(present_keys))
-    if (
-        database_after.get("snapshot_sha256") != expected_database_sha256
-        or retention_after != retention_before
-    ):
-        raise RuntimeError("checkout lifecycle metadata changed during current_work observation")
-
-    repository_set = set(repositories)
     checkout_keys_by_task: dict[str, set[str]] = {}
 
-    def add(owner_id: object, checkout_key: object) -> None:
+    def add(item: object) -> None:
+        if not isinstance(item, dict):
+            raise RuntimeError("checkout lifecycle database row is invalid")
+        owner_id = item.get("owner_id")
+        checkout_key = item.get("checkout_key")
         if (
             not isinstance(owner_id, str)
             or not owner_id.startswith("task:")
@@ -293,18 +328,16 @@ def _task_checkout_presence(
         task_id = owner_id.removeprefix("task:")
         checkout_keys_by_task.setdefault(task_id, set()).add(checkout_key)
 
-    for binding in database_before.get("bindings", []):
-        if not isinstance(binding, dict):
-            raise RuntimeError("checkout lifecycle binding snapshot is invalid")
-        repo_path = binding.get("repo_path")
-        if (
-            isinstance(repo_path, str)
-            and str(Path(repo_path).expanduser().resolve(strict=False)) in repository_set
-        ):
-            add(binding.get("owner_id"), binding.get("checkout_key"))
-    for checkout_key, retention in retention_before.items():
-        if isinstance(retention, dict):
-            add(retention.get("owner_id"), checkout_key)
+    for binding in bindings:
+        add(binding)
+    for retention in retentions:
+        add(retention)
+
+    database_after = reconciler.collect_lifecycle_bindings_from_db()
+    if database_after.get("snapshot_sha256") != expected_database_sha256:
+        raise RuntimeError(
+            "checkout lifecycle database changed during current_work observation"
+        )
 
     if len(checkout_keys_by_task) > MAX_SOURCE_TASKS:
         raise RuntimeError("task checkout presence exceeds bounded task maximum")
@@ -313,7 +346,7 @@ def _task_checkout_presence(
         if len(checkout_keys) > current_work.MAX_EVIDENCE:
             raise RuntimeError("task checkout presence exceeds bounded evidence maximum")
         result[task_id] = sorted(checkout_keys)
-    return result
+    return result, True
 
 
 def _reconciliation_payload(repositories: list[str]) -> dict[str, Any]:
@@ -323,7 +356,10 @@ def _reconciliation_payload(repositories: list[str]) -> dict[str, Any]:
         limit=reconciler.MAX_PAGE_LIMIT,
         git_timeout_seconds=CURRENT_WORK_GIT_TIMEOUT_SECONDS,
     )
-    task_checkout_presence = _task_checkout_presence(
+    (
+        task_checkout_presence,
+        task_checkout_presence_complete,
+    ) = _task_checkout_presence(
         repositories,
         reconciler=reconciler,
         reconciliation_payload=payload,
@@ -331,7 +367,7 @@ def _reconciliation_payload(repositories: list[str]) -> dict[str, Any]:
     return {
         **payload,
         "task_checkout_presence": task_checkout_presence,
-        "task_checkout_presence_complete": True,
+        "task_checkout_presence_complete": task_checkout_presence_complete,
     }
 
 
