@@ -8209,7 +8209,12 @@ class MidCutoverResumeRuntime:
             source_repo_head=self.blue_repo_head,
             target_release_id=self.green_binding["release_id"],
             target_repo_head=self.green_binding["repo_head"],
-            source_evidence_time=int(self.resume_binding["source_evidence_time"]),
+            source_evidence_time=int(
+                self.resume_binding.get(
+                    "snapshot_source_evidence_time",
+                    self.resume_binding["source_evidence_time"],
+                )
+            ),
             publication_request_id=str(
                 self.resume_binding["publication_request_id"]
             ),
@@ -8505,7 +8510,10 @@ class MidCutoverResumeRuntime:
             green_release_id=self.green_binding["release_id"],
             target_head=self.green_binding["repo_head"],
             source_evidence_time=int(
-                self.resume_binding["source_evidence_time"]
+                self.resume_binding.get(
+                    "snapshot_source_evidence_time",
+                    self.resume_binding["source_evidence_time"],
+                )
             ),
             publication_request_id=str(
                 self.resume_binding["publication_request_id"]
@@ -8595,7 +8603,12 @@ class MidCutoverResumeRuntime:
             blue_repo_head=self.blue_repo_head,
             green_release_id=self.green_binding["release_id"],
             target_head=self.green_binding["repo_head"],
-            source_evidence_time=int(self.resume_binding["source_evidence_time"]),
+            source_evidence_time=int(
+                self.resume_binding.get(
+                    "snapshot_source_evidence_time",
+                    self.resume_binding["source_evidence_time"],
+                )
+            ),
             publication_request_id=str(
                 self.resume_binding["publication_request_id"]
             ),
