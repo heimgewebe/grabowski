@@ -1157,6 +1157,124 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
                     probe["response_delivery"]["terminal_delivery_count"], 1
                 )
 
+    def test_connector_transport_live_diagnostics_terminal_error_delivery_is_not_recovery_activity(
+        self,
+    ) -> None:
+        module = self._load_module()
+        module.FRICTION_LOG.parent.mkdir(parents=True, exist_ok=True)
+        module.FRICTION_LOG.write_text("", encoding="utf-8")
+        terminal_error_messages = (
+            "dispatcher delivered preserved MCP error response to control plane",
+            "dispatcher posted terminal downstream error response to control plane",
+            "dispatcher received MCP upstream error; posted error response to control plane",
+            "dispatcher failed to connect to MCP transport; posted error response to control plane",
+        )
+
+        for terminal_message in terminal_error_messages:
+            for later_forwarding in (False, True):
+                with self.subTest(
+                    terminal_message=terminal_message,
+                    later_forwarding=later_forwarding,
+                ):
+                    records = [
+                        {
+                            "__REALTIME_TIMESTAMP": "100",
+                            "MESSAGE": json.dumps({
+                                "level": "ERROR",
+                                "component": "dispatcher",
+                                "msg": "Received exception from stream: 502 upstream/external service error",
+                                "cmd_request_id": "wfr_terminal_error_aggregate/abcd",
+                                "rpc_request_id": 4,
+                            }),
+                        },
+                        {
+                            "__REALTIME_TIMESTAMP": "110",
+                            "MESSAGE": json.dumps({
+                                "level": "ERROR",
+                                "component": "dispatcher",
+                                "msg": terminal_message,
+                                "cmd_request_id": "wfr_terminal_error_aggregate/abcd",
+                                "rpc_request_id": 4,
+                            }),
+                        },
+                    ]
+                    if later_forwarding:
+                        records.append({
+                            "__REALTIME_TIMESTAMP": "120",
+                            "MESSAGE": json.dumps({
+                                "level": "INFO",
+                                "component": "dispatcher",
+                                "msg": "dispatcher forwarded command to MCP server",
+                                "cmd_request_id": "wfr_recovered_request/abcd",
+                                "rpc_request_id": 5,
+                            }),
+                        })
+
+                    def fake_run(argv, *, timeout_seconds=30, max_output_bytes=131_072):
+                        if argv[0] == "systemctl":
+                            return {
+                                "returncode": 0,
+                                "timed_out": False,
+                                "stdout": (
+                                    "LoadState=loaded\n"
+                                    "ActiveState=active\n"
+                                    "SubState=running\n"
+                                    "Result=success\n"
+                                    "NRestarts=0\n"
+                                ),
+                                "stderr": "",
+                                "stdout_truncated": False,
+                                "stderr_truncated": False,
+                            }
+                        if argv[0] == "journalctl":
+                            return {
+                                "returncode": 0,
+                                "timed_out": False,
+                                "stdout": "".join(
+                                    json.dumps(record) + "\n" for record in records
+                                ),
+                                "stderr": "",
+                                "stdout_truncated": False,
+                                "stderr_truncated": False,
+                            }
+                        raise AssertionError(argv)
+
+                    module._run_diagnostic_command = fake_run
+                    diagnostics = module.connector_transport_live_diagnostics(
+                        limit=1, max_log_lines=25
+                    )
+
+                    self.assertEqual(
+                        diagnostics["response_delivery"]["evidence_state"],
+                        "terminal_delivery_observed",
+                    )
+                    if later_forwarding:
+                        self.assertEqual(
+                            diagnostics["transport_window_state"],
+                            "errors_followed_by_activity",
+                        )
+                        self.assertEqual(
+                            diagnostics["transport_health_state"], "degraded"
+                        )
+                        self.assertGreater(
+                            diagnostics["post_error_activity_counts"].get(
+                                "forwarded_to_mcp", 0
+                            ),
+                            0,
+                        )
+                    else:
+                        self.assertEqual(
+                            diagnostics["transport_window_state"],
+                            "errors_without_later_activity",
+                        )
+                        self.assertEqual(
+                            diagnostics["transport_health_state"],
+                            "unavailable_suspected",
+                        )
+                        self.assertEqual(
+                            diagnostics["post_error_activity_counts"], {}
+                        )
+
     def test_connector_transport_probe_correlates_ttl_with_late_response(self) -> None:
         module = self._load_module()
         request_id = "wfr_sensitive_request/abcd"
