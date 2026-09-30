@@ -2879,7 +2879,7 @@ class OperatorContractTests(unittest.TestCase):
             review_command = [
                 "claude",
                 "--model",
-                "opus",
+                "claude-opus-5-5",
                 "--effort",
                 "high",
                 "--permission-mode",
@@ -2935,7 +2935,7 @@ class OperatorContractTests(unittest.TestCase):
                 provenance["sandbox"],
                 "bubblewrap-minimal-root-read-only-worktree-v1",
             )
-            self.assertEqual(provenance["review_route"]["route_id"], "claude-opus-5-high")
+            self.assertEqual(provenance["review_route"]["route_id"], "claude-opus-5.5-high")
             self.assertEqual(provenance["review_route"]["provider_family"], "anthropic")
             self.assertEqual(
                 provenance,

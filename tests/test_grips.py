@@ -7936,12 +7936,12 @@ class GripFoundationTests(unittest.TestCase):
             else None
         )
         reviewer = {
-            "route": "claude-opus-5-high",
+            "route": "claude-opus-5.5-high",
             "harness": "claude",
             "argv_prefix": [
                 "claude",
                 "--model",
-                "opus",
+                "claude-opus-5-5",
                 "--effort",
                 "high",
                 "--permission-mode",

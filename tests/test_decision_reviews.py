@@ -167,7 +167,7 @@ def make_job(
     role_command = [
         "claude",
         "--model",
-        "opus",
+        "claude-opus-5-5",
         "--effort",
         "high",
         "--permission-mode",
@@ -314,7 +314,7 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
         role_command = [
             "claude",
             "--model",
-            "opus",
+            "claude-opus-5-5",
             "--effort",
             "high",
             "--permission-mode",
@@ -427,7 +427,7 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
         self.assertTrue(attempt["review_role_verified"])
         self.assertTrue(attempt["review_route_verified"])
         self.assertTrue(attempt["independence_verified"])
-        self.assertEqual(attempt["review_route_id"], "claude-opus-5-high")
+        self.assertEqual(attempt["review_route_id"], "claude-opus-5.5-high")
         self.assertEqual(attempt["review_provider_family"], "anthropic")
 
     def test_historical_review_role_path_rotation_accepts_identical_immutable_bytes(self) -> None:
@@ -845,7 +845,7 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
             "--",
             "claude",
             "--model",
-            "opus",
+            "claude-opus-5-5",
             "--effort",
             "high",
             "--permission-mode",
@@ -893,7 +893,7 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
             "--",
             "claude",
             "--model",
-            "opus",
+            "claude-opus-5-5",
             "--effort",
             "high",
             "--permission-mode",
