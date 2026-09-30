@@ -2719,12 +2719,46 @@ class AdmissionTopologyTests(unittest.TestCase):
                     ),
                 )
             )
-        with patches[0], patches[1], patches[2]:
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            mock.patch.object(dual.time, "sleep"),
+        ):
             return dual.classify_canonical_admission_topology()
 
     def test_live_canonical_operator_is_drained(self) -> None:
         verdict = self._classify(service="active", listener=True)
         self.assertEqual(verdict["topology"], dual.CANONICAL_OPERATOR_LIVE)
+
+    def test_transient_transport_failure_is_retried(self) -> None:
+        observation = mock.Mock()
+        observation.confirmed_active = True
+        observation.confirmed_inactive = False
+        observation.to_dict = lambda: {"state": "active"}
+        transport = dual.core.DeployError(
+            "temporarily unavailable",
+            phase="operator-admission-drain",
+            details={"failure_class": "transport"},
+        )
+        with (
+            mock.patch.object(dual, "observe_service", return_value=observation),
+            mock.patch.object(dual, "_listener_present", return_value=True),
+            mock.patch.object(
+                dual,
+                "_operator_admission_observation",
+                side_effect=[transport, {}],
+            ) as probe,
+            mock.patch.object(dual.time, "sleep") as sleep,
+        ):
+            verdict = dual.classify_canonical_admission_topology()
+        self.assertEqual(verdict["topology"], dual.CANONICAL_OPERATOR_LIVE)
+        self.assertEqual(verdict["admission_status_probe_attempts"], 2)
+        self.assertEqual(verdict["admission_status_transport_retries"], 1)
+        self.assertEqual(probe.call_count, 2)
+        sleep.assert_called_once_with(
+            dual.CANONICAL_ADMISSION_TOPOLOGY_RETRY_SECONDS
+        )
 
     def test_absent_canonical_operator_needs_no_drain(self) -> None:
         verdict = self._classify(service="inactive", listener=False)
@@ -2735,6 +2769,14 @@ class AdmissionTopologyTests(unittest.TestCase):
             service="active", listener=True, status_error="unreachable"
         )
         self.assertEqual(verdict["topology"], dual.CANONICAL_OPERATOR_AMBIGUOUS)
+        self.assertEqual(
+            verdict["admission_status_probe_attempts"],
+            dual.CANONICAL_ADMISSION_TOPOLOGY_TRANSPORT_ATTEMPTS,
+        )
+        self.assertEqual(
+            verdict["admission_status_transport_retries"],
+            dual.CANONICAL_ADMISSION_TOPOLOGY_TRANSPORT_ATTEMPTS,
+        )
 
     def test_inactive_with_a_live_listener_is_ambiguous(self) -> None:
         verdict = self._classify(service="inactive", listener=True)
@@ -4044,16 +4086,27 @@ class GreenDrainTargetTests(unittest.TestCase):
                     ) as verify,
                 ):
                     result = runtime.terminalize_effects()
-                self.assertEqual(wait.call_args.kwargs["port"], 18182)
                 self.assertEqual(result["drain_target_port"], 18182)
-                verify_ports = [call.kwargs["port"] for call in verify.call_args_list]
-                self.assertIn(18182, verify_ports)
+                wait_ports = [
+                    call.kwargs["port"] for call in wait.call_args_list
+                ]
+                verify_ports = [
+                    call.kwargs["port"] for call in verify.call_args_list
+                ]
                 if topology == dual.CANONICAL_OPERATOR_LIVE:
+                    self.assertEqual(wait_ports, [18182, 18181])
+                    self.assertFalse(
+                        wait.call_args_list[1].kwargs[
+                            "allow_single_recovery_parent"
+                        ]
+                    )
                     self.assertIn(18181, verify_ports)
                     self.assertIsNotNone(result["canonical_guard_sha256"])
                 else:
+                    self.assertEqual(wait_ports, [18182])
                     self.assertNotIn(18181, verify_ports)
                     self.assertIsNone(result["canonical_guard_sha256"])
+                self.assertIn(18182, verify_ports)
 
     def _canonical_admission_observation(
         self, *, blocking_tools: dict[str, int]
@@ -4095,7 +4148,7 @@ class GreenDrainTargetTests(unittest.TestCase):
                 dual,
                 "wait_for_operator_deployment_admission",
                 return_value={"supported": True, "blocking_tool_calls": 0},
-            ),
+            ) as wait,
             mock.patch.object(
                 dual,
                 "verify_operator_deployment_admission",
@@ -4108,6 +4161,13 @@ class GreenDrainTargetTests(unittest.TestCase):
             result = runtime.terminalize_effects()
         strict_verify.assert_called_once_with(
             runtime.admission_marker, port=dual.GREEN_OPERATOR_LISTENER_PORT
+        )
+        self.assertEqual(
+            [call.kwargs["port"] for call in wait.call_args_list],
+            [dual.GREEN_OPERATOR_LISTENER_PORT, dual.OPERATOR_LISTENER_PORT],
+        )
+        self.assertTrue(
+            wait.call_args_list[1].kwargs["allow_single_recovery_parent"]
         )
         self.assertEqual(result["drain_target_port"], dual.GREEN_OPERATOR_LISTENER_PORT)
         self.assertIsNotNone(result["canonical_guard_sha256"])

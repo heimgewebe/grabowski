@@ -3220,6 +3220,46 @@ class DeploymentAdmissionTests(unittest.TestCase):
         )
         self.assertEqual(0, proof["observation"]["drain_blocking_tool_calls"])
 
+    def test_operator_admission_s3_wait_tolerates_only_recovery_parent(
+        self,
+    ) -> None:
+        marker = self.marker()
+        observed = {
+            "valid": True,
+            "active": True,
+            "state": "active",
+            "admission_gate_installed": True,
+            "token": marker["token"],
+            "expected_head": marker["expected_head"],
+            "source_identity_sha256": marker["source_identity_sha256"],
+            "active_tool_calls": 1,
+            "drain_blocking_tool_calls": 1,
+            "read_only_active_tool_calls": 0,
+            "effect_classification": dual.OPERATOR_ADMISSION_EFFECT_CLASSIFICATION,
+            "active_tool_calls_by_tool_name": {
+                dual.MIDCUTOVER_RECOVERY_TOOL_NAME: 1
+            },
+            "active_tool_calls_by_tool_name_truncated": False,
+            "active_tool_calls_by_tool_name_omitted_call_count": 0,
+        }
+        with (
+            mock.patch.object(
+                dual,
+                "_operator_admission_observation",
+                side_effect=[observed, observed],
+            ),
+            mock.patch.object(dual.time, "sleep"),
+        ):
+            proof = dual.wait_for_operator_deployment_admission(
+                marker,
+                timeout_seconds=5,
+                allow_single_recovery_parent=True,
+            )
+        self.assertTrue(proof["supported"])
+        self.assertEqual(2, proof["attempts"])
+        self.assertEqual(1, proof["blocking_tool_calls"])
+        self.assertTrue(proof["recovery_parent_allowed"])
+
     def test_operator_admission_extended_timeout_preserves_failure_evidence(self) -> None:
         marker = self.marker()
         observed = {
