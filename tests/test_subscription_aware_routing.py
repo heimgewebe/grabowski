@@ -93,6 +93,10 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
     def test_live_verified_models_replace_stale_generation_defaults(self) -> None:
         models = self.catalog["models"]
         self.assertEqual(models["claude-opus-5"]["availability"], "live-verified-via-claude-pro")
+        self.assertEqual(
+            models["claude-opus-5.5"]["availability"],
+            "live-verified-via-claude-pro",
+        )
         self.assertEqual(models["claude-sonnet-5"]["availability"], "live-verified-via-claude-pro")
         self.assertEqual(models["gemini-3.1-pro"]["availability"], "live-verified-via-google-ai")
         self.assertEqual(models["gpt-5.6-sol"]["availability"], "live-verified-via-chatgpt-pro")
@@ -148,7 +152,7 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
 
     def test_independent_subscription_review_routes_are_executable_and_advisory(self) -> None:
         expected = {
-            "claude-opus-5-high": ("claude", "anthropic-claude-pro"),
+            "claude-opus-5.5-high": ("claude", "anthropic-claude-pro"),
             "antigravity-gemini-pro-review-high": ("antigravity", "google-gemini-pro"),
             "grok-4.6-review-high": ("grok", "xai-grok-4.6"),
         }
@@ -163,8 +167,8 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
                 self.assertIn("critical-review", route["task_classes"])
 
     def test_opus_has_separate_escalation_writer_and_review_route(self) -> None:
-        writer = self.routes["claude-opus-5-writer-high"]
-        reviewer = self.routes["claude-opus-5-high"]
+        writer = self.routes["claude-opus-5.5-writer-high"]
+        reviewer = self.routes["claude-opus-5.5-high"]
         self.assertTrue(writer["enabled"])
         self.assertTrue(writer["escalation_only"])
         self.assertFalse(writer.get("review_only", False))
@@ -178,12 +182,23 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
         self.assertTrue(reviewer["review_only"])
         self.assertEqual(reviewer["argv_prefix"][-2:], ["--permission-mode", "plan"])
 
+    def test_superseded_opus_5_routes_are_disabled_and_exact_model_pinned(self) -> None:
+        writer = self.routes["claude-opus-5-writer-high"]
+        reviewer = self.routes["claude-opus-5-high"]
+        self.assertFalse(writer["enabled"])
+        self.assertFalse(reviewer["enabled"])
+        self.assertEqual(writer["argv_prefix"][1:3], ["--model", "claude-opus-5"])
+        self.assertEqual(reviewer["argv_prefix"][1:3], ["--model", "claude-opus-5"])
+        self.assertIn("Superseded", writer["disabled_reason"])
+        self.assertIn("Superseded", reviewer["disabled_reason"])
+        self.assertIn("claude-opus-5.5", self.catalog["quota_pools"]["claude-pro"]["included_models_live_verified"])
+
     def test_frontier_policy_keeps_codex_top_and_grok_independent_peer(self) -> None:
         frontier = self.catalog["policy"]["frontier_model_policy"]
         self.assertEqual(frontier["escalation_route"], "codex-sol-xhigh")
         self.assertEqual(frontier["top_contrast_routes"], ["codex-sol-high"])
         self.assertIn("codex-sol-review-high", frontier["upper_review_or_contrast_routes"])
-        self.assertNotIn("claude-opus-5-writer-high", frontier["upper_review_or_contrast_routes"])
+        self.assertNotIn("claude-opus-5.5-writer-high", frontier["upper_review_or_contrast_routes"])
         grok_writer = self.routes["grok-4.6-high"]
         grok_reviewer = self.routes["grok-4.6-review-high"]
         self.assertTrue(grok_writer["enabled"])
@@ -257,11 +272,11 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
 
     def test_runtime_command_prefixes_do_not_duplicate_runner_owned_flags(self) -> None:
         self.assertEqual(
-            self.routes["claude-opus-5-writer-high"]["argv_prefix"],
+            self.routes["claude-opus-5.5-writer-high"]["argv_prefix"],
             [
                 "claude",
                 "--model",
-                "opus",
+                "claude-opus-5-5",
                 "--effort",
                 "high",
                 "--permission-mode",
@@ -269,11 +284,11 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            self.routes["claude-opus-5-high"]["argv_prefix"],
+            self.routes["claude-opus-5.5-high"]["argv_prefix"],
             [
                 "claude",
                 "--model",
-                "opus",
+                "claude-opus-5-5",
                 "--effort",
                 "high",
                 "--permission-mode",
