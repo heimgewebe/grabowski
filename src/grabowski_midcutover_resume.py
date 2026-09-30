@@ -111,6 +111,9 @@ SNAPSHOT_BINDING_PENDING = "bound_to_predecessor"
 SNAPSHOT_BINDING_DONE = "rebound_by_this_lineage"
 SNAPSHOT_BINDING_FOREIGN = "foreign"
 SNAPSHOT_BINDING_UNREADABLE = "unreadable"
+# Must stay aligned with grabowski_client_snapshot.SNAPSHOT_CLOCK_SKEW_SECONDS.
+# Recovery cannot import that parser here without recreating a module cycle.
+SNAPSHOT_CLOCK_SKEW_SECONDS = 120
 
 
 def observe_client_snapshot_binding(
@@ -433,12 +436,12 @@ def historical_terminal_activation_observation(
         or isinstance(transition.get("source_expires_at_unix"), bool)
         or not isinstance(transition.get("source_expires_at_unix"), int)
         or not (
-            transition["source_created_at_unix"]
+            transition["source_created_at_unix"] - SNAPSHOT_CLOCK_SKEW_SECONDS
             <= observed_at
             <= transition["source_expires_at_unix"]
         )
         or not (
-            transition["source_created_at_unix"]
+            transition["source_created_at_unix"] - SNAPSHOT_CLOCK_SKEW_SECONDS
             <= transition["source_evidence_time"]
             <= transition["source_expires_at_unix"]
         )
@@ -1417,6 +1420,9 @@ _RESUME_BINDING_V2_KEYS = frozenset(
         "binding_sha256",
     }
 )
+_RESUME_BINDING_V2_SNAPSHOT_TIME_KEYS = frozenset(
+    {*_RESUME_BINDING_V2_KEYS, "snapshot_source_evidence_time"}
+)
 _LEGACY_TERMINAL_BINDING_KEYS = frozenset(
     _RESUME_BINDING_V2_KEYS
     - {
@@ -1507,7 +1513,10 @@ def _validated_resume_binding(
     keys = frozenset(binding)
     is_v2 = binding.get("resume_binding_schema_version") == 2
     if is_v2:
-        if keys != _RESUME_BINDING_V2_KEYS:
+        if keys not in {
+            _RESUME_BINDING_V2_KEYS,
+            _RESUME_BINDING_V2_SNAPSHOT_TIME_KEYS,
+        }:
             return None
     elif not allow_legacy_terminal or keys != _LEGACY_TERMINAL_BINDING_KEYS:
         return None
@@ -1533,6 +1542,14 @@ def _validated_resume_binding(
         item = binding.get(key)
         minimum = 0 if key == "source_evidence_time" else 1
         if isinstance(item, bool) or not isinstance(item, int) or item < minimum:
+            return None
+    if "snapshot_source_evidence_time" in binding:
+        snapshot_time = binding.get("snapshot_source_evidence_time")
+        if (
+            isinstance(snapshot_time, bool)
+            or not isinstance(snapshot_time, int)
+            or snapshot_time < 0
+        ):
             return None
     if (
         CUTOVER_ID_RE.fullmatch(str(binding.get("cutover_id") or "")) is None
@@ -1823,6 +1840,11 @@ def _completed_lineage_binding(receipt: dict[str, Any]) -> dict[str, Any] | None
         != binding["source_client_declaration_sha256"]
         or final_snapshot.get("classified_snapshot_receipt_sha256")
         != rebind.get("receipt_sha256")
+        or final_snapshot.get("source_evidence_time")
+        != binding.get(
+            "snapshot_source_evidence_time",
+            binding["source_evidence_time"],
+        )
     ):
         return None
     schema_changed = final_snapshot.get("schema_changed")
@@ -1912,6 +1934,14 @@ def _lineage_resolved(
             != switch.get("runtime_binding_sha256")
             or binding.get("source_evidence_time")
             != activation.get("source_evidence_time")
+            or binding.get(
+                "snapshot_source_evidence_time",
+                binding.get("source_evidence_time"),
+            )
+            != activation.get(
+                "snapshot_source_evidence_time",
+                activation.get("source_evidence_time"),
+            )
             or binding.get("activation_observation_sha256")
             != activation.get("observation_sha256")
             or binding.get("publication_request_id")
@@ -2465,6 +2495,10 @@ def classify_recovery_lane(
                 "expected_upstream_port": selector.get("upstream_port"),
                 "source_identity_sha256": candidate.get("source_identity_sha256"),
                 "source_evidence_time": activation.get("source_evidence_time"),
+                "snapshot_source_evidence_time": activation.get(
+                    "snapshot_source_evidence_time",
+                    activation.get("source_evidence_time"),
+                ),
                 "activation_observation_sha256": activation.get(
                     "observation_sha256"
                 ),

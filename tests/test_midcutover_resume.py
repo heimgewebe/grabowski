@@ -148,6 +148,7 @@ SNAPSHOT_REBOUND = {
     "bound_repo_head": HEAD_GREEN,
     "snapshot_receipt_sha256": REBOUND_SNAPSHOT_RECEIPT_SHA256,
     "classified_snapshot_receipt_sha256": REBOUND_SNAPSHOT_RECEIPT_SHA256,
+    "source_evidence_time": ACTIVATION_TIME,
     "transition_sha256": "93" * 32,
     "schema_changed": True,
 }
@@ -315,6 +316,7 @@ def resume_receipt(
         ),
         "source_identity_sha256": SOURCE_IDENTITY_SHA256,
         "source_evidence_time": ACTIVATION_TIME,
+        "snapshot_source_evidence_time": ACTIVATION_TIME,
         "activation_observation_sha256": ACTIVATION_EVIDENCE[
             "observation_sha256"
         ],
@@ -770,6 +772,13 @@ def historical_terminal_cutover_receipt() -> dict[str, object]:
     return receipt
 
 
+class HistoricalSnapshotClockContractTests(unittest.TestCase):
+    def test_recovery_clock_skew_matches_canonical_snapshot_contract(self) -> None:
+        self.assertEqual(
+            midcutover.SNAPSHOT_CLOCK_SKEW_SECONDS,
+            client_snapshot.SNAPSHOT_CLOCK_SKEW_SECONDS,
+        )
+
 class HistoricalTerminalActivationTests(unittest.TestCase):
     def test_platform_converged_requires_terminal_cutover_evidence(self) -> None:
         receipt = historical_terminal_cutover_receipt()
@@ -906,6 +915,36 @@ class HistoricalTerminalActivationTests(unittest.TestCase):
             ACTIVATION_TIME,
         )
 
+    def test_historical_clock_skew_within_canonical_window_is_accepted(self) -> None:
+        receipt = historical_terminal_cutover_receipt()
+        transition = receipt["snapshot_rebind"]["cutover_transition"]
+        transition["source_created_at_unix"] = ACTIVATION_TIME + 2
+        transition["source_evidence_time"] = ACTIVATION_TIME + 1
+        receipt.pop("receipt_sha256", None)
+        receipt["receipt_sha256"] = midcutover.canonical_json_sha256(receipt)
+
+        activation = midcutover.historical_terminal_activation_observation(receipt)
+        self.assertEqual(activation["source_evidence_time"], ACTIVATION_TIME)
+        self.assertEqual(
+            activation["snapshot_source_evidence_time"], ACTIVATION_TIME + 1
+        )
+
+    def test_historical_clock_skew_beyond_canonical_window_fails_closed(self) -> None:
+        receipt = historical_terminal_cutover_receipt()
+        transition = receipt["snapshot_rebind"]["cutover_transition"]
+        transition["source_created_at_unix"] = ACTIVATION_TIME
+        transition["source_evidence_time"] = (
+            ACTIVATION_TIME - midcutover.SNAPSHOT_CLOCK_SKEW_SECONDS - 1
+        )
+        receipt.pop("receipt_sha256", None)
+        receipt["receipt_sha256"] = midcutover.canonical_json_sha256(receipt)
+
+        with self.assertRaisesRegex(
+            midcutover.MidCutoverEvidenceError,
+            "historical terminal snapshot rebind evidence is invalid",
+        ):
+            midcutover.historical_terminal_activation_observation(receipt)
+
     def test_historical_rebind_time_outside_source_freshness_window_fails_closed(self) -> None:
         receipt = historical_terminal_cutover_receipt()
         transition = receipt["snapshot_rebind"]["cutover_transition"]
@@ -987,6 +1026,10 @@ class HistoricalTerminalActivationTests(unittest.TestCase):
 
     def test_completed_resume_becomes_tombstone_for_historical_lineage(self) -> None:
         receipt = historical_terminal_cutover_receipt()
+        transition = receipt["snapshot_rebind"]["cutover_transition"]
+        transition["source_evidence_time"] = ACTIVATION_TIME + 1
+        receipt.pop("receipt_sha256", None)
+        receipt["receipt_sha256"] = midcutover.canonical_json_sha256(receipt)
         activation = midcutover.historical_terminal_activation_observation(receipt)
         resumed = resume_receipt(
             resumed_receipt_sha256=receipt["receipt_sha256"],
@@ -994,11 +1037,18 @@ class HistoricalTerminalActivationTests(unittest.TestCase):
         )
         binding = dict(resumed["resume_binding"])
         binding["activation_observation_sha256"] = activation["observation_sha256"]
+        binding["snapshot_source_evidence_time"] = activation[
+            "snapshot_source_evidence_time"
+        ]
         binding["binding_sha256"] = midcutover.canonical_json_sha256(
             {key: value for key, value in binding.items() if key != "binding_sha256"}
         )
         resumed["resume_binding"] = binding
         resumed["resume_binding_sha256"] = binding["binding_sha256"]
+        resumed["final_state"]["snapshot"] = {
+            **SNAPSHOT_REBOUND,
+            "source_evidence_time": activation["snapshot_source_evidence_time"],
+        }
         resumed.pop("receipt_sha256", None)
         resumed["receipt_sha256"] = midcutover.canonical_json_sha256(resumed)
 
@@ -1595,6 +1645,7 @@ def resume_binding_for_phase(phase: str) -> dict[str, object]:
         ),
         "source_identity_sha256": SOURCE_IDENTITY_SHA256,
         "source_evidence_time": ACTIVATION_TIME,
+        "snapshot_source_evidence_time": ACTIVATION_TIME,
         "activation_observation_sha256": ACTIVATION_EVIDENCE[
             "observation_sha256"
         ],
@@ -1612,6 +1663,81 @@ def resume_binding_for_phase(phase: str) -> dict[str, object]:
         ),
     }
     return {**material, "binding_sha256": midcutover.canonical_json_sha256(material)}
+
+
+class RuntimeSnapshotClockBindingTests(unittest.TestCase):
+    def _runtime_for_phase(self, phase: str) -> dual.MidCutoverResumeRuntime:
+        binding = resume_binding_for_phase(phase)
+        binding["source_evidence_time"] = ACTIVATION_TIME
+        binding["snapshot_source_evidence_time"] = ACTIVATION_TIME + 1
+        binding["binding_sha256"] = midcutover.canonical_json_sha256(
+            {key: value for key, value in binding.items() if key != "binding_sha256"}
+        )
+        return dual.MidCutoverResumeRuntime(
+            repo=ROOT,
+            runtime=Path("/runtime"),
+            release_path=Path("/release/green"),
+            contract=None,
+            contract_evidence={},
+            green_binding={
+                "release_id": GREEN_RELEASE,
+                "repo_head": HEAD_GREEN,
+                "registered_names_sha256": "d1" * 32,
+                "agent_instructions_sha256": "d2" * 32,
+            },
+            classification={"evidence": {"snapshot_observation": SNAPSHOT_REBOUND}},
+            resume_binding=binding,
+            timeout_seconds=1,
+            green_unit=midcutover.green_operator_unit(CUTOVER_ID),
+            selector_before={},
+            cutover_generation=CUTOVER_GENERATION,
+            blue_repo_head=HEAD_BLUE,
+            receipt_root=Path("/tmp/unused-midcutover-receipts"),
+        )
+
+    def test_s3_and_s4_snapshot_guards_use_hash_bound_rebind_time(self) -> None:
+        for phase in (
+            midcutover.PHASE_RETIRE_GREEN,
+            midcutover.PHASE_CLOSEOUT,
+        ):
+            with self.subTest(phase=phase):
+                runtime = self._runtime_for_phase(phase)
+                with mock.patch.object(
+                    dual.client_snapshot,
+                    "cutover_snapshot_effect_guard",
+                    return_value=nullcontext({}),
+                ) as guard:
+                    runtime.snapshot_effect_guard("test-effect")
+                self.assertEqual(
+                    guard.call_args.kwargs["source_evidence_time"],
+                    ACTIVATION_TIME + 1,
+                )
+
+    def test_s3_and_s4_cold_readback_use_hash_bound_rebind_time(self) -> None:
+        for phase in (
+            midcutover.PHASE_RETIRE_GREEN,
+            midcutover.PHASE_CLOSEOUT,
+        ):
+            with self.subTest(phase=phase):
+                runtime = self._runtime_for_phase(phase)
+                with mock.patch.object(
+                    midcutover,
+                    "observe_client_snapshot_binding",
+                    return_value=SNAPSHOT_REBOUND,
+                ) as observe:
+                    runtime.cold_snapshot_observation()
+                self.assertEqual(
+                    observe.call_args.kwargs["source_evidence_time"],
+                    ACTIVATION_TIME + 1,
+                )
+
+    def test_old_v2_binding_without_snapshot_clock_remains_valid(self) -> None:
+        binding = resume_binding_for_phase(midcutover.PHASE_RETIRE_GREEN)
+        binding.pop("snapshot_source_evidence_time", None)
+        binding["binding_sha256"] = midcutover.canonical_json_sha256(
+            {key: value for key, value in binding.items() if key != "binding_sha256"}
+        )
+        self.assertIsNotNone(midcutover._validated_resume_binding(binding))
 
 
 class _FakeResumeRuntime:
@@ -4889,6 +5015,7 @@ class ResumeLineageIdempotenceTests(unittest.TestCase):
         binding = legacy["resume_binding"]
         for field in (
             "resume_binding_schema_version",
+            "snapshot_source_evidence_time",
             "source_snapshot_receipt_sha256",
             "source_client_declaration_sha256",
             "classified_snapshot_receipt_sha256",
