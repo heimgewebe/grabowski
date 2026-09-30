@@ -83,6 +83,8 @@
     "grabowski_ports",
     "grabowski_tailscale_status",
     "grabowski_privileged_action_reference",
+    "grabowski_critical_user_data_inventory",
+    "grabowski_critical_user_data_inventory_read",
     "grabowski_power_run",
     "grabowski_fleet_list",
     "grabowski_fleet_run",
