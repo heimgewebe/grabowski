@@ -18,8 +18,10 @@ MAX_MANIFEST_BYTES = 2_000_000
 MAX_HEALTH_BYTES = 1_000_000
 MAX_REJECTIONS = 100
 SEGMENT_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,198}[A-Za-z0-9])?\Z")
-COMMIT_RE = re.compile(r"[0-9a-fA-F]{40}\Z")
-SOURCE_RECOVERY_SUFFIX_RE = re.compile(r"([0-9a-fA-F]{40})(?:--recovery-[0-9a-f]{12})?\Z")
+COMMIT_RE = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
+SOURCE_RECOVERY_SUFFIX_RE = re.compile(
+    r"([0-9a-fA-F]{40}|[0-9a-fA-F]{64})(?:--recovery-[0-9a-f]{12})?\Z"
+)
 RETIRED_CANONICAL_REPOSITORY_ALIASES = {
     "heimgewebe__lenskit": "heimgewebe__repoground",
 }
