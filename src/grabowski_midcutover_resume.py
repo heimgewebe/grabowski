@@ -438,11 +438,6 @@ def historical_terminal_activation_observation(
         or not isinstance(transition.get("source_expires_at_unix"), int)
         or not (
             transition["source_created_at_unix"] - SNAPSHOT_CLOCK_SKEW_SECONDS
-            <= observed_at
-            <= transition["source_expires_at_unix"]
-        )
-        or not (
-            transition["source_created_at_unix"] - SNAPSHOT_CLOCK_SKEW_SECONDS
             <= transition["source_evidence_time"]
             <= transition["source_expires_at_unix"]
         )

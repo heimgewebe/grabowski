@@ -856,6 +856,32 @@ class HistoricalTerminalActivationTests(unittest.TestCase):
         activation = midcutover.historical_terminal_activation_observation(receipt)
         self.assertEqual(activation["state"], "platform_converged")
 
+    def test_activation_time_may_follow_source_expiry_when_rebind_time_is_fresh(self) -> None:
+        receipt = historical_terminal_cutover_receipt()
+        transition = receipt["snapshot_rebind"]["cutover_transition"]
+        transition["source_evidence_time"] = transition["source_expires_at_unix"]
+        observation = dict(receipt["observations"][0])
+        observation["observed_at_unix"] = transition["source_expires_at_unix"] + 1
+        material = {
+            key: value
+            for key, value in observation.items()
+            if key != "observation_sha256"
+        }
+        observation["observation_sha256"] = midcutover.canonical_json_sha256(material)
+        receipt["observations"] = [observation]
+        receipt.pop("receipt_sha256", None)
+        receipt["receipt_sha256"] = midcutover.canonical_json_sha256(receipt)
+
+        activation = midcutover.historical_terminal_activation_observation(receipt)
+        self.assertEqual(
+            activation["source_evidence_time"],
+            transition["source_expires_at_unix"] + 1,
+        )
+        self.assertEqual(
+            activation["snapshot_source_evidence_time"],
+            transition["source_expires_at_unix"],
+        )
+
     def test_historical_clock_skew_within_canonical_window_is_accepted(self) -> None:
         receipt = historical_terminal_cutover_receipt()
         transition = receipt["snapshot_rebind"]["cutover_transition"]
