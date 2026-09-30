@@ -836,6 +836,72 @@ class HistoricalTerminalActivationTests(unittest.TestCase):
             midcutover.PHASE_RETIRE_GREEN,
         )
 
+    def test_historical_terminal_evidence_never_authorizes_green_selector(self) -> None:
+        receipt = historical_terminal_cutover_receipt()
+        activation = midcutover.historical_terminal_activation_observation(receipt)
+        pointer = {
+            "release_id": GREEN_RELEASE,
+            "repo_head": HEAD_GREEN,
+            "completion_status": "complete",
+            "pointer_kind": "symlink",
+            "pointer_target_release_id": GREEN_RELEASE,
+            "error": None,
+        }
+        verdict = classify(
+            receipts=[receipt],
+            activation_observation=activation,
+            selector=selector_document(),
+            pointer_observation=pointer,
+            snapshot_observation=SNAPSHOT_REBOUND,
+        )
+        self.assertEqual(verdict["lane"], midcutover.LANE_FAIL_CLOSED)
+        self.assertIn(
+            "historical_terminal_selector_is_canonical", verdict["reasons"]
+        )
+
+    def test_platform_converged_never_reopens_preterminal_phases(self) -> None:
+        receipt = historical_terminal_cutover_receipt()
+        activation = midcutover.historical_terminal_activation_observation(receipt)
+        cases = (
+            (selector_document(), POINTER_AT_BLUE, SNAPSHOT_PENDING),
+            (selector_document(), POINTER_AT_BLUE, SNAPSHOT_REBOUND),
+            (selector_document(), POINTER_AT_TARGET, SNAPSHOT_REBOUND),
+        )
+        for selector, pointer, snapshot in cases:
+            with self.subTest(pointer=pointer["release_id"], snapshot=snapshot["state"]):
+                verdict = midcutover.classify_recovery_lane(
+                    expected_head=HEAD_GREEN,
+                    selector=selector,
+                    receipts=[receipt],
+                    green_observation=GREEN_OBSERVATION,
+                    blue_observation=BLUE_OBSERVATION,
+                    activation_observation=activation,
+                    pointer_observation=pointer,
+                    green_unit_observation={"active": True},
+                    snapshot_observation=snapshot,
+                )
+                self.assertEqual(verdict["lane"], midcutover.LANE_FAIL_CLOSED)
+                self.assertIn("activation_observation_valid", verdict["reasons"])
+
+    def test_historical_terminal_readback_must_match_current_selector(self) -> None:
+        receipt = historical_terminal_cutover_receipt()
+        activation = midcutover.historical_terminal_activation_observation(receipt)
+        selector = dict(receipt["authoritative_readback"]["selector"])
+        selector["selector_sha256"] = "ee" * 32
+        verdict = midcutover.classify_recovery_lane(
+            expected_head=HEAD_GREEN,
+            selector=selector,
+            receipts=[receipt],
+            green_observation=GREEN_OBSERVATION,
+            blue_observation=BLUE_OBSERVATION,
+            activation_observation=activation,
+            pointer_observation=POINTER_AT_TARGET,
+            green_unit_observation={"active": True},
+            snapshot_observation=SNAPSHOT_REBOUND,
+        )
+        self.assertEqual(verdict["lane"], midcutover.LANE_FAIL_CLOSED)
+        self.assertIn("activation_observation_valid", verdict["reasons"])
+
     def test_completed_resume_becomes_tombstone_for_historical_lineage(self) -> None:
         receipt = historical_terminal_cutover_receipt()
         activation = midcutover.historical_terminal_activation_observation(receipt)

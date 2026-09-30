@@ -471,6 +471,7 @@ def historical_terminal_activation_observation(
         "observation_sha256": activation["observation_sha256"],
         "state": details["state"],
         "historical_terminal_evidence": True,
+        "historical_terminal_selector_sha256": readback_selector["selector_sha256"],
     }
 
 
@@ -2216,23 +2217,27 @@ def classify_recovery_lane(
             and isinstance(generation, int)
             and generation >= 1
         )
-        checks["activation_observation_valid"] = bool(
+        activation_shape_valid = bool(
             activation_error is None
             and isinstance(activation, dict)
             and isinstance(activation.get("source_evidence_time"), int)
-            and (
-                activation.get("state") in PLATFORM_PUBLICATION_ACTIVATED_STATES
-                or (
-                    activation.get("state") == "platform_converged"
-                    and activation.get("historical_terminal_evidence") is True
-                )
-            )
             and isinstance(activation.get("publication_request_id"), str)
             and SHA256_RE.fullmatch(
                 str(activation.get("observation_sha256") or "")
             )
             is not None
         )
+        ordinary_activation_valid = bool(
+            activation_shape_valid
+            and activation.get("state") in PLATFORM_PUBLICATION_ACTIVATED_STATES
+        )
+        if (
+            isinstance(activation, dict)
+            and activation.get("historical_terminal_evidence") is True
+        ):
+            checks["historical_terminal_selector_is_canonical"] = (
+                slot == CANONICAL_SLOT
+            )
         checks["blue_release_artifact_matches_predecessor"] = bool(
             isinstance(blue_head, str)
             and HEAD_RE.fullmatch(blue_head)
@@ -2285,6 +2290,24 @@ def classify_recovery_lane(
         evidence["pointer_promoted"] = pointer_promoted
         evidence["green_retired"] = green_retired
         receipt_summary["resume_phase"] = phase
+
+        historical_terminal_activation_valid = bool(
+            activation_shape_valid
+            and activation.get("state") == "platform_converged"
+            and activation.get("historical_terminal_evidence") is True
+            and slot == CANONICAL_SLOT
+            and pointer_promoted
+            and snapshot_rebound
+            and phase in {PHASE_RETIRE_GREEN, PHASE_CLOSEOUT}
+            and activation.get("historical_terminal_selector_sha256")
+            == selector.get("selector_sha256")
+        )
+        checks["activation_observation_valid"] = bool(
+            ordinary_activation_valid or historical_terminal_activation_valid
+        )
+        evidence["historical_terminal_activation_admitted"] = (
+            historical_terminal_activation_valid
+        )
 
         checks["stable_pointer_classifiable"] = pointer_state in {"blue", "target"}
         checks["client_snapshot_classifiable"] = snapshot_state in {
