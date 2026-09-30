@@ -1838,10 +1838,10 @@ def _completed_lineage_binding(receipt: dict[str, Any]) -> dict[str, Any] | None
         != binding["source_client_declaration_sha256"]
         or final_snapshot.get("classified_snapshot_receipt_sha256")
         != rebind.get("receipt_sha256")
-        or final_snapshot.get("source_evidence_time")
-        != binding.get(
-            "snapshot_source_evidence_time",
-            binding["source_evidence_time"],
+        or (
+            "snapshot_source_evidence_time" in binding
+            and final_snapshot.get("source_evidence_time")
+            != binding["snapshot_source_evidence_time"]
         )
     ):
         return None

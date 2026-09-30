@@ -5045,6 +5045,27 @@ class ResumeLineageIdempotenceTests(unittest.TestCase):
                     midcutover._lineage_resolved([forged], cutover_receipt())
                 )
 
+    def test_pre_upgrade_v2_completed_receipt_remains_a_terminal_tombstone(self) -> None:
+        receipt = resume_receipt()
+        binding = receipt["resume_binding"]
+        binding.pop("snapshot_source_evidence_time")
+        receipt["final_state"]["snapshot"] = dict(receipt["final_state"]["snapshot"])
+        receipt["final_state"]["snapshot"].pop("source_evidence_time")
+        self._rehash(receipt, binding_changed=True)
+
+        self.assertIsNotNone(midcutover._validated_resume_binding(binding))
+        self.assertIsNotNone(midcutover._completed_lineage_binding(receipt))
+        self.assertTrue(midcutover._lineage_resolved([receipt], cutover_receipt()))
+
+    def test_timestamped_v2_completed_receipt_requires_matching_snapshot_time(self) -> None:
+        receipt = resume_receipt()
+        receipt["final_state"]["snapshot"] = dict(receipt["final_state"]["snapshot"])
+        receipt["final_state"]["snapshot"]["source_evidence_time"] += 1
+        self._rehash(receipt)
+
+        self.assertIsNone(midcutover._completed_lineage_binding(receipt))
+        self.assertFalse(midcutover._lineage_resolved([receipt], cutover_receipt()))
+
     def test_legacy_completed_receipt_is_only_a_terminal_tombstone(self) -> None:
         legacy = resume_receipt()
         binding = legacy["resume_binding"]
