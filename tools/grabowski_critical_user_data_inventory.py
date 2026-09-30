@@ -56,9 +56,8 @@ SYSTEMD_RUN = Path("/usr/bin/systemd-run")
 SYSTEMCTL = Path("/usr/bin/systemctl")
 STATE_PARENT = Path("/dev/shm")
 STATE_ROOT = STATE_PARENT / "grabowski-critical-user-data-inventory"
-DURABLE_STATE_ROOT = Path("/var/lib/grabowski/critical-user-data-inventory")
 SNAPSHOT_ROOT = STATE_ROOT / "unbound"
-RESULT_ROOT = DURABLE_STATE_ROOT / "unbound"
+RESULT_ROOT = SNAPSHOT_ROOT
 SCANNER_SNAPSHOT = SNAPSHOT_ROOT / "nixos_critical_user_data_inventory.py"
 AGGREGATE_SCANNER_SNAPSHOT = SNAPSHOT_ROOT / "nixos_critical_data_inventory.py"
 CONTRACT_SNAPSHOT = SNAPSHOT_ROOT / "critical-user-data-contract-v1.json"
@@ -142,7 +141,7 @@ def _apply_binding(scanner_sha256: str, contract_sha256: str) -> None:
     SCANNER_SHA256 = scanner
     CONTRACT_SHA256 = contract
     SNAPSHOT_ROOT = STATE_ROOT / f"source-{scanner}-{contract}"
-    RESULT_ROOT = DURABLE_STATE_ROOT / f"source-{scanner}-{contract}"
+    RESULT_ROOT = SNAPSHOT_ROOT
     SCANNER_SNAPSHOT = SNAPSHOT_ROOT / "nixos_critical_user_data_inventory.py"
     AGGREGATE_SCANNER_SNAPSHOT = SNAPSHOT_ROOT / "nixos_critical_data_inventory.py"
     CONTRACT_SNAPSHOT = SNAPSHOT_ROOT / "critical-user-data-contract-v1.json"
@@ -307,11 +306,48 @@ def _ensure_state_root() -> None:
         raise InventoryHelperError("inventory state root is unsafe")
 
 
+def _ensure_existing_state_root() -> None:
+    if STATE_ROOT.parent != STATE_PARENT:
+        try:
+            info = STATE_ROOT.lstat()
+        except OSError as exc:
+            raise InventoryHelperError("inventory state root is unavailable") from exc
+        _validate_parent(STATE_ROOT.parent)
+        if (
+            STATE_ROOT.is_symlink()
+            or not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != 0
+            or info.st_gid != 0
+            or stat.S_IMODE(info.st_mode) != 0o700
+        ):
+            raise InventoryHelperError("inventory state root is unsafe")
+        return
+    try:
+        parent = STATE_PARENT.lstat()
+        info = STATE_ROOT.lstat()
+    except OSError as exc:
+        raise InventoryHelperError("inventory state root is unavailable") from exc
+    if (
+        STATE_PARENT.is_symlink()
+        or not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != 0
+        or parent.st_gid != 0
+        or stat.S_IMODE(parent.st_mode) != 0o1777
+        or STATE_ROOT.is_symlink()
+        or not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or stat.S_IMODE(info.st_mode) != 0o700
+        or info.st_dev != parent.st_dev
+    ):
+        raise InventoryHelperError("inventory state root is unsafe")
+
+
 def _ensure_result_root() -> None:
-    # Snapshot/fence state stays on tmpfs so the inventory never needs a writable
-    # bind on the source filesystem. Only the small sealed terminal result is
-    # durable across reboot.
-    _ensure_private_directory(DURABLE_STATE_ROOT)
+    # Result publication must remain inside the already-created isolated tmpfs
+    # state. This path deliberately avoids re-reading SOURCE_ROOT so a worker can
+    # seal a terminal failure even if the source disappears after dispatch.
+    _ensure_existing_state_root()
     _ensure_private_directory(RESULT_ROOT)
 
 
@@ -402,22 +438,12 @@ def _rename_noreplace(source: Path, destination: Path) -> bool:
     ) from OSError(error, os.strerror(error))
 
 
-def _write_create_only(path: Path, payload: bytes, *, mode: int) -> None:
+def _write_new_file(path: Path, payload: bytes, *, mode: int) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
     flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor: int | None = None
     try:
         descriptor = os.open(path, flags, mode)
-    except FileExistsError:
-        existing = _read_stable_regular(
-            path,
-            max_bytes=max(len(payload), 1),
-            require_root_owned=True,
-            required_mode=mode,
-        )
-        if existing != payload:
-            raise InventoryHelperError("existing inventory state differs")
-        return
-    try:
         os.fchmod(descriptor, mode)
         os.fchown(descriptor, 0, 0)
         offset = 0
@@ -436,9 +462,53 @@ def _write_create_only(path: Path, payload: bytes, *, mode: int) -> None:
             or info.st_nlink != 1
         ):
             raise InventoryHelperError("inventory state file metadata is unsafe")
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+            descriptor = None
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
     finally:
-        os.close(descriptor)
-    _fsync_directory(path.parent)
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _write_create_only(path: Path, payload: bytes, *, mode: int) -> None:
+    if os.path.lexists(path):
+        existing = _read_stable_regular(
+            path,
+            max_bytes=max(len(payload), 1),
+            require_root_owned=True,
+            required_mode=mode,
+        )
+        if existing != payload:
+            raise InventoryHelperError("existing inventory state differs")
+        return
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{secrets.token_hex(12)}.tmp"
+    )
+    try:
+        _write_new_file(temporary, payload, mode=mode)
+        if _rename_noreplace(temporary, path):
+            _fsync_directory(path.parent)
+            return
+        existing = _read_stable_regular(
+            path,
+            max_bytes=max(len(payload), 1),
+            require_root_owned=True,
+            required_mode=mode,
+        )
+        if existing != payload:
+            raise InventoryHelperError("existing inventory state differs")
+        _fsync_directory(path.parent)
+    finally:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
 
 
 def _validate_contract(payload: bytes) -> None:
@@ -775,8 +845,6 @@ def systemd_start_argv() -> list[str]:
         "--property=AmbientCapabilities=",
         f"--property=BindPaths={STATE_ROOT}",
         f"--property=ReadWritePaths={STATE_ROOT}",
-        f"--property=BindPaths={DURABLE_STATE_ROOT}",
-        f"--property=ReadWritePaths={DURABLE_STATE_ROOT}",
         "--property=StandardOutput=journal",
         "--property=StandardError=journal",
         "--property=WorkingDirectory=/",
@@ -1044,7 +1112,6 @@ def _validate_result(value: Any) -> dict[str, Any]:
 
 
 def _write_result(value: dict[str, Any]) -> None:
-    _ensure_state_root()
     _ensure_result_root()
     sealed = _seal_result(value)
     payload = _canonical(sealed)
@@ -1054,7 +1121,7 @@ def _write_result(value: dict[str, Any]) -> None:
         f".{RESULT_PATH.name}.{os.getpid()}.{secrets.token_hex(12)}.tmp"
     )
     try:
-        _write_create_only(temporary, payload, mode=0o600)
+        _write_new_file(temporary, payload, mode=0o600)
         if _rename_noreplace(temporary, RESULT_PATH):
             _fsync_directory(RESULT_ROOT)
             return
@@ -1117,8 +1184,11 @@ def _archive_failed_result(value: dict[str, Any]) -> None:
     _fsync_directory(RESULT_ROOT)
 
 
-def _lock() -> int:
-    _ensure_state_root()
+def _lock(*, require_source_backing: bool = True) -> int:
+    if require_source_backing:
+        _ensure_state_root()
+    else:
+        _ensure_existing_state_root()
     _ensure_private_directory(SNAPSHOT_ROOT)
     descriptor = os.open(
         LOCK_PATH,
@@ -1185,16 +1255,14 @@ def _start() -> dict[str, Any]:
             if result["status"] != "failed":
                 return _public_result(result)
             # An explicit new start is the recovery action for a terminal failed
-            # scan: retain the sealed failure durably, then establish a fresh
-            # start fence.
+            # scan: archive the sealed failure within transient isolated state,
+            # then establish a fresh start fence.
             _archive_failed_result(result)
             _clear_start_attempt()
         elif _start_attempt_exists():
-            # Fresh status has already shown the unit inactive and no result is
-            # present. The scan is read-only, so an explicit new start may
-            # recover this stale transient fence without claiming retry safety
-            # for the ambiguous prior request.
-            _clear_start_attempt()
+            raise InventoryHelperError(
+                "previous inventory start outcome is unresolved"
+            )
         if not _claim_start_attempt():
             raise InventoryHelperError(
                 "previous inventory start outcome is unresolved"
@@ -1231,7 +1299,7 @@ def _start() -> dict[str, Any]:
 
 
 def _execute() -> int:
-    descriptor = _lock()
+    descriptor = _lock(require_source_backing=False)
     stdout = b""
     stderr = b""
     try:

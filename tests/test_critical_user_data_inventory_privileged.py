@@ -550,12 +550,11 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
             "--property=CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH",
             f"--property=BindPaths={helper.STATE_ROOT}",
             f"--property=ReadWritePaths={helper.STATE_ROOT}",
-            f"--property=BindPaths={helper.DURABLE_STATE_ROOT}",
-            f"--property=ReadWritePaths={helper.DURABLE_STATE_ROOT}",
         }
         self.assertTrue(required.issubset(set(argv)))
         self.assertFalse(any("ReadWritePaths=/home" in token for token in argv))
         self.assertNotIn("--property=BindPaths=/dev/shm", argv)
+        self.assertFalse(any("/var/lib/grabowski" in token for token in argv))
         self.assertFalse(any("/var/lib/docker" in token for token in argv))
         self.assertEqual(argv[-2], str(helper.HELPER))
         request = json.loads(argv[-1])
@@ -635,8 +634,7 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
         run.assert_called_once()
 
 
-    def test_start_reclaims_inactive_unresolved_start_marker(self) -> None:
-        passed = self._passed_result()
+    def test_start_refuses_inactive_unresolved_start_marker(self) -> None:
         inactive = {
             "LoadState": "not-found",
             "ActiveState": "inactive",
@@ -647,21 +645,23 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
             mock.patch.object(helper, "_lock", return_value=19),
             mock.patch.object(helper, "_ensure_result_root"),
             mock.patch.object(helper, "_snapshot_sources"),
-            mock.patch.object(helper, "_unit_state", side_effect=[inactive, inactive]),
-            mock.patch.object(helper, "_read_result", side_effect=[None, passed]),
+            mock.patch.object(helper, "_unit_state", return_value=inactive),
+            mock.patch.object(helper, "_read_result", return_value=None),
             mock.patch.object(helper, "_start_attempt_exists", return_value=True),
             mock.patch.object(helper, "_clear_start_attempt") as clear_start_attempt,
-            mock.patch.object(helper, "_claim_start_attempt", return_value=True),
-            mock.patch.object(
-                helper.subprocess, "run", return_value=mock.Mock(returncode=0)
-            ) as run,
+            mock.patch.object(helper, "_claim_start_attempt") as claim_start_attempt,
+            mock.patch.object(helper.subprocess, "run") as run,
             mock.patch.object(helper.os, "close"),
         ):
-            result = helper._start()
+            with self.assertRaisesRegex(
+                helper.InventoryHelperError,
+                "previous inventory start outcome is unresolved",
+            ):
+                helper._start()
 
-        self.assertEqual(result, passed)
-        clear_start_attempt.assert_called_once_with()
-        run.assert_called_once()
+        clear_start_attempt.assert_not_called()
+        claim_start_attempt.assert_not_called()
+        run.assert_not_called()
 
     def test_rename_noreplace_moves_new_destination(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -714,6 +714,70 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
                         "atomic inventory result publish is unavailable",
                     ):
                         helper._rename_noreplace(Path("source"), Path("destination"))
+
+    def test_write_create_only_publishes_only_after_complete_temp(self) -> None:
+        path = helper.SNAPSHOT_ROOT / "atomic-state"
+        payload = b"complete-state"
+        with (
+            mock.patch.object(helper.os.path, "lexists", return_value=False),
+            mock.patch.object(helper, "_write_new_file") as write_new_file,
+            mock.patch.object(helper, "_rename_noreplace", return_value=True) as rename,
+            mock.patch.object(helper, "_fsync_directory") as fsync_directory,
+            mock.patch.object(helper.os, "unlink"),
+        ):
+            helper._write_create_only(path, payload, mode=0o600)
+
+        temporary = write_new_file.call_args.args[0]
+        self.assertNotEqual(temporary, path)
+        self.assertEqual(temporary.parent, path.parent)
+        self.assertTrue(temporary.name.startswith(f".{path.name}."))
+        self.assertTrue(temporary.name.endswith(".tmp"))
+        write_new_file.assert_called_once_with(temporary, payload, mode=0o600)
+        rename.assert_called_once_with(temporary, path)
+        fsync_directory.assert_called_once_with(path.parent)
+
+    def test_write_create_only_never_publishes_failed_temp_write(self) -> None:
+        path = helper.SNAPSHOT_ROOT / "atomic-state"
+        with (
+            mock.patch.object(helper.os.path, "lexists", return_value=False),
+            mock.patch.object(
+                helper,
+                "_write_new_file",
+                side_effect=helper.InventoryHelperError(
+                    "inventory state write was incomplete"
+                ),
+            ),
+            mock.patch.object(helper, "_rename_noreplace") as rename,
+            mock.patch.object(helper.os, "unlink"),
+        ):
+            with self.assertRaisesRegex(
+                helper.InventoryHelperError, "write was incomplete"
+            ):
+                helper._write_create_only(path, b"partial", mode=0o600)
+
+        rename.assert_not_called()
+
+    def test_worker_lock_reuses_existing_state_without_source_readback(self) -> None:
+        info = mock.Mock(
+            st_mode=helper.stat.S_IFREG | 0o600,
+            st_uid=0,
+            st_nlink=1,
+        )
+        with (
+            mock.patch.object(helper, "_ensure_state_root") as ensure_state_root,
+            mock.patch.object(
+                helper, "_ensure_existing_state_root"
+            ) as ensure_existing,
+            mock.patch.object(helper, "_ensure_private_directory"),
+            mock.patch.object(helper.os, "open", return_value=19),
+            mock.patch.object(helper.os, "fstat", return_value=info),
+            mock.patch.object(helper.fcntl, "flock"),
+        ):
+            descriptor = helper._lock(require_source_backing=False)
+
+        self.assertEqual(descriptor, 19)
+        ensure_state_root.assert_not_called()
+        ensure_existing.assert_called_once_with()
 
     def test_archive_failed_result_moves_without_replace_and_fsyncs_durable_tree(self) -> None:
         failed = helper._unsigned_result(
@@ -782,9 +846,9 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
         )
         payload = helper._canonical(helper._seal_result(result))
         with (
-            mock.patch.object(helper, "_ensure_state_root"),
+            mock.patch.object(helper, "_ensure_state_root") as ensure_state_root,
             mock.patch.object(helper, "_ensure_result_root"),
-            mock.patch.object(helper, "_write_create_only") as write_create_only,
+            mock.patch.object(helper, "_write_new_file") as write_new_file,
             mock.patch.object(helper, "_rename_noreplace", return_value=False),
             mock.patch.object(
                 helper,
@@ -796,7 +860,8 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
         ):
             helper._write_result(result)
 
-        temporary = write_create_only.call_args.args[0]
+        ensure_state_root.assert_not_called()
+        temporary = write_new_file.call_args.args[0]
         unlink.assert_called_once_with(temporary)
         fsync_directory.assert_called_once_with(helper.RESULT_ROOT)
 
@@ -812,21 +877,22 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
         )
         sealed_payload = helper._canonical(helper._seal_result(result))
         with (
-            mock.patch.object(helper, "_ensure_state_root"),
+            mock.patch.object(helper, "_ensure_state_root") as ensure_state_root,
             mock.patch.object(helper, "_ensure_result_root"),
-            mock.patch.object(helper, "_write_create_only") as write_create_only,
+            mock.patch.object(helper, "_write_new_file") as write_new_file,
             mock.patch.object(helper, "_rename_noreplace", return_value=True) as rename,
             mock.patch.object(helper, "_fsync_directory") as fsync_directory,
         ):
             helper._write_result(result)
 
-        temporary = write_create_only.call_args.args[0]
+        ensure_state_root.assert_not_called()
+        temporary = write_new_file.call_args.args[0]
         self.assertNotEqual(temporary, helper.RESULT_PATH)
         self.assertEqual(temporary.parent, helper.RESULT_PATH.parent)
         self.assertTrue(temporary.name.startswith(f".{helper.RESULT_PATH.name}."))
         self.assertTrue(temporary.name.endswith(".tmp"))
-        self.assertEqual(write_create_only.call_args.args[1], sealed_payload)
-        self.assertEqual(write_create_only.call_args.kwargs, {"mode": 0o600})
+        self.assertEqual(write_new_file.call_args.args[1], sealed_payload)
+        self.assertEqual(write_new_file.call_args.kwargs, {"mode": 0o600})
         rename.assert_called_once_with(temporary, helper.RESULT_PATH)
         fsync_directory.assert_called_once_with(helper.RESULT_ROOT)
 
@@ -851,9 +917,9 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
         )
         existing_payload = helper._canonical(helper._seal_result(existing))
         with (
-            mock.patch.object(helper, "_ensure_state_root"),
+            mock.patch.object(helper, "_ensure_state_root") as ensure_state_root,
             mock.patch.object(helper, "_ensure_result_root"),
-            mock.patch.object(helper, "_write_create_only") as write_create_only,
+            mock.patch.object(helper, "_write_new_file") as write_new_file,
             mock.patch.object(helper, "_rename_noreplace", return_value=False) as rename,
             mock.patch.object(
                 helper,
@@ -868,7 +934,8 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
             ):
                 helper._write_result(replacement)
 
-        temporary = write_create_only.call_args.args[0]
+        ensure_state_root.assert_not_called()
+        temporary = write_new_file.call_args.args[0]
         rename.assert_called_once_with(temporary, helper.RESULT_PATH)
         read_existing.assert_called_once_with(
             helper.RESULT_PATH,
@@ -881,7 +948,7 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
 
     def test_execute_seals_pre_scan_snapshot_failure(self) -> None:
         with (
-            mock.patch.object(helper, "_lock", return_value=19),
+            mock.patch.object(helper, "_lock", return_value=19) as lock,
             mock.patch.object(helper, "_read_result", return_value=None),
             mock.patch.object(
                 helper,
@@ -896,6 +963,7 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
             returncode = helper._execute()
 
         self.assertEqual(returncode, 2)
+        lock.assert_called_once_with(require_source_backing=False)
         run.assert_not_called()
         failed = write_result.call_args.args[0]
         self.assertEqual(failed["status"], "failed")
@@ -951,7 +1019,6 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
         recovery_path.write_bytes(recovery_contract)
         state = root / "state"
         state.mkdir(mode=0o700)
-        durable = root / "durable"
         return temporary, {
             "scanner": scanner,
             "aggregate_scanner": aggregate_scanner,
@@ -969,7 +1036,6 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
             "home_sha": home_sha,
             "recovery_sha": _sha(recovery_contract),
             "state": state,
-            "durable": durable,
         }
 
     def _snapshot_context(self, fx: dict[str, object]) -> ExitStack:
@@ -986,7 +1052,6 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
             ("AUTHORIZED_HOME_CONTRACT_SHA256", fx["home_sha"]),
             ("AUTHORIZED_RECOVERY_CONTRACT_SHA256", fx["recovery_sha"]),
             ("STATE_ROOT", fx["state"]),
-            ("DURABLE_STATE_ROOT", fx["durable"]),
         ):
             stack.enter_context(mock.patch.object(helper, name, value))
         helper._apply_binding(
@@ -995,14 +1060,14 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
         )
         return stack
 
-    def test_binding_keeps_durable_result_separate_from_transient_state(self) -> None:
+    def test_binding_keeps_result_inside_transient_isolated_state(self) -> None:
         temporary, fx = self._fixture()
         self.addCleanup(temporary.cleanup)
         with self._snapshot_context(fx):
-            self.assertEqual(helper.RESULT_ROOT.parent, helper.DURABLE_STATE_ROOT)
+            self.assertEqual(helper.RESULT_ROOT, helper.SNAPSHOT_ROOT)
             self.assertEqual(helper.RESULT_PATH.parent, helper.RESULT_ROOT)
             self.assertEqual(helper.FAILED_ROOT.parent, helper.RESULT_ROOT)
-            self.assertNotEqual(helper.RESULT_ROOT.parent, helper.STATE_ROOT)
+            self.assertEqual(helper.RESULT_ROOT.parent, helper.STATE_ROOT)
 
     def test_snapshot_rejects_changed_source_after_authority_binding(self) -> None:
         temporary, fx = self._fixture()
@@ -1186,6 +1251,153 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
                 scanner_sha256=helper.AUTHORIZED_SCANNER_SHA256,
                 contract_sha256=helper.AUTHORIZED_CONTRACT_SHA256,
             )
+
+    def test_preflight_failed_same_result_after_ambiguous_start_stays_unknown(self) -> None:
+        old_sha = "a" * 64
+        failed_status = {
+            "broker_returncode": 0,
+            "result": {
+                "schema_version": 1,
+                "kind": "grabowski.critical_user_data_inventory_status.v1",
+                "status": "failed",
+                "scanner_sha256": helper.AUTHORIZED_SCANNER_SHA256,
+                "contract_sha256": helper.AUTHORIZED_CONTRACT_SHA256,
+                "unit": "inventory.service",
+                "unit_state": {
+                    "load": "loaded",
+                    "active": "inactive",
+                    "sub": "dead",
+                    "result": "failed",
+                },
+                "result_sha256": old_sha,
+            },
+        }
+        blocked = {
+            "broker_returncode": 2,
+            "result": {
+                "schema_version": 1,
+                "kind": "grabowski.critical_user_data_inventory_error.v1",
+                "status": "blocked",
+                "scanner_sha256": helper.AUTHORIZED_SCANNER_SHA256,
+                "contract_sha256": helper.AUTHORIZED_CONTRACT_SHA256,
+            },
+        }
+        calls = [
+            ({"request_id": "pre-old", "reference_sha256": "1" * 64}, failed_status),
+            ({"request_id": "start-old", "reference_sha256": "2" * 64}, blocked),
+            ({"request_id": "status-old", "reference_sha256": "3" * 64}, failed_status),
+        ]
+        with (
+            mock.patch.object(
+                privileged, "_critical_inventory_broker_call", side_effect=calls
+            ),
+            mock.patch.object(
+                privileged.operator, "_require_operator_mutation", return_value=None
+            ) as mutation_gate,
+        ):
+            value = privileged.grabowski_critical_user_data_inventory(
+                "start",
+                helper.AUTHORIZED_SCANNER_SHA256,
+                helper.AUTHORIZED_CONTRACT_SHA256,
+            )
+
+        mutation_gate.assert_called_once_with("power_execute")
+        self.assertEqual(value["outcome"], "outcome_unknown")
+        self.assertTrue(value["readback_required"])
+        self.assertFalse(value["retry_safe"])
+        self.assertEqual(value["readback"]["result_sha256"], old_sha)
+
+    def test_preflight_passed_requires_matching_result_digest(self) -> None:
+        passed = self._passed_result()
+        observed_sha = "a" * 64
+        self.assertNotEqual(passed["result_sha256"], observed_sha)
+        passed_status = {
+            "broker_returncode": 0,
+            "result": {
+                "schema_version": 1,
+                "kind": "grabowski.critical_user_data_inventory_status.v1",
+                "status": "passed",
+                "scanner_sha256": helper.AUTHORIZED_SCANNER_SHA256,
+                "contract_sha256": helper.AUTHORIZED_CONTRACT_SHA256,
+                "unit": "inventory.service",
+                "unit_state": {
+                    "load": "loaded",
+                    "active": "inactive",
+                    "sub": "dead",
+                    "result": "success",
+                },
+                "result_sha256": observed_sha,
+            },
+        }
+        calls = [
+            ({"request_id": "pre-passed", "reference_sha256": "4" * 64}, passed_status),
+            (
+                {"request_id": "result-passed", "reference_sha256": "5" * 64},
+                {"broker_returncode": 0, "result": passed},
+            ),
+        ]
+        with (
+            mock.patch.object(
+                privileged, "_critical_inventory_broker_call", side_effect=calls
+            ),
+            mock.patch.object(
+                privileged.operator, "_require_operator_mutation"
+            ) as mutation_gate,
+        ):
+            value = privileged.grabowski_critical_user_data_inventory(
+                "start",
+                helper.AUTHORIZED_SCANNER_SHA256,
+                helper.AUTHORIZED_CONTRACT_SHA256,
+            )
+
+        mutation_gate.assert_not_called()
+        self.assertEqual(value["outcome"], "outcome_unknown")
+        self.assertTrue(value["readback_required"])
+        self.assertFalse(value["retry_safe"])
+        self.assertEqual(value["readback"]["result_sha256"], observed_sha)
+
+    def test_preflight_outcome_unknown_blocks_start_without_mutation(self) -> None:
+        unresolved = {
+            "broker_returncode": 0,
+            "result": {
+                "schema_version": 1,
+                "kind": "grabowski.critical_user_data_inventory_status.v1",
+                "status": "outcome-unknown",
+                "scanner_sha256": helper.AUTHORIZED_SCANNER_SHA256,
+                "contract_sha256": helper.AUTHORIZED_CONTRACT_SHA256,
+                "unit": "inventory.service",
+                "unit_state": {
+                    "load": "loaded",
+                    "active": "inactive",
+                    "sub": "dead",
+                    "result": "success",
+                },
+                "result_sha256": None,
+            },
+        }
+        pre = {"request_id": "pre-unresolved", "reference_sha256": "6" * 64}
+        with (
+            mock.patch.object(
+                privileged,
+                "_critical_inventory_broker_call",
+                return_value=(pre, unresolved),
+            ) as broker_call,
+            mock.patch.object(
+                privileged.operator, "_require_operator_mutation"
+            ) as mutation_gate,
+        ):
+            value = privileged.grabowski_critical_user_data_inventory(
+                "start",
+                helper.AUTHORIZED_SCANNER_SHA256,
+                helper.AUTHORIZED_CONTRACT_SHA256,
+            )
+
+        broker_call.assert_called_once()
+        mutation_gate.assert_not_called()
+        self.assertEqual(value["outcome"], "outcome_unknown")
+        self.assertTrue(value["readback_required"])
+        self.assertFalse(value["retry_safe"])
+        self.assertEqual(value["readback"]["status"], "outcome-unknown")
 
     def test_start_timeout_reconciles_running_status_without_retry(self) -> None:
         not_started = {
@@ -1628,17 +1840,18 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
                 "contract_sha256": helper.AUTHORIZED_CONTRACT_SHA256,
             },
         }
+        passed = self._passed_result()
         passed_status = {
             "broker_returncode": 0,
             "result": {
                 **not_started["result"],
                 "status": "passed",
-                "result_sha256": "7" * 64,
+                "result_sha256": passed["result_sha256"],
             },
         }
         passed_result = {
             "broker_returncode": 0,
-            "result": self._passed_result(),
+            "result": passed,
         }
         calls = [
             ({"request_id": "pre-terminal", "reference_sha256": "7" * 64}, not_started),
@@ -1663,6 +1876,74 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
         self.assertEqual(value["readback_request_id"], "result-terminal")
         self.assertEqual(value["result"]["status"], "passed")
         self.assertFalse(value["retry_safe"])
+
+    def test_start_blocked_terminal_digest_mismatch_stays_unknown(self) -> None:
+        not_started = {
+            "broker_returncode": 0,
+            "result": {
+                "schema_version": 1,
+                "kind": "grabowski.critical_user_data_inventory_status.v1",
+                "status": "not-started",
+                "scanner_sha256": helper.AUTHORIZED_SCANNER_SHA256,
+                "contract_sha256": helper.AUTHORIZED_CONTRACT_SHA256,
+                "unit": "inventory.service",
+                "unit_state": {
+                    "load": "not-found",
+                    "active": "inactive",
+                    "sub": "dead",
+                    "result": "success",
+                },
+                "result_sha256": None,
+            },
+        }
+        blocked = {
+            "broker_returncode": 2,
+            "result": {
+                "schema_version": 1,
+                "kind": "grabowski.critical_user_data_inventory_error.v1",
+                "status": "blocked",
+                "scanner_sha256": helper.AUTHORIZED_SCANNER_SHA256,
+                "contract_sha256": helper.AUTHORIZED_CONTRACT_SHA256,
+            },
+        }
+        status_sha = "b" * 64
+        passed = self._passed_result()
+        self.assertNotEqual(passed["result_sha256"], status_sha)
+        passed_status = {
+            "broker_returncode": 0,
+            "result": {
+                **not_started["result"],
+                "status": "passed",
+                "result_sha256": status_sha,
+            },
+        }
+        calls = [
+            ({"request_id": "pre-mismatch", "reference_sha256": "8" * 64}, not_started),
+            ({"request_id": "start-mismatch", "reference_sha256": "9" * 64}, blocked),
+            ({"request_id": "status-mismatch", "reference_sha256": "a" * 64}, passed_status),
+            (
+                {"request_id": "result-mismatch", "reference_sha256": "b" * 64},
+                {"broker_returncode": 0, "result": passed},
+            ),
+        ]
+        with (
+            mock.patch.object(
+                privileged, "_critical_inventory_broker_call", side_effect=calls
+            ),
+            mock.patch.object(
+                privileged.operator, "_require_operator_mutation", return_value=None
+            ),
+        ):
+            value = privileged.grabowski_critical_user_data_inventory(
+                "start",
+                helper.AUTHORIZED_SCANNER_SHA256,
+                helper.AUTHORIZED_CONTRACT_SHA256,
+            )
+
+        self.assertEqual(value["outcome"], "outcome_unknown")
+        self.assertTrue(value["readback_required"])
+        self.assertFalse(value["retry_safe"])
+        self.assertEqual(value["readback"]["result_sha256"], status_sha)
 
     def test_start_blocked_terminal_result_timeout_stays_unknown(self) -> None:
         not_started = {

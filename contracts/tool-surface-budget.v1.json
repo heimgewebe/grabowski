@@ -823,7 +823,7 @@
       ],
       "exception_detail": {
         "claim": "The tool owns only one hash-pinned start transition for the canonical critical-user-data aggregate inventory.",
-        "evidence": "A start-only broker request, fixed content-addressed source paths, member digest validation, root-owned evidence state, systemd sandboxing, commit-bound helper/action attestation, a durable start-attempt fence and focused negative/public-projection tests."
+        "evidence": "A start-only broker request, fixed content-addressed source paths, member digest validation, transient root-owned evidence state, systemd sandboxing, commit-bound helper/action attestation, an exclusive start-attempt fence and focused negative/public-projection tests."
       },
       "justification_kind": "distinct_authority_boundary",
       "operation_alternative_considered": "Reusing grabowski_power_run, terminal execution or a generic typed operation was rejected because those surfaces cannot enforce the exact scanner/contract SHA pair, fixed helper argv, zero-sample authoritative mode, internal-only execute operation, start-attempt fencing and safe aggregate-only response without granting materially broader root command or path authority.",
@@ -837,7 +837,7 @@
           "root-systemd-task-start"
         ],
         "read_only": false,
-        "reversibility": "no-user-data-mutation-root-owned-evidence-retained",
+        "reversibility": "no-user-data-mutation-root-owned-evidence-transient",
         "risk_class": "high",
         "tool": "grabowski_critical_user_data_inventory"
       }

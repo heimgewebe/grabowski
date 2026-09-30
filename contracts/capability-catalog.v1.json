@@ -1,6 +1,6 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "11977ef51e772002174da6cec1c902523d4decbc786d8242f5b2cd4dbd8a9987",
+  "capability_source_sha256": "7d671c856396c38b3e682216c24a905e02656fb3512294eb3f720db6c1312a06",
   "contract": "config/runtime-entrypoint.json",
   "contract_sha256": "bd94b08a5b4690a752e47d3e1ae20e30945bac55df2aed58840fb260e055eabd",
   "integrity": {
@@ -1038,9 +1038,9 @@
         "root-owned-inventory-evidence-write"
       ],
       "id": "grabowski_critical_user_data_inventory",
-      "purpose": "Start one fixed SHA-pinned authoritative critical-user-data inventory through the root-owned broker without arbitrary argv or paths.",
+      "purpose": "Start one fixed SHA-pinned authoritative critical-user-data inventory through the root-owned broker without arbitrary argv or paths; sealed result evidence is root-owned but transient and must be captured before reboot.",
       "read_only": false,
-      "reversibility": "no-user-data-mutation-root-owned-evidence-retained",
+      "reversibility": "no-user-data-mutation-root-owned-evidence-transient",
       "risk_class": "high",
       "tool": "grabowski_critical_user_data_inventory"
     },

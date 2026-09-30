@@ -1442,9 +1442,21 @@ def _critical_inventory_terminal_readback(
     start_invoked: dict[str, Any],
     status_invoked: dict[str, Any],
     status_parsed: dict[str, Any],
+    preflight_result_sha256: str | None = None,
 ) -> dict[str, Any]:
     status_result = status_parsed["result"]
     state = status_result["status"]
+    if (
+        preflight_result_sha256 is not None
+        and state in {"passed", "failed"}
+        and status_result.get("result_sha256") == preflight_result_sha256
+    ):
+        return _critical_inventory_unknown_start(
+            scanner,
+            contract,
+            start_invoked,
+            readback=status_result,
+        )
     if state == "running":
         return {
             **_critical_inventory_response(
@@ -1470,6 +1482,18 @@ def _critical_inventory_terminal_readback(
             ambiguous_on_invalid=True,
         )
         if result_parsed is not None:
+            status_result_sha256 = status_result.get("result_sha256")
+            result_result_sha256 = result_parsed["result"].get("result_sha256")
+            if (
+                not isinstance(status_result_sha256, str)
+                or result_result_sha256 != status_result_sha256
+            ):
+                return _critical_inventory_unknown_start(
+                    scanner,
+                    contract,
+                    start_invoked,
+                    readback=status_result,
+                )
             return {
                 **_critical_inventory_response(
                     "start",
@@ -1528,13 +1552,26 @@ def grabowski_critical_user_data_inventory(
         }
     pre_status = pre_parsed["result"]["status"]
     if pre_status == "passed":
+        preflight_result_sha256 = pre_parsed["result"].get("result_sha256")
+        if not isinstance(preflight_result_sha256, str):
+            return _critical_inventory_unknown_start(
+                scanner,
+                contract,
+                pre_invoked,
+                readback=pre_parsed["result"],
+            )
         result_invoked, result_parsed = _critical_inventory_broker_call(
             "result",
             scanner,
             contract,
             action=CRITICAL_USER_DATA_INVENTORY_READ_ACTION,
+            ambiguous_on_invalid=True,
         )
-        if result_parsed is not None:
+        if (
+            result_parsed is not None
+            and result_parsed["result"].get("result_sha256")
+            == preflight_result_sha256
+        ):
             return {
                 **_critical_inventory_response(
                     "start",
@@ -1566,13 +1603,28 @@ def grabowski_critical_user_data_inventory(
             "readback_required": False,
             "retry_safe": False,
         }
-    if pre_status not in {"not-started", "failed", "outcome-unknown"}:
+    if pre_status not in {"not-started", "failed"}:
         return _critical_inventory_unknown_start(
             scanner,
             contract,
             pre_invoked,
             readback=pre_parsed["result"],
         )
+
+    # Terminal failed results may be retried explicitly. An outcome-unknown
+    # preflight never reaches this mutation path; it remains blocked until an
+    # administrative recovery transition outside this start operation resolves it.
+    preflight_result_sha256: str | None = None
+    if pre_status == "failed":
+        observed_preflight_sha = pre_parsed["result"].get("result_sha256")
+        if not isinstance(observed_preflight_sha, str):
+            return _critical_inventory_unknown_start(
+                scanner,
+                contract,
+                pre_invoked,
+                readback=pre_parsed["result"],
+            )
+        preflight_result_sha256 = observed_preflight_sha
 
     operator._require_operator_mutation("power_execute")
     invoked, parsed = _critical_inventory_broker_call(
@@ -1606,6 +1658,7 @@ def grabowski_critical_user_data_inventory(
         start_invoked=invoked,
         status_invoked=status_invoked,
         status_parsed=status_parsed,
+        preflight_result_sha256=preflight_result_sha256,
     )
 
 

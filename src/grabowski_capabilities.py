@@ -476,7 +476,8 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "category": "privileged-execution",
         "purpose": (
             "Start one fixed SHA-pinned authoritative critical-user-data inventory "
-            "through the root-owned broker without arbitrary argv or paths."
+            "through the root-owned broker without arbitrary argv or paths; sealed "
+            "result evidence is root-owned but transient and must be captured before reboot."
         ),
         "risk_class": "high",
         "effects": [
@@ -484,7 +485,7 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
             "root-systemd-task-start",
             "root-owned-inventory-evidence-write",
         ],
-        "reversibility": "no-user-data-mutation-root-owned-evidence-retained",
+        "reversibility": "no-user-data-mutation-root-owned-evidence-transient",
     },
     "grabowski_critical_user_data_inventory_read": {
         "category": "privileged-reference",
