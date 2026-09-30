@@ -122,7 +122,8 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_ports` | diagnostics | yes | low | List listening TCP and UDP sockets. |
 | `grabowski_tailscale_status` | diagnostics | yes | low | Read bounded local Tailscale node and peer health without account records or mutation controls. |
 | `grabowski_privileged_action_reference` | privileged-reference | yes | medium | Create a non-executable reference contract for a future external privileged action. |
-| `grabowski_critical_user_data_inventory` | privileged-execution | no | high | Start or read one fixed-path SHA-pinned authoritative critical-user-data inventory through the root-owned broker without arbitrary argv or paths. |
+| `grabowski_critical_user_data_inventory` | privileged-execution | no | high | Start one fixed SHA-pinned authoritative critical-user-data inventory through the root-owned broker without arbitrary argv or paths. |
+| `grabowski_critical_user_data_inventory_read` | privileged-reference | yes | low | Read status or a sealed result for the fixed SHA-pinned critical-user-data inventory without dispatching a new scan. |
 | `grabowski_power_run` | privileged-execution | no | critical | Run one audited root command through the canonical root-owned broker. |
 | `grabowski_fleet_list` | fleet | yes | low | Return a bounded projection of the validated local and SSH host registry. |
 | `grabowski_fleet_run` | fleet | no | variable | Run one bounded argv command on one registered local or SSH host. |

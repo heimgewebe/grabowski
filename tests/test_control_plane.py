@@ -1964,7 +1964,8 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
         legacy_kill_switch = "/home/alex/.local/state/grabowski/operator-kill-switch"
         automatic_repos = (
             "/home/alex/repos/grabowski",
-            "/home/alex/repos/heim-pc",
+            "/home/alex/repos/.repoground-sources/"
+            "heimgewebe__heim-pc__main--d6d4b3c4337d8bd51758d10d83975c9d61fd18d7",
         )
         expected_service_binds = tuple(
             sorted((recovery_source, legacy_kill_switch, *automatic_repos, *mounted))

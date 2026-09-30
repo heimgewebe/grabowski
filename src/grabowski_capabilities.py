@@ -475,17 +475,26 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
     "grabowski_critical_user_data_inventory": {
         "category": "privileged-execution",
         "purpose": (
-            "Start or read one fixed-path SHA-pinned authoritative critical-user-data "
-            "inventory through the root-owned broker without arbitrary argv or paths."
+            "Start one fixed SHA-pinned authoritative critical-user-data inventory "
+            "through the root-owned broker without arbitrary argv or paths."
         ),
         "risk_class": "high",
         "effects": [
             "root-read-only-home-traversal",
-            "root-read-only-docker-volume-traversal",
             "root-systemd-task-start",
             "root-owned-inventory-evidence-write",
         ],
         "reversibility": "no-user-data-mutation-root-owned-evidence-retained",
+    },
+    "grabowski_critical_user_data_inventory_read": {
+        "category": "privileged-reference",
+        "purpose": (
+            "Read status or a sealed result for the fixed SHA-pinned critical-user-data "
+            "inventory without dispatching a new scan."
+        ),
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
     },
     "grabowski_power_run": {
         "category": "privileged-execution",

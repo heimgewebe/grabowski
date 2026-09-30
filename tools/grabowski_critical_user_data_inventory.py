@@ -24,7 +24,10 @@ SCOPE_KIND = "heim_pc.critical_user_data_scope_contract"
 SCOPE_SEMANTICS = "explicit-positive-selection"
 SOURCE_STABILITY_MODE = "kernel-local-pci-nvme-readonly-mountinfo-v3"
 AGGREGATE_EXECUTION_MODE = "external-verified-payload-exec-v1"
-SOURCE_ROOT = Path("/home/alex/repos/heim-pc")
+SOURCE_ROOT = Path(
+    "/home/alex/repos/.repoground-sources/"
+    "heimgewebe__heim-pc__main--d6d4b3c4337d8bd51758d10d83975c9d61fd18d7"
+)
 SCANNER_SOURCE = SOURCE_ROOT / "scripts/nixos_critical_user_data_inventory.py"
 AGGREGATE_SCANNER_SOURCE = SOURCE_ROOT / "scripts/nixos_critical_data_inventory.py"
 CONTRACT_SOURCE = SOURCE_ROOT / "nixos/production/critical-user-data-contract-v1.json"
@@ -46,10 +49,10 @@ AUTHORIZED_RECOVERY_CONTRACT_SHA256 = "fcd9856f9038652469605b97818bb6904bf34bb54
 SCANNER_SHA256 = ""
 CONTRACT_SHA256 = ""
 HELPER = Path("/usr/local/libexec/grabowski-critical-user-data-inventory")
-PYTHON = Path("/usr/bin/python3")
 SYSTEMD_RUN = Path("/usr/bin/systemd-run")
 SYSTEMCTL = Path("/usr/bin/systemctl")
-STATE_ROOT = Path("/run/grabowski/critical-user-data-inventory")
+STATE_PARENT = Path("/dev/shm")
+STATE_ROOT = STATE_PARENT / "grabowski-critical-user-data-inventory"
 SNAPSHOT_ROOT = STATE_ROOT / "unbound"
 SCANNER_SNAPSHOT = SNAPSHOT_ROOT / "nixos_critical_user_data_inventory.py"
 AGGREGATE_SCANNER_SNAPSHOT = SNAPSHOT_ROOT / "nixos_critical_data_inventory.py"
@@ -58,6 +61,7 @@ HOME_CONTRACT_SNAPSHOT = SNAPSHOT_ROOT / "critical-user-home-data-contract-v1.js
 RECOVERY_CONTRACT_SNAPSHOT = SNAPSHOT_ROOT / "recovery-contract-v1.json"
 RESULT_PATH = SNAPSHOT_ROOT / "result.json"
 FAILED_ROOT = SNAPSHOT_ROOT / "failed-results"
+START_ATTEMPT_PATH = SNAPSHOT_ROOT / "start-attempt.json"
 LOCK_PATH = SNAPSHOT_ROOT / "operation.lock"
 UNIT = "grabowski-critical-user-data-inventory-unbound.service"
 RUNTIME_SECONDS = 6 * 60 * 60
@@ -119,7 +123,7 @@ def _apply_binding(scanner_sha256: str, contract_sha256: str) -> None:
     global SCANNER_SHA256, CONTRACT_SHA256
     global SNAPSHOT_ROOT, SCANNER_SNAPSHOT, AGGREGATE_SCANNER_SNAPSHOT
     global CONTRACT_SNAPSHOT, HOME_CONTRACT_SNAPSHOT, RECOVERY_CONTRACT_SNAPSHOT
-    global RESULT_PATH, FAILED_ROOT, LOCK_PATH, UNIT
+    global RESULT_PATH, FAILED_ROOT, START_ATTEMPT_PATH, LOCK_PATH, UNIT
 
     scanner = _validate_digest(scanner_sha256, "scanner_sha256")
     contract = _validate_digest(contract_sha256, "contract_sha256")
@@ -138,6 +142,7 @@ def _apply_binding(scanner_sha256: str, contract_sha256: str) -> None:
     RECOVERY_CONTRACT_SNAPSHOT = SNAPSHOT_ROOT / "recovery-contract-v1.json"
     RESULT_PATH = SNAPSHOT_ROOT / "result.json"
     FAILED_ROOT = SNAPSHOT_ROOT / "failed-results"
+    START_ATTEMPT_PATH = SNAPSHOT_ROOT / "start-attempt.json"
     LOCK_PATH = SNAPSHOT_ROOT / "operation.lock"
     UNIT = (
         "grabowski-critical-user-data-inventory-"
@@ -256,6 +261,74 @@ def _ensure_private_directory(path: Path) -> None:
         or stat.S_IMODE(info.st_mode) != 0o700
     ):
         raise InventoryHelperError("inventory private directory is unsafe")
+
+
+def _ensure_state_root() -> None:
+    if STATE_ROOT.parent != STATE_PARENT:
+        _ensure_private_directory(STATE_ROOT)
+        return
+    try:
+        parent = STATE_PARENT.lstat()
+        source = SOURCE_ROOT.lstat()
+    except OSError as exc:
+        raise InventoryHelperError("inventory state backing is unavailable") from exc
+    if (
+        STATE_PARENT.is_symlink()
+        or not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != 0
+        or parent.st_gid != 0
+        or stat.S_IMODE(parent.st_mode) != 0o1777
+        or SOURCE_ROOT.is_symlink()
+        or not stat.S_ISDIR(source.st_mode)
+        or parent.st_dev == source.st_dev
+    ):
+        raise InventoryHelperError("inventory state backing is unsafe")
+    try:
+        STATE_ROOT.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    info = STATE_ROOT.lstat()
+    if (
+        STATE_ROOT.is_symlink()
+        or not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or stat.S_IMODE(info.st_mode) != 0o700
+        or info.st_dev == source.st_dev
+    ):
+        raise InventoryHelperError("inventory state root is unsafe")
+
+
+def _start_attempt_payload() -> bytes:
+    return _canonical(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "kind": "grabowski.critical_user_data_inventory_start_attempt.v1",
+            "scanner_sha256": SCANNER_SHA256,
+            "contract_sha256": CONTRACT_SHA256,
+        }
+    )
+
+
+def _start_attempt_exists() -> bool:
+    if not os.path.lexists(START_ATTEMPT_PATH):
+        return False
+    observed = _read_stable_regular(
+        START_ATTEMPT_PATH,
+        max_bytes=4096,
+        require_root_owned=True,
+        required_mode=0o600,
+    )
+    if observed != _start_attempt_payload():
+        raise InventoryHelperError("inventory start-attempt marker is invalid")
+    return True
+
+
+def _claim_start_attempt() -> bool:
+    if _start_attempt_exists():
+        return False
+    _write_create_only(START_ATTEMPT_PATH, _start_attempt_payload(), mode=0o600)
+    return True
 
 
 def _fsync_directory(path: Path) -> None:
@@ -427,7 +500,13 @@ def _validate_recovery_contract(payload: bytes) -> None:
         or critical_scope.get("contract_kind") != SCOPE_KIND
         or critical_scope.get("scope") != "critical-user-data"
         or critical_scope.get("sha256") != AUTHORIZED_CONTRACT_SHA256
+        or critical_scope.get("off_host_restore_critical_scope_sha256_bound")
+        is not True
         or critical_scope.get("aggregate_member_contracts_bound") is not True
+        or critical_scope.get("off_host_restore_source_inventory_sha256_bound")
+        is not True
+        or critical_scope.get("off_host_restore_restored_inventory_sha256_bound")
+        is not True
         or critical_scope.get("off_host_restore_inventory_sha256_equality_required")
         is not True
     ):
@@ -462,7 +541,7 @@ def _snapshot_sources() -> None:
     _validate_home_contract(home_contract)
     _validate_recovery_contract(recovery_contract)
 
-    _ensure_private_directory(STATE_ROOT)
+    _ensure_state_root()
     _ensure_private_directory(SNAPSHOT_ROOT)
     _write_create_only(SCANNER_SNAPSHOT, scanner, mode=0o500)
     _write_create_only(
@@ -634,6 +713,7 @@ def systemd_start_argv() -> list[str]:
         "--property=MemoryDenyWriteExecute=yes",
         "--property=CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH",
         "--property=AmbientCapabilities=",
+        f"--property=BindPaths={STATE_ROOT}",
         f"--property=ReadWritePaths={STATE_ROOT}",
         "--property=StandardOutput=journal",
         "--property=StandardError=journal",
@@ -902,7 +982,7 @@ def _validate_result(value: Any) -> dict[str, Any]:
 
 
 def _write_result(value: dict[str, Any]) -> None:
-    _ensure_private_directory(STATE_ROOT)
+    _ensure_state_root()
     sealed = _seal_result(value)
     payload = _canonical(sealed)
     if len(payload) > MAX_RESULT_BYTES:
@@ -947,7 +1027,7 @@ def _archive_failed_result(value: dict[str, Any]) -> None:
 
 
 def _lock() -> int:
-    _ensure_private_directory(STATE_ROOT)
+    _ensure_state_root()
     _ensure_private_directory(SNAPSHOT_ROOT)
     descriptor = os.open(
         LOCK_PATH,
@@ -978,6 +1058,8 @@ def _status_payload() -> dict[str, Any]:
         status = str(result["status"])
     elif unit["ActiveState"] == "active":
         status = "running"
+    elif _start_attempt_exists():
+        status = "outcome-unknown"
     else:
         status = "not-started"
     return {
@@ -1007,10 +1089,12 @@ def _start() -> dict[str, Any]:
         if unit["ActiveState"] == "active":
             return _status_payload()
         result = _read_result()
-        if result is not None and result["status"] == "passed":
-            return _public_result(result)
         if result is not None:
-            _archive_failed_result(result)
+            return _public_result(result)
+        if not _claim_start_attempt():
+            raise InventoryHelperError(
+                "previous inventory start outcome is unresolved"
+            )
         completed = subprocess.run(
             systemd_start_argv(),
             stdin=subprocess.DEVNULL,

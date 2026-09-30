@@ -68,6 +68,18 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
             action["target_pattern"],
         )
 
+        read_action = config["actions"][dual.CRITICAL_USER_DATA_INVENTORY_READ_ACTION]
+        self.assertEqual(
+            dual.CRITICAL_USER_DATA_INVENTORY_READ_TARGET_PATTERN,
+            read_action["target_pattern"],
+        )
+        self.assertEqual(
+            rootbroker_cutover_module.CRITICAL_USER_DATA_INVENTORY_READ_TARGET_PATTERN,
+            read_action["target_pattern"],
+        )
+        self.assertNotIn("kill_switch_path", read_action)
+        self.assertNotIn("legacy_kill_switch_path", read_action)
+
     def _fixture(self) -> tuple[dict[str, object], dict[Path, bytes]]:
         lifecycle = {
             "enabled": True,
@@ -138,6 +150,18 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
             "allowed_peer_uid": 1000,
             "allowed_peer_unit": dual.OPERATOR_SERVICE,
         }
+        critical_user_data_inventory_read = {
+            "enabled": True,
+            "mode": "template",
+            "target_pattern": dual.CRITICAL_USER_DATA_INVENTORY_READ_TARGET_PATTERN,
+            "argv": [
+                "/usr/local/libexec/grabowski-critical-user-data-inventory",
+                "{target}",
+            ],
+            "timeout_seconds": 90,
+            "allowed_peer_uid": 1000,
+            "allowed_peer_unit": dual.OPERATOR_SERVICE,
+        }
         config = {
             "schema_version": 2,
             "actions": {
@@ -147,6 +171,7 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
                 dual.SECRET_PTY_ACTION: secret_pty,
                 dual.PLATFORM_CONNECTOR_CAPTURE_ACTION: platform_connector_capture,
                 dual.CRITICAL_USER_DATA_INVENTORY_ACTION: critical_user_data_inventory,
+                dual.CRITICAL_USER_DATA_INVENTORY_READ_ACTION: critical_user_data_inventory_read,
             },
         }
         artifact_sources = tuple(
@@ -216,6 +241,9 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
                 ),
                 dual.CRITICAL_USER_DATA_INVENTORY_ACTION: dual._canonical_line_sha256(
                     critical_user_data_inventory
+                ),
+                dual.CRITICAL_USER_DATA_INVENTORY_READ_ACTION: dual._canonical_line_sha256(
+                    critical_user_data_inventory_read
                 ),
             },
             "power_peer_binding": {

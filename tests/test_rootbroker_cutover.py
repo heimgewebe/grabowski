@@ -155,6 +155,10 @@ def _critical_user_data_inventory_action() -> dict[str, object]:
     return _bound_action(cutover.CRITICAL_USER_DATA_INVENTORY_ACTION)
 
 
+def _critical_user_data_inventory_read_action() -> dict[str, object]:
+    return _bound_action(cutover.CRITICAL_USER_DATA_INVENTORY_READ_ACTION)
+
+
 def _local_backup_ntfs_actions() -> dict[str, dict[str, object]]:
     return {name: _bound_action(name) for name in cutover.LOCAL_BACKUP_STORAGE_ACTIONS}
 
@@ -210,6 +214,7 @@ def _example_config_text() -> str:
                 cutover.PROCESS_OBSERVER_ACTION: _bound_action(cutover.PROCESS_OBSERVER_ACTION),
                 cutover.PLATFORM_CONNECTOR_CAPTURE_ACTION: _platform_connector_capture_action(),
                 cutover.CRITICAL_USER_DATA_INVENTORY_ACTION: _critical_user_data_inventory_action(),
+                cutover.CRITICAL_USER_DATA_INVENTORY_READ_ACTION: _critical_user_data_inventory_read_action(),
                 cutover.BOOTSTRAP_RECOVERY_ACTION: _bootstrap_recovery_action(),
                 cutover.OPERATOR_SERVICE_CONTROL_ACTION: _operator_service_control_action(),
                 cutover.ROOTBROKER_CUTOVER_ACTION: _rootbroker_cutover_action(),
@@ -900,6 +905,7 @@ class RootbrokerCutoverTests(unittest.TestCase):
                 cutover.SECRET_PTY_ACTION: _secret_pty_action(),
                 cutover.PLATFORM_CONNECTOR_CAPTURE_ACTION: _platform_connector_capture_action(),
                 cutover.CRITICAL_USER_DATA_INVENTORY_ACTION: _critical_user_data_inventory_action(),
+                cutover.CRITICAL_USER_DATA_INVENTORY_READ_ACTION: _critical_user_data_inventory_read_action(),
                 **_local_backup_ntfs_actions(),
             },
         }
@@ -957,6 +963,10 @@ class RootbrokerCutoverTests(unittest.TestCase):
             cutover.CRITICAL_USER_DATA_INVENTORY_ACTION,
             attestation["action_sha256"],
         )
+        self.assertIn(
+            cutover.CRITICAL_USER_DATA_INVENTORY_READ_ACTION,
+            attestation["action_sha256"],
+        )
         self.assertEqual(
             attestation["artifact_sha256"]["critical_user_data_inventory"],
             source_artifacts[cutover.CRITICAL_USER_DATA_INVENTORY_TARGET][2],
@@ -980,6 +990,7 @@ class RootbrokerCutoverTests(unittest.TestCase):
                 cutover.SECRET_PTY_ACTION: _secret_pty_action(),
                 cutover.PLATFORM_CONNECTOR_CAPTURE_ACTION: _platform_connector_capture_action(),
                 cutover.CRITICAL_USER_DATA_INVENTORY_ACTION: _critical_user_data_inventory_action(),
+                cutover.CRITICAL_USER_DATA_INVENTORY_READ_ACTION: _critical_user_data_inventory_read_action(),
             },
         }
         source_artifacts = {}
@@ -1515,7 +1526,8 @@ class RootbrokerCutoverTests(unittest.TestCase):
             cutover.AUTOMATIC_CUTOVER_BIND_PATHS,
             (
                 "/home/alex/repos/grabowski",
-                "/home/alex/repos/heim-pc",
+                "/home/alex/repos/.repoground-sources/"
+                "heimgewebe__heim-pc__main--d6d4b3c4337d8bd51758d10d83975c9d61fd18d7",
             ),
         )
         self.assertNotIn(

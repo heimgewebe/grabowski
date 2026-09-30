@@ -700,6 +700,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_ports": ("port_inspect",),
     "grabowski_privileged_action_reference": ("privileged_reference",),
     "grabowski_critical_user_data_inventory": ("power_execute",),
+    "grabowski_critical_user_data_inventory_read": (),
     "grabowski_power_run": ("power_execute",),
     "grabowski_fleet_list": (),
     "grabowski_fleet_run": ("terminal_execute",),
