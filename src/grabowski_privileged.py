@@ -167,6 +167,8 @@ PROCESS_REFERENCE_LEXICAL_ROOTS = (
 BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
 ROOT_TASK_SYSTEMD_ACTION = "operator_root_task_systemd_unit"
 ROOTBROKER_CUTOVER_ACTION = "operator_rootbroker_cutover"
+CRITICAL_USER_DATA_INVENTORY_ACTION = "critical_user_data_inventory"
+CRITICAL_USER_DATA_INVENTORY_READ_ACTION = "critical_user_data_inventory_read"
 OPERATOR_AUTHORITY_ATTESTATION_PATH = Path(
     "/var/lib/grabowski/operator-authority-attestation.v1.json"
 )
@@ -1038,6 +1040,678 @@ def observe_process_references(
         "reference_count": len(observation["path_references"]),
     })
     return observation
+
+
+def _critical_inventory_digest(value: Any, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{label} must be one lowercase SHA-256 digest")
+    return value
+
+
+def _critical_inventory_projection(
+    value: Any,
+    *,
+    scanner_sha256: str,
+    contract_sha256: str,
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or value.get("schema_version") != 1:
+        raise RuntimeError("critical-user-data inventory response is invalid")
+    kind = value.get("kind")
+    status = value.get("status")
+    if not isinstance(status, str):
+        raise RuntimeError("critical-user-data inventory status is invalid")
+    observed_scanner = value.get("scanner_sha256")
+    observed_contract = value.get("contract_sha256")
+    if observed_scanner is not None and observed_scanner != scanner_sha256:
+        raise RuntimeError("critical-user-data inventory scanner binding drifted")
+    if observed_contract is not None and observed_contract != contract_sha256:
+        raise RuntimeError("critical-user-data inventory contract binding drifted")
+
+    base: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": kind,
+        "status": status,
+        "scanner_sha256": scanner_sha256,
+        "contract_sha256": contract_sha256,
+    }
+    common_keys = {
+        "schema_version",
+        "kind",
+        "status",
+        "scanner_sha256",
+        "contract_sha256",
+    }
+    if kind == "grabowski.critical_user_data_inventory_error.v1":
+        if (
+            status != "blocked"
+            or not {"schema_version", "kind", "status"}.issubset(value)
+            or not set(value).issubset(common_keys)
+        ):
+            raise RuntimeError("critical-user-data inventory error is malformed")
+        return base
+
+    if kind == "grabowski.critical_user_data_inventory_start.v1":
+        expected = common_keys | {"unit", "runtime_seconds"}
+        if set(value) != expected or status != "started":
+            raise RuntimeError("critical-user-data inventory start is malformed")
+        runtime_seconds = value.get("runtime_seconds")
+        unit = value.get("unit")
+        if (
+            isinstance(runtime_seconds, bool)
+            or not isinstance(runtime_seconds, int)
+            or runtime_seconds <= 0
+            or not isinstance(unit, str)
+            or not unit
+        ):
+            raise RuntimeError("critical-user-data inventory start metadata is invalid")
+        return {**base, "unit": unit, "runtime_seconds": runtime_seconds}
+
+    if kind == "grabowski.critical_user_data_inventory_status.v1":
+        expected = common_keys | {"unit", "unit_state", "result_sha256"}
+        if (
+            set(value) != expected
+            or status not in {"running", "not-started", "outcome-unknown", "passed", "failed"}
+        ):
+            raise RuntimeError("critical-user-data inventory status is malformed")
+        unit = value.get("unit")
+        unit_state = value.get("unit_state")
+        result_sha256 = value.get("result_sha256")
+        if (
+            not isinstance(unit, str)
+            or not unit
+            or not isinstance(unit_state, dict)
+            or set(unit_state) != {"load", "active", "sub", "result"}
+            or not all(isinstance(item, str) for item in unit_state.values())
+        ):
+            raise RuntimeError("critical-user-data inventory unit state is invalid")
+        if result_sha256 is not None:
+            _critical_inventory_digest(result_sha256, "result_sha256")
+        return {
+            **base,
+            "unit": unit,
+            "unit_state": dict(unit_state),
+            "result_sha256": result_sha256,
+        }
+
+    if kind != "grabowski.critical_user_data_inventory_result.v1":
+        raise RuntimeError("critical-user-data inventory response kind is invalid")
+    result_sha256 = _critical_inventory_digest(
+        value.get("result_sha256"), "result_sha256"
+    )
+    completed_at = value.get("completed_at_unix")
+    unit = value.get("unit")
+    if (
+        isinstance(completed_at, bool)
+        or not isinstance(completed_at, int)
+        or completed_at < 0
+        or not isinstance(unit, str)
+        or not unit
+        or status not in {"passed", "failed"}
+    ):
+        raise RuntimeError("critical-user-data inventory result metadata is invalid")
+
+    if status == "failed":
+        expected = common_keys | {
+            "unit",
+            "completed_at_unix",
+            "result_sha256",
+            "failure_code",
+            "returncode",
+            "stdout_sha256",
+            "stdout_bytes",
+            "stderr_sha256",
+            "stderr_bytes",
+        }
+        if set(value) != expected:
+            raise RuntimeError("critical-user-data inventory failure fields are invalid")
+        failure_code = value.get("failure_code")
+        returncode = value.get("returncode")
+        if (
+            not isinstance(failure_code, str)
+            or not failure_code
+            or isinstance(returncode, bool)
+            or not isinstance(returncode, int)
+        ):
+            raise RuntimeError("critical-user-data inventory failure is malformed")
+        digests: dict[str, Any] = {}
+        for key in ("stdout_sha256", "stderr_sha256"):
+            digests[key] = _critical_inventory_digest(value.get(key), key)
+        for key in ("stdout_bytes", "stderr_bytes"):
+            item = value.get(key)
+            if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+                raise RuntimeError("critical-user-data inventory failure size is invalid")
+            digests[key] = item
+        return {
+            **base,
+            "completed_at_unix": completed_at,
+            "result_sha256": result_sha256,
+            "failure_code": failure_code,
+            "returncode": returncode,
+            **digests,
+        }
+
+    expected_result = common_keys | {
+        "unit",
+        "completed_at_unix",
+        "result_sha256",
+        "inventory",
+    }
+    if set(value) != expected_result:
+        raise RuntimeError("critical-user-data inventory result fields are invalid")
+    inventory = value.get("inventory")
+    required_inventory = {
+        "schema_version",
+        "kind",
+        "scope",
+        "scope_semantics",
+        "algorithm",
+        "critical_scope_sha256",
+        "contract_sha256",
+        "authoritative_inventory",
+        "inventory_sha256",
+        "member_count",
+        "members",
+        "record_count",
+        "regular_file_bytes",
+        "exclusion_boundary_count",
+        "production_effects_authorized",
+    }
+    if not isinstance(inventory, dict) or set(inventory) != required_inventory:
+        raise RuntimeError("critical-user-data inventory aggregate is invalid")
+    members = inventory.get("members")
+    if (
+        inventory.get("schema_version") != 1
+        or inventory.get("kind")
+        != "heim_pc.critical_user_data_aggregate_inventory.v1"
+        or inventory.get("scope") != "critical-user-data"
+        or inventory.get("scope_semantics") != "explicit-positive-selection"
+        or inventory.get("algorithm") != "member-inventory-sha256-v1"
+        or inventory.get("critical_scope_sha256") != contract_sha256
+        or inventory.get("contract_sha256") != contract_sha256
+        or inventory.get("authoritative_inventory") is not True
+        or inventory.get("production_effects_authorized") is not False
+        or inventory.get("member_count") != 1
+        or not isinstance(members, list)
+        or len(members) != 1
+        or not isinstance(members[0], dict)
+        or set(members[0])
+        != {
+            "id",
+            "scope",
+            "contract_sha256",
+            "inventory_sha256",
+            "record_count",
+            "regular_file_bytes",
+            "exclusion_boundary_count",
+        }
+        or members[0].get("id") != "home"
+        or members[0].get("scope") != "critical-user-data-home"
+    ):
+        raise RuntimeError("critical-user-data inventory aggregate binding is invalid")
+    inventory_sha256 = _critical_inventory_digest(
+        inventory.get("inventory_sha256"), "inventory_sha256"
+    )
+    member_inventory_sha = _critical_inventory_digest(
+        members[0].get("inventory_sha256"), "home inventory_sha256"
+    )
+    _critical_inventory_digest(
+        members[0].get("contract_sha256"), "home contract_sha256"
+    )
+    counts: dict[str, int] = {}
+    for key in ("record_count", "regular_file_bytes", "exclusion_boundary_count"):
+        aggregate_item = inventory.get(key)
+        member_item = members[0].get(key)
+        if (
+            isinstance(aggregate_item, bool)
+            or not isinstance(aggregate_item, int)
+            or aggregate_item < 0
+            or aggregate_item != member_item
+        ):
+            raise RuntimeError(f"critical-user-data inventory {key} is invalid")
+        counts[key] = aggregate_item
+    expected_inventory_sha = hashlib.sha256(
+        (
+            json.dumps(
+                {
+                    "id": "home",
+                    "contract_sha256": members[0]["contract_sha256"],
+                    "inventory_sha256": member_inventory_sha,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+    ).hexdigest()
+    if inventory_sha256 != expected_inventory_sha:
+        raise RuntimeError("critical-user-data inventory aggregate digest is invalid")
+    return {
+        **base,
+        "completed_at_unix": completed_at,
+        "result_sha256": result_sha256,
+        "inventory_sha256": inventory_sha256,
+        **counts,
+    }
+
+
+def _critical_inventory_target(
+    operation: str,
+    scanner: str,
+    contract: str,
+) -> str:
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "operation": operation,
+            "scanner_sha256": scanner,
+            "contract_sha256": contract,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _critical_inventory_broker_call(
+    operation: str,
+    scanner: str,
+    contract: str,
+    *,
+    action: str,
+    ambiguous_on_invalid: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    target = _critical_inventory_target(operation, scanner, contract)
+    invoked = _invoke_privileged_reference(
+        action=action,
+        target=target,
+        justification=(
+            "Operate the fixed-path SHA-pinned read-only Heim-PC "
+            "critical-user-data authoritative inventory"
+        ),
+        timeout_seconds=90,
+        max_output_bytes=128 * 1024,
+    )
+    if invoked.get("broker_client_timed_out") is True:
+        return invoked, None
+    try:
+        outer = invoked.get("broker_response")
+        if not isinstance(outer, dict):
+            raise RuntimeError(
+                "critical-user-data inventory broker response is invalid"
+            )
+        timed_out = outer.get("timed_out")
+        if timed_out is True:
+            return invoked, None
+        if timed_out is not False:
+            raise RuntimeError(
+                "critical-user-data inventory broker timed_out flag is invalid"
+            )
+        raw = outer.get("stdout")
+        if not isinstance(raw, str) or not raw:
+            raise RuntimeError(
+                "critical-user-data inventory broker omitted safe output"
+            )
+        try:
+            inner = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "critical-user-data inventory broker output is invalid"
+            ) from exc
+        result = _critical_inventory_projection(
+            inner,
+            scanner_sha256=scanner,
+            contract_sha256=contract,
+        )
+        broker_returncode = outer.get("returncode")
+        if isinstance(broker_returncode, bool) or not isinstance(
+            broker_returncode, int
+        ):
+            raise RuntimeError(
+                "critical-user-data inventory broker returncode is invalid"
+            )
+    except (RuntimeError, OSError, ValueError):
+        if ambiguous_on_invalid:
+            return invoked, None
+        raise
+    return invoked, {
+        "broker_returncode": broker_returncode,
+        "result": result,
+    }
+
+
+def _critical_inventory_response(
+    operation: str,
+    scanner: str,
+    contract: str,
+    invoked: dict[str, Any],
+    parsed: dict[str, Any],
+    *,
+    outcome: str | None = None,
+) -> dict[str, Any]:
+    result = parsed["result"]
+    value = {
+        "success": (
+            parsed["broker_returncode"] == 0
+            and result["status"] != "blocked"
+            and result["status"] != "failed"
+            and result["status"] != "outcome-unknown"
+        ),
+        "operation": operation,
+        "scanner_sha256": scanner,
+        "contract_sha256": contract,
+        "request_id": invoked["request_id"],
+        "reference_sha256": invoked["reference_sha256"],
+        "broker_returncode": parsed["broker_returncode"],
+        "result": result,
+    }
+    if outcome is not None:
+        value["outcome"] = outcome
+    return value
+
+
+def _critical_inventory_unknown_start(
+    scanner: str,
+    contract: str,
+    invoked: dict[str, Any],
+    *,
+    readback: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    value: dict[str, Any] = {
+        "success": False,
+        "operation": "start",
+        "scanner_sha256": scanner,
+        "contract_sha256": contract,
+        "request_id": invoked["request_id"],
+        "reference_sha256": invoked["reference_sha256"],
+        "broker_returncode": None,
+        "outcome": "outcome_unknown",
+        "readback_required": True,
+        "retry_safe": False,
+    }
+    if readback is not None:
+        value["readback"] = readback
+    return value
+
+
+def _critical_inventory_terminal_readback(
+    scanner: str,
+    contract: str,
+    *,
+    start_invoked: dict[str, Any],
+    status_invoked: dict[str, Any],
+    status_parsed: dict[str, Any],
+    preflight_result_sha256: str | None = None,
+) -> dict[str, Any]:
+    status_result = status_parsed["result"]
+    state = status_result["status"]
+    if (
+        preflight_result_sha256 is not None
+        and state in {"passed", "failed"}
+        and status_result.get("result_sha256") == preflight_result_sha256
+    ):
+        return _critical_inventory_unknown_start(
+            scanner,
+            contract,
+            start_invoked,
+            readback=status_result,
+        )
+    if state == "running":
+        return {
+            **_critical_inventory_response(
+                "start",
+                scanner,
+                contract,
+                start_invoked,
+                {
+                    "broker_returncode": 0,
+                    "result": status_result,
+                },
+                outcome="readback_reconciled",
+            ),
+            "readback_required": False,
+            "retry_safe": False,
+        }
+    if state in {"passed", "failed"}:
+        result_invoked, result_parsed = _critical_inventory_broker_call(
+            "result",
+            scanner,
+            contract,
+            action=CRITICAL_USER_DATA_INVENTORY_READ_ACTION,
+            ambiguous_on_invalid=True,
+        )
+        if result_parsed is not None:
+            status_result_sha256 = status_result.get("result_sha256")
+            result_result_sha256 = result_parsed["result"].get("result_sha256")
+            if (
+                not isinstance(status_result_sha256, str)
+                or result_result_sha256 != status_result_sha256
+            ):
+                return _critical_inventory_unknown_start(
+                    scanner,
+                    contract,
+                    start_invoked,
+                    readback=status_result,
+                )
+            return {
+                **_critical_inventory_response(
+                    "start",
+                    scanner,
+                    contract,
+                    start_invoked,
+                    result_parsed,
+                    outcome="readback_reconciled",
+                ),
+                "readback_required": False,
+                "retry_safe": False,
+                "readback_request_id": result_invoked["request_id"],
+                "readback_reference_sha256": result_invoked["reference_sha256"],
+            }
+    return _critical_inventory_unknown_start(
+        scanner,
+        contract,
+        start_invoked,
+        readback=status_result,
+    )
+
+
+@mcp.tool(name="grabowski_critical_user_data_inventory", annotations=MUTATING)
+def grabowski_critical_user_data_inventory(
+    operation: str,
+    scanner_sha256: str,
+    contract_sha256: str,
+) -> dict[str, Any]:
+    """Start one fixed SHA-pinned authoritative critical-user-data inventory."""
+    if operation != "start":
+        raise ValueError(
+            "operation must be start; use grabowski_critical_user_data_inventory_read "
+            "for status or result"
+        )
+    scanner = _critical_inventory_digest(scanner_sha256, "scanner_sha256")
+    contract = _critical_inventory_digest(contract_sha256, "contract_sha256")
+
+    pre_invoked, pre_parsed = _critical_inventory_broker_call(
+        "status",
+        scanner,
+        contract,
+        action=CRITICAL_USER_DATA_INVENTORY_READ_ACTION,
+    )
+    if pre_parsed is None:
+        return {
+            "success": False,
+            "operation": "start",
+            "scanner_sha256": scanner,
+            "contract_sha256": contract,
+            "request_id": pre_invoked["request_id"],
+            "reference_sha256": pre_invoked["reference_sha256"],
+            "broker_returncode": None,
+            "outcome": "preflight_readback_unavailable",
+            "readback_required": True,
+            "retry_safe": True,
+        }
+    pre_status = pre_parsed["result"]["status"]
+    if pre_status == "passed":
+        preflight_result_sha256 = pre_parsed["result"].get("result_sha256")
+        if not isinstance(preflight_result_sha256, str):
+            return _critical_inventory_unknown_start(
+                scanner,
+                contract,
+                pre_invoked,
+                readback=pre_parsed["result"],
+            )
+        result_invoked, result_parsed = _critical_inventory_broker_call(
+            "result",
+            scanner,
+            contract,
+            action=CRITICAL_USER_DATA_INVENTORY_READ_ACTION,
+            ambiguous_on_invalid=True,
+        )
+        if (
+            result_parsed is not None
+            and result_parsed["result"].get("result_sha256")
+            == preflight_result_sha256
+        ):
+            return {
+                **_critical_inventory_response(
+                    "start",
+                    scanner,
+                    contract,
+                    result_invoked,
+                    result_parsed,
+                    outcome="existing_result",
+                ),
+                "readback_required": False,
+                "retry_safe": False,
+            }
+        return _critical_inventory_unknown_start(
+            scanner,
+            contract,
+            pre_invoked,
+            readback=pre_parsed["result"],
+        )
+    if pre_status == "running":
+        return {
+            **_critical_inventory_response(
+                "start",
+                scanner,
+                contract,
+                pre_invoked,
+                pre_parsed,
+                outcome="already_running",
+            ),
+            "readback_required": False,
+            "retry_safe": False,
+        }
+    if pre_status not in {"not-started", "failed"}:
+        return _critical_inventory_unknown_start(
+            scanner,
+            contract,
+            pre_invoked,
+            readback=pre_parsed["result"],
+        )
+
+    # Terminal failed results may be retried explicitly. An outcome-unknown
+    # preflight never reaches this mutation path; it remains blocked until an
+    # administrative recovery transition outside this start operation resolves it.
+    preflight_result_sha256: str | None = None
+    if pre_status == "failed":
+        observed_preflight_sha = pre_parsed["result"].get("result_sha256")
+        if not isinstance(observed_preflight_sha, str):
+            return _critical_inventory_unknown_start(
+                scanner,
+                contract,
+                pre_invoked,
+                readback=pre_parsed["result"],
+            )
+        preflight_result_sha256 = observed_preflight_sha
+
+    operator._require_operator_mutation("power_execute")
+    invoked, parsed = _critical_inventory_broker_call(
+        "start",
+        scanner,
+        contract,
+        action=CRITICAL_USER_DATA_INVENTORY_ACTION,
+        ambiguous_on_invalid=True,
+    )
+    if parsed is not None and parsed["result"]["status"] != "blocked":
+        direct_result = parsed["result"]
+        if (
+            preflight_result_sha256 is not None
+            and direct_result.get("result_sha256") == preflight_result_sha256
+        ):
+            return _critical_inventory_unknown_start(
+                scanner,
+                contract,
+                invoked,
+                readback=direct_result,
+            )
+        return _critical_inventory_response(
+            "start",
+            scanner,
+            contract,
+            invoked,
+            parsed,
+        )
+
+    status_invoked, status_parsed = _critical_inventory_broker_call(
+        "status",
+        scanner,
+        contract,
+        action=CRITICAL_USER_DATA_INVENTORY_READ_ACTION,
+        ambiguous_on_invalid=True,
+    )
+    if status_parsed is None:
+        return _critical_inventory_unknown_start(scanner, contract, invoked)
+    return _critical_inventory_terminal_readback(
+        scanner,
+        contract,
+        start_invoked=invoked,
+        status_invoked=status_invoked,
+        status_parsed=status_parsed,
+        preflight_result_sha256=preflight_result_sha256,
+    )
+
+
+@mcp.tool(name="grabowski_critical_user_data_inventory_read", annotations=READ_ONLY)
+def grabowski_critical_user_data_inventory_read(
+    operation: str,
+    scanner_sha256: str,
+    contract_sha256: str,
+) -> dict[str, Any]:
+    """Read status or result for the fixed SHA-pinned critical-data inventory."""
+    if operation not in {"status", "result"}:
+        raise ValueError("operation must be status or result")
+    scanner = _critical_inventory_digest(scanner_sha256, "scanner_sha256")
+    contract = _critical_inventory_digest(contract_sha256, "contract_sha256")
+    invoked, parsed = _critical_inventory_broker_call(
+        operation,
+        scanner,
+        contract,
+        action=CRITICAL_USER_DATA_INVENTORY_READ_ACTION,
+    )
+    if parsed is None:
+        return {
+            "success": False,
+            "operation": operation,
+            "scanner_sha256": scanner,
+            "contract_sha256": contract,
+            "request_id": invoked["request_id"],
+            "reference_sha256": invoked["reference_sha256"],
+            "broker_returncode": None,
+            "outcome": "read_timeout",
+            "readback_required": True,
+            "retry_safe": True,
+        }
+    return _critical_inventory_response(
+        operation,
+        scanner,
+        contract,
+        invoked,
+        parsed,
+    )
 
 
 @mcp.tool(name="grabowski_power_run", annotations=MUTATING)

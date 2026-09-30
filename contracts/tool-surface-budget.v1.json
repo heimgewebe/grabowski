@@ -815,6 +815,56 @@
         "tool": "grabowski_context_fabric_plan"
       }
     },
+    "grabowski_critical_user_data_inventory": {
+      "evidence_refs": [
+        "config:privileged-actions.example.json",
+        "contract:critical-user-data-aggregate-inventory-v1",
+        "tests:test_critical_user_data_inventory_privileged.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool owns only one hash-pinned start transition for the canonical critical-user-data aggregate inventory.",
+        "evidence": "A start-only broker request, fixed content-addressed source paths, member digest validation, transient root-owned evidence state, systemd sandboxing, commit-bound helper/action attestation, an exclusive start-attempt fence and focused negative/public-projection tests."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "Reusing grabowski_power_run, terminal execution or a generic typed operation was rejected because those surfaces cannot enforce the exact scanner/contract SHA pair, fixed helper argv, zero-sample authoritative mode, internal-only execute operation, start-attempt fencing and safe aggregate-only response without granting materially broader root command or path authority.",
+      "rationale": "Authoritative critical-user-data inventory needs a narrowly typed root start transition over the fixed critical-user-data Home scope while remaining narrower than generic root execution. Status and result reads are intentionally separated so mutation blockades do not hide authoritative readback.",
+      "tool_contract": {
+        "authority_class": "mutation",
+        "category": "privileged-execution",
+        "effects": [
+          "root-owned-inventory-evidence-write",
+          "root-read-only-home-traversal",
+          "root-systemd-task-start"
+        ],
+        "read_only": false,
+        "reversibility": "no-user-data-mutation-root-owned-evidence-transient",
+        "risk_class": "high",
+        "tool": "grabowski_critical_user_data_inventory"
+      }
+    },
+    "grabowski_critical_user_data_inventory_read": {
+      "evidence_refs": [
+        "config:privileged-actions.example.json",
+        "contract:critical-user-data-aggregate-inventory-v1",
+        "tests:test_critical_user_data_inventory_privileged.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool exposes only status or a sealed result for the existing hash-pinned critical-user-data inventory and cannot dispatch a new scan.",
+        "evidence": "A dedicated status|result broker regex without mutation kill-switch fields, READ_ONLY MCP annotation, no operator mutation guard, safe result projection and timeout/readback regression tests."
+      },
+      "justification_kind": "material_call_shape",
+      "operation_alternative_considered": "Keeping status and result on the mutating start tool was rejected because mutation blockades would make authoritative readback unavailable exactly when an ambiguous start outcome must be reconciled before any retry.",
+      "rationale": "Blockade-safe inventory observation is a materially different call shape from starting the privileged scan. A separate read-only surface preserves outcome visibility without granting start authority or broader root execution.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "privileged-reference",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_critical_user_data_inventory_read"
+      }
+    },
     "grabowski_current_work": {
       "evidence_refs": [
         "bureau:GRABOWSKI-OPERATOR-SURFACE-V1-T068",
