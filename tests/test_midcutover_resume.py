@@ -836,6 +836,29 @@ class HistoricalTerminalActivationTests(unittest.TestCase):
             midcutover.PHASE_RETIRE_GREEN,
         )
 
+    def test_historical_rebind_time_may_differ_within_source_freshness_window(self) -> None:
+        receipt = historical_terminal_cutover_receipt()
+        transition = receipt["snapshot_rebind"]["cutover_transition"]
+        transition["source_evidence_time"] = ACTIVATION_TIME + 1
+        receipt.pop("receipt_sha256", None)
+        receipt["receipt_sha256"] = midcutover.canonical_json_sha256(receipt)
+
+        activation = midcutover.historical_terminal_activation_observation(receipt)
+        self.assertEqual(activation["state"], "platform_converged")
+
+    def test_historical_rebind_time_outside_source_freshness_window_fails_closed(self) -> None:
+        receipt = historical_terminal_cutover_receipt()
+        transition = receipt["snapshot_rebind"]["cutover_transition"]
+        transition["source_evidence_time"] = transition["source_expires_at_unix"] + 1
+        receipt.pop("receipt_sha256", None)
+        receipt["receipt_sha256"] = midcutover.canonical_json_sha256(receipt)
+
+        with self.assertRaisesRegex(
+            midcutover.MidCutoverEvidenceError,
+            "historical terminal snapshot rebind evidence is invalid",
+        ):
+            midcutover.historical_terminal_activation_observation(receipt)
+
     def test_historical_terminal_evidence_never_authorizes_green_selector(self) -> None:
         receipt = historical_terminal_cutover_receipt()
         activation = midcutover.historical_terminal_activation_observation(receipt)

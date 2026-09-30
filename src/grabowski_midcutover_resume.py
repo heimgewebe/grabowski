@@ -426,7 +426,22 @@ def historical_terminal_activation_observation(
         or transition.get("from_release_id") != validated.get("blue_release_id")
         or transition.get("to_release_id") != validated.get("green_release_id")
         or transition.get("to_repo_head") != validated.get("expected_head")
-        or transition.get("source_evidence_time") != observed_at
+        or isinstance(transition.get("source_created_at_unix"), bool)
+        or not isinstance(transition.get("source_created_at_unix"), int)
+        or isinstance(transition.get("source_evidence_time"), bool)
+        or not isinstance(transition.get("source_evidence_time"), int)
+        or isinstance(transition.get("source_expires_at_unix"), bool)
+        or not isinstance(transition.get("source_expires_at_unix"), int)
+        or not (
+            transition["source_created_at_unix"]
+            <= observed_at
+            <= transition["source_expires_at_unix"]
+        )
+        or not (
+            transition["source_created_at_unix"]
+            <= transition["source_evidence_time"]
+            <= transition["source_expires_at_unix"]
+        )
         or transition.get("green_readiness_sha256") != canonical_json_sha256(readiness)
         or rebind.get("target_release_id") != validated.get("green_release_id")
         or rebind.get("target_repo_head") != validated.get("expected_head")
