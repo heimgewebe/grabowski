@@ -1320,6 +1320,7 @@ def _critical_inventory_broker_call(
     contract: str,
     *,
     action: str,
+    ambiguous_on_invalid: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     target = _critical_inventory_target(operation, scanner, contract)
     invoked = _invoke_privileged_reference(
@@ -1334,33 +1335,46 @@ def _critical_inventory_broker_call(
     )
     if invoked.get("broker_client_timed_out") is True:
         return invoked, None
-    outer = invoked.get("broker_response")
-    if not isinstance(outer, dict):
-        raise RuntimeError("critical-user-data inventory broker response is invalid")
-    timed_out = outer.get("timed_out")
-    if timed_out is True:
-        return invoked, None
-    if timed_out is not False:
-        raise RuntimeError(
-            "critical-user-data inventory broker timed_out flag is invalid"
-        )
-    raw = outer.get("stdout")
-    if not isinstance(raw, str) or not raw:
-        raise RuntimeError("critical-user-data inventory broker omitted safe output")
     try:
-        inner = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            "critical-user-data inventory broker output is invalid"
-        ) from exc
-    result = _critical_inventory_projection(
-        inner,
-        scanner_sha256=scanner,
-        contract_sha256=contract,
-    )
-    broker_returncode = outer.get("returncode")
-    if isinstance(broker_returncode, bool) or not isinstance(broker_returncode, int):
-        raise RuntimeError("critical-user-data inventory broker returncode is invalid")
+        outer = invoked.get("broker_response")
+        if not isinstance(outer, dict):
+            raise RuntimeError(
+                "critical-user-data inventory broker response is invalid"
+            )
+        timed_out = outer.get("timed_out")
+        if timed_out is True:
+            return invoked, None
+        if timed_out is not False:
+            raise RuntimeError(
+                "critical-user-data inventory broker timed_out flag is invalid"
+            )
+        raw = outer.get("stdout")
+        if not isinstance(raw, str) or not raw:
+            raise RuntimeError(
+                "critical-user-data inventory broker omitted safe output"
+            )
+        try:
+            inner = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "critical-user-data inventory broker output is invalid"
+            ) from exc
+        result = _critical_inventory_projection(
+            inner,
+            scanner_sha256=scanner,
+            contract_sha256=contract,
+        )
+        broker_returncode = outer.get("returncode")
+        if isinstance(broker_returncode, bool) or not isinstance(
+            broker_returncode, int
+        ):
+            raise RuntimeError(
+                "critical-user-data inventory broker returncode is invalid"
+            )
+    except (RuntimeError, OSError, ValueError):
+        if ambiguous_on_invalid:
+            return invoked, None
+        raise
     return invoked, {
         "broker_returncode": broker_returncode,
         "result": result,
@@ -1453,6 +1467,7 @@ def _critical_inventory_terminal_readback(
             scanner,
             contract,
             action=CRITICAL_USER_DATA_INVENTORY_READ_ACTION,
+            ambiguous_on_invalid=True,
         )
         if result_parsed is not None:
             return {
@@ -1512,40 +1527,46 @@ def grabowski_critical_user_data_inventory(
             "retry_safe": True,
         }
     pre_status = pre_parsed["result"]["status"]
-    if pre_status != "not-started":
-        if pre_status in {"passed", "failed"}:
-            result_invoked, result_parsed = _critical_inventory_broker_call(
-                "result",
-                scanner,
-                contract,
-                action=CRITICAL_USER_DATA_INVENTORY_READ_ACTION,
-            )
-            if result_parsed is not None:
-                return {
-                    **_critical_inventory_response(
-                        "start",
-                        scanner,
-                        contract,
-                        result_invoked,
-                        result_parsed,
-                        outcome="existing_result",
-                    ),
-                    "readback_required": False,
-                    "retry_safe": False,
-                }
-        if pre_status == "running":
+    if pre_status == "passed":
+        result_invoked, result_parsed = _critical_inventory_broker_call(
+            "result",
+            scanner,
+            contract,
+            action=CRITICAL_USER_DATA_INVENTORY_READ_ACTION,
+        )
+        if result_parsed is not None:
             return {
                 **_critical_inventory_response(
                     "start",
                     scanner,
                     contract,
-                    pre_invoked,
-                    pre_parsed,
-                    outcome="already_running",
+                    result_invoked,
+                    result_parsed,
+                    outcome="existing_result",
                 ),
                 "readback_required": False,
                 "retry_safe": False,
             }
+        return _critical_inventory_unknown_start(
+            scanner,
+            contract,
+            pre_invoked,
+            readback=pre_parsed["result"],
+        )
+    if pre_status == "running":
+        return {
+            **_critical_inventory_response(
+                "start",
+                scanner,
+                contract,
+                pre_invoked,
+                pre_parsed,
+                outcome="already_running",
+            ),
+            "readback_required": False,
+            "retry_safe": False,
+        }
+    if pre_status not in {"not-started", "failed", "outcome-unknown"}:
         return _critical_inventory_unknown_start(
             scanner,
             contract,
@@ -1559,6 +1580,7 @@ def grabowski_critical_user_data_inventory(
         scanner,
         contract,
         action=CRITICAL_USER_DATA_INVENTORY_ACTION,
+        ambiguous_on_invalid=True,
     )
     if parsed is not None and parsed["result"]["status"] != "blocked":
         return _critical_inventory_response(
@@ -1574,6 +1596,7 @@ def grabowski_critical_user_data_inventory(
         scanner,
         contract,
         action=CRITICAL_USER_DATA_INVENTORY_READ_ACTION,
+        ambiguous_on_invalid=True,
     )
     if status_parsed is None:
         return _critical_inventory_unknown_start(scanner, contract, invoked)

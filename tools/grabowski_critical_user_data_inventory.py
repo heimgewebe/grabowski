@@ -56,14 +56,16 @@ SYSTEMD_RUN = Path("/usr/bin/systemd-run")
 SYSTEMCTL = Path("/usr/bin/systemctl")
 STATE_PARENT = Path("/dev/shm")
 STATE_ROOT = STATE_PARENT / "grabowski-critical-user-data-inventory"
+DURABLE_STATE_ROOT = Path("/var/lib/grabowski/critical-user-data-inventory")
 SNAPSHOT_ROOT = STATE_ROOT / "unbound"
+RESULT_ROOT = DURABLE_STATE_ROOT / "unbound"
 SCANNER_SNAPSHOT = SNAPSHOT_ROOT / "nixos_critical_user_data_inventory.py"
 AGGREGATE_SCANNER_SNAPSHOT = SNAPSHOT_ROOT / "nixos_critical_data_inventory.py"
 CONTRACT_SNAPSHOT = SNAPSHOT_ROOT / "critical-user-data-contract-v1.json"
 HOME_CONTRACT_SNAPSHOT = SNAPSHOT_ROOT / "critical-user-home-data-contract-v1.json"
 RECOVERY_CONTRACT_SNAPSHOT = SNAPSHOT_ROOT / "recovery-contract-v1.json"
-RESULT_PATH = SNAPSHOT_ROOT / "result.json"
-FAILED_ROOT = SNAPSHOT_ROOT / "failed-results"
+RESULT_PATH = RESULT_ROOT / "result.json"
+FAILED_ROOT = RESULT_ROOT / "failed-results"
 START_ATTEMPT_PATH = SNAPSHOT_ROOT / "start-attempt.json"
 LOCK_PATH = SNAPSHOT_ROOT / "operation.lock"
 UNIT = "grabowski-critical-user-data-inventory-unbound.service"
@@ -126,7 +128,7 @@ def _validate_digest(value: Any, label: str) -> str:
 
 def _apply_binding(scanner_sha256: str, contract_sha256: str) -> None:
     global SCANNER_SHA256, CONTRACT_SHA256
-    global SNAPSHOT_ROOT, SCANNER_SNAPSHOT, AGGREGATE_SCANNER_SNAPSHOT
+    global SNAPSHOT_ROOT, RESULT_ROOT, SCANNER_SNAPSHOT, AGGREGATE_SCANNER_SNAPSHOT
     global CONTRACT_SNAPSHOT, HOME_CONTRACT_SNAPSHOT, RECOVERY_CONTRACT_SNAPSHOT
     global RESULT_PATH, FAILED_ROOT, START_ATTEMPT_PATH, LOCK_PATH, UNIT
 
@@ -140,13 +142,14 @@ def _apply_binding(scanner_sha256: str, contract_sha256: str) -> None:
     SCANNER_SHA256 = scanner
     CONTRACT_SHA256 = contract
     SNAPSHOT_ROOT = STATE_ROOT / f"source-{scanner}-{contract}"
+    RESULT_ROOT = DURABLE_STATE_ROOT / f"source-{scanner}-{contract}"
     SCANNER_SNAPSHOT = SNAPSHOT_ROOT / "nixos_critical_user_data_inventory.py"
     AGGREGATE_SCANNER_SNAPSHOT = SNAPSHOT_ROOT / "nixos_critical_data_inventory.py"
     CONTRACT_SNAPSHOT = SNAPSHOT_ROOT / "critical-user-data-contract-v1.json"
     HOME_CONTRACT_SNAPSHOT = SNAPSHOT_ROOT / "critical-user-home-data-contract-v1.json"
     RECOVERY_CONTRACT_SNAPSHOT = SNAPSHOT_ROOT / "recovery-contract-v1.json"
-    RESULT_PATH = SNAPSHOT_ROOT / "result.json"
-    FAILED_ROOT = SNAPSHOT_ROOT / "failed-results"
+    RESULT_PATH = RESULT_ROOT / "result.json"
+    FAILED_ROOT = RESULT_ROOT / "failed-results"
     START_ATTEMPT_PATH = SNAPSHOT_ROOT / "start-attempt.json"
     LOCK_PATH = SNAPSHOT_ROOT / "operation.lock"
     UNIT = (
@@ -302,6 +305,14 @@ def _ensure_state_root() -> None:
         or info.st_dev == source.st_dev
     ):
         raise InventoryHelperError("inventory state root is unsafe")
+
+
+def _ensure_result_root() -> None:
+    # Snapshot/fence state stays on tmpfs so the inventory never needs a writable
+    # bind on the source filesystem. Only the small sealed terminal result is
+    # durable across reboot.
+    _ensure_private_directory(DURABLE_STATE_ROOT)
+    _ensure_private_directory(RESULT_ROOT)
 
 
 def _start_attempt_payload() -> bytes:
@@ -764,6 +775,8 @@ def systemd_start_argv() -> list[str]:
         "--property=AmbientCapabilities=",
         f"--property=BindPaths={STATE_ROOT}",
         f"--property=ReadWritePaths={STATE_ROOT}",
+        f"--property=BindPaths={DURABLE_STATE_ROOT}",
+        f"--property=ReadWritePaths={DURABLE_STATE_ROOT}",
         "--property=StandardOutput=journal",
         "--property=StandardError=journal",
         "--property=WorkingDirectory=/",
@@ -1032,7 +1045,7 @@ def _validate_result(value: Any) -> dict[str, Any]:
 
 def _write_result(value: dict[str, Any]) -> None:
     _ensure_state_root()
-    _ensure_private_directory(SNAPSHOT_ROOT)
+    _ensure_result_root()
     sealed = _seal_result(value)
     payload = _canonical(sealed)
     if len(payload) > MAX_RESULT_BYTES:
@@ -1043,7 +1056,7 @@ def _write_result(value: dict[str, Any]) -> None:
     try:
         _write_create_only(temporary, payload, mode=0o600)
         if _rename_noreplace(temporary, RESULT_PATH):
-            _fsync_directory(SNAPSHOT_ROOT)
+            _fsync_directory(RESULT_ROOT)
             return
         existing = _read_stable_regular(
             RESULT_PATH,
@@ -1057,7 +1070,7 @@ def _write_result(value: dict[str, Any]) -> None:
             os.unlink(temporary)
         except FileNotFoundError:
             pass
-        _fsync_directory(SNAPSHOT_ROOT)
+        _fsync_directory(RESULT_ROOT)
     except BaseException:
         try:
             os.unlink(temporary)
@@ -1085,9 +1098,11 @@ def _read_result() -> dict[str, Any] | None:
 def _archive_failed_result(value: dict[str, Any]) -> None:
     if value.get("status") != "failed":
         raise InventoryHelperError("only failed inventory results may be archived")
+    _ensure_result_root()
     _ensure_private_directory(FAILED_ROOT)
     target = FAILED_ROOT / f"result-{time.time_ns()}.json"
-    os.replace(RESULT_PATH, target)
+    if not _rename_noreplace(RESULT_PATH, target):
+        raise InventoryHelperError("archived inventory result already exists")
     info = target.lstat()
     if (
         target.is_symlink()
@@ -1099,7 +1114,7 @@ def _archive_failed_result(value: dict[str, Any]) -> None:
     ):
         raise InventoryHelperError("archived inventory result is unsafe")
     _fsync_directory(FAILED_ROOT)
-    _fsync_directory(STATE_ROOT)
+    _fsync_directory(RESULT_ROOT)
 
 
 def _lock() -> int:
@@ -1160,13 +1175,26 @@ def _status_payload() -> dict[str, Any]:
 def _start() -> dict[str, Any]:
     descriptor = _lock()
     try:
+        _ensure_result_root()
         _snapshot_sources()
         unit = _unit_state()
         if unit["ActiveState"] == "active":
             return _status_payload()
         result = _read_result()
         if result is not None:
-            return _public_result(result)
+            if result["status"] != "failed":
+                return _public_result(result)
+            # An explicit new start is the recovery action for a terminal failed
+            # scan: retain the sealed failure durably, then establish a fresh
+            # start fence.
+            _archive_failed_result(result)
+            _clear_start_attempt()
+        elif _start_attempt_exists():
+            # Fresh status has already shown the unit inactive and no result is
+            # present. The scan is read-only, so an explicit new start may
+            # recover this stale transient fence without claiming retry safety
+            # for the ambiguous prior request.
+            _clear_start_attempt()
         if not _claim_start_attempt():
             raise InventoryHelperError(
                 "previous inventory start outcome is unresolved"
