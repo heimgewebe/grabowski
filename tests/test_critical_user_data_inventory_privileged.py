@@ -624,6 +624,88 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
         run.assert_called_once()
 
 
+    def test_rename_noreplace_moves_new_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            destination = root / "destination"
+            source.write_bytes(b"new-result")
+
+            self.assertTrue(helper._rename_noreplace(source, destination))
+
+            self.assertFalse(source.exists())
+            self.assertEqual(destination.read_bytes(), b"new-result")
+
+    def test_rename_noreplace_preserves_existing_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            destination = root / "destination"
+            source.write_bytes(b"new-result")
+            destination.write_bytes(b"existing-result")
+
+            self.assertFalse(helper._rename_noreplace(source, destination))
+
+            self.assertEqual(source.read_bytes(), b"new-result")
+            self.assertEqual(destination.read_bytes(), b"existing-result")
+
+    def test_rename_noreplace_rejects_missing_libc_symbol(self) -> None:
+        with mock.patch.object(helper.ctypes, "CDLL", return_value=object()):
+            with self.assertRaisesRegex(
+                helper.InventoryHelperError,
+                "atomic inventory result publish is unavailable",
+            ):
+                helper._rename_noreplace(Path("source"), Path("destination"))
+
+    def test_rename_noreplace_rejects_unavailable_errno(self) -> None:
+        for error in (helper.errno.ENOSYS, helper.errno.EINVAL, helper.errno.ENOTSUP):
+            with self.subTest(error=error):
+                renameat2 = mock.Mock()
+
+                def unavailable(*_args, error=error):
+                    helper.ctypes.set_errno(error)
+                    return -1
+
+                renameat2.side_effect = unavailable
+                libc = mock.Mock()
+                libc.renameat2 = renameat2
+                with mock.patch.object(helper.ctypes, "CDLL", return_value=libc):
+                    with self.assertRaisesRegex(
+                        helper.InventoryHelperError,
+                        "atomic inventory result publish is unavailable",
+                    ):
+                        helper._rename_noreplace(Path("source"), Path("destination"))
+
+    def test_write_result_reuses_identical_existing_result_and_cleans_temp(self) -> None:
+        result = helper._unsigned_result(
+            status="failed",
+            failure_code="inventory-timeout",
+            returncode=124,
+            stdout_sha256="0" * 64,
+            stdout_bytes=0,
+            stderr_sha256="0" * 64,
+            stderr_bytes=0,
+        )
+        payload = helper._canonical(helper._seal_result(result))
+        with (
+            mock.patch.object(helper, "_ensure_state_root"),
+            mock.patch.object(helper, "_ensure_private_directory"),
+            mock.patch.object(helper, "_write_create_only") as write_create_only,
+            mock.patch.object(helper, "_rename_noreplace", return_value=False),
+            mock.patch.object(
+                helper,
+                "_read_stable_regular",
+                return_value=payload,
+            ),
+            mock.patch.object(helper.os, "unlink") as unlink,
+            mock.patch.object(helper, "_fsync_directory") as fsync_directory,
+        ):
+            helper._write_result(result)
+
+        temporary = write_create_only.call_args.args[0]
+        unlink.assert_called_once_with(temporary)
+        fsync_directory.assert_called_once_with(helper.SNAPSHOT_ROOT)
+
     def test_write_result_publishes_complete_temp_atomically(self) -> None:
         result = helper._unsigned_result(
             status="failed",
@@ -684,6 +766,7 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
                 "_read_stable_regular",
                 return_value=existing_payload,
             ) as read_existing,
+            mock.patch.object(helper.os, "unlink") as unlink,
             mock.patch.object(helper, "_fsync_directory") as fsync_directory,
         ):
             with self.assertRaisesRegex(
@@ -699,6 +782,7 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
             require_root_owned=True,
             required_mode=0o600,
         )
+        unlink.assert_called_once_with(temporary)
         fsync_directory.assert_not_called()
 
     def test_execute_seals_pre_scan_snapshot_failure(self) -> None:

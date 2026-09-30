@@ -1040,23 +1040,30 @@ def _write_result(value: dict[str, Any]) -> None:
     temporary = RESULT_PATH.with_name(
         f".{RESULT_PATH.name}.{os.getpid()}.{secrets.token_hex(12)}.tmp"
     )
-    _write_create_only(temporary, payload, mode=0o600)
-    if _rename_noreplace(temporary, RESULT_PATH):
-        _fsync_directory(SNAPSHOT_ROOT)
-        return
-    existing = _read_stable_regular(
-        RESULT_PATH,
-        max_bytes=MAX_RESULT_BYTES,
-        require_root_owned=True,
-        required_mode=0o600,
-    )
-    if existing != payload:
-        raise InventoryHelperError("existing inventory result differs")
     try:
-        os.unlink(temporary)
-    except FileNotFoundError:
-        pass
-    _fsync_directory(SNAPSHOT_ROOT)
+        _write_create_only(temporary, payload, mode=0o600)
+        if _rename_noreplace(temporary, RESULT_PATH):
+            _fsync_directory(SNAPSHOT_ROOT)
+            return
+        existing = _read_stable_regular(
+            RESULT_PATH,
+            max_bytes=MAX_RESULT_BYTES,
+            require_root_owned=True,
+            required_mode=0o600,
+        )
+        if existing != payload:
+            raise InventoryHelperError("existing inventory result differs")
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        _fsync_directory(SNAPSHOT_ROOT)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
 
 
 def _read_result() -> dict[str, Any] | None:
