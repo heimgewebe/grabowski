@@ -1211,6 +1211,138 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
         self.assertFalse(value["retry_safe"])
         self.assertEqual(value["request_id"], "start")
 
+    def test_start_blocked_after_dispatch_reconciles_running_status(self) -> None:
+        not_started = {
+            "broker_returncode": 0,
+            "result": {
+                "schema_version": 1,
+                "kind": "grabowski.critical_user_data_inventory_status.v1",
+                "status": "not-started",
+                "scanner_sha256": helper.AUTHORIZED_SCANNER_SHA256,
+                "contract_sha256": helper.AUTHORIZED_CONTRACT_SHA256,
+                "unit": "inventory.service",
+                "unit_state": {
+                    "load": "not-found",
+                    "active": "inactive",
+                    "sub": "dead",
+                    "result": "success",
+                },
+                "result_sha256": None,
+            },
+        }
+        blocked = {
+            "broker_returncode": 2,
+            "result": {
+                "schema_version": 1,
+                "kind": "grabowski.critical_user_data_inventory_error.v1",
+                "status": "blocked",
+                "scanner_sha256": helper.AUTHORIZED_SCANNER_SHA256,
+                "contract_sha256": helper.AUTHORIZED_CONTRACT_SHA256,
+            },
+        }
+        running = {
+            "broker_returncode": 0,
+            "result": {
+                **not_started["result"],
+                "status": "running",
+                "unit_state": {
+                    "load": "loaded",
+                    "active": "active",
+                    "sub": "running",
+                    "result": "success",
+                },
+            },
+        }
+        pre_invoked = {"request_id": "pre-blocked", "reference_sha256": "8" * 64}
+        start_invoked = {"request_id": "start-blocked", "reference_sha256": "9" * 64}
+        status_invoked = {"request_id": "status-blocked", "reference_sha256": "a" * 64}
+        with (
+            mock.patch.object(
+                privileged,
+                "_critical_inventory_broker_call",
+                side_effect=[
+                    (pre_invoked, not_started),
+                    (start_invoked, blocked),
+                    (status_invoked, running),
+                ],
+            ),
+            mock.patch.object(
+                privileged.operator,
+                "_require_operator_mutation",
+                return_value=None,
+            ),
+        ):
+            value = privileged.grabowski_critical_user_data_inventory(
+                "start",
+                helper.AUTHORIZED_SCANNER_SHA256,
+                helper.AUTHORIZED_CONTRACT_SHA256,
+            )
+
+        self.assertEqual(value["outcome"], "readback_reconciled")
+        self.assertFalse(value["readback_required"])
+        self.assertFalse(value["retry_safe"])
+        self.assertEqual(value["request_id"], "start-blocked")
+        self.assertEqual(value["result"]["status"], "running")
+
+    def test_start_blocked_after_dispatch_unresolved_is_not_retry_safe(self) -> None:
+        not_started = {
+            "broker_returncode": 0,
+            "result": {
+                "schema_version": 1,
+                "kind": "grabowski.critical_user_data_inventory_status.v1",
+                "status": "not-started",
+                "scanner_sha256": helper.AUTHORIZED_SCANNER_SHA256,
+                "contract_sha256": helper.AUTHORIZED_CONTRACT_SHA256,
+                "unit": "inventory.service",
+                "unit_state": {
+                    "load": "not-found",
+                    "active": "inactive",
+                    "sub": "dead",
+                    "result": "success",
+                },
+                "result_sha256": None,
+            },
+        }
+        blocked = {
+            "broker_returncode": 2,
+            "result": {
+                "schema_version": 1,
+                "kind": "grabowski.critical_user_data_inventory_error.v1",
+                "status": "blocked",
+                "scanner_sha256": helper.AUTHORIZED_SCANNER_SHA256,
+                "contract_sha256": helper.AUTHORIZED_CONTRACT_SHA256,
+            },
+        }
+        pre_invoked = {"request_id": "pre-blocked-unknown", "reference_sha256": "b" * 64}
+        start_invoked = {"request_id": "start-blocked-unknown", "reference_sha256": "c" * 64}
+        status_invoked = {"request_id": "status-blocked-unknown", "reference_sha256": "d" * 64}
+        with (
+            mock.patch.object(
+                privileged,
+                "_critical_inventory_broker_call",
+                side_effect=[
+                    (pre_invoked, not_started),
+                    (start_invoked, blocked),
+                    (status_invoked, None),
+                ],
+            ),
+            mock.patch.object(
+                privileged.operator,
+                "_require_operator_mutation",
+                return_value=None,
+            ),
+        ):
+            value = privileged.grabowski_critical_user_data_inventory(
+                "start",
+                helper.AUTHORIZED_SCANNER_SHA256,
+                helper.AUTHORIZED_CONTRACT_SHA256,
+            )
+
+        self.assertEqual(value["outcome"], "outcome_unknown")
+        self.assertTrue(value["readback_required"])
+        self.assertFalse(value["retry_safe"])
+        self.assertEqual(value["request_id"], "start-blocked-unknown")
+
     def test_broker_execution_timeout_enters_readback_path(self) -> None:
         invoked = {
             "request_id": "broker-timeout",

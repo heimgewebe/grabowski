@@ -1560,7 +1560,7 @@ def grabowski_critical_user_data_inventory(
         contract,
         action=CRITICAL_USER_DATA_INVENTORY_ACTION,
     )
-    if parsed is not None:
+    if parsed is not None and parsed["result"]["status"] != "blocked":
         return _critical_inventory_response(
             "start",
             scanner,
