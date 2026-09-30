@@ -2341,18 +2341,20 @@ def _repo_orient_admit_repoground_context(
         status = "dirty_unbound"
         reason = "dirty_worktree_is_not_bound_to_repoground_snapshot"
     elif context.get("available") is not True:
-        status = (
-            "unavailable"
-            if source_freshness == "publication_unavailable"
-            or source_status
-            in {
-                "missing",
-                "excluded",
-                "canonical_publication_unavailable",
-                "missing_publication_root",
-            }
-            else "unknown"
-        )
+        if source_status == "excluded":
+            status = "excluded"
+        else:
+            status = (
+                "unavailable"
+                if source_freshness == "publication_unavailable"
+                or source_status
+                in {
+                    "missing",
+                    "canonical_publication_unavailable",
+                    "missing_publication_root",
+                }
+                else "unknown"
+            )
         reason = str(context.get("reason") or "exact_repoground_context_unavailable")
     elif target_revision is None or snapshot_commit is None:
         status = "unknown"
@@ -2385,12 +2387,14 @@ def _repo_orient_admit_repoground_context(
         "fallback": {
             "mode": (
                 "live_fallback"
-                if dirty or target_revision is None
+                if dirty or target_revision is None or source_status == "excluded"
                 else "targeted_build_or_live_fallback"
             ),
             "targeted_build_recommended": targeted_build_recommended,
             "live_fallback_allowed": True,
-            "live_fallback_required": dirty or target_revision is None,
+            "live_fallback_required": (
+                dirty or target_revision is None or source_status == "excluded"
+            ),
         },
         "does_not_establish": [
             "repoground_context_available",

@@ -134,6 +134,32 @@ def test_repo_orient_withholds_exact_base_for_dirty_worktree() -> None:
     }
 
 
+def test_repo_orient_preserves_excluded_as_skip_with_live_fallback() -> None:
+    result = grips._repo_orient_admit_repoground_context(
+        _orientation(),
+        {
+            "available": False,
+            "status": "excluded",
+            "freshness_status": "publication_unavailable",
+            "reason": "repository is intentionally excluded from RepoGround fleet publication",
+            "repository": "grabowski",
+            "ref": "main",
+            "canonical_md_path": "/must/not/leak.md",
+        },
+    )
+
+    assert result["available"] is False
+    assert result["status"] == "excluded"
+    assert result["admission"] == "withheld"
+    assert result["fallback"] == {
+        "mode": "live_fallback",
+        "targeted_build_recommended": False,
+        "live_fallback_allowed": True,
+        "live_fallback_required": True,
+    }
+    assert "canonical_md_path" not in result
+
+
 def test_repo_orient_marks_missing_publication_unavailable() -> None:
     result = grips._repo_orient_admit_repoground_context(
         _orientation(),
