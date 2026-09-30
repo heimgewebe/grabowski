@@ -184,6 +184,87 @@ def test_repobrief_context_matches_repo_name_containing_double_underscores() -> 
     assert result["freshness_status"] == "fresh"
 
 
+def test_repobrief_context_preserves_internal_revision_separators() -> None:
+    repo = "foo--bar"
+    ref = "release--candidate"
+    manifest = {
+        "snapshotProvenance": {
+            "repositories": [
+                {
+                    "name": f"owner__{repo}__{ref}--{TARGET}",
+                    "git_commit": TARGET,
+                    "git_dirty": False,
+                }
+            ]
+        }
+    }
+    result = repobrief._process_manifest_candidate(
+        manifest,
+        Path(f"/tmp/published/{repo}.bundle.manifest.json"),
+        repo,
+        ref,
+        "canonical_publication",
+        Path("/tmp/published"),
+        _orientation(),
+    )
+
+    assert result["snapshot_commit"] == TARGET
+    assert result["snapshot_dirty"] is False
+    assert result["freshness_status"] == "fresh"
+
+
+def test_repobrief_context_normalizes_commit_alias() -> None:
+    manifest = {
+        "snapshotProvenance": {
+            "repositories": [
+                {
+                    "repo": "grabowski",
+                    "commit": TARGET.upper(),
+                    "git_dirty": False,
+                }
+            ]
+        }
+    }
+    result = repobrief._process_manifest_candidate(
+        manifest,
+        Path("/tmp/published/grabowski.bundle.manifest.json"),
+        "grabowski",
+        "main",
+        "canonical_publication",
+        Path("/tmp/published"),
+        _orientation(),
+    )
+
+    assert result["snapshot_commit"] == TARGET
+    assert result["freshness_status"] == "fresh"
+
+
+def test_repobrief_context_accepts_head_alias() -> None:
+    manifest = {
+        "snapshotProvenance": {
+            "repositories": [
+                {
+                    "repository": "heimgewebe/grabowski",
+                    "head": TARGET,
+                    "git_dirty": False,
+                }
+            ]
+        }
+    }
+    result = repobrief._process_manifest_candidate(
+        manifest,
+        Path("/tmp/published/grabowski.bundle.manifest.json"),
+        "grabowski",
+        "main",
+        "canonical_publication",
+        Path("/tmp/published"),
+        _orientation(),
+    )
+
+    assert result["snapshot_commit"] == TARGET
+    assert result["freshness_status"] == "fresh"
+
+
 def test_repobrief_context_refuses_unmatched_repository_provenance() -> None:
     manifest = {
         "snapshotProvenance": {

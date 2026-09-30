@@ -17,6 +17,7 @@ DEFAULT_PUBLICATION_ROOT = Path(
 ).expanduser()
 EXCLUDED_REPOSITORIES = {"vault-gewebe"}
 SEGMENT_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,198}[A-Za-z0-9])?\Z")
+REVISION_SUFFIX_RE = re.compile(r"--(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
 DEFAULT_REFS = ("main", "master")
 
 CommandRunner = Callable[[Path, list[str]], dict[str, Any]]
@@ -284,7 +285,7 @@ def _snapshot_repository_matches(
         value = candidate.strip().removesuffix(".git")
         if value == repo_segment or value.endswith(f"/{repo_segment}"):
             return True
-        canonical_identity = value.split("--", 1)[0]
+        canonical_identity = REVISION_SUFFIX_RE.sub("", value)
         if canonical_identity.endswith(f"__{repo_segment}__{ref}"):
             return True
     return False
@@ -351,9 +352,17 @@ def _process_manifest_candidate(
         )
         if not has_identity:
             snapshot_repository = only_repository
+    raw_snapshot_commit = None
+    if snapshot_repository is not None:
+        raw_snapshot_commit = (
+            snapshot_repository.get("git_commit")
+            or snapshot_repository.get("commit")
+            or snapshot_repository.get("head")
+        )
     snapshot_commit = (
-        snapshot_repository.get("git_commit")
-        if snapshot_repository is not None
+        raw_snapshot_commit.lower()
+        if isinstance(raw_snapshot_commit, str)
+        and repoground_catalog.COMMIT_RE.fullmatch(raw_snapshot_commit)
         else None
     )
     snapshot_dirty = (
