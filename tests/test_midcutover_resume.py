@@ -1378,6 +1378,27 @@ class HistoricalActivationContractTests(unittest.TestCase):
             midcutover.validate_cutover_receipt(receipt)
 
 
+class SnapshotRecoveryProjectionTests(unittest.TestCase):
+    def test_snapshot_projection_preserves_validated_source_clock(self) -> None:
+        observed = midcutover.observe_client_snapshot_binding(
+            cutover_id=CUTOVER_ID,
+            cutover_generation=CUTOVER_GENERATION,
+            blue_release_id=BLUE_RELEASE,
+            blue_repo_head=HEAD_BLUE,
+            green_release_id=GREEN_RELEASE,
+            target_head=HEAD_GREEN,
+            source_evidence_time=ACTIVATION_TIME + 1,
+            publication_request_id=PUBLICATION_REQUEST_ID,
+            registered_tool_count=2,
+            registered_names_sha256="d1" * 32,
+            agent_instructions_sha256="d2" * 32,
+            green_readiness=GREEN_READINESS,
+            source_identity_sha256=SOURCE_IDENTITY_SHA256,
+            snapshot_inspector=lambda **_kwargs: SNAPSHOT_REBOUND,
+        )
+        self.assertEqual(observed["source_evidence_time"], ACTIVATION_TIME + 1)
+
+
 class SnapshotInspectorDependencyTests(unittest.TestCase):
     def test_snapshot_inspector_is_injected_and_unknown_state_fails_closed(self) -> None:
         calls: list[dict[str, object]] = []

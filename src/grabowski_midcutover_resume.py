@@ -177,6 +177,7 @@ def observe_client_snapshot_binding(
     return {
         **observed,
         "state": state,
+        "source_evidence_time": source_evidence_time,
         "transition_sha256": observed.get("publication_transition_sha256"),
     }
 
