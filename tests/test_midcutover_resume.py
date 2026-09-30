@@ -845,6 +845,66 @@ class HistoricalTerminalActivationTests(unittest.TestCase):
 
         activation = midcutover.historical_terminal_activation_observation(receipt)
         self.assertEqual(activation["state"], "platform_converged")
+        self.assertEqual(activation["source_evidence_time"], ACTIVATION_TIME)
+        self.assertEqual(
+            activation["snapshot_source_evidence_time"], ACTIVATION_TIME + 1
+        )
+
+        selector = receipt["authoritative_readback"]["selector"]
+        pointer = {
+            "release_id": GREEN_RELEASE,
+            "repo_head": HEAD_GREEN,
+            "completion_status": "complete",
+            "pointer_kind": "symlink",
+            "pointer_target_release_id": GREEN_RELEASE,
+            "error": None,
+        }
+        observed_snapshot_call = {}
+
+        def observe_release(release_id, **_kwargs):
+            return (
+                GREEN_OBSERVATION
+                if release_id == GREEN_RELEASE
+                else BLUE_OBSERVATION
+            )
+
+        def inspect_snapshot(**kwargs):
+            observed_snapshot_call.update(kwargs)
+            return SNAPSHOT_REBOUND
+
+        with (
+            mock.patch.object(
+                midcutover, "read_routing_selector_document", return_value=selector
+            ),
+            mock.patch.object(
+                midcutover,
+                "load_receipts",
+                return_value={
+                    "receipts": [receipt],
+                    "unreadable": [],
+                    "root": "/test",
+                    "present": True,
+                },
+            ),
+            mock.patch.object(
+                midcutover, "observe_green_release", side_effect=observe_release
+            ),
+            mock.patch.object(
+                midcutover, "observe_stable_pointer", return_value=pointer
+            ),
+        ):
+            inputs = midcutover.collect_classification_inputs(
+                green_unit_observer=lambda _unit: {"active": True},
+                snapshot_inspector=inspect_snapshot,
+            )
+
+        self.assertEqual(
+            observed_snapshot_call["source_evidence_time"], ACTIVATION_TIME + 1
+        )
+        self.assertEqual(
+            inputs["activation_observation"]["source_evidence_time"],
+            ACTIVATION_TIME,
+        )
 
     def test_historical_rebind_time_outside_source_freshness_window_fails_closed(self) -> None:
         receipt = historical_terminal_cutover_receipt()

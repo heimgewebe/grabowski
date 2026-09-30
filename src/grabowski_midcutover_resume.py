@@ -482,6 +482,7 @@ def historical_terminal_activation_observation(
         )
     return {
         "source_evidence_time": observed_at,
+        "snapshot_source_evidence_time": transition["source_evidence_time"],
         "publication_request_id": details["request_id"],
         "observation_sha256": activation["observation_sha256"],
         "state": details["state"],
@@ -1202,7 +1203,10 @@ def collect_classification_inputs(
                 blue_repo_head=str((blue_observation or {}).get("repo_head") or ""),
                 green_release_id=str(cutover.get("green_release_id") or ""),
                 target_head=str(cutover.get("expected_head") or ""),
-                source_evidence_time=activation["source_evidence_time"],
+                source_evidence_time=activation.get(
+                    "snapshot_source_evidence_time",
+                    activation["source_evidence_time"],
+                ),
                 publication_request_id=activation["publication_request_id"],
                 registered_tool_count=int(
                     readiness.get("complete_schema_count") or 0
