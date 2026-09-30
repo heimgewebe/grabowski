@@ -148,6 +148,7 @@ SNAPSHOT_REBOUND = {
     "bound_repo_head": HEAD_GREEN,
     "snapshot_receipt_sha256": REBOUND_SNAPSHOT_RECEIPT_SHA256,
     "classified_snapshot_receipt_sha256": REBOUND_SNAPSHOT_RECEIPT_SHA256,
+    "source_evidence_time": ACTIVATION_TIME,
     "transition_sha256": "93" * 32,
     "schema_changed": True,
 }
@@ -315,6 +316,7 @@ def resume_receipt(
         ),
         "source_identity_sha256": SOURCE_IDENTITY_SHA256,
         "source_evidence_time": ACTIVATION_TIME,
+        "snapshot_source_evidence_time": ACTIVATION_TIME,
         "activation_observation_sha256": ACTIVATION_EVIDENCE[
             "observation_sha256"
         ],
@@ -735,6 +737,343 @@ def classify(**overrides) -> dict[str, object]:
     return midcutover.classify_recovery_lane(**parameters)
 
 
+def historical_terminal_cutover_receipt() -> dict[str, object]:
+    receipt = cutover_receipt(activation_state="platform_converged")
+    receipt["snapshot_rebind"] = durable_rebind_evidence(
+        receipt_sha256=REBOUND_SNAPSHOT_RECEIPT_SHA256
+    )
+    routing = selector_document(
+        slot=midcutover.CANONICAL_SLOT,
+        generation=GENERATION + 1,
+        selector_sha256="f3" * 32,
+        previous_selector_sha256=SELECTOR_SHA256,
+    )
+    routing["release_id"] = GREEN_RELEASE
+    routing["repo_head"] = HEAD_GREEN
+    readback_material = {
+        "authoritative": True,
+        "selector": routing,
+        "ingress": {
+            "selector_sha256": routing["selector_sha256"],
+            "selector_generation": routing["generation"],
+            "selected_slot": routing["selected_slot"],
+            "upstream_port": routing["upstream_port"],
+            "runtime_binding_sha256": BINDING_SHA256,
+            "release_id": GREEN_RELEASE,
+            "repo_head": HEAD_GREEN,
+        },
+    }
+    receipt["authoritative_readback"] = {
+        **readback_material,
+        "readback_sha256": midcutover.canonical_json_sha256(readback_material),
+    }
+    receipt.pop("receipt_sha256", None)
+    receipt["receipt_sha256"] = midcutover.canonical_json_sha256(receipt)
+    return receipt
+
+
+class HistoricalSnapshotClockContractTests(unittest.TestCase):
+    def test_recovery_clock_skew_matches_canonical_snapshot_contract(self) -> None:
+        self.assertEqual(
+            midcutover.SNAPSHOT_CLOCK_SKEW_SECONDS,
+            client_snapshot.SNAPSHOT_CLOCK_SKEW_SECONDS,
+        )
+
+
+class HistoricalTerminalActivationTests(unittest.TestCase):
+    def test_platform_converged_requires_terminal_cutover_evidence(self) -> None:
+        receipt = historical_terminal_cutover_receipt()
+        activation = midcutover.historical_terminal_activation_observation(receipt)
+        self.assertEqual(activation["state"], "platform_converged")
+
+        incomplete = cutover_receipt(activation_state="platform_converged")
+        with self.assertRaisesRegex(
+            midcutover.MidCutoverEvidenceError,
+            "historical terminal activation evidence is incomplete",
+        ):
+            midcutover.historical_terminal_activation_observation(incomplete)
+
+    def test_collector_admits_exact_historical_canonical_lineage(self) -> None:
+        receipt = historical_terminal_cutover_receipt()
+        selector = receipt["authoritative_readback"]["selector"]
+        pointer = {
+            "release_id": GREEN_RELEASE,
+            "repo_head": HEAD_GREEN,
+            "completion_status": "complete",
+            "pointer_kind": "symlink",
+            "pointer_target_release_id": GREEN_RELEASE,
+            "error": None,
+        }
+
+        def observe_release(release_id, **_kwargs):
+            return GREEN_OBSERVATION if release_id == GREEN_RELEASE else BLUE_OBSERVATION
+
+        with (
+            mock.patch.object(
+                midcutover, "read_routing_selector_document", return_value=selector
+            ),
+            mock.patch.object(
+                midcutover,
+                "load_receipts",
+                return_value={
+                    "receipts": [receipt],
+                    "unreadable": [],
+                    "root": "/test",
+                    "present": True,
+                },
+            ),
+            mock.patch.object(
+                midcutover, "observe_green_release", side_effect=observe_release
+            ),
+            mock.patch.object(
+                midcutover, "observe_stable_pointer", return_value=pointer
+            ),
+        ):
+            inputs = midcutover.collect_classification_inputs(
+                green_unit_observer=lambda _unit: {"active": True},
+                snapshot_inspector=lambda **_kwargs: SNAPSHOT_REBOUND,
+            )
+
+        self.assertEqual(
+            inputs["activation_observation"]["state"], "platform_converged"
+        )
+        verdict = midcutover.classify_recovery_lane(
+            expected_head=HEAD_GREEN, **inputs
+        )
+        self.assertEqual(verdict["lane"], midcutover.LANE_MID_CUTOVER_RESUME)
+        self.assertEqual(
+            verdict["resume_binding"]["resume_phase"],
+            midcutover.PHASE_RETIRE_GREEN,
+        )
+
+    def test_historical_rebind_time_may_differ_within_source_freshness_window(self) -> None:
+        receipt = historical_terminal_cutover_receipt()
+        transition = receipt["snapshot_rebind"]["cutover_transition"]
+        transition["source_evidence_time"] = ACTIVATION_TIME + 1
+        receipt.pop("receipt_sha256", None)
+        receipt["receipt_sha256"] = midcutover.canonical_json_sha256(receipt)
+
+        activation = midcutover.historical_terminal_activation_observation(receipt)
+        self.assertEqual(activation["state"], "platform_converged")
+
+    def test_activation_time_may_follow_source_expiry_when_rebind_time_is_fresh(self) -> None:
+        receipt = historical_terminal_cutover_receipt()
+        transition = receipt["snapshot_rebind"]["cutover_transition"]
+        transition["source_evidence_time"] = transition["source_expires_at_unix"]
+        observation = dict(receipt["observations"][0])
+        observation["observed_at_unix"] = transition["source_expires_at_unix"] + 1
+        material = {
+            key: value
+            for key, value in observation.items()
+            if key != "observation_sha256"
+        }
+        observation["observation_sha256"] = midcutover.canonical_json_sha256(material)
+        receipt["observations"] = [observation]
+        receipt.pop("receipt_sha256", None)
+        receipt["receipt_sha256"] = midcutover.canonical_json_sha256(receipt)
+
+        activation = midcutover.historical_terminal_activation_observation(receipt)
+        self.assertEqual(
+            activation["source_evidence_time"],
+            transition["source_expires_at_unix"] + 1,
+        )
+        self.assertEqual(
+            activation["snapshot_source_evidence_time"],
+            transition["source_expires_at_unix"],
+        )
+
+    def test_historical_clock_skew_within_canonical_window_is_accepted(self) -> None:
+        receipt = historical_terminal_cutover_receipt()
+        transition = receipt["snapshot_rebind"]["cutover_transition"]
+        transition["source_created_at_unix"] = ACTIVATION_TIME + 2
+        transition["source_evidence_time"] = ACTIVATION_TIME + 1
+        receipt.pop("receipt_sha256", None)
+        receipt["receipt_sha256"] = midcutover.canonical_json_sha256(receipt)
+
+        activation = midcutover.historical_terminal_activation_observation(receipt)
+        self.assertEqual(activation["source_evidence_time"], ACTIVATION_TIME)
+        self.assertEqual(
+            activation["snapshot_source_evidence_time"], ACTIVATION_TIME + 1
+        )
+
+    def test_historical_clock_skew_beyond_canonical_window_fails_closed(self) -> None:
+        receipt = historical_terminal_cutover_receipt()
+        transition = receipt["snapshot_rebind"]["cutover_transition"]
+        transition["source_created_at_unix"] = ACTIVATION_TIME
+        transition["source_evidence_time"] = (
+            ACTIVATION_TIME - midcutover.SNAPSHOT_CLOCK_SKEW_SECONDS - 1
+        )
+        receipt.pop("receipt_sha256", None)
+        receipt["receipt_sha256"] = midcutover.canonical_json_sha256(receipt)
+
+        with self.assertRaisesRegex(
+            midcutover.MidCutoverEvidenceError,
+            "historical terminal snapshot rebind evidence is invalid",
+        ):
+            midcutover.historical_terminal_activation_observation(receipt)
+
+    def test_historical_rebind_time_outside_source_freshness_window_fails_closed(self) -> None:
+        receipt = historical_terminal_cutover_receipt()
+        transition = receipt["snapshot_rebind"]["cutover_transition"]
+        transition["source_evidence_time"] = transition["source_expires_at_unix"] + 1
+        receipt.pop("receipt_sha256", None)
+        receipt["receipt_sha256"] = midcutover.canonical_json_sha256(receipt)
+
+        with self.assertRaisesRegex(
+            midcutover.MidCutoverEvidenceError,
+            "historical terminal snapshot rebind evidence is invalid",
+        ):
+            midcutover.historical_terminal_activation_observation(receipt)
+
+    def test_collector_passes_historical_rebind_time_to_snapshot_inspector(self) -> None:
+        receipt = historical_terminal_cutover_receipt()
+        transition = receipt["snapshot_rebind"]["cutover_transition"]
+        transition["source_evidence_time"] = ACTIVATION_TIME + 1
+        receipt.pop("receipt_sha256", None)
+        receipt["receipt_sha256"] = midcutover.canonical_json_sha256(receipt)
+        selector = receipt["authoritative_readback"]["selector"]
+        pointer = {
+            "release_id": GREEN_RELEASE,
+            "repo_head": HEAD_GREEN,
+            "completion_status": "complete",
+            "pointer_kind": "symlink",
+            "pointer_target_release_id": GREEN_RELEASE,
+            "error": None,
+        }
+        seen = {}
+
+        def inspect_snapshot(**kwargs):
+            seen["source_evidence_time"] = kwargs["source_evidence_time"]
+            return SNAPSHOT_REBOUND
+
+        def observe_release(release_id, **_kwargs):
+            return GREEN_OBSERVATION if release_id == GREEN_RELEASE else BLUE_OBSERVATION
+
+        with (
+            mock.patch.object(midcutover, "read_routing_selector_document", return_value=selector),
+            mock.patch.object(
+                midcutover,
+                "load_receipts",
+                return_value={"receipts": [receipt], "unreadable": [], "root": "/test", "present": True},
+            ),
+            mock.patch.object(midcutover, "observe_green_release", side_effect=observe_release),
+            mock.patch.object(midcutover, "observe_stable_pointer", return_value=pointer),
+        ):
+            inputs = midcutover.collect_classification_inputs(
+                green_unit_observer=lambda _unit: {"active": True},
+                snapshot_inspector=inspect_snapshot,
+            )
+
+        self.assertEqual(seen["source_evidence_time"], ACTIVATION_TIME + 1)
+        verdict = midcutover.classify_recovery_lane(expected_head=HEAD_GREEN, **inputs)
+        self.assertEqual(verdict["lane"], midcutover.LANE_MID_CUTOVER_RESUME)
+        self.assertEqual(
+            verdict["resume_binding"]["resume_phase"],
+            midcutover.PHASE_RETIRE_GREEN,
+        )
+
+    def test_historical_terminal_evidence_never_authorizes_green_selector(self) -> None:
+        receipt = historical_terminal_cutover_receipt()
+        activation = midcutover.historical_terminal_activation_observation(receipt)
+        pointer = {
+            "release_id": GREEN_RELEASE,
+            "repo_head": HEAD_GREEN,
+            "completion_status": "complete",
+            "pointer_kind": "symlink",
+            "pointer_target_release_id": GREEN_RELEASE,
+            "error": None,
+        }
+        verdict = classify(
+            receipts=[receipt],
+            activation_observation=activation,
+            selector=selector_document(),
+            pointer_observation=pointer,
+            snapshot_observation=SNAPSHOT_REBOUND,
+        )
+        self.assertEqual(verdict["lane"], midcutover.LANE_FAIL_CLOSED)
+        self.assertIn(
+            "historical_terminal_selector_is_canonical", verdict["reasons"]
+        )
+
+    def test_platform_converged_never_reopens_preterminal_phases(self) -> None:
+        receipt = historical_terminal_cutover_receipt()
+        activation = midcutover.historical_terminal_activation_observation(receipt)
+        cases = (
+            (selector_document(), POINTER_AT_BLUE, SNAPSHOT_PENDING),
+            (selector_document(), POINTER_AT_BLUE, SNAPSHOT_REBOUND),
+            (selector_document(), POINTER_AT_TARGET, SNAPSHOT_REBOUND),
+        )
+        for selector, pointer, snapshot in cases:
+            with self.subTest(pointer=pointer["release_id"], snapshot=snapshot["state"]):
+                verdict = midcutover.classify_recovery_lane(
+                    expected_head=HEAD_GREEN,
+                    selector=selector,
+                    receipts=[receipt],
+                    green_observation=GREEN_OBSERVATION,
+                    blue_observation=BLUE_OBSERVATION,
+                    activation_observation=activation,
+                    pointer_observation=pointer,
+                    green_unit_observation={"active": True},
+                    snapshot_observation=snapshot,
+                )
+                self.assertEqual(verdict["lane"], midcutover.LANE_FAIL_CLOSED)
+                self.assertIn("activation_observation_valid", verdict["reasons"])
+
+    def test_historical_terminal_readback_must_match_current_selector(self) -> None:
+        receipt = historical_terminal_cutover_receipt()
+        activation = midcutover.historical_terminal_activation_observation(receipt)
+        selector = dict(receipt["authoritative_readback"]["selector"])
+        selector["selector_sha256"] = "ee" * 32
+        verdict = midcutover.classify_recovery_lane(
+            expected_head=HEAD_GREEN,
+            selector=selector,
+            receipts=[receipt],
+            green_observation=GREEN_OBSERVATION,
+            blue_observation=BLUE_OBSERVATION,
+            activation_observation=activation,
+            pointer_observation=POINTER_AT_TARGET,
+            green_unit_observation={"active": True},
+            snapshot_observation=SNAPSHOT_REBOUND,
+        )
+        self.assertEqual(verdict["lane"], midcutover.LANE_FAIL_CLOSED)
+        self.assertIn("activation_observation_valid", verdict["reasons"])
+
+    def test_completed_resume_becomes_tombstone_for_historical_lineage(self) -> None:
+        receipt = historical_terminal_cutover_receipt()
+        transition = receipt["snapshot_rebind"]["cutover_transition"]
+        transition["source_evidence_time"] = ACTIVATION_TIME + 1
+        receipt.pop("receipt_sha256", None)
+        receipt["receipt_sha256"] = midcutover.canonical_json_sha256(receipt)
+        activation = midcutover.historical_terminal_activation_observation(receipt)
+        resumed = resume_receipt(
+            resumed_receipt_sha256=receipt["receipt_sha256"],
+            resume_phase=midcutover.PHASE_RETIRE_GREEN,
+        )
+        binding = dict(resumed["resume_binding"])
+        binding["activation_observation_sha256"] = activation["observation_sha256"]
+        binding["snapshot_source_evidence_time"] = activation[
+            "snapshot_source_evidence_time"
+        ]
+        binding["binding_sha256"] = midcutover.canonical_json_sha256(
+            {key: value for key, value in binding.items() if key != "binding_sha256"}
+        )
+        resumed["resume_binding"] = binding
+        resumed["resume_binding_sha256"] = binding["binding_sha256"]
+        resumed["final_state"]["snapshot"] = {
+            **SNAPSHOT_REBOUND,
+            "source_evidence_time": activation["snapshot_source_evidence_time"],
+        }
+        resumed.pop("receipt_sha256", None)
+        resumed["receipt_sha256"] = midcutover.canonical_json_sha256(resumed)
+
+        self.assertEqual(
+            midcutover.unresolved_post_switch_receipts([receipt, resumed]), []
+        )
+        resolution = midcutover.resolution_for_cutover([receipt, resumed], receipt)
+        self.assertIsNotNone(resolution)
+        self.assertEqual(resolution["resumed_cutover_id"], CUTOVER_ID)
+
+
 class ClassificationTests(unittest.TestCase):
     """Tests 10-16 and 23: only the exact stranded state is resumable."""
 
@@ -1065,6 +1404,27 @@ class HistoricalActivationContractTests(unittest.TestCase):
             midcutover.validate_cutover_receipt(receipt)
 
 
+class SnapshotRecoveryProjectionTests(unittest.TestCase):
+    def test_snapshot_projection_preserves_validated_source_clock(self) -> None:
+        observed = midcutover.observe_client_snapshot_binding(
+            cutover_id=CUTOVER_ID,
+            cutover_generation=CUTOVER_GENERATION,
+            blue_release_id=BLUE_RELEASE,
+            blue_repo_head=HEAD_BLUE,
+            green_release_id=GREEN_RELEASE,
+            target_head=HEAD_GREEN,
+            source_evidence_time=ACTIVATION_TIME + 1,
+            publication_request_id=PUBLICATION_REQUEST_ID,
+            registered_tool_count=2,
+            registered_names_sha256="d1" * 32,
+            agent_instructions_sha256="d2" * 32,
+            green_readiness=GREEN_READINESS,
+            source_identity_sha256=SOURCE_IDENTITY_SHA256,
+            snapshot_inspector=lambda **_kwargs: SNAPSHOT_REBOUND,
+        )
+        self.assertEqual(observed["source_evidence_time"], ACTIVATION_TIME + 1)
+
+
 class SnapshotInspectorDependencyTests(unittest.TestCase):
     def test_snapshot_inspector_is_injected_and_unknown_state_fails_closed(self) -> None:
         calls: list[dict[str, object]] = []
@@ -1320,6 +1680,7 @@ def resume_binding_for_phase(phase: str) -> dict[str, object]:
         ),
         "source_identity_sha256": SOURCE_IDENTITY_SHA256,
         "source_evidence_time": ACTIVATION_TIME,
+        "snapshot_source_evidence_time": ACTIVATION_TIME,
         "activation_observation_sha256": ACTIVATION_EVIDENCE[
             "observation_sha256"
         ],
@@ -1337,6 +1698,81 @@ def resume_binding_for_phase(phase: str) -> dict[str, object]:
         ),
     }
     return {**material, "binding_sha256": midcutover.canonical_json_sha256(material)}
+
+
+class RuntimeSnapshotClockBindingTests(unittest.TestCase):
+    def _runtime_for_phase(self, phase: str) -> dual.MidCutoverResumeRuntime:
+        binding = resume_binding_for_phase(phase)
+        binding["source_evidence_time"] = ACTIVATION_TIME
+        binding["snapshot_source_evidence_time"] = ACTIVATION_TIME + 1
+        binding["binding_sha256"] = midcutover.canonical_json_sha256(
+            {key: value for key, value in binding.items() if key != "binding_sha256"}
+        )
+        return dual.MidCutoverResumeRuntime(
+            repo=ROOT,
+            runtime=Path("/runtime"),
+            release_path=Path("/release/green"),
+            contract=None,
+            contract_evidence={},
+            green_binding={
+                "release_id": GREEN_RELEASE,
+                "repo_head": HEAD_GREEN,
+                "registered_names_sha256": "d1" * 32,
+                "agent_instructions_sha256": "d2" * 32,
+            },
+            classification={"evidence": {"snapshot_observation": SNAPSHOT_REBOUND}},
+            resume_binding=binding,
+            timeout_seconds=1,
+            green_unit=midcutover.green_operator_unit(CUTOVER_ID),
+            selector_before={},
+            cutover_generation=CUTOVER_GENERATION,
+            blue_repo_head=HEAD_BLUE,
+            receipt_root=Path("/tmp/unused-midcutover-receipts"),
+        )
+
+    def test_s3_and_s4_snapshot_guards_use_hash_bound_rebind_time(self) -> None:
+        for phase in (
+            midcutover.PHASE_RETIRE_GREEN,
+            midcutover.PHASE_CLOSEOUT,
+        ):
+            with self.subTest(phase=phase):
+                runtime = self._runtime_for_phase(phase)
+                with mock.patch.object(
+                    dual.client_snapshot,
+                    "cutover_snapshot_effect_guard",
+                    return_value=nullcontext({}),
+                ) as guard:
+                    runtime.snapshot_effect_guard("test-effect")
+                self.assertEqual(
+                    guard.call_args.kwargs["source_evidence_time"],
+                    ACTIVATION_TIME + 1,
+                )
+
+    def test_s3_and_s4_cold_readback_use_hash_bound_rebind_time(self) -> None:
+        for phase in (
+            midcutover.PHASE_RETIRE_GREEN,
+            midcutover.PHASE_CLOSEOUT,
+        ):
+            with self.subTest(phase=phase):
+                runtime = self._runtime_for_phase(phase)
+                with mock.patch.object(
+                    midcutover,
+                    "observe_client_snapshot_binding",
+                    return_value=SNAPSHOT_REBOUND,
+                ) as observe:
+                    runtime.cold_snapshot_observation()
+                self.assertEqual(
+                    observe.call_args.kwargs["source_evidence_time"],
+                    ACTIVATION_TIME + 1,
+                )
+
+    def test_old_v2_binding_without_snapshot_clock_remains_valid(self) -> None:
+        binding = resume_binding_for_phase(midcutover.PHASE_RETIRE_GREEN)
+        binding.pop("snapshot_source_evidence_time", None)
+        binding["binding_sha256"] = midcutover.canonical_json_sha256(
+            {key: value for key, value in binding.items() if key != "binding_sha256"}
+        )
+        self.assertIsNotNone(midcutover._validated_resume_binding(binding))
 
 
 class _FakeResumeRuntime:
@@ -4609,11 +5045,33 @@ class ResumeLineageIdempotenceTests(unittest.TestCase):
                     midcutover._lineage_resolved([forged], cutover_receipt())
                 )
 
+    def test_pre_upgrade_v2_completed_receipt_remains_a_terminal_tombstone(self) -> None:
+        receipt = resume_receipt()
+        binding = receipt["resume_binding"]
+        binding.pop("snapshot_source_evidence_time")
+        receipt["final_state"]["snapshot"] = dict(receipt["final_state"]["snapshot"])
+        receipt["final_state"]["snapshot"].pop("source_evidence_time")
+        self._rehash(receipt, binding_changed=True)
+
+        self.assertIsNotNone(midcutover._validated_resume_binding(binding))
+        self.assertIsNotNone(midcutover._completed_lineage_binding(receipt))
+        self.assertTrue(midcutover._lineage_resolved([receipt], cutover_receipt()))
+
+    def test_timestamped_v2_completed_receipt_requires_matching_snapshot_time(self) -> None:
+        receipt = resume_receipt()
+        receipt["final_state"]["snapshot"] = dict(receipt["final_state"]["snapshot"])
+        receipt["final_state"]["snapshot"]["source_evidence_time"] += 1
+        self._rehash(receipt)
+
+        self.assertIsNone(midcutover._completed_lineage_binding(receipt))
+        self.assertFalse(midcutover._lineage_resolved([receipt], cutover_receipt()))
+
     def test_legacy_completed_receipt_is_only_a_terminal_tombstone(self) -> None:
         legacy = resume_receipt()
         binding = legacy["resume_binding"]
         for field in (
             "resume_binding_schema_version",
+            "snapshot_source_evidence_time",
             "source_snapshot_receipt_sha256",
             "source_client_declaration_sha256",
             "classified_snapshot_receipt_sha256",
