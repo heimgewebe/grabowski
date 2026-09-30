@@ -213,6 +213,34 @@ def test_repobrief_context_preserves_internal_revision_separators() -> None:
     assert result["freshness_status"] == "fresh"
 
 
+def test_repobrief_context_matches_catalog_recovery_revision_name() -> None:
+    recovery = "c0ffee123456"
+    manifest = {
+        "snapshotProvenance": {
+            "repositories": [
+                {
+                    "name": f"owner__grabowski__main--{TARGET}--recovery-{recovery}",
+                    "git_commit": TARGET,
+                    "git_dirty": False,
+                }
+            ]
+        }
+    }
+    result = repobrief._process_manifest_candidate(
+        manifest,
+        Path("/tmp/published/grabowski.bundle.manifest.json"),
+        "grabowski",
+        "main",
+        "canonical_publication",
+        Path("/tmp/published"),
+        _orientation(),
+    )
+
+    assert result["snapshot_commit"] == TARGET
+    assert result["snapshot_dirty"] is False
+    assert result["freshness_status"] == "fresh"
+
+
 def test_repobrief_context_normalizes_commit_alias() -> None:
     manifest = {
         "snapshotProvenance": {

@@ -17,7 +17,6 @@ DEFAULT_PUBLICATION_ROOT = Path(
 ).expanduser()
 EXCLUDED_REPOSITORIES = {"vault-gewebe"}
 SEGMENT_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,198}[A-Za-z0-9])?\Z")
-REVISION_SUFFIX_RE = re.compile(r"--(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
 DEFAULT_REFS = ("main", "master")
 
 CommandRunner = Callable[[Path, list[str]], dict[str, Any]]
@@ -271,6 +270,15 @@ def _determine_candidates(
     return candidates, None
 
 
+def _without_catalog_revision_suffix(value: str) -> str:
+    separators = [match.start() for match in re.finditer(r"--", value)]
+    for separator in reversed(separators):
+        suffix = value[separator + 2 :]
+        if repoground_catalog.SOURCE_RECOVERY_SUFFIX_RE.fullmatch(suffix):
+            return value[:separator]
+    return value
+
+
 def _snapshot_repository_matches(
     item: dict[str, Any], repo_segment: str, ref: str
 ) -> bool:
@@ -285,7 +293,7 @@ def _snapshot_repository_matches(
         value = candidate.strip().removesuffix(".git")
         if value == repo_segment or value.endswith(f"/{repo_segment}"):
             return True
-        canonical_identity = REVISION_SUFFIX_RE.sub("", value)
+        canonical_identity = _without_catalog_revision_suffix(value)
         if canonical_identity.endswith(f"__{repo_segment}__{ref}"):
             return True
     return False
