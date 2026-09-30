@@ -3,12 +3,15 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import subprocess
 import sys
@@ -70,6 +73,8 @@ MAX_SCANNER_BYTES = 2 * 1024 * 1024
 MAX_CONTRACT_BYTES = 512 * 1024
 MAX_SCANNER_OUTPUT_BYTES = 256 * 1024
 MAX_RESULT_BYTES = 256 * 1024
+AT_FDCWD = getattr(os, "AT_FDCWD", -100)
+RENAME_NOREPLACE = 1
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 SAFE_ENV = {
     "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
@@ -347,6 +352,43 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _rename_noreplace(source: Path, destination: Path) -> bool:
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except (OSError, AttributeError) as exc:
+        raise InventoryHelperError(
+            "atomic inventory result publish is unavailable"
+        ) from exc
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    result = renameat2(
+        ctypes.c_int(AT_FDCWD),
+        os.fsencode(source),
+        ctypes.c_int(AT_FDCWD),
+        os.fsencode(destination),
+        ctypes.c_uint(RENAME_NOREPLACE),
+    )
+    if result == 0:
+        return True
+    error = ctypes.get_errno()
+    if error == errno.EEXIST:
+        return False
+    if error in {errno.ENOSYS, errno.EINVAL, errno.ENOTSUP}:
+        raise InventoryHelperError(
+            "atomic inventory result publish is unavailable"
+        ) from OSError(error, os.strerror(error))
+    raise InventoryHelperError(
+        "atomic inventory result publish failed"
+    ) from OSError(error, os.strerror(error))
 
 
 def _write_create_only(path: Path, payload: bytes, *, mode: int) -> None:
@@ -990,11 +1032,31 @@ def _validate_result(value: Any) -> dict[str, Any]:
 
 def _write_result(value: dict[str, Any]) -> None:
     _ensure_state_root()
+    _ensure_private_directory(SNAPSHOT_ROOT)
     sealed = _seal_result(value)
     payload = _canonical(sealed)
     if len(payload) > MAX_RESULT_BYTES:
         raise InventoryHelperError("inventory result exceeds size bound")
-    _write_create_only(RESULT_PATH, payload, mode=0o600)
+    temporary = RESULT_PATH.with_name(
+        f".{RESULT_PATH.name}.{os.getpid()}.{secrets.token_hex(12)}.tmp"
+    )
+    _write_create_only(temporary, payload, mode=0o600)
+    if _rename_noreplace(temporary, RESULT_PATH):
+        _fsync_directory(SNAPSHOT_ROOT)
+        return
+    existing = _read_stable_regular(
+        RESULT_PATH,
+        max_bytes=MAX_RESULT_BYTES,
+        require_root_owned=True,
+        required_mode=0o600,
+    )
+    if existing != payload:
+        raise InventoryHelperError("existing inventory result differs")
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    _fsync_directory(SNAPSHOT_ROOT)
 
 
 def _read_result() -> dict[str, Any] | None:

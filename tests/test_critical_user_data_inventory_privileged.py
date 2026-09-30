@@ -624,6 +624,83 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
         run.assert_called_once()
 
 
+    def test_write_result_publishes_complete_temp_atomically(self) -> None:
+        result = helper._unsigned_result(
+            status="failed",
+            failure_code="inventory-safety-check",
+            returncode=2,
+            stdout_sha256="0" * 64,
+            stdout_bytes=0,
+            stderr_sha256="0" * 64,
+            stderr_bytes=0,
+        )
+        sealed_payload = helper._canonical(helper._seal_result(result))
+        with (
+            mock.patch.object(helper, "_ensure_state_root"),
+            mock.patch.object(helper, "_ensure_private_directory"),
+            mock.patch.object(helper, "_write_create_only") as write_create_only,
+            mock.patch.object(helper, "_rename_noreplace", return_value=True) as rename,
+            mock.patch.object(helper, "_fsync_directory") as fsync_directory,
+        ):
+            helper._write_result(result)
+
+        temporary = write_create_only.call_args.args[0]
+        self.assertNotEqual(temporary, helper.RESULT_PATH)
+        self.assertEqual(temporary.parent, helper.RESULT_PATH.parent)
+        self.assertTrue(temporary.name.startswith(f".{helper.RESULT_PATH.name}."))
+        self.assertTrue(temporary.name.endswith(".tmp"))
+        self.assertEqual(write_create_only.call_args.args[1], sealed_payload)
+        self.assertEqual(write_create_only.call_args.kwargs, {"mode": 0o600})
+        rename.assert_called_once_with(temporary, helper.RESULT_PATH)
+        fsync_directory.assert_called_once_with(helper.SNAPSHOT_ROOT)
+
+    def test_write_result_never_replaces_existing_result(self) -> None:
+        existing = helper._unsigned_result(
+            status="failed",
+            failure_code="inventory-timeout",
+            returncode=124,
+            stdout_sha256="0" * 64,
+            stdout_bytes=0,
+            stderr_sha256="0" * 64,
+            stderr_bytes=0,
+        )
+        replacement = helper._unsigned_result(
+            status="failed",
+            failure_code="inventory-safety-check",
+            returncode=2,
+            stdout_sha256="1" * 64,
+            stdout_bytes=1,
+            stderr_sha256="2" * 64,
+            stderr_bytes=1,
+        )
+        existing_payload = helper._canonical(helper._seal_result(existing))
+        with (
+            mock.patch.object(helper, "_ensure_state_root"),
+            mock.patch.object(helper, "_ensure_private_directory"),
+            mock.patch.object(helper, "_write_create_only") as write_create_only,
+            mock.patch.object(helper, "_rename_noreplace", return_value=False) as rename,
+            mock.patch.object(
+                helper,
+                "_read_stable_regular",
+                return_value=existing_payload,
+            ) as read_existing,
+            mock.patch.object(helper, "_fsync_directory") as fsync_directory,
+        ):
+            with self.assertRaisesRegex(
+                helper.InventoryHelperError, "existing inventory result differs"
+            ):
+                helper._write_result(replacement)
+
+        temporary = write_create_only.call_args.args[0]
+        rename.assert_called_once_with(temporary, helper.RESULT_PATH)
+        read_existing.assert_called_once_with(
+            helper.RESULT_PATH,
+            max_bytes=helper.MAX_RESULT_BYTES,
+            require_root_owned=True,
+            required_mode=0o600,
+        )
+        fsync_directory.assert_not_called()
+
     def test_execute_seals_pre_scan_snapshot_failure(self) -> None:
         with (
             mock.patch.object(helper, "_lock", return_value=19),
