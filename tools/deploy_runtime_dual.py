@@ -74,6 +74,21 @@ OPERATOR_SERVICE_CONTROL_ACTION = "operator_system_service_control"
 ROOTBROKER_CUTOVER_ACTION = "operator_rootbroker_cutover"
 SECRET_PTY_ACTION = "operator_secret_pty_getpass_probe"
 PLATFORM_CONNECTOR_CAPTURE_ACTION = "platform_connector_capture"
+CRITICAL_USER_DATA_INVENTORY_ACTION = "critical_user_data_inventory"
+CRITICAL_USER_DATA_INVENTORY_READ_ACTION = "critical_user_data_inventory_read"
+CRITICAL_USER_DATA_INVENTORY_TARGET_PATTERN = (
+    r'\{"contract_sha256":"[0-9a-f]{64}",'
+    r'"operation":"start",'
+    r'"scanner_sha256":"[0-9a-f]{64}","schema_version":1\}'
+)
+CRITICAL_USER_DATA_INVENTORY_READ_TARGET_PATTERN = (
+    r'\{"contract_sha256":"[0-9a-f]{64}",'
+    r'"operation":"(?:status|result)",'
+    r'"scanner_sha256":"[0-9a-f]{64}","schema_version":1\}'
+)
+CRITICAL_USER_DATA_INVENTORY_TARGET = (
+    "/usr/local/libexec/grabowski-critical-user-data-inventory"
+)
 LOCAL_BACKUP_NTFS_CHECK_ACTION = "local_backup_ntfs_check"
 LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION = "local_backup_ntfs_clear_dirty"
 LOCAL_BACKUP_SMART_READ_ACTION = "local_backup_smart_read"
@@ -5006,6 +5021,9 @@ def require_operator_authority_anchored(
         "broker_module": Path("src/grabowski_privileged_broker.py"),
         "secret_pty_module": Path("src/grabowski_secret_pty.py"),
         "broker_wrapper": Path("tools/grabowski_privileged_broker.py"),
+        "critical_user_data_inventory": Path(
+            "tools/grabowski_critical_user_data_inventory.py"
+        ),
         "platform_connector_capture": Path("tools/grabowski_platform_connector_capture.py"),
         "cutover_helper": Path("tools/grabowski_rootbroker_cutover.py"),
         "operator_service": Path("systemd/grabowski-operator.service.example"),
@@ -5049,6 +5067,10 @@ def require_operator_authority_anchored(
     rootbroker_cutover = actions.get(ROOTBROKER_CUTOVER_ACTION)
     secret_pty = actions.get(SECRET_PTY_ACTION)
     platform_connector_capture = actions.get(PLATFORM_CONNECTOR_CAPTURE_ACTION)
+    critical_user_data_inventory = actions.get(CRITICAL_USER_DATA_INVENTORY_ACTION)
+    critical_user_data_inventory_read = actions.get(
+        CRITICAL_USER_DATA_INVENTORY_READ_ACTION
+    )
     backup_storage = {
         name: actions.get(name) for name in LOCAL_BACKUP_STORAGE_ACTIONS
     }
@@ -5060,6 +5082,8 @@ def require_operator_authority_anchored(
             rootbroker_cutover,
             secret_pty,
             platform_connector_capture,
+            critical_user_data_inventory,
+            critical_user_data_inventory_read,
         )
     ):
         core.fail(
@@ -5084,6 +5108,68 @@ def require_operator_authority_anchored(
     assert isinstance(rootbroker_cutover, dict)
     assert isinstance(secret_pty, dict)
     assert isinstance(platform_connector_capture, dict)
+    assert isinstance(critical_user_data_inventory, dict)
+    assert isinstance(critical_user_data_inventory_read, dict)
+    required_critical_user_data_inventory = {
+        "enabled",
+        "mode",
+        "target_pattern",
+        "argv",
+        "timeout_seconds",
+        "kill_switch_path",
+        "legacy_kill_switch_path",
+        "allowed_peer_unit",
+        "allowed_peer_uid",
+    }
+    if (
+        set(critical_user_data_inventory) != required_critical_user_data_inventory
+        or critical_user_data_inventory.get("enabled") is not True
+        or critical_user_data_inventory.get("mode") != "template"
+        or critical_user_data_inventory.get("target_pattern")
+        != CRITICAL_USER_DATA_INVENTORY_TARGET_PATTERN
+        or critical_user_data_inventory.get("argv")
+        != [CRITICAL_USER_DATA_INVENTORY_TARGET, "{target}"]
+        or critical_user_data_inventory.get("timeout_seconds") != 90
+        or critical_user_data_inventory.get("kill_switch_path")
+        != "/var/lib/grabowski/operator-blockade/operator-kill-switch"
+        or critical_user_data_inventory.get("legacy_kill_switch_path")
+        != "/home/alex/.local/state/grabowski/operator-kill-switch"
+        or critical_user_data_inventory.get("allowed_peer_uid") != 1000
+        or critical_user_data_inventory.get("allowed_peer_unit") != OPERATOR_SERVICE
+    ):
+        core.fail(
+            "Critical-User-Data-Inventory-Authority-Vertrag driftet",
+            phase="operator-authority-attestation",
+        )
+    required_critical_user_data_inventory_read = {
+        "enabled",
+        "mode",
+        "target_pattern",
+        "argv",
+        "timeout_seconds",
+        "allowed_peer_unit",
+        "allowed_peer_uid",
+    }
+    if (
+        set(critical_user_data_inventory_read)
+        != required_critical_user_data_inventory_read
+        or critical_user_data_inventory_read.get("enabled") is not True
+        or critical_user_data_inventory_read.get("mode") != "template"
+        or critical_user_data_inventory_read.get("target_pattern")
+        != CRITICAL_USER_DATA_INVENTORY_READ_TARGET_PATTERN
+        or critical_user_data_inventory_read.get("argv")
+        != [CRITICAL_USER_DATA_INVENTORY_TARGET, "{target}"]
+        or critical_user_data_inventory_read.get("timeout_seconds") != 90
+        or critical_user_data_inventory_read.get("allowed_peer_uid") != 1000
+        or critical_user_data_inventory_read.get("allowed_peer_unit")
+        != OPERATOR_SERVICE
+        or "kill_switch_path" in critical_user_data_inventory_read
+        or "legacy_kill_switch_path" in critical_user_data_inventory_read
+    ):
+        core.fail(
+            "Critical-User-Data-Inventory-Read-Authority-Vertrag driftet",
+            phase="operator-authority-attestation",
+        )
     expected_peer = {
         "allowed_peer_uid": lifecycle.get("allowed_peer_uid"),
         "allowed_peer_unit": lifecycle.get("allowed_peer_unit"),
@@ -5099,6 +5185,8 @@ def require_operator_authority_anchored(
         ROOTBROKER_CUTOVER_ACTION: rootbroker_cutover,
         SECRET_PTY_ACTION: secret_pty,
         PLATFORM_CONNECTOR_CAPTURE_ACTION: platform_connector_capture,
+        CRITICAL_USER_DATA_INVENTORY_ACTION: critical_user_data_inventory,
+        CRITICAL_USER_DATA_INVENTORY_READ_ACTION: critical_user_data_inventory_read,
     }
     expected_action_contracts.update(
         {
