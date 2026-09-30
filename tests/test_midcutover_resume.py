@@ -4127,6 +4127,12 @@ class GreenDrainTargetTests(unittest.TestCase):
             "active_tool_calls_by_tool_name": blocking_tools,
             "active_tool_calls_by_tool_name_truncated": False,
             "active_tool_calls_by_tool_name_omitted_call_count": 0,
+            "active_tool_calls_sample": [
+                {"tool_name": name, "drain_blocking": True}
+                for name, count in blocking_tools.items()
+                for _ in range(count)
+            ],
+            "active_tool_calls_sample_truncated": False,
         }
 
     def test_s3_retirement_allows_only_its_parent_recovery_call_on_canonical(

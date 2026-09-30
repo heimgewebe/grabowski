@@ -3241,6 +3241,13 @@ class DeploymentAdmissionTests(unittest.TestCase):
             },
             "active_tool_calls_by_tool_name_truncated": False,
             "active_tool_calls_by_tool_name_omitted_call_count": 0,
+            "active_tool_calls_sample": [
+                {
+                    "tool_name": dual.MIDCUTOVER_RECOVERY_TOOL_NAME,
+                    "drain_blocking": True,
+                }
+            ],
+            "active_tool_calls_sample_truncated": False,
         }
         with (
             mock.patch.object(
@@ -3259,6 +3266,100 @@ class DeploymentAdmissionTests(unittest.TestCase):
         self.assertEqual(2, proof["attempts"])
         self.assertEqual(1, proof["blocking_tool_calls"])
         self.assertTrue(proof["recovery_parent_allowed"])
+
+    def test_operator_admission_s3_parent_can_coexist_with_read_only_call(
+        self,
+    ) -> None:
+        observed = {
+            "active_tool_calls": 2,
+            "drain_blocking_tool_calls": 1,
+            "read_only_active_tool_calls": 1,
+            "effect_classification": dual.OPERATOR_ADMISSION_EFFECT_CLASSIFICATION,
+            "active_tool_calls_by_tool_name": {
+                dual.MIDCUTOVER_RECOVERY_TOOL_NAME: 1,
+                "grabowski_git": 1,
+            },
+            "active_tool_calls_by_tool_name_truncated": False,
+            "active_tool_calls_by_tool_name_omitted_call_count": 0,
+            "active_tool_calls_sample": [
+                {
+                    "tool_name": dual.MIDCUTOVER_RECOVERY_TOOL_NAME,
+                    "drain_blocking": True,
+                },
+                {"tool_name": "grabowski_git", "drain_blocking": False},
+            ],
+            "active_tool_calls_sample_truncated": False,
+        }
+        call_counts = dual._operator_admission_call_counts(
+            observed, phase="operator-admission-drain"
+        )
+        self.assertTrue(
+            dual._operator_admission_recovery_parent_allowed(
+                observed,
+                call_counts,
+                allow_single_recovery_parent=True,
+            )
+        )
+
+    def test_operator_admission_s3_parent_rejects_second_blocker_and_truncation(
+        self,
+    ) -> None:
+        second_blocker = {
+            "active_tool_calls": 2,
+            "drain_blocking_tool_calls": 2,
+            "read_only_active_tool_calls": 0,
+            "effect_classification": dual.OPERATOR_ADMISSION_EFFECT_CLASSIFICATION,
+            "active_tool_calls_by_tool_name": {
+                dual.MIDCUTOVER_RECOVERY_TOOL_NAME: 1,
+                "grabowski_create_text": 1,
+            },
+            "active_tool_calls_by_tool_name_truncated": False,
+            "active_tool_calls_by_tool_name_omitted_call_count": 0,
+            "active_tool_calls_sample": [
+                {
+                    "tool_name": dual.MIDCUTOVER_RECOVERY_TOOL_NAME,
+                    "drain_blocking": True,
+                },
+                {"tool_name": "grabowski_create_text", "drain_blocking": True},
+            ],
+            "active_tool_calls_sample_truncated": False,
+        }
+        counts = dual._operator_admission_call_counts(
+            second_blocker, phase="operator-admission-drain"
+        )
+        self.assertFalse(
+            dual._operator_admission_recovery_parent_allowed(
+                second_blocker,
+                counts,
+                allow_single_recovery_parent=True,
+            )
+        )
+        truncated = {
+            **second_blocker,
+            "active_tool_calls": 1,
+            "drain_blocking_tool_calls": 1,
+            "read_only_active_tool_calls": 0,
+            "active_tool_calls_by_tool_name": {
+                dual.MIDCUTOVER_RECOVERY_TOOL_NAME: 1
+            },
+            "active_tool_calls_sample": [
+                {
+                    "tool_name": dual.MIDCUTOVER_RECOVERY_TOOL_NAME,
+                    "drain_blocking": True,
+                }
+            ],
+            "active_tool_calls_sample_truncated": True,
+        }
+        counts = dual._operator_admission_call_counts(
+            truncated, phase="operator-admission-drain"
+        )
+        self.assertFalse(
+            dual._operator_admission_recovery_parent_allowed(
+                truncated,
+                counts,
+                allow_single_recovery_parent=True,
+            )
+        )
 
     def test_operator_admission_extended_timeout_preserves_failure_evidence(self) -> None:
         marker = self.marker()

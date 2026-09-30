@@ -4033,19 +4033,48 @@ def _operator_admission_recovery_parent_allowed(
     *,
     allow_single_recovery_parent: bool,
 ) -> bool:
-    """Whether one exact S3 parent recovery call may remain in flight."""
+    """Whether one exact S3 parent recovery call may remain in flight.
+
+    The aggregate blocking count is necessary but not sufficient evidence: the
+    tool-name projection includes both blocking and read-only calls.  Bind the
+    exception to the complete active-call sample as well, and prove that its one
+    and only drain-blocking entry is the recovery parent itself.  Read-only
+    calls may coexist because retirement intentionally does not wait on them.
+    """
     if not (
         allow_single_recovery_parent
         and call_counts.get("effect_aware") is True
         and call_counts.get("blocking_tool_calls") == 1
         and observed.get("active_tool_calls_by_tool_name_truncated") is False
         and observed.get("active_tool_calls_by_tool_name_omitted_call_count") == 0
+        and observed.get("active_tool_calls_sample_truncated") is False
     ):
         return False
     by_tool_name = observed.get("active_tool_calls_by_tool_name")
+    sample = observed.get("active_tool_calls_sample")
+    active_tool_calls = call_counts.get("active_tool_calls")
+    if (
+        not isinstance(by_tool_name, dict)
+        or by_tool_name.get(MIDCUTOVER_RECOVERY_TOOL_NAME) != 1
+        or not isinstance(sample, list)
+        or isinstance(active_tool_calls, bool)
+        or not isinstance(active_tool_calls, int)
+        or len(sample) != active_tool_calls
+    ):
+        return False
+    blocking_entries: list[dict[str, Any]] = []
+    for entry in sample:
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("tool_name"), str)
+            or not isinstance(entry.get("drain_blocking"), bool)
+        ):
+            return False
+        if entry["drain_blocking"]:
+            blocking_entries.append(entry)
     return bool(
-        isinstance(by_tool_name, dict)
-        and by_tool_name.get(MIDCUTOVER_RECOVERY_TOOL_NAME) == 1
+        len(blocking_entries) == 1
+        and blocking_entries[0]["tool_name"] == MIDCUTOVER_RECOVERY_TOOL_NAME
     )
 
 
