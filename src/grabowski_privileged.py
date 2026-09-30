@@ -1062,6 +1062,8 @@ def _critical_inventory_projection(
         raise RuntimeError("critical-user-data inventory response is invalid")
     kind = value.get("kind")
     status = value.get("status")
+    if not isinstance(status, str):
+        raise RuntimeError("critical-user-data inventory status is invalid")
     observed_scanner = value.get("scanner_sha256")
     observed_contract = value.get("contract_sha256")
     if observed_scanner is not None and observed_scanner != scanner_sha256:
@@ -1635,6 +1637,17 @@ def grabowski_critical_user_data_inventory(
         ambiguous_on_invalid=True,
     )
     if parsed is not None and parsed["result"]["status"] != "blocked":
+        direct_result = parsed["result"]
+        if (
+            preflight_result_sha256 is not None
+            and direct_result.get("result_sha256") == preflight_result_sha256
+        ):
+            return _critical_inventory_unknown_start(
+                scanner,
+                contract,
+                invoked,
+                readback=direct_result,
+            )
         return _critical_inventory_response(
             "start",
             scanner,

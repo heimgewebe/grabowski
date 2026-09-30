@@ -566,6 +566,86 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
             request["contract_sha256"], helper.AUTHORIZED_CONTRACT_SHA256
         )
 
+    def test_operation_lock_probe_is_nonblocking_when_writer_holds_lock(self) -> None:
+        info = mock.Mock(
+            st_mode=helper.stat.S_IFREG | 0o600,
+            st_uid=0,
+            st_nlink=1,
+        )
+        blocked = BlockingIOError(helper.errno.EAGAIN, "locked")
+        with (
+            mock.patch.object(helper.os, "open", return_value=19),
+            mock.patch.object(helper.os, "fstat", return_value=info),
+            mock.patch.object(helper.fcntl, "flock", side_effect=blocked) as flock,
+            mock.patch.object(helper.os, "close") as close,
+        ):
+            self.assertTrue(helper._operation_lock_held())
+
+        flock.assert_called_once_with(
+            19, helper.fcntl.LOCK_SH | helper.fcntl.LOCK_NB
+        )
+        close.assert_called_once_with(19)
+
+    def test_status_rereads_result_before_marking_fence_unknown(self) -> None:
+        passed = self._passed_result()
+        inactive = {
+            "LoadState": "loaded",
+            "ActiveState": "inactive",
+            "SubState": "dead",
+            "Result": "success",
+        }
+        with (
+            mock.patch.object(
+                helper, "_read_result", side_effect=[None, passed]
+            ) as read_result,
+            mock.patch.object(helper, "_unit_state", return_value=inactive),
+            mock.patch.object(helper, "_start_attempt_exists") as start_attempt,
+        ):
+            value = helper._status_payload()
+
+        self.assertEqual(value["status"], "passed")
+        self.assertEqual(value["result_sha256"], passed["result_sha256"])
+        self.assertEqual(read_result.call_count, 2)
+        start_attempt.assert_not_called()
+
+    def test_status_reports_start_dispatch_gap_as_running(self) -> None:
+        inactive = {
+            "LoadState": "loaded",
+            "ActiveState": "inactive",
+            "SubState": "dead",
+            "Result": "success",
+        }
+        with (
+            mock.patch.object(helper, "_read_result", side_effect=[None, None]),
+            mock.patch.object(helper, "_unit_state", return_value=inactive),
+            mock.patch.object(helper, "_start_attempt_exists", return_value=True),
+            mock.patch.object(helper, "_operation_lock_held", return_value=True),
+        ):
+            value = helper._status_payload()
+
+        self.assertEqual(value["status"], "running")
+        self.assertIsNone(value["result_sha256"])
+
+    def test_status_retains_unknown_for_unlocked_stale_fence(self) -> None:
+        inactive = {
+            "LoadState": "loaded",
+            "ActiveState": "inactive",
+            "SubState": "dead",
+            "Result": "success",
+        }
+        with (
+            mock.patch.object(
+                helper, "_read_result", side_effect=[None, None, None]
+            ),
+            mock.patch.object(helper, "_unit_state", return_value=inactive),
+            mock.patch.object(helper, "_start_attempt_exists", return_value=True),
+            mock.patch.object(helper, "_operation_lock_held", return_value=False),
+        ):
+            value = helper._status_payload()
+
+        self.assertEqual(value["status"], "outcome-unknown")
+        self.assertIsNone(value["result_sha256"])
+
     def test_start_archives_failed_result_before_relaunch(self) -> None:
         failed = helper._seal_result(
             helper._unsigned_result(
@@ -1251,6 +1331,175 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
                 scanner_sha256=helper.AUTHORIZED_SCANNER_SHA256,
                 contract_sha256=helper.AUTHORIZED_CONTRACT_SHA256,
             )
+
+    def test_unhashable_start_status_reconciles_without_exception(self) -> None:
+        status = {
+            "schema_version": 1,
+            "kind": "grabowski.critical_user_data_inventory_status.v1",
+            "status": "not-started",
+            "scanner_sha256": helper.AUTHORIZED_SCANNER_SHA256,
+            "contract_sha256": helper.AUTHORIZED_CONTRACT_SHA256,
+            "unit": "inventory.service",
+            "unit_state": {
+                "load": "not-found",
+                "active": "inactive",
+                "sub": "dead",
+                "result": "success",
+            },
+            "result_sha256": None,
+        }
+        malformed = {**status, "status": []}
+        unresolved = {**status, "status": "outcome-unknown"}
+
+        def invoked(request_id: str, payload: dict[str, object]) -> dict[str, object]:
+            return {
+                "request_id": request_id,
+                "reference_sha256": "1" * 64,
+                "broker_client_timed_out": False,
+                "broker_response": {
+                    "returncode": 0,
+                    "timed_out": False,
+                    "stdout": json.dumps(payload),
+                },
+            }
+
+        with (
+            mock.patch.object(
+                privileged,
+                "_invoke_privileged_reference",
+                side_effect=[
+                    invoked("pre-unhashable-start", status),
+                    invoked("start-unhashable", malformed),
+                    invoked("status-after-unhashable", unresolved),
+                ],
+            ),
+            mock.patch.object(
+                privileged.operator, "_require_operator_mutation", return_value=None
+            ),
+        ):
+            value = privileged.grabowski_critical_user_data_inventory(
+                "start",
+                helper.AUTHORIZED_SCANNER_SHA256,
+                helper.AUTHORIZED_CONTRACT_SHA256,
+            )
+
+        self.assertEqual(value["outcome"], "outcome_unknown")
+        self.assertTrue(value["readback_required"])
+        self.assertFalse(value["retry_safe"])
+        self.assertEqual(value["request_id"], "start-unhashable")
+
+    def test_unhashable_reconciliation_status_stays_unknown(self) -> None:
+        status = {
+            "schema_version": 1,
+            "kind": "grabowski.critical_user_data_inventory_status.v1",
+            "status": "not-started",
+            "scanner_sha256": helper.AUTHORIZED_SCANNER_SHA256,
+            "contract_sha256": helper.AUTHORIZED_CONTRACT_SHA256,
+            "unit": "inventory.service",
+            "unit_state": {
+                "load": "not-found",
+                "active": "inactive",
+                "sub": "dead",
+                "result": "success",
+            },
+            "result_sha256": None,
+        }
+        malformed = {**status, "status": []}
+
+        def invoked(
+            request_id: str,
+            payload: dict[str, object] | None = None,
+            *,
+            timed_out: bool = False,
+        ) -> dict[str, object]:
+            outer: dict[str, object] = {
+                "returncode": 124 if timed_out else 0,
+                "timed_out": timed_out,
+                "stdout": "" if payload is None else json.dumps(payload),
+            }
+            return {
+                "request_id": request_id,
+                "reference_sha256": "2" * 64,
+                "broker_client_timed_out": False,
+                "broker_response": outer,
+            }
+
+        with (
+            mock.patch.object(
+                privileged,
+                "_invoke_privileged_reference",
+                side_effect=[
+                    invoked("pre-unhashable-readback", status),
+                    invoked("start-timeout-unhashable", timed_out=True),
+                    invoked("status-unhashable", malformed),
+                ],
+            ),
+            mock.patch.object(
+                privileged.operator, "_require_operator_mutation", return_value=None
+            ),
+        ):
+            value = privileged.grabowski_critical_user_data_inventory(
+                "start",
+                helper.AUTHORIZED_SCANNER_SHA256,
+                helper.AUTHORIZED_CONTRACT_SHA256,
+            )
+
+        self.assertEqual(value["outcome"], "outcome_unknown")
+        self.assertTrue(value["readback_required"])
+        self.assertFalse(value["retry_safe"])
+        self.assertEqual(value["request_id"], "start-timeout-unhashable")
+
+    def test_preflight_failed_same_direct_result_stays_unknown(self) -> None:
+        old_sha = "a" * 64
+        failed_status = {
+            "broker_returncode": 0,
+            "result": {
+                "schema_version": 1,
+                "kind": "grabowski.critical_user_data_inventory_status.v1",
+                "status": "failed",
+                "scanner_sha256": helper.AUTHORIZED_SCANNER_SHA256,
+                "contract_sha256": helper.AUTHORIZED_CONTRACT_SHA256,
+                "unit": "inventory.service",
+                "unit_state": {
+                    "load": "loaded",
+                    "active": "inactive",
+                    "sub": "dead",
+                    "result": "failed",
+                },
+                "result_sha256": old_sha,
+            },
+        }
+        broker_call = mock.Mock(
+            side_effect=[
+                (
+                    {"request_id": "pre-direct-old", "reference_sha256": "3" * 64},
+                    failed_status,
+                ),
+                (
+                    {"request_id": "start-direct-old", "reference_sha256": "4" * 64},
+                    failed_status,
+                ),
+            ]
+        )
+        with (
+            mock.patch.object(
+                privileged, "_critical_inventory_broker_call", broker_call
+            ),
+            mock.patch.object(
+                privileged.operator, "_require_operator_mutation", return_value=None
+            ),
+        ):
+            value = privileged.grabowski_critical_user_data_inventory(
+                "start",
+                helper.AUTHORIZED_SCANNER_SHA256,
+                helper.AUTHORIZED_CONTRACT_SHA256,
+            )
+
+        self.assertEqual(value["outcome"], "outcome_unknown")
+        self.assertTrue(value["readback_required"])
+        self.assertFalse(value["retry_safe"])
+        self.assertEqual(value["readback"]["result_sha256"], old_sha)
+        self.assertEqual(broker_call.call_count, 2)
 
     def test_preflight_failed_same_result_after_ambiguous_start_stays_unknown(self) -> None:
         old_sha = "a" * 64

@@ -1208,6 +1208,37 @@ def _lock(*, require_source_backing: bool = True) -> int:
     return descriptor
 
 
+def _operation_lock_held() -> bool:
+    try:
+        descriptor = os.open(
+            LOCK_PATH,
+            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except FileNotFoundError:
+        return False
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != 0
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_nlink != 1
+        ):
+            raise InventoryHelperError("inventory lock is unsafe")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                return True
+            raise InventoryHelperError(
+                "inventory lock state is unavailable"
+            ) from exc
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(descriptor)
+
+
 def _public_result(value: dict[str, Any]) -> dict[str, Any]:
     return _validate_result(value)
 
@@ -1215,14 +1246,33 @@ def _public_result(value: dict[str, Any]) -> dict[str, Any]:
 def _status_payload() -> dict[str, Any]:
     result = _read_result()
     unit = _unit_state()
+    if result is None and unit["ActiveState"] != "active":
+        result = _read_result()
     if result is not None:
         status = str(result["status"])
     elif unit["ActiveState"] == "active":
         status = "running"
-    elif _start_attempt_exists():
-        status = "outcome-unknown"
     else:
-        status = "not-started"
+        start_attempt = _start_attempt_exists()
+        if start_attempt and _operation_lock_held():
+            status = "running"
+        else:
+            # Close both publication and start/worker hand-off races without
+            # ever waiting on the operation lock. A genuinely stale fence is
+            # reported outcome-unknown only after fresh terminal readback.
+            unit = _unit_state()
+            result = _read_result()
+            if result is not None:
+                status = str(result["status"])
+            elif unit["ActiveState"] == "active":
+                status = "running"
+            elif start_attempt and _start_attempt_exists():
+                status = "outcome-unknown"
+            else:
+                result = _read_result()
+                status = (
+                    str(result["status"]) if result is not None else "not-started"
+                )
     return {
         "schema_version": SCHEMA_VERSION,
         "kind": "grabowski.critical_user_data_inventory_status.v1",
