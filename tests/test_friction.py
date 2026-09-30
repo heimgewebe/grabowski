@@ -617,13 +617,31 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         self.assertEqual(probe["transport_error_count"], 1)
         self.assertEqual(probe["http_status_counts"], {"502": 1})
         self.assertEqual(probe["activity_counts"], {"forwarded_to_mcp": 1})
+        self.assertEqual(
+            probe["response_delivery"]["evidence_state"],
+            "forwarded_without_visible_terminal_delivery",
+        )
+        self.assertEqual(probe["response_delivery"]["terminal_delivery_count"], 0)
         self.assertEqual(probe["window_state"], "errors_without_later_activity")
         self.assertEqual(probe["post_error_activity_counts"], {})
         self.assertEqual(diagnostics["transport_window_state"], "errors_without_later_activity")
         self.assertEqual(diagnostics["transport_health_state"], "unavailable_suspected")
         self.assertTrue(diagnostics["transport_degraded"])
         self.assertEqual(diagnostics["planned_lifecycle_issue_count"], 0)
+        self.assertEqual(
+            diagnostics["response_delivery"]["evidence_state"],
+            "forwarded_without_visible_terminal_delivery",
+        )
+        self.assertEqual(
+            diagnostics["response_delivery"]["visibility_semantics"],
+            "normal_success_delivery_may_not_be_emitted_at_the_configured_log_level",
+        )
+        self.assertIn(
+            "outer_chat_message_stream_delivery",
+            diagnostics["response_delivery"]["does_not_establish"],
+        )
         self.assertIn("command_success_or_failure", diagnostics["does_not_establish"])
+        self.assertIn("outer_chat_message_stream_delivery", diagnostics["does_not_establish"])
         self.assertIn("target state is re-read", diagnostics["recommended_next_policy"]["mutation_rule"])
         rendered = json.dumps(diagnostics, sort_keys=True)
         self.assertNotIn("host python[1]", rendered)
@@ -902,11 +920,9 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
                     probe["window_state"], "errors_without_later_activity"
                 )
 
-    def test_connector_transport_event_hashes_identity_only_for_lifecycle_signals(self) -> None:
+    def test_connector_transport_event_hashes_identity_for_correlatable_activity(self) -> None:
         module = self._load_module()
-        module._connector_request_identity_sha256 = lambda payload: self.fail(
-            "non-lifecycle journal record must not hash request identity"
-        )
+        module._connector_request_identity_sha256 = lambda payload: "a" * 64
         record = {
             "__REALTIME_TIMESTAMP": "100",
             "MESSAGE": json.dumps({
@@ -922,7 +938,67 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
 
         self.assertEqual(event["activity"], "forwarded_to_mcp")
         self.assertIsNone(event["response_lifecycle_signal"])
-        self.assertIsNone(event["request_identity_sha256"])
+        self.assertEqual(event["request_identity_sha256"], "a" * 64)
+
+    def test_connector_transport_probe_correlates_forwarding_with_terminal_delivery(self) -> None:
+        module = self._load_module()
+        request_id = "wfr_sensitive_delivery/abcd"
+        records = [
+            {
+                "__REALTIME_TIMESTAMP": "100",
+                "MESSAGE": json.dumps({
+                    "time": "2026-09-30T07:00:00+02:00",
+                    "level": "INFO",
+                    "component": "dispatcher",
+                    "msg": "dispatcher forwarded command to MCP server",
+                    "cmd_request_id": request_id,
+                    "rpc_request_id": 4,
+                }),
+            },
+            {
+                "__REALTIME_TIMESTAMP": "110",
+                "MESSAGE": json.dumps({
+                    "time": "2026-09-30T07:00:01+02:00",
+                    "level": "DEBUG",
+                    "component": "dispatcher",
+                    "msg": "dispatcher delivered response to control plane",
+                    "cmd_request_id": request_id,
+                    "rpc_request_id": 4,
+                }),
+            },
+        ]
+        module._run_diagnostic_command = lambda *args, **kwargs: {
+            "returncode": 0,
+            "timed_out": False,
+            "stdout": "".join(json.dumps(record) + "\n" for record in records),
+            "stderr": "",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+        }
+
+        probe = module._journal_transport_probe("tunnel-client-grabowski.service", 25)
+
+        self.assertEqual(probe["transport_error_count"], 0)
+        self.assertEqual(probe["window_state"], "no_errors")
+        self.assertEqual(
+            probe["activity_counts"],
+            {"forwarded_to_mcp": 1, "terminal_response_delivered": 1},
+        )
+        delivery = probe["response_delivery"]
+        self.assertEqual(delivery["evidence_state"], "terminal_delivery_observed")
+        self.assertEqual(delivery["terminal_delivery_count"], 1)
+        self.assertEqual(
+            delivery["classification_counts"],
+            {"terminal_response_delivered": 1},
+        )
+        self.assertEqual(delivery["affected_request_identity_count"], 1)
+        self.assertEqual(delivery["matched_forwarding_request_identity_count"], 1)
+        self.assertEqual(
+            delivery["forwarded_without_visible_delivery_request_identity_count"], 0
+        )
+        self.assertEqual(delivery["samples"][0]["level"], "DEBUG")
+        self.assertIn("outer_chat_message_stream_delivery", delivery["does_not_establish"])
+        self.assertNotIn(request_id, json.dumps(probe, sort_keys=True))
 
     def test_connector_transport_probe_correlates_ttl_with_late_response(self) -> None:
         module = self._load_module()

@@ -451,7 +451,15 @@ CONNECTOR_HTTP_STATUS_KEYS = (
 CONNECTOR_ACTIVITY_MESSAGES = {
     "dispatcher forwarded command to MCP server": "forwarded_to_mcp",
     "dispatcher acknowledged notification with control plane": "control_plane_ack",
+    "dispatcher delivered response to control plane": "terminal_response_delivered",
+    "dispatcher delivered preserved MCP error response to control plane": "terminal_response_delivered",
+    "dispatcher posted terminal downstream error response to control plane": "terminal_response_delivered",
+    "dispatcher received MCP upstream error; posted error response to control plane": "terminal_response_delivered",
+    "dispatcher failed to connect to MCP transport; posted error response to control plane": "terminal_response_delivered",
 }
+CONNECTOR_TERMINAL_DELIVERY_ACTIVITIES = frozenset({
+    "terminal_response_delivered",
+})
 CONNECTOR_RESPONSE_LIFECYCLE_MESSAGES = {
     "MCP connection TTL reached; stopping response forwarding": "response_ttl_expired",
     "response already fulfilled or unknown request": "response_already_fulfilled_or_unknown",
@@ -497,6 +505,8 @@ CONNECTOR_TRANSPORT_DOES_NOT_ESTABLISH = (
     "connector_vendor_fix",
     "runtime_policy_change",
     "command_success_or_failure",
+    "outer_chat_message_stream_delivery",
+    "client_render_delivery",
     "safe_mutation_retry",
     "transport_reliability_proof",
 )
@@ -1080,7 +1090,7 @@ def _journal_transport_event(
     response_lifecycle_signal = CONNECTOR_RESPONSE_LIFECYCLE_MESSAGES.get(message)
     request_identity_sha256 = (
         _connector_request_identity_sha256(payload)
-        if response_lifecycle_signal is not None
+        if response_lifecycle_signal is not None or activity is not None
         else None
     )
     return {
@@ -1271,6 +1281,10 @@ def _journal_transport_probe(unit: str, max_lines: int) -> dict[str, Any]:
     response_lifecycle_samples: list[dict[str, Any]] = []
     response_lifecycle_counts: Counter[str] = Counter()
     response_request_identities: set[str] = set()
+    terminal_delivery_counts: Counter[str] = Counter()
+    terminal_delivery_samples: list[dict[str, Any]] = []
+    forwarded_request_identities: set[str] = set()
+    terminal_delivery_request_identities: set[str] = set()
     transport_error_count = 0
     planned_lifecycle_issue_count = 0
     last_transport_error_microseconds: int | None = None
@@ -1338,8 +1352,25 @@ def _journal_transport_probe(unit: str, max_lines: int) -> dict[str, Any]:
                 })
         event["error_domains"] = sorted(domains)
         if event["activity"]:
-            activity_counts[event["activity"]] += 1
-            activity_events.append((event["realtime_microseconds"], event["activity"]))
+            activity = event["activity"]
+            activity_counts[activity] += 1
+            activity_events.append((event["realtime_microseconds"], activity))
+            if request_identity:
+                if activity == "forwarded_to_mcp":
+                    forwarded_request_identities.add(request_identity)
+                if activity in CONNECTOR_TERMINAL_DELIVERY_ACTIVITIES:
+                    terminal_delivery_request_identities.add(request_identity)
+            if activity in CONNECTOR_TERMINAL_DELIVERY_ACTIVITIES:
+                terminal_delivery_counts[activity] += 1
+                if len(terminal_delivery_samples) < CONNECTOR_DIAGNOSTIC_SAMPLE_LIMIT:
+                    terminal_delivery_samples.append({
+                        "timestamp": event["timestamp"],
+                        "invocation_id": event["invocation_id"],
+                        "level": event["level"],
+                        "component": event["component"],
+                        "classification": activity,
+                        "request_identity_sha256": request_identity,
+                    })
         if event["planned_lifecycle_issue"]:
             planned_lifecycle_issue_count += 1
             for domain in event["error_domains"]:
@@ -1383,6 +1414,19 @@ def _journal_transport_probe(unit: str, max_lines: int) -> dict[str, Any]:
         for timestamp, activity in activity_events:
             if timestamp is not None and timestamp > last_transport_error_microseconds:
                 post_error_activity_counts[activity] += 1
+    matched_delivery_request_identities = (
+        forwarded_request_identities & terminal_delivery_request_identities
+    )
+    forwarded_without_visible_delivery_request_identities = (
+        forwarded_request_identities - terminal_delivery_request_identities
+    )
+    terminal_delivery_count = sum(terminal_delivery_counts.values())
+    if terminal_delivery_count > 0:
+        delivery_evidence_state = "terminal_delivery_observed"
+    elif activity_counts["forwarded_to_mcp"] > 0:
+        delivery_evidence_state = "forwarded_without_visible_terminal_delivery"
+    else:
+        delivery_evidence_state = "no_recent_command_activity"
     journal_window_complete = bool(
         result["returncode"] == 0
         and not result["timed_out"]
@@ -1444,6 +1488,30 @@ def _journal_transport_probe(unit: str, max_lines: int) -> dict[str, Any]:
         "planned_lifecycle_samples_truncated": (
             planned_lifecycle_issue_count > len(planned_lifecycle_samples)
         ),
+        "response_delivery": {
+            "schema_version": 1,
+            "evidence_state": delivery_evidence_state,
+            "terminal_delivery_count": terminal_delivery_count,
+            "classification_counts": dict(sorted(terminal_delivery_counts.items())),
+            "affected_request_identity_count": len(terminal_delivery_request_identities),
+            "matched_forwarding_request_identity_count": len(
+                matched_delivery_request_identities
+            ),
+            "forwarded_without_visible_delivery_request_identity_count": len(
+                forwarded_without_visible_delivery_request_identities
+            ),
+            "samples": terminal_delivery_samples,
+            "samples_truncated": terminal_delivery_count > len(terminal_delivery_samples),
+            "absence_semantics": (
+                "absence_of_terminal_delivery_evidence_is_not_terminal_delivery_failure"
+            ),
+            "does_not_establish": [
+                "command_application_success",
+                "terminal_delivery_failure_from_absence",
+                "outer_chat_message_stream_delivery",
+                "client_render_delivery",
+            ],
+        },
         "response_lifecycle": {
             "schema_version": 1,
             "classification_counts": dict(sorted(response_lifecycle_counts.items())),
@@ -1571,6 +1639,32 @@ def connector_transport_live_diagnostics(
                 else "indeterminate_incomplete"
             )
 
+    response_delivery_counts: Counter[str] = Counter()
+    response_delivery_units: list[str] = []
+    response_delivery_matched_request_identities = 0
+    response_delivery_unpaired_forwarding_request_identities = 0
+    forwarded_activity_count = 0
+    for unit, probe in journal_probes.items():
+        delivery = probe["response_delivery"]
+        response_delivery_counts.update(delivery["classification_counts"])
+        response_delivery_matched_request_identities += delivery[
+            "matched_forwarding_request_identity_count"
+        ]
+        response_delivery_unpaired_forwarding_request_identities += delivery[
+            "forwarded_without_visible_delivery_request_identity_count"
+        ]
+        forwarded_activity_count += probe["activity_counts"].get("forwarded_to_mcp", 0)
+        if delivery["terminal_delivery_count"] > 0:
+            response_delivery_units.append(unit)
+
+    terminal_delivery_count = sum(response_delivery_counts.values())
+    if terminal_delivery_count > 0:
+        response_delivery_evidence_state = "terminal_delivery_observed"
+    elif forwarded_activity_count > 0:
+        response_delivery_evidence_state = "forwarded_without_visible_terminal_delivery"
+    else:
+        response_delivery_evidence_state = "no_recent_command_activity"
+
     response_lifecycle_counts: Counter[str] = Counter()
     response_lifecycle_units: list[str] = []
     for unit, probe in journal_probes.items():
@@ -1649,6 +1743,33 @@ def connector_transport_live_diagnostics(
         "transport_window_state_by_unit": window_states,
         "post_error_activity_counts": dict(sorted(post_error_activity_counts.items())),
         "planned_lifecycle_issue_count": planned_lifecycle_issue_count,
+        "response_delivery": {
+            "schema_version": 1,
+            "evidence_state": response_delivery_evidence_state,
+            "terminal_delivery_count": terminal_delivery_count,
+            "classification_counts": dict(sorted(response_delivery_counts.items())),
+            "units_with_terminal_delivery": sorted(response_delivery_units),
+            "matched_forwarding_request_identity_count": (
+                response_delivery_matched_request_identities
+            ),
+            "forwarded_without_visible_delivery_request_identity_count": (
+                response_delivery_unpaired_forwarding_request_identities
+            ),
+            "normal_success_event": "dispatcher delivered response to control plane",
+            "visibility_semantics": (
+                "normal_success_delivery_may_not_be_emitted_at_the_configured_log_level"
+            ),
+            "absence_semantics": (
+                "absence_of_terminal_delivery_evidence_is_not_terminal_delivery_failure"
+            ),
+            "does_not_establish": [
+                "command_application_success",
+                "terminal_delivery_failure_from_absence",
+                "outer_chat_message_stream_delivery",
+                "client_render_delivery",
+                "transport_reliability_proof",
+            ],
+        },
         "response_lifecycle": {
             "schema_version": 1,
             "classification_counts": dict(sorted(response_lifecycle_counts.items())),
