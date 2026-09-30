@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date, datetime
 import importlib.util
 import json
 import os
@@ -28,6 +29,18 @@ gate = _load_tool("pr_review_gate.py")
 
 
 class ClaudeModelPinningTests(unittest.TestCase):
+    def test_catalog_snapshot_covers_recorded_alias_observations(self) -> None:
+        catalog = json.loads((ROOT / "config/coding-agent-catalog.json").read_text())
+        snapshot_date = date.fromisoformat(catalog["observed_at"])
+        for name, model in catalog["models"].items():
+            observed_at = model.get("alias_resolution_observed_at")
+            if observed_at is not None:
+                with self.subTest(model=name):
+                    observation_date = datetime.fromisoformat(
+                        observed_at.replace("Z", "+00:00")
+                    ).date()
+                    self.assertGreaterEqual(snapshot_date, observation_date)
+
     def _command(self) -> list[str]:
         # Construct argv only: no provider execution or real budget change.
         with mock.patch.dict(
