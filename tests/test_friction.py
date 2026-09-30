@@ -1088,6 +1088,75 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         self.assertIn("outer_chat_message_stream_delivery", delivery["does_not_establish"])
         self.assertNotIn(request_id, json.dumps(probe, sort_keys=True))
 
+    def test_connector_transport_probe_terminal_error_delivery_is_not_recovery_activity(
+        self,
+    ) -> None:
+        module = self._load_module()
+        terminal_error_messages = (
+            "dispatcher delivered preserved MCP error response to control plane",
+            "dispatcher posted terminal downstream error response to control plane",
+            "dispatcher received MCP upstream error; posted error response to control plane",
+            "dispatcher failed to connect to MCP transport; posted error response to control plane",
+        )
+        for terminal_message in terminal_error_messages:
+            with self.subTest(terminal_message=terminal_message):
+                request_id = "wfr_terminal_error_delivery/abcd"
+                records = [
+                    {
+                        "__REALTIME_TIMESTAMP": "100",
+                        "MESSAGE": json.dumps({
+                            "level": "ERROR",
+                            "component": "dispatcher",
+                            "msg": "Received exception from stream: 502 upstream/external service error",
+                            "cmd_request_id": request_id,
+                            "rpc_request_id": 4,
+                        }),
+                    },
+                    {
+                        "__REALTIME_TIMESTAMP": "110",
+                        "MESSAGE": json.dumps({
+                            "level": "ERROR",
+                            "component": "dispatcher",
+                            "msg": terminal_message,
+                            "cmd_request_id": request_id,
+                            "rpc_request_id": 4,
+                        }),
+                    },
+                ]
+                module._run_diagnostic_command = lambda *args, **kwargs: {
+                    "returncode": 0,
+                    "timed_out": False,
+                    "stdout": "".join(
+                        json.dumps(record) + "\n" for record in records
+                    ),
+                    "stderr": "",
+                    "stdout_truncated": False,
+                    "stderr_truncated": False,
+                }
+
+                probe = module._journal_transport_probe(
+                    "tunnel-client-grabowski.service", 25
+                )
+
+                self.assertEqual(probe["transport_error_count"], 1)
+                self.assertEqual(
+                    probe["window_state"], "errors_without_later_activity"
+                )
+                self.assertEqual(
+                    probe["transport_health_state"], "unavailable_suspected"
+                )
+                self.assertEqual(probe["post_error_activity_counts"], {})
+                self.assertEqual(
+                    probe["activity_counts"], {"terminal_response_delivered": 1}
+                )
+                self.assertEqual(
+                    probe["response_delivery"]["evidence_state"],
+                    "terminal_delivery_observed",
+                )
+                self.assertEqual(
+                    probe["response_delivery"]["terminal_delivery_count"], 1
+                )
+
     def test_connector_transport_probe_correlates_ttl_with_late_response(self) -> None:
         module = self._load_module()
         request_id = "wfr_sensitive_request/abcd"

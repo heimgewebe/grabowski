@@ -457,6 +457,12 @@ CONNECTOR_ACTIVITY_MESSAGES = {
     "dispatcher received MCP upstream error; posted error response to control plane": "terminal_response_delivered",
     "dispatcher failed to connect to MCP transport; posted error response to control plane": "terminal_response_delivered",
 }
+CONNECTOR_TERMINAL_ERROR_DELIVERY_MESSAGES = frozenset({
+    "dispatcher delivered preserved MCP error response to control plane",
+    "dispatcher posted terminal downstream error response to control plane",
+    "dispatcher received MCP upstream error; posted error response to control plane",
+    "dispatcher failed to connect to MCP transport; posted error response to control plane",
+})
 CONNECTOR_TERMINAL_DELIVERY_ACTIVITIES = frozenset({
     "terminal_response_delivered",
 })
@@ -1087,6 +1093,9 @@ def _journal_transport_event(
         and realtime_microseconds <= completed_stop_at
     )
     activity = CONNECTOR_ACTIVITY_MESSAGES.get(message)
+    transport_recovery_activity = (
+        None if message in CONNECTOR_TERMINAL_ERROR_DELIVERY_MESSAGES else activity
+    )
     response_lifecycle_signal = CONNECTOR_RESPONSE_LIFECYCLE_MESSAGES.get(message)
     request_identity_sha256 = (
         _connector_request_identity_sha256(payload)
@@ -1102,6 +1111,7 @@ def _journal_transport_event(
         "http_statuses": statuses,
         "error_domains": sorted(domains),
         "activity": activity,
+        "transport_recovery_activity": transport_recovery_activity,
         "planned_lifecycle_issue": planned_lifecycle_issue,
         "response_lifecycle_signal": response_lifecycle_signal,
         "request_identity_sha256": request_identity_sha256,
@@ -1354,7 +1364,11 @@ def _journal_transport_probe(unit: str, max_lines: int) -> dict[str, Any]:
         if event["activity"]:
             activity = event["activity"]
             activity_counts[activity] += 1
-            activity_events.append((event["realtime_microseconds"], activity))
+            recovery_activity = event["transport_recovery_activity"]
+            if recovery_activity:
+                activity_events.append(
+                    (event["realtime_microseconds"], recovery_activity)
+                )
             if request_identity:
                 if activity == "forwarded_to_mcp":
                     forwarded_request_identities.add(request_identity)
