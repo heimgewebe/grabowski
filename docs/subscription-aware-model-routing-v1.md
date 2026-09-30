@@ -19,12 +19,12 @@ Codex has a dedicated `codex-sol-review-high` route in addition to its contrast 
 
 ## Verified subscription baselines
 
-Baseline observations are from 2026-07-29; xAI model discovery was refreshed on 2026-08-22:
+The subscription baseline observations date from 2026-07-29; xAI model discovery was refreshed on 2026-08-22. The catalog snapshot dated 2026-09-29 incorporates the recorded Claude Opus 5.5 exact-model and alias-resolution evidence from that day. This scoped Claude refresh does not re-date the other providers’ entitlement or quota observations:
 
 | Provider | Canonical local plan label | Live evidence | Included routing surface | Excluded cost surfaces |
 | --- | --- | --- | --- | --- |
 | OpenAI | ChatGPT Pro | owner assertion; `codex login status` reports ChatGPT login; `gpt-5.6-sol` xhigh smoke passed | Codex CLI review and contrast | OpenAI API, purchased Codex credits |
-| Anthropic | Claude Pro | `claude auth status` reports `subscriptionType: pro`; Sonnet 5 and Opus 5 smokes passed | Claude Code review and contrast | Anthropic API, usage credits |
+| Anthropic | Claude Pro | `claude auth status` reports `subscriptionType: pro`; Sonnet 5 and Opus 5 smokes passed; recorded Opus 5.5 exact-model and alias evidence refreshed on 2026-09-29 | Claude Code review and contrast | Anthropic API, usage credits |
 | Google | Google AI subscription | owner assertion; Antigravity `gemini-3.1-pro-high` smoke passed | Antigravity and Jules baseline | Vertex AI API, Google AI Studio API, purchased AI credits |
 | xAI | SuperGrok | Grok authentication reports `subscription_tier: SuperGrok`; authenticated `grok models` readback exposes `grok-4.6` | Grok Build review and contrast | xAI API, extra usage credits, pay-as-you-go overage |
 
