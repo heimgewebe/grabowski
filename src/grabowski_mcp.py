@@ -8526,7 +8526,7 @@ def _repoground_manifest_snapshot_provenance(
     commit = (
         fallback.get("git_commit") or fallback.get("commit") or fallback.get("head")
     )
-    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", commit):
+    if not isinstance(commit, str) or not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", commit):
         return {
             "available": False,
             "reason": "snapshot_repository_commit_absent",
@@ -10262,6 +10262,7 @@ def _repoground_agent_freshness_admission_error(
     elif (
         freshness_status == _REPOGROUND_EXACT_AGENT_FRESHNESS[0]
         and freshness_identity == _REPOGROUND_EXACT_AGENT_FRESHNESS[1]
+        and bundle_dirty is False
     ):
         return None
 
@@ -12390,7 +12391,7 @@ def _repoground_working_repo(
 
 def _repoground_resolve_commit(repo_path: Path, revision: str) -> str:
     rc, out, _err = _repoground_git(repo_path, ["rev-parse", "--verify", f"{revision}^{{commit}}"])
-    if rc != 0 or not re.fullmatch(r"[a-f0-9]{40}", out):
+    if rc != 0 or re.fullmatch(r"(?:[a-f0-9]{40}|[a-f0-9]{64})", out) is None:
         raise ValueError(f"Git revision could not be resolved: {revision}")
     return out
 

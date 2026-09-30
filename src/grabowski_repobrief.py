@@ -271,7 +271,7 @@ def _determine_candidates(
 
 
 def _snapshot_repository_matches(
-    item: dict[str, Any], repo_segment: str
+    item: dict[str, Any], repo_segment: str, ref: str
 ) -> bool:
     for candidate in (
         item.get("repo"),
@@ -284,8 +284,8 @@ def _snapshot_repository_matches(
         value = candidate.strip().removesuffix(".git")
         if value == repo_segment or value.endswith(f"/{repo_segment}"):
             return True
-        parts = value.split("__")
-        if len(parts) >= 2 and parts[1] == repo_segment:
+        canonical_identity = value.split("--", 1)[0]
+        if canonical_identity.endswith(f"__{repo_segment}__{ref}"):
             return True
     return False
 
@@ -336,7 +336,7 @@ def _process_manifest_candidate(
     matching_repositories = [
         item
         for item in repositories
-        if _snapshot_repository_matches(item, repo_segment)
+        if _snapshot_repository_matches(item, repo_segment, ref)
     ]
     snapshot_repository = (
         matching_repositories[0] if len(matching_repositories) == 1 else None
@@ -356,6 +356,11 @@ def _process_manifest_candidate(
         if snapshot_repository is not None
         else None
     )
+    snapshot_dirty = (
+        snapshot_repository.get("git_dirty")
+        if snapshot_repository is not None
+        else None
+    )
     freshness = _freshness_status(snapshot_commit, orientation.get("head"))
     does_not_establish = manifest.get("does_not_establish")
     if does_not_establish is None:
@@ -371,6 +376,7 @@ def _process_manifest_candidate(
         "bundle_manifest_path": bundle_path,
         "generated_at": manifest.get("created_at") or manifest.get("generatedAt"),
         "snapshot_commit": snapshot_commit,
+        "snapshot_dirty": snapshot_dirty,
         "current_head_matches_snapshot": freshness == "fresh",
         "freshness_status": freshness,
         "agent_reading_pack_path": agent_reading_pack,

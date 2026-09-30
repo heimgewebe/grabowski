@@ -2315,6 +2315,7 @@ def _repo_orient_admit_repoground_context(
     source_status = str(context.get("status") or "unknown")
     source_freshness = str(context.get("freshness_status") or "unknown")
     dirty = orientation.get("dirty") is True
+    snapshot_dirty = context.get("snapshot_dirty")
     exact_identity = (
         target_revision is not None
         and snapshot_commit is not None
@@ -2323,6 +2324,7 @@ def _repo_orient_admit_repoground_context(
     exact = (
         context.get("available") is True
         and not dirty
+        and snapshot_dirty is False
         and exact_identity
         and source_freshness in _REPOGROUND_EXACT_FRESHNESS
     )
@@ -2362,6 +2364,13 @@ def _repo_orient_admit_repoground_context(
     elif not exact_identity:
         status = "stale"
         reason = "snapshot_commit_does_not_match_target_revision"
+    elif snapshot_dirty is not False:
+        status = "dirty_overlay" if snapshot_dirty is True else "unknown"
+        reason = (
+            "repoground_snapshot_is_dirty"
+            if snapshot_dirty is True
+            else "repoground_snapshot_cleanliness_unproven"
+        )
     else:
         status = "unknown"
         reason = "repoground_freshness_not_exact"
@@ -2380,6 +2389,7 @@ def _repo_orient_admit_repoground_context(
         "ref": context.get("ref"),
         "target_revision": target_revision,
         "snapshot_commit": snapshot_commit,
+        "snapshot_dirty": snapshot_dirty,
         "current_head_matches_snapshot": exact_identity,
         "admission": "withheld",
         "source_status": source_status,
@@ -2399,6 +2409,7 @@ def _repo_orient_admit_repoground_context(
         "does_not_establish": [
             "repoground_context_available",
             "dirty_worktree_identity",
+            "snapshot_cleanliness",
             "targeted_build_success",
             "live_fallback_completed",
         ],

@@ -72,6 +72,7 @@ def _freshness(
 
 def test_agent_freshness_admission_accepts_only_exact() -> None:
     exact = _freshness("fresh", "fresh_exact")
+    exact["bundle"] = {"git_dirty": False}
     assert (
         mcp._repoground_agent_freshness_admission_error(
             "heimgewebe/demo",
@@ -80,6 +81,15 @@ def test_agent_freshness_admission_accepts_only_exact() -> None:
         )
         is None
     )
+
+    unknown_cleanliness = _freshness("fresh", "fresh_exact")
+    refused_unknown = mcp._repoground_agent_freshness_admission_error(
+        "heimgewebe/demo",
+        "demo-stem",
+        unknown_cleanliness,
+    )
+    assert refused_unknown is not None
+    assert refused_unknown["reason"] == "freshness_unverified"
 
     nonexact = [
         (_freshness("stale", "stale_head"), "stale_context_refused"),
@@ -110,6 +120,72 @@ def test_agent_freshness_admission_accepts_only_exact() -> None:
             "writes": [],
             "read_paths_do_not_refresh": True,
         }
+
+
+def test_manifest_snapshot_provenance_accepts_sha256_git_object_id() -> None:
+    commit = "a" * 64
+    result = mcp._repoground_manifest_snapshot_provenance(
+        {
+            "snapshotProvenance": {
+                "repositories": [
+                    {
+                        "repo": "heimgewebe/demo",
+                        "git_commit": commit,
+                        "git_dirty": False,
+                    }
+                ]
+            }
+        },
+        "heimgewebe/demo",
+    )
+
+    assert result["available"] is True
+    assert result["git_commit"] == commit
+    assert result["git_dirty"] is False
+
+
+def test_manifest_snapshot_provenance_rejects_invalid_git_object_id_lengths() -> None:
+    for length in (39, 41, 63, 65):
+        result = mcp._repoground_manifest_snapshot_provenance(
+            {
+                "snapshotProvenance": {
+                    "repositories": [
+                        {
+                            "repo": "heimgewebe/demo",
+                            "git_commit": "a" * length,
+                            "git_dirty": False,
+                        }
+                    ]
+                }
+            },
+            "heimgewebe/demo",
+        )
+        assert result["available"] is False
+        assert result["reason"] == "snapshot_repository_commit_absent"
+
+
+def test_repoground_commit_and_manifest_parsers_accept_sha256_ids() -> None:
+    target = "c" * 64
+    with patch.object(mcp, "_repoground_git", return_value=(0, target, "")):
+        assert mcp._repoground_resolve_commit(Path("/tmp/repo"), "HEAD") == target
+
+    provenance = mcp._repoground_manifest_snapshot_provenance(
+        {
+            "snapshot_provenance": {
+                "repositories": [
+                    {
+                        "repo": "heimgewebe/demo",
+                        "git_commit": target,
+                        "git_dirty": False,
+                    }
+                ]
+            }
+        },
+        "heimgewebe/demo",
+    )
+    assert provenance["available"] is True
+    assert provenance["git_commit"] == target
+    assert provenance["git_dirty"] is False
 
 
 def test_explicit_expected_commit_allows_only_that_exact_bundle_commit() -> None:
@@ -194,6 +270,7 @@ def test_selected_manifest_keeps_exact_pinned_publication_available() -> None:
             "publication_run_id": "run-a",
         }
         exact = _freshness("fresh", "fresh_exact")
+        exact["bundle"] = {"git_dirty": False}
         with (
             patch.object(mcp, "_repoground_manifest_summary", return_value=status),
             patch.object(mcp, "_repoground_freshness_from_status", return_value=exact),

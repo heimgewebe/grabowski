@@ -64,6 +64,7 @@ def _orientation(*, dirty: bool = False) -> dict[str, object]:
 def _context(
     *,
     snapshot_commit: str = TARGET,
+    snapshot_dirty: object = False,
     freshness_status: str = "fresh",
     available: bool = True,
     status: str = "available",
@@ -74,6 +75,7 @@ def _context(
         "repository": "grabowski",
         "ref": "main",
         "snapshot_commit": snapshot_commit,
+        "snapshot_dirty": snapshot_dirty,
         "current_head_matches_snapshot": snapshot_commit == TARGET,
         "freshness_status": freshness_status,
         "manifest_path": "/published/manifest.json",
@@ -94,6 +96,26 @@ def test_repo_orient_admits_exact_clean_context() -> None:
     assert result["target_revision"] == TARGET
     assert result["context_revision"] == TARGET
     assert result["canonical_md_path"] == "/published/canonical.md"
+
+
+def test_repo_orient_withholds_dirty_or_unproven_snapshot() -> None:
+    dirty = grips._repo_orient_admit_repoground_context(
+        _orientation(),
+        _context(snapshot_dirty=True),
+    )
+    unknown = grips._repo_orient_admit_repoground_context(
+        _orientation(),
+        _context(snapshot_dirty=None),
+    )
+
+    assert dirty["available"] is False
+    assert dirty["status"] == "dirty_overlay"
+    assert dirty["reason"] == "repoground_snapshot_is_dirty"
+    assert dirty["snapshot_dirty"] is True
+    assert unknown["available"] is False
+    assert unknown["status"] == "unknown"
+    assert unknown["reason"] == "repoground_snapshot_cleanliness_unproven"
+    assert unknown["snapshot_dirty"] is None
 
 
 def test_repo_orient_admits_exact_clean_sha256_context() -> None:
@@ -132,6 +154,33 @@ def test_repobrief_context_selects_target_repository_provenance() -> None:
     )
 
     assert result["snapshot_commit"] == OTHER
+    assert result["freshness_status"] == "fresh"
+
+
+def test_repobrief_context_matches_repo_name_containing_double_underscores() -> None:
+    manifest = {
+        "snapshotProvenance": {
+            "repositories": [
+                {
+                    "name": f"owner__foo__bar__main--{TARGET}",
+                    "git_commit": TARGET,
+                    "git_dirty": False,
+                }
+            ]
+        }
+    }
+    result = repobrief._process_manifest_candidate(
+        manifest,
+        Path("/tmp/published/foo__bar.bundle.manifest.json"),
+        "foo__bar",
+        "main",
+        "canonical_publication",
+        Path("/tmp/published"),
+        _orientation(),
+    )
+
+    assert result["snapshot_commit"] == TARGET
+    assert result["snapshot_dirty"] is False
     assert result["freshness_status"] == "fresh"
 
 
