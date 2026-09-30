@@ -698,6 +698,94 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
             diagnostics["transport_window_state_by_unit"]["tunnel-client-grabowski.service"],
             "indeterminate_incomplete",
         )
+        self.assertEqual(
+            diagnostics["journal_transport_probes"]["tunnel-client-grabowski.service"][
+                "response_delivery"
+            ]["evidence_state"],
+            "indeterminate_incomplete_journal_window",
+        )
+        self.assertEqual(
+            diagnostics["response_delivery"]["evidence_state"],
+            "indeterminate_incomplete_journal_window",
+        )
+
+    def test_connector_transport_probe_delivery_evidence_fails_closed_on_incomplete_window(
+        self,
+    ) -> None:
+        module = self._load_module()
+        forwarded = {
+            "__REALTIME_TIMESTAMP": "100",
+            "MESSAGE": json.dumps({
+                "level": "INFO",
+                "component": "dispatcher",
+                "msg": "dispatcher forwarded command to MCP server",
+                "cmd_request_id": "wfr_incomplete_delivery/abcd",
+                "rpc_request_id": 4,
+            }),
+        }
+        terminal = {
+            "__REALTIME_TIMESTAMP": "110",
+            "MESSAGE": json.dumps({
+                "level": "DEBUG",
+                "component": "dispatcher",
+                "msg": "dispatcher delivered response to control plane",
+                "cmd_request_id": "wfr_incomplete_delivery/abcd",
+                "rpc_request_id": 4,
+            }),
+        }
+        forwarded_stdout = json.dumps(forwarded) + "\n"
+        terminal_stdout = json.dumps(terminal) + "\n"
+        cases = {
+            "command-failed": (
+                {"returncode": 1, "stdout": forwarded_stdout},
+                "indeterminate_incomplete_journal_window",
+            ),
+            "timed-out": (
+                {"timed_out": True, "stdout": forwarded_stdout},
+                "indeterminate_incomplete_journal_window",
+            ),
+            "stdout-truncated": (
+                {"stdout_truncated": True, "stdout": forwarded_stdout},
+                "indeterminate_incomplete_journal_window",
+            ),
+            "stderr-truncated": (
+                {"stderr_truncated": True, "stdout": forwarded_stdout},
+                "indeterminate_incomplete_journal_window",
+            ),
+            "invalid-json": (
+                {"stdout": forwarded_stdout + "not-json\n"},
+                "indeterminate_incomplete_journal_window",
+            ),
+            "positive-terminal-on-failed-read": (
+                {"returncode": 1, "stdout": terminal_stdout},
+                "terminal_delivery_observed",
+            ),
+        }
+
+        for label, (overrides, expected_state) in cases.items():
+            with self.subTest(label=label):
+                result = {
+                    "returncode": 0,
+                    "timed_out": False,
+                    "stdout": "",
+                    "stderr": "",
+                    "stdout_truncated": False,
+                    "stderr_truncated": False,
+                    **overrides,
+                }
+                module._run_diagnostic_command = (
+                    lambda *args, _result=result, **kwargs: _result
+                )
+
+                probe = module._journal_transport_probe(
+                    "tunnel-client-grabowski.service", 25
+                )
+
+                self.assertFalse(probe["journal_window_complete"])
+                self.assertEqual(
+                    probe["response_delivery"]["evidence_state"],
+                    expected_state,
+                )
 
     def test_connector_transport_probe_uses_journal_priority_for_plain_errors(self) -> None:
         module = self._load_module()

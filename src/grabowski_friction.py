@@ -1421,12 +1421,6 @@ def _journal_transport_probe(unit: str, max_lines: int) -> dict[str, Any]:
         forwarded_request_identities - terminal_delivery_request_identities
     )
     terminal_delivery_count = sum(terminal_delivery_counts.values())
-    if terminal_delivery_count > 0:
-        delivery_evidence_state = "terminal_delivery_observed"
-    elif activity_counts["forwarded_to_mcp"] > 0:
-        delivery_evidence_state = "forwarded_without_visible_terminal_delivery"
-    else:
-        delivery_evidence_state = "no_recent_command_activity"
     journal_window_complete = bool(
         result["returncode"] == 0
         and not result["timed_out"]
@@ -1434,6 +1428,14 @@ def _journal_transport_probe(unit: str, max_lines: int) -> dict[str, Any]:
         and not result["stderr_truncated"]
         and invalid_json_records == 0
     )
+    if terminal_delivery_count > 0:
+        delivery_evidence_state = "terminal_delivery_observed"
+    elif not journal_window_complete:
+        delivery_evidence_state = "indeterminate_incomplete_journal_window"
+    elif activity_counts["forwarded_to_mcp"] > 0:
+        delivery_evidence_state = "forwarded_without_visible_terminal_delivery"
+    else:
+        delivery_evidence_state = "no_recent_command_activity"
     if not journal_window_complete:
         window_state = (
             "indeterminate_truncated"
@@ -1658,8 +1660,15 @@ def connector_transport_live_diagnostics(
             response_delivery_units.append(unit)
 
     terminal_delivery_count = sum(response_delivery_counts.values())
+    response_delivery_indeterminate = any(
+        probe["response_delivery"]["evidence_state"]
+        == "indeterminate_incomplete_journal_window"
+        for probe in journal_probes.values()
+    )
     if terminal_delivery_count > 0:
         response_delivery_evidence_state = "terminal_delivery_observed"
+    elif response_delivery_indeterminate:
+        response_delivery_evidence_state = "indeterminate_incomplete_journal_window"
     elif forwarded_activity_count > 0:
         response_delivery_evidence_state = "forwarded_without_visible_terminal_delivery"
     else:
