@@ -331,6 +331,13 @@ def _claim_start_attempt() -> bool:
     return True
 
 
+def _clear_start_attempt() -> None:
+    if not _start_attempt_exists():
+        return
+    os.unlink(START_ATTEMPT_PATH)
+    _fsync_directory(SNAPSHOT_ROOT)
+
+
 def _fsync_directory(path: Path) -> None:
     descriptor = os.open(
         path,
@@ -1128,15 +1135,40 @@ def _start() -> dict[str, Any]:
 
 def _execute() -> int:
     descriptor = _lock()
+    stdout = b""
+    stderr = b""
     try:
-        if _read_result() is not None:
+        try:
+            existing_result = _read_result()
+        except InventoryHelperError:
+            _clear_start_attempt()
+            raise
+        if existing_result is not None:
             raise InventoryHelperError("inventory result already exists")
-        _snapshot_sources()
+        try:
+            _snapshot_sources()
+        except InventoryHelperError:
+            result = _unsigned_result(
+                status="failed",
+                failure_code="inventory-safety-check",
+                returncode=2,
+                stdout_sha256=_sha256(stdout),
+                stdout_bytes=len(stdout),
+                stderr_sha256=_sha256(stderr),
+                stderr_bytes=len(stderr),
+            )
+            _write_result(result)
+            print(
+                json.dumps(
+                    _seal_result(result),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            return 2
     finally:
         os.close(descriptor)
 
-    stdout = b""
-    stderr = b""
     try:
         completed = subprocess.run(
             aggregate_argv(),

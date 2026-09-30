@@ -623,6 +623,52 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
         self.assertEqual(read_result.call_count, 2)
         run.assert_called_once()
 
+
+    def test_execute_seals_pre_scan_snapshot_failure(self) -> None:
+        with (
+            mock.patch.object(helper, "_lock", return_value=19),
+            mock.patch.object(helper, "_read_result", return_value=None),
+            mock.patch.object(
+                helper,
+                "_snapshot_sources",
+                side_effect=helper.InventoryHelperError("source drift"),
+            ),
+            mock.patch.object(helper, "_write_result") as write_result,
+            mock.patch.object(helper.subprocess, "run") as run,
+            mock.patch.object(helper.os, "close"),
+            mock.patch("builtins.print"),
+        ):
+            returncode = helper._execute()
+
+        self.assertEqual(returncode, 2)
+        run.assert_not_called()
+        failed = write_result.call_args.args[0]
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["failure_code"], "inventory-safety-check")
+        self.assertEqual(failed["returncode"], 2)
+
+    def test_execute_clears_start_fence_when_result_readback_is_invalid(self) -> None:
+        with (
+            mock.patch.object(helper, "_lock", return_value=19),
+            mock.patch.object(
+                helper,
+                "_read_result",
+                side_effect=helper.InventoryHelperError("invalid result"),
+            ),
+            mock.patch.object(helper, "_clear_start_attempt") as clear_start_attempt,
+            mock.patch.object(helper, "_snapshot_sources") as snapshot_sources,
+            mock.patch.object(helper.subprocess, "run") as run,
+            mock.patch.object(helper.os, "close"),
+        ):
+            with self.assertRaisesRegex(
+                helper.InventoryHelperError, "invalid result"
+            ):
+                helper._execute()
+
+        clear_start_attempt.assert_called_once_with()
+        snapshot_sources.assert_not_called()
+        run.assert_not_called()
+
     def _fixture(self) -> tuple[tempfile.TemporaryDirectory[str], dict[str, object]]:
         temporary = tempfile.TemporaryDirectory()
         root = Path(temporary.name)
