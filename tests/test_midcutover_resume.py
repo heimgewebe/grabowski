@@ -859,6 +859,53 @@ class HistoricalTerminalActivationTests(unittest.TestCase):
         ):
             midcutover.historical_terminal_activation_observation(receipt)
 
+    def test_collector_passes_historical_rebind_time_to_snapshot_inspector(self) -> None:
+        receipt = historical_terminal_cutover_receipt()
+        transition = receipt["snapshot_rebind"]["cutover_transition"]
+        transition["source_evidence_time"] = ACTIVATION_TIME + 1
+        receipt.pop("receipt_sha256", None)
+        receipt["receipt_sha256"] = midcutover.canonical_json_sha256(receipt)
+        selector = receipt["authoritative_readback"]["selector"]
+        pointer = {
+            "release_id": GREEN_RELEASE,
+            "repo_head": HEAD_GREEN,
+            "completion_status": "complete",
+            "pointer_kind": "symlink",
+            "pointer_target_release_id": GREEN_RELEASE,
+            "error": None,
+        }
+        seen = {}
+
+        def inspect_snapshot(**kwargs):
+            seen["source_evidence_time"] = kwargs["source_evidence_time"]
+            return SNAPSHOT_REBOUND
+
+        def observe_release(release_id, **_kwargs):
+            return GREEN_OBSERVATION if release_id == GREEN_RELEASE else BLUE_OBSERVATION
+
+        with (
+            mock.patch.object(midcutover, "read_routing_selector_document", return_value=selector),
+            mock.patch.object(
+                midcutover,
+                "load_receipts",
+                return_value={"receipts": [receipt], "unreadable": [], "root": "/test", "present": True},
+            ),
+            mock.patch.object(midcutover, "observe_green_release", side_effect=observe_release),
+            mock.patch.object(midcutover, "observe_stable_pointer", return_value=pointer),
+        ):
+            inputs = midcutover.collect_classification_inputs(
+                green_unit_observer=lambda _unit: {"active": True},
+                snapshot_inspector=inspect_snapshot,
+            )
+
+        self.assertEqual(seen["source_evidence_time"], ACTIVATION_TIME + 1)
+        verdict = midcutover.classify_recovery_lane(expected_head=HEAD_GREEN, **inputs)
+        self.assertEqual(verdict["lane"], midcutover.LANE_MID_CUTOVER_RESUME)
+        self.assertEqual(
+            verdict["resume_binding"]["resume_phase"],
+            midcutover.PHASE_RETIRE_GREEN,
+        )
+
     def test_historical_terminal_evidence_never_authorizes_green_selector(self) -> None:
         receipt = historical_terminal_cutover_receipt()
         activation = midcutover.historical_terminal_activation_observation(receipt)
