@@ -342,6 +342,146 @@ def activation_observation(receipt: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def historical_terminal_activation_observation(
+    receipt: dict[str, Any],
+) -> dict[str, Any]:
+    """Recover platform_converged only from an evidence-complete terminal cutover."""
+    validated = validate_cutover_receipt(receipt)
+    observations = validated.get("observations")
+    if not isinstance(observations, list):
+        raise MidCutoverEvidenceError("blue-green receipt observations are missing")
+    matches: list[dict[str, Any]] = []
+    for index, observation in enumerate(observations):
+        if not isinstance(observation, dict):
+            raise MidCutoverEvidenceError(
+                f"blue-green observation {index} is not an object"
+            )
+        declared = observation.get("observation_sha256")
+        material = {
+            key: item for key, item in observation.items() if key != "observation_sha256"
+        }
+        if (
+            not isinstance(declared, str)
+            or SHA256_RE.fullmatch(declared) is None
+            or canonical_json_sha256(material) != declared
+        ):
+            raise MidCutoverEvidenceError(
+                f"blue-green observation {index} hash mismatch"
+            )
+        if observation.get("phase") == "platform_publication_activation":
+            matches.append(dict(observation))
+    if len(matches) != 1:
+        raise MidCutoverEvidenceError(
+            "blue-green receipt requires exactly one publication activation observation"
+        )
+    activation = matches[0]
+    observed_at = activation.get("observed_at_unix")
+    details = activation.get("details")
+    if (
+        isinstance(observed_at, bool)
+        or not isinstance(observed_at, int)
+        or observed_at < 0
+        or not isinstance(details, dict)
+        or details.get("state") != "platform_converged"
+        or not isinstance(details.get("request_id"), str)
+        or CUTOVER_ID_RE.fullmatch(details["request_id"]) is None
+    ):
+        raise MidCutoverEvidenceError(
+            "historical terminal activation observation is invalid"
+        )
+    switch = _switch_evidence(validated)
+    rebind = validated.get("snapshot_rebind")
+    readback = validated.get("authoritative_readback")
+    recovery = validated.get("recovery")
+    readiness = validated.get("green_readiness")
+    if (
+        validated.get("outcome") != RESUMABLE_OUTCOME
+        or validated.get("phase") != RESUMABLE_OUTCOME
+        or switch is None
+        or not isinstance(rebind, dict)
+        or not isinstance(readback, dict)
+        or not isinstance(recovery, dict)
+        or recovery.get("automatic_rollback_forbidden") is not True
+        or not isinstance(readiness, dict)
+    ):
+        raise MidCutoverEvidenceError(
+            "historical terminal activation evidence is incomplete"
+        )
+    cutover_binding = rebind.get("cutover_binding")
+    transition = rebind.get("cutover_transition")
+    if (
+        rebind.get("state") != "matched"
+        or rebind.get("verified") is not True
+        or rebind.get("cutover_rebind") is not True
+        or SHA256_RE.fullmatch(str(rebind.get("receipt_sha256") or "")) is None
+        or SHA256_RE.fullmatch(str(rebind.get("source_snapshot_receipt_sha256") or "")) is None
+        or SHA256_RE.fullmatch(str(rebind.get("source_client_declaration_sha256") or "")) is None
+        or not isinstance(cutover_binding, dict)
+        or cutover_binding != {
+            "cutover_id": validated.get("cutover_id"),
+            "cutover_generation": validated.get("cutover_generation"),
+            "rebind_role": "blue-green-cutover",
+        }
+        or not isinstance(transition, dict)
+        or transition.get("from_release_id") != validated.get("blue_release_id")
+        or transition.get("to_release_id") != validated.get("green_release_id")
+        or transition.get("to_repo_head") != validated.get("expected_head")
+        or transition.get("source_evidence_time") != observed_at
+        or transition.get("green_readiness_sha256") != canonical_json_sha256(readiness)
+        or rebind.get("target_release_id") != validated.get("green_release_id")
+        or rebind.get("target_repo_head") != validated.get("expected_head")
+    ):
+        raise MidCutoverEvidenceError(
+            "historical terminal snapshot rebind evidence is invalid"
+        )
+    readback_material = dict(readback)
+    declared_readback_sha256 = readback_material.pop("readback_sha256", None)
+    readback_selector = readback.get("selector")
+    ingress = readback.get("ingress")
+    if (
+        readback.get("authoritative") is not True
+        or set(readback) != {"authoritative", "selector", "ingress", "readback_sha256"}
+        or SHA256_RE.fullmatch(str(declared_readback_sha256 or "")) is None
+        or canonical_json_sha256(readback_material) != declared_readback_sha256
+        or not isinstance(readback_selector, dict)
+        or SHA256_RE.fullmatch(str(readback_selector.get("selector_sha256") or "")) is None
+        or readback_selector.get("selected_slot") != CANONICAL_SLOT
+        or readback_selector.get("upstream_port") != CANONICAL_UPSTREAM_PORT
+        or readback_selector.get("generation") != int(switch["generation"]) + 1
+        or readback_selector.get("cutover_id") != validated.get("cutover_id")
+        or readback_selector.get("previous_selector_sha256") != switch.get("selector_sha256")
+        or readback_selector.get("runtime_binding_sha256") != switch.get("runtime_binding_sha256")
+        or readback_selector.get("release_id") != validated.get("green_release_id")
+        or readback_selector.get("repo_head") != validated.get("expected_head")
+        or not isinstance(ingress, dict)
+        or ingress.get("selector_sha256") != readback_selector.get("selector_sha256")
+        or ingress.get("selector_generation") != readback_selector.get("generation")
+        or ingress.get("selected_slot") != CANONICAL_SLOT
+        or ingress.get("upstream_port") != CANONICAL_UPSTREAM_PORT
+        or ingress.get("runtime_binding_sha256") != switch.get("runtime_binding_sha256")
+        or ingress.get("release_id") != validated.get("green_release_id")
+        or ingress.get("repo_head") != validated.get("expected_head")
+    ):
+        raise MidCutoverEvidenceError(
+            "historical terminal authoritative readback evidence is invalid"
+        )
+    return {
+        "source_evidence_time": observed_at,
+        "publication_request_id": details["request_id"],
+        "observation_sha256": activation["observation_sha256"],
+        "state": details["state"],
+        "historical_terminal_evidence": True,
+    }
+
+
+def recovery_activation_observation(receipt: dict[str, Any]) -> dict[str, Any]:
+    """Return ordinary activation or narrowly proven legacy terminal activation."""
+    try:
+        return activation_observation(receipt)
+    except MidCutoverEvidenceError:
+        return historical_terminal_activation_observation(receipt)
+
+
 def validate_resume_receipt(value: Any) -> dict[str, Any]:
     """Accept a persisted resume receipt only if it re-hashes to itself.
 
@@ -1033,7 +1173,7 @@ def collect_classification_inputs(
             connect_timeout_seconds=0.01,
         )
         try:
-            activation = activation_observation(cutover)
+            activation = recovery_activation_observation(cutover)
             readiness = cutover.get("green_readiness")
             if not isinstance(readiness, dict):
                 raise MidCutoverEvidenceError(
@@ -1716,7 +1856,7 @@ def _lineage_resolved(
     """True only for a completed resume bound to *this exact* cutover receipt."""
     try:
         cutover = validate_cutover_receipt(cutover)
-        activation = activation_observation(cutover)
+        activation = recovery_activation_observation(cutover)
     except MidCutoverEvidenceError:
         return False
     switch = _switch_evidence(cutover)
@@ -2080,7 +2220,13 @@ def classify_recovery_lane(
             activation_error is None
             and isinstance(activation, dict)
             and isinstance(activation.get("source_evidence_time"), int)
-            and activation.get("state") in PLATFORM_PUBLICATION_ACTIVATED_STATES
+            and (
+                activation.get("state") in PLATFORM_PUBLICATION_ACTIVATED_STATES
+                or (
+                    activation.get("state") == "platform_converged"
+                    and activation.get("historical_terminal_evidence") is True
+                )
+            )
             and isinstance(activation.get("publication_request_id"), str)
             and SHA256_RE.fullmatch(
                 str(activation.get("observation_sha256") or "")

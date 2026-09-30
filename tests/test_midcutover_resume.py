@@ -735,6 +735,132 @@ def classify(**overrides) -> dict[str, object]:
     return midcutover.classify_recovery_lane(**parameters)
 
 
+def historical_terminal_cutover_receipt() -> dict[str, object]:
+    receipt = cutover_receipt(activation_state="platform_converged")
+    receipt["snapshot_rebind"] = durable_rebind_evidence(
+        receipt_sha256=REBOUND_SNAPSHOT_RECEIPT_SHA256
+    )
+    routing = selector_document(
+        slot=midcutover.CANONICAL_SLOT,
+        generation=GENERATION + 1,
+        selector_sha256="f3" * 32,
+        previous_selector_sha256=SELECTOR_SHA256,
+    )
+    routing["release_id"] = GREEN_RELEASE
+    routing["repo_head"] = HEAD_GREEN
+    readback_material = {
+        "authoritative": True,
+        "selector": routing,
+        "ingress": {
+            "selector_sha256": routing["selector_sha256"],
+            "selector_generation": routing["generation"],
+            "selected_slot": routing["selected_slot"],
+            "upstream_port": routing["upstream_port"],
+            "runtime_binding_sha256": BINDING_SHA256,
+            "release_id": GREEN_RELEASE,
+            "repo_head": HEAD_GREEN,
+        },
+    }
+    receipt["authoritative_readback"] = {
+        **readback_material,
+        "readback_sha256": midcutover.canonical_json_sha256(readback_material),
+    }
+    receipt.pop("receipt_sha256", None)
+    receipt["receipt_sha256"] = midcutover.canonical_json_sha256(receipt)
+    return receipt
+
+
+class HistoricalTerminalActivationTests(unittest.TestCase):
+    def test_platform_converged_requires_terminal_cutover_evidence(self) -> None:
+        receipt = historical_terminal_cutover_receipt()
+        activation = midcutover.historical_terminal_activation_observation(receipt)
+        self.assertEqual(activation["state"], "platform_converged")
+
+        incomplete = cutover_receipt(activation_state="platform_converged")
+        with self.assertRaisesRegex(
+            midcutover.MidCutoverEvidenceError,
+            "historical terminal activation evidence is incomplete",
+        ):
+            midcutover.historical_terminal_activation_observation(incomplete)
+
+    def test_collector_admits_exact_historical_canonical_lineage(self) -> None:
+        receipt = historical_terminal_cutover_receipt()
+        selector = receipt["authoritative_readback"]["selector"]
+        pointer = {
+            "release_id": GREEN_RELEASE,
+            "repo_head": HEAD_GREEN,
+            "completion_status": "complete",
+            "pointer_kind": "symlink",
+            "pointer_target_release_id": GREEN_RELEASE,
+            "error": None,
+        }
+
+        def observe_release(release_id, **_kwargs):
+            return GREEN_OBSERVATION if release_id == GREEN_RELEASE else BLUE_OBSERVATION
+
+        with (
+            mock.patch.object(
+                midcutover, "read_routing_selector_document", return_value=selector
+            ),
+            mock.patch.object(
+                midcutover,
+                "load_receipts",
+                return_value={
+                    "receipts": [receipt],
+                    "unreadable": [],
+                    "root": "/test",
+                    "present": True,
+                },
+            ),
+            mock.patch.object(
+                midcutover, "observe_green_release", side_effect=observe_release
+            ),
+            mock.patch.object(
+                midcutover, "observe_stable_pointer", return_value=pointer
+            ),
+        ):
+            inputs = midcutover.collect_classification_inputs(
+                green_unit_observer=lambda _unit: {"active": True},
+                snapshot_inspector=lambda **_kwargs: SNAPSHOT_REBOUND,
+            )
+
+        self.assertEqual(
+            inputs["activation_observation"]["state"], "platform_converged"
+        )
+        verdict = midcutover.classify_recovery_lane(
+            expected_head=HEAD_GREEN, **inputs
+        )
+        self.assertEqual(verdict["lane"], midcutover.LANE_MID_CUTOVER_RESUME)
+        self.assertEqual(
+            verdict["resume_binding"]["resume_phase"],
+            midcutover.PHASE_RETIRE_GREEN,
+        )
+
+    def test_completed_resume_becomes_tombstone_for_historical_lineage(self) -> None:
+        receipt = historical_terminal_cutover_receipt()
+        activation = midcutover.historical_terminal_activation_observation(receipt)
+        resumed = resume_receipt(
+            resumed_receipt_sha256=receipt["receipt_sha256"],
+            resume_phase=midcutover.PHASE_RETIRE_GREEN,
+        )
+        binding = dict(resumed["resume_binding"])
+        binding["activation_observation_sha256"] = activation["observation_sha256"]
+        binding["binding_sha256"] = midcutover.canonical_json_sha256(
+            {key: value for key, value in binding.items() if key != "binding_sha256"}
+        )
+        resumed["resume_binding"] = binding
+        resumed["resume_binding_sha256"] = binding["binding_sha256"]
+        resumed.pop("receipt_sha256", None)
+        resumed["receipt_sha256"] = midcutover.canonical_json_sha256(resumed)
+
+        self.assertEqual(
+            midcutover.unresolved_post_switch_receipts([receipt, resumed]), []
+        )
+        resolution = midcutover.resolution_for_cutover([receipt, resumed], receipt)
+        self.assertIsNotNone(resolution)
+        self.assertEqual(resolution["resumed_cutover_id"], CUTOVER_ID)
+
+
 class ClassificationTests(unittest.TestCase):
     """Tests 10-16 and 23: only the exact stranded state is resumable."""
 
