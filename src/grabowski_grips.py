@@ -2302,6 +2302,105 @@ def _orient(repo: Path, runner: CommandRunner) -> dict[str, Any]:
     }
 
 
+_REPOGROUND_EXACT_FRESHNESS = frozenset({"fresh", "fresh_exact"})
+
+
+def _repo_orient_admit_repoground_context(
+    orientation: dict[str, Any],
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    """Expose RepoGround context only when it exactly matches the clean checkout."""
+    target_revision = _normalize_40_sha(orientation.get("head"))
+    snapshot_commit = _normalize_40_sha(context.get("snapshot_commit"))
+    source_status = str(context.get("status") or "unknown")
+    source_freshness = str(context.get("freshness_status") or "unknown")
+    dirty = orientation.get("dirty") is True
+    exact_identity = (
+        target_revision is not None
+        and snapshot_commit is not None
+        and target_revision == snapshot_commit
+    )
+    exact = (
+        context.get("available") is True
+        and not dirty
+        and exact_identity
+        and source_freshness in _REPOGROUND_EXACT_FRESHNESS
+    )
+    if exact:
+        admitted = dict(context)
+        admitted.update(
+            {
+                "target_revision": target_revision,
+                "context_revision": snapshot_commit,
+                "admission": "exact",
+            }
+        )
+        return admitted
+
+    if dirty:
+        status = "dirty_unbound"
+        reason = "dirty_worktree_is_not_bound_to_repoground_snapshot"
+    elif context.get("available") is not True:
+        status = (
+            "unavailable"
+            if source_freshness == "publication_unavailable"
+            or source_status
+            in {
+                "missing",
+                "excluded",
+                "canonical_publication_unavailable",
+                "missing_publication_root",
+            }
+            else "unknown"
+        )
+        reason = str(context.get("reason") or "exact_repoground_context_unavailable")
+    elif target_revision is None or snapshot_commit is None:
+        status = "unknown"
+        reason = "repoground_context_identity_unproven"
+    elif not exact_identity:
+        status = "stale"
+        reason = "snapshot_commit_does_not_match_target_revision"
+    else:
+        status = "unknown"
+        reason = "repoground_freshness_not_exact"
+
+    targeted_build_recommended = (
+        not dirty
+        and target_revision is not None
+        and source_status != "excluded"
+    )
+    return {
+        "available": False,
+        "status": status,
+        "freshness_status": status,
+        "reason": reason,
+        "repository": context.get("repository"),
+        "ref": context.get("ref"),
+        "target_revision": target_revision,
+        "snapshot_commit": snapshot_commit,
+        "current_head_matches_snapshot": exact_identity,
+        "admission": "withheld",
+        "source_status": source_status,
+        "source_freshness_status": source_freshness,
+        "fallback": {
+            "mode": (
+                "live_fallback"
+                if dirty or target_revision is None
+                else "targeted_build_or_live_fallback"
+            ),
+            "targeted_build_recommended": targeted_build_recommended,
+            "live_fallback_allowed": True,
+            "live_fallback_required": dirty or target_revision is None,
+        },
+        "does_not_establish": [
+            "repoground_context_available",
+            "dirty_worktree_identity",
+            "targeted_build_success",
+            "live_fallback_completed",
+        ],
+    }
+
+
 def _run_repo_orient(
     spec: GripSpec,
     parameters: dict[str, Any],
@@ -2335,6 +2434,7 @@ def _run_repo_orient(
         rb = grabowski_repobrief.context(repo, runner, orientation, parameters)
     except Exception as exc:
         rb = {"available": False, "status": "error", "reason": str(exc)}
+    rb = _repo_orient_admit_repoground_context(orientation, rb)
     orientation["repobrief_context"] = rb
     rb_status = str(rb.get("status") or "unknown")
     rb_check = "pass" if rb.get("available") else ("skip" if rb_status == "excluded" else "warn")

@@ -5,6 +5,7 @@ from unittest.mock import patch
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import types
@@ -756,9 +757,39 @@ class RepoGroundConsumerBindingTests(CatalogFixture):
         self.assertEqual("publication_source_dirty", result["reason"])
 
     def test_agent_surfaces_bind_the_same_manifest_sha(self) -> None:
+        repo = self.home / "repos" / "demo"
+        repo.mkdir()
+        subprocess.run(
+            ["git", "init", "-q", "-b", "main"],
+            cwd=repo,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.invalid"],
+            cwd=repo,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Grabowski Test"],
+            cwd=repo,
+            check=True,
+        )
+        (repo / "README.md").write_text("demo\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-qm", "fixture"],
+            cwd=repo,
+            check=True,
+        )
+        head = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo,
+            text=True,
+        ).strip()
         manifest, stem = self.write_canonical(
             run_dir="20260718T120000Z-bind",
             created_at="2026-07-18T12:00:00Z",
+            commit=head,
         )
         expected_sha = hashlib.sha256(manifest.read_bytes()).hexdigest()
         available = {

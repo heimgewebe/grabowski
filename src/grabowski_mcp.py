@@ -8258,6 +8258,7 @@ class _RepoGroundPinnedPublication:
     manifest_sha256: str
     stem: str
     publication_run_id: str | None
+    expected_commits: tuple[str, ...] = ()
 
 
 def _repoground_pin_publication_record(
@@ -10217,12 +10218,100 @@ def _repoground_context_citation_ids(snippets: list[dict[str, Any]]) -> list[str
     return ids
 
 
+_REPOGROUND_EXACT_AGENT_FRESHNESS = ("fresh", "fresh_exact")
+
+
+def _repoground_normalize_expected_commits(
+    expected_commits: str | tuple[str, ...] | None,
+) -> tuple[str, ...]:
+    if expected_commits is None or expected_commits == ():
+        return ()
+    raw = (expected_commits,) if isinstance(expected_commits, str) else expected_commits
+    if not isinstance(raw, tuple):
+        raise ValueError("expected RepoGround commits must be a tuple or Git object id")
+    normalized: list[str] = []
+    for commit in raw:
+        if (
+            not isinstance(commit, str)
+            or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", commit) is None
+        ):
+            raise ValueError(
+                "expected RepoGround commits must be lowercase Git object ids"
+            )
+        if commit not in normalized:
+            normalized.append(commit)
+    return tuple(normalized)
+
+
+def _repoground_agent_freshness_admission_error(
+    repo: str,
+    stem: str | None,
+    freshness: dict[str, Any],
+    *,
+    expected_commits: str | tuple[str, ...] | None = None,
+) -> dict[str, Any] | None:
+    freshness_status = str(freshness.get("freshness_status") or "unknown")
+    freshness_identity = str(freshness.get("freshness") or "unknown")
+    bundle = freshness.get("bundle")
+    bundle_commit = bundle.get("git_commit") if isinstance(bundle, dict) else None
+    bundle_dirty = bundle.get("git_dirty") if isinstance(bundle, dict) else None
+    expected = _repoground_normalize_expected_commits(expected_commits)
+    if expected:
+        if bundle_commit in expected and bundle_dirty is False:
+            return None
+    elif (
+        freshness_status == _REPOGROUND_EXACT_AGENT_FRESHNESS[0]
+        and freshness_identity == _REPOGROUND_EXACT_AGENT_FRESHNESS[1]
+    ):
+        return None
+
+    if freshness_status == "stale":
+        reason = "stale_context_refused"
+    elif freshness_status == "dirty_overlay":
+        reason = "dirty_context_refused"
+    elif freshness_status == "publication_unavailable":
+        reason = "publication_unavailable"
+    else:
+        reason = "freshness_unverified"
+
+    return {
+        "kind": "grabowski.repoground_selection",
+        "schema_version": 2,
+        "repo": repo,
+        "stem": stem,
+        "available": False,
+        "freshness": freshness,
+        "reason": reason,
+        "freshness_status": freshness_status,
+        "freshness_identity": freshness_identity,
+        "freshness_reason": freshness.get("reason"),
+        "expected_commits": list(expected),
+        "bundle_commit": bundle_commit,
+        "route": "targeted_build_or_live_fallback",
+        "targeted_build_recommended": True,
+        "live_fallback_allowed": True,
+        "mutation_boundary": {
+            "writes": [],
+            "read_paths_do_not_refresh": True,
+        },
+    }
+
+
 def _repoground_selected_manifest_for_repo(
     repo: str,
     stem: str | None | _RepoGroundPinnedPublication,
+    *,
+    expected_commits: str | tuple[str, ...] | None = None,
 ) -> tuple[dict[str, Any], str | None, Path | None, dict[str, Any] | None]:
+    expected = _repoground_normalize_expected_commits(expected_commits)
     if isinstance(stem, _RepoGroundPinnedPublication):
         pinned = stem
+        pinned_expected = _repoground_normalize_expected_commits(
+            pinned.expected_commits
+        )
+        if expected and pinned_expected and set(expected) != set(pinned_expected):
+            raise ValueError("conflicting RepoGround expected commit bindings")
+        expected = expected or pinned_expected
     else:
         resolution = _repoground_catalog_resolution(repo, stem)
         selected = resolution.get("selected")
@@ -10359,6 +10448,14 @@ def _repoground_selected_manifest_for_repo(
             },
         )
     freshness = _repoground_freshness_from_status(repo, status)
+    admission_error = _repoground_agent_freshness_admission_error(
+        repo,
+        pinned.stem,
+        freshness,
+        expected_commits=expected,
+    )
+    if admission_error is not None:
+        return freshness, pinned.stem, None, admission_error
     return freshness, pinned.stem, pinned.manifest_path, None
 
 
@@ -13024,11 +13121,80 @@ def repoground_context_compose(
             "does_not_establish": ["truth", "completeness", "patch_correctness", "test_sufficiency", "merge_readiness", "runtime_behavior"],
         }
 
+    if dirty_overlay.get("dirty") is not False:
+        dirty_reason = (
+            "dirty_worktree_unbound"
+            if dirty_overlay.get("dirty") is True
+            else "dirty_worktree_status_unavailable"
+        )
+        return {
+            "kind": "grabowski.repoground_context_compose",
+            "schema_version": 1,
+            "available": False,
+            "status": "unavailable",
+            "reason": dirty_reason,
+            "change_identity": change_identity,
+            "dirty_overlay": dirty_overlay,
+            "context": blocked_context,
+            "context_budget": {
+                "requested_bytes": context_budget_bytes,
+                "effective_limit_bytes": context_budget_bytes,
+                "used_bytes": blocked_used_bytes,
+                "remaining_bytes": max(
+                    0, context_budget_bytes - blocked_used_bytes
+                ),
+                "hard_limit_applies_to": "context",
+                "lane_counts": blocked_lane_counts,
+            },
+            "retrieval_lanes": {
+                "used": ["direct_changes"],
+                "skipped": [
+                    "agent_impact",
+                    "query_context",
+                    "entry_manifest",
+                    "pr_delta_cards",
+                    "diff_locality",
+                    "symbol_navigation",
+                    "call_graph",
+                    "citation",
+                    "live_evidence",
+                ],
+            },
+            "fallback": {
+                "mode": "live_fallback",
+                "targeted_build_recommended": False,
+                "live_fallback_allowed": True,
+                "live_fallback_required": True,
+            },
+            "stop_criteria": {
+                "triggered": [dirty_reason],
+                "available": [
+                    "diff_sha256_mismatch",
+                    "publication_unavailable",
+                    "impact_context_blocked",
+                    "budget_exhausted",
+                ],
+            },
+            "does_not_establish": [
+                "dirty_worktree_identity",
+                "truth",
+                "completeness",
+                "patch_correctness",
+                "test_sufficiency",
+                "merge_readiness",
+                "runtime_behavior",
+            ],
+        }
+
     selection_token = (
         pinned_publication if pinned_publication is not None else stem
     )
     freshness, selected_stem, manifest_path, selection_error = (
-        _repoground_selected_manifest_for_repo(repo, selection_token)
+        _repoground_selected_manifest_for_repo(
+            repo,
+            selection_token,
+            expected_commits=(base_commit, target_commit),
+        )
     )
     if selection_error is not None or manifest_path is None:
         return {
@@ -13059,6 +13225,13 @@ def repoground_context_compose(
         else _repoground_pin_publication_from_selection(
             manifest_path, selected_stem, freshness
         )
+    )
+    selected_publication = _RepoGroundPinnedPublication(
+        manifest_path=selected_publication.manifest_path,
+        manifest_sha256=selected_publication.manifest_sha256,
+        stem=selected_publication.stem,
+        publication_run_id=selected_publication.publication_run_id,
+        expected_commits=(base_commit, target_commit),
     )
     changed_paths = [str(item["path"]) for item in changes]
     diff_local_symbols, diff_locality = _repoground_diff_local_symbols(
