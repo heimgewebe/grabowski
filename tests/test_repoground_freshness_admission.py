@@ -221,6 +221,7 @@ def test_query_stale_selection_emits_no_evidence_or_retrieval() -> None:
     assert error is not None
 
     with (
+        patch.object(mcp, "_require_capability", return_value=None),
         patch.object(
             mcp,
             "_repoground_selected_manifest_for_repo",
@@ -250,6 +251,7 @@ def test_context_pack_stale_selection_emits_no_context_or_preflight() -> None:
     assert error is not None
 
     with (
+        patch.object(mcp, "_require_capability", return_value=None),
         patch.object(
             mcp,
             "_repoground_selected_manifest_for_repo",

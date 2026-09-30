@@ -270,6 +270,26 @@ def _determine_candidates(
     return candidates, None
 
 
+def _snapshot_repository_matches(
+    item: dict[str, Any], repo_segment: str
+) -> bool:
+    for candidate in (
+        item.get("repo"),
+        item.get("repository"),
+        item.get("repo_id"),
+        item.get("name"),
+    ):
+        if not isinstance(candidate, str):
+            continue
+        value = candidate.strip().removesuffix(".git")
+        if value == repo_segment or value.endswith(f"/{repo_segment}"):
+            return True
+        parts = value.split("__")
+        if len(parts) >= 2 and parts[1] == repo_segment:
+            return True
+    return False
+
+
 def _process_manifest_candidate(
     manifest: dict[str, Any],
     manifest_path: Path,
@@ -313,7 +333,29 @@ def _process_manifest_candidate(
         repositories = [
             item for item in provenance["repositories"] if isinstance(item, dict)
         ]
-    snapshot_commit = repositories[0].get("git_commit") if repositories else None
+    matching_repositories = [
+        item
+        for item in repositories
+        if _snapshot_repository_matches(item, repo_segment)
+    ]
+    snapshot_repository = (
+        matching_repositories[0] if len(matching_repositories) == 1 else None
+    )
+    if snapshot_repository is None and len(repositories) == 1:
+        only_repository = repositories[0]
+        identity_fields = ("repo", "repository", "repo_id", "name")
+        has_identity = any(
+            isinstance(only_repository.get(key), str)
+            and bool(str(only_repository.get(key)).strip())
+            for key in identity_fields
+        )
+        if not has_identity:
+            snapshot_repository = only_repository
+    snapshot_commit = (
+        snapshot_repository.get("git_commit")
+        if snapshot_repository is not None
+        else None
+    )
     freshness = _freshness_status(snapshot_commit, orientation.get("head"))
     does_not_establish = manifest.get("does_not_establish")
     if does_not_establish is None:

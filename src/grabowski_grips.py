@@ -2310,8 +2310,8 @@ def _repo_orient_admit_repoground_context(
     context: dict[str, Any],
 ) -> dict[str, Any]:
     """Expose RepoGround context only when it exactly matches the clean checkout."""
-    target_revision = _normalize_40_sha(orientation.get("head"))
-    snapshot_commit = _normalize_40_sha(context.get("snapshot_commit"))
+    target_revision = _normalize_git_object_id(orientation.get("head"))
+    snapshot_commit = _normalize_git_object_id(context.get("snapshot_commit"))
     source_status = str(context.get("status") or "unknown")
     source_freshness = str(context.get("freshness_status") or "unknown")
     dirty = orientation.get("dirty") is True
@@ -2469,6 +2469,12 @@ def _is_sha256_hex(value: Any) -> bool:
 
 def _normalize_40_sha(value: Any) -> str | None:
     if not _is_hex_sha(value, lengths=(40,)):
+        return None
+    return str(value).lower()
+
+
+def _normalize_git_object_id(value: Any) -> str | None:
+    if not _is_hex_sha(value, lengths=(40, 64)):
         return None
     return str(value).lower()
 

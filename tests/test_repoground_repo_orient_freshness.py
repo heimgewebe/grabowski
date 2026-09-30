@@ -36,6 +36,7 @@ if "mcp" not in sys.modules:
     sys.modules["mcp.types"] = fake_types
 
 import grabowski_grips as grips
+import grabowski_repobrief as repobrief
 
 
 TARGET = "a" * 40
@@ -93,6 +94,88 @@ def test_repo_orient_admits_exact_clean_context() -> None:
     assert result["target_revision"] == TARGET
     assert result["context_revision"] == TARGET
     assert result["canonical_md_path"] == "/published/canonical.md"
+
+
+def test_repo_orient_admits_exact_clean_sha256_context() -> None:
+    target = "c" * 64
+    result = grips._repo_orient_admit_repoground_context(
+        {**_orientation(), "head": target},
+        _context(snapshot_commit=target),
+    )
+
+    assert result["available"] is True
+    assert result["admission"] == "exact"
+    assert result["target_revision"] == target
+    assert result["context_revision"] == target
+
+
+def test_repobrief_context_selects_target_repository_provenance() -> None:
+    manifest = {
+        "snapshotProvenance": {
+            "repositories": [
+                {"repo": "other", "git_commit": TARGET},
+                {
+                    "name": "heimgewebe__grabowski__main",
+                    "git_commit": OTHER,
+                },
+            ]
+        }
+    }
+    result = repobrief._process_manifest_candidate(
+        manifest,
+        Path("/tmp/published/grabowski.bundle.manifest.json"),
+        "grabowski",
+        "main",
+        "canonical_publication",
+        Path("/tmp/published"),
+        {**_orientation(), "head": OTHER},
+    )
+
+    assert result["snapshot_commit"] == OTHER
+    assert result["freshness_status"] == "fresh"
+
+
+def test_repobrief_context_refuses_unmatched_repository_provenance() -> None:
+    manifest = {
+        "snapshotProvenance": {
+            "repositories": [{"repo": "other", "git_commit": TARGET}]
+        }
+    }
+    result = repobrief._process_manifest_candidate(
+        manifest,
+        Path("/tmp/published/grabowski.bundle.manifest.json"),
+        "grabowski",
+        "main",
+        "canonical_publication",
+        Path("/tmp/published"),
+        _orientation(),
+    )
+
+    assert result["snapshot_commit"] is None
+    assert result["freshness_status"] == "provenance_missing"
+
+
+def test_repobrief_context_refuses_ambiguous_target_repository_provenance() -> None:
+    manifest = {
+        "snapshotProvenance": {
+            "repositories": [
+                {"repo": "grabowski", "git_commit": TARGET},
+                {"repository": "heimgewebe/grabowski", "git_commit": OTHER},
+            ]
+        }
+    }
+    result = repobrief._process_manifest_candidate(
+        manifest,
+        Path("/tmp/published/grabowski.bundle.manifest.json"),
+        "grabowski",
+        "main",
+        "canonical_publication",
+        Path("/tmp/published"),
+        _orientation(),
+    )
+
+    assert result["snapshot_commit"] is None
+    assert result["freshness_status"] == "provenance_missing"
 
 
 def test_repo_orient_withholds_stale_context_and_paths() -> None:
