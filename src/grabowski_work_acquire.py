@@ -36,6 +36,9 @@ SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
 IDEMPOTENCY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 SUCCESS_STATES = frozenset({"CREATED", "ALREADY_CORRECT"})
 DIRECT_SOURCE_KINDS = frozenset({"direct", "direct-user"})
+WORK_SOURCE_KINDS = frozenset(
+    DIRECT_SOURCE_KINDS | checkouts.TERMINAL_EVIDENCE_SOURCE_KINDS
+)
 MAX_WRITE_PATHS = 256
 MAX_WRITER_ARGV = 256
 MAX_WRITER_ARGUMENT_BYTES = 8192
@@ -2178,6 +2181,9 @@ def _lifecycle_source(inputs: dict[str, Any]) -> dict[str, str]:
     source_id = source.get("id")
     if not isinstance(kind, str) or not isinstance(source_id, str):
         raise RuntimeError("work lane source binding is invalid")
+    if kind not in WORK_SOURCE_KINDS:
+        allowed = ", ".join(sorted(WORK_SOURCE_KINDS))
+        raise ValueError(f"source_kind must be one of {allowed}")
     if kind in DIRECT_SOURCE_KINDS:
         lane_id = inputs.get("lane_id")
         if not isinstance(lane_id, str) or not lane_id:
@@ -4148,7 +4154,12 @@ def grabowski_work_acquire(
     ttl_seconds: int = 7200,
     terminal_closeout: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Acquire a work lane, persist terminal closeout, or repair only its missing audit."""
+    """Acquire a work lane, persist terminal closeout, or repair only its missing audit.
+
+    New acquisitions accept source_kind only from bureau_task, github_issue,
+    operator_obligation, thread_focus, work_lane, direct, or direct-user.
+    Direct sources bind checkout lifecycle evidence to the Work Lane itself.
+    """
     parameters = {
         "source_kind": source_kind,
         "source_id": source_id,

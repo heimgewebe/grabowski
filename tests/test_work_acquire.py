@@ -344,6 +344,36 @@ class WorkAcquireTests(unittest.TestCase):
         acquire.assert_not_called()
         ensure.assert_not_called()
 
+    def test_unsupported_source_kind_blocks_before_resource_or_worktree_effect(self) -> None:
+        for source_kind in ("chat-thread", "github-pr"):
+            with self.subTest(source_kind=source_kind):
+                params = self.parameters()
+                params["source_kind"] = source_kind
+                acquire = Mock()
+                ensure = Mock()
+                with self.assertRaisesRegex(ValueError, "source_kind must be one of"):
+                    work_acquire.acquire_work(
+                        params,
+                        acquire_resources_fn=acquire,
+                        release_resources_fn=Mock(),
+                        inspect_resource_fn=Mock(),
+                        ensure_worktree_fn=ensure,
+                        runner=Mock(),
+                    )
+                acquire.assert_not_called()
+                ensure.assert_not_called()
+                self.assertFalse(self.state.exists())
+
+    def test_supported_terminal_source_kind_is_preserved_for_lifecycle(self) -> None:
+        params = self.parameters()
+        params["source_kind"] = "github_issue"
+        params["source_id"] = "heimgewebe/grabowski#1"
+        normalized = work_acquire._normalize(params)
+        self.assertEqual(
+            work_acquire._lifecycle_source(normalized),
+            {"kind": "github_issue", "id": "heimgewebe/grabowski#1"},
+        )
+
     def test_acquires_narrow_resources_and_returns_ready_lane(self) -> None:
         seen: dict[str, object] = {}
         acquire_calls = 0
