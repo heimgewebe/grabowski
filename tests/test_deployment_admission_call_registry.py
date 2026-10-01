@@ -425,7 +425,7 @@ class SyncToolAllocatorTrimTests(unittest.TestCase):
             malloc_trim=lambda pad: calls.append(pad) or 1,
         )
 
-    def test_trim_waits_until_tool_registry_is_idle_and_retries_on_final_release(
+    def test_trim_waits_until_no_drain_blocking_calls_and_retries_on_release(
         self,
     ) -> None:
         operator = _load_operator_module()
@@ -476,6 +476,254 @@ class SyncToolAllocatorTrimTests(unittest.TestCase):
 
         self.assertEqual([0], calls)
         self.assertFalse(operator._SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED)
+
+    def test_trim_allows_drain_neutral_overlap(self) -> None:
+        operator = _load_operator_module()
+        calls: list[int] = []
+        libc = self._libc(
+            operator.SYNC_TOOL_ALLOCATOR_TRIM_FREE_BYTES,
+            calls,
+        )
+        identity = operator._deployment_admission_register_tool_call(
+            "read-only-overlap",
+            operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC,
+            drain_blocking=False,
+            drain_neutral=True,
+        )
+        try:
+            with patch.object(
+                operator, "_sync_tool_allocator_libc", return_value=libc
+            ), patch.object(
+                operator.time, "monotonic", return_value=100.0
+            ), patch.object(
+                operator,
+                "_SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC",
+                float("-inf"),
+            ):
+                self.assertTrue(operator._maybe_trim_sync_tool_allocator())
+                self.assertEqual([0], calls)
+                self.assertEqual(
+                    1, operator._deployment_admission_active_tool_calls()
+                )
+                self.assertFalse(operator._SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED)
+        finally:
+            operator._deployment_admission_release_tool_call(identity)
+
+    def test_trim_allows_ordinary_nonblocking_overlap(self) -> None:
+        operator = _load_operator_module()
+        calls: list[int] = []
+        libc = self._libc(
+            operator.SYNC_TOOL_ALLOCATOR_TRIM_FREE_BYTES,
+            calls,
+        )
+        identity = operator._deployment_admission_register_tool_call(
+            "ordinary-read-overlap",
+            operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC,
+            drain_blocking=False,
+        )
+        try:
+            with patch.object(
+                operator, "_sync_tool_allocator_libc", return_value=libc
+            ), patch.object(
+                operator.time, "monotonic", return_value=100.0
+            ), patch.object(
+                operator,
+                "_SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC",
+                float("-inf"),
+            ):
+                self.assertTrue(operator._maybe_trim_sync_tool_allocator())
+                self.assertEqual([0], calls)
+                self.assertEqual(
+                    1, operator._deployment_admission_active_tool_calls()
+                )
+                self.assertFalse(operator._SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED)
+        finally:
+            operator._deployment_admission_release_tool_call(identity)
+
+    def test_trim_missing_drain_blocking_classification_fails_closed(self) -> None:
+        operator = _load_operator_module()
+        calls: list[int] = []
+        libc = self._libc(
+            operator.SYNC_TOOL_ALLOCATOR_TRIM_FREE_BYTES,
+            calls,
+        )
+        identity = "legacy-unclassified"
+        with operator._DEPLOYMENT_ADMISSION_LOCK:
+            operator._DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY[identity] = {
+                "identity": identity,
+                "tool_name": "legacy-read",
+                "kind": operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC,
+                "started_at_unix": time.time(),
+                "started_monotonic": time.monotonic(),
+            }
+        try:
+            with patch.object(
+                operator, "_sync_tool_allocator_libc", return_value=libc
+            ), patch.object(
+                operator.time, "monotonic", return_value=100.0
+            ), patch.object(
+                operator,
+                "_SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC",
+                float("-inf"),
+            ):
+                self.assertFalse(operator._maybe_trim_sync_tool_allocator())
+                self.assertEqual([], calls)
+                self.assertTrue(operator._SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED)
+        finally:
+            operator._deployment_admission_release_tool_call(identity)
+
+    def test_trim_mixed_blocking_and_nonblocking_overlap_still_defers(self) -> None:
+        operator = _load_operator_module()
+        calls: list[int] = []
+        libc = self._libc(
+            operator.SYNC_TOOL_ALLOCATOR_TRIM_FREE_BYTES,
+            calls,
+        )
+        read_identity = operator._deployment_admission_register_tool_call(
+            "ordinary-read",
+            operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC,
+            drain_blocking=False,
+        )
+        blocking_identity = operator._deployment_admission_register_tool_call(
+            "blocking-work",
+            operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC,
+        )
+        try:
+            with patch.object(
+                operator, "_sync_tool_allocator_libc", return_value=libc
+            ), patch.object(
+                operator.time, "monotonic", return_value=100.0
+            ), patch.object(
+                operator,
+                "_SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC",
+                float("-inf"),
+            ):
+                self.assertFalse(operator._maybe_trim_sync_tool_allocator())
+                self.assertEqual([], calls)
+                self.assertTrue(operator._SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED)
+        finally:
+            operator._deployment_admission_release_tool_call(blocking_identity)
+            operator._deployment_admission_release_tool_call(read_identity)
+
+    def test_last_blocking_release_retries_with_ordinary_read_overlap(
+        self,
+    ) -> None:
+        operator = _load_operator_module()
+        timers: list[object] = []
+
+        class FakeTimer:
+            def __init__(self, interval, function, args=()):
+                self.interval = interval
+                self.function = function
+                self.args = args
+                self.daemon = False
+                self.started = False
+                timers.append(self)
+
+            def start(self):
+                self.started = True
+
+            def cancel(self):
+                pass
+
+        read_identity = operator._deployment_admission_register_tool_call(
+            "ordinary-read-overlap",
+            operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC,
+            drain_blocking=False,
+        )
+        blocking_identity = operator._deployment_admission_register_tool_call(
+            "blocking-work",
+            operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC,
+        )
+        operator._SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = True
+        try:
+            with patch.object(operator.threading, "Timer", FakeTimer):
+                self.assertTrue(
+                    operator._deployment_admission_release_tool_call(
+                        blocking_identity
+                    )
+                )
+                self.assertEqual(1, len(timers))
+                self.assertEqual(0.0, timers[0].interval)
+                self.assertTrue(timers[0].started)
+                self.assertEqual(
+                    1, operator._deployment_admission_active_tool_calls()
+                )
+        finally:
+            operator._SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = False
+            operator._cancel_sync_tool_allocator_trim_retry()
+            operator._deployment_admission_release_tool_call(read_identity)
+
+    def test_last_blocking_release_retries_with_drain_neutral_overlap(
+        self,
+    ) -> None:
+        operator = _load_operator_module()
+        calls: list[int] = []
+        timers: list[object] = []
+
+        class FakeTimer:
+            def __init__(self, interval, function, args=()):
+                self.interval = interval
+                self.function = function
+                self.args = args
+                self.daemon = False
+                self.started = False
+                timers.append(self)
+
+            def start(self):
+                self.started = True
+
+            def cancel(self):
+                pass
+
+            def fire(self):
+                self.function(*self.args)
+
+        libc = self._libc(
+            operator.SYNC_TOOL_ALLOCATOR_TRIM_FREE_BYTES,
+            calls,
+        )
+        read_only_identity = operator._deployment_admission_register_tool_call(
+            "read-only-overlap",
+            operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC,
+            drain_blocking=False,
+            drain_neutral=True,
+        )
+        blocking_identity = operator._deployment_admission_register_tool_call(
+            "blocking-work",
+            operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC,
+        )
+        operator._SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = True
+        try:
+            with patch.object(operator.threading, "Timer", FakeTimer), patch.object(
+                operator, "_sync_tool_allocator_libc", return_value=libc
+            ), patch.object(
+                operator.time, "monotonic", return_value=200.0
+            ), patch.object(
+                operator,
+                "_SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC",
+                float("-inf"),
+            ):
+                self.assertTrue(
+                    operator._deployment_admission_release_tool_call(
+                        blocking_identity
+                    )
+                )
+                self.assertEqual(
+                    1, operator._deployment_admission_active_tool_calls()
+                )
+                self.assertEqual(1, len(timers))
+                self.assertEqual(0.0, timers[0].interval)
+                self.assertTrue(timers[0].daemon)
+                self.assertTrue(timers[0].started)
+                self.assertEqual([], calls)
+
+                timers[0].fire()
+
+            self.assertEqual([0], calls)
+            self.assertFalse(operator._SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED)
+        finally:
+            operator._deployment_admission_release_tool_call(read_only_identity)
 
     def test_trim_requires_material_free_arena_bytes_and_respects_cooldown(
         self,
@@ -675,7 +923,7 @@ class SyncToolAllocatorTrimTests(unittest.TestCase):
         self.assertFalse(operator._SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED)
         self.assertIsNone(operator._SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER)
 
-    def test_trim_cooldown_retry_rechecks_global_idle(self) -> None:
+    def test_trim_cooldown_retry_rechecks_drain_blocking_state(self) -> None:
         operator = _load_operator_module()
         calls: list[int] = []
         timers: list[object] = []
@@ -892,6 +1140,150 @@ class SyncToolAllocatorTrimTests(unittest.TestCase):
         self.assertIsNone(
             operator._SYNC_TOOL_ALLOCATOR_TRIM_RETRY_COALESCED_DELAY_SECONDS
         )
+
+    def test_trim_does_not_hold_admission_lock_during_allocator_call(self) -> None:
+        operator = _load_operator_module()
+        trim_started = threading.Event()
+        finish_trim = threading.Event()
+        calls: list[int] = []
+
+        def malloc_trim(pad):
+            trim_started.set()
+            if not finish_trim.wait(timeout=5):
+                raise RuntimeError("trim release timed out")
+            calls.append(pad)
+            return 1
+
+        libc = types.SimpleNamespace(
+            mallinfo2=lambda: types.SimpleNamespace(
+                fordblks=operator.SYNC_TOOL_ALLOCATOR_TRIM_FREE_BYTES
+            ),
+            malloc_trim=malloc_trim,
+        )
+        with patch.object(
+            operator, "_sync_tool_allocator_libc", return_value=libc
+        ), patch.object(
+            operator.time, "monotonic", return_value=100.0
+        ), patch.object(
+            operator,
+            "_SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC",
+            float("-inf"),
+        ):
+            trim_thread = threading.Thread(
+                target=operator._maybe_trim_sync_tool_allocator
+            )
+            trim_thread.start()
+            try:
+                self.assertTrue(trim_started.wait(timeout=1))
+                acquired = operator._DEPLOYMENT_ADMISSION_LOCK.acquire(
+                    blocking=False
+                )
+                if acquired:
+                    operator._DEPLOYMENT_ADMISSION_LOCK.release()
+                self.assertTrue(acquired)
+                identity = operator._deployment_admission_register_tool_call(
+                    "ordinary-read-during-trim",
+                    operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC,
+                    drain_blocking=False,
+                )
+                self.assertTrue(
+                    operator._deployment_admission_release_tool_call(identity)
+                )
+            finally:
+                finish_trim.set()
+                trim_thread.join(timeout=5)
+        self.assertFalse(trim_thread.is_alive())
+        self.assertEqual([0], calls)
+
+    def test_blocking_admission_waits_for_trim_without_stalling_event_loop(
+        self,
+    ) -> None:
+        operator = _load_operator_module()
+        operator._SYNC_TOOL_ALLOCATOR_TRIM_LOCK.acquire()
+
+        async def exercise() -> None:
+            heartbeat = asyncio.Event()
+            loop = asyncio.get_running_loop()
+            task = asyncio.create_task(
+                operator._deployment_admission_register_gated_tool_call(
+                    "blocking-work",
+                    operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC,
+                    drain_blocking=True,
+                )
+            )
+            loop.call_soon(heartbeat.set)
+            await asyncio.wait_for(heartbeat.wait(), timeout=1)
+            self.assertFalse(task.done())
+            operator._SYNC_TOOL_ALLOCATOR_TRIM_LOCK.release()
+            identity = await asyncio.wait_for(task, timeout=1)
+            try:
+                snapshot = operator._deployment_admission_snapshot()
+                self.assertEqual(1, snapshot["drain_blocking_tool_calls"])
+            finally:
+                operator._deployment_admission_release_tool_call(identity)
+
+        try:
+            asyncio.run(exercise())
+        finally:
+            if operator._SYNC_TOOL_ALLOCATOR_TRIM_LOCK.locked():
+                operator._SYNC_TOOL_ALLOCATOR_TRIM_LOCK.release()
+
+    def test_cancelled_blocking_admission_wait_does_not_orphan_identity(
+        self,
+    ) -> None:
+        operator = _load_operator_module()
+        operator._SYNC_TOOL_ALLOCATOR_TRIM_LOCK.acquire()
+        waiter_started = threading.Event()
+        waiter_finished = threading.Event()
+        original_register = (
+            operator._deployment_admission_register_drain_blocking_tool_call
+        )
+
+        def observed_register(tool_name, kind):
+            waiter_started.set()
+            try:
+                return original_register(tool_name, kind)
+            finally:
+                waiter_finished.set()
+
+        async def exercise() -> None:
+            with patch.object(
+                operator,
+                "_deployment_admission_register_drain_blocking_tool_call",
+                side_effect=observed_register,
+            ):
+                task = asyncio.create_task(
+                    operator._deployment_admission_register_gated_tool_call(
+                        "blocking-work",
+                        operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC,
+                        drain_blocking=True,
+                    )
+                )
+                self.assertTrue(
+                    await asyncio.to_thread(waiter_started.wait, 1)
+                )
+                task.cancel()
+                asyncio.get_running_loop().call_soon(
+                    operator._SYNC_TOOL_ALLOCATOR_TRIM_LOCK.release
+                )
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                self.assertTrue(
+                    await asyncio.to_thread(waiter_finished.wait, 1)
+                )
+                for _attempt in range(100):
+                    if operator._deployment_admission_active_tool_calls() == 0:
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertEqual(
+                    0, operator._deployment_admission_active_tool_calls()
+                )
+
+        try:
+            asyncio.run(exercise())
+        finally:
+            if operator._SYNC_TOOL_ALLOCATOR_TRIM_LOCK.locked():
+                operator._SYNC_TOOL_ALLOCATOR_TRIM_LOCK.release()
 
     def test_final_async_release_does_not_wait_for_in_progress_trim_gate(
         self,
@@ -2363,7 +2755,7 @@ class DeploymentAdmissionGateTests(unittest.TestCase):
 
         self.assertEqual(0, operator._deployment_admission_active_tool_calls())
 
-    def test_gate_overlapping_sync_bypasses_do_not_trim_until_global_idle(self) -> None:
+    def test_gate_overlapping_sync_bypasses_schedule_trim_after_each_release(self) -> None:
         operator = _load_operator_module()
         marker = {
             "kind": "grabowski_deployment_admission_observation",
