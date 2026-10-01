@@ -1972,6 +1972,14 @@ def _deployment_admission_active_tool_calls() -> int:
         return len(_DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY)
 
 
+def _deployment_admission_has_drain_blocking_tool_calls_locked() -> bool:
+    """Return whether any active tool call still blocks global allocator trim."""
+    return any(
+        entry.get("drain_blocking") is not False
+        for entry in _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY.values()
+    )
+
+
 def _repoground_consultation_tool_name(tool_name: Any) -> str | None:
     """Return one bounded public RepoGround tool name suitable for telemetry."""
     if (
@@ -2061,7 +2069,7 @@ def _deployment_admission_release_tool_call(identity: Any) -> bool:
         released = entry is not None
         retry_deferred_idle = (
             released
-            and not _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY
+            and not _deployment_admission_has_drain_blocking_tool_calls_locked()
             and _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED
         )
     if retry_deferred_idle:
@@ -2327,16 +2335,17 @@ def _schedule_sync_tool_allocator_trim_retry(delay_seconds: float) -> bool:
 
 
 def _maybe_trim_sync_tool_allocator() -> bool:
-    """Return free glibc pages at a globally idle MCP-tool boundary."""
+    """Return free glibc pages when no drain-blocking MCP tool is active."""
     global _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED
     global _SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC
     _SYNC_TOOL_ALLOCATOR_TRIM_LOCK.acquire()
     try:
-        # malloc_trim is process-wide. Hold admission closed through the
-        # allocator probe and trim so no newly admitted MCP tool can start
-        # allocating between the idle check and the global trim.
+        # malloc_trim is process-wide and glibc documents it as MT-Safe.
+        # Hold admission closed through the blocker check, allocator probe and
+        # trim so no newly admitted blocking call can race that decision.
+        # Already-running drain-neutral reads may continue concurrently.
         with _DEPLOYMENT_ADMISSION_LOCK:
-            if _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY:
+            if _deployment_admission_has_drain_blocking_tool_calls_locked():
                 _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = True
                 return False
             now = time.monotonic()

@@ -477,6 +477,109 @@ class SyncToolAllocatorTrimTests(unittest.TestCase):
         self.assertEqual([0], calls)
         self.assertFalse(operator._SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED)
 
+    def test_trim_allows_drain_neutral_overlap(self) -> None:
+        operator = _load_operator_module()
+        calls: list[int] = []
+        libc = self._libc(
+            operator.SYNC_TOOL_ALLOCATOR_TRIM_FREE_BYTES,
+            calls,
+        )
+        identity = operator._deployment_admission_register_tool_call(
+            "read-only-overlap",
+            operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC,
+            drain_blocking=False,
+            drain_neutral=True,
+        )
+        try:
+            with patch.object(
+                operator, "_sync_tool_allocator_libc", return_value=libc
+            ), patch.object(
+                operator.time, "monotonic", return_value=100.0
+            ), patch.object(
+                operator,
+                "_SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC",
+                float("-inf"),
+            ):
+                self.assertTrue(operator._maybe_trim_sync_tool_allocator())
+                self.assertEqual([0], calls)
+                self.assertEqual(
+                    1, operator._deployment_admission_active_tool_calls()
+                )
+                self.assertFalse(operator._SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED)
+        finally:
+            operator._deployment_admission_release_tool_call(identity)
+
+    def test_last_blocking_release_retries_with_drain_neutral_overlap(
+        self,
+    ) -> None:
+        operator = _load_operator_module()
+        calls: list[int] = []
+        timers: list[object] = []
+
+        class FakeTimer:
+            def __init__(self, interval, function, args=()):
+                self.interval = interval
+                self.function = function
+                self.args = args
+                self.daemon = False
+                self.started = False
+                timers.append(self)
+
+            def start(self):
+                self.started = True
+
+            def cancel(self):
+                pass
+
+            def fire(self):
+                self.function(*self.args)
+
+        libc = self._libc(
+            operator.SYNC_TOOL_ALLOCATOR_TRIM_FREE_BYTES,
+            calls,
+        )
+        read_only_identity = operator._deployment_admission_register_tool_call(
+            "read-only-overlap",
+            operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC,
+            drain_blocking=False,
+            drain_neutral=True,
+        )
+        blocking_identity = operator._deployment_admission_register_tool_call(
+            "blocking-work",
+            operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC,
+        )
+        operator._SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = True
+        try:
+            with patch.object(operator.threading, "Timer", FakeTimer), patch.object(
+                operator, "_sync_tool_allocator_libc", return_value=libc
+            ), patch.object(
+                operator.time, "monotonic", return_value=200.0
+            ), patch.object(
+                operator,
+                "_SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC",
+                float("-inf"),
+            ):
+                self.assertTrue(
+                    operator._deployment_admission_release_tool_call(
+                        blocking_identity
+                    )
+                )
+                self.assertEqual(
+                    1, operator._deployment_admission_active_tool_calls()
+                )
+                self.assertEqual(1, len(timers))
+                self.assertEqual(0.0, timers[0].interval)
+                self.assertTrue(timers[0].daemon)
+                self.assertTrue(timers[0].started)
+                self.assertEqual([], calls)
+
+                timers[0].fire()
+
+            self.assertEqual([0], calls)
+            self.assertFalse(operator._SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED)
+        finally:
+            operator._deployment_admission_release_tool_call(read_only_identity)
+
     def test_trim_requires_material_free_arena_bytes_and_respects_cooldown(
         self,
     ) -> None:
