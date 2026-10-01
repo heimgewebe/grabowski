@@ -344,6 +344,46 @@ class WorkAcquireTests(unittest.TestCase):
         acquire.assert_not_called()
         ensure.assert_not_called()
 
+    def test_unsupported_source_kind_blocks_before_resource_or_worktree_effect(self) -> None:
+        for source_kind in ("chat-thread", "github-pr"):
+            with self.subTest(source_kind=source_kind):
+                params = self.parameters()
+                params["source_kind"] = source_kind
+                acquire = Mock()
+                ensure = Mock()
+                with self.assertRaisesRegex(ValueError, "source_kind must be one of"):
+                    work_acquire.acquire_work(
+                        params,
+                        acquire_resources_fn=acquire,
+                        release_resources_fn=Mock(),
+                        inspect_resource_fn=Mock(),
+                        ensure_worktree_fn=ensure,
+                        runner=Mock(),
+                    )
+                acquire.assert_not_called()
+                ensure.assert_not_called()
+                self.assertFalse(self.state.exists())
+
+    def test_lifecycle_source_preserves_historical_noncanonical_binding(self) -> None:
+        params = self.parameters()
+        params["source_kind"] = "github-pr"
+        params["source_id"] = "heimgewebe/grabowski#1361"
+        normalized = work_acquire._normalize(params)
+        self.assertEqual(
+            work_acquire._lifecycle_source(normalized),
+            {"kind": "github-pr", "id": "heimgewebe/grabowski#1361"},
+        )
+
+    def test_supported_terminal_source_kind_is_preserved_for_lifecycle(self) -> None:
+        params = self.parameters()
+        params["source_kind"] = "github_issue"
+        params["source_id"] = "heimgewebe/grabowski#1"
+        normalized = work_acquire._normalize(params)
+        self.assertEqual(
+            work_acquire._lifecycle_source(normalized),
+            {"kind": "github_issue", "id": "heimgewebe/grabowski#1"},
+        )
+
     def test_acquires_narrow_resources_and_returns_ready_lane(self) -> None:
         seen: dict[str, object] = {}
         acquire_calls = 0
@@ -1402,6 +1442,63 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertEqual(ensure.call_count, 1)
         release.assert_not_called()
         preimage.assert_not_called()
+
+    def test_collected_writer_with_bound_finalization_is_terminal(self) -> None:
+        unit = "grabowski-job-123456789abc"
+        status = self.writer_status(unit, "succeeded", systemd_visible=False)
+        status["terminalization_evidence"] = {
+            "source": "persisted-runner-receipt",
+            "query_valid": True,
+            "systemd_visible": False,
+            "final_status": "succeeded",
+            "receipt_valid": True,
+            "receipt_sha256": "a" * 64,
+            "payload_sha256": "b" * 64,
+        }
+        status["finalization_receipt"] = {
+            "valid": True,
+            "final_status": "succeeded",
+            "receipt_sha256": "a" * 64,
+            "payload_sha256": "b" * 64,
+        }
+
+        liveness = work_acquire._scoped_writer_liveness(
+            self.writer_result(self.target),
+            Mock(return_value=status),
+        )
+
+        self.assertTrue(liveness["terminal"])
+        self.assertFalse(liveness["systemd_visible"])
+        self.assertEqual(
+            liveness["terminality_basis"], "collected_bound_finalization"
+        )
+
+    def test_collected_writer_receipt_digest_mismatch_stays_nonterminal(self) -> None:
+        unit = "grabowski-job-123456789abc"
+        status = self.writer_status(unit, "succeeded", systemd_visible=False)
+        status["terminalization_evidence"] = {
+            "source": "persisted-runner-receipt",
+            "query_valid": True,
+            "systemd_visible": False,
+            "final_status": "succeeded",
+            "receipt_valid": True,
+            "receipt_sha256": "a" * 64,
+            "payload_sha256": "b" * 64,
+        }
+        status["finalization_receipt"] = {
+            "valid": True,
+            "final_status": "succeeded",
+            "receipt_sha256": "c" * 64,
+            "payload_sha256": "b" * 64,
+        }
+
+        liveness = work_acquire._scoped_writer_liveness(
+            self.writer_result(self.target),
+            Mock(return_value=status),
+        )
+
+        self.assertFalse(liveness["terminal"])
+        self.assertEqual(liveness["terminality_basis"], "unproven")
 
     def test_invalid_existing_writer_status_evidence_fails_closed(self) -> None:
         params = self.parameters()
