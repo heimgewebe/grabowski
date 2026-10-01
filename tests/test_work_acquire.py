@@ -1433,6 +1433,63 @@ class WorkAcquireTests(unittest.TestCase):
         release.assert_not_called()
         preimage.assert_not_called()
 
+    def test_collected_writer_with_bound_finalization_is_terminal(self) -> None:
+        unit = "grabowski-job-123456789abc"
+        status = self.writer_status(unit, "succeeded", systemd_visible=False)
+        status["terminalization_evidence"] = {
+            "source": "persisted-runner-receipt",
+            "query_valid": True,
+            "systemd_visible": False,
+            "final_status": "succeeded",
+            "receipt_valid": True,
+            "receipt_sha256": "a" * 64,
+            "payload_sha256": "b" * 64,
+        }
+        status["finalization_receipt"] = {
+            "valid": True,
+            "final_status": "succeeded",
+            "receipt_sha256": "a" * 64,
+            "payload_sha256": "b" * 64,
+        }
+
+        liveness = work_acquire._scoped_writer_liveness(
+            self.writer_result(self.target),
+            Mock(return_value=status),
+        )
+
+        self.assertTrue(liveness["terminal"])
+        self.assertFalse(liveness["systemd_visible"])
+        self.assertEqual(
+            liveness["terminality_basis"], "collected_bound_finalization"
+        )
+
+    def test_collected_writer_receipt_digest_mismatch_stays_nonterminal(self) -> None:
+        unit = "grabowski-job-123456789abc"
+        status = self.writer_status(unit, "succeeded", systemd_visible=False)
+        status["terminalization_evidence"] = {
+            "source": "persisted-runner-receipt",
+            "query_valid": True,
+            "systemd_visible": False,
+            "final_status": "succeeded",
+            "receipt_valid": True,
+            "receipt_sha256": "a" * 64,
+            "payload_sha256": "b" * 64,
+        }
+        status["finalization_receipt"] = {
+            "valid": True,
+            "final_status": "succeeded",
+            "receipt_sha256": "c" * 64,
+            "payload_sha256": "b" * 64,
+        }
+
+        liveness = work_acquire._scoped_writer_liveness(
+            self.writer_result(self.target),
+            Mock(return_value=status),
+        )
+
+        self.assertFalse(liveness["terminal"])
+        self.assertEqual(liveness["terminality_basis"], "unproven")
+
     def test_invalid_existing_writer_status_evidence_fails_closed(self) -> None:
         params = self.parameters()
         params["scoped_writer_argv"] = ["writer", "--once"]

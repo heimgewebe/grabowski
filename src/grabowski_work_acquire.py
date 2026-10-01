@@ -2037,19 +2037,46 @@ def _scoped_writer_liveness(
     ):
         raise RuntimeError("scoped writer durable finalization evidence is invalid")
 
-    # Persisted runner receipts are intentionally not live-process evidence.
-    # Only a currently visible, already-terminal systemd unit proves writer
-    # quiescence. launch_failed is the one safe invisible case because the
-    # canonical job contract admits it only for a proven non-start.
-    terminal = (
-        systemd_visible
+    finalization_receipt = status.get("finalization_receipt")
+    collected_terminal = bool(
+        not systemd_visible
         and final_status in SYSTEMD_PROVEN_TERMINAL_SCOPED_WRITER_STATUSES
-    ) or (not systemd_visible and final_status == "launch_failed")
+        and terminalization.get("source") == "persisted-runner-receipt"
+        and terminalization.get("query_valid") is True
+        and terminalization.get("receipt_valid") is True
+        and isinstance(finalization_receipt, dict)
+        and finalization_receipt.get("valid") is True
+        and finalization_receipt.get("final_status") == final_status
+        and terminalization.get("receipt_sha256")
+        == finalization_receipt.get("receipt_sha256")
+        and terminalization.get("payload_sha256")
+        == finalization_receipt.get("payload_sha256")
+    )
+
+    # A visible terminal unit is direct quiescence evidence. After systemd has
+    # already collected a short-lived unit, accept only a fresh valid not-found
+    # observation that the canonical job-status path paired with the exact
+    # bound finalization receipt. A receipt by itself remains insufficient.
+    if systemd_visible and final_status in SYSTEMD_PROVEN_TERMINAL_SCOPED_WRITER_STATUSES:
+        terminality_basis = "systemd_visible_terminal"
+    elif collected_terminal:
+        terminality_basis = "collected_bound_finalization"
+    elif not systemd_visible and final_status == "launch_failed":
+        terminality_basis = "proven_nonstart"
+    else:
+        terminality_basis = "unproven"
+    terminal = terminality_basis != "unproven"
     material = {
         "unit": unit,
         "final_status": final_status,
         "systemd_visible": systemd_visible,
+        "terminality_basis": terminality_basis,
         "terminalization_evidence_sha256": _sha(terminalization),
+        "finalization_receipt_sha256": (
+            _sha(finalization_receipt)
+            if isinstance(finalization_receipt, dict)
+            else None
+        ),
     }
     return {
         **material,
