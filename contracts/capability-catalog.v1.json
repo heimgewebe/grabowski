@@ -515,7 +515,7 @@
     },
     {
       "category": "work-coordination",
-      "description": "Acquire a work lane, persist terminal closeout, or repair only its missing audit.",
+      "description": "Acquire a work lane, persist terminal closeout, or repair only its missing audit.\n\nNew acquisitions accept source_kind only from bureau_task, github_issue,\noperator_obligation, thread_focus, work_lane, direct, or direct-user.\nDirect sources bind checkout lifecycle evidence to the Work Lane itself.",
       "effects": [
         "resource-lease",
         "git-worktree-create",
