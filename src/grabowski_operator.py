@@ -2061,6 +2061,71 @@ def _deployment_admission_register_tool_call(
     return identity
 
 
+def _deployment_admission_register_drain_blocking_tool_call(
+    tool_name: Any,
+    kind: str,
+) -> str:
+    """Register blocking work while holding the allocator trim barrier."""
+    with _SYNC_TOOL_ALLOCATOR_TRIM_LOCK:
+        return _deployment_admission_register_tool_call(
+            tool_name,
+            kind,
+            drain_blocking=True,
+        )
+
+
+async def _deployment_admission_register_gated_tool_call(
+    tool_name: Any,
+    kind: str,
+    *,
+    drain_blocking: bool,
+) -> str:
+    """Register one gated call without stalling the event loop on allocator trim."""
+    if not isinstance(drain_blocking, bool):
+        raise ValueError("deployment admission drain_blocking must be boolean")
+    if not drain_blocking:
+        return _deployment_admission_register_tool_call(
+            tool_name,
+            kind,
+            drain_blocking=False,
+        )
+    if _SYNC_TOOL_ALLOCATOR_TRIM_LOCK.acquire(blocking=False):
+        try:
+            return _deployment_admission_register_tool_call(
+                tool_name,
+                kind,
+                drain_blocking=True,
+            )
+        finally:
+            _SYNC_TOOL_ALLOCATOR_TRIM_LOCK.release()
+    cancelled = False
+    pending_registration = asyncio.create_task(
+        asyncio.to_thread(
+            _deployment_admission_register_drain_blocking_tool_call,
+            tool_name,
+            kind,
+        )
+    )
+
+    def _release_cancelled_registration(completed: asyncio.Task[str]) -> None:
+        if not cancelled or completed.cancelled():
+            return
+        try:
+            identity = completed.result()
+        except Exception:
+            return
+        _deployment_admission_release_tool_call(identity)
+
+    pending_registration.add_done_callback(_release_cancelled_registration)
+    try:
+        return await asyncio.shield(pending_registration)
+    except asyncio.CancelledError:
+        cancelled = True
+        if pending_registration.done():
+            _release_cancelled_registration(pending_registration)
+        raise
+
+
 def _deployment_admission_release_tool_call(identity: Any) -> bool:
     if not isinstance(identity, str) or not identity:
         return False
@@ -2340,49 +2405,49 @@ def _maybe_trim_sync_tool_allocator() -> bool:
     global _SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC
     _SYNC_TOOL_ALLOCATOR_TRIM_LOCK.acquire()
     try:
-        # malloc_trim is process-wide and glibc documents it as MT-Safe.
-        # Hold admission closed through the blocker check, allocator probe and
-        # trim so no newly admitted blocking call can race that decision.
-        # Already-running drain-neutral reads may continue concurrently.
+        # The trim lock is also the admission barrier for new drain-blocking
+        # calls. Keep the deployment-admission lock short: ordinary nonblocking
+        # reads may register and release while process-wide malloc_trim runs,
+        # while a new blocking call waits off the event loop on the trim lock.
         with _DEPLOYMENT_ADMISSION_LOCK:
             if _deployment_admission_has_drain_blocking_tool_calls_locked():
                 _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = True
                 return False
-            now = time.monotonic()
-            libc = _sync_tool_allocator_libc()
-            if libc is None:
-                _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = False
-                _cancel_sync_tool_allocator_trim_retry()
-                return False
-            try:
-                free_bytes = int(libc.mallinfo2().fordblks)
-            except (AttributeError, OSError, TypeError, ValueError):
-                _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = False
-                _cancel_sync_tool_allocator_trim_retry()
-                return False
-            if free_bytes < SYNC_TOOL_ALLOCATOR_TRIM_FREE_BYTES:
-                _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = False
-                _cancel_sync_tool_allocator_trim_retry()
-                return False
-            elapsed = now - _SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC
-            if elapsed < SYNC_TOOL_ALLOCATOR_TRIM_MIN_INTERVAL_SECONDS:
-                # The free arena is already material, so a final request must
-                # not leave retention stranded merely because no later tool
-                # release occurs after the cooldown expires.
-                _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = True
-                _schedule_sync_tool_allocator_trim_retry(
-                    SYNC_TOOL_ALLOCATOR_TRIM_MIN_INTERVAL_SECONDS - elapsed
-                )
-                return False
-            # Record the attempt, not only a successful madvise, so an already
-            # trimmed arena cannot cause a malloc_trim storm on every small read.
-            _cancel_sync_tool_allocator_trim_retry()
-            _SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC = now
+        now = time.monotonic()
+        libc = _sync_tool_allocator_libc()
+        if libc is None:
             _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = False
-            try:
-                return bool(libc.malloc_trim(0))
-            except (AttributeError, OSError, TypeError, ValueError):
-                return False
+            _cancel_sync_tool_allocator_trim_retry()
+            return False
+        try:
+            free_bytes = int(libc.mallinfo2().fordblks)
+        except (AttributeError, OSError, TypeError, ValueError):
+            _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = False
+            _cancel_sync_tool_allocator_trim_retry()
+            return False
+        if free_bytes < SYNC_TOOL_ALLOCATOR_TRIM_FREE_BYTES:
+            _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = False
+            _cancel_sync_tool_allocator_trim_retry()
+            return False
+        elapsed = now - _SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC
+        if elapsed < SYNC_TOOL_ALLOCATOR_TRIM_MIN_INTERVAL_SECONDS:
+            # The free arena is already material, so a final request must
+            # not leave retention stranded merely because no later tool
+            # release occurs after the cooldown expires.
+            _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = True
+            _schedule_sync_tool_allocator_trim_retry(
+                SYNC_TOOL_ALLOCATOR_TRIM_MIN_INTERVAL_SECONDS - elapsed
+            )
+            return False
+        # Record the attempt, not only a successful madvise, so an already
+        # trimmed arena cannot cause a malloc_trim storm on every small read.
+        _cancel_sync_tool_allocator_trim_retry()
+        _SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC = now
+        _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = False
+        try:
+            return bool(libc.malloc_trim(0))
+        except (AttributeError, OSError, TypeError, ValueError):
+            return False
     finally:
         _SYNC_TOOL_ALLOCATOR_TRIM_LOCK.release()
 
@@ -2734,12 +2799,13 @@ def _install_deployment_admission_gate() -> None:
             if tool is not None and getattr(tool, "is_async", True) is False
             else _DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC
         )
-        identity = _deployment_admission_register_tool_call(
+        drain_blocking = _deployment_admission_drain_blocking(
+            tool_name, arguments, tool
+        )
+        identity = await _deployment_admission_register_gated_tool_call(
             tool_name,
             kind,
-            drain_blocking=_deployment_admission_drain_blocking(
-                tool_name, arguments, tool
-            ),
+            drain_blocking=drain_blocking,
         )
         maulwurf_guard: int | None = None
         release_in_finally = True
