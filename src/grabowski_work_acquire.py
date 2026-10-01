@@ -2208,9 +2208,6 @@ def _lifecycle_source(inputs: dict[str, Any]) -> dict[str, str]:
     source_id = source.get("id")
     if not isinstance(kind, str) or not isinstance(source_id, str):
         raise RuntimeError("work lane source binding is invalid")
-    if kind not in WORK_SOURCE_KINDS:
-        allowed = ", ".join(sorted(WORK_SOURCE_KINDS))
-        raise ValueError(f"source_kind must be one of {allowed}")
     if kind in DIRECT_SOURCE_KINDS:
         lane_id = inputs.get("lane_id")
         if not isinstance(lane_id, str) or not lane_id:
@@ -3293,6 +3290,10 @@ def acquire_work(
     writer_argv = inputs.pop("_scoped_writer_argv")
     lane_id = inputs["lane_id"]
     inputs_sha256 = _sha(inputs)
+    source_kind = inputs["source"]["kind"]
+    if source_kind not in WORK_SOURCE_KINDS:
+        allowed = ", ".join(sorted(WORK_SOURCE_KINDS))
+        raise ValueError(f"source_kind must be one of {allowed}")
     lifecycle_source = _lifecycle_source(inputs)
     acquisition_plan = _resource_acquisition_plan(inputs["resource_keys"])
     with _lane_lock(lane_id) as receipt_path:

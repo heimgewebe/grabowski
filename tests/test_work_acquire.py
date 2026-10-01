@@ -364,6 +364,16 @@ class WorkAcquireTests(unittest.TestCase):
                 ensure.assert_not_called()
                 self.assertFalse(self.state.exists())
 
+    def test_lifecycle_source_preserves_historical_noncanonical_binding(self) -> None:
+        params = self.parameters()
+        params["source_kind"] = "github-pr"
+        params["source_id"] = "heimgewebe/grabowski#1361"
+        normalized = work_acquire._normalize(params)
+        self.assertEqual(
+            work_acquire._lifecycle_source(normalized),
+            {"kind": "github-pr", "id": "heimgewebe/grabowski#1361"},
+        )
+
     def test_supported_terminal_source_kind_is_preserved_for_lifecycle(self) -> None:
         params = self.parameters()
         params["source_kind"] = "github_issue"
