@@ -2642,12 +2642,14 @@ def _worktree_registration_present(repository: Path, target: Path) -> bool:
     return False
 
 
+
 def _canonical_main_refresh_state(snapshot: dict[str, Any]) -> dict[str, Any]:
     return {
         key: snapshot.get(key)
         for key in (
             "canonical_repository",
             "current_head",
+            "current_branch",
             "target_head",
             "origin_main",
             "clean",
@@ -2697,20 +2699,21 @@ def _canonical_main_refresh_candidate(
         _git_result(canonical, "rev-parse", "--is-shallow-repository"),
         "canonical shallow-repository lookup",
     )
-    if branch != "main":
-        raise RuntimeError(
-            f"current-main refresh requires canonical main, found {branch}"
-        )
     if status:
-        raise RuntimeError("current-main refresh requires a clean canonical checkout")
+        raise RuntimeError(
+            "protected-main ref refresh requires a clean canonical checkout"
+        )
     if shallow != "false":
-        raise RuntimeError("current-main refresh requires a non-shallow canonical repository")
+        raise RuntimeError(
+            "protected-main ref refresh requires a non-shallow canonical repository"
+        )
     for label, value in (("HEAD", head), ("origin/main", origin_main)):
         if OBJECT_ID_RE.fullmatch(value) is None:
             raise RuntimeError(f"canonical {label} is not a full Git object ID")
     return {
         "canonical_repository": str(canonical),
         "current_head": head,
+        "current_branch": branch,
         "target_head": expected_head,
         "origin_main": origin_main,
         "clean": True,
@@ -2724,13 +2727,16 @@ def _origin_main_refresh_plan(expected_head: str) -> dict[str, Any]:
         CANONICAL_REPOSITORY,
         label="canonical repository",
     )
+    common_dir = _git_common_directory(canonical)
     generation = uuid.uuid4().hex[:12]
     return {
         "canonical_repository": canonical,
+        "git_common_directory": common_dir,
         "generation": generation,
         "owner_id": f"runtime-deploy-ref:{expected_head[:12]}:{generation}",
         "operation_key": f"repo:{canonical}:operation:{ORIGIN_MAIN_REFRESH_OPERATION}",
-        "path_key": f"path:{canonical}",
+        "objects_key": f"path:{common_dir / 'objects'}",
+        "origin_main_ref_key": f"path:{common_dir / 'refs/remotes/origin/main'}",
     }
 
 
@@ -2748,12 +2754,15 @@ def _acquire_origin_main_refresh_resources(
     )
     return resources.acquire_resources(
         plan["owner_id"],
-        [plan["operation_key"], plan["path_key"]],
+        [
+            plan["operation_key"],
+            plan["objects_key"],
+            plan["origin_main_ref_key"],
+        ],
         purpose=f"refresh exact protected-main deployment object {expected_head[:12]}",
         ttl_seconds=ORIGIN_MAIN_REFRESH_LEASE_TTL_SECONDS,
         metadata={"operation_scope": operation_scope},
     )
-
 
 def _release_origin_main_refresh_resources(
     plan: dict[str, Any],
@@ -2767,27 +2776,36 @@ def _release_origin_main_refresh_resources(
     )
 
 
+
 def _refresh_canonical_origin_main(
     expected_head: str,
     initial_snapshot: dict[str, Any],
 ) -> dict[str, Any]:
     if initial_snapshot.get("origin_main") == expected_head:
-        raise RuntimeError("current-main refresh was requested for an already-current origin/main")
+        raise RuntimeError(
+            "protected-main ref refresh was requested for an already-current origin/main"
+        )
     plan = _origin_main_refresh_plan(expected_head)
     canonical = plan["canonical_repository"]
     if initial_snapshot.get("canonical_repository") != str(canonical):
-        raise RuntimeError("current-main refresh snapshot repository mismatch")
+        raise RuntimeError("protected-main ref refresh snapshot repository mismatch")
     operation_lease: dict[str, Any] | None = None
-    path_lease: dict[str, Any] | None = None
+    objects_lease: dict[str, Any] | None = None
+    origin_main_ref_lease: dict[str, Any] | None = None
     try:
         acquisition = _acquire_origin_main_refresh_resources(plan, expected_head)
         operation_lease = _lease_for_key(acquisition, plan["operation_key"])
-        path_lease = _lease_for_key(acquisition, plan["path_key"])
-        locked = _canonical_main_refresh_candidate(expected_head, plan["owner_id"])
+        objects_lease = _lease_for_key(acquisition, plan["objects_key"])
+        origin_main_ref_lease = _lease_for_key(
+            acquisition, plan["origin_main_ref_key"]
+        )
+        locked = _canonical_main_refresh_candidate(expected_head)
         if _canonical_main_refresh_state(locked) != _canonical_main_refresh_state(
             initial_snapshot
         ):
-            raise RuntimeError("canonical main state drifted before exact object refresh")
+            raise RuntimeError(
+                "canonical checkout state drifted before exact protected-main refresh"
+            )
         public_before_fetch = _fresh_public_github_main(expected_head)
         if public_before_fetch != expected_head:
             raise RuntimeError(
@@ -2797,6 +2815,7 @@ def _refresh_canonical_origin_main(
         fetch_result = _mutating_git_result(
             canonical,
             "fetch",
+            "--no-auto-maintenance",
             "--no-tags",
             "--no-write-fetch-head",
             "--no-recurse-submodules",
@@ -2805,12 +2824,12 @@ def _refresh_canonical_origin_main(
         )
         if fetch_result.get("timed_out") is True or fetch_result.get("returncode") != 0:
             raise RuntimeError("exact protected-main object fetch failed")
-        after_fetch = _canonical_main_refresh_candidate(expected_head, plan["owner_id"])
+        after_fetch = _canonical_main_refresh_candidate(expected_head)
         if _canonical_main_refresh_state(after_fetch) != _canonical_main_refresh_state(
             initial_snapshot
         ):
             raise RuntimeError(
-                "canonical main or origin/main changed during exact object fetch"
+                "canonical checkout or origin/main changed during exact object fetch"
             )
         resolved_target = _required_stdout(
             _git_result(
@@ -2823,21 +2842,18 @@ def _refresh_canonical_origin_main(
         )
         if resolved_target != expected_head:
             raise RuntimeError("fetched protected-main object does not match expected head")
-        for label, predecessor in (
-            ("canonical HEAD", str(initial_snapshot["current_head"])),
-            ("origin/main", str(initial_snapshot["origin_main"])),
-        ):
-            ancestor = _git_result(
-                canonical,
-                "merge-base",
-                "--is-ancestor",
-                predecessor,
-                expected_head,
+        ancestor = _git_result(
+            canonical,
+            "merge-base",
+            "--is-ancestor",
+            str(initial_snapshot["origin_main"]),
+            expected_head,
+        )
+        if ancestor.get("timed_out") is True or ancestor.get("returncode") != 0:
+            raise RuntimeError(
+                "protected-main ref refresh requires prior origin/main to be an "
+                "ancestor of the deployment target"
             )
-            if ancestor.get("timed_out") is True or ancestor.get("returncode") != 0:
-                raise RuntimeError(
-                    f"current-main refresh requires {label} to be an ancestor of the deployment target"
-                )
         public_after_fetch = _fresh_public_github_main(expected_head)
         if public_after_fetch != expected_head:
             raise RuntimeError(
@@ -2863,14 +2879,18 @@ def _refresh_canonical_origin_main(
         if observed_origin_main != expected_head:
             if observed_origin_main == initial_snapshot.get("origin_main"):
                 raise RuntimeError("origin/main CAS update produced no effect")
-            raise RuntimeError("origin/main changed to an unexpected commit during CAS update")
-        after_cas = _canonical_main_refresh_candidate(expected_head, plan["owner_id"])
+            raise RuntimeError(
+                "origin/main changed to an unexpected commit during CAS update"
+            )
+        after_cas = _canonical_main_refresh_candidate(expected_head)
         expected_after = {
             **_canonical_main_refresh_state(initial_snapshot),
             "origin_main": expected_head,
         }
         if _canonical_main_refresh_state(after_cas) != expected_after:
-            raise RuntimeError("canonical state drifted during origin/main CAS update")
+            raise RuntimeError(
+                "canonical checkout state drifted during origin/main CAS update"
+            )
         public_after_cas = _fresh_public_github_main(expected_head)
         if public_after_cas != expected_head:
             _append_deploy_audit(
@@ -2894,11 +2914,13 @@ def _refresh_canonical_origin_main(
             "canonical_repository": str(canonical),
             "expected_head": expected_head,
             "previous_head": initial_snapshot["current_head"],
+            "previous_branch": initial_snapshot.get("current_branch"),
             "previous_origin_main": initial_snapshot["origin_main"],
             "observed_origin_main": observed_origin_main,
             "owner_id": plan["owner_id"],
             "operation_resource_key": plan["operation_key"],
-            "path_resource_key": plan["path_key"],
+            "objects_resource_key": plan["objects_key"],
+            "origin_main_ref_resource_key": plan["origin_main_ref_key"],
             "fetch": {
                 "returncode": fetch_result.get("returncode"),
                 "timed_out": fetch_result.get("timed_out") is True,
@@ -2927,6 +2949,7 @@ def _refresh_canonical_origin_main(
                 "operation": "runtime-deploy-origin-main-refreshed",
                 "expected_head": expected_head,
                 "previous_head": initial_snapshot["current_head"],
+                "previous_branch": initial_snapshot.get("current_branch"),
                 "previous_origin_main": initial_snapshot["origin_main"],
                 "observed_origin_main": observed_origin_main,
                 "receipt_sha256": receipt["receipt_sha256"],
@@ -2938,7 +2961,12 @@ def _refresh_canonical_origin_main(
         release_leases: list[dict[str, Any]] = []
         for label, resource_key, candidate_lease in (
             ("operation", plan["operation_key"], operation_lease),
-            ("path", plan["path_key"], path_lease),
+            ("objects", plan["objects_key"], objects_lease),
+            (
+                "origin-main-ref",
+                plan["origin_main_ref_key"],
+                origin_main_ref_lease,
+            ),
         ):
             if candidate_lease is None:
                 try:
@@ -2946,7 +2974,9 @@ def _refresh_canonical_origin_main(
                         resource_key, plan["owner_id"]
                     )
                 except Exception as cleanup_error:
-                    cleanup_failures.append((f"{label}-lease-readback", cleanup_error))
+                    cleanup_failures.append(
+                        (f"{label}-lease-readback", cleanup_error)
+                    )
                     candidate_lease = None
             if candidate_lease is not None:
                 release_keys.append(resource_key)
@@ -2961,7 +2991,9 @@ def _refresh_canonical_origin_main(
                     cleanup_failures.append(
                         (
                             "resource-release",
-                            RuntimeError("current-main refresh cleanup release was incomplete"),
+                            RuntimeError(
+                                "protected-main ref refresh cleanup release was incomplete"
+                            ),
                         )
                     )
             except Exception as cleanup_error:
@@ -2972,15 +3004,19 @@ def _refresh_canonical_origin_main(
                 + _cleanup_failure_text(cleanup_failures)
             ) from exc
         raise
-    assert operation_lease is not None and path_lease is not None
+    assert (
+        operation_lease is not None
+        and objects_lease is not None
+        and origin_main_ref_lease is not None
+    )
     release = _release_origin_main_refresh_resources(
         plan,
-        [plan["operation_key"], plan["path_key"]],
-        [operation_lease, path_lease],
+        [plan["operation_key"], plan["objects_key"], plan["origin_main_ref_key"]],
+        [operation_lease, objects_lease, origin_main_ref_lease],
     )
     released = release.get("released")
-    if not isinstance(released, list) or len(released) != 2:
-        raise RuntimeError("current-main refresh resource release was incomplete")
+    if not isinstance(released, list) or len(released) != 3:
+        raise RuntimeError("protected-main ref refresh resource release was incomplete")
     return receipt
 
 
@@ -2990,6 +3026,7 @@ def _canonical_stale_snapshot_state(snapshot: dict[str, Any]) -> dict[str, Any]:
         for key in (
             "canonical_repository",
             "current_head",
+            "current_branch",
             "target_head",
             "origin_main",
             "clean",
@@ -3029,40 +3066,26 @@ def _canonical_stale_main_snapshot(expected_head: str) -> dict[str, Any] | None:
         ),
         "canonical worktree status",
     )
-    if branch != "main":
-        raise RuntimeError(
-            f"automatic deployment source requires canonical main, found {branch}"
-        )
     if status:
-        raise RuntimeError("automatic deployment source requires a clean canonical checkout")
+        raise RuntimeError(
+            "automatic deployment source requires a clean canonical checkout"
+        )
     if origin_main != expected_head:
         raise RuntimeError(
             "automatic deployment source requires refs/remotes/origin/main to match "
             f"the deployment target: expected {expected_head}, found {origin_main}"
         )
-    if head == expected_head:
+    if head == expected_head and branch == "main":
         return None
-    ancestor = _git_result(
-        canonical,
-        "merge-base",
-        "--is-ancestor",
-        head,
-        expected_head,
-    )
-    if ancestor.get("timed_out") or ancestor.get("returncode") != 0:
-        raise RuntimeError(
-            "automatic deployment source requires current canonical main to be an "
-            "ancestor of the deployment target"
-        )
     return {
         "canonical_repository": str(canonical),
         "current_head": head,
+        "current_branch": branch,
         "target_head": expected_head,
         "origin_main": origin_main,
         "clean": True,
         "lease_evidence": lease_evidence,
     }
-
 
 def _auto_deploy_source_plan(expected_head: str) -> dict[str, Any]:
     canonical = _validated_repository_path(
@@ -4026,6 +4049,93 @@ def _deployment_source_preflight(
     }
 
 
+
+def _deployment_schedule_preflight(
+    expected_head: str,
+    source_repository: str | None,
+    source_lease_owner_id: str | None,
+) -> dict[str, Any]:
+    public_main = _fresh_public_github_main(expected_head)
+    if public_main != expected_head:
+        raise RuntimeError(
+            "fresh public GitHub main differs from deployment target: "
+            f"expected {expected_head}, found {public_main}"
+        )
+    if source_repository is not None:
+        repository, runner, source_identity = _deployment_source_preflight(
+            expected_head,
+            source_repository,
+            source_lease_owner_id,
+        )
+        return {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_schedule_preflight",
+            "resolution_mode": "bound-source",
+            "expected_head": expected_head,
+            "public_github_main": public_main,
+            "repository": str(repository),
+            "runner": str(runner),
+            "source_identity": source_identity,
+            "source_identity_sha256": source_identity["identity_sha256"],
+            "origin_main_refresh_required": False,
+            "canonical_state": None,
+            "ready": True,
+        }
+
+    try:
+        repository, runner, source_identity = _deployment_source_preflight(
+            expected_head,
+            None,
+            None,
+        )
+    except RuntimeError as canonical_error:
+        try:
+            canonical_state = _canonical_main_refresh_candidate(expected_head)
+            root = AUTO_DEPLOY_SOURCE_ROOT
+            if root.is_symlink() or not root.is_dir():
+                raise RuntimeError(
+                    f"automatic deployment source root is unavailable: {root}"
+                )
+            resolved_root = root.resolve(strict=True)
+            if resolved_root != root or not resolved_root.is_dir():
+                raise RuntimeError(
+                    "automatic deployment source root must be an exact real directory"
+                )
+        except Exception as fallback_error:
+            raise canonical_error from fallback_error
+        return {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_schedule_preflight",
+            "resolution_mode": "scheduler-auto-source",
+            "expected_head": expected_head,
+            "public_github_main": public_main,
+            "repository": None,
+            "runner": None,
+            "source_identity": None,
+            "source_identity_sha256": None,
+            "origin_main_refresh_required": (
+                canonical_state["origin_main"] != expected_head
+            ),
+            "canonical_state": _canonical_main_refresh_state(canonical_state),
+            "ready": True,
+        }
+
+    return {
+        "schema_version": 1,
+        "kind": "grabowski_runtime_deploy_schedule_preflight",
+        "resolution_mode": "bound-source",
+        "expected_head": expected_head,
+        "public_github_main": public_main,
+        "repository": str(repository),
+        "runner": str(runner),
+        "source_identity": source_identity,
+        "source_identity_sha256": source_identity["identity_sha256"],
+        "origin_main_refresh_required": False,
+        "canonical_state": None,
+        "ready": True,
+    }
+
+
 def _fresh_public_github_main(expected_head: str) -> str:
     if re.fullmatch(r"[0-9a-f]{40}", expected_head) is None:
         raise ValueError("public GitHub main verification requires one full SHA-1 commit id")
@@ -4140,6 +4250,7 @@ def grabowski_runtime_deploy_schedule(
                     canonical_refresh_snapshot = refresh_candidate
                     automatic_source_needed = (
                         refresh_candidate["current_head"] != expected_head
+                        or refresh_candidate.get("current_branch") != "main"
                     )
                 else:
                     if stale_snapshot is None:

@@ -3831,6 +3831,7 @@ def _runtime_deploy_delay_seconds(parameters: dict[str, Any]) -> int:
     return value
 
 
+
 def _runtime_deploy_self_preflight(
     expected_head: str,
     source_repository: str | None = None,
@@ -3838,31 +3839,54 @@ def _runtime_deploy_self_preflight(
 ) -> dict[str, Any]:
     import grabowski_self_deploy
 
-    repository, runner, source_identity = grabowski_self_deploy._deployment_source_preflight(
+    plan = grabowski_self_deploy._deployment_schedule_preflight(
         expected_head,
         source_repository,
         source_lease_owner_id,
     )
+    source_identity = plan.get("source_identity")
+    lease_evidence = (
+        source_identity.get("lease_evidence")
+        if isinstance(source_identity, dict)
+        else None
+    )
+    lease = (
+        lease_evidence.get("lease")
+        if isinstance(lease_evidence, dict)
+        else None
+    )
     return {
         "adapter": RUNTIME_DEPLOY_ADAPTER_GRABOWSKI_SELF,
-        "repository": str(repository),
-        "runner": str(runner),
+        "repository": plan.get("repository"),
+        "runner": plan.get("runner"),
         "job_root": str(grabowski_self_deploy.DEPLOY_JOB_ROOT),
         "job_prefix": grabowski_self_deploy.DEPLOY_JOB_PREFIX,
         "expected_head": expected_head,
-        "source_kind": source_identity["source_kind"],
-        "source_identity_sha256": source_identity["identity_sha256"],
-        "source_lease_resource_key": source_identity["lease_evidence"].get("resource_key"),
+        "resolution_mode": plan["resolution_mode"],
+        "source_kind": (
+            source_identity.get("source_kind")
+            if isinstance(source_identity, dict)
+            else "scheduler-auto-source"
+        ),
+        "source_identity_sha256": plan.get("source_identity_sha256"),
+        "source_lease_resource_key": (
+            lease_evidence.get("resource_key")
+            if isinstance(lease_evidence, dict)
+            else None
+        ),
         "source_lease_metadata_sha256": (
-            source_identity["lease_evidence"].get("lease") or {}
-        ).get("metadata_sha256"),
+            lease.get("metadata_sha256") if isinstance(lease, dict) else None
+        ),
+        "origin_main_refresh_required": plan.get(
+            "origin_main_refresh_required", False
+        ),
+        "canonical_state": plan.get("canonical_state"),
         "target": {
             "service": RUNTIME_DEPLOY_GRABOWSKI_SERVICE,
             "runtime_target": RUNTIME_DEPLOY_GRABOWSKI_TARGET,
         },
-        "ready": True,
+        "ready": plan.get("ready") is True,
     }
-
 
 def _runtime_deploy_self_schedule(
     expected_head: str,
@@ -3878,6 +3902,91 @@ def _runtime_deploy_self_schedule(
         source_repository,
         source_lease_owner_id,
     )
+
+
+
+def _runtime_deploy_self_schedule_source_preflight(
+    schedule: dict[str, Any],
+    expected_head: str,
+) -> dict[str, Any]:
+    import grabowski_self_deploy
+
+    if schedule.get("reused_across_source_identity") is True:
+        raise GripPreflightError(
+            "runtime deploy schedule reused a different source identity; "
+            "Captain requires exact source readback"
+        )
+    source_identity = schedule.get("source_identity")
+    expected_identity_sha256 = schedule.get("source_identity_sha256")
+    if (
+        not isinstance(source_identity, dict)
+        or not isinstance(expected_identity_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_identity_sha256)
+        or source_identity.get("identity_sha256") != expected_identity_sha256
+    ):
+        raise GripPreflightError(
+            "runtime deploy schedule source identity is missing or malformed"
+        )
+    source_kind = source_identity.get("source_kind")
+    repository_text = source_identity.get("repository")
+    if source_kind == "canonical-main":
+        source_repository = None
+        source_owner = None
+    elif source_kind == "detached-worktree":
+        if not isinstance(repository_text, str) or not repository_text.startswith("/"):
+            raise GripPreflightError(
+                "runtime deploy detached source repository is invalid"
+            )
+        lease_evidence = source_identity.get("lease_evidence")
+        lease = (
+            lease_evidence.get("lease")
+            if isinstance(lease_evidence, dict)
+            else None
+        )
+        source_owner = lease.get("owner_id") if isinstance(lease, dict) else None
+        if not isinstance(source_owner, str) or not source_owner:
+            raise GripPreflightError(
+                "runtime deploy detached source lease owner is missing"
+            )
+        source_repository = repository_text
+    else:
+        raise GripPreflightError(
+            "runtime deploy schedule source kind is not recognized"
+        )
+
+    repository, runner, observed_identity = (
+        grabowski_self_deploy._deployment_source_preflight(
+            expected_head,
+            source_repository,
+            source_owner,
+        )
+    )
+    if observed_identity["identity_sha256"] != expected_identity_sha256:
+        raise GripPreflightError(
+            "runtime deploy schedule source identity drifted after scheduling"
+        )
+    effective_identity = schedule.get("effective_source_identity_sha256")
+    if (
+        effective_identity is not None
+        and effective_identity != expected_identity_sha256
+    ):
+        raise GripPreflightError(
+            "runtime deploy scheduled job is bound to another source identity"
+        )
+    return {
+        "repository": str(repository),
+        "runner": str(runner),
+        "source_kind": observed_identity["source_kind"],
+        "source_identity_sha256": observed_identity["identity_sha256"],
+        "source_lease_resource_key": observed_identity["lease_evidence"].get(
+            "resource_key"
+        ),
+        "source_lease_metadata_sha256": (
+            (observed_identity["lease_evidence"].get("lease") or {}).get(
+                "metadata_sha256"
+            )
+        ),
+    }
 
 
 def _runtime_deploy_self_expected_argv_sha256(
@@ -15416,6 +15525,14 @@ def _runtime_deploy_schedule_errors(
         errors.append("runtime_deploy_schedule_argv_hash_mismatch")
     if schedule.get("source_identity_sha256") != expected_source_identity_sha256:
         errors.append("runtime_deploy_schedule_source_identity_mismatch")
+    if schedule.get("reused_across_source_identity") is True:
+        errors.append("runtime_deploy_schedule_reused_across_source_identity")
+    effective_source_identity_sha256 = schedule.get("effective_source_identity_sha256")
+    if (
+        effective_source_identity_sha256 is not None
+        and effective_source_identity_sha256 != expected_source_identity_sha256
+    ):
+        errors.append("runtime_deploy_schedule_effective_source_identity_mismatch")
     source_identity = schedule.get("source_identity")
     if not isinstance(source_identity, dict) or source_identity.get("identity_sha256") != expected_source_identity_sha256:
         errors.append("runtime_deploy_schedule_source_identity_missing_or_unbound")
@@ -15447,6 +15564,7 @@ def _runtime_deploy_schedule_errors(
     return errors
 
 
+
 def _run_captain_runtime_deploy(
     action: dict[str, Any],
     parameters: dict[str, Any],
@@ -15470,7 +15588,9 @@ def _run_captain_runtime_deploy(
         "verification_scope": "schedule-registration",
         "deployment_completion_verified": False,
     }
-    source_repository, source_lease_owner_id = _runtime_deploy_source_parameters(parameters)
+    source_repository, source_lease_owner_id = _runtime_deploy_source_parameters(
+        parameters
+    )
     target_errors = _captain_runtime_deploy_target_errors(action, parameters)
     if target_errors:
         execution_result["preflight_errors"] = target_errors
@@ -15488,7 +15608,10 @@ def _run_captain_runtime_deploy(
         )
     except (GripPreflightError, OSError, RuntimeError, ValueError) as exc:
         execution_result["preflight_errors"] = [str(exc)]
-        execution_result["verification_error"] = f"runtime deploy preflight failed; deployment not scheduled: {exc}"
+        execution_result["verification_error"] = (
+            "runtime deploy preflight failed; deployment not scheduled: "
+            f"{exc}"
+        )
         return execution_result
     execution_result["preflight"] = preflight
     execution_result["preflight_passed"] = True
@@ -15506,20 +15629,55 @@ def _run_captain_runtime_deploy(
             )
         )
         execution_result["command_returned"] = True
-    except Exception as exc:  # pragma: no cover - defensive receipt boundary
+    except Exception as exc:
         execution_result["runner_exception"] = (
             f"{type(exc).__name__}: {_bounded_command_output(str(exc), limit=512)}"
         )
         execution_result["mutation_outcome_unknown"] = True
         execution_result["local_mutation_outcome_unknown"] = True
         execution_result["verification_error"] = (
-            "runtime deploy scheduling raised an exception; a job may already have been registered"
+            "runtime deploy scheduling raised an exception; a job may already "
+            "have been registered"
         )
         return execution_result
     execution_result["schedule"] = schedule
+    if preflight.get("resolution_mode") == "scheduler-auto-source":
+        try:
+            source_readback = _runtime_deploy_self_schedule_source_preflight(
+                schedule,
+                expected_head,
+            )
+        except (GripPreflightError, OSError, RuntimeError, ValueError) as exc:
+            message = (
+                "runtime deploy schedule source readback failed after scheduling: "
+                f"{exc}"
+            )
+            execution_result["post_verify_errors"] = [message]
+            execution_result["mutation_outcome_unknown"] = True
+            execution_result["local_mutation_outcome_unknown"] = True
+            execution_result["verification_error"] = message
+            return execution_result
+    else:
+        source_readback = {
+            key: preflight[key]
+            for key in (
+                "repository",
+                "runner",
+                "source_kind",
+                "source_identity_sha256",
+                "source_lease_resource_key",
+                "source_lease_metadata_sha256",
+            )
+            if key in preflight
+        }
+    execution_result["source_readback"] = source_readback
     effective_delay = schedule.get("delay_seconds") if isinstance(schedule, dict) else None
     expected_schedule_hash = (
-        _runtime_deploy_self_expected_argv_sha256(preflight, expected_head, effective_delay)
+        _runtime_deploy_self_expected_argv_sha256(
+            {**preflight, **source_readback},
+            expected_head,
+            effective_delay,
+        )
         if isinstance(effective_delay, int) and not isinstance(effective_delay, bool)
         else ""
     )
@@ -15530,7 +15688,9 @@ def _run_captain_runtime_deploy(
         expected_argv_sha256=expected_schedule_hash,
         expected_job_root=str(preflight["job_root"]),
         expected_job_prefix=str(preflight["job_prefix"]),
-        expected_source_identity_sha256=str(preflight["source_identity_sha256"]),
+        expected_source_identity_sha256=str(
+            source_readback["source_identity_sha256"]
+        ),
     )
     if schedule_errors:
         execution_result["post_verify_errors"] = schedule_errors
@@ -15549,7 +15709,7 @@ def _run_captain_runtime_deploy(
         "logs_tool": schedule["logs_tool"],
         "unit": schedule["unit"],
         "expected_head": expected_head,
-        "source_identity_sha256": schedule["source_identity_sha256"],
+        "source_identity_sha256": source_readback["source_identity_sha256"],
     }
     execution_result["non_claims"] = [
         "schedule verification does not claim that the delayed deployment has completed",
@@ -15557,8 +15717,6 @@ def _run_captain_runtime_deploy(
         "runtime identity must be checked after the connector reconnects",
     ]
     return execution_result
-
-
 
 def _run_runtime_refresh_lease_release(
     spec: GripSpec,

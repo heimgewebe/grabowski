@@ -11640,6 +11640,29 @@ class RuntimeDeployGripTests(unittest.TestCase):
         self.assertFalse(result["output"]["mutation_attempted"])
         check.assert_called_once_with(expected)
 
+    def test_runtime_deploy_self_preflight_accepts_scheduler_auto_source(self) -> None:
+        expected = "d" * 40
+        plan = {
+            "resolution_mode": "scheduler-auto-source",
+            "repository": None,
+            "runner": None,
+            "source_identity": None,
+            "source_identity_sha256": None,
+            "origin_main_refresh_required": True,
+            "canonical_state": {"current_branch": "feature/active-work"},
+            "ready": True,
+        }
+        import grabowski_self_deploy
+        with patch.object(
+            grabowski_self_deploy,
+            "_deployment_schedule_preflight",
+            return_value=plan,
+        ):
+            result = grips._runtime_deploy_self_preflight(expected)
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["resolution_mode"], "scheduler-auto-source")
+        self.assertIsNone(result["source_identity_sha256"])
+
     def test_runtime_deploy_check_blocks_unknown_adapter_and_failed_preflight(self) -> None:
         unknown = grips.run_grip(
             "runtime-deploy-check",
@@ -14539,6 +14562,8 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         with patch.object(grips, "_runtime_deploy_self_preflight", return_value=preflight) as check, patch.object(
             grips, "_runtime_deploy_self_schedule", return_value=schedule
         ) as scheduler, patch.object(
+            grips, "_runtime_deploy_self_schedule_source_preflight", return_value=preflight
+        ), patch.object(
             grips, "_runtime_deploy_self_expected_argv_sha256", return_value=expected_argv_sha256
         ) as hash_check:
             result = grips.grip_run(
@@ -14566,6 +14591,131 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         check.assert_called_once_with(CAPTAIN_HEAD)
         scheduler.assert_called_once_with(CAPTAIN_HEAD, 8)
         hash_check.assert_called_once_with(preflight, CAPTAIN_HEAD, 8)
+
+    def test_captain_run_binds_scheduler_materialized_auto_source_identity(self) -> None:
+        action = captain_action(
+            action="runtime-deploy",
+            target={
+                "service": "grabowski-mcp",
+                "runtime_target": "heim-pc",
+                "adapter": "grabowski-self",
+            },
+            scope={
+                "allowed_effects": ["schedule one verified Grabowski self-deployment"],
+                "forbidden_effects": ["arbitrary shell", "other services", "other hosts"],
+                "boundaries": "single local Grabowski runtime",
+                "max_targets": 1,
+            },
+            risk={
+                "risk_level": "high",
+                "irreversibility": "reversible",
+                "recovery_path": "inspect the scheduled job and roll back to the previous release",
+            },
+            receipt_path="receipts/captain/runtime-deploy-auto-source.json",
+        )
+        parameters = captain_parameters(
+            [action],
+            trusted_owner_mode=True,
+            autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+            allow_execution=True,
+        )
+        parameters.pop("human_authorization")
+        parameters.pop("execution_authority")
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        preflight = {
+            "adapter": "grabowski-self",
+            "repository": None,
+            "runner": None,
+            "job_root": str(Path.home() / ".local/state/grabowski/jobs"),
+            "job_prefix": "grabowski-job-",
+            "expected_head": CAPTAIN_HEAD,
+            "resolution_mode": "scheduler-auto-source",
+            "source_kind": "scheduler-auto-source",
+            "source_identity_sha256": None,
+            "origin_main_refresh_required": True,
+            "canonical_state": {
+                "current_head": "a" * 40,
+                "current_branch": "feature/active-work",
+                "target_head": CAPTAIN_HEAD,
+                "origin_main": "b" * 40,
+                "clean": True,
+                "shallow": False,
+            },
+            "target": {"service": "grabowski-mcp", "runtime_target": "heim-pc"},
+            "ready": True,
+        }
+        source_repository = (
+            "/home/alex/repos/.grabowski-deploy-worktrees/"
+            "auto-current-main-captain-test"
+        )
+        source_sha = "e" * 64
+        source_readback = {
+            "repository": source_repository,
+            "runner": f"{source_repository}/tools/run_scheduled_deploy.py",
+            "source_kind": "detached-worktree",
+            "source_identity_sha256": source_sha,
+            "source_lease_resource_key": f"path:{source_repository}",
+            "source_lease_metadata_sha256": "f" * 64,
+        }
+        unit = "grabowski-job-fedcba654321"
+        job_dir = Path(preflight["job_root"]) / unit
+        expected_argv_sha256 = "d" * 64
+        schedule = {
+            "scheduled": True,
+            "already_scheduled": False,
+            "expected_head": CAPTAIN_HEAD,
+            "requested_delay_seconds": 8,
+            "delay_seconds": 8,
+            "unit": unit,
+            "argv_sha256": expected_argv_sha256,
+            "source_identity_sha256": source_sha,
+            "effective_source_identity_sha256": source_sha,
+            "source_identity": {"identity_sha256": source_sha},
+            "metadata_path": str(job_dir / "metadata.json"),
+            "stdout_path": str(job_dir / "stdout.log"),
+            "stderr_path": str(job_dir / "stderr.log"),
+            "expected_connector_disconnect": True,
+            "status_tool": "grabowski_job_status",
+            "logs_tool": "grabowski_job_logs",
+        }
+
+        with patch.object(
+            grips, "_runtime_deploy_self_preflight", return_value=preflight
+        ) as check, patch.object(
+            grips, "_runtime_deploy_self_schedule", return_value=schedule
+        ) as scheduler, patch.object(
+            grips,
+            "_runtime_deploy_self_schedule_source_preflight",
+            return_value=source_readback,
+        ) as source_check, patch.object(
+            grips,
+            "_runtime_deploy_self_expected_argv_sha256",
+            return_value=expected_argv_sha256,
+        ) as hash_check:
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=FakeGh(),
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        execution = result["output"]["executions"][0]
+        self.assertEqual("scheduler-auto-source", execution["preflight"]["resolution_mode"])
+        self.assertEqual(source_readback, execution["source_readback"])
+        self.assertEqual(
+            source_sha,
+            execution["next_verification"]["source_identity_sha256"],
+        )
+        check.assert_called_once_with(CAPTAIN_HEAD)
+        scheduler.assert_called_once_with(CAPTAIN_HEAD, 8)
+        source_check.assert_called_once_with(schedule, CAPTAIN_HEAD)
+        bound_preflight = hash_check.call_args.args[0]
+        self.assertEqual(source_repository, bound_preflight["repository"])
+        self.assertEqual("detached-worktree", bound_preflight["source_kind"])
+        self.assertEqual(source_sha, bound_preflight["source_identity_sha256"])
 
     def test_captain_run_marks_local_mutation_unknown_when_scheduler_receipt_is_invalid(self) -> None:
         action = captain_action(
@@ -14622,6 +14772,8 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         }
         with patch.object(grips, "_runtime_deploy_self_preflight", return_value=preflight), patch.object(
             grips, "_runtime_deploy_self_schedule", return_value=invalid_schedule
+        ), patch.object(
+            grips, "_runtime_deploy_self_schedule_source_preflight", return_value=preflight
         ), patch.object(
             grips, "_runtime_deploy_self_expected_argv_sha256", return_value="d" * 64
         ):

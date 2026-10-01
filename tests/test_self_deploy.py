@@ -946,20 +946,23 @@ class SelfDeployToolTests(unittest.TestCase):
                     _result("main"),
                     _result(expected),
                     _result(""),
-                    _result("", 0),
                 ],
             ) as git_result:
                 snapshot = SELF_DEPLOY._canonical_stale_main_snapshot(expected)
             self.assertEqual(snapshot["current_head"], current)
+            self.assertEqual(snapshot["current_branch"], "main")
             self.assertEqual(snapshot["target_head"], expected)
             self.assertEqual(snapshot["origin_main"], expected)
             self.assertTrue(snapshot["clean"])
-            self.assertEqual(
-                git_result.call_args_list[-1].args[1:],
-                ("merge-base", "--is-ancestor", current, expected),
+            self.assertFalse(
+                any(
+                    "merge-base" in call_item.args
+                    for call_item in git_result.call_args_list
+                )
             )
 
-    def test_canonical_stale_main_snapshot_rejects_non_fast_forward(self) -> None:
+
+    def test_canonical_stale_main_snapshot_allows_clean_non_main_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary).resolve()
             expected = "b" * 40
@@ -973,14 +976,18 @@ class SelfDeployToolTests(unittest.TestCase):
                 "_git_result",
                 side_effect=[
                     _result(current),
-                    _result("main"),
+                    _result("feature/active-work"),
                     _result(expected),
                     _result(""),
-                    _result("", 1),
                 ],
-            ):
-                with self.assertRaisesRegex(RuntimeError, "ancestor"):
-                    SELF_DEPLOY._canonical_stale_main_snapshot(expected)
+            ) as git_result:
+                snapshot = SELF_DEPLOY._canonical_stale_main_snapshot(expected)
+            self.assertEqual(snapshot["current_head"], current)
+            self.assertEqual(snapshot["current_branch"], "feature/active-work")
+            self.assertEqual(snapshot["origin_main"], expected)
+            self.assertFalse(
+                any("merge-base" in call_item.args for call_item in git_result.call_args_list)
+            )
 
     def test_current_main_refresh_candidate_does_not_require_target_object(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1012,62 +1019,100 @@ class SelfDeployToolTests(unittest.TestCase):
             self.assertNotIn(f"{expected}^{{commit}}", flattened)
             self.assertFalse(any("merge-base" in call_item.args for call_item in git_result.call_args_list))
 
+    def test_schedule_preflight_defers_exact_source_for_clean_non_main_checkout(self) -> None:
+        expected = "d" * 40
+        canonical_state = {
+            "canonical_repository": "/home/alex/repos/grabowski",
+            "current_head": "a" * 40,
+            "current_branch": "feature/active-work",
+            "target_head": expected,
+            "origin_main": "c" * 40,
+            "clean": True,
+            "shallow": False,
+            "lease_evidence": {
+                "resource_key": "path:/home/alex/repos/grabowski",
+                "lease": None,
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            with patch.object(
+                SELF_DEPLOY, "_fresh_public_github_main", return_value=expected
+            ), patch.object(
+                SELF_DEPLOY,
+                "_deployment_source_preflight",
+                side_effect=RuntimeError("HEAD drift"),
+            ), patch.object(
+                SELF_DEPLOY,
+                "_canonical_main_refresh_candidate",
+                return_value=canonical_state,
+            ), patch.object(
+                SELF_DEPLOY, "AUTO_DEPLOY_SOURCE_ROOT", root
+            ):
+                result = SELF_DEPLOY._deployment_schedule_preflight(
+                    expected, None, None
+                )
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["resolution_mode"], "scheduler-auto-source")
+        self.assertTrue(result["origin_main_refresh_required"])
+        self.assertIsNone(result["source_identity_sha256"])
+
+
     def test_origin_main_refresh_fetches_exact_public_object_then_cas_updates_tracking_ref(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary).resolve()
+            common = repo / ".git"
             expected = "c" * 40
             current = "a" * 40
             origin = "b" * 40
             owner = "runtime-deploy-ref:cccccccccccc:abc123def456"
             operation_key = f"repo:{repo}:operation:{SELF_DEPLOY.ORIGIN_MAIN_REFRESH_OPERATION}"
-            path_key = f"path:{repo}"
+            objects_key = f"path:{common / 'objects'}"
+            origin_ref_key = f"path:{common / 'refs/remotes/origin/main'}"
             plan = {
                 "canonical_repository": repo,
+                "git_common_directory": common,
                 "generation": "abc123def456",
                 "owner_id": owner,
                 "operation_key": operation_key,
-                "path_key": path_key,
+                "objects_key": objects_key,
+                "origin_main_ref_key": origin_ref_key,
             }
-            operation_lease = {
-                "resource_key": operation_key,
-                "owner_id": owner,
-                "acquired_at_unix": 10,
-                "updated_at_unix": 10,
-                "expires_at_unix": 100,
-                "metadata_sha256": "1" * 64,
-            }
-            path_lease = {
-                "resource_key": path_key,
-                "owner_id": owner,
-                "acquired_at_unix": 10,
-                "updated_at_unix": 10,
-                "expires_at_unix": 100,
-                "metadata_sha256": "2" * 64,
-            }
+            leases = [
+                {
+                    "resource_key": key,
+                    "owner_id": owner,
+                    "acquired_at_unix": 10,
+                    "updated_at_unix": 10,
+                    "expires_at_unix": 100,
+                    "metadata_sha256": str(index) * 64,
+                }
+                for index, key in enumerate(
+                    [operation_key, objects_key, origin_ref_key], start=1
+                )
+            ]
             initial = {
                 "canonical_repository": str(repo),
                 "current_head": current,
+                "current_branch": "feature/active-work",
                 "target_head": expected,
                 "origin_main": origin,
                 "clean": True,
                 "shallow": False,
-                "lease_evidence": {"resource_key": path_key, "lease": None},
+                "lease_evidence": {"resource_key": f"path:{repo}", "lease": None},
             }
-            locked = {
-                **initial,
-                "lease_evidence": {"resource_key": path_key, "lease": path_lease},
-            }
-            after_cas = {**locked, "origin_main": expected}
+            locked = dict(initial)
+            after_cas = {**initial, "origin_main": expected}
             with patch.object(
                 SELF_DEPLOY, "_origin_main_refresh_plan", return_value=plan
             ), patch.object(
                 SELF_DEPLOY,
                 "_acquire_origin_main_refresh_resources",
-                return_value={"leases": [operation_lease, path_lease]},
+                return_value={"leases": leases},
             ), patch.object(
                 SELF_DEPLOY,
                 "_release_origin_main_refresh_resources",
-                return_value={"released": [operation_lease, path_lease]},
+                return_value={"released": leases},
             ) as release, patch.object(
                 SELF_DEPLOY,
                 "_canonical_main_refresh_candidate",
@@ -1086,78 +1131,51 @@ class SelfDeployToolTests(unittest.TestCase):
                 side_effect=[
                     _result(expected),
                     _result("", 0),
-                    _result("", 0),
                     _result(expected),
                 ],
             ), patch.object(SELF_DEPLOY, "_append_deploy_audit"):
                 receipt = SELF_DEPLOY._refresh_canonical_origin_main(expected, initial)
             self.assertEqual(receipt["previous_origin_main"], origin)
+            self.assertEqual(receipt["previous_branch"], "feature/active-work")
             self.assertEqual(receipt["observed_origin_main"], expected)
+            self.assertEqual(receipt["objects_resource_key"], objects_key)
+            self.assertEqual(receipt["origin_main_ref_resource_key"], origin_ref_key)
             self.assertRegex(receipt["receipt_sha256"], r"[0-9a-f]{64}")
-            self.assertEqual(
-                mutate.call_args_list[0].args,
-                (
-                    repo,
-                    "fetch",
-                    "--no-tags",
-                    "--no-write-fetch-head",
-                    "--no-recurse-submodules",
-                    SELF_DEPLOY.PUBLIC_GITHUB_REPOSITORY_URL,
-                    SELF_DEPLOY.PUBLIC_GITHUB_MAIN_REF,
-                ),
-            )
-            self.assertEqual(
-                mutate.call_args_list[1].args,
-                (
-                    repo,
-                    "update-ref",
-                    "refs/remotes/origin/main",
-                    expected,
-                    origin,
-                ),
-            )
+            self.assertEqual(mutate.call_args_list[0].args[1], "fetch")
+            self.assertIn("--no-auto-maintenance", mutate.call_args_list[0].args)
+            self.assertEqual(mutate.call_args_list[1].args[1], "update-ref")
             release.assert_called_once_with(
-                plan, [operation_key, path_key], [operation_lease, path_lease]
+                plan,
+                [operation_key, objects_key, origin_ref_key],
+                leases,
             )
+
 
     def test_origin_main_refresh_malformed_acquisition_releases_live_leases(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary).resolve()
+            common = repo / ".git"
             expected = "c" * 40
             owner = "runtime-deploy-ref:cccccccccccc:abc123def456"
             operation_key = f"repo:{repo}:operation:{SELF_DEPLOY.ORIGIN_MAIN_REFRESH_OPERATION}"
-            path_key = f"path:{repo}"
-            plan = {"canonical_repository": repo, "owner_id": owner, "operation_key": operation_key, "path_key": path_key}
-            operation_lease = {"resource_key": operation_key, "owner_id": owner}
-            path_lease = {"resource_key": path_key, "owner_id": owner}
-            initial = {"canonical_repository": str(repo), "current_head": "a" * 40, "target_head": expected, "origin_main": "b" * 40, "clean": True, "shallow": False}
-            with patch.object(SELF_DEPLOY, "_origin_main_refresh_plan", return_value=plan), patch.object(SELF_DEPLOY, "_acquire_origin_main_refresh_resources", return_value={"leases": [operation_lease]}), patch.object(SELF_DEPLOY, "_live_auto_deploy_source_lease_snapshot", return_value=path_lease) as live_snapshot, patch.object(SELF_DEPLOY, "_release_origin_main_refresh_resources", return_value={"released": [operation_lease, path_lease]}) as release, patch.object(SELF_DEPLOY, "_canonical_main_refresh_candidate") as candidate:
-                with self.assertRaisesRegex(RuntimeError, "lease receipt omitted"):
-                    SELF_DEPLOY._refresh_canonical_origin_main(expected, initial)
-            live_snapshot.assert_called_once_with(path_key, owner)
-            release.assert_called_once_with(plan, [operation_key, path_key], [operation_lease, path_lease])
-            candidate.assert_not_called()
-
-    def test_origin_main_refresh_surfaces_cleanup_release_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            repo = Path(temporary).resolve()
-            expected = "c" * 40
-            owner = "runtime-deploy-ref:cccccccccccc:abc123def456"
-            operation_key = (
-                f"repo:{repo}:operation:{SELF_DEPLOY.ORIGIN_MAIN_REFRESH_OPERATION}"
-            )
-            path_key = f"path:{repo}"
+            objects_key = f"path:{common / 'objects'}"
+            origin_ref_key = f"path:{common / 'refs/remotes/origin/main'}"
             plan = {
                 "canonical_repository": repo,
                 "owner_id": owner,
                 "operation_key": operation_key,
-                "path_key": path_key,
+                "objects_key": objects_key,
+                "origin_main_ref_key": origin_ref_key,
             }
-            operation_lease = {"resource_key": operation_key, "owner_id": owner}
-            path_lease = {"resource_key": path_key, "owner_id": owner}
+            leases = [
+                {"resource_key": operation_key, "owner_id": owner},
+                {"resource_key": objects_key, "owner_id": owner},
+                {"resource_key": origin_ref_key, "owner_id": owner},
+            ]
             initial = {
                 "canonical_repository": str(repo),
                 "current_head": "a" * 40,
+                "current_branch": "feature/active-work",
                 "target_head": expected,
                 "origin_main": "b" * 40,
                 "clean": True,
@@ -1168,11 +1186,69 @@ class SelfDeployToolTests(unittest.TestCase):
             ), patch.object(
                 SELF_DEPLOY,
                 "_acquire_origin_main_refresh_resources",
-                return_value={"leases": [operation_lease]},
+                return_value={"leases": [leases[0]]},
             ), patch.object(
                 SELF_DEPLOY,
                 "_live_auto_deploy_source_lease_snapshot",
-                return_value=path_lease,
+                side_effect=leases[1:],
+            ) as live_snapshot, patch.object(
+                SELF_DEPLOY,
+                "_release_origin_main_refresh_resources",
+                return_value={"released": leases},
+            ) as release, patch.object(
+                SELF_DEPLOY, "_canonical_main_refresh_candidate"
+            ) as candidate:
+                with self.assertRaisesRegex(RuntimeError, "lease receipt omitted"):
+                    SELF_DEPLOY._refresh_canonical_origin_main(expected, initial)
+            self.assertEqual(live_snapshot.call_count, 2)
+            release.assert_called_once_with(
+                plan,
+                [operation_key, objects_key, origin_ref_key],
+                leases,
+            )
+            candidate.assert_not_called()
+
+
+    def test_origin_main_refresh_surfaces_cleanup_release_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary).resolve()
+            common = repo / ".git"
+            expected = "c" * 40
+            owner = "runtime-deploy-ref:cccccccccccc:abc123def456"
+            operation_key = f"repo:{repo}:operation:{SELF_DEPLOY.ORIGIN_MAIN_REFRESH_OPERATION}"
+            objects_key = f"path:{common / 'objects'}"
+            origin_ref_key = f"path:{common / 'refs/remotes/origin/main'}"
+            plan = {
+                "canonical_repository": repo,
+                "owner_id": owner,
+                "operation_key": operation_key,
+                "objects_key": objects_key,
+                "origin_main_ref_key": origin_ref_key,
+            }
+            leases = [
+                {"resource_key": operation_key, "owner_id": owner},
+                {"resource_key": objects_key, "owner_id": owner},
+                {"resource_key": origin_ref_key, "owner_id": owner},
+            ]
+            initial = {
+                "canonical_repository": str(repo),
+                "current_head": "a" * 40,
+                "current_branch": "feature/active-work",
+                "target_head": expected,
+                "origin_main": "b" * 40,
+                "clean": True,
+                "shallow": False,
+            }
+            with patch.object(
+                SELF_DEPLOY, "_origin_main_refresh_plan", return_value=plan
+            ), patch.object(
+                SELF_DEPLOY,
+                "_acquire_origin_main_refresh_resources",
+                return_value={"leases": [leases[0]]},
+            ), patch.object(
+                SELF_DEPLOY,
+                "_live_auto_deploy_source_lease_snapshot",
+                side_effect=leases[1:],
             ), patch.object(
                 SELF_DEPLOY,
                 "_release_origin_main_refresh_resources",
@@ -1183,50 +1259,57 @@ class SelfDeployToolTests(unittest.TestCase):
                 ):
                     SELF_DEPLOY._refresh_canonical_origin_main(expected, initial)
             release.assert_called_once_with(
-                plan, [operation_key, path_key], [operation_lease, path_lease]
+                plan,
+                [operation_key, objects_key, origin_ref_key],
+                leases,
             )
+
 
     def test_origin_main_refresh_blocks_public_drift_before_tracking_ref_cas(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary).resolve()
+            common = repo / ".git"
             expected = "c" * 40
             current = "a" * 40
             origin = "b" * 40
             owner = "runtime-deploy-ref:cccccccccccc:abc123def456"
             operation_key = f"repo:{repo}:operation:{SELF_DEPLOY.ORIGIN_MAIN_REFRESH_OPERATION}"
-            path_key = f"path:{repo}"
+            objects_key = f"path:{common / 'objects'}"
+            origin_ref_key = f"path:{common / 'refs/remotes/origin/main'}"
             plan = {
                 "canonical_repository": repo,
                 "generation": "abc123def456",
                 "owner_id": owner,
                 "operation_key": operation_key,
-                "path_key": path_key,
+                "objects_key": objects_key,
+                "origin_main_ref_key": origin_ref_key,
             }
-            operation_lease = {"resource_key": operation_key, "owner_id": owner}
-            path_lease = {"resource_key": path_key, "owner_id": owner}
+            leases = [
+                {"resource_key": operation_key, "owner_id": owner},
+                {"resource_key": objects_key, "owner_id": owner},
+                {"resource_key": origin_ref_key, "owner_id": owner},
+            ]
             initial = {
                 "canonical_repository": str(repo),
                 "current_head": current,
+                "current_branch": "feature/active-work",
                 "target_head": expected,
                 "origin_main": origin,
                 "clean": True,
                 "shallow": False,
-                "lease_evidence": {"resource_key": path_key, "lease": None},
+                "lease_evidence": {"resource_key": f"path:{repo}", "lease": None},
             }
-            locked = {
-                **initial,
-                "lease_evidence": {"resource_key": path_key, "lease": path_lease},
-            }
+            locked = dict(initial)
             with patch.object(
                 SELF_DEPLOY, "_origin_main_refresh_plan", return_value=plan
             ), patch.object(
                 SELF_DEPLOY,
                 "_acquire_origin_main_refresh_resources",
-                return_value={"leases": [operation_lease, path_lease]},
+                return_value={"leases": leases},
             ), patch.object(
                 SELF_DEPLOY,
                 "_release_origin_main_refresh_resources",
-                return_value={"released": [operation_lease, path_lease]},
+                return_value={"released": leases},
             ), patch.object(
                 SELF_DEPLOY,
                 "_canonical_main_refresh_candidate",
@@ -1245,10 +1328,11 @@ class SelfDeployToolTests(unittest.TestCase):
                 side_effect=[
                     _result(expected),
                     _result("", 0),
-                    _result("", 0),
                 ],
             ):
-                with self.assertRaisesRegex(RuntimeError, "drifted after exact object fetch"):
+                with self.assertRaisesRegex(
+                    RuntimeError, "drifted after exact object fetch"
+                ):
                     SELF_DEPLOY._refresh_canonical_origin_main(expected, initial)
             self.assertEqual(mutate.call_count, 1)
             self.assertEqual(mutate.call_args.args[1], "fetch")
