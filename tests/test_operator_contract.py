@@ -6372,6 +6372,8 @@ class GitServerVerifiedReadTransportTests(unittest.TestCase):
                 ["diff", "--cached", "--check"],
                 ["show", "--stat"],
                 ["log", "-1"],
+                ["status", "--short", "--branch"],
+                ["status", "--short", "--branch", "--untracked-files=normal"],
             ):
                 arguments = {
                     "repo": str(repo),
@@ -6422,6 +6424,40 @@ class GitServerVerifiedReadTransportTests(unittest.TestCase):
             self.assertEqual(second["returncode"], 0)
             self.assertIn("--no-ext-diff", first["argv"])
             self.assertIn("--no-textconv", first["argv"])
+            self.assertGreaterEqual(capability.call_count, 2)
+            mutation.assert_not_called()
+
+    def test_generic_git_status_repeats_without_mutation_or_index_write(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = self._repo(operator, temporary)
+            tracked = repo / "tracked.txt"
+            tracked.write_text("base\n", encoding="utf-8")
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "add", "tracked.txt"], check=True
+            )
+            index_path = repo / ".git" / "index"
+            before = hashlib.sha256(index_path.read_bytes()).hexdigest()
+            tracked.write_text("changed\n", encoding="utf-8")
+
+            with (
+                patch.object(operator, "_require_operator_capability") as capability,
+                patch.object(operator, "_require_operator_mutation") as mutation,
+            ):
+                first = operator.grabowski_git(
+                    str(repo),
+                    ["status", "--short", "--branch", "--untracked-files=normal"],
+                )
+                second = operator.grabowski_git(
+                    str(repo),
+                    ["status", "--short", "--branch", "--untracked-files=normal"],
+                )
+
+            after = hashlib.sha256(index_path.read_bytes()).hexdigest()
+            self.assertEqual(first["returncode"], 0)
+            self.assertEqual(second["returncode"], 0)
+            self.assertIn("tracked.txt", first["stdout"])
+            self.assertEqual(before, after)
             self.assertGreaterEqual(capability.call_count, 2)
             mutation.assert_not_called()
 
@@ -6651,7 +6687,6 @@ class GitServerVerifiedReadTransportTests(unittest.TestCase):
                 ["show", "--show-signature"],
                 ["show", "--show-sig"],
                 ["log", "--output=/tmp/log.txt"],
-                ["status", "--short"],
                 ["status", "--porc"],
                 ["diff", "--check"],
                 ["rev-parse", "--parseopt"],
