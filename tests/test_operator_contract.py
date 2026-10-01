@@ -6427,18 +6427,57 @@ class GitServerVerifiedReadTransportTests(unittest.TestCase):
             self.assertGreaterEqual(capability.call_count, 2)
             mutation.assert_not_called()
 
-    def test_generic_git_status_repeats_without_mutation_or_index_write(self) -> None:
+    def test_generic_git_status_repeats_without_filter_or_index_effects(self) -> None:
         operator = _load_operator_module()
         with tempfile.TemporaryDirectory() as temporary:
             repo = self._repo(operator, temporary)
-            tracked = repo / "tracked.txt"
-            tracked.write_text("base\n", encoding="utf-8")
             operator.subprocess.run(
-                ["git", "-C", str(repo), "add", "tracked.txt"], check=True
+                ["git", "-C", str(repo), "config", "user.name", "Test"], check=True
             )
+            operator.subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    "user.email",
+                    "test@example.invalid",
+                ],
+                check=True,
+            )
+            marker = Path(temporary) / "clean-filter-ran"
+            tracked = repo / "tracked.txt"
+            (repo / ".gitattributes").write_text(
+                "tracked.txt filter=sentinel\n", encoding="utf-8"
+            )
+            tracked.write_text("aaaa\n", encoding="utf-8")
+            operator.subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    "filter.sentinel.clean",
+                    f"sh -c 'touch {marker}; cat'",
+                ],
+                check=True,
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "add", ".gitattributes", "tracked.txt"],
+                check=True,
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True
+            )
+            marker.unlink(missing_ok=True)
             index_path = repo / ".git" / "index"
             before = hashlib.sha256(index_path.read_bytes()).hexdigest()
-            tracked.write_text("changed\n", encoding="utf-8")
+            original = tracked.stat()
+            tracked.write_text("bbbb\n", encoding="utf-8")
+            os.utime(
+                tracked,
+                ns=(original.st_atime_ns, original.st_mtime_ns),
+            )
 
             with (
                 patch.object(operator, "_require_operator_capability") as capability,
@@ -6456,10 +6495,137 @@ class GitServerVerifiedReadTransportTests(unittest.TestCase):
             after = hashlib.sha256(index_path.read_bytes()).hexdigest()
             self.assertEqual(first["returncode"], 0)
             self.assertEqual(second["returncode"], 0)
-            self.assertIn("tracked.txt", first["stdout"])
+            self.assertIn(" M tracked.txt", first["stdout"])
             self.assertEqual(before, after)
+            self.assertFalse(marker.exists())
+            self.assertEqual(first["read_strategy"], "config-isolated-shadow-status-v1")
             self.assertGreaterEqual(capability.call_count, 2)
             mutation.assert_not_called()
+
+    def test_generic_git_status_shadow_ignores_process_filter_configuration(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = self._repo(operator, temporary)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Test"], check=True
+            )
+            operator.subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    "user.email",
+                    "test@example.invalid",
+                ],
+                check=True,
+            )
+            marker = Path(temporary) / "process-filter-ran"
+            tracked = repo / "tracked.txt"
+            (repo / ".gitattributes").write_text(
+                "tracked.txt filter=sentinel\n", encoding="utf-8"
+            )
+            tracked.write_text("aaaa\n", encoding="utf-8")
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "add", ".gitattributes", "tracked.txt"],
+                check=True,
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True
+            )
+            operator.subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    "filter.sentinel.process",
+                    f"sh -c 'touch {marker}; exit 1'",
+                ],
+                check=True,
+            )
+            original = tracked.stat()
+            tracked.write_text("bbbb\n", encoding="utf-8")
+            os.utime(tracked, ns=(original.st_atime_ns, original.st_mtime_ns))
+
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "status", "--short"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertTrue(marker.exists())
+            marker.unlink()
+
+            result = operator.grabowski_git(
+                str(repo),
+                ["status", "--short", "--branch", "--untracked-files=normal"],
+            )
+            self.assertEqual(result["returncode"], 0)
+            self.assertIn(" M tracked.txt", result["stdout"])
+            self.assertFalse(marker.exists())
+            self.assertEqual(
+                result["read_strategy"], "config-isolated-shadow-status-v1"
+            )
+
+    def test_generic_git_status_shadow_supports_linked_worktree_index(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = self._repo(operator, temporary)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Test"], check=True
+            )
+            operator.subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    "user.email",
+                    "test@example.invalid",
+                ],
+                check=True,
+            )
+            tracked = repo / "tracked.txt"
+            tracked.write_text("base\n", encoding="utf-8")
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "add", "tracked.txt"], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True
+            )
+            linked = Path(temporary) / "linked"
+            operator.subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "feature",
+                    str(linked),
+                ],
+                check=True,
+            )
+            (linked / "tracked.txt").write_text("changed\n", encoding="utf-8")
+
+            first = operator.grabowski_git(
+                str(linked),
+                ["status", "--short", "--branch", "--untracked-files=normal"],
+            )
+            second = operator.grabowski_git(
+                str(linked),
+                ["status", "--short", "--branch", "--untracked-files=normal"],
+            )
+            self.assertEqual(first["returncode"], 0)
+            self.assertEqual(second["returncode"], 0)
+            self.assertIn("## feature", first["stdout"])
+            self.assertIn(" M tracked.txt", first["stdout"])
+            self.assertEqual(
+                first["read_strategy"], "config-isolated-shadow-status-v1"
+            )
 
     def test_generic_git_read_strips_inherited_trace_sinks(self) -> None:
         operator = _load_operator_module()
@@ -6688,6 +6854,8 @@ class GitServerVerifiedReadTransportTests(unittest.TestCase):
                 ["show", "--show-sig"],
                 ["log", "--output=/tmp/log.txt"],
                 ["status", "--porc"],
+                ["status", "--short", "--", "tracked.txt"],
+                ["status", "--short", "--untracked-files=all"],
                 ["diff", "--check"],
                 ["rev-parse", "--parseopt"],
                 ["-c", "diff.external=/tmp/helper", "diff", "--check"],

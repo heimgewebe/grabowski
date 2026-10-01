@@ -22,6 +22,7 @@ import shlex
 import signal
 import stat
 import subprocess
+import tempfile
 import sys
 import threading
 import time
@@ -764,6 +765,7 @@ GIT_SERVER_READ_ONLY_OPTIONS = {
         {
             "--branch",
             "--short",
+            "--untracked-files=normal",
         }
     ),
 }
@@ -784,8 +786,6 @@ def _git_server_read_option_allowed(subcommand: str, option: str) -> bool:
             or re.fullmatch(r"-n[1-9][0-9]{0,5}", option) is not None
             or re.fullmatch(r"--max-count=[1-9][0-9]{0,5}", option) is not None
         )
-    if subcommand == "status":
-        return re.fullmatch(r"--untracked-files=(?:no|normal|all)", option) is not None
     return False
 
 
@@ -821,6 +821,24 @@ def _server_verified_git_read_invocation(
         item in {"--cached", "--staged"} for item in command_arguments
     ):
         return None
+    if subcommand == "status":
+        # Never execute porcelain status itself on the replay-exempt path:
+        # worktree refresh may invoke repository-configured clean/process filters.
+        # Admit only the fixed short status projection reconstructed below from
+        # a config-isolated shadow Git directory.
+        if (
+            "--short" not in command_arguments
+            or len(command_arguments) != len(set(command_arguments))
+            or any(
+                item not in GIT_SERVER_READ_ONLY_OPTIONS["status"]
+                for item in command_arguments
+            )
+        ):
+            return None
+        return {
+            "subcommand": subcommand,
+            "command_arguments": list(command_arguments),
+        }
     after_separator = False
     for item in command_arguments:
         if after_separator:
@@ -945,6 +963,265 @@ def _git_server_read_command(
         ],
         cwd=repo,
     )
+
+
+def _git_server_plumbing_command(repo: Path, *arguments: str) -> list[str]:
+    return _validate_argv(
+        [
+            _trusted_git_cli_path(),
+            "-c",
+            "core.pager=cat",
+            "-c",
+            "pager.status=false",
+            "-c",
+            "diff.external=",
+            "-c",
+            "diff.trustExitCode=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "protocol.file.allow=never",
+            "-C",
+            str(repo),
+            *arguments,
+        ],
+        cwd=repo,
+    )
+
+
+def _git_server_safe_status(
+    repo: Path,
+    read_shape: dict[str, Any],
+    *,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    """Run short status against a config-free shadow Git directory."""
+
+    requested = list(read_shape["command_arguments"])
+    include_branch = "--branch" in requested
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    probes: list[dict[str, Any]] = []
+    metadata_environment = _git_server_read_environment()
+    explicit_remove = {
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG",
+        "GIT_EXEC_PATH",
+        "GIT_TEMPLATE_DIR",
+        "LD_LIBRARY_PATH",
+        "LD_PRELOAD",
+    }
+    for key in tuple(metadata_environment):
+        if key in explicit_remove or key.startswith("GIT_CONFIG_"):
+            metadata_environment.pop(key, None)
+    metadata_environment.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "PATH": "/usr/bin:/bin",
+        }
+    )
+
+    def run_probe(
+        arguments: list[str],
+        *,
+        environment: dict[str, str],
+        allowed: tuple[int, ...] = (0,),
+    ) -> dict[str, Any]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("safe Git status projection exceeded its total timeout")
+        result = _run(
+            _git_server_plumbing_command(repo, *arguments),
+            cwd=repo,
+            timeout_seconds=max(1, int(remaining) + 1),
+            max_output_bytes=MAX_OUTPUT_BYTES,
+            environment=environment,
+        )
+        probes.append(result)
+        if (
+            result.get("timed_out") is True
+            or result.get("stdout_truncated") is True
+            or result.get("stderr_truncated") is True
+            or result.get("returncode") not in allowed
+        ):
+            detail = str(result.get("stderr") or "").strip()
+            raise RuntimeError(
+                "safe Git status probe failed"
+                + (f": {detail}" if detail else "")
+            )
+        return result
+
+    head_probe = run_probe(
+        ["rev-parse", "--verify", "--quiet", "HEAD"],
+        environment=metadata_environment,
+        allowed=(0, 1),
+    )
+    head_oid = head_probe["stdout"].strip() if head_probe["returncode"] == 0 else None
+    if head_oid is not None and re.fullmatch(
+        r"[0-9a-f]{40}|[0-9a-f]{64}", head_oid
+    ) is None:
+        raise RuntimeError("safe Git status probe returned malformed HEAD")
+
+    format_probe = run_probe(
+        ["rev-parse", "--show-object-format"],
+        environment=metadata_environment,
+    )
+    object_format = format_probe["stdout"].strip()
+    if object_format not in {"sha1", "sha256"}:
+        raise RuntimeError("safe Git status probe returned unsupported object format")
+    if head_oid is not None and len(head_oid) != (
+        40 if object_format == "sha1" else 64
+    ):
+        raise RuntimeError("safe Git status HEAD/object-format mismatch")
+
+    try:
+        physical = grabowski_physical_checkout.capture_physical_checkout_identity(repo)
+        git_dir = Path(physical["git_dir"]["path"])
+        common_dir = Path(physical["common_dir"]["path"])
+    except Exception as exc:
+        raise RuntimeError("safe Git status could not bind the physical checkout") from exc
+    index_path = git_dir / "index"
+    objects_path = common_dir / "objects"
+    if not objects_path.is_dir() or objects_path.is_symlink():
+        raise RuntimeError("safe Git status object directory is unavailable")
+
+    branch_header: str | None = None
+    if include_branch:
+        branch_probe = run_probe(
+            ["symbolic-ref", "--quiet", "--short", "HEAD"],
+            environment=metadata_environment,
+            allowed=(0, 1),
+        )
+        if branch_probe["returncode"] == 0:
+            branch = branch_probe["stdout"].strip()
+            if (
+                not branch
+                or "\n" in branch
+                or "\r" in branch
+                or branch.startswith("-")
+                or len(branch.encode("utf-8")) > 512
+            ):
+                raise RuntimeError("safe Git status probe returned malformed branch")
+            branch_header = f"## {branch}"
+            upstream_probe = run_probe(
+                [
+                    "for-each-ref",
+                    "--format=%(upstream:short)",
+                    f"refs/heads/{branch}",
+                ],
+                environment=metadata_environment,
+            )
+            upstream = upstream_probe["stdout"].strip()
+            if upstream:
+                if (
+                    "\n" in upstream
+                    or "\r" in upstream
+                    or upstream.startswith("-")
+                    or len(upstream.encode("utf-8")) > 512
+                ):
+                    raise RuntimeError("safe Git status probe returned malformed upstream")
+                branch_header += f"...{upstream}"
+                counts = run_probe(
+                    ["rev-list", "--left-right", "--count", f"HEAD...{upstream}"],
+                    environment=metadata_environment,
+                    allowed=(0, 128),
+                )
+                if counts["returncode"] == 0:
+                    fields = counts["stdout"].split()
+                    if len(fields) != 2 or not all(
+                        item.isdigit() for item in fields
+                    ):
+                        raise RuntimeError(
+                            "safe Git status probe returned malformed divergence counts"
+                        )
+                    ahead, behind = (int(fields[0]), int(fields[1]))
+                    divergence = []
+                    if ahead:
+                        divergence.append(f"ahead {ahead}")
+                    if behind:
+                        divergence.append(f"behind {behind}")
+                    if divergence:
+                        branch_header += " [" + ", ".join(divergence) + "]"
+        else:
+            branch_header = "## HEAD (no branch)"
+
+    with tempfile.TemporaryDirectory(prefix="grabowski-status-shadow-") as temporary:
+        shadow = Path(temporary)
+        (shadow / "objects").mkdir(mode=0o700)
+        (shadow / "refs").mkdir(mode=0o700)
+        head_value = (
+            head_oid
+            if head_oid is not None
+            else "ref: refs/heads/grabowski-unborn"
+        )
+        (shadow / "HEAD").write_text(head_value + "\n", encoding="ascii")
+        config_lines = [
+            "[core]",
+            "\trepositoryformatversion = "
+            + ("0" if object_format == "sha1" else "1"),
+            "\tbare = false",
+        ]
+        if object_format == "sha256":
+            config_lines.extend(["[extensions]", "\tobjectFormat = sha256"])
+        (shadow / "config").write_text(
+            "\n".join(config_lines) + "\n",
+            encoding="ascii",
+        )
+        shadow_environment = dict(metadata_environment)
+        shadow_environment.update(
+            {
+                "GIT_DIR": str(shadow),
+                "GIT_WORK_TREE": str(repo),
+                "GIT_INDEX_FILE": str(index_path),
+                "GIT_OBJECT_DIRECTORY": str(objects_path),
+            }
+        )
+        status_result = run_probe(
+            [
+                "status",
+                "--short",
+                "--untracked-files=normal",
+                "--ignore-submodules=all",
+                "--no-renames",
+            ],
+            environment=shadow_environment,
+        )
+
+    stdout = status_result["stdout"]
+    if branch_header is not None:
+        stdout = branch_header + "\n" + stdout
+    stdout, late_truncated = _limit(stdout, MAX_OUTPUT_BYTES)
+    virtual_argv = _git_server_read_command(repo, read_shape)
+    return {
+        "argv": _redact_argv(virtual_argv),
+        "argv_sha256": _argv_hash(virtual_argv),
+        "command": _redacted_command(virtual_argv),
+        "cwd": str(repo),
+        "returncode": 0,
+        "timed_out": False,
+        "duration_seconds": round(time.monotonic() - started, 3),
+        "stdout": stdout,
+        "stderr": status_result["stderr"],
+        "stdout_truncated": status_result["stdout_truncated"] or late_truncated,
+        "stderr_truncated": status_result["stderr_truncated"],
+        "read_strategy": "config-isolated-shadow-status-v1",
+        "probe_argv_sha256s": [item["argv_sha256"] for item in probes],
+        "does_not_establish": [
+            "exact_git_status_porcelain_equivalence",
+            "submodule_worktree_status",
+            "repository_config_dependent_status_semantics",
+        ],
+    }
 
 
 def _github_pr_view_transport_read_only(arguments: Any) -> bool:
@@ -8082,6 +8359,12 @@ def grabowski_git(
     subcommand, _command_arguments, _configurations = _split_git_invocation(arguments)
     execution_timeout_seconds = _timeout(timeout_seconds)
 
+    if read_shape is not None and subcommand == "status":
+        return _git_server_safe_status(
+            path,
+            read_shape,
+            timeout_seconds=execution_timeout_seconds,
+        )
     if read_shape is not None:
         command = _git_server_read_command(path, read_shape)
         environment = _git_server_read_environment()
