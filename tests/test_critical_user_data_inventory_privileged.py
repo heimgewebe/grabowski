@@ -220,6 +220,141 @@ class CriticalUserDataInventoryPrivilegedTests(unittest.TestCase):
             helper.AUTHORIZED_CONTRACT_SHA256,
         )
 
+    def test_mainpid_inventory_transport_uses_direct_broker_socket(self) -> None:
+        reference = {
+            "request_id": "a" * 32,
+            "reference_sha256": "b" * 64,
+        }
+        response = {
+            "request_id": reference["request_id"],
+            "action": "critical_user_data_inventory_read",
+            "mode": "template",
+            "returncode": 0,
+            "timed_out": False,
+            "stdout": "{}",
+            "stderr": "",
+        }
+        response_bytes = json.dumps(response).encode("utf-8")
+        transport = mock.Mock()
+        transport.__enter__ = mock.Mock(return_value=transport)
+        transport.__exit__ = mock.Mock(return_value=False)
+        transport.recv = mock.Mock(side_effect=[response_bytes, b""])
+
+        with (
+            mock.patch.object(
+                privileged,
+                "_privileged_broker_status",
+                return_value={"ready": True},
+            ),
+            mock.patch.object(
+                privileged,
+                "_create_privileged_reference",
+                return_value=reference,
+            ),
+            mock.patch.object(
+                privileged.socket,
+                "socket",
+                return_value=transport,
+            ),
+            mock.patch.object(privileged.subprocess, "run") as subprocess_run,
+        ):
+            value = privileged._invoke_mainpid_privileged_reference(
+                action=privileged.CRITICAL_USER_DATA_INVENTORY_READ_ACTION,
+                target=_target("status"),
+                justification="test",
+                timeout_seconds=90,
+                max_output_bytes=128 * 1024,
+            )
+
+        subprocess_run.assert_not_called()
+        transport.connect.assert_called_once_with(str(privileged.BROKER_SOCKET))
+        transport.shutdown.assert_called_once_with(privileged.socket.SHUT_WR)
+        sent = json.loads(transport.sendall.call_args.args[0].decode("utf-8"))
+        self.assertEqual(sent, reference)
+        self.assertFalse(value["broker_client_timed_out"])
+        self.assertIsNone(value["broker_client_transport_error"])
+        self.assertEqual(
+            value["broker_response"],
+            {
+                **response,
+                "stdout_truncated_by_client": False,
+                "stderr_truncated_by_client": False,
+            },
+        )
+
+    def test_inventory_broker_call_uses_mainpid_transport(self) -> None:
+        status = {
+            "schema_version": 1,
+            "kind": "grabowski.critical_user_data_inventory_status.v1",
+            "status": "not-started",
+            "scanner_sha256": helper.AUTHORIZED_SCANNER_SHA256,
+            "contract_sha256": helper.AUTHORIZED_CONTRACT_SHA256,
+            "unit": "inventory.service",
+            "unit_state": {
+                "load": "not-found",
+                "active": "inactive",
+                "sub": "dead",
+                "result": "success",
+            },
+            "result_sha256": None,
+        }
+        invoked = {
+            "request_id": "c" * 32,
+            "reference_sha256": "d" * 64,
+            "broker_client_timed_out": False,
+            "broker_response": {
+                "returncode": 0,
+                "timed_out": False,
+                "stdout": json.dumps(status),
+            },
+        }
+        with (
+            mock.patch.object(
+                privileged,
+                "_invoke_mainpid_privileged_reference",
+                return_value=invoked,
+            ) as direct,
+            mock.patch.object(
+                privileged,
+                "_invoke_privileged_reference",
+            ) as subprocess_transport,
+        ):
+            observed, parsed = privileged._critical_inventory_broker_call(
+                "status",
+                helper.AUTHORIZED_SCANNER_SHA256,
+                helper.AUTHORIZED_CONTRACT_SHA256,
+                action=privileged.CRITICAL_USER_DATA_INVENTORY_READ_ACTION,
+            )
+
+        self.assertEqual(observed, invoked)
+        self.assertEqual(parsed["result"]["status"], "not-started")
+        direct.assert_called_once()
+        subprocess_transport.assert_not_called()
+
+    def test_inventory_read_surfaces_rootbroker_error(self) -> None:
+        invoked = {
+            "request_id": "e" * 32,
+            "reference_sha256": "f" * 64,
+            "broker_client_timed_out": False,
+            "broker_response": {
+                "error": "blockade lifecycle peer is not systemd MainPID"
+            },
+        }
+        with mock.patch.object(
+            privileged,
+            "_invoke_mainpid_privileged_reference",
+            return_value=invoked,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "broker rejected request: blockade lifecycle peer is not systemd MainPID",
+            ):
+                privileged.grabowski_critical_user_data_inventory_read(
+                    "status",
+                    helper.AUTHORIZED_SCANNER_SHA256,
+                    helper.AUTHORIZED_CONTRACT_SHA256,
+                )
+
     def test_action_accepts_only_canonical_typed_requests(self) -> None:
         start_action = _action()
         read_action = _action("critical_user_data_inventory_read")
@@ -1366,7 +1501,7 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
         with (
             mock.patch.object(
                 privileged,
-                "_invoke_privileged_reference",
+                "_invoke_mainpid_privileged_reference",
                 side_effect=[
                     invoked("pre-unhashable-start", status),
                     invoked("start-unhashable", malformed),
@@ -1427,7 +1562,7 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
         with (
             mock.patch.object(
                 privileged,
-                "_invoke_privileged_reference",
+                "_invoke_mainpid_privileged_reference",
                 side_effect=[
                     invoked("pre-unhashable-readback", status),
                     invoked("start-timeout-unhashable", timed_out=True),
@@ -1966,7 +2101,7 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
         ]
         with (
             mock.patch.object(
-                privileged, "_invoke_privileged_reference", side_effect=invoked
+                privileged, "_invoke_mainpid_privileged_reference", side_effect=invoked
             ),
             mock.patch.object(
                 privileged.operator, "_require_operator_mutation", return_value=None
@@ -2043,7 +2178,7 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
         ]
         with (
             mock.patch.object(
-                privileged, "_invoke_privileged_reference", side_effect=invoked
+                privileged, "_invoke_mainpid_privileged_reference", side_effect=invoked
             ),
             mock.patch.object(
                 privileged.operator, "_require_operator_mutation", return_value=None
@@ -2329,7 +2464,7 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
         }
         with mock.patch.object(
             privileged,
-            "_invoke_privileged_reference",
+            "_invoke_mainpid_privileged_reference",
             return_value=invoked,
         ):
             observed, parsed = privileged._critical_inventory_broker_call(
@@ -2363,7 +2498,7 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
             ) as mutation_gate,
             mock.patch.object(
                 privileged,
-                "_invoke_privileged_reference",
+                "_invoke_mainpid_privileged_reference",
                 return_value=invoked,
             ),
         ):
