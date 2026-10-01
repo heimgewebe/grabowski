@@ -36,6 +36,9 @@ SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
 IDEMPOTENCY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 SUCCESS_STATES = frozenset({"CREATED", "ALREADY_CORRECT"})
 DIRECT_SOURCE_KINDS = frozenset({"direct", "direct-user"})
+WORK_SOURCE_KINDS = frozenset(
+    DIRECT_SOURCE_KINDS | checkouts.TERMINAL_EVIDENCE_SOURCE_KINDS
+)
 MAX_WRITE_PATHS = 256
 MAX_WRITER_ARGV = 256
 MAX_WRITER_ARGUMENT_BYTES = 8192
@@ -2034,19 +2037,46 @@ def _scoped_writer_liveness(
     ):
         raise RuntimeError("scoped writer durable finalization evidence is invalid")
 
-    # Persisted runner receipts are intentionally not live-process evidence.
-    # Only a currently visible, already-terminal systemd unit proves writer
-    # quiescence. launch_failed is the one safe invisible case because the
-    # canonical job contract admits it only for a proven non-start.
-    terminal = (
-        systemd_visible
+    finalization_receipt = status.get("finalization_receipt")
+    collected_terminal = bool(
+        not systemd_visible
         and final_status in SYSTEMD_PROVEN_TERMINAL_SCOPED_WRITER_STATUSES
-    ) or (not systemd_visible and final_status == "launch_failed")
+        and terminalization.get("source") == "persisted-runner-receipt"
+        and terminalization.get("query_valid") is True
+        and terminalization.get("receipt_valid") is True
+        and isinstance(finalization_receipt, dict)
+        and finalization_receipt.get("valid") is True
+        and finalization_receipt.get("final_status") == final_status
+        and terminalization.get("receipt_sha256")
+        == finalization_receipt.get("receipt_sha256")
+        and terminalization.get("payload_sha256")
+        == finalization_receipt.get("payload_sha256")
+    )
+
+    # A visible terminal unit is direct quiescence evidence. After systemd has
+    # already collected a short-lived unit, accept only a fresh valid not-found
+    # observation that the canonical job-status path paired with the exact
+    # bound finalization receipt. A receipt by itself remains insufficient.
+    if systemd_visible and final_status in SYSTEMD_PROVEN_TERMINAL_SCOPED_WRITER_STATUSES:
+        terminality_basis = "systemd_visible_terminal"
+    elif collected_terminal:
+        terminality_basis = "collected_bound_finalization"
+    elif not systemd_visible and final_status == "launch_failed":
+        terminality_basis = "proven_nonstart"
+    else:
+        terminality_basis = "unproven"
+    terminal = terminality_basis != "unproven"
     material = {
         "unit": unit,
         "final_status": final_status,
         "systemd_visible": systemd_visible,
+        "terminality_basis": terminality_basis,
         "terminalization_evidence_sha256": _sha(terminalization),
+        "finalization_receipt_sha256": (
+            _sha(finalization_receipt)
+            if isinstance(finalization_receipt, dict)
+            else None
+        ),
     }
     return {
         **material,
@@ -3260,6 +3290,10 @@ def acquire_work(
     writer_argv = inputs.pop("_scoped_writer_argv")
     lane_id = inputs["lane_id"]
     inputs_sha256 = _sha(inputs)
+    source_kind = inputs["source"]["kind"]
+    if source_kind not in WORK_SOURCE_KINDS:
+        allowed = ", ".join(sorted(WORK_SOURCE_KINDS))
+        raise ValueError(f"source_kind must be one of {allowed}")
     lifecycle_source = _lifecycle_source(inputs)
     acquisition_plan = _resource_acquisition_plan(inputs["resource_keys"])
     with _lane_lock(lane_id) as receipt_path:
@@ -4148,7 +4182,12 @@ def grabowski_work_acquire(
     ttl_seconds: int = 7200,
     terminal_closeout: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Acquire a work lane, persist terminal closeout, or repair only its missing audit."""
+    """Acquire a work lane, persist terminal closeout, or repair only its missing audit.
+
+    New acquisitions accept source_kind only from bureau_task, github_issue,
+    operator_obligation, thread_focus, work_lane, direct, or direct-user.
+    Direct sources bind checkout lifecycle evidence to the Work Lane itself.
+    """
     parameters = {
         "source_kind": source_kind,
         "source_id": source_id,
