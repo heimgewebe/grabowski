@@ -45,6 +45,10 @@ _FLOWLINES_BSP_MAX_QUEUE_SIZE = 512
 _FLOWLINES_BSP_SCHEDULE_DELAY_MILLIS = 1_000
 _FLOWLINES_BSP_MAX_EXPORT_BATCH_SIZE = 64
 _FLOWLINES_BSP_EXPORT_TIMEOUT_MILLIS = 5_000
+ReportOutcomeUnmetNeeds = Annotated[
+    list[Annotated[str, Field(min_length=1, max_length=512)]],
+    Field(max_length=16),
+]
 _FLOWLINES_FORBIDDEN_EXPORT_ENV = (
     "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
     "OTEL_PYTHON_EXPORTER_OTLP_HTTP_CREDENTIAL_PROVIDER",
@@ -491,7 +495,7 @@ def _register_report_outcome(mcp: Any, read_only_annotations: Any) -> None:
         user_intent: Annotated[str, Field(min_length=1, max_length=256)],
         status: Literal["accomplished", "partial", "failed"],
         outcome_summary: Annotated[str, Field(min_length=1, max_length=2_000)],
-        unmet_needs: list[str] | None = None,
+        unmet_needs: ReportOutcomeUnmetNeeds | None = None,
     ) -> dict[str, bool]:
         """REQUIRED final call in every conversation before the assistant gives its final answer.
 

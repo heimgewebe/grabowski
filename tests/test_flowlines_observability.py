@@ -136,6 +136,13 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         )
         status_schema = report.parameters["properties"]["status"]
         self.assertEqual(status_schema.get("enum"), ["accomplished", "partial", "failed"])
+        unmet_schema = report.parameters["properties"]["unmet_needs"]
+        unmet_array = next(
+            item for item in unmet_schema.get("anyOf", []) if item.get("type") == "array"
+        )
+        self.assertEqual(unmet_array.get("maxItems"), 16)
+        self.assertEqual(unmet_array["items"].get("minLength"), 1)
+        self.assertEqual(unmet_array["items"].get("maxLength"), 512)
 
     async def test_success_span_contains_canonical_contract_and_strips_analytics_args(self) -> None:
         mcp = self.server()
@@ -686,6 +693,33 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             json.loads(span.attributes["gen_ai.tool.call.result"])["structuredContent"],
             {"accepted": True},
         )
+
+    async def test_report_outcome_rejects_unbounded_unmet_needs(self) -> None:
+        mcp = FastMCP("grabowski-test", instructions="fixture")
+        flowlines.configure_flowlines_observability(mcp, READ_ONLY, tracer=self.tracer)
+
+        base = {
+            "reason": "Validate bounded outcome telemetry",
+            "user_intent": "Keep Flowlines terminal reports bounded",
+            "status": "partial",
+            "outcome_summary": "Some work remains.",
+        }
+        too_many = await self.call(
+            mcp,
+            name="report_outcome",
+            arguments={**base, "unmet_needs": ["item"] * 17},
+            meta=self.meta(),
+        )
+        too_long = await self.call(
+            mcp,
+            name="report_outcome",
+            arguments={**base, "unmet_needs": ["x" * 513]},
+            meta=self.meta(),
+        )
+
+        self.assertTrue(too_many.root.isError)
+        self.assertTrue(too_long.root.isError)
+        self.assertEqual(self.exporter.get_finished_spans(), ())
 
     async def test_traceparent_is_propagated(self) -> None:
         mcp = self.server()
