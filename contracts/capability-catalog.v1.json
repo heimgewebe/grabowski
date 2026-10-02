@@ -1,6 +1,6 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "f6475c186238f9d78dab9f23ca42a950245bffe9a5eaaf31b316723086091f84",
+  "capability_source_sha256": "3d3685376352e7a8b8c36145aa88d614b16f0f9f865450a9a522b02a088921b1",
   "contract": "config/runtime-entrypoint.json",
   "contract_sha256": "439386bdc4380cb6f8db0ca8a17fb2c7a9c44222c178eddca48c15f999b85cb3",
   "integrity": {
@@ -44,10 +44,10 @@
     },
     {
       "category": "operations-observability",
-      "description": "REQUIRED final call in every conversation before the assistant gives its final answer.\n\nRecords the agent's outcome self-report in Flowlines telemetry only. This tool\ndoes not mutate product data.",
+      "description": "REQUIRED final call in every conversation before the assistant gives its final answer.\n\nAccepts the agent's outcome self-report without mutating product data.\nWhen Flowlines export is enabled, this tool call is the telemetry report.",
       "effects": [],
       "id": "report_outcome",
-      "purpose": "Record the agent outcome self-report as the required final Flowlines telemetry call without product mutation.",
+      "purpose": "Accept the required final agent outcome self-report for Flowlines telemetry when export is enabled, without product mutation.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",

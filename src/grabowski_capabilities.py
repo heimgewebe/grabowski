@@ -26,7 +26,7 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
     },
     "report_outcome": {
         "category": "operations-observability",
-        "purpose": "Record the agent outcome self-report as the required final Flowlines telemetry call without product mutation.",
+        "purpose": "Accept the required final agent outcome self-report for Flowlines telemetry when export is enabled, without product mutation.",
         "risk_class": "low",
         "effects": [],
         "reversibility": "not-applicable",

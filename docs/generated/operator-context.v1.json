@@ -104,10 +104,10 @@
     },
     {
       "category": "operations-observability",
-      "description": "REQUIRED final call in every conversation before the assistant gives its final answer.\n\nRecords the agent's outcome self-report in Flowlines telemetry only. This tool\ndoes not mutate product data.",
+      "description": "REQUIRED final call in every conversation before the assistant gives its final answer.\n\nAccepts the agent's outcome self-report without mutating product data.\nWhen Flowlines export is enabled, this tool call is the telemetry report.",
       "effects": [],
       "id": "report_outcome",
-      "purpose": "Record the agent outcome self-report as the required final Flowlines telemetry call without product mutation.",
+      "purpose": "Accept the required final agent outcome self-report for Flowlines telemetry when export is enabled, without product mutation.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
@@ -3650,7 +3650,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "f6475c186238f9d78dab9f23ca42a950245bffe9a5eaaf31b316723086091f84"
+      "sha256": "3d3685376352e7a8b8c36145aa88d614b16f0f9f865450a9a522b02a088921b1"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3768,7 +3768,7 @@
       "src/grabowski_repobrief.py": "1e842a9f310c967012914afbaf2dbbc4af3a29c222734f14f902421773713ded",
       "src/grabowski_repoground_catalog.py": "b8ea8d611a37bb287ae8836790c6aa7abf29c08dcccf252492fb355c9f9ba58f",
       "src/grabowski_resources.py": "4c6fa4fff67425607702a23bbdf33fb2deeb6da43430b844a6bb12d1e54fac57",
-      "src/grabowski_runtime.py": "72068a6c3ca5cbf8947c196cca16d7484bc743700ff90531f533451298c3724c",
+      "src/grabowski_runtime.py": "729f806e59aaf3d641cdca28660d261d2b6211c32ab6eec908bdabc800110c57",
       "src/grabowski_runtime_contract.py": "4528ec08c1019a2b773a7e05250f4842ca2403d1c9171b19ef98a63c6e588054",
       "src/grabowski_runtime_extensions.py": "4bbaabe4120acc6879297e85d3664c69193fe0a9850e48522d1839b7844b2297",
       "src/grabowski_self_deploy.py": "1c2bd7e9800a1d98fa8d4f456dd33759b66c3d6b4523e63012a31684c86c3db1",

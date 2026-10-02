@@ -38,6 +38,22 @@ _STRIP_MARKER = "_grabowski_flowlines_strip"
 _HANDLER_MARKER = "_grabowski_flowlines_handler"
 _MAX_DESCRIPTION_CHARS = 10_000
 _MAX_SCHEMA_CHARS = 50_000
+_FLOWLINES_TRACE_ENDPOINT = f"{FLOWLINES_ENDPOINT}/v1/traces"
+_FLOWLINES_EXPORT_TIMEOUT_SECONDS = 5.0
+_FLOWLINES_MAX_REQUEST_BYTES = 8 * 1024 * 1024
+_FLOWLINES_BSP_MAX_QUEUE_SIZE = 512
+_FLOWLINES_BSP_SCHEDULE_DELAY_MILLIS = 1_000
+_FLOWLINES_BSP_MAX_EXPORT_BATCH_SIZE = 64
+_FLOWLINES_BSP_EXPORT_TIMEOUT_MILLIS = 5_000
+_FLOWLINES_FORBIDDEN_EXPORT_ENV = (
+    "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+    "OTEL_PYTHON_EXPORTER_OTLP_HTTP_CREDENTIAL_PROVIDER",
+    "OTEL_PYTHON_EXPORTER_OTLP_HTTP_TRACES_CREDENTIAL_PROVIDER",
+    "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_CLIENT_KEY",
+    "OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY",
+)
 _SENSITIVE_RESULT_TOOLS = frozenset(
     {
         "grabowski_secret_reveal",
@@ -329,16 +345,36 @@ def _tool_attributes(
     return attributes
 
 
-def _has_flowlines_api_key(headers: str) -> bool:
+def _flowlines_api_key(headers: str) -> str | None:
+    values: list[str] = []
     for item in headers.split(","):
+        if not item.strip():
+            continue
         key, separator, value = item.partition("=")
+        normalized_key = key.strip().lower()
+        normalized_value = value.strip()
         if (
-            separator
-            and key.strip().lower() == "x-flowlines-api-key"
-            and bool(value.strip())
+            not separator
+            or normalized_key != "x-flowlines-api-key"
+            or not normalized_value
         ):
-            return True
-    return False
+            return None
+        values.append(normalized_value)
+    if len(values) != 1:
+        return None
+    return values[0]
+
+
+def _has_flowlines_api_key(headers: str) -> bool:
+    return _flowlines_api_key(headers) is not None
+
+
+def _unsafe_flowlines_export_overrides() -> list[str]:
+    return [
+        name
+        for name in _FLOWLINES_FORBIDDEN_EXPORT_ENV
+        if os.environ.get(name, "").strip()
+    ]
 
 
 def _endpoint_is_flowlines() -> bool:
@@ -364,8 +400,12 @@ def _build_environment_tracer() -> tuple[Any | None, Any | None]:
     if enabled not in {"1", "true", "yes", "on"}:
         return None, None
     headers = os.environ.get("OTEL_EXPORTER_OTLP_HEADERS", "")
-    if not _has_flowlines_api_key(headers) or not _endpoint_is_flowlines():
-        LOGGER.warning("Flowlines telemetry disabled: endpoint or secret-backed header is not configured")
+    api_key = _flowlines_api_key(headers)
+    unsafe_overrides = _unsafe_flowlines_export_overrides()
+    if api_key is None or not _endpoint_is_flowlines() or unsafe_overrides:
+        LOGGER.warning(
+            "Flowlines telemetry disabled: exact endpoint/header contract is not configured"
+        )
         return None, None
     try:
         from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
@@ -382,12 +422,26 @@ def _build_environment_tracer() -> tuple[Any | None, Any | None]:
         or "grabowski-mcp"
     )
     try:
+        exporter = OTLPSpanExporter(
+            endpoint=_FLOWLINES_TRACE_ENDPOINT,
+            headers={"x-flowlines-api-key": api_key},
+            timeout=_FLOWLINES_EXPORT_TIMEOUT_SECONDS,
+            max_request_size=_FLOWLINES_MAX_REQUEST_BYTES,
+        )
         provider = TracerProvider(
             resource=Resource.create({"service.name": service_name}),
             sampler=ALWAYS_ON,
             shutdown_on_exit=False,
         )
-        provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+        provider.add_span_processor(
+            BatchSpanProcessor(
+                exporter,
+                max_queue_size=_FLOWLINES_BSP_MAX_QUEUE_SIZE,
+                schedule_delay_millis=_FLOWLINES_BSP_SCHEDULE_DELAY_MILLIS,
+                max_export_batch_size=_FLOWLINES_BSP_MAX_EXPORT_BATCH_SIZE,
+                export_timeout_millis=_FLOWLINES_BSP_EXPORT_TIMEOUT_MILLIS,
+            )
+        )
         tracer = provider.get_tracer("grabowski.flowlines")
     except Exception:
         LOGGER.warning(
@@ -425,12 +479,12 @@ def _register_report_outcome(mcp: Any, read_only_annotations: Any) -> None:
     ) -> dict[str, bool]:
         """REQUIRED final call in every conversation before the assistant gives its final answer.
 
-        Records the agent's outcome self-report in Flowlines telemetry only. This tool
-        does not mutate product data. Call it after read-only, accomplished, partial,
-        failed, or blocked work.
+        Accepts the agent's outcome self-report without mutating product data.
+        When Flowlines export is enabled, this tool call is the telemetry report.
+        Call it after read-only, accomplished, partial, failed, or blocked work.
         """
         del reason, user_intent, status, outcome_summary, unmet_needs
-        return {"recorded": True}
+        return {"accepted": True}
 
 
 def _install_strip_wrapper(manager: Any, *, require_context: bool) -> None:

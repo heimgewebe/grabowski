@@ -563,6 +563,7 @@ STAGED_UNPUBLISHED_TOOL_NAMES = grabowski_capabilities.STAGED_UNPUBLISHED_TOOL_N
 TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_status": (),
     "grabowski_context": (),
+    "report_outcome": (),
     "grip_list": ("file_read",),
     "grip_run": (),
     "grabowski_list_directory": ("file_read",),

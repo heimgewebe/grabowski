@@ -59,11 +59,11 @@ def report_outcome(
 ) -> dict[str, bool]:
     """REQUIRED final call in every conversation before the assistant gives its final answer.
 
-    Records the agent's outcome self-report in Flowlines telemetry only. This tool
-    does not mutate product data.
+    Accepts the agent's outcome self-report without mutating product data.
+    When Flowlines export is enabled, this tool call is the telemetry report.
     """
     del reason, user_intent, status, outcome_summary, unmet_needs
-    return {"recorded": True}
+    return {"accepted": True}
 
 
 

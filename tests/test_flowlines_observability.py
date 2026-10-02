@@ -383,6 +383,91 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(flowlines._has_flowlines_api_key("authorization=abc"))
         self.assertTrue(flowlines._has_flowlines_api_key("x-flowlines-api-key=present"))
 
+    def test_api_key_header_rejects_extra_or_duplicate_headers(self) -> None:
+        self.assertFalse(
+            flowlines._has_flowlines_api_key(
+                "x-flowlines-api-key=present,authorization=secret"
+            )
+        )
+        self.assertFalse(
+            flowlines._has_flowlines_api_key(
+                "x-flowlines-api-key=first,x-flowlines-api-key=second"
+            )
+        )
+
+    def test_ambient_credential_overrides_disable_export(self) -> None:
+        base = {
+            "GRABOWSKI_FLOWLINES_ENABLED": "1",
+            "OTEL_EXPORTER_OTLP_ENDPOINT": "https://api.flowlines.ai",
+            "OTEL_EXPORTER_OTLP_HEADERS": "x-flowlines-api-key=fixture",
+        }
+        for name in flowlines._FLOWLINES_FORBIDDEN_EXPORT_ENV:
+            with self.subTest(name=name), mock.patch.dict(
+                os.environ,
+                {**base, name: "fixture-override"},
+                clear=True,
+            ):
+                tracer, provider = flowlines._build_environment_tracer()
+                self.assertIsNone(tracer)
+                self.assertIsNone(provider)
+
+    def test_exporter_is_bound_to_flowlines_and_bounded_processor(self) -> None:
+        base = {
+            "GRABOWSKI_FLOWLINES_ENABLED": "1",
+            "OTEL_EXPORTER_OTLP_ENDPOINT": "https://api.flowlines.ai",
+            "OTEL_EXPORTER_OTLP_HEADERS": "x-flowlines-api-key=fixture",
+            "OTEL_SERVICE_NAME": "grabowski-mcp",
+        }
+
+        class Provider:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.processors = []
+
+            def add_span_processor(self, processor):
+                self.processors.append(processor)
+
+            def get_tracer(self, name):
+                return ("tracer", name)
+
+        provider = Provider()
+        exporter = object()
+        processor = object()
+        with (
+            mock.patch.dict(os.environ, base, clear=True),
+            mock.patch(
+                "opentelemetry.exporter.otlp.proto.http.trace_exporter.OTLPSpanExporter",
+                return_value=exporter,
+            ) as exporter_factory,
+            mock.patch(
+                "opentelemetry.sdk.trace.TracerProvider",
+                return_value=provider,
+            ) as provider_factory,
+            mock.patch(
+                "opentelemetry.sdk.trace.export.BatchSpanProcessor",
+                return_value=processor,
+            ) as processor_factory,
+        ):
+            tracer, returned_provider = flowlines._build_environment_tracer()
+
+        self.assertEqual(tracer, ("tracer", "grabowski.flowlines"))
+        self.assertIs(returned_provider, provider)
+        exporter_factory.assert_called_once_with(
+            endpoint="https://api.flowlines.ai/v1/traces",
+            headers={"x-flowlines-api-key": "fixture"},
+            timeout=5.0,
+            max_request_size=8 * 1024 * 1024,
+        )
+        processor_factory.assert_called_once_with(
+            exporter,
+            max_queue_size=512,
+            schedule_delay_millis=1_000,
+            max_export_batch_size=64,
+            export_timeout_millis=5_000,
+        )
+        self.assertEqual(provider.processors, [processor])
+        self.assertFalse(provider_factory.call_args.kwargs["shutdown_on_exit"])
+
     def test_exporter_initialization_failure_is_fail_open(self) -> None:
         with (
             mock.patch.dict(
@@ -392,7 +477,7 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
                     "OTEL_EXPORTER_OTLP_ENDPOINT": "https://api.flowlines.ai",
                     "OTEL_EXPORTER_OTLP_HEADERS": "x-flowlines-api-key=fixture",
                 },
-                clear=False,
+                clear=True,
             ),
             mock.patch(
                 "opentelemetry.exporter.otlp.proto.http.trace_exporter.OTLPSpanExporter",
@@ -416,6 +501,30 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         provider = Provider()
         flowlines._bounded_flush(provider)
         self.assertEqual(provider.timeouts, [2_000])
+
+    async def test_report_outcome_returns_local_acceptance_and_is_traced(self) -> None:
+        mcp = FastMCP("grabowski-test", instructions="fixture")
+        flowlines.configure_flowlines_observability(mcp, READ_ONLY, tracer=self.tracer)
+        result = await self.call(
+            mcp,
+            name="report_outcome",
+            arguments={
+                "reason": "Close the Flowlines test session",
+                "user_intent": "Verify Flowlines outcome reporting",
+                "status": "accomplished",
+                "outcome_summary": "The local report was accepted.",
+                "unmet_needs": [],
+            },
+            meta=self.meta(),
+        )
+        self.assertFalse(result.root.isError)
+        self.assertEqual(result.root.structuredContent, {"accepted": True})
+        span = self.exporter.get_finished_spans()[0]
+        self.assertEqual(span.attributes["gen_ai.tool.name"], "report_outcome")
+        self.assertEqual(
+            json.loads(span.attributes["gen_ai.tool.call.result"])["structuredContent"],
+            {"accepted": True},
+        )
 
     async def test_traceparent_is_propagated(self) -> None:
         mcp = self.server()
