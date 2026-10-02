@@ -160,7 +160,7 @@ def _worker_main(scenario: str) -> None:
 
     async def run() -> None:
         if scenario == "combined":
-            secret = "Bearer private-combined-secret"
+            secret = "synthetic-private-combined-marker"
             private_intent = "private combined user intent"
             mcp, calls = server(tracer)
             client = CapturingPostHog()
@@ -250,7 +250,7 @@ def _worker_main(scenario: str) -> None:
             install_posthog_then_http_gate(mcp, client)
             result = await call(
                 mcp,
-                secret="Bearer posthog-failure-secret",
+                secret="synthetic-posthog-failure-marker",
                 user_intent="verify PostHog failure isolation",
             )
             if result.root.isError or len(calls) != 1:
@@ -268,7 +268,7 @@ def _worker_main(scenario: str) -> None:
             install_posthog_then_http_gate(mcp, client)
             result = await call(
                 mcp,
-                secret="Bearer flowlines-failure-secret",
+                secret="synthetic-flowlines-failure-marker",
                 user_intent="verify Flowlines failure isolation",
             )
             if result.root.isError or len(calls) != 1:
