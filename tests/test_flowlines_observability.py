@@ -492,6 +492,7 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             environment: dict[str, str],
             headers: dict[str, str],
             service_token: str,
+            session_escalation: dict[str, str],
             value: str,
         ) -> dict[str, str]:
             return {
@@ -500,6 +501,7 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
                 "environment_seen": str(bool(environment)),
                 "headers_seen": str(bool(headers)),
                 "token_seen": str(bool(service_token)),
+                "session_escalation_seen": str(bool(session_escalation)),
             }
 
         flowlines.configure_flowlines_observability(mcp, READ_ONLY, tracer=self.tracer)
@@ -515,6 +517,7 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
                     "X-Custom": "must-not-export-header",
                 },
                 "service_token": "must-not-export-token",
+                "session_escalation": {"recovery": "must-not-export-escalation"},
                 "value": "safe",
                 "reason": "Verify argument redaction",
                 "user_intent": "Keep credentials out of Flowlines",
@@ -527,12 +530,14 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["environment"], "<redacted>")
         self.assertEqual(captured["headers"], "<redacted>")
         self.assertEqual(captured["service_token"], "<redacted>")
+        self.assertEqual(captured["session_escalation"], "<redacted>")
         self.assertEqual(captured["value"], "safe")
         serialized = span.attributes["gen_ai.tool.call.arguments"]
         self.assertNotIn("must-not-export", serialized)
         self.assertNotIn("must-not-export-env", serialized)
         self.assertNotIn("must-not-export-header", serialized)
         self.assertNotIn("must-not-export-token", serialized)
+        self.assertNotIn("must-not-export-escalation", serialized)
 
     def test_content_bearing_argument_fields_are_redacted_per_tool(self) -> None:
         marker = "synthetic-private-argument-content"
@@ -565,8 +570,8 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             "grabowski_operation_run": {"parameters"},
             "grabowski_operator_recall_export": {"sources"},
             "grabowski_operational_guidance": {"symptoms"},
-            "ipad_file_create": {"payload_b64", "session_escalation"},
-            "ipad_file_replace": {"payload_b64", "session_escalation"},
+            "ipad_file_create": {"payload_b64"},
+            "ipad_file_replace": {"payload_b64"},
         }
         self.assertEqual(
             set(cases),

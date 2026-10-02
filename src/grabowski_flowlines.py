@@ -138,8 +138,8 @@ _SENSITIVE_ARGUMENT_FIELDS_BY_TOOL = {
     "grabowski_operation_run": frozenset({"parameters"}),
     "grabowski_operator_recall_export": frozenset({"sources"}),
     "grabowski_operational_guidance": frozenset({"symptoms"}),
-    "ipad_file_create": frozenset({"payload_b64", "session_escalation"}),
-    "ipad_file_replace": frozenset({"payload_b64", "session_escalation"}),
+    "ipad_file_create": frozenset({"payload_b64"}),
+    "ipad_file_replace": frozenset({"payload_b64"}),
 }
 _SENSITIVE_ARGUMENT_KEYS = frozenset(
     {
@@ -162,6 +162,7 @@ _SENSITIVE_ARGUMENT_KEYS = frozenset(
         "credentials",
         "oauth",
         "oauth_claims",
+        "session_escalation",
     }
 )
 _SENSITIVE_ARGUMENT_SUFFIXES = (
