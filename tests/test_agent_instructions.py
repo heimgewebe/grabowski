@@ -90,15 +90,12 @@ class AgentInstructionsTests(unittest.TestCase):
         self.assertIn("read probes", narrow)
         for phrase in (
             "cross-repo stable",
-            "owner/role/boundary/entrypoint/relation",
+            "truth/role/boundary/entrypoint/relation",
             "grabowski_systemkatalog_query",
+            "if result changes/confirms decision",
+            "hash-bound",
             "tools/systemkatalog_usage_receipt.py",
-            "decision use",
-            "fixed fields/no prose",
-            "repoground",
-            "repo/code/text",
-            "runtime/pr/ci",
-            "live",
+            "fixed categories/no chat/free prose",
         ):
             self.assertIn(phrase, narrow)
         host_resolution = rules["host-capability-resolution"].lower()
@@ -112,7 +109,7 @@ class AgentInstructionsTests(unittest.TestCase):
             "reread live policy/readiness at execution",
             "not-ready!=not-found",
             "reuse before new infra",
-            "no execution/setup authority",
+            "discovery: no execution/setup authority",
             "provider/model pinning",
         ):
             self.assertIn(phrase, host_resolution)
@@ -150,16 +147,16 @@ class AgentInstructionsTests(unittest.TestCase):
             self.assertIn(phrase, narrowing)
         transport = rules["transport-roundtrip-before-mutation"].lower()
         for phrase in (
+            "fresh shared_unlabeled challenge",
             "grip_run transport-roundtrip",
             "action=execute",
             "challenge_receipt_sha256",
             "exact target_tool_name",
             "exact unchanged target_arguments",
             "same-process optimization",
-            "action=ack",
+            "stable scope may action=ack",
             "unchanged target once",
-            "action=begin",
-            "target_tool_name/target_arguments",
+            "action=begin requires exact target_tool_name/target_arguments",
             "read back ambiguous effects",
         ):
             self.assertIn(phrase, transport)

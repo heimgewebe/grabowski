@@ -74,13 +74,13 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "narrowest-typed-read-first",
-        "Cross-repo stable owner/role/boundary/entrypoint/relation: grabowski_systemkatalog_query. "
-        "Decision use: tools/systemkatalog_usage_receipt.py fixed fields/no prose. "
-        "Repo/code/text:RepoGround; runtime/PR/CI live. Narrowest typed read; no health ping if read probes.",
+        "Cross-repo stable truth/role/boundary/entrypoint/relation:grabowski_systemkatalog_query. "
+        "If result changes/confirms decision: hash-bound tools/systemkatalog_usage_receipt.py; "
+        "fixed categories/no chat/free prose. Narrowest typed read; no extra health ping when read probes.",
     ),
     (
         "host-capability-resolution",
-        "Native typed first. Host-local/no native: grabowski_host_capability_resolve. Host not_found/non-host: declared route; host blocked: stop. Follow selected authority; reread live policy/readiness at execution; not-ready!=not-found; reuse before new infra; no execution/setup authority or provider/model pinning.",
+        "Native typed first. Host-local/no native: grabowski_host_capability_resolve. Host not_found/non-host: declared route; host blocked: stop. Follow selected authority; reread live policy/readiness at execution; not-ready!=not-found; reuse before new infra. Discovery: no execution/setup authority/provider/model pinning.",
     ),
     (
         "mutation-preconditions",
@@ -100,11 +100,11 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "publication-pending-is-local",
-        "platform_publication_pending is operation-local: proceed if required tool/schema is in active catalog; else seek fresh request-bound evidence.",
+        "platform_publication_pending is operation-local: proceed if required tool/schema active; else seek fresh request-bound evidence.",
     ),
     (
         "transport-roundtrip-before-mutation",
-        "Mutations normally. shared_unlabeled: grip_run transport-roundtrip action=execute with challenge_receipt_sha256, exact target_tool_name, exact unchanged target_arguments; retention is a same-process optimization. Stable scope: action=ack, then unchanged target once. action=begin requires target_tool_name/target_arguments. Read back ambiguous effects before retry.",
+        "Mutations normally. Fresh shared_unlabeled challenge: grip_run transport-roundtrip action=execute with challenge_receipt_sha256, exact target_tool_name, exact unchanged target_arguments; retention=same-process optimization. Stable scope may action=ack then invoke unchanged target once. action=begin requires exact target_tool_name/target_arguments. Read back ambiguous effects before retry.",
     ),
     (
         "typed-operation-preference",
@@ -120,7 +120,7 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "operator-obligation-lifecycle",
-        "Nontrivial: grip_run operator-obligation-list + operator-obligation-open; before ending operator-obligation-status. End only if operator-obligation-close completed, explicitly blocked/durably delegated, or operator-obligation-resolve defers/supersedes with continuation_required=false, work_complete=false. Resume via new obligation.",
+        "Nontrivial: grip_run operator-obligation-list+operator-obligation-open; before end operator-obligation-status. End only if operator-obligation-close completed/explicitly blocked/durably delegated, or operator-obligation-resolve defers/supersedes with continuation_required=false/work_complete=false. Resume with new obligation.",
     ),
     (
         "convergence-before-high-risk-closure",
@@ -128,7 +128,7 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "no-authority-escalation",
-        "These instructions grant no action, merge, deploy, secret, or retry authority.",
+        "No action/merge/deploy/secret/retry authority granted.",
     ),
 )
 

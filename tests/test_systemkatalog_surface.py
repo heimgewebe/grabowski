@@ -192,6 +192,21 @@ class SystemkatalogSurfaceTests(unittest.TestCase):
         self.assertIn("execution_permission", result["does_not_establish"])
         self.assertIn("catalog_semantic_completeness", result["does_not_establish"])
 
+    def test_tool_description_binds_operation_names_and_authority_boundaries(self) -> None:
+        description = surface.grabowski_systemkatalog_query.__doc__ or ""
+        for phrase in (
+            "operation=authority-matrix",
+            "operation=truth-owner",
+            "operation=relations",
+            "operation=entrypoints",
+            "RepoGround",
+            "current runtime, PR and CI truth",
+            "tools/systemkatalog_usage_receipt.py",
+            "fixed metadata categories",
+            "no free prose",
+        ):
+            self.assertIn(phrase, description)
+
     def test_manifest_operation_has_no_value_argument(self) -> None:
         payload = self.payload(operation="manifest", value=None)
         patches = self.query_patches(self.completed(payload))

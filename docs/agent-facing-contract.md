@@ -32,10 +32,11 @@ The rendered contract requires the agent to:
 1. treat live runtime state and concrete receipts as higher-authority than prose;
 2. use the narrowest typed read tool that can answer the question before broader
    surfaces. For repository-crossing stable truth ownership, system roles,
-   responsibility boundaries, canonical entrypoints or stable relations, use
-   `grabowski_systemkatalog_query`; for authority use `authority-matrix` when the
-   domain key is unknown and `truth-owner` when it is known. Use RepoGround for
-   local repository, implementation or free-text content. Current runtime, PR and
+   responsibility boundaries, canonical entrypoints or stable relations, call
+   `grabowski_systemkatalog_query` with `operation=authority-matrix` when the domain
+   key is unknown, `operation=truth-owner` when it is known, and
+   `operation=relations` or `operation=entrypoints` for those query classes. Use
+   RepoGround for local repository, implementation or free-text content. Current runtime, PR and
    CI truth remains with its owning live source. When a Systemkatalog result changes
    or confirms a decision, record a hash-bound usage receipt through
    `tools/systemkatalog_usage_receipt.py` using only its fixed metadata categories
