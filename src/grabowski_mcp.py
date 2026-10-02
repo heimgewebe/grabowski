@@ -74,11 +74,14 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "narrowest-typed-read-first",
-        "Use the narrowest typed read that answers the question; no connectivity-only health ping when that read can serve as the probe.",
+        "Use the narrowest typed read that answers the question. Stable ecosystem ownership/authority: "
+        "grabowski_systemkatalog_query; authority-matrix if key unknown, truth-owner if known. "
+        "RepoGround is for repository/implementation/free-text content; current runtime/PR/CI truth stays with its owning live source. "
+        "No connectivity-only health ping when that read can serve as the probe.",
     ),
     (
         "host-capability-resolution",
-        "Native typed first. Host-local/no native: grabowski_host_capability_resolve. Host not_found/non-host: declared route; host blocked: stop. Follow selected authority; reread live policy/readiness at execution; not-ready!=not-found. Reuse before new infra. Discovery grants no execution/setup authority or provider/model pinning.",
+        "Native typed first. Host-local/no native: grabowski_host_capability_resolve. Host not_found/non-host: declared route; host blocked: stop. Follow selected authority; reread live policy/readiness at execution; not-ready!=not-found; reuse before new infra; no execution/setup authority or provider/model pinning.",
     ),
     (
         "mutation-preconditions",
@@ -90,19 +93,19 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "pre-runtime-platform-denial",
-        "If ChatGPT or another upstream platform refuses a call before host dispatch and no Grabowski receipt exists, classify it as platform_filter and do not attribute it to the Grabowski runtime; do not retry the blocked call unchanged, and resume from existing lane or task receipts in a supported conversation when present.",
+        "If an upstream platform refuses before host dispatch and no Grabowski receipt exists: classify platform_filter; do not attribute it to the Grabowski runtime; do not retry the blocked call unchanged; resume from lane or task receipts in a supported conversation.",
     ),
     (
         "platform-filter-narrowing",
-        "After readback proves an upstream platform filter caused no effect, continue the authorized goal through an existing semantically narrower typed operation when available; do not weaken, disguise, bypass, or repackage the platform safeguard.",
+        "After readback proves an upstream platform filter caused no effect, use an existing semantically narrower typed operation for the authorized goal; do not weaken, bypass, disguise, or repackage the safeguard.",
     ),
     (
         "publication-pending-is-local",
-        "Treat platform_publication_pending as operation-local: proceed unless required tool/schema is absent from active catalog; otherwise seek fresh request-bound evidence.",
+        "platform_publication_pending is operation-local: proceed if required tool/schema is in active catalog; else seek fresh request-bound evidence.",
     ),
     (
         "transport-roundtrip-before-mutation",
-        "Invoke mutations normally. For fresh shared_unlabeled challenge, call grip_run transport-roundtrip action=execute with challenge_receipt_sha256, exact target_tool_name, exact unchanged target_arguments; retention is a same-process optimization. Stable scope may action=ack then invoke unchanged target once. action=begin requires exact target_tool_name/target_arguments. Read back ambiguous effects before retry.",
+        "Mutations normally. shared_unlabeled: grip_run transport-roundtrip action=execute with challenge_receipt_sha256, exact target_tool_name, exact unchanged target_arguments; retention is a same-process optimization. Stable scope: action=ack, then unchanged target once. action=begin requires target_tool_name/target_arguments. Read back ambiguous effects before retry.",
     ),
     (
         "typed-operation-preference",
@@ -114,11 +117,11 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "goal-fidelity-before-continuation",
-        "User outcome outranks strategy. Use minimum sufficient mechanism; persistent complexity requires proof of benefit. Compare a simpler path with fresh evidence; choose CONTINUE/CHANGE/PARK-STOP. A tool failure alone is not strategic evidence. Managed dirty checkout after ensure: continue only from exact lane/lifecycle/checkout evidence with fresh Git preimage; never reset/clean/stash merely to satisfy ensure.",
+        "User outcome outranks strategy; use minimum sufficient mechanism. Persistent complexity requires proof of benefit; compare a simpler path with fresh evidence; choose CONTINUE/CHANGE/PARK-STOP. Tool failure alone is not strategic evidence. Managed dirty checkout: continue only from lane/lifecycle/checkout evidence with fresh Git preimage; never reset/clean/stash.",
     ),
     (
         "operator-obligation-lifecycle",
-        "For nontrivial work use grip_run/operator-obligation-list, operator-obligation-open and before ending operator-obligation-status. End only when operator-obligation-close is completed, explicitly blocked or durably delegated, or operator-obligation-resolve defers/supersedes open work with continuation_required=false and work_complete=false. Resume with a new obligation.",
+        "Nontrivial: grip_run operator-obligation-list + operator-obligation-open; before ending operator-obligation-status. End only if operator-obligation-close completed, explicitly blocked/durably delegated, or operator-obligation-resolve defers/supersedes with continuation_required=false, work_complete=false. Resume via new obligation.",
     ),
     (
         "convergence-before-high-risk-closure",

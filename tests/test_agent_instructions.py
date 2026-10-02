@@ -88,6 +88,17 @@ class AgentInstructionsTests(unittest.TestCase):
         self.assertIn("narrowest typed read", narrow)
         self.assertIn("connectivity-only health ping", narrow)
         self.assertIn("serve as the probe", narrow)
+        for phrase in (
+            "stable ecosystem ownership/authority",
+            "grabowski_systemkatalog_query",
+            "authority-matrix",
+            "truth-owner",
+            "repoground",
+            "repository/implementation/free-text",
+            "current runtime/pr/ci truth",
+            "owning live source",
+        ):
+            self.assertIn(phrase, narrow)
         host_resolution = rules["host-capability-resolution"].lower()
         for phrase in (
             "native typed first",
@@ -137,6 +148,7 @@ class AgentInstructionsTests(unittest.TestCase):
             self.assertIn(phrase, narrowing)
         transport = rules["transport-roundtrip-before-mutation"].lower()
         for phrase in (
+            "grip_run transport-roundtrip",
             "action=execute",
             "challenge_receipt_sha256",
             "exact target_tool_name",

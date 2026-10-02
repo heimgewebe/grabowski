@@ -677,5 +677,10 @@ def grabowski_systemkatalog_query(
         ),
     ] = None,
 ) -> dict[str, Any]:
-    """Run one typed, revision-bound Systemkatalog v2 query without write authority."""
+    """Prefer this typed read for stable ecosystem ownership/authority.
+
+    Use authority-matrix when the domain key is unknown and truth-owner when known.
+    Use RepoGround for repository/implementation/free-text content. Current runtime,
+    PR and CI truth stays with its owning live source. Grants no write authority.
+    """
     return query_systemkatalog(operation, value)
