@@ -946,6 +946,7 @@ class SelfDeployToolTests(unittest.TestCase):
                     _result("main"),
                     _result(expected),
                     _result(""),
+                    _result("", 0),
                 ],
             ) as git_result:
                 snapshot = SELF_DEPLOY._canonical_stale_main_snapshot(expected)
@@ -954,13 +955,42 @@ class SelfDeployToolTests(unittest.TestCase):
             self.assertEqual(snapshot["target_head"], expected)
             self.assertEqual(snapshot["origin_main"], expected)
             self.assertTrue(snapshot["clean"])
-            self.assertFalse(
+            self.assertTrue(
                 any(
-                    "merge-base" in call_item.args
+                    call_item.args
+                    == (
+                        repo,
+                        "merge-base",
+                        "--is-ancestor",
+                        current,
+                        expected,
+                    )
                     for call_item in git_result.call_args_list
                 )
             )
 
+    def test_canonical_stale_main_snapshot_rejects_non_fast_forward_main(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary).resolve()
+            expected = "b" * 40
+            current = "a" * 40
+            with patch.object(SELF_DEPLOY, "CANONICAL_REPOSITORY", repo), patch.object(
+                SELF_DEPLOY,
+                "_resource_inspect",
+                return_value={"resource_key": f"path:{repo}", "lease": None},
+            ), patch.object(
+                SELF_DEPLOY,
+                "_git_result",
+                side_effect=[
+                    _result(current),
+                    _result("main"),
+                    _result(expected),
+                    _result(""),
+                    _result("", 1),
+                ],
+            ):
+                with self.assertRaisesRegex(RuntimeError, "ancestor"):
+                    SELF_DEPLOY._canonical_stale_main_snapshot(expected)
 
     def test_canonical_stale_main_snapshot_allows_clean_non_main_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1057,6 +1087,75 @@ class SelfDeployToolTests(unittest.TestCase):
         self.assertTrue(result["origin_main_refresh_required"])
         self.assertIsNone(result["source_identity_sha256"])
 
+
+    def test_origin_main_refresh_rejects_divergent_canonical_main_before_ref_update(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary).resolve()
+            common = repo / ".git"
+            expected = "c" * 40
+            current = "a" * 40
+            origin = "b" * 40
+            owner = "runtime-deploy-ref:cccccccccccc:abc123def456"
+            operation_key = f"repo:{repo}:operation:{SELF_DEPLOY.ORIGIN_MAIN_REFRESH_OPERATION}"
+            objects_key = f"path:{common / 'objects'}"
+            origin_ref_key = f"path:{common / 'refs/remotes/origin/main'}"
+            plan = {
+                "canonical_repository": repo,
+                "git_common_directory": common,
+                "generation": "abc123def456",
+                "owner_id": owner,
+                "operation_key": operation_key,
+                "objects_key": objects_key,
+                "origin_main_ref_key": origin_ref_key,
+            }
+            leases = [
+                {"resource_key": key, "owner_id": owner}
+                for key in [operation_key, objects_key, origin_ref_key]
+            ]
+            initial = {
+                "canonical_repository": str(repo),
+                "current_head": current,
+                "current_branch": "main",
+                "target_head": expected,
+                "origin_main": origin,
+                "clean": True,
+                "shallow": False,
+            }
+            locked = dict(initial)
+            with patch.object(
+                SELF_DEPLOY, "_origin_main_refresh_plan", return_value=plan
+            ), patch.object(
+                SELF_DEPLOY,
+                "_acquire_origin_main_refresh_resources",
+                return_value={"leases": leases},
+            ), patch.object(
+                SELF_DEPLOY,
+                "_release_origin_main_refresh_resources",
+                return_value={"released": leases},
+            ), patch.object(
+                SELF_DEPLOY,
+                "_canonical_main_refresh_candidate",
+                side_effect=[locked, locked],
+            ), patch.object(
+                SELF_DEPLOY,
+                "_fresh_public_github_main",
+                return_value=expected,
+            ), patch.object(
+                SELF_DEPLOY,
+                "_mutating_git_result",
+                return_value=_result(""),
+            ) as mutate, patch.object(
+                SELF_DEPLOY,
+                "_git_result",
+                side_effect=[
+                    _result(expected),
+                    _result("", 1),
+                ],
+            ), patch.object(SELF_DEPLOY, "_append_deploy_audit"):
+                with self.assertRaisesRegex(RuntimeError, "current canonical main"):
+                    SELF_DEPLOY._refresh_canonical_origin_main(expected, initial)
+            self.assertEqual(mutate.call_count, 1)
+            self.assertEqual(mutate.call_args.args[1], "fetch")
 
     def test_origin_main_refresh_fetches_exact_public_object_then_cas_updates_tracking_ref(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

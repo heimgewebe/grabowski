@@ -2842,6 +2842,22 @@ def _refresh_canonical_origin_main(
         )
         if resolved_target != expected_head:
             raise RuntimeError("fetched protected-main object does not match expected head")
+        if initial_snapshot.get("current_branch") == "main":
+            head_ancestor = _git_result(
+                canonical,
+                "merge-base",
+                "--is-ancestor",
+                str(initial_snapshot["current_head"]),
+                expected_head,
+            )
+            if (
+                head_ancestor.get("timed_out") is True
+                or head_ancestor.get("returncode") != 0
+            ):
+                raise RuntimeError(
+                    "protected-main ref refresh requires current canonical main to be an "
+                    "ancestor of the deployment target"
+                )
         ancestor = _git_result(
             canonical,
             "merge-base",
@@ -3077,6 +3093,19 @@ def _canonical_stale_main_snapshot(expected_head: str) -> dict[str, Any] | None:
         )
     if head == expected_head and branch == "main":
         return None
+    if branch == "main":
+        ancestor = _git_result(
+            canonical,
+            "merge-base",
+            "--is-ancestor",
+            head,
+            expected_head,
+        )
+        if ancestor.get("timed_out") or ancestor.get("returncode") != 0:
+            raise RuntimeError(
+                "automatic deployment source requires current canonical main to be an "
+                "ancestor of the deployment target"
+            )
     return {
         "canonical_repository": str(canonical),
         "current_head": head,
