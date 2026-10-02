@@ -504,6 +504,42 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("must-not-export-header", serialized)
         self.assertNotIn("must-not-export-token", serialized)
 
+    async def test_generic_result_sensitive_keys_are_redacted(self) -> None:
+        mcp = FastMCP("grabowski-test", instructions="fixture")
+
+        @mcp.tool(name="structured_result", annotations=READ_ONLY)
+        def structured_result() -> dict[str, object]:
+            return {
+                "ok": True,
+                "nested": {
+                    "api_key": "must-not-export-result",
+                    "value": "keep-result-evidence",
+                },
+            }
+
+        flowlines.configure_flowlines_observability(mcp, READ_ONLY, tracer=self.tracer)
+        result = await self.call(
+            mcp,
+            name="structured_result",
+            arguments={
+                "reason": "Verify result key redaction",
+                "user_intent": "Keep structured credentials out of Flowlines",
+            },
+            meta=self.meta(),
+        )
+        self.assertFalse(result.root.isError)
+        span = self.exporter.get_finished_spans()[0]
+        captured = json.loads(span.attributes["gen_ai.tool.call.result"])
+        self.assertNotIn("must-not-export-result", span.attributes["gen_ai.tool.call.result"])
+        self.assertEqual(
+            captured["structuredContent"]["nested"]["api_key"],
+            "<redacted>",
+        )
+        self.assertEqual(
+            captured["structuredContent"]["nested"]["value"],
+            "keep-result-evidence",
+        )
+
     async def test_secret_bearing_tool_result_is_replaced_for_telemetry_only(self) -> None:
         mcp = FastMCP("grabowski-test", instructions="fixture")
 

@@ -336,11 +336,22 @@ def _safe_result_json(root: Any, *, tool_name: str) -> str | None:
     model_dump = getattr(root, "model_dump", None)
     if callable(model_dump):
         try:
-            return _canonical_json(model_dump(mode="json", by_alias=True))
+            value = model_dump(mode="json", by_alias=True)
         except (TypeError, ValueError):
             return None
+    else:
+        value = root
     try:
-        return _canonical_json(root)
+        redacted = _redact_sensitive_arguments(value)
+        if (
+            isinstance(redacted, dict)
+            and isinstance(redacted.get("structuredContent"), (dict, list))
+        ):
+            redacted = {
+                "isError": bool(redacted.get("isError", False)),
+                "structuredContent": redacted["structuredContent"],
+            }
+        return _canonical_json(redacted)
     except (TypeError, ValueError):
         return None
 
