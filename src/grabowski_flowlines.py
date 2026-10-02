@@ -87,6 +87,8 @@ _SENSITIVE_RESULT_TOOLS = frozenset(
         "grabowski_text_artifact_read",
         "grabowski_browser_worker_semantic",
         "grabowski_juno_run",
+        "grabowski_agent_competition_status",
+        "grabowski_agent_competition_compare",
         "grabowski_agent_workspace_create",
         "grabowski_agent_workspace_status",
         "grabowski_agent_workspace_attach",

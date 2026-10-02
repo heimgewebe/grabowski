@@ -766,6 +766,8 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             "grabowski_text_artifact_read",
             "grabowski_browser_worker_semantic",
             "grabowski_juno_run",
+            "grabowski_agent_competition_status",
+            "grabowski_agent_competition_compare",
             "grabowski_bureau_candidate_record",
             "grabowski_bureau_task_propose",
             "grabowski_context_fabric_compose",
