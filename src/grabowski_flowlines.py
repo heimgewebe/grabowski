@@ -76,6 +76,7 @@ _SENSITIVE_RESULT_TOOLS = frozenset(
         "grabowski_task_archive_read",
         "grabowski_tmux_capture",
         "grabowski_fleet_run",
+        "grabowski_power_run",
         "grabowski_task_logs",
         "grabowski_service_logs",
         "grabowski_git",
