@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 import os
 from pathlib import Path
@@ -13,10 +14,29 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from mcp.server.fastmcp import FastMCP
-from mcp.server.lowlevel.server import request_ctx
-from mcp.shared.context import RequestContext
-from mcp.types import CallToolRequest, ToolAnnotations
+_PRIOR_MCP_MODULES = {
+    name: module
+    for name, module in tuple(sys.modules.items())
+    if name == "mcp" or name.startswith("mcp.")
+}
+for name in tuple(_PRIOR_MCP_MODULES):
+    sys.modules.pop(name, None)
+try:
+    from mcp.server.fastmcp import FastMCP
+    from mcp.server.lowlevel.server import request_ctx
+    from mcp.shared.context import RequestContext
+    from mcp.types import CallToolRequest, ToolAnnotations
+
+    _REAL_MCP_MODULES = {
+        name: module
+        for name, module in tuple(sys.modules.items())
+        if name == "mcp" or name.startswith("mcp.")
+    }
+finally:
+    for name in tuple(sys.modules):
+        if name == "mcp" or name.startswith("mcp."):
+            sys.modules.pop(name, None)
+    sys.modules.update(_PRIOR_MCP_MODULES)
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
@@ -30,6 +50,10 @@ READ_ONLY = ToolAnnotations(readOnlyHint=True)
 
 class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
+        mcp_modules = mock.patch.dict(sys.modules, _REAL_MCP_MODULES, clear=False)
+        mcp_modules.start()
+        self.addCleanup(mcp_modules.stop)
+
         self.exporter = InMemorySpanExporter()
         self.provider = TracerProvider(sampler=ALWAYS_ON)
         self.provider.add_span_processor(SimpleSpanProcessor(self.exporter))
@@ -204,6 +228,87 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(result.root.isError)
         self.assertEqual(self.exporter.get_finished_spans(), ())
+
+    async def test_span_setup_failure_is_fail_open_and_calls_domain_once(self) -> None:
+        calls = 0
+        mcp = FastMCP("grabowski-test", instructions="fixture")
+
+        @mcp.tool(name="echo", annotations=READ_ONLY)
+        def echo(value: str) -> dict[str, str]:
+            nonlocal calls
+            calls += 1
+            return {"value": value}
+
+        class FailingTracer:
+            def start_as_current_span(self, *args, **kwargs):
+                del args, kwargs
+                raise RuntimeError("fixture span setup failure")
+
+        flowlines.configure_flowlines_observability(
+            mcp,
+            READ_ONLY,
+            tracer=FailingTracer(),
+        )
+        result = await self.call(
+            mcp,
+            arguments={
+                "value": "hello",
+                "reason": "Exercise telemetry setup failure",
+                "user_intent": "Verify Flowlines fail-open behavior",
+            },
+            meta=self.meta(),
+        )
+        self.assertFalse(result.root.isError)
+        self.assertEqual(result.root.structuredContent, {"value": "hello"})
+        self.assertEqual(calls, 1)
+
+    async def test_span_close_failure_is_fail_open_and_calls_domain_once(self) -> None:
+        calls = 0
+        mcp = FastMCP("grabowski-test", instructions="fixture")
+
+        @mcp.tool(name="echo", annotations=READ_ONLY)
+        def echo(value: str) -> dict[str, str]:
+            nonlocal calls
+            calls += 1
+            return {"value": value}
+
+        class Span:
+            def set_status(self, *args, **kwargs):
+                del args, kwargs
+
+            def set_attribute(self, *args, **kwargs):
+                del args, kwargs
+
+        class FailingSpanContext:
+            def __enter__(self):
+                return Span()
+
+            def __exit__(self, exc_type, exc, traceback):
+                del exc_type, exc, traceback
+                raise RuntimeError("fixture span close failure")
+
+        class FailingTracer:
+            def start_as_current_span(self, *args, **kwargs):
+                del args, kwargs
+                return FailingSpanContext()
+
+        flowlines.configure_flowlines_observability(
+            mcp,
+            READ_ONLY,
+            tracer=FailingTracer(),
+        )
+        result = await self.call(
+            mcp,
+            arguments={
+                "value": "hello",
+                "reason": "Exercise telemetry close failure",
+                "user_intent": "Verify Flowlines fail-open behavior",
+            },
+            meta=self.meta(),
+        )
+        self.assertFalse(result.root.isError)
+        self.assertEqual(result.root.structuredContent, {"value": "hello"})
+        self.assertEqual(calls, 1)
 
     async def test_verified_identity_overrides_client_analytics_identity(self) -> None:
         mcp = self.server(
@@ -433,18 +538,26 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         provider = Provider()
         exporter = object()
         processor = object()
+        exporter_module = importlib.import_module(
+            "opentelemetry.exporter.otlp.proto.http.trace_exporter"
+        )
+        trace_module = importlib.import_module("opentelemetry.sdk.trace")
+        trace_export_module = importlib.import_module("opentelemetry.sdk.trace.export")
         with (
             mock.patch.dict(os.environ, base, clear=True),
-            mock.patch(
-                "opentelemetry.exporter.otlp.proto.http.trace_exporter.OTLPSpanExporter",
+            mock.patch.object(
+                exporter_module,
+                "OTLPSpanExporter",
                 return_value=exporter,
             ) as exporter_factory,
-            mock.patch(
-                "opentelemetry.sdk.trace.TracerProvider",
+            mock.patch.object(
+                trace_module,
+                "TracerProvider",
                 return_value=provider,
             ) as provider_factory,
-            mock.patch(
-                "opentelemetry.sdk.trace.export.BatchSpanProcessor",
+            mock.patch.object(
+                trace_export_module,
+                "BatchSpanProcessor",
                 return_value=processor,
             ) as processor_factory,
         ):
@@ -469,6 +582,9 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(provider_factory.call_args.kwargs["shutdown_on_exit"])
 
     def test_exporter_initialization_failure_is_fail_open(self) -> None:
+        exporter_module = importlib.import_module(
+            "opentelemetry.exporter.otlp.proto.http.trace_exporter"
+        )
         with (
             mock.patch.dict(
                 os.environ,
@@ -479,8 +595,9 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
                 },
                 clear=True,
             ),
-            mock.patch(
-                "opentelemetry.exporter.otlp.proto.http.trace_exporter.OTLPSpanExporter",
+            mock.patch.object(
+                exporter_module,
+                "OTLPSpanExporter",
                 side_effect=RuntimeError("fixture exporter failure"),
             ),
         ):

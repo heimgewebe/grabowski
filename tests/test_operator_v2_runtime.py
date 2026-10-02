@@ -1992,8 +1992,8 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             ]
         }
         summary = status["capability_requirements"]
-        self.assertEqual(summary["registered_tool_requirements"], 201)
-        self.assertEqual(summary["known_tool_requirements"], 202)
+        self.assertEqual(summary["registered_tool_requirements"], 202)
+        self.assertEqual(summary["known_tool_requirements"], 203)
         self.assertEqual(
             summary["staged_unpublished_tools"],
             ["grabowski_agent_workspace_adopt"],

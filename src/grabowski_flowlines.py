@@ -49,6 +49,8 @@ _FLOWLINES_FORBIDDEN_EXPORT_ENV = (
     "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
     "OTEL_PYTHON_EXPORTER_OTLP_HTTP_CREDENTIAL_PROVIDER",
     "OTEL_PYTHON_EXPORTER_OTLP_HTTP_TRACES_CREDENTIAL_PROVIDER",
+    "OTEL_EXPORTER_OTLP_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE",
     "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE",
     "OTEL_EXPORTER_OTLP_CLIENT_KEY",
     "OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE",
@@ -575,53 +577,64 @@ def _install_lowlevel_handler(
             return await original(req)
 
         reason, user_intent = public
-        attributes = _tool_attributes(
-            tool=tool,
-            tool_name=tool_name,
-            arguments=arguments,
-            reason=reason,
-            user_intent=user_intent,
-            request_id=getattr(request_context, "request_id", ""),
-            identity=identity,
-            server_name=str(getattr(mcp, "name", "grabowski-mcp")),
-        )
-        incoming_context = _incoming_trace_context(request_context)
         try:
+            attributes = _tool_attributes(
+                tool=tool,
+                tool_name=tool_name,
+                arguments=arguments,
+                reason=reason,
+                user_intent=user_intent,
+                request_id=getattr(request_context, "request_id", ""),
+                identity=identity,
+                server_name=str(getattr(mcp, "name", "grabowski-mcp")),
+            )
+            incoming_context = _incoming_trace_context(request_context)
             from opentelemetry.trace import SpanKind, Status, StatusCode
-        except ImportError:
+
+            span_context = tracer.start_as_current_span(
+                f"execute_tool {tool_name}",
+                context=incoming_context,
+                kind=SpanKind.SERVER,
+                attributes=attributes,
+                record_exception=False,
+                set_status_on_exception=False,
+            )
+            span = span_context.__enter__()
+        except Exception:
+            LOGGER.warning("Flowlines telemetry span setup failed open", exc_info=False)
             return await original(req)
 
-        with tracer.start_as_current_span(
-            f"execute_tool {tool_name}",
-            context=incoming_context,
-            kind=SpanKind.SERVER,
-            attributes=attributes,
-            record_exception=False,
-            set_status_on_exception=False,
-        ) as span:
+        try:
+            result = await original(req)
+        except BaseException as error:
             try:
-                result = await original(req)
-            except BaseException as error:
-                try:
-                    span.set_status(Status(StatusCode.ERROR))
-                    span.set_attribute("error.type", type(error).__name__[:256])
-                except Exception:
-                    pass
-                raise
-
-            root = _result_root(result)
-            is_error = _result_is_error(root)
-            try:
-                encoded_result = _safe_result_json(root, tool_name=tool_name)
-                if encoded_result is not None:
-                    span.set_attribute("gen_ai.tool.call.result", encoded_result)
-                span.set_status(Status(StatusCode.ERROR if is_error else StatusCode.OK))
-                if is_error:
-                    span.set_attribute("error.type", "tool_error")
+                span.set_status(Status(StatusCode.ERROR))
+                span.set_attribute("error.type", type(error).__name__[:256])
             except Exception:
-                # Telemetry is fail-open after the domain call. Never retry the tool.
                 pass
-            return result
+            try:
+                span_context.__exit__(type(error), error, error.__traceback__)
+            except Exception:
+                LOGGER.warning("Flowlines telemetry span close failed open", exc_info=False)
+            raise
+
+        root = _result_root(result)
+        is_error = _result_is_error(root)
+        try:
+            encoded_result = _safe_result_json(root, tool_name=tool_name)
+            if encoded_result is not None:
+                span.set_attribute("gen_ai.tool.call.result", encoded_result)
+            span.set_status(Status(StatusCode.ERROR if is_error else StatusCode.OK))
+            if is_error:
+                span.set_attribute("error.type", "tool_error")
+        except Exception:
+            # Telemetry is fail-open after the domain call. Never retry the tool.
+            pass
+        try:
+            span_context.__exit__(None, None, None)
+        except Exception:
+            LOGGER.warning("Flowlines telemetry span close failed open", exc_info=False)
+        return result
 
     setattr(flowlines_call_tool_handler, _HANDLER_MARKER, True)
     handlers[CallToolRequest] = flowlines_call_tool_handler
