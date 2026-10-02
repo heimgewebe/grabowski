@@ -58,9 +58,23 @@ _FLOWLINES_FORBIDDEN_EXPORT_ENV = (
 )
 _SENSITIVE_RESULT_TOOLS = frozenset(
     {
+        "grabowski_read_text",
         "grabowski_secret_reveal",
         "grabowski_secret_use",
         "grabowski_browser_profile_read",
+        "grabowski_terminal_run",
+        "grabowski_job_logs",
+        "grabowski_tmux_capture",
+        "grabowski_fleet_run",
+        "grabowski_task_logs",
+        "grabowski_service_logs",
+        "grabowski_git_diff",
+        "grabowski_git_show",
+        "grabowski_text_artifact_read",
+        "grabowski_browser_worker_semantic",
+        "grabowski_juno_run",
+        "ipad_file_read",
+        "ipad_bluetooth_read",
     }
 )
 _SENSITIVE_ARGUMENT_KEYS = frozenset(

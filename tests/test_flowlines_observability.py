@@ -482,6 +482,50 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             {"reason": "sensitive_tool_result", "redacted": True},
         )
 
+    def test_content_bearing_tool_results_are_replaced(self) -> None:
+        marker = "synthetic-private-content"
+        expected = {
+            "grabowski_read_text",
+            "grabowski_terminal_run",
+            "grabowski_job_logs",
+            "grabowski_tmux_capture",
+            "grabowski_fleet_run",
+            "grabowski_task_logs",
+            "grabowski_service_logs",
+            "grabowski_git_diff",
+            "grabowski_git_show",
+            "grabowski_text_artifact_read",
+            "grabowski_browser_worker_semantic",
+            "grabowski_juno_run",
+            "ipad_file_read",
+            "ipad_bluetooth_read",
+        }
+        self.assertTrue(expected.issubset(flowlines._SENSITIVE_RESULT_TOOLS))
+
+        class Result:
+            isError = False
+
+            def model_dump(self, **kwargs):
+                del kwargs
+                return {
+                    "text": marker,
+                    "stdout": marker,
+                    "payload_b64": marker,
+                }
+
+        for tool_name in expected:
+            with self.subTest(tool_name=tool_name):
+                captured = flowlines._safe_result_json(
+                    Result(),
+                    tool_name=tool_name,
+                )
+                self.assertIsNotNone(captured)
+                self.assertNotIn(marker, captured)
+                self.assertEqual(
+                    json.loads(captured),
+                    {"reason": "sensitive_tool_result", "redacted": True},
+                )
+
     def test_api_key_header_must_be_present_and_nonempty(self) -> None:
         self.assertFalse(flowlines._has_flowlines_api_key(""))
         self.assertFalse(flowlines._has_flowlines_api_key("x-flowlines-api-key="))
