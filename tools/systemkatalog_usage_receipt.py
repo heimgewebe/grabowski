@@ -223,7 +223,11 @@ def _query(root: Path, command: str, argument: str | None) -> dict[str, Any]:
     if value.get("command") != command:
         raise UsageReceiptError("Systemkatalog query result command mismatch")
     query = value.get("query")
-    if not isinstance(query, dict) or query.get("value") != argument:
+    if (
+        not isinstance(query, dict)
+        or "value" not in query
+        or query["value"] != argument
+    ):
         raise UsageReceiptError("Systemkatalog query result value mismatch")
     if value.get("catalogRepository") != "heimgewebe/systemkatalog":
         raise UsageReceiptError("Systemkatalog query result repository mismatch")

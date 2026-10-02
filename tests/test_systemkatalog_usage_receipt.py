@@ -284,6 +284,28 @@ class SystemkatalogUsageReceiptTests(unittest.TestCase):
             [MODULE.sys.executable, str(script), "authority-matrix"],
         )
 
+    def test_authority_matrix_query_requires_explicit_null_value(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            (scripts / "systemkatalog_query.py").write_text(
+                "# fixture\n", encoding="utf-8"
+            )
+            invalid = query_result(command="authority-matrix", argument=None)
+            invalid["query"] = {}
+            completed = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=json.dumps(invalid),
+                stderr="",
+            )
+            with patch.object(MODULE.subprocess, "run", return_value=completed):
+                with self.assertRaisesRegex(
+                    MODULE.UsageReceiptError, "value mismatch"
+                ):
+                    MODULE._query(root, "authority-matrix", None)
+
     def test_query_value_must_match_requested_argument(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             root = Path(raw_tmp)
