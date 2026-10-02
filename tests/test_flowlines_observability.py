@@ -179,8 +179,9 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attrs["session.user_intent"], "Verify Flowlines instrumentation")
 
         public_arguments = json.loads(attrs["gen_ai.tool.call.arguments"])
-        self.assertEqual(public_arguments["value"], "hello")
+        self.assertEqual(public_arguments["value"], "<redacted>")
         self.assertEqual(public_arguments["reason"], "Read the fixture value")
+        self.assertEqual(public_arguments["user_intent"], "Verify Flowlines instrumentation")
         self.assertNotIn("_meta", public_arguments)
 
         captured_result = json.loads(attrs["gen_ai.tool.call.result"])
@@ -483,6 +484,38 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         }
         self.assertIsNone(flowlines._schema_attribute(schema))
 
+    def test_ordinary_tool_payload_values_are_redacted_by_default(self) -> None:
+        marker = "SYNTHETIC_SECRET_ARGUMENT_PAYLOAD"
+        cases = {
+            "grabowski_create_text": {
+                "path": "/tmp/synthetic-private-path",
+                "content": marker,
+                "reason": "Create the requested text",
+                "user_intent": "Verify default Flowlines argument privacy",
+            },
+            "grabowski_terminal_run": {
+                "argv": ["printf", marker],
+                "cwd": "/tmp/synthetic-private-cwd",
+                "reason": "Run the requested command",
+                "user_intent": "Verify default Flowlines argument privacy",
+            },
+            "generic_tool": {
+                "stdin": marker,
+                "reason": "Process provided input",
+                "user_intent": "Verify default Flowlines argument privacy",
+            },
+        }
+
+        for tool_name, arguments in cases.items():
+            with self.subTest(tool_name=tool_name):
+                captured = flowlines._telemetry_arguments(tool_name, arguments)
+                serialized = flowlines._canonical_json(captured)
+                self.assertNotIn(marker, serialized)
+                self.assertEqual(captured["reason"], arguments["reason"])
+                self.assertEqual(captured["user_intent"], arguments["user_intent"])
+                for key in set(arguments) - {"reason", "user_intent"}:
+                    self.assertEqual(captured[key], "<redacted>")
+
     async def test_sensitive_argument_keys_are_redacted_from_telemetry(self) -> None:
         mcp = FastMCP("grabowski-test", instructions="fixture")
 
@@ -531,7 +564,7 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["headers"], "<redacted>")
         self.assertEqual(captured["service_token"], "<redacted>")
         self.assertEqual(captured["session_escalation"], "<redacted>")
-        self.assertEqual(captured["value"], "safe")
+        self.assertEqual(captured["value"], "<redacted>")
         serialized = span.attributes["gen_ai.tool.call.arguments"]
         self.assertNotIn("must-not-export", serialized)
         self.assertNotIn("must-not-export-env", serialized)
@@ -539,7 +572,7 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("must-not-export-token", serialized)
         self.assertNotIn("must-not-export-escalation", serialized)
 
-    def test_content_bearing_argument_fields_are_redacted_per_tool(self) -> None:
+    def test_content_bearing_argument_fields_are_redacted_by_default(self) -> None:
         marker = "synthetic-private-argument-content"
         cases = {
             "grabowski_secret_use": {"argv"},
@@ -573,13 +606,13 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             "ipad_file_create": {"payload_b64"},
             "ipad_file_replace": {"payload_b64"},
         }
-        self.assertEqual(
-            set(cases),
-            set(flowlines._SENSITIVE_ARGUMENT_FIELDS_BY_TOOL),
-        )
         for tool_name, fields in cases.items():
             with self.subTest(tool_name=tool_name):
-                arguments = {"safe_metadata": "keep"}
+                arguments = {
+                    "safe_metadata": "must-not-export-even-when-benignly-named",
+                    "reason": "Preserve only the analytics reason",
+                    "user_intent": "Preserve only the analytics intent",
+                }
                 for field in fields:
                     if field in {"argv", "arguments"}:
                         arguments[field] = [marker]
@@ -603,7 +636,9 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
                 captured = flowlines._telemetry_arguments(tool_name, arguments)
                 for field in fields:
                     self.assertEqual(captured[field], "<redacted>")
-                self.assertEqual(captured["safe_metadata"], "keep")
+                self.assertEqual(captured["safe_metadata"], "<redacted>")
+                self.assertEqual(captured["reason"], "Preserve only the analytics reason")
+                self.assertEqual(captured["user_intent"], "Preserve only the analytics intent")
                 self.assertNotIn(marker, json.dumps(captured))
 
     async def test_generic_result_sensitive_keys_are_redacted(self) -> None:
@@ -915,6 +950,12 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.root.structuredContent, {"accepted": True})
         span = self.exporter.get_finished_spans()[0]
         self.assertEqual(span.attributes["gen_ai.tool.name"], "report_outcome")
+        public_arguments = json.loads(span.attributes["gen_ai.tool.call.arguments"])
+        self.assertEqual(public_arguments["status"], "accomplished")
+        self.assertEqual(public_arguments["outcome_summary"], "The local report was accepted.")
+        self.assertEqual(public_arguments["unmet_needs"], [])
+        self.assertEqual(public_arguments["reason"], "Close the Flowlines test session")
+        self.assertEqual(public_arguments["user_intent"], "Verify Flowlines outcome reporting")
         self.assertEqual(
             json.loads(span.attributes["gen_ai.tool.call.result"])["structuredContent"],
             {"accepted": True},

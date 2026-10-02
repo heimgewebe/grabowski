@@ -109,38 +109,6 @@ _SENSITIVE_RESULT_TOOLS = frozenset(
         "ipad_bluetooth_read",
     }
 )
-_SENSITIVE_ARGUMENT_FIELDS_BY_TOOL = {
-    "grabowski_secret_use": frozenset({"argv"}),
-    "grabowski_create_text": frozenset({"content"}),
-    "grabowski_replace_text": frozenset({"content"}),
-    "repoground_query": frozenset({"query"}),
-    "repoground_query_existing_index": frozenset({"query"}),
-    "repoground_context_pack": frozenset({"query"}),
-    "repoground_context_compose": frozenset({"query"}),
-    "repoground_agent_handoff": frozenset({"query"}),
-    "grabowski_terminal_run": frozenset({"argv"}),
-    "grabowski_job_start": frozenset({"argv"}),
-    "grabowski_git": frozenset({"arguments"}),
-    "grabowski_github": frozenset({"arguments"}),
-    "grabowski_tmux_send": frozenset({"text"}),
-    "grabowski_fleet_run": frozenset({"argv"}),
-    "grabowski_power_run": frozenset({"argv"}),
-    "grabowski_task_start": frozenset({"argv"}),
-    "grip_run": frozenset({"parameters"}),
-    "grabowski_juno_run": frozenset({"code"}),
-    "grabowski_browser_worker_semantic": frozenset({"navigation_target"}),
-    "grabowski_bureau_candidate_record": frozenset({"request"}),
-    "grabowski_bureau_task_propose": frozenset({"task_json", "placeholder_justification"}),
-    "grabowski_context_fabric_compose": frozenset({"binding", "observations"}),
-    "grabowski_context_fabric_explain": frozenset({"composed_context"}),
-    "grabowski_context_fabric_compare": frozenset({"baseline", "candidate"}),
-    "grabowski_operation_plan": frozenset({"parameters"}),
-    "grabowski_operation_run": frozenset({"parameters"}),
-    "grabowski_operator_recall_export": frozenset({"sources"}),
-    "grabowski_operational_guidance": frozenset({"symptoms"}),
-    "ipad_file_create": frozenset({"payload_b64"}),
-    "ipad_file_replace": frozenset({"payload_b64"}),
-}
 _SENSITIVE_ARGUMENT_KEYS = frozenset(
     {
         "authorization",
@@ -358,13 +326,17 @@ def _redact_sensitive_arguments(value: Any) -> Any:
 
 
 def _telemetry_arguments(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    redacted = _redact_sensitive_arguments(arguments)
-    if not isinstance(redacted, dict):
-        return {}
-    for field in _SENSITIVE_ARGUMENT_FIELDS_BY_TOOL.get(tool_name, frozenset()):
-        if field in redacted:
-            redacted[field] = "<redacted>"
-    return redacted
+    if tool_name == REPORT_OUTCOME_TOOL:
+        redacted = _redact_sensitive_arguments(arguments)
+        return redacted if isinstance(redacted, dict) else {}
+    return {
+        str(key): (
+            value
+            if str(key) in {"reason", "user_intent"}
+            else "<redacted>"
+        )
+        for key, value in arguments.items()
+    }
 
 
 def _request_headers(request_context: Any) -> Mapping[str, str]:
