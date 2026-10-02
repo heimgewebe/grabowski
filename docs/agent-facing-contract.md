@@ -87,7 +87,10 @@ The rendered contract requires the agent to:
     convergence when the convergence plan requires it; ordinary work completion is
     not itself a systemic-convergence claim;
 15. treat the instructions as non-authoritative: they grant no action, merge,
-    deploy, secret or retry authority.
+    deploy, secret or retry authority. For Flowlines observability, include non-empty
+    `reason` and stable `user_intent` on every ordinary tool call and invoke
+    `report_outcome` exactly once as the final tool call before every final answer,
+    including read-only, partial, failed or blocked work.
 
 The executable rules in `AGENT_INSTRUCTION_RULES` are the source of truth if
 this explanatory list drifts. Native Grabowski surfaces remain first-class
@@ -113,6 +116,12 @@ actually followed the rule. An open obligation reports `response_may_end=false`;
 completed and blocked evidence is SHA-256-bound, while the close grip itself
 live-observes and binds a durable task, workspace or job before delegation. See
 `docs/operator-obligation-contract-v1.md`.
+
+The Flowlines clause is a client-behavior contract, not export authority. Runtime
+export remains separately opt-in. During schema migration the published tool schemas
+may already advertise `reason` and `user_intent` while export is disabled and legacy
+calls remain executable; hard enforcement starts only when the Flowlines exporter is
+actually enabled.
 
 ## Rendering invariants
 

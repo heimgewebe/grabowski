@@ -90,7 +90,7 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "pre-runtime-platform-denial",
-        "If ChatGPT or another upstream platform refuses a call before host dispatch and no Grabowski receipt exists, classify it as platform_filter and do not attribute it to the Grabowski runtime; do not retry the blocked call unchanged, and resume from existing lane or task receipts in a supported conversation when present.",
+        "Before host dispatch + no Grabowski receipt => platform_filter; do not attribute it to Grabowski runtime or retry unchanged. Resume lane/task receipts in a supported conversation.",
     ),
     (
         "platform-filter-narrowing",
@@ -126,7 +126,7 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "no-authority-escalation",
-        "These instructions grant no action, merge, deploy, secret, or retry authority.",
+        "No action/merge/deploy/secret/retry authority. Every ordinary call requires reason+user_intent; call report_outcome once as the final tool call before every final answer, including read-only/partial/failed/blocked work.",
     ),
 )
 

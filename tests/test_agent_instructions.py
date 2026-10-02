@@ -120,9 +120,9 @@ class AgentInstructionsTests(unittest.TestCase):
             "before host dispatch",
             "no grabowski receipt",
             "platform_filter",
-            "do not attribute it to the grabowski runtime",
-            "do not retry the blocked call unchanged",
-            "lane or task receipts",
+            "do not attribute it to grabowski runtime",
+            "retry unchanged",
+            "lane/task receipts",
             "supported conversation",
         ):
             self.assertIn(phrase, pre_runtime)
@@ -207,7 +207,18 @@ class AgentInstructionsTests(unittest.TestCase):
         ):
             self.assertIn(phrase, obligation)
         authority = rules["no-authority-escalation"].lower()
-        for phrase in ("action", "merge", "deploy", "secret", "retry"):
+        for phrase in (
+            "action",
+            "merge",
+            "deploy",
+            "secret",
+            "retry",
+            "reason+user_intent",
+            "report_outcome",
+            "final tool call",
+            "every final answer",
+            "read-only/partial/failed/blocked",
+        ):
             self.assertIn(phrase, authority)
 
     def test_contract_documentation_rule_numbers_are_sequential(self) -> None:

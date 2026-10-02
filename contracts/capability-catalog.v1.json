@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "7d671c856396c38b3e682216c24a905e02656fb3512294eb3f720db6c1312a06",
+  "capability_source_sha256": "f6475c186238f9d78dab9f23ca42a950245bffe9a5eaaf31b316723086091f84",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "bd94b08a5b4690a752e47d3e1ae20e30945bac55df2aed58840fb260e055eabd",
+  "contract_sha256": "439386bdc4380cb6f8db0ca8a17fb2c7a9c44222c178eddca48c15f999b85cb3",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -41,6 +41,17 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_context"
+    },
+    {
+      "category": "operations-observability",
+      "description": "REQUIRED final call in every conversation before the assistant gives its final answer.\n\nRecords the agent's outcome self-report in Flowlines telemetry only. This tool\ndoes not mutate product data.",
+      "effects": [],
+      "id": "report_outcome",
+      "purpose": "Record the agent outcome self-report as the required final Flowlines telemetry call without product mutation.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "report_outcome"
     },
     {
       "category": "grip-surface",

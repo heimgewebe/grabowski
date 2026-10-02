@@ -204,7 +204,7 @@ class RepositoryContractTests(unittest.TestCase):
         profiles = json.loads(
             (ROOT / "contracts" / "publication-profiles.v1.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(profiles["counts"], {"core": 23, "full": 201, "operator": 185})
+        self.assertEqual(profiles["counts"], {"core": 23, "full": 202, "operator": 186})
         self.assertNotIn("grabowski_task_reconcile", profiles["profiles"]["full"])
         self.assertNotIn("grabowski_task_reconcile", profiles["profiles"]["operator"])
         self.assertTrue(
