@@ -99,6 +99,27 @@ _SENSITIVE_RESULT_TOOLS = frozenset(
         "ipad_bluetooth_read",
     }
 )
+_SENSITIVE_ARGUMENT_FIELDS_BY_TOOL = {
+    "grabowski_secret_use": frozenset({"argv"}),
+    "grabowski_create_text": frozenset({"content"}),
+    "grabowski_replace_text": frozenset({"content"}),
+    "repoground_query": frozenset({"query"}),
+    "repoground_query_existing_index": frozenset({"query"}),
+    "repoground_context_pack": frozenset({"query"}),
+    "repoground_context_compose": frozenset({"query"}),
+    "repoground_agent_handoff": frozenset({"query"}),
+    "grabowski_terminal_run": frozenset({"argv"}),
+    "grabowski_job_start": frozenset({"argv"}),
+    "grabowski_git": frozenset({"arguments"}),
+    "grabowski_github": frozenset({"arguments"}),
+    "grabowski_tmux_send": frozenset({"text"}),
+    "grabowski_fleet_run": frozenset({"argv"}),
+    "grabowski_power_run": frozenset({"argv"}),
+    "grabowski_task_start": frozenset({"argv"}),
+    "grip_run": frozenset({"parameters"}),
+    "grabowski_juno_run": frozenset({"code"}),
+    "grabowski_browser_worker_semantic": frozenset({"navigation_target"}),
+}
 _SENSITIVE_ARGUMENT_KEYS = frozenset(
     {
         "authorization",
@@ -223,11 +244,28 @@ def _augment_tool_schema(tool: Any) -> None:
     tool.parameters = schema
 
 
-def _validate_public_arguments(tool_name: str, arguments: Any) -> tuple[str, str] | None:
+def _validate_public_arguments(
+    tool: Any,
+    tool_name: str,
+    arguments: Any,
+) -> tuple[str, str] | None:
     if not isinstance(arguments, dict):
         return None
-    reason = _nonempty_text(arguments.get("reason"), maximum=128)
-    user_intent = _nonempty_text(arguments.get("user_intent"), maximum=256)
+    domain_fields = _domain_analytics_fields(tool)
+
+    def analytics_text(field: str, *, injected_maximum: int) -> str | None:
+        value = arguments.get(field)
+        if field not in domain_fields:
+            return _nonempty_text(value, maximum=injected_maximum)
+        if not isinstance(value, str):
+            return None
+        stripped = value.strip()
+        if not stripped or "\x00" in stripped:
+            return None
+        return stripped
+
+    reason = analytics_text("reason", injected_maximum=128)
+    user_intent = analytics_text("user_intent", injected_maximum=256)
     if reason is None or user_intent is None:
         return None
     return reason, user_intent
@@ -298,9 +336,13 @@ def _redact_sensitive_arguments(value: Any) -> Any:
 
 
 def _telemetry_arguments(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    del tool_name
     redacted = _redact_sensitive_arguments(arguments)
-    return redacted if isinstance(redacted, dict) else {}
+    if not isinstance(redacted, dict):
+        return {}
+    for field in _SENSITIVE_ARGUMENT_FIELDS_BY_TOOL.get(tool_name, frozenset()):
+        if field in redacted:
+            redacted[field] = "<redacted>"
+    return redacted
 
 
 def _request_headers(request_context: Any) -> Mapping[str, str]:
@@ -439,12 +481,13 @@ def _endpoint_is_flowlines() -> bool:
         return False
     try:
         parsed = urlsplit(candidate)
+        port = parsed.port
     except ValueError:
         return False
     return (
         parsed.scheme == "https"
         and parsed.hostname == "api.flowlines.ai"
-        and parsed.port in (None, 443)
+        and port in (None, 443)
         and (not traces_endpoint or parsed.path in ("", "/", "/v1/traces", "/traces"))
     )
 
@@ -554,14 +597,14 @@ def _install_strip_wrapper(manager: Any, *, require_context: bool) -> None:
             arguments = kwargs.get("arguments")
             context = kwargs.get("context")
 
+        tool = manager.get_tool(str(tool_name))
         if (
             require_context
             and context is not None
             and tool_name != REPORT_OUTCOME_TOOL
-            and _validate_public_arguments(str(tool_name), arguments) is None
+            and _validate_public_arguments(tool, str(tool_name), arguments) is None
         ):
             raise ValueError("Flowlines requires non-empty reason and user_intent")
-        tool = manager.get_tool(str(tool_name))
         stripped = _strip_analytics_arguments(tool, str(tool_name), arguments)
         if len(args) > 1:
             mutable = list(args)
@@ -604,7 +647,7 @@ def _install_lowlevel_handler(
 
         manager = getattr(mcp, "_tool_manager", None)
         tool = manager.get_tool(tool_name) if manager is not None else None
-        public = _validate_public_arguments(tool_name, arguments)
+        public = _validate_public_arguments(tool, tool_name, arguments)
         if tool is None or public is None or not _validate_domain_arguments(tool, tool_name, arguments):
             return await original(req)
 

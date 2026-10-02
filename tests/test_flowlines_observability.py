@@ -266,9 +266,11 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
 
         flowlines.configure_flowlines_observability(mcp, READ_ONLY, tracer=self.tracer)
 
+        long_required_reason = "required-domain-reason-" + ("r" * 160)
+        long_optional_reason = "optional-domain-reason-" + ("o" * 160)
         for tool_name, value in (
-            ("required_domain_reason", "Required domain reason"),
-            ("optional_domain_reason", "Explicit optional domain reason"),
+            ("required_domain_reason", long_required_reason),
+            ("optional_domain_reason", long_optional_reason),
         ):
             result = await self.call(
                 mcp,
@@ -282,13 +284,13 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(result.root.isError)
             self.assertEqual(result.root.structuredContent, {"reason": value})
 
-        self.assertEqual(seen["required"], "Required domain reason")
-        self.assertEqual(seen["optional"], "Explicit optional domain reason")
+        self.assertEqual(seen["required"], long_required_reason)
+        self.assertEqual(seen["optional"], long_optional_reason)
         spans = self.exporter.get_finished_spans()
         self.assertEqual(len(spans), 2)
         self.assertEqual(
             [span.attributes["gen_ai.tool.call.reason"] for span in spans],
-            ["Required domain reason", "Explicit optional domain reason"],
+            [long_required_reason, long_optional_reason],
         )
 
     async def test_missing_identity_is_fail_open_but_emits_no_span(self) -> None:
@@ -532,6 +534,46 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("must-not-export-header", serialized)
         self.assertNotIn("must-not-export-token", serialized)
 
+    def test_content_bearing_argument_fields_are_redacted_per_tool(self) -> None:
+        marker = "synthetic-private-argument-content"
+        cases = {
+            "grabowski_secret_use": "argv",
+            "grabowski_create_text": "content",
+            "grabowski_replace_text": "content",
+            "repoground_query": "query",
+            "repoground_query_existing_index": "query",
+            "repoground_context_pack": "query",
+            "repoground_context_compose": "query",
+            "repoground_agent_handoff": "query",
+            "grabowski_terminal_run": "argv",
+            "grabowski_job_start": "argv",
+            "grabowski_git": "arguments",
+            "grabowski_github": "arguments",
+            "grabowski_tmux_send": "text",
+            "grabowski_fleet_run": "argv",
+            "grabowski_power_run": "argv",
+            "grabowski_task_start": "argv",
+            "grip_run": "parameters",
+            "grabowski_juno_run": "code",
+            "grabowski_browser_worker_semantic": "navigation_target",
+        }
+        self.assertEqual(
+            set(cases),
+            set(flowlines._SENSITIVE_ARGUMENT_FIELDS_BY_TOOL),
+        )
+        for tool_name, field in cases.items():
+            with self.subTest(tool_name=tool_name):
+                captured = flowlines._telemetry_arguments(
+                    tool_name,
+                    {
+                        field: [marker] if field in {"argv", "arguments"} else ({"payload": marker} if field == "parameters" else marker),
+                        "safe_metadata": "keep",
+                    },
+                )
+                self.assertEqual(captured[field], "<redacted>")
+                self.assertEqual(captured["safe_metadata"], "keep")
+                self.assertNotIn(marker, json.dumps(captured))
+
     async def test_generic_result_sensitive_keys_are_redacted(self) -> None:
         mcp = FastMCP("grabowski-test", instructions="fixture")
 
@@ -689,6 +731,20 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
                 tracer, provider = flowlines._build_environment_tracer()
                 self.assertIsNone(tracer)
                 self.assertIsNone(provider)
+
+    def test_malformed_endpoint_port_disables_export_without_raising(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GRABOWSKI_FLOWLINES_ENABLED": "1",
+                "OTEL_EXPORTER_OTLP_ENDPOINT": "https://api.flowlines.ai:notaport",
+                "OTEL_EXPORTER_OTLP_HEADERS": "x-flowlines-api-key=fixture",
+            },
+            clear=True,
+        ):
+            tracer, provider = flowlines._build_environment_tracer()
+        self.assertIsNone(tracer)
+        self.assertIsNone(provider)
 
     def test_exporter_is_bound_to_flowlines_and_bounded_processor(self) -> None:
         base = {

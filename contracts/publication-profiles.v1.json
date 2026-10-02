@@ -8,12 +8,13 @@
     "sha256": "23dc8544e3c411e99db3f05a8b02001342030c4f59935fbc10687908dba18b82"
   },
   "counts": {
-    "core": 23,
+    "core": 24,
     "full": 202,
     "operator": 186
   },
   "profiles": {
     "core": [
+      "report_outcome",
       "grabowski_verify_audit",
       "repoground_bundle_discover",
       "repoground_bundle_status",
@@ -463,7 +464,8 @@
         "repoground_bundle_status",
         "repoground_context_compose",
         "repoground_context_pack",
-        "repoground_freshness_check"
+        "repoground_freshness_check",
+        "report_outcome"
       ],
       "read_only": true,
       "risk_classes": [
@@ -483,7 +485,8 @@
         "repoground_bundle_status",
         "repoground_context_compose",
         "repoground_context_pack",
-        "repoground_freshness_check"
+        "repoground_freshness_check",
+        "report_outcome"
       ],
       "selection": "all tools not in core plus orientation tools"
     }

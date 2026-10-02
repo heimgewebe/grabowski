@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import importlib.util
 from pathlib import Path
 import re
@@ -79,6 +80,14 @@ class AgentInstructionsTests(unittest.TestCase):
             grabowski_mcp.mcp._mcp_server.instructions,
             grabowski_mcp.AGENT_INSTRUCTIONS,
         )
+
+    def test_mandatory_outcome_tool_is_available_in_core_profile(self) -> None:
+        profiles = json.loads(
+            (ROOT / "contracts/publication-profiles.v1.json").read_text(encoding="utf-8")
+        )
+        for profile in ("core", "operator", "full"):
+            with self.subTest(profile=profile):
+                self.assertIn("report_outcome", profiles["profiles"][profile])
 
     def test_rules_cover_routing_mutation_retry_and_authority_boundaries(self) -> None:
         rules = dict(grabowski_mcp.AGENT_INSTRUCTION_RULES)
