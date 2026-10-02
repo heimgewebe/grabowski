@@ -1881,6 +1881,28 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             {"grabowski_agent_workspace_adopt"},
         )
 
+    def test_runtime_report_outcome_accepts_blocked_status(self) -> None:
+        source = (ROOT / "src" / "grabowski_runtime.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        report = next(
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "report_outcome"
+        )
+        status_index = [argument.arg for argument in report.args.args].index("status")
+        annotation = report.args.args[status_index].annotation
+        self.assertIsInstance(annotation, ast.Subscript)
+        literal_values = {
+            node.value
+            for node in ast.walk(annotation)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        }
+        self.assertEqual(
+            literal_values,
+            {"accomplished", "partial", "failed", "blocked"},
+        )
+
     def test_staged_workspace_adopt_remains_implemented_but_not_public(self) -> None:
         contract = json.loads(
             (ROOT / "config" / "runtime-entrypoint.json").read_text(encoding="utf-8")

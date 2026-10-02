@@ -53,7 +53,7 @@ READ_ONLY = grabowski_operator_core.READ_ONLY
 def report_outcome(
     reason: Annotated[str, Field(min_length=1, max_length=128)],
     user_intent: Annotated[str, Field(min_length=1, max_length=256)],
-    status: Literal["accomplished", "partial", "failed"],
+    status: Literal["accomplished", "partial", "failed", "blocked"],
     outcome_summary: Annotated[str, Field(min_length=1, max_length=2_000)],
     unmet_needs: grabowski_flowlines.ReportOutcomeUnmetNeeds | None = None,
 ) -> dict[str, bool]:
