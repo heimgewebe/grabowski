@@ -71,6 +71,7 @@ _SENSITIVE_RESULT_TOOLS = frozenset(
         "grabowski_job_status",
         "grabowski_process_list",
         "grabowski_current_work",
+        "grabowski_work_acquire",
         "grabowski_task_status",
         "grabowski_task_list",
         "grabowski_task_archive_read",
@@ -145,6 +146,12 @@ _SENSITIVE_ARGUMENT_KEYS = frozenset(
         "oauth",
         "oauth_claims",
         "session_escalation",
+        "argv",
+        "justification",
+        "note",
+        "evidence",
+        "route_evidence",
+        "external_closeout_evidence",
     }
 )
 _SENSITIVE_ARGUMENT_SUFFIXES = (
@@ -156,6 +163,7 @@ _SENSITIVE_ARGUMENT_SUFFIXES = (
     "_apikey",
     "_credential",
     "_credentials",
+    "_argv",
 )
 
 
@@ -389,7 +397,7 @@ def _result_is_error(root: Any) -> bool:
 def _safe_result_json(root: Any, *, tool_name: str) -> str | None:
     if _result_is_error(root):
         return _canonical_json({"isError": True, "content": [{"type": "text", "text": "tool_error"}]})
-    if tool_name in _SENSITIVE_RESULT_TOOLS:
+    if tool_name in _SENSITIVE_RESULT_TOOLS or tool_name.startswith("grabowski_agent_workspace_"):
         return _canonical_json({"redacted": True, "reason": "sensitive_tool_result"})
     model_dump = getattr(root, "model_dump", None)
     if callable(model_dump):
@@ -574,7 +582,7 @@ def _register_report_outcome(mcp: Any, read_only_annotations: Any) -> None:
     def report_outcome(
         reason: Annotated[str, Field(min_length=1, max_length=128)],
         user_intent: Annotated[str, Field(min_length=1, max_length=256)],
-        status: Literal["accomplished", "partial", "failed"],
+        status: Literal["accomplished", "partial", "failed", "blocked"],
         outcome_summary: Annotated[str, Field(min_length=1, max_length=2_000)],
         unmet_needs: ReportOutcomeUnmetNeeds | None = None,
     ) -> dict[str, bool]:

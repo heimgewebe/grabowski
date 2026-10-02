@@ -136,7 +136,7 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             {"reason", "user_intent", "status", "outcome_summary"}.issubset(required)
         )
         status_schema = report.parameters["properties"]["status"]
-        self.assertEqual(status_schema.get("enum"), ["accomplished", "partial", "failed"])
+        self.assertEqual(status_schema.get("enum"), ["accomplished", "partial", "failed", "blocked"])
         unmet_schema = report.parameters["properties"]["unmet_needs"]
         unmet_array = next(
             item for item in unmet_schema.get("anyOf", []) if item.get("type") == "array"
@@ -526,6 +526,13 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             headers: dict[str, str],
             service_token: str,
             session_escalation: dict[str, str],
+            argv: list[str],
+            writer_argv: list[str],
+            justification: str,
+            note: str,
+            evidence: dict[str, str],
+            route_evidence: dict[str, str],
+            external_closeout_evidence: dict[str, str],
             value: str,
         ) -> dict[str, str]:
             return {
@@ -535,6 +542,13 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
                 "headers_seen": str(bool(headers)),
                 "token_seen": str(bool(service_token)),
                 "session_escalation_seen": str(bool(session_escalation)),
+                "argv_seen": str(bool(argv)),
+                "writer_argv_seen": str(bool(writer_argv)),
+                "justification_seen": str(bool(justification)),
+                "note_seen": str(bool(note)),
+                "evidence_seen": str(bool(evidence)),
+                "route_evidence_seen": str(bool(route_evidence)),
+                "external_closeout_evidence_seen": str(bool(external_closeout_evidence)),
             }
 
         flowlines.configure_flowlines_observability(mcp, READ_ONLY, tracer=self.tracer)
@@ -551,6 +565,13 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
                 },
                 "service_token": "must-not-export-token",
                 "session_escalation": {"recovery": "must-not-export-escalation"},
+                "argv": ["must-not-export-argv"],
+                "writer_argv": ["must-not-export-writer-argv"],
+                "justification": "must-not-export-justification",
+                "note": "must-not-export-note",
+                "evidence": {"detail": "must-not-export-evidence"},
+                "route_evidence": {"detail": "must-not-export-route-evidence"},
+                "external_closeout_evidence": {"detail": "must-not-export-closeout-evidence"},
                 "value": "safe",
                 "reason": "Verify argument redaction",
                 "user_intent": "Keep credentials out of Flowlines",
@@ -564,6 +585,13 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["headers"], "<redacted>")
         self.assertEqual(captured["service_token"], "<redacted>")
         self.assertEqual(captured["session_escalation"], "<redacted>")
+        self.assertEqual(captured["argv"], "<redacted>")
+        self.assertEqual(captured["writer_argv"], "<redacted>")
+        self.assertEqual(captured["justification"], "<redacted>")
+        self.assertEqual(captured["note"], "<redacted>")
+        self.assertEqual(captured["evidence"], "<redacted>")
+        self.assertEqual(captured["route_evidence"], "<redacted>")
+        self.assertEqual(captured["external_closeout_evidence"], "<redacted>")
         self.assertEqual(captured["value"], "<redacted>")
         serialized = span.attributes["gen_ai.tool.call.arguments"]
         self.assertNotIn("must-not-export", serialized)
@@ -571,6 +599,13 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("must-not-export-header", serialized)
         self.assertNotIn("must-not-export-token", serialized)
         self.assertNotIn("must-not-export-escalation", serialized)
+        self.assertNotIn("must-not-export-argv", serialized)
+        self.assertNotIn("must-not-export-writer-argv", serialized)
+        self.assertNotIn("must-not-export-justification", serialized)
+        self.assertNotIn("must-not-export-note", serialized)
+        self.assertNotIn("must-not-export-evidence", serialized)
+        self.assertNotIn("must-not-export-route-evidence", serialized)
+        self.assertNotIn("must-not-export-closeout-evidence", serialized)
 
     def test_content_bearing_argument_fields_are_redacted_by_default(self) -> None:
         marker = "synthetic-private-argument-content"
@@ -603,6 +638,9 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             "grabowski_operation_run": {"parameters"},
             "grabowski_operator_recall_export": {"sources"},
             "grabowski_operational_guidance": {"symptoms"},
+            "grabowski_agent_competition_start": {"task", "primary_summary"},
+            "grabowski_context_fabric_plan": {"binding"},
+            "grabowski_bureau_pickup_execute": {"request"},
             "ipad_file_create": {"payload_b64"},
             "ipad_file_replace": {"payload_b64"},
         }
@@ -712,6 +750,7 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             "grabowski_job_status",
             "grabowski_process_list",
             "grabowski_current_work",
+            "grabowski_work_acquire",
             "grabowski_task_status",
             "grabowski_task_list",
             "grabowski_task_archive_read",
@@ -727,20 +766,6 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             "grabowski_text_artifact_read",
             "grabowski_browser_worker_semantic",
             "grabowski_juno_run",
-            "grabowski_agent_workspace_create",
-            "grabowski_agent_workspace_status",
-            "grabowski_agent_workspace_attach",
-            "grabowski_agent_workspace_collect",
-            "grabowski_agent_workspace_adopt",
-            "grabowski_agent_workspace_role_retry",
-            "grabowski_agent_workspace_writer_handoff",
-            "grabowski_agent_workspace_close",
-            "grabowski_agent_workspace_observe",
-            "grabowski_agent_workspace_optimize",
-            "grabowski_agent_workspace_cleanup_plan",
-            "grabowski_agent_workspace_reconcile_stale",
-            "grabowski_agent_workspace_reconcile_idle_tmux",
-            "grabowski_agent_workspace_cleanup",
             "grabowski_bureau_candidate_record",
             "grabowski_bureau_task_propose",
             "grabowski_context_fabric_compose",
@@ -782,6 +807,44 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
                     Result(),
                     tool_name=tool_name,
                 )
+                self.assertIsNotNone(captured)
+                self.assertNotIn(marker, captured)
+                self.assertEqual(
+                    json.loads(captured),
+                    {"reason": "sensitive_tool_result", "redacted": True},
+                )
+
+    def test_agent_workspace_result_family_is_replaced(self) -> None:
+        marker = "synthetic-private-workspace-command"
+
+        class Result:
+            isError = False
+
+            def model_dump(self, **kwargs):
+                del kwargs
+                return {"workspace": {"commands": {"writer": [marker]}}}
+
+        current_tool_names = {
+            "grabowski_agent_workspace_create",
+            "grabowski_agent_workspace_status",
+            "grabowski_agent_workspace_attach",
+            "grabowski_agent_workspace_collect",
+            "grabowski_agent_workspace_adopt",
+            "grabowski_agent_workspace_role_retry",
+            "grabowski_agent_workspace_writer_handoff",
+            "grabowski_agent_workspace_close",
+            "grabowski_agent_workspace_observe",
+            "grabowski_agent_workspace_optimize",
+            "grabowski_agent_workspace_cleanup_plan",
+            "grabowski_agent_workspace_reconcile_stale",
+            "grabowski_agent_workspace_reconcile_idle_tmux",
+            "grabowski_agent_workspace_cleanup",
+        }
+        self.assertTrue(current_tool_names.issubset(flowlines._SENSITIVE_RESULT_TOOLS))
+        tool_names = current_tool_names | {"grabowski_agent_workspace_future_tool"}
+        for tool_name in tool_names:
+            with self.subTest(tool_name=tool_name):
+                captured = flowlines._safe_result_json(Result(), tool_name=tool_name)
                 self.assertIsNotNone(captured)
                 self.assertNotIn(marker, captured)
                 self.assertEqual(
@@ -974,6 +1037,29 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             json.loads(span.attributes["gen_ai.tool.call.result"])["structuredContent"],
             {"accepted": True},
         )
+
+    async def test_report_outcome_accepts_blocked_status(self) -> None:
+        mcp = FastMCP("grabowski-test", instructions="fixture")
+        flowlines.configure_flowlines_observability(mcp, READ_ONLY, tracer=self.tracer)
+
+        result = await self.call(
+            mcp,
+            name="report_outcome",
+            arguments={
+                "reason": "Record an operator block",
+                "user_intent": "Represent blocked work without misclassification",
+                "status": "blocked",
+                "outcome_summary": "A required operator gate blocked completion.",
+                "unmet_needs": ["Clear the operator gate."],
+            },
+            meta=self.meta(),
+        )
+
+        self.assertFalse(result.root.isError)
+        span = self.exporter.get_finished_spans()[0]
+        public_arguments = json.loads(span.attributes["gen_ai.tool.call.arguments"])
+        self.assertEqual(public_arguments["status"], "blocked")
+        self.assertEqual(public_arguments["unmet_needs"], ["Clear the operator gate."])
 
     async def test_report_outcome_rejects_unbounded_unmet_needs(self) -> None:
         mcp = FastMCP("grabowski-test", instructions="fixture")
