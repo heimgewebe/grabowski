@@ -537,40 +537,65 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
     def test_content_bearing_argument_fields_are_redacted_per_tool(self) -> None:
         marker = "synthetic-private-argument-content"
         cases = {
-            "grabowski_secret_use": "argv",
-            "grabowski_create_text": "content",
-            "grabowski_replace_text": "content",
-            "repoground_query": "query",
-            "repoground_query_existing_index": "query",
-            "repoground_context_pack": "query",
-            "repoground_context_compose": "query",
-            "repoground_agent_handoff": "query",
-            "grabowski_terminal_run": "argv",
-            "grabowski_job_start": "argv",
-            "grabowski_git": "arguments",
-            "grabowski_github": "arguments",
-            "grabowski_tmux_send": "text",
-            "grabowski_fleet_run": "argv",
-            "grabowski_power_run": "argv",
-            "grabowski_task_start": "argv",
-            "grip_run": "parameters",
-            "grabowski_juno_run": "code",
-            "grabowski_browser_worker_semantic": "navigation_target",
+            "grabowski_secret_use": {"argv"},
+            "grabowski_create_text": {"content"},
+            "grabowski_replace_text": {"content"},
+            "repoground_query": {"query"},
+            "repoground_query_existing_index": {"query"},
+            "repoground_context_pack": {"query"},
+            "repoground_context_compose": {"query"},
+            "repoground_agent_handoff": {"query"},
+            "grabowski_terminal_run": {"argv"},
+            "grabowski_job_start": {"argv"},
+            "grabowski_git": {"arguments"},
+            "grabowski_github": {"arguments"},
+            "grabowski_tmux_send": {"text"},
+            "grabowski_fleet_run": {"argv"},
+            "grabowski_power_run": {"argv"},
+            "grabowski_task_start": {"argv"},
+            "grip_run": {"parameters"},
+            "grabowski_juno_run": {"code"},
+            "grabowski_browser_worker_semantic": {"navigation_target"},
+            "grabowski_bureau_candidate_record": {"request"},
+            "grabowski_bureau_task_propose": {"task_json", "placeholder_justification"},
+            "grabowski_context_fabric_compose": {"binding", "observations"},
+            "grabowski_context_fabric_explain": {"composed_context"},
+            "grabowski_context_fabric_compare": {"baseline", "candidate"},
+            "grabowski_operation_plan": {"parameters"},
+            "grabowski_operation_run": {"parameters"},
+            "grabowski_operator_recall_export": {"sources"},
+            "grabowski_operational_guidance": {"symptoms"},
         }
         self.assertEqual(
             set(cases),
             set(flowlines._SENSITIVE_ARGUMENT_FIELDS_BY_TOOL),
         )
-        for tool_name, field in cases.items():
+        for tool_name, fields in cases.items():
             with self.subTest(tool_name=tool_name):
-                captured = flowlines._telemetry_arguments(
-                    tool_name,
-                    {
-                        field: [marker] if field in {"argv", "arguments"} else ({"payload": marker} if field == "parameters" else marker),
-                        "safe_metadata": "keep",
-                    },
-                )
-                self.assertEqual(captured[field], "<redacted>")
+                arguments = {"safe_metadata": "keep"}
+                for field in fields:
+                    if field in {"argv", "arguments"}:
+                        arguments[field] = [marker]
+                    elif field in {
+                        "parameters",
+                        "request",
+                        "task_json",
+                        "binding",
+                        "composed_context",
+                        "baseline",
+                        "candidate",
+                        "sources",
+                    }:
+                        arguments[field] = {"payload": marker}
+                    elif field == "observations":
+                        arguments[field] = [{"payload": marker}]
+                    elif field == "symptoms":
+                        arguments[field] = [marker]
+                    else:
+                        arguments[field] = marker
+                captured = flowlines._telemetry_arguments(tool_name, arguments)
+                for field in fields:
+                    self.assertEqual(captured[field], "<redacted>")
                 self.assertEqual(captured["safe_metadata"], "keep")
                 self.assertNotIn(marker, json.dumps(captured))
 
@@ -660,6 +685,15 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             "grabowski_text_artifact_read",
             "grabowski_browser_worker_semantic",
             "grabowski_juno_run",
+            "grabowski_bureau_candidate_record",
+            "grabowski_bureau_task_propose",
+            "grabowski_context_fabric_compose",
+            "grabowski_context_fabric_explain",
+            "grabowski_context_fabric_compare",
+            "grabowski_operation_plan",
+            "grabowski_operation_run",
+            "grabowski_operator_historical_recall",
+            "grabowski_operator_recall_export",
             "grip_run",
             "repoground_query",
             "repoground_query_existing_index",
