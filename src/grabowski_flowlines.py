@@ -483,7 +483,7 @@ def _build_environment_tracer() -> tuple[Any | None, Any | None]:
             max_request_size=_FLOWLINES_MAX_REQUEST_BYTES,
         )
         provider = TracerProvider(
-            resource=Resource.create({"service.name": service_name}),
+            resource=Resource({"service.name": service_name}),
             sampler=ALWAYS_ON,
             shutdown_on_exit=False,
         )

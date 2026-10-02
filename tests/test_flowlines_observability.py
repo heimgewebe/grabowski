@@ -658,6 +658,7 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             "OTEL_EXPORTER_OTLP_ENDPOINT": "https://api.flowlines.ai",
             "OTEL_EXPORTER_OTLP_HEADERS": "x-flowlines-api-key=fixture",
             "OTEL_SERVICE_NAME": "grabowski-mcp",
+            "OTEL_RESOURCE_ATTRIBUTES": "secret.env=must-not-export-resource",
         }
 
         class Provider:
@@ -715,6 +716,10 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             export_timeout_millis=5_000,
         )
         self.assertEqual(provider.processors, [processor])
+        self.assertEqual(
+            dict(provider_factory.call_args.kwargs["resource"].attributes),
+            {"service.name": "grabowski-mcp"},
+        )
         self.assertFalse(provider_factory.call_args.kwargs["shutdown_on_exit"])
 
     def test_exporter_initialization_failure_is_fail_open(self) -> None:
