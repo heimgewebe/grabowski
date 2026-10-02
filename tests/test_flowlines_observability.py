@@ -222,6 +222,47 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.root.structuredContent, {"value": "legacy"})
         self.assertEqual(self.exporter.get_finished_spans(), ())
 
+    async def test_existing_domain_reason_arguments_are_preserved(self) -> None:
+        mcp = FastMCP("grabowski-test", instructions="fixture")
+        seen: dict[str, str] = {}
+
+        @mcp.tool(name="required_domain_reason", annotations=READ_ONLY)
+        def required_domain_reason(reason: str) -> dict[str, str]:
+            seen["required"] = reason
+            return {"reason": reason}
+
+        @mcp.tool(name="optional_domain_reason", annotations=READ_ONLY)
+        def optional_domain_reason(reason: str = "") -> dict[str, str]:
+            seen["optional"] = reason
+            return {"reason": reason}
+
+        flowlines.configure_flowlines_observability(mcp, READ_ONLY, tracer=self.tracer)
+
+        for tool_name, value in (
+            ("required_domain_reason", "Required domain reason"),
+            ("optional_domain_reason", "Explicit optional domain reason"),
+        ):
+            result = await self.call(
+                mcp,
+                name=tool_name,
+                arguments={
+                    "reason": value,
+                    "user_intent": "Verify Flowlines preserves domain reason fields",
+                },
+                meta=self.meta(),
+            )
+            self.assertFalse(result.root.isError)
+            self.assertEqual(result.root.structuredContent, {"reason": value})
+
+        self.assertEqual(seen["required"], "Required domain reason")
+        self.assertEqual(seen["optional"], "Explicit optional domain reason")
+        spans = self.exporter.get_finished_spans()
+        self.assertEqual(len(spans), 2)
+        self.assertEqual(
+            [span.attributes["gen_ai.tool.call.reason"] for span in spans],
+            ["Required domain reason", "Explicit optional domain reason"],
+        )
+
     async def test_missing_identity_is_fail_open_but_emits_no_span(self) -> None:
         mcp = self.server()
         result = await self.call(

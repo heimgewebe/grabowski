@@ -225,12 +225,27 @@ def _validate_public_arguments(tool_name: str, arguments: Any) -> tuple[str, str
     return reason, user_intent
 
 
-def _strip_analytics_arguments(tool_name: str, arguments: Any) -> Any:
+def _domain_analytics_fields(tool: Any) -> frozenset[str]:
+    fn_metadata = getattr(tool, "fn_metadata", None)
+    arg_model = getattr(fn_metadata, "arg_model", None)
+    model_fields = getattr(arg_model, "model_fields", None)
+    if not isinstance(model_fields, Mapping):
+        return frozenset()
+    return frozenset(
+        field
+        for field in ("reason", "user_intent")
+        if field in model_fields
+    )
+
+
+def _strip_analytics_arguments(tool: Any, tool_name: str, arguments: Any) -> Any:
     if tool_name == REPORT_OUTCOME_TOOL or not isinstance(arguments, dict):
         return arguments
+    domain_fields = _domain_analytics_fields(tool)
     stripped = dict(arguments)
-    stripped.pop("reason", None)
-    stripped.pop("user_intent", None)
+    for field in ("reason", "user_intent"):
+        if field not in domain_fields:
+            stripped.pop(field, None)
     return stripped
 
 
@@ -240,7 +255,7 @@ def _validate_domain_arguments(tool: Any, tool_name: str, arguments: dict[str, A
     validator = getattr(arg_model, "model_validate", None)
     if not callable(validator):
         return False
-    candidate = arguments if tool_name == REPORT_OUTCOME_TOOL else _strip_analytics_arguments(tool_name, arguments)
+    candidate = _strip_analytics_arguments(tool, tool_name, arguments)
     try:
         validator(candidate)
     except Exception:
@@ -531,7 +546,8 @@ def _install_strip_wrapper(manager: Any, *, require_context: bool) -> None:
             and _validate_public_arguments(str(tool_name), arguments) is None
         ):
             raise ValueError("Flowlines requires non-empty reason and user_intent")
-        stripped = _strip_analytics_arguments(str(tool_name), arguments)
+        tool = manager.get_tool(str(tool_name))
+        stripped = _strip_analytics_arguments(tool, str(tool_name), arguments)
         if len(args) > 1:
             mutable = list(args)
             mutable[1] = stripped
