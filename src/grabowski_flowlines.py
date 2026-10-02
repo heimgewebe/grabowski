@@ -60,79 +60,6 @@ _FLOWLINES_FORBIDDEN_EXPORT_ENV = (
     "OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE",
     "OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY",
 )
-_SENSITIVE_RESULT_TOOLS = frozenset(
-    {
-        "grabowski_read_text",
-        "grabowski_secret_reveal",
-        "grabowski_secret_use",
-        "grabowski_browser_profile_read",
-        "grabowski_terminal_run",
-        "grabowski_job_logs",
-        "grabowski_job_status",
-        "grabowski_process_list",
-        "grabowski_current_work",
-        "grabowski_work_acquire",
-        "grabowski_task_status",
-        "grabowski_task_list",
-        "grabowski_task_archive_read",
-        "grabowski_tmux_capture",
-        "grabowski_fleet_run",
-        "grabowski_power_run",
-        "grabowski_task_logs",
-        "grabowski_service_logs",
-        "grabowski_git",
-        "grabowski_git_diff",
-        "grabowski_git_show",
-        "grabowski_github",
-        "grabowski_text_artifact_read",
-        "grabowski_browser_worker_semantic",
-        "grabowski_juno_run",
-        "grabowski_agent_competition_status",
-        "grabowski_agent_competition_compare",
-        "grabowski_agent_workspace_create",
-        "grabowski_agent_workspace_status",
-        "grabowski_agent_workspace_attach",
-        "grabowski_agent_workspace_collect",
-        "grabowski_agent_workspace_adopt",
-        "grabowski_agent_workspace_role_retry",
-        "grabowski_agent_workspace_writer_handoff",
-        "grabowski_agent_workspace_close",
-        "grabowski_agent_workspace_observe",
-        "grabowski_agent_workspace_optimize",
-        "grabowski_agent_workspace_cleanup_plan",
-        "grabowski_agent_workspace_reconcile_stale",
-        "grabowski_agent_workspace_reconcile_idle_tmux",
-        "grabowski_agent_workspace_cleanup",
-        "grabowski_bureau_candidate_record",
-        "grabowski_bureau_task_propose",
-        "grabowski_context_fabric_compose",
-        "grabowski_context_fabric_explain",
-        "grabowski_context_fabric_compare",
-        "grabowski_operation_plan",
-        "grabowski_operation_run",
-        "grabowski_operator_historical_recall",
-        "grabowski_operator_recall_export",
-        "grip_run",
-        "repoground_query",
-        "repoground_query_existing_index",
-        "repoground_range_get",
-        "repoground_context_pack",
-        "repoground_context_compose",
-        "repoground_agent_handoff",
-        "repoground_find_symbol",
-        "repoground_get_callers",
-        "repoground_get_callees",
-        "ipad_file_read",
-        "ipad_bluetooth_read",
-    }
-)
-_SENSITIVE_RESULT_TOOL_PREFIXES = (
-    "grabowski_agent_workspace_",
-    "grabowski_checkout_",
-    "grabowski_resource_",
-    "grabowski_git_",
-    "grabowski_github_",
-)
 _SENSITIVE_ARGUMENT_KEYS = frozenset(
     {
         "authorization",
@@ -406,8 +333,8 @@ def _result_is_error(root: Any) -> bool:
 def _safe_result_json(root: Any, *, tool_name: str) -> str | None:
     if _result_is_error(root):
         return _canonical_json({"isError": True, "content": [{"type": "text", "text": "tool_error"}]})
-    if tool_name in _SENSITIVE_RESULT_TOOLS or tool_name.startswith(_SENSITIVE_RESULT_TOOL_PREFIXES):
-        return _canonical_json({"redacted": True, "reason": "sensitive_tool_result"})
+    if tool_name != REPORT_OUTCOME_TOOL:
+        return _canonical_json({"redacted": True, "reason": "tool_result_content_disabled"})
     model_dump = getattr(root, "model_dump", None)
     if callable(model_dump):
         try:
@@ -417,19 +344,9 @@ def _safe_result_json(root: Any, *, tool_name: str) -> str | None:
     else:
         value = root
     try:
-        redacted = _redact_sensitive_arguments(value)
-        if (
-            isinstance(redacted, dict)
-            and isinstance(redacted.get("structuredContent"), (dict, list))
-        ):
-            redacted = {
-                "isError": bool(redacted.get("isError", False)),
-                "structuredContent": redacted["structuredContent"],
-            }
-        return _canonical_json(redacted)
+        return _canonical_json(_redact_sensitive_arguments(value))
     except (TypeError, ValueError):
         return None
-
 
 def _tool_attributes(
     *,

@@ -185,8 +185,10 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("_meta", public_arguments)
 
         captured_result = json.loads(attrs["gen_ai.tool.call.result"])
-        self.assertFalse(captured_result["isError"])
-        self.assertEqual(captured_result["structuredContent"], {"value": "hello"})
+        self.assertEqual(
+            captured_result,
+            {"reason": "tool_result_content_disabled", "redacted": True},
+        )
 
         declared = json.loads(attrs["gen_ai.tool.input_schema"])
         published = mcp._tool_manager.get_tool("echo").parameters
@@ -679,215 +681,30 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(captured["user_intent"], "Preserve only the analytics intent")
                 self.assertNotIn(marker, json.dumps(captured))
 
-    async def test_generic_result_sensitive_keys_are_redacted(self) -> None:
-        mcp = FastMCP("grabowski-test", instructions="fixture")
+    def test_ordinary_successful_result_content_is_disabled_by_default(self) -> None:
+        marker = "synthetic-private-future-tool-result"
 
-        @mcp.tool(name="structured_result", annotations=READ_ONLY)
-        def structured_result() -> dict[str, object]:
-            return {
-                "ok": True,
-                "nested": {
-                    "api_key": "must-not-export-result",
-                    "value": "keep-result-evidence",
-                },
-            }
+        class Result:
+            isError = False
 
-        flowlines.configure_flowlines_observability(mcp, READ_ONLY, tracer=self.tracer)
-        result = await self.call(
-            mcp,
-            name="structured_result",
-            arguments={
-                "reason": "Verify result key redaction",
-                "user_intent": "Keep structured credentials out of Flowlines",
-            },
-            meta=self.meta(),
+            def model_dump(self, **kwargs):
+                del kwargs
+                return {
+                    "path": "/private/future/path",
+                    "purpose": marker,
+                    "nested": {"value": marker},
+                }
+
+        captured = flowlines._safe_result_json(
+            Result(),
+            tool_name="future_published_tool",
         )
-        self.assertFalse(result.root.isError)
-        span = self.exporter.get_finished_spans()[0]
-        captured = json.loads(span.attributes["gen_ai.tool.call.result"])
-        self.assertNotIn("must-not-export-result", span.attributes["gen_ai.tool.call.result"])
-        self.assertEqual(
-            captured["structuredContent"]["nested"]["api_key"],
-            "<redacted>",
-        )
-        self.assertEqual(
-            captured["structuredContent"]["nested"]["value"],
-            "keep-result-evidence",
-        )
-
-    async def test_secret_bearing_tool_result_is_replaced_for_telemetry_only(self) -> None:
-        mcp = FastMCP("grabowski-test", instructions="fixture")
-
-        @mcp.tool(name="grabowski_secret_reveal", annotations=READ_ONLY)
-        def reveal() -> dict[str, str]:
-            return {"secret_text": "must-not-export"}
-
-        flowlines.configure_flowlines_observability(mcp, READ_ONLY, tracer=self.tracer)
-        result = await self.call(
-            mcp,
-            name="grabowski_secret_reveal",
-            arguments={
-                "reason": "Verify result redaction",
-                "user_intent": "Keep break-glass secrets out of Flowlines",
-            },
-            meta=self.meta(),
-        )
-        self.assertEqual(result.root.structuredContent, {"secret_text": "must-not-export"})
-        span = self.exporter.get_finished_spans()[0]
-        captured = span.attributes["gen_ai.tool.call.result"]
-        self.assertNotIn("must-not-export", captured)
+        self.assertIsNotNone(captured)
+        self.assertNotIn(marker, captured)
         self.assertEqual(
             json.loads(captured),
-            {"reason": "sensitive_tool_result", "redacted": True},
+            {"reason": "tool_result_content_disabled", "redacted": True},
         )
-
-    def test_content_bearing_tool_results_are_replaced(self) -> None:
-        marker = "synthetic-private-content"
-        expected = {
-            "grabowski_read_text",
-            "grabowski_terminal_run",
-            "grabowski_job_logs",
-            "grabowski_job_status",
-            "grabowski_process_list",
-            "grabowski_current_work",
-            "grabowski_work_acquire",
-            "grabowski_task_status",
-            "grabowski_task_list",
-            "grabowski_task_archive_read",
-            "grabowski_tmux_capture",
-            "grabowski_fleet_run",
-            "grabowski_power_run",
-            "grabowski_task_logs",
-            "grabowski_service_logs",
-            "grabowski_git",
-            "grabowski_git_diff",
-            "grabowski_git_show",
-            "grabowski_github",
-            "grabowski_text_artifact_read",
-            "grabowski_browser_worker_semantic",
-            "grabowski_juno_run",
-            "grabowski_agent_competition_status",
-            "grabowski_agent_competition_compare",
-            "grabowski_bureau_candidate_record",
-            "grabowski_bureau_task_propose",
-            "grabowski_context_fabric_compose",
-            "grabowski_context_fabric_explain",
-            "grabowski_context_fabric_compare",
-            "grabowski_operation_plan",
-            "grabowski_operation_run",
-            "grabowski_operator_historical_recall",
-            "grabowski_operator_recall_export",
-            "grip_run",
-            "repoground_query",
-            "repoground_query_existing_index",
-            "repoground_range_get",
-            "repoground_context_pack",
-            "repoground_context_compose",
-            "repoground_agent_handoff",
-            "repoground_find_symbol",
-            "repoground_get_callers",
-            "repoground_get_callees",
-            "ipad_file_read",
-            "ipad_bluetooth_read",
-        }
-        self.assertTrue(expected.issubset(flowlines._SENSITIVE_RESULT_TOOLS))
-
-        class Result:
-            isError = False
-
-            def model_dump(self, **kwargs):
-                del kwargs
-                return {
-                    "text": marker,
-                    "stdout": marker,
-                    "payload_b64": marker,
-                }
-
-        for tool_name in expected:
-            with self.subTest(tool_name=tool_name):
-                captured = flowlines._safe_result_json(
-                    Result(),
-                    tool_name=tool_name,
-                )
-                self.assertIsNotNone(captured)
-                self.assertNotIn(marker, captured)
-                self.assertEqual(
-                    json.loads(captured),
-                    {"reason": "sensitive_tool_result", "redacted": True},
-                )
-
-    def test_operator_result_families_are_replaced(self) -> None:
-        marker = "synthetic-private-operator-result"
-
-        class Result:
-            isError = False
-
-            def model_dump(self, **kwargs):
-                del kwargs
-                return {
-                    "path": "/private/operator/path",
-                    "purpose": marker,
-                    "stdout": marker,
-                    "title": marker,
-                }
-
-        tool_names = {
-            "grabowski_checkout_inventory",
-            "grabowski_checkout_future_tool",
-            "grabowski_resource_list",
-            "grabowski_resource_future_tool",
-            "grabowski_git_status",
-            "grabowski_git_future_tool",
-            "grabowski_github_pr_view",
-            "grabowski_github_future_tool",
-        }
-        for tool_name in tool_names:
-            with self.subTest(tool_name=tool_name):
-                captured = flowlines._safe_result_json(Result(), tool_name=tool_name)
-                self.assertIsNotNone(captured)
-                self.assertNotIn(marker, captured)
-                self.assertEqual(
-                    json.loads(captured),
-                    {"reason": "sensitive_tool_result", "redacted": True},
-                )
-
-    def test_agent_workspace_result_family_is_replaced(self) -> None:
-        marker = "synthetic-private-workspace-command"
-
-        class Result:
-            isError = False
-
-            def model_dump(self, **kwargs):
-                del kwargs
-                return {"workspace": {"commands": {"writer": [marker]}}}
-
-        current_tool_names = {
-            "grabowski_agent_workspace_create",
-            "grabowski_agent_workspace_status",
-            "grabowski_agent_workspace_attach",
-            "grabowski_agent_workspace_collect",
-            "grabowski_agent_workspace_adopt",
-            "grabowski_agent_workspace_role_retry",
-            "grabowski_agent_workspace_writer_handoff",
-            "grabowski_agent_workspace_close",
-            "grabowski_agent_workspace_observe",
-            "grabowski_agent_workspace_optimize",
-            "grabowski_agent_workspace_cleanup_plan",
-            "grabowski_agent_workspace_reconcile_stale",
-            "grabowski_agent_workspace_reconcile_idle_tmux",
-            "grabowski_agent_workspace_cleanup",
-        }
-        self.assertTrue(current_tool_names.issubset(flowlines._SENSITIVE_RESULT_TOOLS))
-        tool_names = current_tool_names | {"grabowski_agent_workspace_future_tool"}
-        for tool_name in tool_names:
-            with self.subTest(tool_name=tool_name):
-                captured = flowlines._safe_result_json(Result(), tool_name=tool_name)
-                self.assertIsNotNone(captured)
-                self.assertNotIn(marker, captured)
-                self.assertEqual(
-                    json.loads(captured),
-                    {"reason": "sensitive_tool_result", "redacted": True},
-                )
 
     def test_api_key_header_must_be_present_and_nonempty(self) -> None:
         self.assertFalse(flowlines._has_flowlines_api_key(""))
