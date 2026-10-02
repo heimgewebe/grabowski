@@ -3,4 +3,5 @@
 filelock==3.32.2
 jsonschema==4.26.0
 mcp==1.30.0
+posthog==7.62.0
 pyyaml==6.0.3
