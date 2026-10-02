@@ -30,8 +30,15 @@ Für rein lokale Codefragen ist kein Systemkatalog-Beleg nötig.
 python3 tools/systemkatalog_usage_receipt.py   --query truth-owner   --argument agent_routing   --reason truth_owner   --result-use used   --decision-effect confirmed   --output /tmp/systemkatalog-agent-routing.receipt.json
 ```
 
-Die Ausgabe wird zusätzlich auf stdout geschrieben. Eine angegebene Datei wird
-atomar mit Modus `0600` erzeugt.
+Für die argumentlose Authority-Matrix-Abfrage wird kein `--argument` angegeben:
+
+```bash
+python3 tools/systemkatalog_usage_receipt.py   --query authority-matrix   --reason truth_owner   --result-use used   --decision-effect confirmed   --output /tmp/systemkatalog-authority-matrix.receipt.json
+```
+
+Der Beleg speichert diese Query explizit mit `"argument": null`. Die Ausgabe wird
+zusätzlich auf stdout geschrieben. Eine angegebene Datei wird atomar mit Modus
+`0600` erzeugt.
 
 ## Begrenzte Felder
 
@@ -50,13 +57,15 @@ atomar mit Modus `0600` erzeugt.
 `changed` und `confirmed` sind nur zusammen mit `result_use=used` zulässig.
 
 Freie Gesprächsinhalte, Prompttexte und Begründungsprosa werden nicht im Beleg
-gespeichert. Der Abfrageparameter muss ein begrenzter Katalogbezeichner sein.
+gespeichert. Wertbehaftete Queries verlangen einen begrenzten Katalogbezeichner;
+`authority-matrix` ist absichtlich argumentlos. Das Receipt-Tool bindet sich
+fail-closed an den aktuellen Systemkatalog-Query-Vertrag `schemaVersion=2`.
 
 ## Beweisgrenze
 
 Direkt belegt sind:
 
-- die ausgeführte Query-Form;
+- die ausgeführte Query-Form einschließlich des exakten Query-Werts oder `null`;
 - ein vor und nach der Query stabiler Systemkatalog-`HEAD`;
 - ein sauberer getrackter Systemkatalog-Working-Tree;
 - die Bytegleichheit aller gemeldeten Quellpfade mit `git show HEAD:<Pfad>`;

@@ -17,13 +17,19 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
-def query_result(*, command: str = "truth-owner") -> dict[str, object]:
+def query_result(
+    *,
+    command: str = "truth-owner",
+    argument: str | None = "agent_routing",
+) -> dict[str, object]:
     return {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "kind": "system_catalog_query_result",
+        "status": "ok",
         "catalogRepository": "heimgewebe/systemkatalog",
         "catalogCommit": "a" * 40,
         "command": command,
+        "query": {"value": argument},
         "result": {"owner": "repo:grabowski"},
         "sourcePaths": [
             "registry/ecosystem/nodes.json",
@@ -85,6 +91,36 @@ class SystemkatalogUsageReceiptTests(unittest.TestCase):
             {key: value for key, value in receipt.items() if key != "receipt_sha256"}
         )
         self.assertEqual(receipt["receipt_sha256"], expected_hash)
+
+    def test_authority_matrix_receipt_is_argumentless_and_hash_bound(self) -> None:
+        result = query_result(command="authority-matrix", argument=None)
+        state = {
+            "root": Path("/unused"),
+            "head": "a" * 40,
+            "tracked_worktree_clean": True,
+        }
+        with (
+            patch.object(MODULE, "_catalog_state", side_effect=[state, state]),
+            patch.object(MODULE, "_query", return_value=result),
+            patch.object(MODULE, "_verify_sources_match_head"),
+        ):
+            receipt = MODULE.build_receipt(
+                systemkatalog_root=Path("/unused"),
+                command="authority-matrix",
+                argument=None,
+                reason="truth_owner",
+                result_use="used",
+                decision_effect="confirmed",
+            )
+
+        self.assertEqual(
+            receipt["systemkatalog"]["query"],
+            {"command": "authority-matrix", "argument": None},
+        )
+        self.assertEqual(
+            receipt["systemkatalog"]["query_result_sha256"],
+            MODULE._sha256_json(result),
+        )
 
     def test_dirty_catalog_is_rejected_before_query(self) -> None:
         dirty = {
@@ -174,6 +210,25 @@ class SystemkatalogUsageReceiptTests(unittest.TestCase):
                 "truth-owner", "agent_routing", "entrypoint_lookup", "used", "confirmed"
             )
 
+    def test_authority_matrix_requires_omitted_argument(self) -> None:
+        MODULE._validate_inputs(
+            "authority-matrix", None, "truth_owner", "used", "confirmed"
+        )
+        with self.assertRaisesRegex(MODULE.UsageReceiptError, "must be omitted"):
+            MODULE._validate_inputs(
+                "authority-matrix",
+                "agent_routing",
+                "truth_owner",
+                "used",
+                "confirmed",
+            )
+
+    def test_value_query_requires_argument(self) -> None:
+        with self.assertRaisesRegex(MODULE.UsageReceiptError, "bounded"):
+            MODULE._validate_inputs(
+                "truth-owner", None, "truth_owner", "used", "confirmed"
+            )
+
     def test_decision_effect_requires_used_result(self) -> None:
         with self.assertRaisesRegex(MODULE.UsageReceiptError, "require result_use=used"):
             MODULE._validate_inputs(
@@ -204,6 +259,50 @@ class SystemkatalogUsageReceiptTests(unittest.TestCase):
         self.assertEqual(kwargs["timeout"], 15)
         self.assertEqual(kwargs["env"]["PYTHONDONTWRITEBYTECODE"], "1")
         self.assertNotIn("HOME", kwargs["env"])
+
+    def test_authority_matrix_query_omits_argument_from_argv(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            script = scripts / "systemkatalog_query.py"
+            script.write_text("# fixture\n", encoding="utf-8")
+            completed = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=json.dumps(
+                    query_result(command="authority-matrix", argument=None)
+                ),
+                stderr="",
+            )
+            with patch.object(MODULE.subprocess, "run", return_value=completed) as run:
+                value = MODULE._query(root, "authority-matrix", None)
+
+        self.assertEqual(value["command"], "authority-matrix")
+        self.assertEqual(
+            run.call_args.args[0],
+            [MODULE.sys.executable, str(script), "authority-matrix"],
+        )
+
+    def test_query_value_must_match_requested_argument(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            (scripts / "systemkatalog_query.py").write_text(
+                "# fixture\n", encoding="utf-8"
+            )
+            completed = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=json.dumps(query_result(argument="other_domain")),
+                stderr="",
+            )
+            with patch.object(MODULE.subprocess, "run", return_value=completed):
+                with self.assertRaisesRegex(
+                    MODULE.UsageReceiptError, "value mismatch"
+                ):
+                    MODULE._query(root, "truth-owner", "agent_routing")
 
     def test_query_timeout_is_explicit(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:

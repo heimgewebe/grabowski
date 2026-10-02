@@ -18,7 +18,10 @@ from typing import Any
 RECEIPT_KIND = "grabowski.systemkatalog_usage_receipt"
 RECEIPT_SCHEMA_VERSION = 1
 QUERY_RESULT_KIND = "system_catalog_query_result"
-QUERY_COMMANDS = {"system", "repository", "truth-owner", "relations", "entrypoints"}
+QUERY_RESULT_SCHEMA_VERSION = 2
+VALUE_QUERY_COMMANDS = {"system", "repository", "truth-owner", "relations", "entrypoints"}
+VALUELESS_QUERY_COMMANDS = {"authority-matrix"}
+QUERY_COMMANDS = VALUE_QUERY_COMMANDS | VALUELESS_QUERY_COMMANDS
 REASONS = {
     "truth_owner",
     "repository_selection",
@@ -35,6 +38,7 @@ COMMAND_REASON = {
     "system": {"system_overview", "scope_boundary"},
     "repository": {"repository_selection", "scope_boundary"},
     "truth-owner": {"truth_owner"},
+    "authority-matrix": {"truth_owner", "scope_boundary"},
     "relations": {"relation_lookup"},
     "entrypoints": {"entrypoint_lookup"},
 }
@@ -136,11 +140,24 @@ def _verify_sources_match_head(root: Path, head: str, source_paths: list[str]) -
             )
 
 
-def _validate_inputs(command: str, argument: str, reason: str, result_use: str, decision_effect: str) -> None:
+def _validate_inputs(
+    command: str,
+    argument: str | None,
+    reason: str,
+    result_use: str,
+    decision_effect: str,
+) -> None:
     if command not in QUERY_COMMANDS:
         raise UsageReceiptError(f"unsupported query command: {command}")
-    if ARGUMENT_RE.fullmatch(argument) is None:
-        raise UsageReceiptError("argument must be a bounded Systemkatalog identifier")
+    if command in VALUE_QUERY_COMMANDS:
+        if argument is None or ARGUMENT_RE.fullmatch(argument) is None:
+            raise UsageReceiptError(
+                "argument must be a bounded Systemkatalog identifier for this query command"
+            )
+    elif argument is not None:
+        raise UsageReceiptError(
+            "argument must be omitted for valueless Systemkatalog query commands"
+        )
     if reason not in REASONS:
         raise UsageReceiptError(f"unsupported consultation reason: {reason}")
     if reason not in COMMAND_REASON[command]:
@@ -155,7 +172,7 @@ def _validate_inputs(command: str, argument: str, reason: str, result_use: str, 
         raise UsageReceiptError("not_used results cannot change or confirm a decision")
 
 
-def _query(root: Path, command: str, argument: str) -> dict[str, Any]:
+def _query(root: Path, command: str, argument: str | None) -> dict[str, Any]:
     root = root.expanduser().resolve()
     script_candidate = root / "scripts/systemkatalog_query.py"
     if script_candidate.is_symlink():
@@ -174,8 +191,11 @@ def _query(root: Path, command: str, argument: str) -> dict[str, Any]:
         "PYTHONDONTWRITEBYTECODE": "1",
     }
     try:
+        argv = [sys.executable, str(script), command]
+        if argument is not None:
+            argv.append(argument)
         completed = subprocess.run(
-            [sys.executable, str(script), command, argument],
+            argv,
             cwd=root,
             env=env,
             text=True,
@@ -194,10 +214,17 @@ def _query(root: Path, command: str, argument: str) -> dict[str, Any]:
         raise UsageReceiptError("Systemkatalog query returned invalid JSON") from exc
     if not isinstance(value, dict):
         raise UsageReceiptError("Systemkatalog query result must be an object")
-    if value.get("schemaVersion") != 1 or value.get("kind") != QUERY_RESULT_KIND:
+    if (
+        value.get("schemaVersion") != QUERY_RESULT_SCHEMA_VERSION
+        or value.get("kind") != QUERY_RESULT_KIND
+        or value.get("status") != "ok"
+    ):
         raise UsageReceiptError("Systemkatalog query result identity mismatch")
     if value.get("command") != command:
         raise UsageReceiptError("Systemkatalog query result command mismatch")
+    query = value.get("query")
+    if not isinstance(query, dict) or query.get("value") != argument:
+        raise UsageReceiptError("Systemkatalog query result value mismatch")
     if value.get("catalogRepository") != "heimgewebe/systemkatalog":
         raise UsageReceiptError("Systemkatalog query result repository mismatch")
     commit = value.get("catalogCommit")
@@ -216,7 +243,7 @@ def build_receipt(
     *,
     systemkatalog_root: Path,
     command: str,
-    argument: str,
+    argument: str | None,
     reason: str,
     result_use: str,
     decision_effect: str,
@@ -304,7 +331,7 @@ def main() -> int:
         default=Path(os.environ.get("SYSTEMKATALOG_ROOT", "/home/alex/repos/systemkatalog")),
     )
     parser.add_argument("--query", required=True, choices=sorted(QUERY_COMMANDS))
-    parser.add_argument("--argument", required=True)
+    parser.add_argument("--argument")
     parser.add_argument("--reason", required=True, choices=sorted(REASONS))
     parser.add_argument("--result-use", required=True, choices=sorted(RESULT_USES))
     parser.add_argument("--decision-effect", required=True, choices=sorted(DECISION_EFFECTS))
