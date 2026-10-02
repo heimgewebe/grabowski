@@ -251,6 +251,36 @@ HTTP_TRANSPORT_VERBOSE_LOGGERS = (
 )
 MCP_SESSION_LOCK_PROBE_TIMEOUT_SECONDS = 1.0
 MCP_LIVENESS_PATH = "/_grabowski/mcp-liveness"
+POSTHOG_MCP_ANALYTICS_SWITCH_ENV = "GRABOWSKI_POSTHOG_MCP_ANALYTICS"
+POSTHOG_PROJECT_TOKEN_ENV = "GRABOWSKI_POSTHOG_PROJECT_TOKEN"
+POSTHOG_HOST_ENV = "GRABOWSKI_POSTHOG_HOST"
+POSTHOG_DEFAULT_HOST = "https://eu.i.posthog.com"
+POSTHOG_ALLOWED_HOSTS = frozenset(
+    {"https://eu.i.posthog.com", "https://us.i.posthog.com"}
+)
+POSTHOG_PROJECT_TOKEN_FILE = (
+    HOME / ".config" / "grabowski" / "posthog-project-token"
+)
+POSTHOG_PROJECT_TOKEN_MAX_BYTES = 512
+POSTHOG_DISTINCT_ID = "grabowski-mcp-anonymous"
+POSTHOG_METADATA_PROPERTIES = frozenset(
+    {
+        "$lib",
+        "$lib_version",
+        "$mcp_duration_ms",
+        "$mcp_is_error",
+        "$mcp_protocol_version",
+        "$mcp_server_name",
+        "$mcp_server_version",
+        "$mcp_source",
+        "$mcp_tool_name",
+        "$session_id",
+    }
+)
+_POSTHOG_MCP_CLIENT: Any | None = None
+_POSTHOG_MCP_ANALYTICS: Any | None = None
+
+
 STACK_DUMP_MEMFD_NAME = "grabowski-operator-stackdump"
 STACK_DUMP_MAX_BYTES = 1_048_576
 _STACK_DUMP_FILE: Any | None = None
@@ -3313,6 +3343,218 @@ def _configure_http_runtime() -> None:
         raise RuntimeError("FastMCP stateless HTTP mode retained a session limit")
 
 
+
+
+def _posthog_mcp_analytics_switch() -> bool | None:
+    raw = os.environ.get(POSTHOG_MCP_ANALYTICS_SWITCH_ENV)
+    if raw is None:
+        return None
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off", ""}:
+        return False
+    logging.getLogger(__name__).warning(
+        "%s has an invalid boolean value; PostHog MCP analytics stays disabled",
+        POSTHOG_MCP_ANALYTICS_SWITCH_ENV,
+    )
+    return False
+
+
+def _read_posthog_project_token_file(path: Path = POSTHOG_PROJECT_TOKEN_FILE) -> str | None:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise RuntimeError("PostHog project token path is not a regular file")
+        if before.st_uid != os.getuid():
+            raise RuntimeError("PostHog project token file is not owned by the operator user")
+        if before.st_nlink != 1:
+            raise RuntimeError("PostHog project token file must have exactly one hard link")
+        if stat.S_IMODE(before.st_mode) & 0o077:
+            raise RuntimeError("PostHog project token file permissions must be 0600 or stricter")
+        if before.st_size > POSTHOG_PROJECT_TOKEN_MAX_BYTES:
+            raise RuntimeError("PostHog project token file is too large")
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, POSTHOG_PROJECT_TOKEN_MAX_BYTES))
+            if not chunk:
+                raise RuntimeError("PostHog project token file ended early")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise RuntimeError("PostHog project token file grew while being read")
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    identity_before = (
+        before.st_dev,
+        before.st_ino,
+        before.st_mode,
+        before.st_nlink,
+        before.st_uid,
+        before.st_gid,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    identity_after = (
+        after.st_dev,
+        after.st_ino,
+        after.st_mode,
+        after.st_nlink,
+        after.st_uid,
+        after.st_gid,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if identity_before != identity_after:
+        raise RuntimeError("PostHog project token file changed while being read")
+    payload = b"".join(chunks)
+    try:
+        token = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("PostHog project token file is not UTF-8") from exc
+    if any(character.isspace() for character in token):
+        raise RuntimeError("PostHog project token file must not contain whitespace")
+    return token or None
+
+
+def _posthog_project_token() -> str | None:
+    token = os.environ.get(POSTHOG_PROJECT_TOKEN_ENV, "")
+    if not token:
+        token = _read_posthog_project_token_file()
+    if token is not None and (
+        not token.startswith("phc_")
+        or len(token.encode("utf-8")) > POSTHOG_PROJECT_TOKEN_MAX_BYTES
+        or any(character.isspace() for character in token)
+    ):
+        raise RuntimeError("PostHog project token has an unexpected format")
+    return token
+
+
+def _posthog_ingestion_host() -> str:
+    raw = os.environ.get(POSTHOG_HOST_ENV, POSTHOG_DEFAULT_HOST).strip()
+    parsed = urlsplit(raw)
+    normalized = f"{parsed.scheme}://{parsed.netloc}"
+    if (
+        parsed.scheme != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+        or normalized not in POSTHOG_ALLOWED_HOSTS
+    ):
+        raise RuntimeError("PostHog host must be an allowlisted HTTPS ingestion origin")
+    return normalized
+
+
+def _posthog_metadata_only_before_send(event: Any) -> dict[str, Any] | None:
+    if not isinstance(event, dict) or event.get("event") != "$mcp_tool_call":
+        return None
+    properties = event.get("properties")
+    if not isinstance(properties, dict):
+        return None
+    tool_name = properties.get("$mcp_tool_name")
+    is_error = properties.get("$mcp_is_error")
+    if not isinstance(tool_name, str) or not tool_name or not isinstance(is_error, bool):
+        return None
+    projected = {
+        key: properties[key]
+        for key in POSTHOG_METADATA_PROPERTIES
+        if key in properties
+    }
+    projected["$geoip_disable"] = True
+    projected["$process_person_profile"] = False
+    sanitized: dict[str, Any] = {
+        "event": "$mcp_tool_call",
+        "distinct_id": POSTHOG_DISTINCT_ID,
+        "properties": projected,
+    }
+    if "timestamp" in event:
+        sanitized["timestamp"] = event["timestamp"]
+    return sanitized
+
+
+def _configure_posthog_mcp_analytics() -> bool:
+    global _POSTHOG_MCP_ANALYTICS, _POSTHOG_MCP_CLIENT
+    if _POSTHOG_MCP_CLIENT is not None:
+        return True
+    switch = _posthog_mcp_analytics_switch()
+    if switch is False:
+        return False
+    try:
+        token = _posthog_project_token()
+        if token is None:
+            if switch is True:
+                logging.getLogger(__name__).warning(
+                    "PostHog MCP analytics requested but no project token is configured"
+                )
+            return False
+        host = _posthog_ingestion_host()
+        from posthog import Posthog
+        from posthog.mcp import instrument
+        from posthog.mcp.types import MCPAnalyticsOptions
+    except (ImportError, OSError, RuntimeError, ValueError) as exc:
+        logging.getLogger(__name__).warning(
+            "PostHog MCP analytics remains disabled: %s", type(exc).__name__
+        )
+        return False
+
+    client: Any | None = None
+    try:
+        client = Posthog(token, host=host)
+        analytics = instrument(
+            mcp,
+            client,
+            MCPAnalyticsOptions(
+                report_missing=False,
+                enable_conversation_id=False,
+                enable_exception_autocapture=False,
+                context=False,
+                capture_model=False,
+                collect_feedback=False,
+                before_send=_posthog_metadata_only_before_send,
+            ),
+        )
+    except Exception as exc:
+        if client is not None:
+            try:
+                client.shutdown()
+            except Exception:
+                pass
+        logging.getLogger(__name__).warning(
+            "PostHog MCP analytics initialization failed open: %s",
+            type(exc).__name__,
+        )
+        return False
+    _POSTHOG_MCP_CLIENT = client
+    _POSTHOG_MCP_ANALYTICS = analytics
+    return True
+
+
+def _shutdown_posthog_mcp_analytics() -> None:
+    global _POSTHOG_MCP_ANALYTICS, _POSTHOG_MCP_CLIENT
+    client = _POSTHOG_MCP_CLIENT
+    _POSTHOG_MCP_CLIENT = None
+    _POSTHOG_MCP_ANALYTICS = None
+    if client is None:
+        return
+    try:
+        client.shutdown()
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "PostHog MCP analytics shutdown failed open: %s", type(exc).__name__
+        )
 
 
 def _open_stack_dump_memfd(max_bytes: int = STACK_DUMP_MAX_BYTES) -> Any:
@@ -9907,8 +10149,17 @@ def main() -> None:
             raise SystemExit("port must be between 1024 and 65535")
         mcp.settings.host = args.host
         mcp.settings.port = args.port
-        _configure_http_runtime()
-    mcp.run(transport=args.transport)
+    _configure_posthog_mcp_analytics()
+    try:
+        if args.transport == "streamable-http":
+            # Instrument before building the Streamable HTTP app. PostHog's
+            # FastMCP adapter installs middleware while the app is built; the
+            # Grabowski HTTP setup then installs the deployment/authority gate
+            # as the outer call boundary around the instrumented manager.
+            _configure_http_runtime()
+        mcp.run(transport=args.transport)
+    finally:
+        _shutdown_posthog_mcp_analytics()
 
 
 if __name__ == "__main__":
