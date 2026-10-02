@@ -74,10 +74,9 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "narrowest-typed-read-first",
-        "Use the narrowest typed read that answers the question. Stable ecosystem ownership/authority: "
-        "grabowski_systemkatalog_query; authority-matrix if key unknown, truth-owner if known. "
-        "RepoGround is for repository/implementation/free-text content; current runtime/PR/CI truth stays with its owning live source. "
-        "No connectivity-only health ping when that read can serve as the probe.",
+        "Stable ecosystem authority: grabowski_systemkatalog_query (authority-matrix unknown; truth-owner known). "
+        "Repo/implementation/free-text: RepoGround. Runtime/PR/CI: live source. Narrowest typed read; "
+        "no connectivity-only health ping if it can serve as the probe.",
     ),
     (
         "host-capability-resolution",
@@ -93,11 +92,11 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "pre-runtime-platform-denial",
-        "If an upstream platform refuses before host dispatch and no Grabowski receipt exists: classify platform_filter; do not attribute it to the Grabowski runtime; do not retry the blocked call unchanged; resume from lane or task receipts in a supported conversation.",
+        "If ChatGPT or another upstream platform refuses a call before host dispatch and no Grabowski receipt exists, classify it as platform_filter and do not attribute it to the Grabowski runtime; do not retry the blocked call unchanged, and resume from existing lane or task receipts in a supported conversation when present.",
     ),
     (
         "platform-filter-narrowing",
-        "After readback proves an upstream platform filter caused no effect, use an existing semantically narrower typed operation for the authorized goal; do not weaken, bypass, disguise, or repackage the safeguard.",
+        "After readback proves an upstream platform filter caused no effect, continue the authorized goal through an existing semantically narrower typed operation when available; do not weaken, disguise, bypass, or repackage the platform safeguard.",
     ),
     (
         "publication-pending-is-local",
@@ -117,7 +116,7 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "goal-fidelity-before-continuation",
-        "User outcome outranks strategy; use minimum sufficient mechanism. Persistent complexity requires proof of benefit; compare a simpler path with fresh evidence; choose CONTINUE/CHANGE/PARK-STOP. Tool failure alone is not strategic evidence. Managed dirty checkout: continue only from lane/lifecycle/checkout evidence with fresh Git preimage; never reset/clean/stash.",
+        "User outcome outranks strategy. Use minimum sufficient mechanism; persistent complexity requires proof of benefit. Compare a simpler path with fresh evidence; choose CONTINUE/CHANGE/PARK-STOP. A tool failure alone is not strategic evidence. Managed dirty checkout after ensure: continue only from exact lane/lifecycle/checkout evidence with fresh Git preimage; never reset/clean/stash merely to satisfy ensure.",
     ),
     (
         "operator-obligation-lifecycle",

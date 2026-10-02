@@ -89,14 +89,14 @@ class AgentInstructionsTests(unittest.TestCase):
         self.assertIn("connectivity-only health ping", narrow)
         self.assertIn("serve as the probe", narrow)
         for phrase in (
-            "stable ecosystem ownership/authority",
+            "stable ecosystem authority",
             "grabowski_systemkatalog_query",
             "authority-matrix",
             "truth-owner",
             "repoground",
-            "repository/implementation/free-text",
-            "current runtime/pr/ci truth",
-            "owning live source",
+            "repo/implementation/free-text",
+            "runtime/pr/ci",
+            "live source",
         ):
             self.assertIn(phrase, narrow)
         host_resolution = rules["host-capability-resolution"].lower()
