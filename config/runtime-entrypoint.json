@@ -2,6 +2,7 @@
   "expected_tools": [
     "grabowski_status",
     "grabowski_context",
+    "report_outcome",
     "grip_list",
     "grip_run",
     "grabowski_list_directory",
@@ -210,6 +211,10 @@
     {
       "module": "grabowski_operator_core",
       "source": "src/grabowski_operator.py"
+    },
+    {
+      "module": "grabowski_flowlines",
+      "source": "src/grabowski_flowlines.py"
     },
     {
       "module": "grabowski_bureau_runtime_refresh_executor",

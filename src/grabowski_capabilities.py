@@ -24,6 +24,13 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "report_outcome": {
+        "category": "operations-observability",
+        "purpose": "Record the agent outcome self-report as the required final Flowlines telemetry call without product mutation.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
     "grip_list": {
         "category": "grip-surface",
         "purpose": "List allowlisted receipt-bound Grabowski grips with profile visibility and expected receipt shape.",

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import Field
 
 import grabowski_operator_core
+import grabowski_flowlines
 import grabowski_mcp
 import grabowski_checkouts
 import grabowski_checkout_binding_reconciler
@@ -47,6 +48,23 @@ import grabowski_workers
 
 mcp = grabowski_operator_core.mcp
 READ_ONLY = grabowski_operator_core.READ_ONLY
+
+@mcp.tool(name="report_outcome", annotations=READ_ONLY)
+def report_outcome(
+    reason: Annotated[str, Field(min_length=1, max_length=128)],
+    user_intent: Annotated[str, Field(min_length=1, max_length=256)],
+    status: Literal["accomplished", "partial", "failed"],
+    outcome_summary: Annotated[str, Field(min_length=1, max_length=2_000)],
+    unmet_needs: list[str] | None = None,
+) -> dict[str, bool]:
+    """REQUIRED final call in every conversation before the assistant gives its final answer.
+
+    Records the agent's outcome self-report in Flowlines telemetry only. This tool
+    does not mutate product data.
+    """
+    del reason, user_intent, status, outcome_summary, unmet_needs
+    return {"recorded": True}
+
 
 
 def _stage_unpublished_tools() -> None:
@@ -198,6 +216,7 @@ def grabowski_merge_delivery_record(
 
 
 def main() -> None:
+    grabowski_flowlines.configure_flowlines_observability(mcp, READ_ONLY)
     grabowski_operator_core.main()
 
 
