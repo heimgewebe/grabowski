@@ -395,6 +395,97 @@ def _invoke_privileged_reference(
     }
 
 
+def _invoke_mainpid_privileged_reference(
+    *,
+    action: str,
+    target: str,
+    justification: str,
+    timeout_seconds: int,
+    max_output_bytes: int,
+) -> dict[str, Any]:
+    """Invoke one inventory Rootbroker action directly from the operator MainPID."""
+    if action not in {
+        CRITICAL_USER_DATA_INVENTORY_ACTION,
+        CRITICAL_USER_DATA_INVENTORY_READ_ACTION,
+    }:
+        raise ValueError("MainPID privileged inventory action is not allowed")
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, int)
+        or not 1 <= timeout_seconds <= 120
+    ):
+        raise ValueError("MainPID privileged inventory timeout is invalid")
+    broker = _privileged_broker_status()
+    if not broker.get("ready"):
+        raise PermissionError("privileged broker is not ready")
+    reference = _create_privileged_reference(
+        action=action,
+        target=target,
+        justification=justification,
+    )
+    payload = (
+        json.dumps(reference, ensure_ascii=False, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if not payload or len(payload) > 64 * 1024:
+        raise ValueError("privileged reference exceeds broker input limit")
+
+    client_timed_out = False
+    transport_error: str | None = None
+    chunks: list[bytes] = []
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(timeout_seconds + 15)
+            client.connect(str(BROKER_SOCKET))
+            client.sendall(payload)
+            client.shutdown(socket.SHUT_WR)
+            total = 0
+            while True:
+                chunk = client.recv(64 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > 512 * 1024:
+                    raise RuntimeError(
+                        "privileged broker response exceeds output limit"
+                    )
+                chunks.append(chunk)
+    except (socket.timeout, TimeoutError) as exc:
+        client_timed_out = True
+        transport_error = str(exc) or "privileged broker request timed out"
+    except (OSError, RuntimeError) as exc:
+        transport_error = f"{type(exc).__name__}: {exc}"
+
+    stdout_full = _redact_text(
+        b"".join(chunks).decode("utf-8", errors="replace")
+    )
+    stderr_full = _redact_text(transport_error or "")
+    stdout, stdout_truncated = _limit_text(stdout_full, max_output_bytes)
+    stderr, stderr_truncated = _limit_text(stderr_full, max_output_bytes)
+    try:
+        parsed = json.loads(stdout_full) if stdout_full.strip() else None
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict):
+        for key in ("stdout", "stderr"):
+            if isinstance(parsed.get(key), str):
+                parsed[key], parsed[f"{key}_truncated_by_client"] = _limit_text(
+                    _redact_text(parsed[key]),
+                    max_output_bytes,
+                )
+    return {
+        "request_id": reference["request_id"],
+        "reference_sha256": reference["reference_sha256"],
+        "broker_client_returncode": None,
+        "broker_client_timed_out": client_timed_out,
+        "broker_client_transport_error": transport_error,
+        "broker_response": parsed,
+        "stdout": stdout,
+        "stderr": stderr,
+        "stdout_truncated": stdout_truncated,
+        "stderr_truncated": stderr_truncated,
+    }
+
+
 def _operator_authority_attestation_head() -> str | None:
     path = OPERATOR_AUTHORITY_ATTESTATION_PATH
     flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
@@ -1325,7 +1416,7 @@ def _critical_inventory_broker_call(
     ambiguous_on_invalid: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     target = _critical_inventory_target(operation, scanner, contract)
-    invoked = _invoke_privileged_reference(
+    invoked = _invoke_mainpid_privileged_reference(
         action=action,
         target=target,
         justification=(
@@ -1342,6 +1433,16 @@ def _critical_inventory_broker_call(
         if not isinstance(outer, dict):
             raise RuntimeError(
                 "critical-user-data inventory broker response is invalid"
+            )
+        broker_error = outer.get("error")
+        if broker_error is not None:
+            if not isinstance(broker_error, str) or not broker_error:
+                raise RuntimeError(
+                    "critical-user-data inventory broker error response is invalid"
+                )
+            raise RuntimeError(
+                "critical-user-data inventory broker rejected request: "
+                + broker_error[:500]
             )
         timed_out = outer.get("timed_out")
         if timed_out is True:
