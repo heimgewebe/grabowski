@@ -86,17 +86,19 @@ class AgentInstructionsTests(unittest.TestCase):
         self.assertIn("live runtime state", rules["truth-hierarchy"].lower())
         narrow = rules["narrowest-typed-read-first"].lower()
         self.assertIn("narrowest typed read", narrow)
-        self.assertIn("connectivity-only health ping", narrow)
-        self.assertIn("serve as the probe", narrow)
+        self.assertIn("health ping", narrow)
+        self.assertIn("read probes", narrow)
         for phrase in (
-            "stable ecosystem authority",
+            "cross-repo stable",
+            "owner/role/boundary/entrypoint/relation",
             "grabowski_systemkatalog_query",
-            "authority-matrix",
-            "truth-owner",
+            "tools/systemkatalog_usage_receipt.py",
+            "decision use",
+            "fixed fields/no prose",
             "repoground",
-            "repo/implementation/free-text",
+            "repo/code/text",
             "runtime/pr/ci",
-            "live source",
+            "live",
         ):
             self.assertIn(phrase, narrow)
         host_resolution = rules["host-capability-resolution"].lower()

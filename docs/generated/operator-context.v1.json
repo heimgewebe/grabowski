@@ -1875,7 +1875,7 @@
     },
     {
       "category": "knowledge",
-      "description": "Run one typed, revision-bound Systemkatalog v2 query without write authority.",
+      "description": "Prefer this typed read for cross-repository stable Systemkatalog truth.\n\nThis includes truth ownership, system roles, responsibility boundaries, canonical\nentrypoints and stable relations. For authority use authority-matrix when the\ndomain key is unknown and truth-owner when known. Use RepoGround for local\nrepository/implementation/free-text content; current runtime, PR and CI truth\nstays with its owning live source. If the result changes or confirms a decision,\nrecord a hash-bound usage receipt via tools/systemkatalog_usage_receipt.py using\nfixed metadata categories and no free prose. Grants no write authority.",
       "effects": [],
       "id": "grabowski_systemkatalog_query",
       "purpose": "Run one bounded, revision-bound Systemkatalog v2 semantic query without catalog, task, runtime or merge authority.",
@@ -3758,7 +3758,7 @@
       "src/grabowski_serving_process.py": "6976c47f932c693f5b7a25e43354e31c3f300e48e4ec7284c66c3b6007cc7160",
       "src/grabowski_sqlite_store.py": "efad0f7cb515e6ab005edf3cbe596b5a4fbe8c097fa7c4361c46d344f9a7ec84",
       "src/grabowski_system_map.py": "cdb1aae6cce14f049160dd0ddadc29234bdc053a29b3c251a6f879079cc90cc3",
-      "src/grabowski_systemkatalog.py": "4fefcfd0b5ea3b68d37b6a95d27516799cbf5c2ada14494c3b4c17688f98585d",
+      "src/grabowski_systemkatalog.py": "45c9bfd5c66a19cce0c08701c07528b8ee5f77f077323a44cc62e7111351c227",
       "src/grabowski_task_attention.py": "a16d4b045bef23bf78ad3df0c4c58d91a304dc9a83b6e757fb1b0f88754ad6f3",
       "src/grabowski_task_reconcile.py": "64dc6195c9d0cb3435d192e4715a0d4d5679b9f1904057308366f4e2f2e9bbea",
       "src/grabowski_tasks.py": "b616d105e72f21a3230b0f045cb97596f5c0cf9440eab3d2ae947e4fffaa160a",

@@ -677,10 +677,14 @@ def grabowski_systemkatalog_query(
         ),
     ] = None,
 ) -> dict[str, Any]:
-    """Prefer this typed read for stable ecosystem ownership/authority.
+    """Prefer this typed read for cross-repository stable Systemkatalog truth.
 
-    Use authority-matrix when the domain key is unknown and truth-owner when known.
-    Use RepoGround for repository/implementation/free-text content. Current runtime,
-    PR and CI truth stays with its owning live source. Grants no write authority.
+    This includes truth ownership, system roles, responsibility boundaries, canonical
+    entrypoints and stable relations. For authority use authority-matrix when the
+    domain key is unknown and truth-owner when known. Use RepoGround for local
+    repository/implementation/free-text content; current runtime, PR and CI truth
+    stays with its owning live source. If the result changes or confirms a decision,
+    record a hash-bound usage receipt via tools/systemkatalog_usage_receipt.py using
+    fixed metadata categories and no free prose. Grants no write authority.
     """
     return query_systemkatalog(operation, value)

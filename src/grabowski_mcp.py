@@ -74,9 +74,9 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "narrowest-typed-read-first",
-        "Stable ecosystem authority: grabowski_systemkatalog_query (authority-matrix unknown; truth-owner known). "
-        "Repo/implementation/free-text: RepoGround. Runtime/PR/CI: live source. Narrowest typed read; "
-        "no connectivity-only health ping if it can serve as the probe.",
+        "Cross-repo stable owner/role/boundary/entrypoint/relation: grabowski_systemkatalog_query. "
+        "Decision use: tools/systemkatalog_usage_receipt.py fixed fields/no prose. "
+        "Repo/code/text:RepoGround; runtime/PR/CI live. Narrowest typed read; no health ping if read probes.",
     ),
     (
         "host-capability-resolution",
