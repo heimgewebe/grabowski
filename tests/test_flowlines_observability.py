@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import importlib
 import json
 import os
@@ -172,8 +173,8 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(attrs["gen_ai.tool.call.id"], "77")
         self.assertEqual(attrs["session.id"], "session-1")
         self.assertEqual(attrs["user.id"], "user-17")
-        self.assertEqual(attrs["user.name"], "Ada")
-        self.assertEqual(attrs["user.email"], "ada@example.invalid")
+        self.assertNotIn("user.name", attrs)
+        self.assertNotIn("user.email", attrs)
         self.assertEqual(attrs["gen_ai.tool.call.reason"], "Read the fixture value")
         self.assertEqual(attrs["session.user_intent"], "Verify Flowlines instrumentation")
 
@@ -221,6 +222,33 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.root.isError)
         self.assertEqual(result.root.structuredContent, {"value": "legacy"})
         self.assertEqual(self.exporter.get_finished_spans(), ())
+
+    def test_existing_domain_analytics_schemas_are_not_overwritten(self) -> None:
+        tool = SimpleNamespace(
+            name="domain_fields",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "enum": ["domain-reason"],
+                        "description": "Domain-owned reason semantics.",
+                    },
+                    "user_intent": {
+                        "type": "string",
+                        "pattern": "^domain-",
+                        "description": "Domain-owned intent semantics.",
+                    },
+                },
+                "required": ["reason"],
+            },
+        )
+        before = copy.deepcopy(tool.parameters["properties"])
+        flowlines._augment_tool_schema(tool)
+        self.assertEqual(tool.parameters["properties"], before)
+        self.assertTrue(
+            {"reason", "user_intent"}.issubset(set(tool.parameters["required"]))
+        )
 
     async def test_existing_domain_reason_arguments_are_preserved(self) -> None:
         mcp = FastMCP("grabowski-test", instructions="fixture")
@@ -383,8 +411,8 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         )
         span = self.exporter.get_finished_spans()[0]
         self.assertEqual(span.attributes["user.id"], "verified-9")
-        self.assertEqual(span.attributes["user.name"], "Verified Name")
-        self.assertEqual(span.attributes["user.email"], "verified@example.invalid")
+        self.assertNotIn("user.name", span.attributes)
+        self.assertNotIn("user.email", span.attributes)
 
     async def test_error_span_is_explicit_and_does_not_export_raw_exception(self) -> None:
         mcp = FastMCP("grabowski-test", instructions="fixture")
@@ -657,7 +685,7 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             "GRABOWSKI_FLOWLINES_ENABLED": "1",
             "OTEL_EXPORTER_OTLP_ENDPOINT": "https://api.flowlines.ai",
             "OTEL_EXPORTER_OTLP_HEADERS": "x-flowlines-api-key=fixture",
-            "OTEL_SERVICE_NAME": "grabowski-mcp",
+            "OTEL_SERVICE_NAME": "ambient-service-name-must-not-win",
             "OTEL_RESOURCE_ATTRIBUTES": "secret.env=must-not-export-resource",
         }
 

@@ -191,17 +191,7 @@ def _identity_from_meta(
     if user_id is None or session_id is None:
         return None
 
-    result = {"user.id": user_id, "session.id": session_id}
-    for target, verified_key, meta_key in (
-        ("user.name", "name", "user.name"),
-        ("user.email", "email", "user.email"),
-    ):
-        value = _nonempty_text(verified.get(verified_key), maximum=1024)
-        if value is None:
-            value = _nonempty_text(meta.get(meta_key), maximum=1024)
-        if value is not None:
-            result[target] = value
-    return result
+    return {"user.id": user_id, "session.id": session_id}
 
 
 def _augment_tool_schema(tool: Any) -> None:
@@ -212,8 +202,8 @@ def _augment_tool_schema(tool: Any) -> None:
     properties = schema.setdefault("properties", {})
     if not isinstance(properties, dict):
         raise RuntimeError("Flowlines tool schema properties must be an object")
-    properties["reason"] = dict(_REASON_SCHEMA)
-    properties["user_intent"] = dict(_USER_INTENT_SCHEMA)
+    properties.setdefault("reason", dict(_REASON_SCHEMA))
+    properties.setdefault("user_intent", dict(_USER_INTENT_SCHEMA))
     required = schema.setdefault("required", [])
     if not isinstance(required, list):
         raise RuntimeError("Flowlines tool schema required must be a list")
@@ -471,10 +461,6 @@ def _build_environment_tracer() -> tuple[Any | None, Any | None]:
         LOGGER.warning("Flowlines telemetry disabled: OpenTelemetry runtime dependencies are unavailable")
         return None, None
 
-    service_name = (
-        _nonempty_text(os.environ.get("OTEL_SERVICE_NAME"), maximum=255)
-        or "grabowski-mcp"
-    )
     try:
         exporter = OTLPSpanExporter(
             endpoint=_FLOWLINES_TRACE_ENDPOINT,
@@ -483,7 +469,7 @@ def _build_environment_tracer() -> tuple[Any | None, Any | None]:
             max_request_size=_FLOWLINES_MAX_REQUEST_BYTES,
         )
         provider = TracerProvider(
-            resource=Resource({"service.name": service_name}),
+            resource=Resource({"service.name": "grabowski-mcp"}),
             sampler=ALWAYS_ON,
             shutdown_on_exit=False,
         )

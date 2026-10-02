@@ -27,7 +27,6 @@ RuntimeDirectoryPreserve=restart
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 Environment=PYTHONUNBUFFERED=1
 Environment=OTEL_EXPORTER_OTLP_ENDPOINT=https://api.flowlines.ai
-Environment=OTEL_SERVICE_NAME=grabowski-mcp
 EnvironmentFile=-/home/alex/.config/grabowski/flowlines.env
 Environment=MALLOC_ARENA_MAX=8
 NoNewPrivileges=yes
