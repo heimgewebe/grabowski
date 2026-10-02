@@ -3906,9 +3906,12 @@ def _runtime_deploy_self_schedule(
 
 
 def _runtime_deploy_self_schedule_source_preflight(
-    schedule: dict[str, Any],
+    schedule: Any,
     expected_head: str,
 ) -> dict[str, Any]:
+    if not isinstance(schedule, dict):
+        raise GripPreflightError("runtime deploy scheduler returned non-object")
+
     import grabowski_self_deploy
 
     if schedule.get("reused_across_source_identity") is True:
