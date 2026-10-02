@@ -126,6 +126,13 @@ _SENSITIVE_RESULT_TOOLS = frozenset(
         "ipad_bluetooth_read",
     }
 )
+_SENSITIVE_RESULT_TOOL_PREFIXES = (
+    "grabowski_agent_workspace_",
+    "grabowski_checkout_",
+    "grabowski_resource_",
+    "grabowski_git_",
+    "grabowski_github_",
+)
 _SENSITIVE_ARGUMENT_KEYS = frozenset(
     {
         "authorization",
@@ -399,7 +406,7 @@ def _result_is_error(root: Any) -> bool:
 def _safe_result_json(root: Any, *, tool_name: str) -> str | None:
     if _result_is_error(root):
         return _canonical_json({"isError": True, "content": [{"type": "text", "text": "tool_error"}]})
-    if tool_name in _SENSITIVE_RESULT_TOOLS or tool_name.startswith("grabowski_agent_workspace_"):
+    if tool_name in _SENSITIVE_RESULT_TOOLS or tool_name.startswith(_SENSITIVE_RESULT_TOOL_PREFIXES):
         return _canonical_json({"redacted": True, "reason": "sensitive_tool_result"})
     model_dump = getattr(root, "model_dump", None)
     if callable(model_dump):

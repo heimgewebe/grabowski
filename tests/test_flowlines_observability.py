@@ -816,6 +816,41 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
                     {"reason": "sensitive_tool_result", "redacted": True},
                 )
 
+    def test_operator_result_families_are_replaced(self) -> None:
+        marker = "synthetic-private-operator-result"
+
+        class Result:
+            isError = False
+
+            def model_dump(self, **kwargs):
+                del kwargs
+                return {
+                    "path": "/private/operator/path",
+                    "purpose": marker,
+                    "stdout": marker,
+                    "title": marker,
+                }
+
+        tool_names = {
+            "grabowski_checkout_inventory",
+            "grabowski_checkout_future_tool",
+            "grabowski_resource_list",
+            "grabowski_resource_future_tool",
+            "grabowski_git_status",
+            "grabowski_git_future_tool",
+            "grabowski_github_pr_view",
+            "grabowski_github_future_tool",
+        }
+        for tool_name in tool_names:
+            with self.subTest(tool_name=tool_name):
+                captured = flowlines._safe_result_json(Result(), tool_name=tool_name)
+                self.assertIsNotNone(captured)
+                self.assertNotIn(marker, captured)
+                self.assertEqual(
+                    json.loads(captured),
+                    {"reason": "sensitive_tool_result", "redacted": True},
+                )
+
     def test_agent_workspace_result_family_is_replaced(self) -> None:
         marker = "synthetic-private-workspace-command"
 
