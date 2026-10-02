@@ -565,6 +565,8 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             "grabowski_operation_run": {"parameters"},
             "grabowski_operator_recall_export": {"sources"},
             "grabowski_operational_guidance": {"symptoms"},
+            "ipad_file_create": {"payload_b64", "session_escalation"},
+            "ipad_file_replace": {"payload_b64", "session_escalation"},
         }
         self.assertEqual(
             set(cases),
