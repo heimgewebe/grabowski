@@ -1658,6 +1658,36 @@ class OperatorSignedTransportTests(unittest.TestCase):
                     )
                 )
 
+    def test_server_verified_git_status_can_repeat_without_signed_replay_state(self) -> None:
+        tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=False))
+        arguments = {
+            "repo": "/tmp/repo",
+            "arguments": [
+                "status",
+                "--short",
+                "--branch",
+                "--untracked-files=normal",
+            ],
+            "timeout_seconds": 60,
+            "branch_attempt": None,
+        }
+        with mock.patch.object(
+            base,
+            "_transport_signed_one_call_evidence",
+            side_effect=AssertionError(
+                "server-verified git status must not consume signed replay state"
+            ),
+        ):
+            for _ in range(2):
+                self.assertIsNone(
+                    operator._require_transport_roundtrip_for_tool(
+                        tool_name="grabowski_git",
+                        arguments=arguments,
+                        context=None,
+                        tool=tool,
+                    )
+                )
+
     def test_captain_preflight_exact_read_only_shape_is_transport_exempt(self) -> None:
         arguments = {
             "name": "captain-preflight",
