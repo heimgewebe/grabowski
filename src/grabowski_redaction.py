@@ -20,10 +20,16 @@ _GITHUB_SECRET_PATTERN = re.compile(
     r"(?![A-Za-z0-9_])",
     re.I,
 )
+_GITLAB_SECRET_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_])"
+    r"glpat-[A-Za-z0-9_-]{20,}"
+    r"(?![A-Za-z0-9_-])"
+)
 SECRET_REDACTIONS = (
     (_OPENAI_SECRET_PATTERN, "<REDACTED_OPENAI_KEY>"),
     (_ANTHROPIC_SECRET_PATTERN, "<REDACTED_ANTHROPIC_KEY>"),
     (_GITHUB_SECRET_PATTERN, "<REDACTED_GITHUB_TOKEN>"),
+    (_GITLAB_SECRET_PATTERN, "<REDACTED_GITLAB_TOKEN>"),
     (
         re.compile(r"Bearer\s+[A-Za-z0-9._~+/-]{12,}=*", re.I),
         "Bearer <REDACTED>",

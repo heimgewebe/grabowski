@@ -295,6 +295,43 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(fine_grained_token, serialized)
         self.assertIn("<REDACTED_GITHUB_TOKEN>", serialized)
 
+    async def test_bare_gitlab_tokens_are_scrubbed_from_text_and_identifiers(self) -> None:
+        gitlab_token = "glpat-" + ("L" * 32)
+        mcp = self.server()
+        result = await self.call(
+            mcp,
+            arguments={
+                "value": "hello",
+                "reason": f"Rotate {gitlab_token}",
+                "user_intent": "Keep GitLab credentials private",
+            },
+            meta=self.meta(
+                **{
+                    "user.id": gitlab_token,
+                    "session.id": f"session-{gitlab_token}",
+                }
+            ),
+            request_id=f"req-{gitlab_token}",
+        )
+
+        self.assertFalse(result.root.isError)
+        attrs = self.exporter.get_finished_spans()[0].attributes
+        serialized = json.dumps(dict(attrs), sort_keys=True)
+        self.assertNotIn(gitlab_token, serialized)
+        self.assertEqual(
+            attrs["gen_ai.tool.call.reason"],
+            "Rotate <REDACTED_GITLAB_TOKEN>",
+        )
+        self.assertEqual(attrs["user.id"], "<REDACTED_GITLAB_TOKEN>")
+        self.assertEqual(
+            attrs["session.id"],
+            "session-<REDACTED_GITLAB_TOKEN>",
+        )
+        self.assertEqual(
+            attrs["mcp.request.id"],
+            "req-<REDACTED_GITLAB_TOKEN>",
+        )
+
     async def test_report_outcome_scrubs_sensitive_free_text_recursively(self) -> None:
         provider_key = "s" + "k-ant-" + ("x" * 24)
         password = "synthetic-password-value"
@@ -347,10 +384,12 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         )
         github_classic = "ghp_" + ("C" * 32)
         github_fine_grained = "github_pat_" + ("D" * 32)
+        gitlab_pat = "glpat-" + ("E" * 32)
         cases = [
             (f"provider {provider_key}", provider_key),
             (f"github {github_classic}", github_classic),
             (f"github {github_fine_grained}", github_fine_grained),
+            (f"gitlab {gitlab_pat}", gitlab_pat),
             (f"aws {aws_access_key}", aws_access_key),
             (private_key, "synthetic-private-material"),
             (
@@ -379,6 +418,7 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             "Review secret authentication requirements",
             "Review password authentication requirements",
             "Inspect credential requirements for the operator",
+            "Discuss glpat-prefix handling without a token",
             "Record the partial outcome and remaining operator gate",
         ]
         for sample in samples:
