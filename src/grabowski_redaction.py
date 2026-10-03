@@ -32,12 +32,18 @@ _SLACK_SECRET_PATTERN = re.compile(
     r"(?![A-Za-z0-9-])",
     re.I,
 )
+_POSTHOG_PROJECT_TOKEN_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_])"
+    r"phc_[A-Za-z0-9._~-]+"
+    r"(?![A-Za-z0-9._~-])",
+)
 SECRET_REDACTIONS = (
     (_OPENAI_SECRET_PATTERN, "<REDACTED_OPENAI_KEY>"),
     (_ANTHROPIC_SECRET_PATTERN, "<REDACTED_ANTHROPIC_KEY>"),
     (_GITHUB_SECRET_PATTERN, "<REDACTED_GITHUB_TOKEN>"),
     (_GITLAB_SECRET_PATTERN, "<REDACTED_GITLAB_TOKEN>"),
     (_SLACK_SECRET_PATTERN, "<REDACTED_SLACK_TOKEN>"),
+    (_POSTHOG_PROJECT_TOKEN_PATTERN, "<REDACTED_POSTHOG_TOKEN>"),
     (
         re.compile(r"Bearer\s+[A-Za-z0-9._~+/-]{12,}=*", re.I),
         "Bearer <REDACTED>",

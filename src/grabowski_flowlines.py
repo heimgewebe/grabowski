@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import atexit
 import copy
+import ctypes
+import hashlib
 import json
 import logging
 import os
 import re
+import socket
+import time
 from typing import Any, Callable, Literal, Mapping
 from urllib.parse import urlsplit
 import uuid
@@ -45,6 +49,67 @@ _MAX_SCHEMA_CHARS = 50_000
 _FLOWLINES_TRACE_ENDPOINT = f"{FLOWLINES_ENDPOINT}/v1/traces"
 _FLOWLINES_EXPORT_TIMEOUT_SECONDS = 5.0
 _FLOWLINES_MAX_REQUEST_BYTES = 8 * 1024 * 1024
+_FLOWLINES_BROKER_SOCKET = "/run/grabowski/privileged-broker.sock"
+_FLOWLINES_SECRET_PATH = "/etc/grabowski/flowlines-headers"
+_FLOWLINES_CREDENTIAL_MAX_BYTES = 4 * 1024
+_FLOWLINES_BROKER_RESPONSE_MAX_BYTES = 16 * 1024
+_FLOWLINES_BROKER_TIMEOUT_SECONDS = 10.0
+_FLOWLINES_PRIVILEGED_REFERENCE_TTL_SECONDS = 60
+_PR_GET_DUMPABLE = 3
+_PR_SET_DUMPABLE = 4
+_FLOWLINES_SECRET_READ_SCRIPT = f"""import os
+import stat
+import sys
+path = {_FLOWLINES_SECRET_PATH!r}
+limit = {_FLOWLINES_CREDENTIAL_MAX_BYTES}
+nofollow = getattr(os, "O_NOFOLLOW", None)
+if nofollow is None:
+    raise SystemExit(2)
+try:
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | nofollow)
+except OSError:
+    raise SystemExit(2)
+try:
+    before = os.fstat(descriptor)
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_mode,
+        before.st_nlink,
+        before.st_uid,
+        before.st_gid,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    if not (
+        stat.S_ISREG(before.st_mode)
+        and before.st_uid == 0
+        and before.st_gid == 0
+        and stat.S_IMODE(before.st_mode) == 0o600
+        and before.st_nlink == 1
+        and 0 < before.st_size <= limit
+    ):
+        raise SystemExit(2)
+    payload = os.pread(descriptor, before.st_size + 1, 0)
+    after = os.fstat(descriptor)
+    after_identity = (
+        after.st_dev,
+        after.st_ino,
+        after.st_mode,
+        after.st_nlink,
+        after.st_uid,
+        after.st_gid,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if before_identity != after_identity or len(payload) != before.st_size:
+        raise SystemExit(2)
+finally:
+    os.close(descriptor)
+sys.stdout.buffer.write(payload)
+"""
 _FLOWLINES_BSP_MAX_QUEUE_SIZE = 512
 _FLOWLINES_BSP_SCHEDULE_DELAY_MILLIS = 1_000
 _FLOWLINES_BSP_MAX_EXPORT_BATCH_SIZE = 64
@@ -54,6 +119,7 @@ ReportOutcomeUnmetNeeds = Annotated[
     Field(max_length=16),
 ]
 _FLOWLINES_FORBIDDEN_EXPORT_ENV = (
+    "OTEL_EXPORTER_OTLP_HEADERS",
     "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
     "OTEL_PYTHON_EXPORTER_OTLP_HTTP_CREDENTIAL_PROVIDER",
     "OTEL_PYTHON_EXPORTER_OTLP_HTTP_TRACES_CREDENTIAL_PROVIDER",
@@ -443,6 +509,123 @@ def _tool_attributes(
     return attributes
 
 
+def _linux_prctl(option: int, argument: int) -> int:
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        prctl = libc.prctl
+    except (AttributeError, OSError):
+        return -1
+    prctl.argtypes = [
+        ctypes.c_int,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+    ]
+    prctl.restype = ctypes.c_int
+    try:
+        return int(prctl(option, argument, 0, 0, 0))
+    except (TypeError, ValueError):
+        return -1
+
+
+def _ensure_process_nondumpable() -> bool:
+    if _linux_prctl(_PR_SET_DUMPABLE, 0) != 0:
+        return False
+    return _linux_prctl(_PR_GET_DUMPABLE, 0) == 0
+
+
+def _flowlines_rootbroker_reference() -> dict[str, Any]:
+    target = _canonical_json(
+        {
+            "argv": ["/usr/bin/python3", "-c", _FLOWLINES_SECRET_READ_SCRIPT],
+            "cwd": "/",
+            "timeout_seconds": 5,
+        }
+    )
+    created_at = int(time.time())
+    reference: dict[str, Any] = {
+        "schema_version": 1,
+        "execution": "unprivileged-reference-only",
+        "may_execute": False,
+        "requires_external_privileged_agent": True,
+        "replay_policy": "single-use-external-broker",
+        "action": "operator_power_argv",
+        "target": target,
+        "justification": (
+            "Read the root-owned Flowlines startup credential for the operator MainPID"
+        ),
+        "request_id": uuid.uuid4().hex,
+        "created_at_unix": created_at,
+        "expires_at_unix": created_at + _FLOWLINES_PRIVILEGED_REFERENCE_TTL_SECONDS,
+    }
+    reference["reference_sha256"] = hashlib.sha256(
+        _canonical_json(reference).encode("utf-8")
+    ).hexdigest()
+    return reference
+
+
+def _read_flowlines_headers_from_rootbroker() -> str | None:
+    reference = _flowlines_rootbroker_reference()
+    payload = (
+        json.dumps(reference, ensure_ascii=False, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.set_inheritable(False)
+            client.settimeout(_FLOWLINES_BROKER_TIMEOUT_SECONDS)
+            client.connect(_FLOWLINES_BROKER_SOCKET)
+            client.sendall(payload)
+            client.shutdown(socket.SHUT_WR)
+            while True:
+                chunk = client.recv(4096)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > _FLOWLINES_BROKER_RESPONSE_MAX_BYTES:
+                    return None
+                chunks.append(chunk)
+    except (OSError, TimeoutError):
+        return None
+
+    try:
+        response = json.loads(b"".join(chunks).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(response, dict)
+        or response.get("request_id") != reference["request_id"]
+        or response.get("action") != "operator_power_argv"
+        or response.get("mode") != "argv-json"
+        or response.get("returncode") != 0
+        or response.get("timed_out") is not False
+        or response.get("output_evidence") is not None
+        or response.get("output_evidence_status") != "not-applicable"
+        or not isinstance(response.get("stdout"), str)
+    ):
+        return None
+    header = response["stdout"].rstrip("\r\n")
+    if (
+        not header
+        or "\x00" in header
+        or "\n" in header
+        or "\r" in header
+        or header != header.strip()
+        or len(header.encode("utf-8")) > _FLOWLINES_CREDENTIAL_MAX_BYTES
+    ):
+        return None
+    return header
+
+
+def _load_flowlines_api_key() -> str | None:
+    if not _ensure_process_nondumpable():
+        raise RuntimeError("Flowlines API key requires a nondumpable process")
+    header = _read_flowlines_headers_from_rootbroker()
+    return _flowlines_api_key(header) if header is not None else None
+
+
 def _flowlines_api_key(headers: str) -> str | None:
     values: list[str] = []
     for item in headers.split(","):
@@ -500,14 +683,23 @@ def _build_environment_tracer() -> tuple[Any | None, Any | None]:
     # variables. Neither generic nor trace-specific OTLP authentication may
     # remain available to later child processes.
     unsafe_overrides = _unsafe_flowlines_export_overrides()
-    headers = os.environ.pop("OTEL_EXPORTER_OTLP_HEADERS", "")
+    os.environ.pop("OTEL_EXPORTER_OTLP_HEADERS", None)
     os.environ.pop("OTEL_EXPORTER_OTLP_TRACES_HEADERS", None)
     if enabled not in {"1", "true", "yes", "on"}:
         return None, None
-    api_key = _flowlines_api_key(headers)
-    if api_key is None or not _endpoint_is_flowlines() or unsafe_overrides:
+    if not _endpoint_is_flowlines() or unsafe_overrides:
         LOGGER.warning(
-            "Flowlines telemetry disabled: exact endpoint/header contract is not configured"
+            "Flowlines telemetry disabled: exact endpoint/override contract is not configured"
+        )
+        return None, None
+    try:
+        api_key = _load_flowlines_api_key()
+    except RuntimeError as exc:
+        LOGGER.warning("Flowlines telemetry disabled: %s", exc)
+        return None, None
+    if api_key is None:
+        LOGGER.warning(
+            "Flowlines telemetry disabled: secure startup credential is unavailable or malformed"
         )
         return None, None
     try:

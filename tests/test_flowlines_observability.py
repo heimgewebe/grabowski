@@ -1071,7 +1071,6 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             {
                 "GRABOWSKI_FLOWLINES_ENABLED": "1",
                 "OTEL_EXPORTER_OTLP_ENDPOINT": "https://api.flowlines.ai:notaport",
-                "OTEL_EXPORTER_OTLP_HEADERS": "x-flowlines-api-key=fixture",
             },
             clear=True,
         ):
@@ -1083,7 +1082,6 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         base = {
             "GRABOWSKI_FLOWLINES_ENABLED": "1",
             "OTEL_EXPORTER_OTLP_ENDPOINT": "https://api.flowlines.ai",
-            "OTEL_EXPORTER_OTLP_HEADERS": "x-flowlines-api-key=fixture",
             "OTEL_SERVICE_NAME": "ambient-service-name-must-not-win",
             "OTEL_RESOURCE_ATTRIBUTES": "secret.env=must-not-export-resource",
         }
@@ -1110,6 +1108,11 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         with (
             mock.patch.dict(os.environ, base, clear=True),
             mock.patch.object(
+                flowlines,
+                "_load_flowlines_api_key",
+                return_value="fixture",
+            ) as credential_loader,
+            mock.patch.object(
                 exporter_module,
                 "OTLPSpanExporter",
                 return_value=exporter,
@@ -1126,8 +1129,8 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             ) as processor_factory,
         ):
             tracer, returned_provider = flowlines._build_environment_tracer()
-            self.assertNotIn("OTEL_EXPORTER_OTLP_HEADERS", os.environ)
 
+        credential_loader.assert_called_once_with()
         self.assertEqual(tracer, ("tracer", "grabowski.flowlines"))
         self.assertIs(returned_provider, provider)
         exporter_factory.assert_called_once_with(
@@ -1160,10 +1163,14 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "GRABOWSKI_FLOWLINES_ENABLED": "1",
                     "OTEL_EXPORTER_OTLP_ENDPOINT": "https://api.flowlines.ai",
-                    "OTEL_EXPORTER_OTLP_HEADERS": "x-flowlines-api-key=fixture",
                 },
                 clear=True,
             ),
+            mock.patch.object(
+                flowlines,
+                "_load_flowlines_api_key",
+                return_value="fixture",
+            ) as credential_loader,
             mock.patch.object(
                 exporter_module,
                 "OTLPSpanExporter",
@@ -1171,8 +1178,8 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             ),
         ):
             tracer, provider = flowlines._build_environment_tracer()
-            self.assertNotIn("OTEL_EXPORTER_OTLP_HEADERS", os.environ)
 
+        credential_loader.assert_called_once_with()
         self.assertIsNone(tracer)
         self.assertIsNone(provider)
 
