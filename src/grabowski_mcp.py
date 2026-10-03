@@ -969,6 +969,21 @@ SENSITIVE_ENV_PARTS = (
     "API_KEY",
     "APIKEY",
 )
+SERVER_ONLY_CHILD_ENV_KEYS = frozenset(
+    {
+        "OTEL_EXPORTER_OTLP_HEADERS",
+    }
+)
+
+
+def _server_child_environment(**updates: str) -> dict[str, str]:
+    environment = dict(os.environ)
+    for key in SERVER_ONLY_CHILD_ENV_KEYS:
+        environment.pop(key, None)
+    environment.update(updates)
+    return environment
+
+
 TOP_LEVEL_POLICY_FIELDS = {
     "version",
     "mode",
@@ -8728,11 +8743,10 @@ def _repoground_git(
         stderr=subprocess.PIPE,
         text=True,
         timeout=10,
-        env={
-            **os.environ,
-            "GIT_TERMINAL_PROMPT": "0",
-            "PYTHONDONTWRITEBYTECODE": "1",
-        },
+        env=_server_child_environment(
+            GIT_TERMINAL_PROMPT="0",
+            PYTHONDONTWRITEBYTECODE="1",
+        ),
     )
     stdout = completed.stdout if preserve_stdout else completed.stdout.strip()
     return completed.returncode, stdout, completed.stderr.strip()
@@ -9579,11 +9593,10 @@ print(json.dumps(result, sort_keys=True))
         stderr=subprocess.PIPE,
         text=True,
         timeout=timeout,
-        env={
-            **os.environ,
-            "GIT_TERMINAL_PROMPT": "0",
-            "PYTHONDONTWRITEBYTECODE": "1",
-        },
+        env=_server_child_environment(
+            GIT_TERMINAL_PROMPT="0",
+            PYTHONDONTWRITEBYTECODE="1",
+        ),
     )
     stdout = completed.stdout[:500_000]
     stderr = completed.stderr[:20_000]

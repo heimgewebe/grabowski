@@ -925,6 +925,21 @@ def _operator_gate_read_only(tool_name: Any, arguments: Any, tool: Any) -> bool:
     return tool_name == "grabowski_git" and _grabowski_git_server_verified_read(arguments)
 
 
+def _operator_policy_arguments(
+    tool_name: Any,
+    arguments: Any,
+    tool: Any,
+) -> Any:
+    """Remove only Flowlines-injected analytics fields before policy checks."""
+    if not isinstance(tool_name, str):
+        return arguments
+    return grabowski_flowlines._strip_analytics_arguments(
+        tool,
+        tool_name,
+        arguments,
+    )
+
+
 def _git_server_read_environment() -> dict[str, str]:
     environment = _git_environment()
     for key in (
@@ -3054,25 +3069,33 @@ def _install_deployment_admission_gate() -> None:
         tool_name, arguments, context = _deployment_observer_tool_call_parts(
             args, kwargs
         )
-        # Connector least-privilege is an authority gate, not a presentation
-        # hint. Enforce it before observer/readiness bypasses and before any
-        # transport assertion can be consumed. Headerless local reads retain
-        # legacy behavior; an enrolled connector capability is policy-bound.
-        base._transport_authorize_connector_tool(context, tool_name, arguments)
-        observer_evidence: dict[str, Any] | None = None
-        try:
-            observer_evidence = _deployment_observer_request_evidence(
-                tool_name, arguments, context, observer_marker
-            )
-        except (OSError, PermissionError, RuntimeError, TypeError, ValueError):
-            observer_evidence = None
         get_tool = getattr(manager, "get_tool", None)
         tool = (
             get_tool(tool_name)
             if callable(get_tool) and isinstance(tool_name, str)
             else None
         )
-        _enforce_maulwurf_recovery_mode(tool_name, arguments, tool)
+        policy_arguments = _operator_policy_arguments(
+            tool_name,
+            arguments,
+            tool,
+        )
+        # Connector least-privilege and every exact admission classifier operate
+        # on domain arguments only. Flowlines-injected reason/user_intent stay
+        # available to the inner telemetry wrapper but cannot change authority.
+        base._transport_authorize_connector_tool(
+            context,
+            tool_name,
+            policy_arguments,
+        )
+        observer_evidence: dict[str, Any] | None = None
+        try:
+            observer_evidence = _deployment_observer_request_evidence(
+                tool_name, policy_arguments, context, observer_marker
+            )
+        except (OSError, PermissionError, RuntimeError, TypeError, ValueError):
+            observer_evidence = None
+        _enforce_maulwurf_recovery_mode(tool_name, policy_arguments, tool)
         if (
             observer_evidence is not None
             and observer_evidence.get("marker_bound") is True
@@ -3081,7 +3104,7 @@ def _install_deployment_admission_gate() -> None:
             current_observer_marker = _read_deployment_admission_marker()
             try:
                 current_observer_evidence = _deployment_observer_request_evidence(
-                    tool_name, arguments, context, current_observer_marker
+                    tool_name, policy_arguments, context, current_observer_marker
                 )
             except (OSError, PermissionError, RuntimeError, TypeError, ValueError):
                 current_observer_evidence = None
@@ -3100,13 +3123,13 @@ def _install_deployment_admission_gate() -> None:
         if (
             observer_marker.get("active") is True
             and observer_marker.get("valid") is True
-            and _deployment_readiness_status_call(tool_name, arguments, tool)
+            and _deployment_readiness_status_call(tool_name, policy_arguments, tool)
         ):
             current_marker = _read_deployment_admission_marker()
             if (
                 current_marker.get("active") is True
                 and current_marker.get("valid") is True
-                and _deployment_readiness_status_call(tool_name, arguments, tool)
+                and _deployment_readiness_status_call(tool_name, policy_arguments, tool)
             ):
                 return await _run_drain_neutral_tool_call(
                     original,
@@ -3117,9 +3140,9 @@ def _install_deployment_admission_gate() -> None:
                 )
 
         read_only_hint = _tool_read_only_hint(tool)
-        effective_read_only = _operator_gate_read_only(tool_name, arguments, tool)
+        effective_read_only = _operator_gate_read_only(tool_name, policy_arguments, tool)
         maulwurf_recovery_operation = _maulwurf_recovery_operation_name(
-            tool_name, arguments
+            tool_name, policy_arguments
         )
         maulwurf_recovery_restricted = _maulwurf_recovery_restricted()
         kind = (
@@ -3128,7 +3151,7 @@ def _install_deployment_admission_gate() -> None:
             else _DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC
         )
         drain_blocking = _deployment_admission_drain_blocking(
-            tool_name, arguments, tool
+            tool_name, policy_arguments, tool
         )
         identity = await _deployment_admission_register_gated_tool_call(
             tool_name,
@@ -3144,7 +3167,7 @@ def _install_deployment_admission_gate() -> None:
                 midcutover_recovery_evidence = await asyncio.to_thread(
                     _deployment_admission_midcutover_recovery_evidence,
                     tool_name,
-                    arguments,
+                    policy_arguments,
                     tool,
                     marker,
                 )
@@ -3193,7 +3216,7 @@ def _install_deployment_admission_gate() -> None:
                 )
             transport_evidence = _require_transport_roundtrip_for_tool(
                 tool_name=tool_name,
-                arguments=arguments,
+                arguments=policy_arguments,
                 context=context,
                 tool=tool,
             )
@@ -3226,7 +3249,7 @@ def _install_deployment_admission_gate() -> None:
                 transport_evidence is None
                 and not effective_read_only
                 and fence_required
-                and not _transport_roundtrip_exempt_call(tool_name, arguments)
+                and not _transport_roundtrip_exempt_call(tool_name, policy_arguments)
                 and not recovery_transport_exempt
             ):
                 raise grabowski_effect_interceptor.OperatorFenceEnforcementDenied(
@@ -3245,7 +3268,7 @@ def _install_deployment_admission_gate() -> None:
                 try:
                     effect_admission = grabowski_effect_interceptor.admit_mutation(
                         tool_name=str(tool_name),
-                        arguments=arguments,
+                        arguments=policy_arguments,
                         transport_evidence=admission_transport_evidence,
                         runtime_sha256=(
                             replay_reentry_runtime_sha256

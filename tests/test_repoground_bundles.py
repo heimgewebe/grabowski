@@ -1639,6 +1639,13 @@ class RepoGroundBundleToolTests(unittest.TestCase):
         )
 
         with (
+            patch.dict(
+                mcp.os.environ,
+                {
+                    "OTEL_EXPORTER_OTLP_HEADERS": "x-flowlines-api-key=fixture-secret",
+                },
+                clear=False,
+            ),
             patch.object(mcp, "_repoground_repo", return_value=(repo, None)),
             patch.object(mcp.subprocess, "run", return_value=completed) as run,
         ):
@@ -1652,9 +1659,42 @@ class RepoGroundBundleToolTests(unittest.TestCase):
         self.assertEqual(command[:3], ["python3", "-B", "-c"])
         self.assertEqual(run.call_args.kwargs["cwd"], repo)
         self.assertEqual(run.call_args.kwargs["env"]["PYTHONDONTWRITEBYTECODE"], "1")
+        self.assertNotIn(
+            "OTEL_EXPORTER_OTLP_HEADERS",
+            run.call_args.kwargs["env"],
+        )
         self.assertIn("from merger.repoground.core", command[3])
         self.assertNotIn("merger.lenskit", command[3])
         self.assertTrue(result["available"])
+
+    def test_repoground_git_does_not_inherit_flowlines_exporter_header(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="ok\n",
+            stderr="",
+        )
+        with (
+            patch.dict(
+                mcp.os.environ,
+                {
+                    "OTEL_EXPORTER_OTLP_HEADERS": "x-flowlines-api-key=fixture-secret",
+                },
+                clear=False,
+            ),
+            patch.object(mcp.subprocess, "run", return_value=completed) as run,
+        ):
+            returncode, stdout, stderr = mcp._repoground_git(
+                Path("/tmp/repository"),
+                ["status"],
+            )
+        self.assertEqual(returncode, 0)
+        self.assertEqual(stdout, "ok")
+        self.assertEqual(stderr, "")
+        self.assertNotIn(
+            "OTEL_EXPORTER_OTLP_HEADERS",
+            run.call_args.kwargs["env"],
+        )
 
     def test_core_manifest_binding_holds_snapshot_across_aba_rewrite(self) -> None:
         repoground_repo = self.home / "repos" / "repoground"

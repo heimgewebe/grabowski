@@ -6247,7 +6247,12 @@ class AgentWorkspaceTests(unittest.TestCase):
                 )
 
     def test_safe_git_environment_disables_executable_helpers(self) -> None:
-        environment = sandbox.safe_git_environment({"HOME": str(self.root)})
+        environment = sandbox.safe_git_environment(
+            {
+                "HOME": str(self.root),
+                "OTEL_EXPORTER_OTLP_HEADERS": "x-flowlines-api-key=fixture-secret",
+            }
+        )
         pairs = {
             environment[f"GIT_CONFIG_KEY_{index}"]: environment[f"GIT_CONFIG_VALUE_{index}"]
             for index in range(int(environment["GIT_CONFIG_COUNT"]))
@@ -6257,6 +6262,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(environment["GIT_CONFIG_GLOBAL"], "/dev/null")
         self.assertEqual(environment["GIT_ALLOW_PROTOCOL"], "ssh:https:file")
         self.assertEqual(environment["GIT_TERMINAL_PROMPT"], "0")
+        self.assertNotIn("OTEL_EXPORTER_OTLP_HEADERS", environment)
 
     def test_workspace_git_runner_does_not_execute_post_checkout_hook(self) -> None:
         hook = self.git.repo / ".git" / "hooks" / "post-checkout"

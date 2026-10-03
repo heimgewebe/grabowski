@@ -439,6 +439,10 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
                 "syntheticBareToken123456",
             ),
             ("authorization Bearer abc123", "abc123"),
+            ("password correcthorsebattery", "correcthorsebattery"),
+            ("authorization huntertwo", "huntertwo"),
+            ("token lowercasecredential", "lowercasecredential"),
+            ("secret abc", "abc"),
         ]
         for value, secret in cases:
             with self.subTest(value=value.splitlines()[0][:48]):

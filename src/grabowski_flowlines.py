@@ -111,7 +111,7 @@ _SENSITIVE_TEXT_ASSIGNMENT = re.compile(
 )
 _SENSITIVE_TEXT_LABEL_VALUE = re.compile(
     r"(?i)\b(authorization|api[_ -]?key|token|secret|password|passwd|credential)s?\b"
-    r"(\s+(?:is\s+)?(?:Bearer\s+)?)([A-Za-z0-9._~+/-]{6,}=*)"
+    r"(\s+(?:is\s+)?(?:Bearer\s+)?)([A-Za-z0-9._~+/-]+=*)"
 )
 
 
@@ -278,39 +278,28 @@ def _is_sensitive_argument_key(key: Any) -> bool:
     return normalized.endswith(_SENSITIVE_ARGUMENT_SUFFIXES)
 
 
-def _looks_sensitive_text_value(value: str) -> bool:
-    candidate = value.rstrip("=")
-    if len(candidate) < 12:
-        return False
-    if any(character.isdigit() or not character.isalnum() for character in candidate):
-        return True
-    if any(character.isupper() for character in candidate[1:]):
-        return True
-    return len(candidate) >= 32
-
-
-def _looks_sensitive_authorization_value(value: str) -> bool:
-    candidate = value.rstrip("=")
-    if len(candidate) < 6:
-        return False
-    if any(character.isdigit() or not character.isalnum() for character in candidate):
-        return True
-    if len(candidate) >= 12 and any(
-        character.isupper() for character in candidate[1:]
-    ):
-        return True
-    return len(candidate) >= 32
+_BENIGN_SENSITIVE_LABEL_FOLLOWERS = frozenset(
+    {
+        "authentication",
+        "bucket",
+        "openid",
+        "required",
+        "requirements",
+        "without",
+    }
+)
 
 
 def _redact_labeled_sensitive_text(match: re.Match[str]) -> str:
     candidate = match.group(3)
-    label = match.group(1).casefold()
-    sensitive = (
-        _looks_sensitive_authorization_value(candidate)
-        if label == "authorization"
-        else _looks_sensitive_text_value(candidate)
-    )
-    if not sensitive:
+    trailing = match.string[match.end() :]
+    # Preserve only narrow, explicitly non-secret multi-word prose patterns.
+    # A terminal or otherwise unrecognized value after a sensitive label is
+    # treated as credential material regardless of case or character variety.
+    if (
+        candidate.rstrip("=").casefold() in _BENIGN_SENSITIVE_LABEL_FOLLOWERS
+        and re.match(r"\s+[A-Za-z]", trailing) is not None
+    ):
         return match.group(0)
     return f"{match.group(1)}{match.group(2)}<REDACTED>"
 

@@ -336,6 +336,66 @@ class OperatorContractTests(unittest.TestCase):
                 self.assertIn(later, main)
                 self.assertLess(main.index(configure), main.index(later))
 
+    def test_admission_policy_ignores_only_injected_flowlines_fields(self) -> None:
+        operator = _load_operator_module()
+        injected_tool = types.SimpleNamespace(
+            fn_metadata=types.SimpleNamespace(
+                arg_model=types.SimpleNamespace(model_fields={})
+            ),
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+        raw_git = {
+            "repo": "/tmp/repo",
+            "arguments": ["status", "--short", "--branch"],
+            "reason": "Observe repository state",
+            "user_intent": "Verify the current revision",
+        }
+        policy_git = operator._operator_policy_arguments(
+            "grabowski_git",
+            raw_git,
+            injected_tool,
+        )
+        self.assertNotIn("reason", policy_git)
+        self.assertNotIn("user_intent", policy_git)
+        self.assertTrue(operator._grabowski_git_server_verified_read(policy_git))
+
+        read_tool = types.SimpleNamespace(
+            fn_metadata=types.SimpleNamespace(
+                arg_model=types.SimpleNamespace(model_fields={})
+            ),
+            annotations=types.SimpleNamespace(readOnlyHint=True),
+        )
+        raw_status = {
+            "view": "minimal",
+            "reason": "Check readiness",
+            "user_intent": "Observe deployment status",
+        }
+        policy_status = operator._operator_policy_arguments(
+            "grabowski_status",
+            raw_status,
+            read_tool,
+        )
+        self.assertTrue(
+            operator._deployment_readiness_status_call(
+                "grabowski_status",
+                policy_status,
+                read_tool,
+            )
+        )
+
+        domain_reason_tool = types.SimpleNamespace(
+            fn_metadata=types.SimpleNamespace(
+                arg_model=types.SimpleNamespace(model_fields={"reason": object()})
+            )
+        )
+        domain_arguments = operator._operator_policy_arguments(
+            "domain_tool",
+            {"reason": "domain-owned", "user_intent": "analytics-only"},
+            domain_reason_tool,
+        )
+        self.assertEqual(domain_arguments["reason"], "domain-owned")
+        self.assertNotIn("user_intent", domain_arguments)
+
     def test_http_recovery_contract_is_loopback_bound(self) -> None:
         operator = _load_operator_module()
         metadata = operator._protected_resource_metadata(
