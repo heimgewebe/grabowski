@@ -4436,6 +4436,52 @@ def _reconcile_inflight_auto_deploy_source(
     return observed_repository, runner, source_identity, owner_id
 
 
+def _recovered_auto_deploy_source_binding(
+    expected_head: str,
+    repository: Path,
+    owner_id: str,
+    source_identity: dict[str, Any],
+) -> dict[str, Any]:
+    resource_key = f"path:{repository}"
+    lease_evidence = source_identity.get("lease_evidence")
+    if (
+        not isinstance(lease_evidence, dict)
+        or lease_evidence.get("resource_key") != resource_key
+    ):
+        raise RuntimeError(
+            "recovered automatic deployment source has malformed lease evidence"
+        )
+    path_lease = lease_evidence.get("lease")
+    required_lease_fields = (
+        "resource_key",
+        "owner_id",
+        "acquired_at_unix",
+        "updated_at_unix",
+        "expires_at_unix",
+        "metadata_sha256",
+    )
+    if (
+        not isinstance(path_lease, dict)
+        or path_lease.get("resource_key") != resource_key
+        or path_lease.get("owner_id") != owner_id
+        or any(path_lease.get(field) is None for field in required_lease_fields)
+    ):
+        raise RuntimeError(
+            "recovered automatic deployment source lease binding drifted"
+        )
+    return {
+        "schema_version": 1,
+        "kind": "grabowski_auto_runtime_deploy_source_binding",
+        "repository": str(repository),
+        "owner_id": owner_id,
+        "expected_head": expected_head,
+        "path_resource_key": resource_key,
+        "path_lease": {
+            field: path_lease[field] for field in required_lease_fields
+        },
+    }
+
+
 @mcp.tool(name="grabowski_runtime_deploy_schedule", annotations=DEPLOY_MUTATING)
 def grabowski_runtime_deploy_schedule(
     expected_head: ExpectedHead,
@@ -4456,6 +4502,7 @@ def grabowski_runtime_deploy_schedule(
                 f"expected {expected_head}, found {public_github_main_before}"
             )
         automatic_source: dict[str, Any] | None = None
+        automatic_source_binding: dict[str, Any] | None = None
         automatic_source_needed = False
         origin_main_refresh: dict[str, Any] | None = None
         canonical_refresh_snapshot: dict[str, Any] | None = None
@@ -4529,6 +4576,12 @@ def grabowski_runtime_deploy_schedule(
                 ) = recovered_source
                 effective_source_repository = str(repository)
                 effective_source_lease_owner_id = recovered_owner_id
+                automatic_source_binding = _recovered_auto_deploy_source_binding(
+                    expected_head,
+                    repository,
+                    recovered_owner_id,
+                    source_identity,
+                )
                 automatic_source_needed = False
                 # Reusing the already scheduled detached source must not mutate
                 # Git-common refs underneath that running deployment.
@@ -4607,6 +4660,7 @@ def grabowski_runtime_deploy_schedule(
             ) = _materialize_auto_deploy_source(expected_head)
             effective_source_repository = str(repository)
             effective_source_lease_owner_id = automatic_source["owner_id"]
+            automatic_source_binding = automatic_source
         if repository is None or runner is None or source_identity is None:
             raise RuntimeError("deployment source resolution did not produce a bound source")
         try:
@@ -4730,7 +4784,7 @@ def grabowski_runtime_deploy_schedule(
                 scheduled=observed,
                 already_scheduled=True,
                 source_identity=source_identity,
-                automatic_source=automatic_source,
+                automatic_source=automatic_source_binding,
             )
 
         intent = {
@@ -4740,7 +4794,7 @@ def grabowski_runtime_deploy_schedule(
             "delay_seconds": delay_seconds,
             "source_identity": source_identity,
             "source_identity_sha256": source_identity["identity_sha256"],
-            "automatic_source": automatic_source,
+            "automatic_source": automatic_source_binding,
             "origin_main_refresh": origin_main_refresh,
             "public_github_main": {
                 "repository": PUBLIC_GITHUB_REPOSITORY_URL,
@@ -4869,6 +4923,6 @@ def grabowski_runtime_deploy_schedule(
             scheduled=scheduled,
             already_scheduled=False,
             source_identity=source_identity,
-            automatic_source=automatic_source,
+            automatic_source=automatic_source_binding,
             deployment_observer_capability=observer_capability,
         )
