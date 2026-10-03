@@ -1902,6 +1902,10 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             literal_values,
             {"accomplished", "partial", "failed"},
         )
+        description = ast.get_docstring(report) or ""
+        self.assertIn("For blocked work, report partial", description)
+        self.assertIn("otherwise report failed", description)
+        self.assertIn("unmet_needs", description)
 
     def test_staged_workspace_adopt_remains_implemented_but_not_public(self) -> None:
         contract = json.loads(

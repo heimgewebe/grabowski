@@ -44,7 +44,7 @@
     },
     {
       "category": "operations-observability",
-      "description": "REQUIRED final call in every conversation before the assistant gives its final answer.\n\nAccepts the agent's outcome self-report without mutating product data.\nWhen Flowlines export is enabled, this tool call is the telemetry report.",
+      "description": "REQUIRED final call in every conversation before the assistant gives its final answer.\n\nAccepts the agent's outcome self-report without mutating product data.\nWhen Flowlines export is enabled, this tool call is the telemetry report.\nFor blocked work, report partial if any of the user goal was accomplished;\notherwise report failed, and describe the blocker in unmet_needs.",
       "effects": [],
       "id": "report_outcome",
       "purpose": "Accept the required final agent outcome self-report for Flowlines telemetry when export is enabled, without product mutation.",

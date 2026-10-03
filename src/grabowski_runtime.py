@@ -61,6 +61,8 @@ def report_outcome(
 
     Accepts the agent's outcome self-report without mutating product data.
     When Flowlines export is enabled, this tool call is the telemetry report.
+    For blocked work, report partial if any of the user goal was accomplished;
+    otherwise report failed, and describe the blocker in unmet_needs.
     """
     del reason, user_intent, status, outcome_summary, unmet_needs
     return {"accepted": True}
