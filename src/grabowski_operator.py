@@ -38,6 +38,7 @@ except ImportError:
 from mcp.types import ToolAnnotations
 
 import grabowski_mcp as base
+import grabowski_flowlines
 import grabowski_consumer_surface as consumer_surface
 import grabowski_command_identity as command_identity
 import grabowski_bureau_runtime_refresh_executor as bureau_runtime_refresh_executor
@@ -10451,6 +10452,7 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     _configure_faulthandler()
+    grabowski_flowlines.configure_flowlines_observability(mcp, READ_ONLY)
     if args.transport == "streamable-http":
         if args.host != "127.0.0.1":
             raise SystemExit(

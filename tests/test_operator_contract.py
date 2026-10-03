@@ -309,6 +309,33 @@ class OperatorContractTests(unittest.TestCase):
             ["OTEL_EXPORTER_OTLP_HEADERS=<REDACTED>"],
         )
 
+    def test_operator_service_entrypoint_configures_flowlines_before_wrappers(self) -> None:
+        source = SOURCE.read_text(encoding="utf-8")
+        service = (
+            ROOT / "systemd" / "grabowski-operator.service.example"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "-m grabowski_operator --transport streamable-http",
+            service,
+        )
+        self.assertIn("import grabowski_flowlines", source)
+        main_marker = "def main() -> None:"
+        self.assertEqual(source.count(main_marker), 1)
+        main = source.split(main_marker, 1)[1]
+        configure = (
+            "grabowski_flowlines.configure_flowlines_observability"
+            "(mcp, READ_ONLY)"
+        )
+        self.assertIn(configure, main)
+        for later in (
+            "_install_deployment_admission_gate()",
+            "_configure_posthog_mcp_analytics()",
+            "mcp.run(transport=args.transport)",
+        ):
+            with self.subTest(later=later):
+                self.assertIn(later, main)
+                self.assertLess(main.index(configure), main.index(later))
+
     def test_http_recovery_contract_is_loopback_bound(self) -> None:
         operator = _load_operator_module()
         metadata = operator._protected_resource_metadata(
