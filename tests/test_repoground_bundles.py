@@ -1643,6 +1643,7 @@ class RepoGroundBundleToolTests(unittest.TestCase):
                 mcp.os.environ,
                 {
                     "OTEL_EXPORTER_OTLP_HEADERS": "x-flowlines-api-key=fixture-secret",
+                    "OTEL_EXPORTER_OTLP_TRACES_HEADERS": "x-flowlines-api-key=trace-secret",
                 },
                 clear=False,
             ),
@@ -1663,6 +1664,10 @@ class RepoGroundBundleToolTests(unittest.TestCase):
             "OTEL_EXPORTER_OTLP_HEADERS",
             run.call_args.kwargs["env"],
         )
+        self.assertNotIn(
+            "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+            run.call_args.kwargs["env"],
+        )
         self.assertIn("from merger.repoground.core", command[3])
         self.assertNotIn("merger.lenskit", command[3])
         self.assertTrue(result["available"])
@@ -1679,6 +1684,7 @@ class RepoGroundBundleToolTests(unittest.TestCase):
                 mcp.os.environ,
                 {
                     "OTEL_EXPORTER_OTLP_HEADERS": "x-flowlines-api-key=fixture-secret",
+                    "OTEL_EXPORTER_OTLP_TRACES_HEADERS": "x-flowlines-api-key=trace-secret",
                 },
                 clear=False,
             ),
@@ -1693,6 +1699,10 @@ class RepoGroundBundleToolTests(unittest.TestCase):
         self.assertEqual(stderr, "")
         self.assertNotIn(
             "OTEL_EXPORTER_OTLP_HEADERS",
+            run.call_args.kwargs["env"],
+        )
+        self.assertNotIn(
+            "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
             run.call_args.kwargs["env"],
         )
 

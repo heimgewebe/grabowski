@@ -26,11 +26,18 @@ _GITLAB_SECRET_PATTERN = re.compile(
     r"[A-Za-z0-9._~+/-]{12,}=*(?![A-Za-z0-9._~+/-])",
     re.I,
 )
+_SLACK_SECRET_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"(?:xox[a-z]-[A-Za-z0-9-]{16,}|xapp-[A-Za-z0-9-]{16,})"
+    r"(?![A-Za-z0-9-])",
+    re.I,
+)
 SECRET_REDACTIONS = (
     (_OPENAI_SECRET_PATTERN, "<REDACTED_OPENAI_KEY>"),
     (_ANTHROPIC_SECRET_PATTERN, "<REDACTED_ANTHROPIC_KEY>"),
     (_GITHUB_SECRET_PATTERN, "<REDACTED_GITHUB_TOKEN>"),
     (_GITLAB_SECRET_PATTERN, "<REDACTED_GITLAB_TOKEN>"),
+    (_SLACK_SECRET_PATTERN, "<REDACTED_SLACK_TOKEN>"),
     (
         re.compile(r"Bearer\s+[A-Za-z0-9._~+/-]{12,}=*", re.I),
         "Bearer <REDACTED>",

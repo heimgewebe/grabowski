@@ -338,6 +338,34 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             "req-<REDACTED_GITLAB_TOKEN>",
         )
 
+
+    async def test_bare_slack_tokens_are_scrubbed_from_text_and_identifiers(self) -> None:
+        bot_token = "xoxb-" + ("B" * 28)
+        app_token = "xapp-1-" + ("A" * 28)
+        mcp = self.server()
+        result = await self.call(
+            mcp,
+            arguments={
+                "value": "hello",
+                "reason": f"Rotate {bot_token}",
+                "user_intent": f"Keep {app_token} private",
+            },
+            meta=self.meta(
+                **{
+                    "user.id": bot_token,
+                    "session.id": f"session-{app_token}",
+                }
+            ),
+            request_id=f"req-{bot_token}",
+        )
+
+        self.assertFalse(result.root.isError)
+        attrs = self.exporter.get_finished_spans()[0].attributes
+        serialized = json.dumps(dict(attrs), sort_keys=True)
+        self.assertNotIn(bot_token, serialized)
+        self.assertNotIn(app_token, serialized)
+        self.assertIn("<REDACTED_SLACK_TOKEN>", serialized)
+
     async def test_report_outcome_scrubs_sensitive_free_text_recursively(self) -> None:
         provider_key = "s" + "k-ant-" + ("x" * 24)
         gitlab_token = "glpat-" + ("N" * 26)
@@ -416,11 +444,17 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
                 "glffct",
             )
         ]
+        slack_tokens = [
+            "xoxb-" + ("S" * 28),
+            "xoxp-" + ("P" * 28),
+            "xapp-1-" + ("A" * 28),
+        ]
         cases = [
             (f"provider {provider_key}", provider_key),
             (f"github {github_classic}", github_classic),
             (f"github {github_fine_grained}", github_fine_grained),
             *((f"gitlab {token}", token) for token in gitlab_tokens),
+            *((f"slack {token}", token) for token in slack_tokens),
             (f"aws {aws_access_key}", aws_access_key),
             (private_key, "synthetic-private-material"),
             (
@@ -1012,6 +1046,24 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
                 tracer, provider = flowlines._build_environment_tracer()
                 self.assertIsNone(tracer)
                 self.assertIsNone(provider)
+
+    def test_trace_specific_header_is_consumed_when_export_is_rejected(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GRABOWSKI_FLOWLINES_ENABLED": "1",
+                "OTEL_EXPORTER_OTLP_ENDPOINT": "https://api.flowlines.ai",
+                "OTEL_EXPORTER_OTLP_HEADERS": "x-flowlines-api-key=fixture",
+                "OTEL_EXPORTER_OTLP_TRACES_HEADERS": "x-flowlines-api-key=trace-fixture",
+            },
+            clear=True,
+        ):
+            tracer, provider = flowlines._build_environment_tracer()
+            self.assertNotIn("OTEL_EXPORTER_OTLP_HEADERS", os.environ)
+            self.assertNotIn("OTEL_EXPORTER_OTLP_TRACES_HEADERS", os.environ)
+
+        self.assertIsNone(tracer)
+        self.assertIsNone(provider)
 
     def test_malformed_endpoint_port_disables_export_without_raising(self) -> None:
         with mock.patch.dict(

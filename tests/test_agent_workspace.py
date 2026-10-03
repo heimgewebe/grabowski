@@ -6251,6 +6251,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             {
                 "HOME": str(self.root),
                 "OTEL_EXPORTER_OTLP_HEADERS": "x-flowlines-api-key=fixture-secret",
+                "OTEL_EXPORTER_OTLP_TRACES_HEADERS": "x-flowlines-api-key=trace-secret",
             }
         )
         pairs = {
@@ -6263,6 +6264,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(environment["GIT_ALLOW_PROTOCOL"], "ssh:https:file")
         self.assertEqual(environment["GIT_TERMINAL_PROMPT"], "0")
         self.assertNotIn("OTEL_EXPORTER_OTLP_HEADERS", environment)
+        self.assertNotIn("OTEL_EXPORTER_OTLP_TRACES_HEADERS", environment)
 
     def test_workspace_git_runner_does_not_execute_post_checkout_hook(self) -> None:
         hook = self.git.repo / ".git" / "hooks" / "post-checkout"

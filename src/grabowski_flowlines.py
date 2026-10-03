@@ -496,14 +496,15 @@ def _endpoint_is_flowlines() -> bool:
 
 def _build_environment_tracer() -> tuple[Any | None, Any | None]:
     enabled = os.environ.get("GRABOWSKI_FLOWLINES_ENABLED", "").strip().lower()
-    # The Flowlines API key is server-only. Consume it before any later child
-    # process can inherit the operator's ambient environment; the exporter is
-    # constructed with an explicit headers mapping below.
+    # Detect forbidden overrides before consuming credential-bearing header
+    # variables. Neither generic nor trace-specific OTLP authentication may
+    # remain available to later child processes.
+    unsafe_overrides = _unsafe_flowlines_export_overrides()
     headers = os.environ.pop("OTEL_EXPORTER_OTLP_HEADERS", "")
+    os.environ.pop("OTEL_EXPORTER_OTLP_TRACES_HEADERS", None)
     if enabled not in {"1", "true", "yes", "on"}:
         return None, None
     api_key = _flowlines_api_key(headers)
-    unsafe_overrides = _unsafe_flowlines_export_overrides()
     if api_key is None or not _endpoint_is_flowlines() or unsafe_overrides:
         LOGGER.warning(
             "Flowlines telemetry disabled: exact endpoint/header contract is not configured"

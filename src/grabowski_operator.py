@@ -318,7 +318,12 @@ SENSITIVE_ENV_PARTS = (
     "API_KEY",
     "APIKEY",
 )
-SENSITIVE_ENV_KEYS = frozenset({"OTEL_EXPORTER_OTLP_HEADERS"})
+SENSITIVE_ENV_KEYS = frozenset(
+    {
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+    }
+)
 PRIVILEGE_ESCALATORS = {"sudo", "su", "pkexec", "doas"}
 PROTECTED_BRANCHES = {"main", "master"}
 GIT_BRANCH_ATTEMPT_SCHEMA_VERSION = 1
@@ -458,7 +463,9 @@ REDACTIONS = (
     (_OPENAI_SECRET_PATTERN, "<REDACTED_OPENAI_KEY>"),
     (_ANTHROPIC_SECRET_PATTERN, "<REDACTED_ANTHROPIC_KEY>"),
     (
-        re.compile(r"(?im)^(\s*OTEL_EXPORTER_OTLP_HEADERS\s*[:=]\s*).+$"),
+        re.compile(
+            r"(?im)^(\s*OTEL_EXPORTER_OTLP(?:_TRACES)?_HEADERS\s*[:=]\s*).+$"
+        ),
         r"\1<REDACTED>",
     ),
     (

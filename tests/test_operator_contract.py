@@ -280,6 +280,10 @@ class OperatorContractTests(unittest.TestCase):
 
     def test_safe_environment_never_exports_flowlines_headers(self) -> None:
         operator = _load_operator_module()
+        headers = {
+            "OTEL_EXPORTER_OTLP_HEADERS": "x-flowlines-api-key=fixture-secret",
+            "OTEL_EXPORTER_OTLP_TRACES_HEADERS": "x-flowlines-api-key=trace-secret",
+        }
         for trusted in (False, True):
             with (
                 self.subTest(trusted=trusted),
@@ -287,27 +291,26 @@ class OperatorContractTests(unittest.TestCase):
                     operator.os.environ,
                     {
                         "XDG_RUNTIME_DIR": "/run/user/1000",
-                        "OTEL_EXPORTER_OTLP_HEADERS": "x-flowlines-api-key=fixture-secret",
+                        **headers,
                     },
                     clear=True,
                 ),
                 patch.object(operator, "_trusted_owner_mode", return_value=trusted),
             ):
                 environment = operator._safe_environment()
-            self.assertNotIn("OTEL_EXPORTER_OTLP_HEADERS", environment)
+            for name in headers:
+                self.assertNotIn(name, environment)
 
-        self.assertEqual(
-            operator._redact(
-                "OTEL_EXPORTER_OTLP_HEADERS=x-flowlines-api-key=fixture-secret"
-            ),
-            "OTEL_EXPORTER_OTLP_HEADERS=<REDACTED>",
-        )
-        self.assertEqual(
-            operator._redact_argv(
-                ["OTEL_EXPORTER_OTLP_HEADERS=x-flowlines-api-key=fixture-secret"]
-            ),
-            ["OTEL_EXPORTER_OTLP_HEADERS=<REDACTED>"],
-        )
+        for name, value in headers.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    operator._redact(f"{name}={value}"),
+                    f"{name}=<REDACTED>",
+                )
+                self.assertEqual(
+                    operator._redact_argv([f"{name}={value}"]),
+                    [f"{name}=<REDACTED>"],
+                )
 
     def test_operator_service_entrypoint_configures_flowlines_before_wrappers(self) -> None:
         source = SOURCE.read_text(encoding="utf-8")
