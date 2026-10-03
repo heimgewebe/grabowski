@@ -17509,6 +17509,128 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             execution["merge_lease_guard"]["errors"],
         )
 
+
+    def test_codex_review_threads_paginate_forward_with_bound(self) -> None:
+        page_one_thread = captain_review_finding_thread(
+            resolved=True, thread_id="PRRT_page_1", comment_id=301
+        )
+        page_two_thread = captain_review_finding_thread(
+            resolved=True, thread_id="PRRT_page_2", comment_id=302
+        )
+        calls: list[tuple[str, ...]] = []
+
+        def github_runner(_repo: Path, argv: list[str]) -> dict[str, object]:
+            calls.append(tuple(argv))
+            after = next(
+                (
+                    item.split("=", 1)[1]
+                    for item in argv
+                    if isinstance(item, str) and item.startswith("after=")
+                ),
+                None,
+            )
+            connection = {
+                "nodes": [deepcopy(page_one_thread if after is None else page_two_thread)],
+                "pageInfo": {
+                    "hasNextPage": after is None,
+                    "endCursor": "cursor-1" if after is None else "cursor-2",
+                },
+            }
+            payload = {
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "reviewThreads": connection,
+                        }
+                    }
+                }
+            }
+            return {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""}
+
+        runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
+        runner.repo_path = Path.cwd()
+        runner.github_runner = github_runner
+        observations: list[dict[str, object]] = []
+        errors: list[str] = []
+
+        payload = runner._codex_paginated_review_threads(
+            owner="heimgewebe",
+            name="grabowski",
+            pr_number=96,
+            observations=observations,
+            errors=errors,
+        )
+
+        self.assertEqual([], errors)
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        nodes = payload["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+        self.assertEqual(
+            [item["id"] for item in nodes],
+            ["PRRT_page_1", "PRRT_page_2"],
+        )
+        self.assertEqual(2, len(calls))
+        self.assertTrue(any("after=cursor-1" in call for call in calls))
+
+    def test_codex_review_threads_fail_closed_above_page_bound(self) -> None:
+        calls: list[tuple[str, ...]] = []
+
+        def github_runner(_repo: Path, argv: list[str]) -> dict[str, object]:
+            calls.append(tuple(argv))
+            after = next(
+                (
+                    item.split("=", 1)[1]
+                    for item in argv
+                    if isinstance(item, str) and item.startswith("after=")
+                ),
+                None,
+            )
+            suffix = 1 if after is None else int(after.rsplit("-", 1)[1]) + 1
+            thread = captain_review_finding_thread(
+                resolved=True,
+                thread_id=f"PRRT_page_{suffix}",
+                comment_id=300 + suffix,
+            )
+            payload = {
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "reviewThreads": {
+                                "nodes": [thread],
+                                "pageInfo": {
+                                    "hasNextPage": True,
+                                    "endCursor": f"cursor-{suffix}",
+                                },
+                            }
+                        }
+                    }
+                }
+            }
+            return {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""}
+
+        runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
+        runner.repo_path = Path.cwd()
+        runner.github_runner = github_runner
+        observations: list[dict[str, object]] = []
+        errors: list[str] = []
+
+        with patch.object(
+            merge_guard, "_CODEX_THREAD_MAX_PAGES", 2
+        ), patch.object(
+            merge_guard, "_CODEX_THREAD_MAX_ITEMS", 200
+        ):
+            payload = runner._codex_paginated_review_threads(
+                owner="heimgewebe",
+                name="grabowski",
+                pr_number=96,
+                observations=observations,
+                errors=errors,
+            )
+
+        self.assertIsNone(payload)
+        self.assertEqual(["merge_guard_codex_threads_truncated"], errors)
+        self.assertEqual(2, len(calls))
+
     def test_codex_review_retrieval_stops_at_bounded_sentinel_page(self) -> None:
         view = {
             "number": 96,
