@@ -4231,6 +4231,49 @@ def _canonical_preflight(expected_head: str) -> tuple[Path, Path]:
     return repository, runner
 
 
+def _reconcile_inflight_auto_deploy_source(
+    expected_head: str,
+    inflight_units: list[Any],
+) -> tuple[Path, Path, dict[str, Any], str] | None:
+    if len(inflight_units) != 1:
+        return None
+    unit = inflight_units[0]
+    if not isinstance(unit, str) or not unit:
+        return None
+    try:
+        metadata = operator._read_job_metadata(unit)
+    except (OSError, PermissionError, ValueError):
+        return None
+    command = metadata.get("argv")
+    fields = _deploy_command_fields(command)
+    if (
+        fields is None
+        or fields["expected_head"] != expected_head
+        or fields["source_kind"] != "detached-worktree"
+    ):
+        return None
+    repository = Path(fields["repository"])
+    prefix = f"{AUTO_DEPLOY_SOURCE_PREFIX}-{expected_head[:12]}-"
+    if repository.parent != AUTO_DEPLOY_SOURCE_ROOT or not repository.name.startswith(
+        prefix
+    ):
+        return None
+    generation = repository.name[len(prefix) :]
+    if re.fullmatch(r"[0-9a-f]{12}", generation) is None:
+        return None
+    owner_id = f"runtime-deploy-source:{expected_head[:12]}:{generation}"
+    observed_repository, runner, source_identity = _deployment_source_preflight(
+        expected_head,
+        str(repository),
+        owner_id,
+    )
+    if source_identity["identity_sha256"] != fields["source_identity_sha256"]:
+        raise RuntimeError(
+            "in-flight automatic deployment source identity drifted before retry"
+        )
+    return observed_repository, runner, source_identity, owner_id
+
+
 @mcp.tool(name="grabowski_runtime_deploy_schedule", annotations=DEPLOY_MUTATING)
 def grabowski_runtime_deploy_schedule(
     expected_head: ExpectedHead,
@@ -4348,18 +4391,33 @@ def grabowski_runtime_deploy_schedule(
                     "automatic deployment source preflight returned malformed in-flight runtime evidence"
                 )
             if inflight_units:
-                raise RuntimeError(
-                    "automatic deployment source refuses to materialize while a runtime job is already in flight: "
-                    + ", ".join(str(unit) for unit in inflight_units)
+                recovered_source = _reconcile_inflight_auto_deploy_source(
+                    expected_head,
+                    inflight_units,
                 )
-            (
-                repository,
-                runner,
-                source_identity,
-                automatic_source,
-            ) = _materialize_auto_deploy_source(expected_head)
-            effective_source_repository = str(repository)
-            effective_source_lease_owner_id = automatic_source["owner_id"]
+                if recovered_source is None:
+                    raise RuntimeError(
+                        "automatic deployment source refuses to materialize while a runtime job is already in flight: "
+                        + ", ".join(str(unit) for unit in inflight_units)
+                    )
+                (
+                    repository,
+                    runner,
+                    source_identity,
+                    recovered_owner_id,
+                ) = recovered_source
+                effective_source_repository = str(repository)
+                effective_source_lease_owner_id = recovered_owner_id
+                automatic_source_needed = False
+            if automatic_source_needed:
+                (
+                    repository,
+                    runner,
+                    source_identity,
+                    automatic_source,
+                ) = _materialize_auto_deploy_source(expected_head)
+                effective_source_repository = str(repository)
+                effective_source_lease_owner_id = automatic_source["owner_id"]
         if repository is None or runner is None or source_identity is None:
             raise RuntimeError("deployment source resolution did not produce a bound source")
         try:

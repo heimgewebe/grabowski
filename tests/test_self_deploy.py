@@ -2488,6 +2488,219 @@ class SelfDeployToolTests(unittest.TestCase):
                 SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
         refresh.assert_not_called()
 
+    def test_reconcile_inflight_auto_source_validates_recorded_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            canonical = root / "canonical"
+            deploy_root = root / "deploy"
+            canonical.mkdir()
+            deploy_root.mkdir()
+            expected = "d" * 40
+            generation = "abc123def456"
+            source = (
+                deploy_root
+                / f"{SELF_DEPLOY.AUTO_DEPLOY_SOURCE_PREFIX}-{expected[:12]}-{generation}"
+            )
+            runner = source / SELF_DEPLOY.RUNNER_RELATIVE_PATH
+            identity = _source_identity(
+                source,
+                expected,
+                kind="detached-worktree",
+                canonical=canonical,
+            )
+            command = SELF_DEPLOY._deploy_command(
+                source,
+                runner,
+                expected,
+                8,
+                canonical_repository=canonical,
+                source_kind="detached-worktree",
+                source_identity_sha256=identity["identity_sha256"],
+            )
+            with patch.object(
+                SELF_DEPLOY, "AUTO_DEPLOY_SOURCE_ROOT", deploy_root
+            ), patch.object(
+                SELF_DEPLOY.operator,
+                "_read_job_metadata",
+                return_value={"argv": command},
+            ), patch.object(
+                SELF_DEPLOY,
+                "_deployment_source_preflight",
+                return_value=(source, runner, identity),
+            ) as preflight:
+                recovered = SELF_DEPLOY._reconcile_inflight_auto_deploy_source(
+                    expected,
+                    ["grabowski-job-existing000001"],
+                )
+            self.assertIsNotNone(recovered)
+            assert recovered is not None
+            self.assertEqual(recovered[:3], (source, runner, identity))
+            self.assertEqual(
+                recovered[3],
+                f"runtime-deploy-source:{expected[:12]}:{generation}",
+            )
+            preflight.assert_called_once_with(
+                expected,
+                str(source),
+                f"runtime-deploy-source:{expected[:12]}:{generation}",
+            )
+
+    def test_reconcile_inflight_auto_source_rejects_non_auto_path(self) -> None:
+        expected = "d" * 40
+        source = Path("/tmp/not-an-auto-source")
+        command = SELF_DEPLOY._deploy_command(
+            source,
+            source / SELF_DEPLOY.RUNNER_RELATIVE_PATH,
+            expected,
+            8,
+            source_kind="detached-worktree",
+            source_identity_sha256="7" * 64,
+        )
+        preflight = Mock()
+        with patch.object(
+            SELF_DEPLOY.operator,
+            "_read_job_metadata",
+            return_value={"argv": command},
+        ), patch.object(
+            SELF_DEPLOY,
+            "_deployment_source_preflight",
+            preflight,
+        ):
+            recovered = SELF_DEPLOY._reconcile_inflight_auto_deploy_source(
+                expected,
+                ["grabowski-job-existing000001"],
+            )
+        self.assertIsNone(recovered)
+        preflight.assert_not_called()
+
+    def test_schedule_reuses_preexisting_auto_source_before_materialization(self) -> None:
+        canonical_state = tempfile.TemporaryDirectory()
+        self.addCleanup(canonical_state.cleanup)
+        canonical = Path(canonical_state.name).resolve()
+        source = Path(
+            "/home/alex/repos/.grabowski-deploy-worktrees/"
+            "auto-current-main-dddddddddddd-abc123def456"
+        )
+        runner = source / SELF_DEPLOY.RUNNER_RELATIVE_PATH
+        expected = "d" * 40
+        owner = f"runtime-deploy-source:{expected[:12]}:abc123def456"
+        identity = _source_identity(
+            source,
+            expected,
+            kind="detached-worktree",
+            canonical=canonical,
+        )
+        existing = {
+            "unit": "grabowski-job-existing000001",
+            "argv_sha256": "8" * 64,
+            "delay_seconds": 8,
+            "metadata_path": "/state/meta",
+            "stdout_path": "/state/out",
+            "stderr_path": "/state/err",
+            "final_status": "running",
+            "source_identity_sha256": identity["identity_sha256"],
+        }
+        materialize = Mock()
+        SELF_DEPLOY.operator._start_job.reset_mock()
+        with patch.object(
+            SELF_DEPLOY,
+            "CANONICAL_REPOSITORY",
+            canonical,
+        ), patch.object(
+            SELF_DEPLOY,
+            "_deployment_source_preflight",
+            side_effect=[
+                RuntimeError("HEAD drift"),
+                RuntimeError("HEAD drift"),
+                (source, runner, identity),
+            ],
+        ) as preflight, patch.object(
+            SELF_DEPLOY,
+            "_canonical_stale_main_snapshot",
+            return_value={"current_head": "a" * 40, "target_head": expected},
+        ), patch.object(
+            SELF_DEPLOY,
+            "_materialize_auto_deploy_source",
+            materialize,
+        ), patch.object(
+            SELF_DEPLOY,
+            "_reconcile_inflight_auto_deploy_source",
+            return_value=(source, runner, identity, owner),
+        ) as reconcile, patch.object(
+            SELF_DEPLOY,
+            "_fresh_public_github_main",
+            side_effect=[expected, expected],
+        ), patch.object(
+            SELF_DEPLOY,
+            "inflight_runtime_job_evidence",
+            return_value={
+                "error": None,
+                "inflight_units": [existing["unit"]],
+            },
+        ), patch.object(
+            SELF_DEPLOY,
+            "_matching_inflight_deploy_job",
+            return_value=existing,
+        ), patch.object(
+            SELF_DEPLOY,
+            "_deploy_schedule_lock",
+            return_value=nullcontext(),
+        ), patch.object(
+            SELF_DEPLOY,
+            "_append_deploy_audit",
+        ):
+            result = SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
+        self.assertTrue(result["already_scheduled"])
+        self.assertEqual(result["unit"], existing["unit"])
+        self.assertEqual(result["source_identity_sha256"], identity["identity_sha256"])
+        self.assertIsNone(result["automatic_source"])
+        reconcile.assert_called_once_with(expected, [existing["unit"]])
+        materialize.assert_not_called()
+        self.assertEqual(
+            preflight.call_args_list[-1].args,
+            (expected, str(source), owner),
+        )
+        SELF_DEPLOY.operator._start_job.assert_not_called()
+
+    def test_schedule_blocks_preexisting_job_before_auto_source_materialization(self) -> None:
+        canonical_state = tempfile.TemporaryDirectory()
+        self.addCleanup(canonical_state.cleanup)
+        canonical = Path(canonical_state.name).resolve()
+        expected = "d" * 40
+        materialize = Mock()
+        lookup = Mock()
+        SELF_DEPLOY.operator._start_job.reset_mock()
+        with patch.object(
+            SELF_DEPLOY,
+            "CANONICAL_REPOSITORY",
+            canonical,
+        ), patch.object(
+            SELF_DEPLOY,
+            "_canonical_main_refresh_candidate",
+            return_value={"current_head": "a" * 40, "origin_main": expected},
+        ), patch.object(
+            SELF_DEPLOY,
+            "_deployment_source_preflight",
+            side_effect=RuntimeError("HEAD drift"),
+        ), patch.object(
+            SELF_DEPLOY,
+            "_canonical_stale_main_snapshot",
+            return_value={"current_head": "a" * 40, "target_head": expected},
+        ), patch.object(
+            SELF_DEPLOY,
+            "_materialize_auto_deploy_source",
+            materialize,
+        ), patch.object(
+            SELF_DEPLOY,
+            "_fresh_public_github_main",
+            side_effect=[expected, expected],
+        ), patch.object(
+            SELF_DEPLOY,
+            "inflight_runtime_job_evidence",
+            return_value={
+                "error": None,
+                "inflight_units": ["grabowski-job-existing000001"],
+            },
     def test_schedule_blocks_preexisting_job_before_auto_source_materialization(self) -> None:
         canonical_state = tempfile.TemporaryDirectory()
         self.addCleanup(canonical_state.cleanup)
@@ -2529,6 +2742,10 @@ class SelfDeployToolTests(unittest.TestCase):
             },
         ), patch.object(
             SELF_DEPLOY,
+            "_reconcile_inflight_auto_deploy_source",
+            return_value=None,
+        ) as reconcile, patch.object(
+            SELF_DEPLOY,
             "_matching_inflight_deploy_job",
             lookup,
         ), patch.object(
@@ -2538,6 +2755,103 @@ class SelfDeployToolTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "already in flight"):
                 SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
+    def test_schedule_blocks_preexisting_job_before_auto_source_materialization(self) -> None:
+        canonical_state = tempfile.TemporaryDirectory()
+        self.addCleanup(canonical_state.cleanup)
+        canonical = Path(canonical_state.name).resolve()
+        expected = "d" * 40
+        materialize = Mock()
+        lookup = Mock()
+        SELF_DEPLOY.operator._start_job.reset_mock()
+        with patch.object(
+            SELF_DEPLOY,
+            "CANONICAL_REPOSITORY",
+            canonical,
+        ), patch.object(
+            SELF_DEPLOY,
+            "_canonical_main_refresh_candidate",
+            return_value={"current_head": "a" * 40, "origin_main": expected},
+        ), patch.object(
+            SELF_DEPLOY,
+            "_deployment_source_preflight",
+            side_effect=RuntimeError("HEAD drift"),
+        ), patch.object(
+            SELF_DEPLOY,
+            "_canonical_stale_main_snapshot",
+            return_value={"current_head": "a" * 40, "target_head": expected},
+        ), patch.object(
+            SELF_DEPLOY,
+            "_materialize_auto_deploy_source",
+            materialize,
+        ), patch.object(
+            SELF_DEPLOY,
+            "_fresh_public_github_main",
+            side_effect=[expected, expected],
+        ), patch.object(
+            SELF_DEPLOY,
+            "inflight_runtime_job_evidence",
+            return_value={
+                "error": None,
+                "inflight_units": ["grabowski-job-existing000001"],
+            },
+    def test_schedule_blocks_preexisting_job_before_auto_source_materialization(self) -> None:
+        canonical_state = tempfile.TemporaryDirectory()
+        self.addCleanup(canonical_state.cleanup)
+        canonical = Path(canonical_state.name).resolve()
+        expected = "d" * 40
+        materialize = Mock()
+        lookup = Mock()
+        SELF_DEPLOY.operator._start_job.reset_mock()
+        with patch.object(
+            SELF_DEPLOY,
+            "CANONICAL_REPOSITORY",
+            canonical,
+        ), patch.object(
+            SELF_DEPLOY,
+            "_canonical_main_refresh_candidate",
+            return_value={"current_head": "a" * 40, "origin_main": expected},
+        ), patch.object(
+            SELF_DEPLOY,
+            "_deployment_source_preflight",
+            side_effect=RuntimeError("HEAD drift"),
+        ), patch.object(
+            SELF_DEPLOY,
+            "_canonical_stale_main_snapshot",
+            return_value={"current_head": "a" * 40, "target_head": expected},
+        ), patch.object(
+            SELF_DEPLOY,
+            "_materialize_auto_deploy_source",
+            materialize,
+        ), patch.object(
+            SELF_DEPLOY,
+            "_fresh_public_github_main",
+            side_effect=[expected, expected],
+        ), patch.object(
+            SELF_DEPLOY,
+            "inflight_runtime_job_evidence",
+            return_value={
+                "error": None,
+                "inflight_units": ["grabowski-job-existing000001"],
+            },
+        ), patch.object(
+            SELF_DEPLOY,
+            "_reconcile_inflight_auto_deploy_source",
+            return_value=None,
+        ) as reconcile, patch.object(
+            SELF_DEPLOY,
+            "_matching_inflight_deploy_job",
+            lookup,
+        ), patch.object(
+            SELF_DEPLOY,
+            "_deploy_schedule_lock",
+            return_value=nullcontext(),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "already in flight"):
+                SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
+        reconcile.assert_called_once_with(
+            expected,
+            ["grabowski-job-existing000001"],
+        )
         materialize.assert_not_called()
         lookup.assert_not_called()
         SELF_DEPLOY.operator._start_job.assert_not_called()
