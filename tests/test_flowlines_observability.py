@@ -277,10 +277,11 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
     def test_established_secret_classes_are_scrubbed(self) -> None:
         provider_key = "s" + "k-proj-" + ("A" * 24)
         aws_access_key = "AKIA" + ("B" * 16)
+        private_key_label = "PRIVATE" + " KEY"
         private_key = (
-            "-----BEGIN PRIVATE KEY-----\n"
+            f"-----BEGIN {private_key_label}-----\n"
             "synthetic-private-material\n"
-            "-----END PRIVATE KEY-----"
+            f"-----END {private_key_label}-----"
         )
         cases = [
             (f"provider {provider_key}", provider_key),
