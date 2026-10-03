@@ -337,7 +337,10 @@ def _target_contract_evidence(repository: Path, expected_head: str) -> dict[str,
 
 
 def _competing_deployment_evidence(
-    command: list[str] | None = None, *, prune: bool = False
+    command: list[str] | None = None,
+    *,
+    prune: bool = False,
+    reconcile_stale_pending: bool = False,
 ) -> dict[str, Any]:
     """Detect an in-flight deployment that this lane must not race.
 
@@ -373,7 +376,11 @@ def _competing_deployment_evidence(
             evidence["error"] = f"deploy lock is unreadable: {exc}"
             return evidence
 
-    indexed = self_deploy.inflight_runtime_job_evidence(command, prune=prune)
+    indexed = self_deploy.inflight_runtime_job_evidence(
+        command,
+        prune=prune,
+        reconcile_stale_pending=reconcile_stale_pending,
+    )
     evidence["inflight_deploy_jobs"] = list(indexed["blocking_units"])
     evidence["inflight_units"] = list(indexed["inflight_units"])
     evidence["idempotent_match"] = indexed["idempotent_match"]
@@ -415,7 +422,9 @@ def _volatile_gate_recheck(
     # Carries the exact argv: the recheck runs under the schedule lock, which is
     # where an identical intent that started meanwhile must be recognised as
     # ours rather than dispatched a second time.
-    competing = _competing_deployment_evidence(command, prune=True)
+    competing = _competing_deployment_evidence(
+        command, prune=True, reconcile_stale_pending=True
+    )
     checks = {
         "kill_switch_clear": not bool(kill_switch.get("engaged")),
         "no_blocking_operator_blockade": bool(blockade["allows_mutation"]),

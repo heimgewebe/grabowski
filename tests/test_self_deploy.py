@@ -50,6 +50,9 @@ def _load_self_deploy():
     ).hexdigest()
     operator._jobs_root = Mock()
     operator._read_job_metadata = Mock()
+    operator._unit_dispatch_readback = Mock(
+        return_value={"query_valid": True, "outcome": "not_started"}
+    )
     operator.grabowski_job_status = Mock()
     base = types.ModuleType("grabowski_mcp")
     base._append_audit = Mock()
@@ -467,6 +470,45 @@ class SelfDeployToolTests(unittest.TestCase):
             index = SELF_DEPLOY._deploy_index(jobs, Path(temporary))
             self.assertEqual(index["units"], [])
             self.assertEqual(index["pending_unit"], unit)
+
+    def test_stale_pending_reservation_clears_only_after_not_started_readback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            unit = "grabowski-job-abcdef012345"
+            SELF_DEPLOY._write_deploy_index(jobs, units=[], pending_unit=unit)
+            readback = {
+                "query_valid": True,
+                "outcome": "not_started",
+                "load_state": "not-found",
+                "active_state": "inactive",
+            }
+            with patch.object(
+                SELF_DEPLOY.operator, "_unit_dispatch_readback", return_value=readback
+            ) as dispatch, patch.object(SELF_DEPLOY, "_append_deploy_audit") as audit:
+                index = SELF_DEPLOY._reconcile_stale_pending_reservation(jobs)
+            self.assertIsNone(index["pending_unit"])
+            self.assertEqual(index["units"], [])
+            dispatch.assert_called_once_with(unit)
+            self.assertEqual(
+                audit.call_args.args[0]["operation"],
+                "runtime-deploy-stale-pending-cleared",
+            )
+
+    def test_stale_pending_reservation_preserves_ambiguous_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            unit = "grabowski-job-abcdef012345"
+            SELF_DEPLOY._write_deploy_index(jobs, units=[], pending_unit=unit)
+            with patch.object(
+                SELF_DEPLOY.operator,
+                "_unit_dispatch_readback",
+                return_value={"query_valid": False, "outcome": "outcome_unknown"},
+            ), patch.object(SELF_DEPLOY, "_append_deploy_audit") as audit:
+                index = SELF_DEPLOY._reconcile_stale_pending_reservation(jobs)
+            self.assertEqual(index["pending_unit"], unit)
+            audit.assert_not_called()
 
     def test_pending_deploy_index_unit_is_recovered_from_exact_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1134,6 +1176,75 @@ class SelfDeployToolTests(unittest.TestCase):
                 resources.acquire_resources.call_args.args[1],
                 [operation_key, common_dir_key, objects_key, origin_ref_key],
             )
+
+    def test_origin_main_refresh_real_resource_conflict_matches_checkout_common_dir(self) -> None:
+        import grabowski_checkouts as checkouts
+        import grabowski_resources as resources
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            repo = root / "repo"
+            repo.mkdir()
+            common = repo / ".git"
+            checkout = root / "checkout"
+            expected = "c" * 40
+            database = root / "resources.sqlite3"
+            with patch.object(resources, "RESOURCE_DB", database), patch.object(
+                SELF_DEPLOY, "CANONICAL_REPOSITORY", repo
+            ), patch.object(
+                SELF_DEPLOY, "_git_common_directory", return_value=common
+            ):
+                checkout_keys = checkouts._checkout_resource_keys(common, checkout)
+                checkout_lease = resources.acquire_resources(
+                    "checkout-test",
+                    checkout_keys,
+                    purpose="hold checkout common-dir serialization",
+                    ttl_seconds=120,
+                )
+                plan = SELF_DEPLOY._origin_main_refresh_plan(expected)
+                with self.assertRaises(SELF_DEPLOY.DeploySchedulePreEffectRefusal) as blocked:
+                    SELF_DEPLOY._acquire_origin_main_refresh_resources(plan, expected)
+                self.assertIsInstance(blocked.exception.__cause__, resources.ResourceConflict)
+                resources.release_resources(
+                    "checkout-test",
+                    checkout_keys,
+                    expected_leases=checkout_lease["leases"],
+                )
+                refresh_lease = SELF_DEPLOY._acquire_origin_main_refresh_resources(
+                    plan, expected
+                )
+                with self.assertRaises(resources.ResourceConflict):
+                    resources.acquire_resources(
+                        "checkout-test-2",
+                        checkout_keys,
+                        purpose="prove reverse common-dir conflict",
+                        ttl_seconds=120,
+                    )
+                resources.release_resources(
+                    plan["owner_id"],
+                    [
+                        plan["operation_key"],
+                        plan["common_dir_key"],
+                        plan["objects_key"],
+                        plan["origin_main_ref_key"],
+                    ],
+                    expected_leases=refresh_lease["leases"],
+                )
+
+    def test_origin_main_refresh_checkout_uncertainty_is_pre_effect_refusal(self) -> None:
+        plan = {"common_dir_key": "path:/tmp/grabowski-common"}
+        checkouts = types.ModuleType("grabowski_checkouts")
+        checkouts._require_no_checkout_operation_uncertainty = Mock(
+            side_effect=RuntimeError("fenced")
+        )
+        with patch.dict(sys.modules, {"grabowski_checkouts": checkouts}):
+            with self.assertRaisesRegex(
+                SELF_DEPLOY.DeploySchedulePreEffectRefusal, "checkout uncertainty"
+            ):
+                SELF_DEPLOY._require_origin_main_refresh_checkout_certainty(plan)
+        checkouts._require_no_checkout_operation_uncertainty.assert_called_once_with(
+            [plan["common_dir_key"]]
+        )
 
     def test_origin_main_refresh_rejects_divergent_canonical_main_before_ref_update(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2923,7 +3034,7 @@ class SelfDeployToolTests(unittest.TestCase):
         self.assertIsNone(result["automatic_source"])
         self.assertEqual(preflight.call_count, 3)
         materialize.assert_not_called()
-        inflight.assert_called_once_with()
+        inflight.assert_called_once_with(reconcile_stale_pending=True)
         self.assertEqual(public_main.call_count, 2)
 
     def test_schedule_reconciles_auto_source_after_canonical_converges(self) -> None:

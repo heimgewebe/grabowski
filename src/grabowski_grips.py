@@ -3888,6 +3888,10 @@ def _runtime_deploy_self_preflight(
         "ready": plan.get("ready") is True,
     }
 
+class RuntimeDeployPreEffectRefusal(RuntimeError):
+    """The scheduler proved that no deploy registration effect began."""
+
+
 def _runtime_deploy_self_schedule(
     expected_head: str,
     delay_seconds: int,
@@ -3896,12 +3900,15 @@ def _runtime_deploy_self_schedule(
 ) -> dict[str, Any]:
     import grabowski_self_deploy
 
-    return grabowski_self_deploy.grabowski_runtime_deploy_schedule(
-        expected_head,
-        delay_seconds,
-        source_repository,
-        source_lease_owner_id,
-    )
+    try:
+        return grabowski_self_deploy.grabowski_runtime_deploy_schedule(
+            expected_head,
+            delay_seconds,
+            source_repository,
+            source_lease_owner_id,
+        )
+    except grabowski_self_deploy.DeploySchedulePreEffectRefusal as exc:
+        raise RuntimeDeployPreEffectRefusal(str(exc)) from exc
 
 
 
@@ -15632,6 +15639,15 @@ def _run_captain_runtime_deploy(
             )
         )
         execution_result["command_returned"] = True
+    except RuntimeDeployPreEffectRefusal as exc:
+        execution_result["execution_invoked"] = False
+        execution_result["execution_attempted"] = False
+        execution_result["pre_effect_refusal"] = True
+        execution_result["definitely_not_scheduled"] = True
+        execution_result["verification_error"] = (
+            "runtime deploy scheduling refused before job registration: " + str(exc)
+        )
+        return execution_result
     except Exception as exc:
         execution_result["runner_exception"] = (
             f"{type(exc).__name__}: {_bounded_command_output(str(exc), limit=512)}"

@@ -1575,6 +1575,43 @@ def _deploy_index(
     return index
 
 
+def _reconcile_stale_pending_reservation(jobs_root: Path) -> dict[str, Any]:
+    """Clear one pre-dispatch reservation only when no unit could have started.
+
+    Callers must already hold the deploy schedule lock. Lock-free readers keep
+    treating every pending reservation as blocking. _start_job creates the
+    durable job directory and metadata before it invokes systemd-run, so a
+    missing directory plus an authoritative not_started unit readback is the
+    narrow proof that this reservation never crossed the dispatch boundary.
+    """
+    index = _deploy_index(jobs_root)
+    pending = index["pending_unit"]
+    if pending is None:
+        return index
+    entry = jobs_root / pending
+    if entry.is_symlink():
+        raise RuntimeError("pending runtime deploy job path is a symlink")
+    if entry.exists():
+        return index
+    readback = operator._unit_dispatch_readback(pending)
+    if not isinstance(readback, dict) or readback.get("outcome") != "not_started":
+        return index
+    reconciled = _write_deploy_index(
+        jobs_root,
+        units=list(index["units"]),
+        pending_unit=None,
+    )
+    _append_deploy_audit(
+        {
+            "timestamp_unix": int(time.time()),
+            "operation": "runtime-deploy-stale-pending-cleared",
+            "unit": pending,
+            "dispatch_readback": readback,
+        }
+    )
+    return reconciled
+
+
 def _validated_deploy_job_receipt(entry: Path, metadata: dict[str, Any]) -> dict[str, str]:
     expected_receipt = metadata.get("expected_receipt")
     if not isinstance(expected_receipt, dict):
@@ -1595,6 +1632,10 @@ def _validated_deploy_job_receipt(entry: Path, metadata: dict[str, Any]) -> dict
         "stdout_path": expected["stdout_path"],
         "stderr_path": expected["stderr_path"],
     }
+
+
+class DeploySchedulePreEffectRefusal(RuntimeError):
+    """Scheduling was refused before any deployment or Git-ref effect began."""
 
 
 class IndexedRuntimeJobConflict(RuntimeError):
@@ -2215,7 +2256,10 @@ def _missing_finalization_deploy_is_noeffect_proven(
 
 
 def inflight_runtime_job_evidence(
-    command: list[str] | None = None, *, prune: bool = False
+    command: list[str] | None = None,
+    *,
+    prune: bool = False,
+    reconcile_stale_pending: bool = False,
 ) -> dict[str, Any]:
     """Project the deploy index for a gate, without deciding for it.
 
@@ -2240,7 +2284,11 @@ def inflight_runtime_job_evidence(
     expected_sha256 = _deploy_command_sha256(command) if command else None
     try:
         jobs_root = operator._jobs_root()
-        index = _deploy_index(jobs_root)
+        index = (
+            _reconcile_stale_pending_reservation(jobs_root)
+            if reconcile_stale_pending
+            else _deploy_index(jobs_root)
+        )
     except (OSError, RuntimeError, ValueError) as exc:
         evidence["error"] = f"deployment job index is unreadable: {exc}"
         return evidence
@@ -2757,18 +2805,36 @@ def _acquire_origin_main_refresh_resources(
         effect_class="deploy",
         operation_class="deploy",
     )
-    return resources.acquire_resources(
-        plan["owner_id"],
-        [
-            plan["operation_key"],
-            plan["common_dir_key"],
-            plan["objects_key"],
-            plan["origin_main_ref_key"],
-        ],
-        purpose=f"refresh exact protected-main deployment object {expected_head[:12]}",
-        ttl_seconds=ORIGIN_MAIN_REFRESH_LEASE_TTL_SECONDS,
-        metadata={"operation_scope": operation_scope},
-    )
+    try:
+        return resources.acquire_resources(
+            plan["owner_id"],
+            [
+                plan["operation_key"],
+                plan["common_dir_key"],
+                plan["objects_key"],
+                plan["origin_main_ref_key"],
+            ],
+            purpose=f"refresh exact protected-main deployment object {expected_head[:12]}",
+            ttl_seconds=ORIGIN_MAIN_REFRESH_LEASE_TTL_SECONDS,
+            metadata={"operation_scope": operation_scope},
+        )
+    except resources.ResourceConflict as exc:
+        raise DeploySchedulePreEffectRefusal(
+            "protected-main ref refresh resources are busy before mutation"
+        ) from exc
+
+
+def _require_origin_main_refresh_checkout_certainty(plan: dict[str, Any]) -> None:
+    import grabowski_checkouts as checkouts
+
+    try:
+        checkouts._require_no_checkout_operation_uncertainty(
+            [plan["common_dir_key"]]
+        )
+    except RuntimeError as exc:
+        raise DeploySchedulePreEffectRefusal(
+            "protected-main ref refresh is blocked before mutation by checkout uncertainty"
+        ) from exc
 
 def _release_origin_main_refresh_resources(
     plan: dict[str, Any],
@@ -2807,6 +2873,7 @@ def _refresh_canonical_origin_main(
         origin_main_ref_lease = _lease_for_key(
             acquisition, plan["origin_main_ref_key"]
         )
+        _require_origin_main_refresh_checkout_certainty(plan)
         locked = _canonical_main_refresh_candidate(expected_head)
         if _canonical_main_refresh_state(locked) != _canonical_main_refresh_state(
             initial_snapshot
@@ -4396,7 +4463,9 @@ def grabowski_runtime_deploy_schedule(
                 effective_source_repository = None
                 effective_source_lease_owner_id = None
         if source_repository is None:
-            inflight_before_resolution = inflight_runtime_job_evidence()
+            inflight_before_resolution = inflight_runtime_job_evidence(
+                reconcile_stale_pending=True
+            )
             inflight_error = inflight_before_resolution.get("error")
             if inflight_error:
                 raise RuntimeError(
