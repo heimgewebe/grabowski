@@ -677,5 +677,17 @@ def grabowski_systemkatalog_query(
         ),
     ] = None,
 ) -> dict[str, Any]:
-    """Run one typed, revision-bound Systemkatalog v2 query without write authority."""
+    """Prefer this typed read for cross-repository stable Systemkatalog truth.
+
+    This includes truth ownership, system roles, responsibility boundaries, canonical
+    entrypoints and stable relations. Use operation=system for a known system,
+    operation=repository for a known repository, operation=truth-owner for a known
+    authority-domain key, and operation=relations or operation=entrypoints for those
+    query classes. Use operation=authority-matrix only when no targeted identifier
+    applies and a broader authority map is required. Use RepoGround for local
+    repository/implementation/free-text content; current runtime, PR and CI truth
+    stays with its owning live source. If the result changes or confirms a decision,
+    record a hash-bound usage receipt via tools/systemkatalog_usage_receipt.py using
+    fixed metadata categories and no free prose. Grants no write authority.
+    """
     return query_systemkatalog(operation, value)

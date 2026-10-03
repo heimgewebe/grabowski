@@ -31,8 +31,19 @@ The rendered contract requires the agent to:
 
 1. treat live runtime state and concrete receipts as higher-authority than prose;
 2. use the narrowest typed read tool that can answer the question before broader
-   surfaces, without adding a connectivity-only health ping when that required
-   read can serve as the probe;
+   surfaces. For repository-crossing stable truth ownership, system roles,
+   responsibility boundaries, canonical entrypoints or stable relations, call
+   `grabowski_systemkatalog_query` with `operation=system` for a known system,
+   `operation=repository` for a known repository, `operation=truth-owner` for a known
+   authority-domain key, and `operation=relations` or `operation=entrypoints` for
+   those query classes. Use `operation=authority-matrix` only when no targeted
+   identifier applies and a broader authority map is required. Use RepoGround for
+   local repository, implementation or free-text content. Current runtime, PR and
+   CI truth remains with its owning live source. When a Systemkatalog result changes
+   or confirms a decision, record a hash-bound usage receipt through
+   `tools/systemkatalog_usage_receipt.py` using only its fixed metadata categories
+   and no conversation text or free prose. Do not add a connectivity-only health
+   ping when the required typed read can serve as the probe;
 3. reuse existing capability infrastructure before building a parallel path: prefer
    a native typed Grabowski capability first. For a host-local capability with no
    native surface, use `grabowski_host_capability_resolve`; only an explicit host

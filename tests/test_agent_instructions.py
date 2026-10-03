@@ -94,9 +94,22 @@ class AgentInstructionsTests(unittest.TestCase):
         self.assertEqual(len(rules), len(grabowski_mcp.AGENT_INSTRUCTION_RULES))
         self.assertIn("live runtime state", rules["truth-hierarchy"].lower())
         narrow = rules["narrowest-typed-read-first"].lower()
-        self.assertIn("narrowest typed read", narrow)
-        self.assertIn("connectivity-only health ping", narrow)
-        self.assertIn("serve as the probe", narrow)
+        self.assertIn("narrowest read", narrow)
+        self.assertIn("no extra health ping if read probes", narrow)
+        self.assertNotIn("no health ping.", narrow)
+        for phrase in (
+            "grabowski_systemkatalog_query",
+            "system=system",
+            "repo=repository",
+            "domain=truth-owner",
+            "relation=relations",
+            "entry=entrypoints",
+            "else=authority-matrix",
+            "decision=>hash-bound",
+            "tools/systemkatalog_usage_receipt.py",
+            "fixed fields/no prose",
+        ):
+            self.assertIn(phrase, narrow)
         host_resolution = rules["host-capability-resolution"].lower()
         for phrase in (
             "native typed first",
@@ -108,7 +121,7 @@ class AgentInstructionsTests(unittest.TestCase):
             "reread live policy/readiness at execution",
             "not-ready!=not-found",
             "reuse before new infra",
-            "no execution/setup authority",
+            "discovery: no execution/setup authority",
             "provider/model pinning",
         ):
             self.assertIn(phrase, host_resolution)
@@ -146,15 +159,16 @@ class AgentInstructionsTests(unittest.TestCase):
             self.assertIn(phrase, narrowing)
         transport = rules["transport-roundtrip-before-mutation"].lower()
         for phrase in (
+            "fresh shared_unlabeled challenge",
+            "grip_run transport-roundtrip",
             "action=execute",
             "challenge_receipt_sha256",
             "exact target_tool_name",
             "exact unchanged target_arguments",
             "same-process optimization",
-            "action=ack",
+            "stable scope may action=ack",
             "unchanged target once",
-            "action=begin",
-            "target_tool_name/target_arguments",
+            "action=begin requires exact target_tool_name/target_arguments",
             "read back ambiguous effects",
         ):
             self.assertIn(phrase, transport)
