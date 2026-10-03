@@ -3149,6 +3149,10 @@
         "source": "src/grabowski_flowlines.py"
       },
       {
+        "module": "grabowski_redaction",
+        "source": "src/grabowski_redaction.py"
+      },
+      {
         "module": "grabowski_bureau_runtime_refresh_executor",
         "source": "src/grabowski_bureau_runtime_refresh_executor.py"
       },
@@ -3658,7 +3662,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "439386bdc4380cb6f8db0ca8a17fb2c7a9c44222c178eddca48c15f999b85cb3"
+      "sha256": "37d292863168f2239c99ea41506d1626d58d0eeac4822c3bcc8c24854596d2c0"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
@@ -3765,6 +3769,7 @@
       "src/grabowski_read_surface.py": "1df8cb96e2c84f52817bbb0f64832de0f66f376de37a683849d41f50e7b08e1f",
       "src/grabowski_recall.py": "386afec03e078b6a7934b0744eb17edb1ae97b0addde982c34c544d0c1b74413",
       "src/grabowski_recovery.py": "0ed22cef9bc1f41b18e4f40b4cedf0492a78469b9d02ffd2747481c337b43013",
+      "src/grabowski_redaction.py": "d1f394aa11e3feb6c8b37e39dfad3b445a2b6fee343f1ff60dd6ac48ca854e84",
       "src/grabowski_repobrief.py": "1e842a9f310c967012914afbaf2dbbc4af3a29c222734f14f902421773713ded",
       "src/grabowski_repoground_catalog.py": "b8ea8d611a37bb287ae8836790c6aa7abf29c08dcccf252492fb355c9f9ba58f",
       "src/grabowski_resources.py": "4c6fa4fff67425607702a23bbdf33fb2deeb6da43430b844a6bb12d1e54fac57",

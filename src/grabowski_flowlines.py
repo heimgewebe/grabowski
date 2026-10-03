@@ -5,10 +5,12 @@ import copy
 import json
 import logging
 import os
+import re
 from typing import Any, Callable, Literal, Mapping
 from urllib.parse import urlsplit
 import uuid
 
+import grabowski_redaction
 from pydantic import Field
 from typing_extensions import Annotated
 
@@ -102,6 +104,14 @@ _SENSITIVE_ARGUMENT_SUFFIXES = (
     "_credential",
     "_credentials",
     "_argv",
+)
+_SENSITIVE_TEXT_ASSIGNMENT = re.compile(
+    r"(?i)\b(authorization|api[_ -]?key|token|secret|password|passwd|credential)s?\b"
+    r"(\s*[:=]\s*)(?:Bearer\s+)?[^\s,;]+"
+)
+_SENSITIVE_TEXT_LABEL_VALUE = re.compile(
+    r"(?i)\b(api[_ -]?key|token|secret|password|passwd|credential)s?\b"
+    r"(\s+(?:is\s+)?)([A-Za-z0-9._~+/-]{12,}=*)"
 )
 
 
@@ -268,6 +278,30 @@ def _is_sensitive_argument_key(key: Any) -> bool:
     return normalized.endswith(_SENSITIVE_ARGUMENT_SUFFIXES)
 
 
+def _looks_sensitive_text_value(value: str) -> bool:
+    candidate = value.rstrip("=")
+    if len(candidate) < 12:
+        return False
+    if any(character.isdigit() or not character.isalnum() for character in candidate):
+        return True
+    if any(character.isupper() for character in candidate[1:]):
+        return True
+    return len(candidate) >= 32
+
+
+def _redact_labeled_sensitive_text(match: re.Match[str]) -> str:
+    candidate = match.group(3)
+    if not _looks_sensitive_text_value(candidate):
+        return match.group(0)
+    return f"{match.group(1)}{match.group(2)}<REDACTED>"
+
+
+def _redact_sensitive_text(value: str) -> str:
+    redacted = grabowski_redaction.redact_sensitive_text(value)[0]
+    redacted = _SENSITIVE_TEXT_ASSIGNMENT.sub(r"\1\2<REDACTED>", redacted)
+    return _SENSITIVE_TEXT_LABEL_VALUE.sub(_redact_labeled_sensitive_text, redacted)
+
+
 def _redact_sensitive_arguments(value: Any) -> Any:
     if isinstance(value, dict):
         return {
@@ -282,6 +316,8 @@ def _redact_sensitive_arguments(value: Any) -> Any:
         return [_redact_sensitive_arguments(item) for item in value]
     if isinstance(value, tuple):
         return [_redact_sensitive_arguments(item) for item in value]
+    if isinstance(value, str):
+        return _redact_sensitive_text(value)
     return value
 
 
@@ -291,7 +327,9 @@ def _telemetry_arguments(tool_name: str, arguments: dict[str, Any]) -> dict[str,
         return redacted if isinstance(redacted, dict) else {}
     return {
         str(key): (
-            value
+            _redact_sensitive_text(value)
+            if str(key) in {"reason", "user_intent"} and isinstance(value, str)
+            else value
             if str(key) in {"reason", "user_intent"}
             else "<redacted>"
         )
@@ -361,11 +399,13 @@ def _tool_attributes(
     identity: Mapping[str, str],
     server_name: str,
 ) -> dict[str, Any]:
+    safe_reason = _redact_sensitive_text(reason)
+    safe_user_intent = _redact_sensitive_text(user_intent)
     attributes: dict[str, Any] = {
         "gen_ai.operation.name": "execute_tool",
         "gen_ai.tool.name": tool_name,
-        "gen_ai.tool.call.reason": reason,
-        "session.user_intent": user_intent,
+        "gen_ai.tool.call.reason": safe_reason,
+        "session.user_intent": safe_user_intent,
         "gen_ai.tool.call.arguments": _canonical_json(_telemetry_arguments(tool_name, arguments)),
         "mcp.method.name": "tools/call",
         "mcp.server.name": server_name,
