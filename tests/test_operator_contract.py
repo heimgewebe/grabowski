@@ -6627,6 +6627,94 @@ class GitServerVerifiedReadTransportTests(unittest.TestCase):
                 first["read_strategy"], "config-isolated-shadow-status-v1"
             )
 
+    def test_generic_git_status_shadow_reports_deleted_tracking_upstream(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = self._repo(operator, temporary)
+            remote = Path(temporary) / "origin.git"
+            operator.subprocess.run(
+                ["git", "init", "--bare", "-q", str(remote)], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Test"], check=True
+            )
+            operator.subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    "user.email",
+                    "test@example.invalid",
+                ],
+                check=True,
+            )
+            tracked = repo / "tracked.txt"
+            tracked.write_text("base\n", encoding="utf-8")
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "add", "tracked.txt"], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True
+            )
+            branch = operator.subprocess.run(
+                ["git", "-C", str(repo), "branch", "--show-current"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "remote", "add", "origin", str(remote)],
+                check=True,
+            )
+            operator.subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-C",
+                    str(repo),
+                    "push",
+                    "-q",
+                    "-u",
+                    "origin",
+                    branch,
+                ],
+                check=True,
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(remote), "update-ref", "-d", f"refs/heads/{branch}"],
+                check=True,
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "fetch", "-q", "--prune", "origin"],
+                check=True,
+            )
+            expected = operator.subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "status",
+                    "--short",
+                    "--branch",
+                    "--untracked-files=normal",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "LC_ALL": "C"},
+            ).stdout
+            result = operator.grabowski_git(
+                str(repo),
+                ["status", "--short", "--branch", "--untracked-files=normal"],
+            )
+            self.assertIn("[gone]", expected)
+            self.assertEqual(result["stdout"], expected)
+            self.assertEqual(
+                result["read_strategy"], "config-isolated-shadow-status-v1"
+            )
+
     def test_generic_git_read_strips_inherited_trace_sinks(self) -> None:
         operator = _load_operator_module()
         with tempfile.TemporaryDirectory() as temporary:

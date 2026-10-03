@@ -1161,12 +1161,18 @@ def _git_server_safe_status(
                 ):
                     raise RuntimeError("safe Git status probe returned malformed upstream")
                 branch_header += f"...{upstream}"
-                counts = run_probe(
-                    ["rev-list", "--left-right", "--count", f"HEAD...{upstream}"],
+                upstream_commit = run_probe(
+                    ["rev-parse", "--verify", "--quiet", f"{upstream}^{{commit}}"],
                     environment=metadata_environment,
-                    allowed=(0, 128),
+                    allowed=(0, 1),
                 )
-                if counts["returncode"] == 0:
+                if upstream_commit["returncode"] == 1:
+                    branch_header += " [gone]"
+                else:
+                    counts = run_probe(
+                        ["rev-list", "--left-right", "--count", f"HEAD...{upstream}"],
+                        environment=metadata_environment,
+                    )
                     fields = counts["stdout"].split()
                     if len(fields) != 2 or not all(
                         item.isdigit() for item in fields
