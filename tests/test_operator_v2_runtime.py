@@ -1881,7 +1881,7 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             {"grabowski_agent_workspace_adopt"},
         )
 
-    def test_runtime_report_outcome_accepts_blocked_status(self) -> None:
+    def test_runtime_report_outcome_has_only_supported_statuses(self) -> None:
         source = (ROOT / "src" / "grabowski_runtime.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
         report = next(
@@ -1900,7 +1900,7 @@ class OperatorV2RuntimeTests(unittest.TestCase):
         }
         self.assertEqual(
             literal_values,
-            {"accomplished", "partial", "failed", "blocked"},
+            {"accomplished", "partial", "failed"},
         )
 
     def test_staged_workspace_adopt_remains_implemented_but_not_public(self) -> None:

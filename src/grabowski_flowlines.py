@@ -19,7 +19,9 @@ FLOWLINES_ENDPOINT = "https://api.flowlines.ai"
 FLOWLINES_INSTRUCTION = (
     "Every ordinary tool call must include non-empty reason and user_intent. "
     "REQUIRED: call report_outcome once as the final tool call before every final answer, "
-    "including read-only, partial, failed, or blocked work."
+    "including read-only, partial, failed, or blocked work. "
+    "For blocked work, use partial if any of the user goal was accomplished; "
+    "otherwise use failed, and describe the blocker in unmet_needs."
 )
 _REASON_SCHEMA = {
     "type": "string",
@@ -508,7 +510,7 @@ def _register_report_outcome(mcp: Any, read_only_annotations: Any) -> None:
     def report_outcome(
         reason: Annotated[str, Field(min_length=1, max_length=128)],
         user_intent: Annotated[str, Field(min_length=1, max_length=256)],
-        status: Literal["accomplished", "partial", "failed", "blocked"],
+        status: Literal["accomplished", "partial", "failed"],
         outcome_summary: Annotated[str, Field(min_length=1, max_length=2_000)],
         unmet_needs: ReportOutcomeUnmetNeeds | None = None,
     ) -> dict[str, bool]:
@@ -517,6 +519,8 @@ def _register_report_outcome(mcp: Any, read_only_annotations: Any) -> None:
         Accepts the agent's outcome self-report without mutating product data.
         When Flowlines export is enabled, this tool call is the telemetry report.
         Call it after read-only, accomplished, partial, failed, or blocked work.
+        For blocked work, report partial if any of the user goal was accomplished;
+        otherwise report failed, and describe the blocker in unmet_needs.
         """
         del reason, user_intent, status, outcome_summary, unmet_needs
         return {"accepted": True}

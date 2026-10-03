@@ -136,7 +136,9 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             {"reason", "user_intent", "status", "outcome_summary"}.issubset(required)
         )
         status_schema = report.parameters["properties"]["status"]
-        self.assertEqual(status_schema.get("enum"), ["accomplished", "partial", "failed", "blocked"])
+        self.assertEqual(status_schema.get("enum"), ["accomplished", "partial", "failed"])
+        self.assertIn("For blocked work, report partial", report.description)
+        self.assertIn("For blocked work, use partial", flowlines.FLOWLINES_INSTRUCTION)
         unmet_schema = report.parameters["properties"]["unmet_needs"]
         unmet_array = next(
             item for item in unmet_schema.get("anyOf", []) if item.get("type") == "array"
@@ -892,7 +894,7 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             {"accepted": True},
         )
 
-    async def test_report_outcome_accepts_blocked_status(self) -> None:
+    async def test_report_outcome_rejects_blocked_status(self) -> None:
         mcp = FastMCP("grabowski-test", instructions="fixture")
         flowlines.configure_flowlines_observability(mcp, READ_ONLY, tracer=self.tracer)
 
@@ -901,7 +903,7 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             name="report_outcome",
             arguments={
                 "reason": "Record an operator block",
-                "user_intent": "Represent blocked work without misclassification",
+                "user_intent": "Represent blocked work with a supported outcome status",
                 "status": "blocked",
                 "outcome_summary": "A required operator gate blocked completion.",
                 "unmet_needs": ["Clear the operator gate."],
@@ -909,11 +911,8 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             meta=self.meta(),
         )
 
-        self.assertFalse(result.root.isError)
-        span = self.exporter.get_finished_spans()[0]
-        public_arguments = json.loads(span.attributes["gen_ai.tool.call.arguments"])
-        self.assertEqual(public_arguments["status"], "blocked")
-        self.assertEqual(public_arguments["unmet_needs"], ["Clear the operator gate."])
+        self.assertTrue(result.root.isError)
+        self.assertEqual(self.exporter.get_finished_spans(), ())
 
     async def test_report_outcome_rejects_unbounded_unmet_needs(self) -> None:
         mcp = FastMCP("grabowski-test", instructions="fixture")
