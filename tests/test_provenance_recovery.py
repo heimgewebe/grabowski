@@ -1466,6 +1466,62 @@ class IndexedInflightJobEvidenceGateTests(unittest.TestCase):
             ["argv"], prune=True, reconcile_stale_pending=True
         )
 
+    def test_volatile_recheck_keeps_competing_read_only_when_kill_switch_is_active(self) -> None:
+        projection = {
+            "deploy_lock_free": True,
+            "inflight_deploy_jobs": [],
+            "idempotent_match": None,
+            "pruned_units": [],
+            "stale_pending_reconciliation": None,
+            "error": None,
+        }
+        with patch.object(
+            provenance_recovery.base,
+            "_kill_switch_state",
+            return_value={"engaged": True},
+        ), patch.object(
+            provenance_recovery,
+            "_blockade_evidence",
+            return_value={"allows_mutation": True, "error": None},
+        ), patch.object(
+            provenance_recovery,
+            "_competing_deployment_evidence",
+            return_value=projection,
+        ) as competing:
+            result = provenance_recovery._volatile_gate_recheck(ROOT, ["argv"])
+        self.assertEqual(result["reasons"], ["kill_switch_clear"])
+        competing.assert_called_once_with(
+            ["argv"], prune=False, reconcile_stale_pending=False
+        )
+
+    def test_volatile_recheck_keeps_competing_read_only_when_blockade_denies(self) -> None:
+        projection = {
+            "deploy_lock_free": True,
+            "inflight_deploy_jobs": [],
+            "idempotent_match": None,
+            "pruned_units": [],
+            "stale_pending_reconciliation": None,
+            "error": None,
+        }
+        with patch.object(
+            provenance_recovery.base,
+            "_kill_switch_state",
+            return_value={"engaged": False},
+        ), patch.object(
+            provenance_recovery,
+            "_blockade_evidence",
+            return_value={"allows_mutation": False, "error": "blocked"},
+        ), patch.object(
+            provenance_recovery,
+            "_competing_deployment_evidence",
+            return_value=projection,
+        ) as competing:
+            result = provenance_recovery._volatile_gate_recheck(ROOT, ["argv"])
+        self.assertEqual(result["reasons"], ["no_blocking_operator_blockade"])
+        competing.assert_called_once_with(
+            ["argv"], prune=False, reconcile_stale_pending=False
+        )
+
     def test_identical_running_intent_is_reported_as_idempotent(self) -> None:
         match = {"unit": "grabowski-job-555555555555", "kind": "deploy"}
         with patch.object(

@@ -15513,6 +15513,48 @@ def _captain_runtime_deploy_target_errors(
     return errors
 
 
+def _runtime_deploy_local_mutation_evidence_valid(
+    evidence: Any,
+    *,
+    expected_job_prefix: str,
+) -> bool:
+    evidence_fields = {
+        "schema_version",
+        "kind",
+        "unit",
+        "dispatch_outcome",
+        "deploy_index_updated",
+        "audit_recorded",
+        "index_updated_at_unix",
+        "evidence_sha256",
+    }
+    if not isinstance(evidence, dict) or set(evidence) != evidence_fields:
+        return False
+    material = {
+        key: value
+        for key, value in evidence.items()
+        if key != "evidence_sha256"
+    }
+    return bool(
+        evidence.get("schema_version") == 1
+        and evidence.get("kind")
+        == "grabowski_runtime_deploy_stale_pending_reconciliation"
+        and evidence.get("dispatch_outcome") == "not_started"
+        and evidence.get("deploy_index_updated") is True
+        and evidence.get("audit_recorded") is True
+        and not isinstance(evidence.get("index_updated_at_unix"), bool)
+        and isinstance(evidence.get("index_updated_at_unix"), int)
+        and evidence.get("index_updated_at_unix", -1) >= 0
+        and isinstance(evidence.get("unit"), str)
+        and re.fullmatch(
+            rf"{re.escape(expected_job_prefix)}[0-9a-f]{{12}}",
+            evidence.get("unit", ""),
+        )
+        is not None
+        and evidence.get("evidence_sha256") == sha256_json(material)
+    )
+
+
 def _runtime_deploy_schedule_errors(
     schedule: Any,
     *,
@@ -15571,48 +15613,14 @@ def _runtime_deploy_schedule_errors(
     if schedule.get("logs_tool") != "grabowski_job_logs":
         errors.append("runtime_deploy_logs_tool_missing")
     local_mutation_evidence = schedule.get("local_mutation_evidence")
-    if local_mutation_evidence is not None:
-        evidence_fields = {
-            "schema_version",
-            "kind",
-            "unit",
-            "dispatch_outcome",
-            "deploy_index_updated",
-            "audit_recorded",
-            "index_updated_at_unix",
-            "evidence_sha256",
-        }
-        evidence_material = (
-            {
-                key: value
-                for key, value in local_mutation_evidence.items()
-                if key != "evidence_sha256"
-            }
-            if isinstance(local_mutation_evidence, dict)
-            else {}
+    if (
+        local_mutation_evidence is not None
+        and not _runtime_deploy_local_mutation_evidence_valid(
+            local_mutation_evidence,
+            expected_job_prefix=expected_job_prefix,
         )
-        if (
-            not isinstance(local_mutation_evidence, dict)
-            or set(local_mutation_evidence) != evidence_fields
-            or local_mutation_evidence.get("schema_version") != 1
-            or local_mutation_evidence.get("kind")
-            != "grabowski_runtime_deploy_stale_pending_reconciliation"
-            or local_mutation_evidence.get("dispatch_outcome") != "not_started"
-            or local_mutation_evidence.get("deploy_index_updated") is not True
-            or local_mutation_evidence.get("audit_recorded") is not True
-            or isinstance(local_mutation_evidence.get("index_updated_at_unix"), bool)
-            or not isinstance(local_mutation_evidence.get("index_updated_at_unix"), int)
-            or local_mutation_evidence.get("index_updated_at_unix", -1) < 0
-            or not isinstance(local_mutation_evidence.get("unit"), str)
-            or re.fullmatch(
-                rf"{re.escape(expected_job_prefix)}[0-9a-f]{{12}}",
-                local_mutation_evidence.get("unit", ""),
-            )
-            is None
-            or local_mutation_evidence.get("evidence_sha256")
-            != sha256_json(evidence_material)
-        ):
-            errors.append("runtime_deploy_schedule_local_mutation_evidence_invalid")
+    ):
+        errors.append("runtime_deploy_schedule_local_mutation_evidence_invalid")
     path_values: dict[str, Path] = {}
     for key in ("metadata_path", "stdout_path", "stderr_path"):
         value = schedule.get(key)
@@ -15718,6 +15726,16 @@ def _run_captain_runtime_deploy(
         execution_result["runner_exception"] = (
             f"{type(exc).__name__}: {_bounded_command_output(str(exc), limit=512)}"
         )
+        local_mutation_evidence = getattr(exc, "local_mutation_evidence", None)
+        expected_job_prefix = str(preflight.get("job_prefix") or "")
+        if _runtime_deploy_local_mutation_evidence_valid(
+            local_mutation_evidence,
+            expected_job_prefix=expected_job_prefix,
+        ):
+            execution_result["local_mutation_observed"] = True
+            execution_result["local_mutation_evidence"] = dict(
+                local_mutation_evidence
+            )
         execution_result["mutation_outcome_unknown"] = True
         execution_result["local_mutation_outcome_unknown"] = True
         execution_result["verification_error"] = (

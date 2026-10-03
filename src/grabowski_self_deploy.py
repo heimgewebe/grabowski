@@ -1670,6 +1670,19 @@ class DeploySchedulePreEffectRefusal(RuntimeError):
         )
 
 
+class DeployScheduleFailureAfterLocalMutation(RuntimeError):
+    """Scheduling failed after one local reconciliation mutation was already observed."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        local_mutation_evidence: dict[str, Any],
+    ) -> None:
+        super().__init__(message)
+        self.local_mutation_evidence = dict(local_mutation_evidence)
+
+
 class IndexedRuntimeJobConflict(RuntimeError):
     """An indexed runtime job forbids starting another one right now."""
 
@@ -3285,6 +3298,7 @@ def _auto_deploy_source_plan(expected_head: str) -> dict[str, Any]:
 
 
 def _acquire_auto_deploy_source_resources(plan: dict[str, Any], expected_head: str) -> dict[str, Any]:
+    import grabowski_checkouts as checkouts
     import grabowski_resources as resources
 
     operation_scope = resources.operation_scope_contract(
@@ -3293,13 +3307,92 @@ def _acquire_auto_deploy_source_resources(plan: dict[str, Any], expected_head: s
         effect_class="worktree_admin",
         operation_class="worktree-admin",
     )
-    return resources.acquire_resources(
-        plan["owner_id"],
-        [plan["operation_key"], plan["path_key"]],
-        purpose=f"materialize detached runtime deploy source {expected_head[:12]}",
-        ttl_seconds=AUTO_DEPLOY_SOURCE_LEASE_TTL_SECONDS,
-        metadata={"operation_scope": operation_scope},
+    common_dir = _git_common_directory(plan["canonical_repository"])
+    common_dir_key = f"path:{common_dir}"
+    resource_keys = [plan["operation_key"], plan["path_key"], common_dir_key]
+    try:
+        acquisition = resources.acquire_resources(
+            plan["owner_id"],
+            resource_keys,
+            purpose=f"materialize detached runtime deploy source {expected_head[:12]}",
+            ttl_seconds=AUTO_DEPLOY_SOURCE_LEASE_TTL_SECONDS,
+            metadata={"operation_scope": operation_scope},
+        )
+    except resources.ResourceConflict as exc:
+        raise DeploySchedulePreEffectRefusal(
+            "automatic deployment source resources are busy before mutation"
+        ) from exc
+    try:
+        checkouts._require_no_checkout_operation_uncertainty([common_dir_key])
+        path_lease = _lease_for_key(acquisition, plan["path_key"])
+        common_dir_lease = _lease_for_key(acquisition, common_dir_key)
+        uncertainty_fence = checkouts._persist_checkout_operation_uncertainty(
+            lease={
+                "owner_id": plan["owner_id"],
+                "leases": [path_lease, common_dir_lease],
+            },
+            checkout_key=checkouts._checkout_key(common_dir, plan["target"]),
+            owner_id=plan["owner_id"],
+            operation="materialize",
+            operation_id=plan["generation"],
+            evidence={
+                "repo": str(plan["canonical_repository"]),
+                "git_common_dir": str(common_dir),
+                "checkout_path": str(plan["target"]),
+                "checkout_key": checkouts._checkout_key(common_dir, plan["target"]),
+                "owner_id": plan["owner_id"],
+                "expected_head": expected_head,
+                "expected_branch": None,
+                "obligation_id": plan["obligation_id"],
+            },
+        )
+    except Exception as exc:
+        leases = acquisition.get("leases")
+        if not isinstance(leases, list) or len(leases) != len(resource_keys):
+            raise RuntimeError(
+                "automatic deployment source lease receipt is malformed during pre-effect refusal"
+            ) from exc
+        try:
+            resources.release_resources(
+                plan["owner_id"],
+                resource_keys,
+                expected_leases=leases,
+            )
+        except Exception as cleanup_error:
+            raise RuntimeError(
+                "automatic deployment source pre-effect refusal "
+                f"could not release serialization leases: {type(cleanup_error).__name__}: "
+                f"{str(cleanup_error)[:256]}"
+            ) from exc
+        raise DeploySchedulePreEffectRefusal(
+            "automatic deployment source is blocked before mutation by checkout coordination"
+        ) from exc
+    return {
+        **acquisition,
+        "common_dir_key": common_dir_key,
+        "checkout_uncertainty_fence": uncertainty_fence,
+    }
+
+
+def _clear_auto_deploy_source_uncertainty(
+    fence: dict[str, Any],
+    *,
+    outcome: str,
+    reason: str,
+) -> dict[str, Any]:
+    import grabowski_checkouts as checkouts
+
+    fence_id = fence.get("fence_id")
+    if not isinstance(fence_id, str) or re.fullmatch(r"[0-9a-f]{32}", fence_id) is None:
+        raise RuntimeError("automatic deployment source uncertainty fence is malformed")
+    cleared = checkouts._clear_checkout_operation_uncertainty(
+        fence_id,
+        outcome=outcome,
+        evidence={"reason": reason},
     )
+    if not isinstance(cleared, dict) or cleared.get("cleared_at_unix") is None:
+        raise RuntimeError("automatic deployment source uncertainty fence did not clear")
+    return cleared
 
 
 def _release_auto_deploy_source_resources(
@@ -3557,6 +3650,10 @@ def _materialize_auto_deploy_source(
     acquisition: dict[str, Any] | None = None
     operation_lease: dict[str, Any] | None = None
     path_lease: dict[str, Any] | None = None
+    common_dir_key: str | None = None
+    common_dir_lease: dict[str, Any] | None = None
+    uncertainty_fence: dict[str, Any] | None = None
+    uncertainty_fence_cleared = False
     created = False
     mutation_attempted = False
     recovery_asset_present = False
@@ -3564,10 +3661,28 @@ def _materialize_auto_deploy_source(
     obligation_opened = False
     obligation_completed = False
     operation_lease_released = False
+    common_dir_lease_released = False
     try:
         acquisition = _acquire_auto_deploy_source_resources(plan, expected_head)
         operation_lease = _lease_for_key(acquisition, plan["operation_key"])
         path_lease = _lease_for_key(acquisition, plan["path_key"])
+        raw_common_dir_key = acquisition.get("common_dir_key")
+        if raw_common_dir_key is not None:
+            if not isinstance(raw_common_dir_key, str) or not raw_common_dir_key:
+                raise RuntimeError(
+                    "automatic deployment source common-dir lease key is malformed"
+                )
+            common_dir_key = raw_common_dir_key
+            common_dir_lease = _lease_for_key(acquisition, common_dir_key)
+            raw_uncertainty_fence = acquisition.get("checkout_uncertainty_fence")
+            if (
+                not isinstance(raw_uncertainty_fence, dict)
+                or not isinstance(raw_uncertainty_fence.get("fence_id"), str)
+            ):
+                raise RuntimeError(
+                    "automatic deployment source checkout uncertainty fence is missing"
+                )
+            uncertainty_fence = dict(raw_uncertainty_fence)
         obligation = _open_auto_deploy_source_obligation(plan, expected_head)
         obligation_state = obligation.get("state")
         if obligation_state != "open":
@@ -3675,6 +3790,13 @@ def _materialize_auto_deploy_source(
                 "automatic deployment source mutation failed with no observed effect: "
                 + (message or "git worktree add reported failure")
             )
+        if uncertainty_fence is not None and not uncertainty_fence_cleared:
+            _clear_auto_deploy_source_uncertainty(
+                uncertainty_fence,
+                outcome="confirmed_success",
+                reason="exact detached deployment source post-state observed",
+            )
+            uncertainty_fence_cleared = True
         assert repository is not None and runner is not None and source_identity is not None
         command_reported_success = bool(
             mutation_error is None
@@ -3693,15 +3815,24 @@ def _materialize_auto_deploy_source(
             lifecycle,
             expected_head,
         )
+        release_keys = [plan["operation_key"]]
+        release_leases = [operation_lease]
+        if common_dir_key is not None and common_dir_lease is not None:
+            release_keys.append(common_dir_key)
+            release_leases.append(common_dir_lease)
         release = _release_auto_deploy_source_resources(
             plan["owner_id"],
-            [plan["operation_key"]],
-            [operation_lease],
+            release_keys,
+            release_leases,
         )
         released = release.get("released")
-        if not isinstance(released, list) or len(released) != 1:
-            raise RuntimeError("automatic deployment source operation lease release was incomplete")
+        if not isinstance(released, list) or len(released) != len(release_keys):
+            raise RuntimeError(
+                "automatic deployment source serialization lease release was incomplete"
+            )
         operation_lease_released = True
+        if common_dir_key is not None:
+            common_dir_lease_released = True
         repository, runner, source_identity = _deployment_source_preflight(
             expected_head,
             str(target),
@@ -3792,6 +3923,20 @@ def _materialize_auto_deploy_source(
             except Exception as cleanup_error:
                 cleanup_failures.append(("obligation-block", cleanup_error))
         preserve_recovery_asset = bool(mutation_attempted and recovery_asset_present)
+        if (
+            uncertainty_fence is not None
+            and not uncertainty_fence_cleared
+            and not preserve_recovery_asset
+        ):
+            try:
+                _clear_auto_deploy_source_uncertainty(
+                    uncertainty_fence,
+                    outcome="confirmed_no_effect",
+                    reason="automatic deployment source mutation had no observed effect",
+                )
+                uncertainty_fence_cleared = True
+            except Exception as cleanup_error:
+                cleanup_failures.append(("uncertainty-fence-clear", cleanup_error))
         if lifecycle is not None and not preserve_recovery_asset:
             try:
                 if not _release_auto_deploy_source_lifecycle(lifecycle):
@@ -3818,6 +3963,25 @@ def _materialize_auto_deploy_source(
             if candidate_operation_lease is not None:
                 release_keys.append(plan["operation_key"])
                 release_leases.append(candidate_operation_lease)
+        if (
+            common_dir_key is not None
+            and not common_dir_lease_released
+            and not preserve_recovery_asset
+        ):
+            candidate_common_dir_lease = common_dir_lease
+            if candidate_common_dir_lease is None and not mutation_attempted:
+                try:
+                    candidate_common_dir_lease = _live_auto_deploy_source_lease_snapshot(
+                        common_dir_key, plan["owner_id"]
+                    )
+                except Exception as cleanup_error:
+                    cleanup_failures.append(
+                        ("common-dir-lease-readback", cleanup_error)
+                    )
+                    candidate_common_dir_lease = None
+            if candidate_common_dir_lease is not None:
+                release_keys.append(common_dir_key)
+                release_leases.append(candidate_common_dir_lease)
         if not preserve_recovery_asset:
             candidate_path_lease = path_lease
             if candidate_path_lease is None and not mutation_attempted:
@@ -4488,18 +4652,16 @@ def _recovered_auto_deploy_source_binding(
     }
 
 
-@mcp.tool(name="grabowski_runtime_deploy_schedule", annotations=DEPLOY_MUTATING)
-def grabowski_runtime_deploy_schedule(
+def _grabowski_runtime_deploy_schedule_impl(
     expected_head: ExpectedHead,
     delay_seconds: DelaySeconds = 8,
     source_repository: SourceRepository | None = None,
     source_lease_owner_id: SourceLeaseOwner | None = None,
     ctx: Context | None = None,
+    *,
+    local_mutation_tracker: dict[str, Any],
 ) -> dict[str, Any]:
-    """Schedule one source-identity-bound self-deployment, reusing an identical in-flight job."""
-    operator._require_operator_mutation("durable_job")
-    operator._require_operator_capability("git_cli")
-    operator._require_operator_capability("privileged_reference")
+    """Implement one source-identity-bound self-deployment schedule attempt."""
     with _deploy_schedule_lock():
         public_github_main_before = _fresh_public_github_main(expected_head)
         if public_github_main_before != expected_head:
@@ -4557,6 +4719,17 @@ def grabowski_runtime_deploy_schedule(
         inflight_before_resolution = inflight_runtime_job_evidence(
             reconcile_stale_pending=True
         )
+        local_mutation_evidence = inflight_before_resolution.get(
+            "stale_pending_reconciliation"
+        )
+        if local_mutation_evidence is not None and not isinstance(
+            local_mutation_evidence, dict
+        ):
+            raise RuntimeError(
+                "deployment source preflight returned malformed local mutation evidence"
+            )
+        if local_mutation_evidence is not None:
+            local_mutation_tracker["evidence"] = dict(local_mutation_evidence)
         inflight_error = inflight_before_resolution.get("error")
         if inflight_error:
             raise RuntimeError(
@@ -4567,15 +4740,6 @@ def grabowski_runtime_deploy_schedule(
         if not isinstance(inflight_units, list):
             raise RuntimeError(
                 "deployment source preflight returned malformed in-flight runtime evidence"
-            )
-        local_mutation_evidence = inflight_before_resolution.get(
-            "stale_pending_reconciliation"
-        )
-        if local_mutation_evidence is not None and not isinstance(
-            local_mutation_evidence, dict
-        ):
-            raise RuntimeError(
-                "deployment source preflight returned malformed local mutation evidence"
             )
         if source_repository is None and inflight_units:
             recovered_source = _reconcile_inflight_auto_deploy_source(
@@ -4943,3 +5107,44 @@ def grabowski_runtime_deploy_schedule(
             local_mutation_evidence=local_mutation_evidence,
             deployment_observer_capability=observer_capability,
         )
+
+@mcp.tool(name="grabowski_runtime_deploy_schedule", annotations=DEPLOY_MUTATING)
+def grabowski_runtime_deploy_schedule(
+    expected_head: ExpectedHead,
+    delay_seconds: DelaySeconds = 8,
+    source_repository: SourceRepository | None = None,
+    source_lease_owner_id: SourceLeaseOwner | None = None,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Schedule one source-identity-bound self-deployment, reusing an identical in-flight job."""
+    operator._require_operator_mutation("durable_job")
+    operator._require_operator_capability("git_cli")
+    operator._require_operator_capability("privileged_reference")
+    local_mutation_tracker: dict[str, Any] = {}
+    try:
+        return _grabowski_runtime_deploy_schedule_impl(
+            expected_head,
+            delay_seconds,
+            source_repository,
+            source_lease_owner_id,
+            ctx,
+            local_mutation_tracker=local_mutation_tracker,
+        )
+    except DeploySchedulePreEffectRefusal as exc:
+        evidence = local_mutation_tracker.get("evidence")
+        if evidence is None or getattr(exc, "local_mutation_evidence", None) is not None:
+            raise
+        raise DeploySchedulePreEffectRefusal(
+            str(exc),
+            local_mutation_evidence=evidence,
+        ) from exc
+    except DeployScheduleFailureAfterLocalMutation:
+        raise
+    except Exception as exc:
+        evidence = local_mutation_tracker.get("evidence")
+        if not isinstance(evidence, dict):
+            raise
+        raise DeployScheduleFailureAfterLocalMutation(
+            str(exc),
+            local_mutation_evidence=evidence,
+        ) from exc

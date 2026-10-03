@@ -1614,8 +1614,10 @@ def _persist_checkout_operation_uncertainty(
 ) -> dict[str, Any]:
     checkout_identity = _validate_sha256(checkout_key, "checkout_key")
     owner = _owner(owner_id)
-    if operation not in {"archive", "cleanup"}:
-        raise ValueError("Checkout uncertainty operation must be archive or cleanup")
+    if operation not in {"archive", "cleanup", "materialize"}:
+        raise ValueError(
+            "Checkout uncertainty operation must be archive, cleanup or materialize"
+        )
     if (
         not isinstance(operation_id, str)
         or not operation_id
@@ -3092,6 +3094,156 @@ def _archive_uncertainty_readback(
     }
 
 
+def _materialize_uncertainty_lifecycle(
+    fence: dict[str, Any],
+) -> dict[str, Any] | None:
+    evidence = fence["evidence"]
+    lifecycle = _strict_lifecycle_binding(str(evidence["checkout_key"]))
+    if lifecycle is None:
+        return None
+    expected = {
+        "checkout_key": evidence["checkout_key"],
+        "repo_common_dir": evidence["git_common_dir"],
+        "repo_path": evidence["repo"],
+        "checkout_path": evidence["checkout_path"],
+        "owner_id": evidence["owner_id"],
+        "expected_head": evidence["expected_head"],
+        "expected_branch": None,
+    }
+    if lifecycle.get("phase") != "active" or any(
+        lifecycle.get(key) != value for key, value in expected.items()
+    ):
+        raise RuntimeError("Materialize uncertainty lifecycle binding mismatch")
+    return lifecycle
+
+
+def _materialize_uncertainty_readback(
+    fence: dict[str, Any],
+) -> dict[str, Any]:
+    evidence = fence["evidence"]
+    repo = _resolve_repo(str(evidence["repo"]))
+    checkout = Path(str(evidence["checkout_path"]))
+    expected_head = _validate_git_object_id(
+        str(evidence["expected_head"]), "expected_head"
+    )
+    if evidence.get("expected_branch") is not None:
+        return {
+            "state": "still_fenced",
+            "reason": "materialize-expected-branch-must-be-detached",
+        }
+    _, common_dir, records = _worktree_records(repo)
+    if str(common_dir) != str(evidence["git_common_dir"]):
+        return {
+            "state": "still_fenced",
+            "reason": "materialize-common-dir-readback-mismatch",
+        }
+    matching = [record for record in records if record.get("path") == str(checkout)]
+    if not matching and not os.path.lexists(checkout):
+        try:
+            _materialize_uncertainty_lifecycle(fence)
+        except RuntimeError as exc:
+            return {
+                "state": "still_fenced",
+                "reason": f"materialize-lifecycle-readback-mismatch:{type(exc).__name__}",
+            }
+        return {
+            "state": "confirmed_no_effect",
+            "checkout_key": evidence["checkout_key"],
+            "expected_head": expected_head,
+        }
+    if len(matching) != 1 or not os.path.lexists(checkout):
+        return {
+            "state": "still_fenced",
+            "reason": "materialize-outcome-remains-ambiguous",
+            "matching_worktrees": len(matching),
+            "path_present": os.path.lexists(checkout),
+        }
+    try:
+        _require_expected(matching[0], expected_head, None)
+        lifecycle = _materialize_uncertainty_lifecycle(fence)
+        status = _worktree_status(matching[0])
+    except Exception as exc:
+        return {
+            "state": "still_fenced",
+            "reason": f"materialize-readback-mismatch:{type(exc).__name__}",
+        }
+    if (
+        lifecycle is None
+        or not matching[0].get("detached")
+        or status.get("dirty") is not False
+        or status.get("error") is not None
+    ):
+        return {
+            "state": "still_fenced",
+            "reason": "materialize-created-source-is-not-exact-and-clean",
+        }
+    return {
+        "state": "recoverable_created",
+        "checkout_key": evidence["checkout_key"],
+        "expected_head": expected_head,
+    }
+
+
+def _reconcile_materialize_uncertainty(
+    fence: dict[str, Any],
+) -> dict[str, Any]:
+    recovery = _acquire_uncertainty_recovery_resources(fence)
+    try:
+        readback = _materialize_uncertainty_readback(fence)
+        state = str(readback.get("state"))
+        if state == "confirmed_no_effect":
+            lifecycle = _materialize_uncertainty_lifecycle(fence)
+            if lifecycle is not None and not _release_checkout_lifecycle_exact(lifecycle):
+                return {
+                    "state": "still_fenced",
+                    "reason": "materialize-no-effect-lifecycle-release-failed",
+                    "readback": readback,
+                }
+            return readback
+        if state != "recoverable_created":
+            return readback
+        evidence = fence["evidence"]
+        repo = _resolve_repo(str(evidence["repo"]))
+        checkout = Path(str(evidence["checkout_path"]))
+        physical_identity = physical_checkout.capture_physical_checkout_identity(
+            checkout
+        )
+        result = _git_mutate(
+            repo,
+            ["worktree", "remove", str(checkout)],
+            timeout_seconds=120,
+            expected_physical_identity=physical_identity,
+            expected_physical_checkout=checkout,
+        )
+        after = _materialize_uncertainty_readback(fence)
+        if after.get("state") != "confirmed_no_effect":
+            return {
+                "state": "still_fenced",
+                "reason": "materialize-recovery-postcondition-failed",
+                "readback": after,
+            }
+        lifecycle = _materialize_uncertainty_lifecycle(fence)
+        if lifecycle is not None and not _release_checkout_lifecycle_exact(lifecycle):
+            return {
+                "state": "still_fenced",
+                "reason": "materialize-recovery-lifecycle-release-failed",
+                "readback": after,
+            }
+        return {
+            "state": "reconciled_success",
+            "checkout_key": evidence["checkout_key"],
+            "expected_head": evidence["expected_head"],
+            "removed_recovery_worktree": True,
+            "git_returncode": result.get("returncode"),
+        }
+    finally:
+        resources.release_resources(
+            str(recovery["owner_id"]),
+            [item["resource_key"] for item in recovery["leases"]],
+            expected_leases=list(recovery["leases"]),
+        )
+
+
 def _cleanup_uncertainty_readback(fence: dict[str, Any]) -> dict[str, Any]:
     evidence = fence["evidence"]
     repo = _resolve_repo(str(evidence["repo"]))
@@ -3241,11 +3393,14 @@ def grabowski_checkout_uncertainty_reconcile(
             "fence": fence,
             "live_lease_count": len(live),
         }
-    readback = (
-        _archive_uncertainty_readback(fence)
-        if fence["operation"] == "archive"
-        else _cleanup_uncertainty_readback(fence)
-    )
+    if fence["operation"] == "archive":
+        readback = _archive_uncertainty_readback(fence)
+    elif fence["operation"] == "cleanup":
+        readback = _cleanup_uncertainty_readback(fence)
+    elif fence["operation"] == "materialize":
+        readback = _reconcile_materialize_uncertainty(fence)
+    else:
+        raise RuntimeError("Checkout uncertainty operation is unsupported")
     outcome = str(readback.get("state"))
     if outcome == "recoverable_complete" and fence["operation"] == "archive":
         readback = _complete_partial_archive(

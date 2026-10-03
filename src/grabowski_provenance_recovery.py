@@ -423,15 +423,21 @@ def _volatile_gate_recheck(
     """Re-read the gates that can change between assessment and dispatch."""
     kill_switch = base._kill_switch_state()
     blockade = _blockade_evidence(repository)
+    kill_switch_clear = not bool(kill_switch.get("engaged"))
+    blockade_allows_mutation = bool(blockade["allows_mutation"])
+    mutation_allowed = kill_switch_clear and blockade_allows_mutation
     # Carries the exact argv: the recheck runs under the schedule lock, which is
     # where an identical intent that started meanwhile must be recognised as
-    # ours rather than dispatched a second time.
+    # ours rather than dispatched a second time.  Stop gates are read first;
+    # once either is active, classification stays strictly read-only.
     competing = _competing_deployment_evidence(
-        command, prune=True, reconcile_stale_pending=True
+        command,
+        prune=mutation_allowed,
+        reconcile_stale_pending=mutation_allowed,
     )
     checks = {
-        "kill_switch_clear": not bool(kill_switch.get("engaged")),
-        "no_blocking_operator_blockade": bool(blockade["allows_mutation"]),
+        "kill_switch_clear": kill_switch_clear,
+        "no_blocking_operator_blockade": blockade_allows_mutation,
         "no_competing_deployment": (
             bool(competing.get("deploy_lock_free"))
             and not competing.get("inflight_deploy_jobs")
