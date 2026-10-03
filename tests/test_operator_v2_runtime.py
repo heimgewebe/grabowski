@@ -1881,6 +1881,32 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             {"grabowski_agent_workspace_adopt"},
         )
 
+    def test_runtime_report_outcome_has_only_supported_statuses(self) -> None:
+        source = (ROOT / "src" / "grabowski_runtime.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        report = next(
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "report_outcome"
+        )
+        status_index = [argument.arg for argument in report.args.args].index("status")
+        annotation = report.args.args[status_index].annotation
+        self.assertIsInstance(annotation, ast.Subscript)
+        literal_values = {
+            node.value
+            for node in ast.walk(annotation)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        }
+        self.assertEqual(
+            literal_values,
+            {"accomplished", "partial", "failed"},
+        )
+        description = ast.get_docstring(report) or ""
+        self.assertIn("For blocked work, report partial", description)
+        self.assertIn("otherwise report failed", description)
+        self.assertIn("unmet_needs", description)
+
     def test_staged_workspace_adopt_remains_implemented_but_not_public(self) -> None:
         contract = json.loads(
             (ROOT / "config" / "runtime-entrypoint.json").read_text(encoding="utf-8")
@@ -1992,8 +2018,8 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             ]
         }
         summary = status["capability_requirements"]
-        self.assertEqual(summary["registered_tool_requirements"], 201)
-        self.assertEqual(summary["known_tool_requirements"], 202)
+        self.assertEqual(summary["registered_tool_requirements"], 202)
+        self.assertEqual(summary["known_tool_requirements"], 203)
         self.assertEqual(
             summary["staged_unpublished_tools"],
             ["grabowski_agent_workspace_adopt"],

@@ -2105,6 +2105,29 @@
         "risk_class": "low",
         "tool": "repoground_range_get"
       }
+    },
+    "report_outcome": {
+      "evidence_refs": [
+        "tests:test_flowlines_observability.py",
+        "docs:agent-facing-contract.md",
+        "contract:flowlines-mcp-observability"
+      ],
+      "exception_detail": {
+        "claim": "The tool records only the agent's terminal session self-report as observability telemetry and grants no product-state authority.",
+        "evidence": "Read-only annotation, empty effects, bounded outcome fields, final-call contract, fail-open exporter behavior and focused in-memory telemetry tests."
+      },
+      "justification_kind": "material_call_shape",
+      "operation_alternative_considered": "Embedding the session outcome in every domain-tool result was rejected because it would conflate product responses with one terminal session evaluation event; generic operation execution would also add unrelated authority.",
+      "rationale": "Flowlines session evaluation needs one explicit final read-only call shape carrying the bounded outcome self-report separately from domain tools. The tool mutates no product state and keeps terminal observability machine-readable.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "operations-observability",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "report_outcome"
+      }
     }
   },
   "baseline": {

@@ -26,6 +26,14 @@ RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=restart
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 Environment=PYTHONUNBUFFERED=1
+# Flowlines remains explicitly opt-in. This optional file may contain only
+# non-secret activation settings such as GRABOWSKI_FLOWLINES_ENABLED=1.
+EnvironmentFile=-/home/alex/.config/grabowski/flowlines-enabled.env
+Environment=OTEL_EXPORTER_OTLP_ENDPOINT=https://api.flowlines.ai
+# Credential-bearing OTLP headers are forbidden in the initial process
+# environment. The enabled operator reads the root-owned credential through
+# the MainPID-bound privileged broker from /etc/grabowski/flowlines-headers.
+UnsetEnvironment=OTEL_EXPORTER_OTLP_HEADERS OTEL_EXPORTER_OTLP_TRACES_HEADERS
 Environment=MALLOC_ARENA_MAX=8
 NoNewPrivileges=yes
 PrivateTmp=yes
