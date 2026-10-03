@@ -1074,6 +1074,7 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             ) as processor_factory,
         ):
             tracer, returned_provider = flowlines._build_environment_tracer()
+            self.assertNotIn("OTEL_EXPORTER_OTLP_HEADERS", os.environ)
 
         self.assertEqual(tracer, ("tracer", "grabowski.flowlines"))
         self.assertIs(returned_provider, provider)
@@ -1118,6 +1119,7 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             ),
         ):
             tracer, provider = flowlines._build_environment_tracer()
+            self.assertNotIn("OTEL_EXPORTER_OTLP_HEADERS", os.environ)
 
         self.assertIsNone(tracer)
         self.assertIsNone(provider)

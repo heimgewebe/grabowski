@@ -383,6 +383,30 @@ class OperatorContractTests(unittest.TestCase):
             )
         )
 
+        raw_recovery_status = {
+            "operation": "maulwurf-recovery-status",
+            "parameters": None,
+            "reason": "Observe recovery state",
+            "user_intent": "Check the recovery controller",
+        }
+        policy_recovery_status = operator._operator_policy_arguments(
+            "grabowski_operation_run",
+            raw_recovery_status,
+            injected_tool,
+        )
+        self.assertNotIn("reason", policy_recovery_status)
+        self.assertNotIn("user_intent", policy_recovery_status)
+        with patch.dict(
+            os.environ,
+            {"GRABOWSKI_MCP_BRANDING_VARIANT": "der-kleine-maulwurf"},
+        ):
+            self.assertTrue(
+                operator._transport_roundtrip_exempt_call(
+                    "grabowski_operation_run",
+                    policy_recovery_status,
+                )
+            )
+
         domain_reason_tool = types.SimpleNamespace(
             fn_metadata=types.SimpleNamespace(
                 arg_model=types.SimpleNamespace(model_fields={"reason": object()})

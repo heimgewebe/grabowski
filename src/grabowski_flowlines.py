@@ -496,9 +496,12 @@ def _endpoint_is_flowlines() -> bool:
 
 def _build_environment_tracer() -> tuple[Any | None, Any | None]:
     enabled = os.environ.get("GRABOWSKI_FLOWLINES_ENABLED", "").strip().lower()
+    # The Flowlines API key is server-only. Consume it before any later child
+    # process can inherit the operator's ambient environment; the exporter is
+    # constructed with an explicit headers mapping below.
+    headers = os.environ.pop("OTEL_EXPORTER_OTLP_HEADERS", "")
     if enabled not in {"1", "true", "yes", "on"}:
         return None, None
-    headers = os.environ.get("OTEL_EXPORTER_OTLP_HEADERS", "")
     api_key = _flowlines_api_key(headers)
     unsafe_overrides = _unsafe_flowlines_export_overrides()
     if api_key is None or not _endpoint_is_flowlines() or unsafe_overrides:
