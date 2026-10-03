@@ -89,6 +89,22 @@ class AgentInstructionsTests(unittest.TestCase):
             with self.subTest(profile=profile):
                 self.assertIn("report_outcome", profiles["profiles"][profile])
 
+    def test_direct_module_entrypoint_configures_flowlines_before_run(self) -> None:
+        source = (ROOT / "src/grabowski_mcp.py").read_text(encoding="utf-8")
+        marker = 'if __name__ == "__main__":'
+        self.assertEqual(source.count(marker), 1)
+        direct_entrypoint = source.split(marker, 1)[1]
+        configure = (
+            "grabowski_flowlines.configure_flowlines_observability"
+            "(mcp, READ_ANNOTATIONS)"
+        )
+        self.assertIn("import grabowski_flowlines", direct_entrypoint)
+        self.assertIn(configure, direct_entrypoint)
+        self.assertLess(
+            direct_entrypoint.index(configure),
+            direct_entrypoint.index("mcp.run()"),
+        )
+
     def test_rules_cover_routing_mutation_retry_and_authority_boundaries(self) -> None:
         rules = dict(grabowski_mcp.AGENT_INSTRUCTION_RULES)
         self.assertEqual(len(rules), len(grabowski_mcp.AGENT_INSTRUCTION_RULES))
