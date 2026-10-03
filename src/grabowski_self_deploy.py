@@ -4244,6 +4244,8 @@ def _reconcile_inflight_auto_deploy_source(
         metadata = operator._read_job_metadata(unit)
     except (OSError, PermissionError, ValueError):
         return None
+    if not isinstance(metadata, dict):
+        return None
     command = metadata.get("argv")
     fields = _deploy_command_fields(command)
     if (
@@ -4377,15 +4379,15 @@ def grabowski_runtime_deploy_schedule(
                 automatic_source_needed = False
                 effective_source_repository = None
                 effective_source_lease_owner_id = None
-        if automatic_source_needed:
-            inflight_before_materialization = inflight_runtime_job_evidence()
-            inflight_error = inflight_before_materialization.get("error")
+        if source_repository is None:
+            inflight_before_resolution = inflight_runtime_job_evidence()
+            inflight_error = inflight_before_resolution.get("error")
             if inflight_error:
                 raise RuntimeError(
                     "automatic deployment source preflight could not classify "
                     f"in-flight runtime jobs: {inflight_error}"
                 )
-            inflight_units = inflight_before_materialization.get("inflight_units")
+            inflight_units = inflight_before_resolution.get("inflight_units")
             if not isinstance(inflight_units, list):
                 raise RuntimeError(
                     "automatic deployment source preflight returned malformed in-flight runtime evidence"
@@ -4395,29 +4397,30 @@ def grabowski_runtime_deploy_schedule(
                     expected_head,
                     inflight_units,
                 )
-                if recovered_source is None:
+                if recovered_source is not None:
+                    (
+                        repository,
+                        runner,
+                        source_identity,
+                        recovered_owner_id,
+                    ) = recovered_source
+                    effective_source_repository = str(repository)
+                    effective_source_lease_owner_id = recovered_owner_id
+                    automatic_source_needed = False
+                elif automatic_source_needed:
                     raise RuntimeError(
                         "automatic deployment source refuses to materialize while a runtime job is already in flight: "
                         + ", ".join(str(unit) for unit in inflight_units)
                     )
-                (
-                    repository,
-                    runner,
-                    source_identity,
-                    recovered_owner_id,
-                ) = recovered_source
-                effective_source_repository = str(repository)
-                effective_source_lease_owner_id = recovered_owner_id
-                automatic_source_needed = False
-            if automatic_source_needed:
-                (
-                    repository,
-                    runner,
-                    source_identity,
-                    automatic_source,
-                ) = _materialize_auto_deploy_source(expected_head)
-                effective_source_repository = str(repository)
-                effective_source_lease_owner_id = automatic_source["owner_id"]
+        if automatic_source_needed:
+            (
+                repository,
+                runner,
+                source_identity,
+                automatic_source,
+            ) = _materialize_auto_deploy_source(expected_head)
+            effective_source_repository = str(repository)
+            effective_source_lease_owner_id = automatic_source["owner_id"]
         if repository is None or runner is None or source_identity is None:
             raise RuntimeError("deployment source resolution did not produce a bound source")
         try:

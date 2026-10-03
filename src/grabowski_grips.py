@@ -15644,35 +15644,21 @@ def _run_captain_runtime_deploy(
         )
         return execution_result
     execution_result["schedule"] = schedule
-    if preflight.get("resolution_mode") == "scheduler-auto-source":
-        try:
-            source_readback = _runtime_deploy_self_schedule_source_preflight(
-                schedule,
-                expected_head,
-            )
-        except (GripPreflightError, OSError, RuntimeError, ValueError) as exc:
-            message = (
-                "runtime deploy schedule source readback failed after scheduling: "
-                f"{exc}"
-            )
-            execution_result["post_verify_errors"] = [message]
-            execution_result["mutation_outcome_unknown"] = True
-            execution_result["local_mutation_outcome_unknown"] = True
-            execution_result["verification_error"] = message
-            return execution_result
-    else:
-        source_readback = {
-            key: preflight[key]
-            for key in (
-                "repository",
-                "runner",
-                "source_kind",
-                "source_identity_sha256",
-                "source_lease_resource_key",
-                "source_lease_metadata_sha256",
-            )
-            if key in preflight
-        }
+    try:
+        source_readback = _runtime_deploy_self_schedule_source_preflight(
+            schedule,
+            expected_head,
+        )
+    except (GripPreflightError, OSError, RuntimeError, ValueError) as exc:
+        message = (
+            "runtime deploy schedule source readback failed after scheduling: "
+            f"{exc}"
+        )
+        execution_result["post_verify_errors"] = [message]
+        execution_result["mutation_outcome_unknown"] = True
+        execution_result["local_mutation_outcome_unknown"] = True
+        execution_result["verification_error"] = message
+        return execution_result
     execution_result["source_readback"] = source_readback
     effective_delay = schedule.get("delay_seconds") if isinstance(schedule, dict) else None
     expected_schedule_hash = (

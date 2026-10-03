@@ -2829,7 +2829,7 @@ class SelfDeployToolTests(unittest.TestCase):
             "source_identity_sha256": identity["identity_sha256"],
         }
         materialize = Mock()
-        inflight = Mock()
+        inflight = Mock(return_value={"error": None, "inflight_units": []})
         with patch.object(SELF_DEPLOY, "CANONICAL_REPOSITORY", canonical), patch.object(
             SELF_DEPLOY,
             "_canonical_main_refresh_candidate",
@@ -2862,8 +2862,99 @@ class SelfDeployToolTests(unittest.TestCase):
         self.assertIsNone(result["automatic_source"])
         self.assertEqual(preflight.call_count, 3)
         materialize.assert_not_called()
-        inflight.assert_not_called()
+        inflight.assert_called_once_with()
         self.assertEqual(public_main.call_count, 2)
+
+    def test_schedule_reconciles_auto_source_after_canonical_converges(self) -> None:
+        canonical_state = tempfile.TemporaryDirectory()
+        self.addCleanup(canonical_state.cleanup)
+        canonical = Path(canonical_state.name).resolve()
+        expected = "d" * 40
+        generation = "abc123def456"
+        source = (
+            SELF_DEPLOY.AUTO_DEPLOY_SOURCE_ROOT
+            / f"{SELF_DEPLOY.AUTO_DEPLOY_SOURCE_PREFIX}-{expected[:12]}-{generation}"
+        )
+        runner = source / SELF_DEPLOY.RUNNER_RELATIVE_PATH
+        owner = f"runtime-deploy-source:{expected[:12]}:{generation}"
+        canonical_identity = _source_identity(canonical, expected, canonical=canonical)
+        detached_identity = _source_identity(
+            source,
+            expected,
+            kind="detached-worktree",
+            canonical=canonical,
+        )
+        existing = {
+            "unit": "grabowski-job-convergedauto",
+            "argv_sha256": "8" * 64,
+            "delay_seconds": 8,
+            "metadata_path": "/state/meta",
+            "stdout_path": "/state/out",
+            "stderr_path": "/state/err",
+            "final_status": "running",
+            "source_identity_sha256": detached_identity["identity_sha256"],
+        }
+        materialize = Mock()
+        with patch.object(
+            SELF_DEPLOY,
+            "CANONICAL_REPOSITORY",
+            canonical,
+        ), patch.object(
+            SELF_DEPLOY,
+            "_deployment_source_preflight",
+            side_effect=[
+                (
+                    canonical,
+                    canonical / SELF_DEPLOY.RUNNER_RELATIVE_PATH,
+                    canonical_identity,
+                ),
+                (source, runner, detached_identity),
+            ],
+        ) as preflight, patch.object(
+            SELF_DEPLOY,
+            "_materialize_auto_deploy_source",
+            materialize,
+        ), patch.object(
+            SELF_DEPLOY,
+            "_reconcile_inflight_auto_deploy_source",
+            return_value=(source, runner, detached_identity, owner),
+        ) as reconcile, patch.object(
+            SELF_DEPLOY,
+            "_fresh_public_github_main",
+            side_effect=[expected, expected],
+        ), patch.object(
+            SELF_DEPLOY,
+            "inflight_runtime_job_evidence",
+            return_value={
+                "error": None,
+                "inflight_units": [existing["unit"]],
+            },
+        ), patch.object(
+            SELF_DEPLOY,
+            "_matching_inflight_deploy_job",
+            return_value=existing,
+        ), patch.object(
+            SELF_DEPLOY,
+            "_deploy_schedule_lock",
+            return_value=nullcontext(),
+        ), patch.object(
+            SELF_DEPLOY,
+            "_append_deploy_audit",
+        ):
+            result = SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
+        self.assertTrue(result["already_scheduled"])
+        self.assertFalse(result["reused_across_source_identity"])
+        self.assertEqual(
+            result["source_identity_sha256"],
+            detached_identity["identity_sha256"],
+        )
+        self.assertIsNone(result["automatic_source"])
+        reconcile.assert_called_once_with(expected, [existing["unit"]])
+        materialize.assert_not_called()
+        self.assertEqual(
+            preflight.call_args_list[-1].args,
+            (expected, str(source), owner),
+        )
 
     def test_schedule_blocks_different_source_job_after_auto_materialization(self) -> None:
         canonical_state = tempfile.TemporaryDirectory()
