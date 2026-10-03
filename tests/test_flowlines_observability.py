@@ -198,6 +198,126 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         output = json.loads(attrs["gen_ai.tool.output_schema"])
         self.assertEqual(output, mcp._tool_manager.get_tool("echo").output_schema)
 
+    async def test_free_text_telemetry_scrubs_credential_patterns(self) -> None:
+        domain_value = "s" + "k-" + ("d" * 24)
+        bare_token = "syntheticBareToken123456"
+        bearer_token = "synthetic-bearer-token-value"
+        mcp = self.server()
+        result = await self.call(
+            mcp,
+            arguments={
+                "value": domain_value,
+                "reason": f"Rotate token {bare_token}",
+                "user_intent": f"Use Authorization: Bearer {bearer_token} safely",
+            },
+            meta=self.meta(),
+        )
+
+        self.assertFalse(result.root.isError)
+        self.assertEqual(result.root.structuredContent, {"value": domain_value})
+        attrs = self.exporter.get_finished_spans()[0].attributes
+        serialized = json.dumps(dict(attrs), sort_keys=True)
+        self.assertNotIn(domain_value, serialized)
+        self.assertNotIn(bare_token, serialized)
+        self.assertNotIn(bearer_token, serialized)
+        self.assertEqual(attrs["gen_ai.tool.call.reason"], "Rotate token <REDACTED>")
+        self.assertEqual(
+            attrs["session.user_intent"],
+            "Use Authorization: <REDACTED> safely",
+        )
+        public_arguments = json.loads(attrs["gen_ai.tool.call.arguments"])
+        self.assertEqual(public_arguments["reason"], "Rotate token <REDACTED>")
+        self.assertEqual(
+            public_arguments["user_intent"],
+            "Use Authorization: <REDACTED> safely",
+        )
+        self.assertEqual(public_arguments["value"], "<redacted>")
+
+    async def test_report_outcome_scrubs_sensitive_free_text_recursively(self) -> None:
+        provider_key = "s" + "k-ant-" + ("x" * 24)
+        password = "synthetic-password-value"
+        mcp = FastMCP("grabowski-test", instructions="fixture")
+        flowlines.configure_flowlines_observability(mcp, READ_ONLY, tracer=self.tracer)
+        await self.call(
+            mcp,
+            name="report_outcome",
+            arguments={
+                "reason": f"Record secret={provider_key}",
+                "user_intent": "Keep the outcome telemetry safe",
+                "status": "partial",
+                "outcome_summary": f"Credential {provider_key} was rotated.",
+                "unmet_needs": [f"Reset password={password}"],
+            },
+            meta=self.meta(),
+        )
+
+        attrs = self.exporter.get_finished_spans()[0].attributes
+        serialized = json.dumps(dict(attrs), sort_keys=True)
+        self.assertNotIn(provider_key, serialized)
+        self.assertNotIn(password, serialized)
+        public_arguments = json.loads(attrs["gen_ai.tool.call.arguments"])
+        self.assertEqual(
+            public_arguments["reason"],
+            "Record secret=<REDACTED>",
+        )
+        self.assertEqual(
+            public_arguments["user_intent"],
+            "Keep the outcome telemetry safe",
+        )
+        self.assertEqual(public_arguments["status"], "partial")
+        self.assertEqual(
+            public_arguments["outcome_summary"],
+            "Credential <REDACTED_ANTHROPIC_KEY> was rotated.",
+        )
+        self.assertEqual(
+            public_arguments["unmet_needs"],
+            ["Reset password=<REDACTED>"],
+        )
+
+    def test_established_secret_classes_are_scrubbed(self) -> None:
+        provider_key = "s" + "k-proj-" + ("A" * 24)
+        aws_access_key = "AKIA" + ("B" * 16)
+        private_key = (
+            "-----BEGIN PRIVATE KEY-----\n"
+            "synthetic-private-material\n"
+            "-----END PRIVATE KEY-----"
+        )
+        cases = [
+            (f"provider {provider_key}", provider_key),
+            (f"aws {aws_access_key}", aws_access_key),
+            (private_key, "synthetic-private-material"),
+            (
+                "AWS_SECRET_ACCESS_KEY=synthetic-aws-secret-value",
+                "synthetic-aws-secret-value",
+            ),
+            (
+                "client-key-data: synthetic-client-key-data-value",
+                "synthetic-client-key-data-value",
+            ),
+            ("Reset password=short", "short"),
+            ("Use credential: abc123", "abc123"),
+        ]
+        for value, secret in cases:
+            with self.subTest(value=value.splitlines()[0][:48]):
+                redacted = flowlines._redact_sensitive_text(value)
+                self.assertNotIn(secret, redacted)
+                self.assertIn("<REDACTED", redacted)
+
+    def test_benign_analytics_text_is_preserved(self) -> None:
+        samples = [
+            "Verify Flowlines instrumentation",
+            "Rotate credentials without exposing repository context",
+            "Use token bucket metadata for rate-limit analysis",
+            "Review token authentication requirements",
+            "Review secret authentication requirements",
+            "Review password authentication requirements",
+            "Inspect credential requirements for the operator",
+            "Record the partial outcome and remaining operator gate",
+        ]
+        for sample in samples:
+            with self.subTest(sample=sample):
+                self.assertEqual(flowlines._redact_sensitive_text(sample), sample)
+
     async def test_export_disabled_keeps_legacy_calls_compatible(self) -> None:
         mcp = FastMCP("grabowski-test", instructions="fixture")
 
