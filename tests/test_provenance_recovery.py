@@ -402,6 +402,41 @@ class VolatileGateRecheckTests(unittest.TestCase):
             "provenance-recovery-aborted-before-dispatch",
         )
 
+    def test_repair_denial_preserves_stale_pending_reconciliation(self) -> None:
+        reconciliation = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-stale000001",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 1,
+            "evidence_sha256": "a" * 64,
+        }
+        raised, start_job, audit = self._repair_with_recheck(
+            {
+                "reasons": ["kill_switch_clear"],
+                "checks": {"kill_switch_clear": False},
+                "competing_deployment": {
+                    "stale_pending_reconciliation": reconciliation,
+                },
+            }
+        )
+
+        self.assertIsNotNone(raised)
+        assert raised is not None
+        self.assertEqual(
+            raised.evidence["recheck"]["competing_deployment"][
+                "stale_pending_reconciliation"
+            ],
+            reconciliation,
+        )
+        start_job.assert_not_called()
+        self.assertEqual(
+            audit.call_args[0][0]["stale_pending_reconciliation"],
+            reconciliation,
+        )
+
     def test_competing_deployment_appearing_late_aborts_dispatch(self) -> None:
         raised, start_job, _audit = self._repair_with_recheck(
             {"reasons": ["no_competing_deployment"], "checks": {}}
@@ -1123,6 +1158,97 @@ class MidCutoverCompletionWarrantTests(unittest.TestCase):
                     result["source_identity_sha256"], source_identity["identity_sha256"]
                 )
 
+    def test_midcutover_resume_denial_preserves_stale_pending_reconciliation(self) -> None:
+        binding = {
+            "cutover_id": "bgc-stale-pending",
+            "resumed_receipt_sha256": "cd" * 32,
+            "binding_sha256": "ab" * 32,
+            "resume_phase": provenance_recovery.midcutover.PHASE_CLOSEOUT,
+        }
+        lane = {
+            "lane": provenance_recovery.midcutover.LANE_MID_CUTOVER_RESUME,
+            "resume_binding": binding,
+            "classification_sha256": "ef" * 32,
+            "reasons": [],
+        }
+        gate = {
+            "allowed": True,
+            "reasons": [],
+            "resume_binding": binding,
+            "recovery_lane": lane,
+        }
+        source_identity = {
+            **_source_identity(ROOT),
+            "identity_sha256": "12" * 32,
+        }
+        reconciliation = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-stale000001",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 1,
+            "evidence_sha256": "a" * 64,
+        }
+        volatile = {
+            "reasons": ["kill_switch_clear"],
+            "checks": {"kill_switch_clear": False},
+            "competing_deployment": {
+                "stale_pending_reconciliation": reconciliation,
+            },
+        }
+        with (
+            patch.object(provenance_recovery, "evaluate_resume_gate", return_value=gate),
+            patch.object(provenance_recovery.base, "_require_valid_audit_chain"),
+            patch.object(
+                provenance_recovery,
+                "_resume_source_preflight",
+                return_value=(
+                    ROOT,
+                    ROOT / provenance_recovery.MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH,
+                    source_identity,
+                ),
+            ),
+            patch.object(
+                provenance_recovery.self_deploy,
+                "_midcutover_resume_command",
+                return_value=["python3"],
+            ),
+            patch.object(
+                provenance_recovery,
+                "_volatile_gate_recheck",
+                return_value=volatile,
+            ),
+            patch.object(
+                provenance_recovery.base,
+                "_append_audit_with_digest",
+                return_value="de" * 32,
+            ),
+            patch.object(provenance_recovery.base, "_append_audit") as audit,
+            patch.object(provenance_recovery.operator, "_start_job") as start_job,
+        ):
+            with self.assertRaises(
+                provenance_recovery.ProvenanceRecoveryDenied
+            ) as raised:
+                provenance_recovery._resume_under_schedule_lock(HEAD)
+
+        self.assertEqual(
+            raised.exception.evidence["recheck"]["competing_deployment"][
+                "stale_pending_reconciliation"
+            ],
+            reconciliation,
+        )
+        start_job.assert_not_called()
+        self.assertEqual(
+            audit.call_args[0][0]["operation"],
+            "midcutover-resume-aborted-before-dispatch",
+        )
+        self.assertEqual(
+            audit.call_args[0][0]["stale_pending_reconciliation"],
+            reconciliation,
+        )
+
     def test_midcutover_resume_rejects_source_drift_before_dispatch(self) -> None:
         binding = {
             "cutover_id": "bgc-source-drift",
@@ -1284,6 +1410,61 @@ class IndexedInflightJobEvidenceGateTests(unittest.TestCase):
             evidence["inflight_deploy_jobs"], ["grabowski-job-444444444444"]
         )
         self.assertIsNone(evidence["idempotent_match"])
+
+    def test_gate_preserves_stale_pending_reconciliation_evidence(self) -> None:
+        reconciliation = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-stale000001",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 1,
+            "evidence_sha256": "a" * 64,
+        }
+        with patch.object(
+            provenance_recovery.self_deploy,
+            "inflight_runtime_job_evidence",
+            return_value={
+                "inflight_units": [],
+                "blocking_units": [],
+                "idempotent_match": None,
+                "pruned_units": [],
+                "stale_pending_reconciliation": reconciliation,
+                "error": None,
+            },
+            create=True,
+        ):
+            evidence = provenance_recovery._competing_deployment_evidence(
+                ["argv"], reconcile_stale_pending=True
+            )
+        self.assertEqual(
+            evidence["stale_pending_reconciliation"],
+            reconciliation,
+        )
+
+    def test_volatile_recheck_requests_lock_bound_stale_pending_reconciliation(self) -> None:
+        projection = {
+            "deploy_lock_free": True,
+            "inflight_deploy_jobs": [],
+            "idempotent_match": None,
+            "pruned_units": [],
+            "error": None,
+        }
+        with patch.object(
+            provenance_recovery.base, "_kill_switch_state", return_value={"engaged": False}
+        ), patch.object(
+            provenance_recovery,
+            "_blockade_evidence",
+            return_value={"allows_mutation": True, "error": None},
+        ), patch.object(
+            provenance_recovery, "_competing_deployment_evidence", return_value=projection
+        ) as competing:
+            result = provenance_recovery._volatile_gate_recheck(ROOT, ["argv"])
+        self.assertEqual(result["reasons"], [])
+        competing.assert_called_once_with(
+            ["argv"], prune=True, reconcile_stale_pending=True
+        )
 
     def test_identical_running_intent_is_reported_as_idempotent(self) -> None:
         match = {"unit": "grabowski-job-555555555555", "kind": "deploy"}

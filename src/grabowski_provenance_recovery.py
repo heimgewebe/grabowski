@@ -337,7 +337,10 @@ def _target_contract_evidence(repository: Path, expected_head: str) -> dict[str,
 
 
 def _competing_deployment_evidence(
-    command: list[str] | None = None, *, prune: bool = False
+    command: list[str] | None = None,
+    *,
+    prune: bool = False,
+    reconcile_stale_pending: bool = False,
 ) -> dict[str, Any]:
     """Detect an in-flight deployment that this lane must not race.
 
@@ -355,6 +358,7 @@ def _competing_deployment_evidence(
         "inflight_deploy_jobs": [],
         "idempotent_match": None,
         "pruned_units": [],
+        "stale_pending_reconciliation": None,
         "error": None,
     }
     lock_path = Path.home() / ".local/state/grabowski/deploy.lock"
@@ -373,11 +377,18 @@ def _competing_deployment_evidence(
             evidence["error"] = f"deploy lock is unreadable: {exc}"
             return evidence
 
-    indexed = self_deploy.inflight_runtime_job_evidence(command, prune=prune)
+    indexed = self_deploy.inflight_runtime_job_evidence(
+        command,
+        prune=prune,
+        reconcile_stale_pending=reconcile_stale_pending,
+    )
     evidence["inflight_deploy_jobs"] = list(indexed["blocking_units"])
     evidence["inflight_units"] = list(indexed["inflight_units"])
     evidence["idempotent_match"] = indexed["idempotent_match"]
     evidence["pruned_units"] = list(indexed["pruned_units"])
+    evidence["stale_pending_reconciliation"] = indexed.get(
+        "stale_pending_reconciliation"
+    )
     if indexed["error"] is not None:
         evidence["error"] = indexed["error"]
     return evidence
@@ -415,7 +426,9 @@ def _volatile_gate_recheck(
     # Carries the exact argv: the recheck runs under the schedule lock, which is
     # where an identical intent that started meanwhile must be recognised as
     # ours rather than dispatched a second time.
-    competing = _competing_deployment_evidence(command, prune=True)
+    competing = _competing_deployment_evidence(
+        command, prune=True, reconcile_stale_pending=True
+    )
     checks = {
         "kill_switch_clear": not bool(kill_switch.get("engaged")),
         "no_blocking_operator_blockade": bool(blockade["allows_mutation"]),
@@ -1042,6 +1055,11 @@ def _resume_under_schedule_lock(
                 "expected_head": expected_head,
                 "reasons": volatile["reasons"],
                 "intent_sha256": intent_sha256,
+                "stale_pending_reconciliation": (
+                    (volatile.get("competing_deployment") or {}).get(
+                        "stale_pending_reconciliation"
+                    )
+                ),
             }
         )
         raise ProvenanceRecoveryDenied(
@@ -1258,6 +1276,11 @@ def _repair_under_schedule_lock(
                 "expected_head": expected_head,
                 "reasons": volatile["reasons"],
                 "intent_sha256": intent_sha256,
+                "stale_pending_reconciliation": (
+                    (volatile.get("competing_deployment") or {}).get(
+                        "stale_pending_reconciliation"
+                    )
+                ),
             }
         )
         raise ProvenanceRecoveryDenied(volatile["reasons"], {**gate, "recheck": volatile})
