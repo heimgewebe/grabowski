@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 from pathlib import Path
 import sys
@@ -193,7 +194,7 @@ class PostHogMCPAnalyticsTests(unittest.TestCase):
             self.assertFalse(self.operator._configure_posthog_mcp_analytics())
         self.assertIsNone(self.operator._POSTHOG_MCP_CLIENT)
 
-    def test_main_instruments_posthog_before_http_runtime_build(self) -> None:
+    def test_main_installs_gate_before_posthog_and_builds_http_afterward(self) -> None:
         calls: list[str] = []
         args = types.SimpleNamespace(
             transport="streamable-http",
@@ -209,8 +210,15 @@ class PostHogMCPAnalyticsTests(unittest.TestCase):
             ),
             patch.object(
                 self.operator,
+                "_install_deployment_admission_gate",
+                side_effect=lambda: calls.append("gate"),
+            ),
+            patch.object(
+                self.operator,
                 "_configure_http_runtime",
-                side_effect=lambda: calls.append("http"),
+                side_effect=lambda **kwargs: calls.append(
+                    f"http:{kwargs.get('admission_gate_preinstalled')}"
+                ),
             ),
             patch.object(
                 self.operator,
@@ -232,8 +240,70 @@ class PostHogMCPAnalyticsTests(unittest.TestCase):
             self.operator.main()
         self.assertEqual(
             calls,
-            ["faulthandler", "posthog", "http", "run", "shutdown"],
+            [
+                "faulthandler",
+                "gate",
+                "posthog",
+                "http:True",
+                "run",
+                "shutdown",
+            ],
         )
+
+    def test_main_keeps_loop_bound_analytics_wrapper_off_sync_worker_loops(self) -> None:
+        args = types.SimpleNamespace(
+            transport="streamable-http",
+            host="127.0.0.1",
+            port=18181,
+        )
+        analytics_lock = asyncio.Lock()
+
+        def install_posthog_like_wrapper() -> bool:
+            original = self.operator.mcp._tool_manager.call_tool
+
+            async def wrapped(*call_args, **call_kwargs):
+                async with analytics_lock:
+                    # Force overlap so the historical ordering would move one
+                    # shared loop-bound lock into multiple asyncio.run() workers.
+                    await asyncio.sleep(0.05)
+                    return await original(*call_args, **call_kwargs)
+
+            self.operator.mcp._tool_manager.call_tool = wrapped
+            return True
+
+        def exercise_http_transport(**_kwargs) -> None:
+            async def run_calls() -> None:
+                await asyncio.gather(
+                    *(
+                        self.operator.mcp._tool_manager.call_tool(
+                            "read", {}, context=None
+                        )
+                        for _ in range(3)
+                    )
+                )
+
+            asyncio.run(run_calls())
+
+        with (
+            patch.object(self.operator, "_parse_args", return_value=args),
+            patch.object(self.operator, "_configure_faulthandler"),
+            patch.object(
+                self.operator,
+                "_configure_posthog_mcp_analytics",
+                side_effect=install_posthog_like_wrapper,
+            ),
+            patch.object(
+                self.operator,
+                "_shutdown_posthog_mcp_analytics",
+            ),
+            patch.object(
+                self.operator.mcp,
+                "run",
+                create=True,
+                side_effect=exercise_http_transport,
+            ),
+        ):
+            self.operator.main()
 
     def test_http_runtime_failure_still_shuts_down_posthog(self) -> None:
         calls: list[str] = []
@@ -247,14 +317,21 @@ class PostHogMCPAnalyticsTests(unittest.TestCase):
             patch.object(self.operator, "_configure_faulthandler"),
             patch.object(
                 self.operator,
+                "_install_deployment_admission_gate",
+                side_effect=lambda: calls.append("gate"),
+            ),
+            patch.object(
+                self.operator,
                 "_configure_posthog_mcp_analytics",
                 side_effect=lambda: calls.append("posthog"),
             ),
             patch.object(
                 self.operator,
                 "_configure_http_runtime",
-                side_effect=lambda: (
-                    calls.append("http"),
+                side_effect=lambda **kwargs: (
+                    calls.append(
+                        f"http:{kwargs.get('admission_gate_preinstalled')}"
+                    ),
                     (_ for _ in ()).throw(RuntimeError("http setup failed")),
                 )[-1],
             ),
@@ -272,7 +349,33 @@ class PostHogMCPAnalyticsTests(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "http setup failed"),
         ):
             self.operator.main()
-        self.assertEqual(calls, ["posthog", "http", "shutdown"])
+        self.assertEqual(
+            calls, ["gate", "posthog", "http:True", "shutdown"]
+        )
+
+    def test_http_runtime_preserves_preinstalled_gate_inside_later_wrapper(self) -> None:
+        self.operator._install_deployment_admission_gate()
+        gate = self.operator.mcp._tool_manager.call_tool
+
+        async def later_wrapper(*args, **kwargs):
+            return await gate(*args, **kwargs)
+
+        self.operator.mcp._tool_manager.call_tool = later_wrapper
+        self.operator._configure_http_runtime(admission_gate_preinstalled=True)
+        self.assertIs(self.operator.mcp._tool_manager.call_tool, later_wrapper)
+
+    def test_http_runtime_requires_claimed_preinstalled_gate(self) -> None:
+        with patch.object(
+            self.operator,
+            "_DEPLOYMENT_ADMISSION_GATE_INSTALLED",
+            False,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "deployment admission gate was not preinstalled"
+            ):
+                self.operator._configure_http_runtime(
+                    admission_gate_preinstalled=True
+                )
 
     def test_enabled_configuration_disables_schema_and_payload_capture(self) -> None:
         calls: dict[str, object] = {}

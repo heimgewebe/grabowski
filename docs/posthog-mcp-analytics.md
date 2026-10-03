@@ -69,12 +69,19 @@ valid token is the opt-in signal.
 
 ## Runtime ordering
 
-PostHog instrumentation is installed before Grabowski builds the Streamable HTTP
-application. The HTTP runtime setup then installs Grabowski's deployment and
-authority gate around the instrumented tool-call boundary. Reversing this order
-would leave an already-built HTTP application without PostHog's stateless MCP
-middleware and would let the SDK replace the previously installed outer
-Grabowski call boundary.
+Grabowski installs its deployment and authority gate on the FastMCP tool manager
+before PostHog instruments that manager. PostHog therefore remains on the stable
+HTTP event loop while the gate can continue to move synchronous tool execution
+into Grabowski's bounded worker pool. This ordering is required because the
+PostHog MCP SDK keeps server-wide asyncio synchronization state; moving the
+instrumented wrapper into Grabowski's short-lived `asyncio.run()` worker loops
+would make that state cross event-loop boundaries.
+
+The Streamable HTTP application is still built only after PostHog
+instrumentation. That preserves PostHog's stateless MCP middleware attachment.
+The resulting call path is PostHog wrapper -> Grabowski authority/execution gate
+-> FastMCP base tool call; authorization and effect gates still run before the
+tool body.
 
 ## Verification
 
