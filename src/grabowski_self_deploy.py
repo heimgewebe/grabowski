@@ -4419,6 +4419,50 @@ def grabowski_runtime_deploy_schedule(
                 source_repository,
                 source_lease_owner_id,
             )
+
+        # Classify every pending/running deployment before any shared-ref refresh.
+        # The schedule lock prevents a cooperating scheduler from entering after
+        # this snapshot; stale pre-dispatch reservations are reconciled here for
+        # both automatic and explicitly bound sources.
+        inflight_before_resolution = inflight_runtime_job_evidence(
+            reconcile_stale_pending=True
+        )
+        inflight_error = inflight_before_resolution.get("error")
+        if inflight_error:
+            raise RuntimeError(
+                "deployment source preflight could not classify in-flight runtime jobs: "
+                f"{inflight_error}"
+            )
+        inflight_units = inflight_before_resolution.get("inflight_units")
+        if not isinstance(inflight_units, list):
+            raise RuntimeError(
+                "deployment source preflight returned malformed in-flight runtime evidence"
+            )
+        if source_repository is None and inflight_units:
+            recovered_source = _reconcile_inflight_auto_deploy_source(
+                expected_head,
+                inflight_units,
+            )
+            if recovered_source is not None:
+                (
+                    repository,
+                    runner,
+                    source_identity,
+                    recovered_owner_id,
+                ) = recovered_source
+                effective_source_repository = str(repository)
+                effective_source_lease_owner_id = recovered_owner_id
+                automatic_source_needed = False
+                # Reusing the already scheduled detached source must not mutate
+                # Git-common refs underneath that running deployment.
+                canonical_refresh_snapshot = None
+            elif canonical_refresh_snapshot is not None or automatic_source_needed:
+                raise RuntimeError(
+                    "automatic deployment source refuses to refresh or materialize while "
+                    "a runtime job is already in flight: "
+                    + ", ".join(str(unit) for unit in inflight_units)
+                )
+
         if canonical_refresh_snapshot is not None:
             origin_main_refresh = _refresh_canonical_origin_main(
                 expected_head, canonical_refresh_snapshot
@@ -4462,41 +4506,6 @@ def grabowski_runtime_deploy_schedule(
                 automatic_source_needed = False
                 effective_source_repository = None
                 effective_source_lease_owner_id = None
-        if source_repository is None:
-            inflight_before_resolution = inflight_runtime_job_evidence(
-                reconcile_stale_pending=True
-            )
-            inflight_error = inflight_before_resolution.get("error")
-            if inflight_error:
-                raise RuntimeError(
-                    "automatic deployment source preflight could not classify "
-                    f"in-flight runtime jobs: {inflight_error}"
-                )
-            inflight_units = inflight_before_resolution.get("inflight_units")
-            if not isinstance(inflight_units, list):
-                raise RuntimeError(
-                    "automatic deployment source preflight returned malformed in-flight runtime evidence"
-                )
-            if inflight_units:
-                recovered_source = _reconcile_inflight_auto_deploy_source(
-                    expected_head,
-                    inflight_units,
-                )
-                if recovered_source is not None:
-                    (
-                        repository,
-                        runner,
-                        source_identity,
-                        recovered_owner_id,
-                    ) = recovered_source
-                    effective_source_repository = str(repository)
-                    effective_source_lease_owner_id = recovered_owner_id
-                    automatic_source_needed = False
-                elif automatic_source_needed:
-                    raise RuntimeError(
-                        "automatic deployment source refuses to materialize while a runtime job is already in flight: "
-                        + ", ".join(str(unit) for unit in inflight_units)
-                    )
         if automatic_source_needed:
             (
                 repository,

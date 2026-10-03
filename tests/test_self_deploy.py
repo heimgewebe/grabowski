@@ -1706,6 +1706,49 @@ class SelfDeployToolTests(unittest.TestCase):
         self.assertTrue(result["already_scheduled"])
         self.assertEqual(result["automatic_source"], materialization)
 
+    def test_schedule_blocks_inflight_job_before_shared_origin_refresh(self) -> None:
+        canonical_state = tempfile.TemporaryDirectory()
+        self.addCleanup(canonical_state.cleanup)
+        canonical = Path(canonical_state.name).resolve()
+        expected = "d" * 40
+        unit = "grabowski-job-oldhead0001"
+        refresh_candidate = {
+            "canonical_repository": str(canonical),
+            "current_head": "a" * 40,
+            "current_branch": "feature/active",
+            "origin_main": "b" * 40,
+        }
+        refresh = Mock()
+        authority = Mock(return_value={"success": True, "outcome": "refreshed"})
+        with patch.object(SELF_DEPLOY, "CANONICAL_REPOSITORY", canonical), patch.object(
+            SELF_DEPLOY, "_deployment_source_preflight", side_effect=RuntimeError("origin/main drift")
+        ), patch.object(
+            SELF_DEPLOY, "_canonical_stale_main_snapshot", side_effect=RuntimeError("origin/main drift")
+        ), patch.object(
+            SELF_DEPLOY, "_canonical_main_refresh_candidate", return_value=refresh_candidate
+        ), patch.object(
+            SELF_DEPLOY, "_fresh_public_github_main", return_value=expected
+        ), patch.object(
+            SELF_DEPLOY,
+            "inflight_runtime_job_evidence",
+            return_value={"error": None, "inflight_units": [unit]},
+        ) as inflight, patch.object(
+            SELF_DEPLOY, "_reconcile_inflight_auto_deploy_source", return_value=None
+        ) as reconcile, patch.object(
+            SELF_DEPLOY, "_refresh_canonical_origin_main", refresh
+        ), patch.object(
+            SELF_DEPLOY.privileged, "ensure_rootbroker_authority", authority
+        ), patch.object(
+            SELF_DEPLOY, "_deploy_schedule_lock", return_value=nullcontext()
+        ):
+            with self.assertRaisesRegex(RuntimeError, "already in flight"):
+                SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
+        inflight.assert_called_once_with(reconcile_stale_pending=True)
+        reconcile.assert_called_once_with(expected, [unit])
+        refresh.assert_not_called()
+        authority.assert_not_called()
+        SELF_DEPLOY.operator._start_job.assert_not_called()
+
     def test_auto_deploy_source_plan_uses_fresh_generation_for_same_head(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -2783,7 +2826,6 @@ class SelfDeployToolTests(unittest.TestCase):
             "_deployment_source_preflight",
             side_effect=[
                 RuntimeError("HEAD drift"),
-                RuntimeError("HEAD drift"),
                 (source, runner, identity),
             ],
         ) as preflight, patch.object(
@@ -3406,6 +3448,10 @@ class SelfDeployToolTests(unittest.TestCase):
             SELF_DEPLOY,
             "_deploy_schedule_lock",
             return_value=nullcontext(),
+        ), patch.object(
+            SELF_DEPLOY,
+            "inflight_runtime_job_evidence",
+            return_value={"error": None, "inflight_units": []},
         ), patch.object(
             SELF_DEPLOY.privileged,
             "ensure_rootbroker_authority",
@@ -4145,6 +4191,10 @@ class SelfDeployToolTests(unittest.TestCase):
             "_fresh_public_github_main",
             side_effect=[expected, "e" * 40],
         ), patch.object(
+            SELF_DEPLOY,
+            "inflight_runtime_job_evidence",
+            return_value={"error": None, "inflight_units": []},
+        ), patch.object(
             SELF_DEPLOY.privileged,
             "ensure_rootbroker_authority",
             return_value={
@@ -4171,6 +4221,10 @@ class SelfDeployToolTests(unittest.TestCase):
             return_value=(repo, runner, identity),
         ), patch.object(
             SELF_DEPLOY, "_deploy_schedule_lock", return_value=nullcontext()
+        ), patch.object(
+            SELF_DEPLOY,
+            "inflight_runtime_job_evidence",
+            return_value={"error": None, "inflight_units": []},
         ), patch.object(
             SELF_DEPLOY.privileged,
             "ensure_rootbroker_authority",
@@ -4311,6 +4365,7 @@ class SelfDeployToolTests(unittest.TestCase):
             "final_status": "running",
             "source_identity_sha256": "1" * 64,
         }
+        inflight = Mock(return_value={"error": None, "inflight_units": []})
         with patch.object(
             SELF_DEPLOY,
             "_deployment_source_preflight",
@@ -4321,6 +4376,8 @@ class SelfDeployToolTests(unittest.TestCase):
             ),
         ), patch.object(
             SELF_DEPLOY, "_deploy_schedule_lock", return_value=nullcontext()
+        ), patch.object(
+            SELF_DEPLOY, "inflight_runtime_job_evidence", inflight
         ), patch.object(
             SELF_DEPLOY, "_matching_inflight_deploy_job", return_value=existing
         ), patch.object(SELF_DEPLOY.base, "_append_audit") as audit:
@@ -4337,6 +4394,7 @@ class SelfDeployToolTests(unittest.TestCase):
         )
         self.assertEqual("1" * 64, result["effective_source_identity_sha256"])
         self.assertTrue(result["reused_across_source_identity"])
+        inflight.assert_called_once_with(reconcile_stale_pending=True)
         observed = audit.call_args.args[0]
         self.assertEqual("1" * 64, observed["effective_source_identity_sha256"])
         self.assertTrue(observed["reused_across_source_identity"])
