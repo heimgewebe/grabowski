@@ -486,7 +486,9 @@ class SelfDeployToolTests(unittest.TestCase):
             with patch.object(
                 SELF_DEPLOY.operator, "_unit_dispatch_readback", return_value=readback
             ) as dispatch, patch.object(SELF_DEPLOY, "_append_deploy_audit") as audit:
-                index = SELF_DEPLOY._reconcile_stale_pending_reservation(jobs)
+                index, reconciliation = SELF_DEPLOY._reconcile_stale_pending_reservation(
+                    jobs
+                )
             self.assertIsNone(index["pending_unit"])
             self.assertEqual(index["units"], [])
             dispatch.assert_called_once_with(unit)
@@ -494,6 +496,17 @@ class SelfDeployToolTests(unittest.TestCase):
                 audit.call_args.args[0]["operation"],
                 "runtime-deploy-stale-pending-cleared",
             )
+            self.assertIsNotNone(reconciliation)
+            assert reconciliation is not None
+            self.assertEqual(
+                reconciliation["kind"],
+                "grabowski_runtime_deploy_stale_pending_reconciliation",
+            )
+            self.assertEqual(reconciliation["unit"], unit)
+            self.assertEqual(reconciliation["dispatch_outcome"], "not_started")
+            self.assertTrue(reconciliation["deploy_index_updated"])
+            self.assertTrue(reconciliation["audit_recorded"])
+            self.assertRegex(reconciliation["evidence_sha256"], r"^[0-9a-f]{64}$")
 
     def test_stale_pending_reservation_preserves_ambiguous_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -506,8 +519,11 @@ class SelfDeployToolTests(unittest.TestCase):
                 "_unit_dispatch_readback",
                 return_value={"query_valid": False, "outcome": "outcome_unknown"},
             ), patch.object(SELF_DEPLOY, "_append_deploy_audit") as audit:
-                index = SELF_DEPLOY._reconcile_stale_pending_reservation(jobs)
+                index, reconciliation = SELF_DEPLOY._reconcile_stale_pending_reservation(
+                    jobs
+                )
             self.assertEqual(index["pending_unit"], unit)
+            self.assertIsNone(reconciliation)
             audit.assert_not_called()
 
     def test_pending_deploy_index_unit_is_recovered_from_exact_directory(self) -> None:
@@ -1142,6 +1158,84 @@ class SelfDeployToolTests(unittest.TestCase):
         self.assertEqual(result["resolution_mode"], "scheduler-auto-source")
         self.assertTrue(result["origin_main_refresh_required"])
         self.assertIsNone(result["source_identity_sha256"])
+
+    def test_schedule_preflight_refresh_only_does_not_require_auto_source_root(self) -> None:
+        expected = "d" * 40
+        canonical_state = {
+            "canonical_repository": "/home/alex/repos/grabowski",
+            "current_head": expected,
+            "current_branch": "main",
+            "target_head": expected,
+            "origin_main": "c" * 40,
+            "clean": True,
+            "shallow": False,
+            "lease_evidence": {
+                "resource_key": "path:/home/alex/repos/grabowski",
+                "lease": None,
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            missing_root = Path(temporary).resolve() / "missing"
+            with patch.object(
+                SELF_DEPLOY, "_fresh_public_github_main", return_value=expected
+            ), patch.object(
+                SELF_DEPLOY,
+                "_deployment_source_preflight",
+                side_effect=RuntimeError("origin/main drift"),
+            ), patch.object(
+                SELF_DEPLOY,
+                "_canonical_main_refresh_candidate",
+                return_value=canonical_state,
+            ), patch.object(
+                SELF_DEPLOY, "AUTO_DEPLOY_SOURCE_ROOT", missing_root
+            ):
+                result = SELF_DEPLOY._deployment_schedule_preflight(
+                    expected, None, None
+                )
+        self.assertTrue(result["ready"])
+        self.assertTrue(result["origin_main_refresh_required"])
+        self.assertEqual(result["canonical_state"]["current_head"], expected)
+        self.assertIsNone(result["source_identity_sha256"])
+
+    def test_schedule_preflight_materialization_still_requires_auto_source_root(self) -> None:
+        expected = "d" * 40
+        canonical_state = {
+            "canonical_repository": "/home/alex/repos/grabowski",
+            "current_head": expected,
+            "current_branch": "feature/active-work",
+            "target_head": expected,
+            "origin_main": "c" * 40,
+            "clean": True,
+            "shallow": False,
+            "lease_evidence": {
+                "resource_key": "path:/home/alex/repos/grabowski",
+                "lease": None,
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            missing_root = Path(temporary).resolve() / "missing"
+            with patch.object(
+                SELF_DEPLOY, "_fresh_public_github_main", return_value=expected
+            ), patch.object(
+                SELF_DEPLOY,
+                "_deployment_source_preflight",
+                side_effect=RuntimeError("HEAD drift"),
+            ), patch.object(
+                SELF_DEPLOY,
+                "_canonical_main_refresh_candidate",
+                return_value=canonical_state,
+            ), patch.object(
+                SELF_DEPLOY, "AUTO_DEPLOY_SOURCE_ROOT", missing_root
+            ):
+                with self.assertRaisesRegex(RuntimeError, "HEAD drift") as blocked:
+                    SELF_DEPLOY._deployment_schedule_preflight(
+                        expected, None, None
+                    )
+        self.assertIsNotNone(blocked.exception.__cause__)
+        self.assertIn(
+            "automatic deployment source root is unavailable",
+            str(blocked.exception.__cause__),
+        )
 
     def test_schedule_preflight_rejects_divergent_canonical_main(self) -> None:
         expected = "d" * 40
@@ -1880,6 +1974,68 @@ class SelfDeployToolTests(unittest.TestCase):
         reconcile.assert_called_once_with(expected, [unit])
         refresh.assert_not_called()
         authority.assert_not_called()
+        SELF_DEPLOY.operator._start_job.assert_not_called()
+
+    def test_schedule_pre_effect_refusal_preserves_stale_pending_reconciliation(self) -> None:
+        canonical_state = tempfile.TemporaryDirectory()
+        self.addCleanup(canonical_state.cleanup)
+        canonical = Path(canonical_state.name).resolve()
+        expected = "d" * 40
+        reconciliation = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-stale000001",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 1,
+            "evidence_sha256": "a" * 64,
+        }
+        refresh_candidate = {
+            "canonical_repository": str(canonical),
+            "current_head": expected,
+            "current_branch": "main",
+            "origin_main": "c" * 40,
+        }
+        with patch.object(SELF_DEPLOY, "CANONICAL_REPOSITORY", canonical), patch.object(
+            SELF_DEPLOY,
+            "_deployment_source_preflight",
+            side_effect=RuntimeError("origin/main drift"),
+        ), patch.object(
+            SELF_DEPLOY,
+            "_canonical_stale_main_snapshot",
+            side_effect=RuntimeError("origin/main drift"),
+        ), patch.object(
+            SELF_DEPLOY,
+            "_canonical_main_refresh_candidate",
+            return_value=refresh_candidate,
+        ), patch.object(
+            SELF_DEPLOY, "_fresh_public_github_main", return_value=expected
+        ), patch.object(
+            SELF_DEPLOY,
+            "inflight_runtime_job_evidence",
+            return_value={
+                "error": None,
+                "inflight_units": [],
+                "stale_pending_reconciliation": reconciliation,
+            },
+        ), patch.object(
+            SELF_DEPLOY,
+            "_refresh_canonical_origin_main",
+            side_effect=SELF_DEPLOY.DeploySchedulePreEffectRefusal(
+                "canonical path busy"
+            ),
+        ), patch.object(
+            SELF_DEPLOY,
+            "_deploy_schedule_lock",
+            return_value=nullcontext(),
+        ):
+            with self.assertRaises(SELF_DEPLOY.DeploySchedulePreEffectRefusal) as blocked:
+                SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
+        self.assertEqual(
+            blocked.exception.local_mutation_evidence,
+            reconciliation,
+        )
         SELF_DEPLOY.operator._start_job.assert_not_called()
 
     def test_auto_deploy_source_plan_uses_fresh_generation_for_same_head(self) -> None:

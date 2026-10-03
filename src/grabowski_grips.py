@@ -3891,6 +3891,19 @@ def _runtime_deploy_self_preflight(
 class RuntimeDeployPreEffectRefusal(RuntimeError):
     """The scheduler proved that no deploy registration effect began."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        local_mutation_evidence: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.local_mutation_evidence = (
+            None
+            if local_mutation_evidence is None
+            else dict(local_mutation_evidence)
+        )
+
 
 def _runtime_deploy_self_schedule(
     expected_head: str,
@@ -3908,7 +3921,12 @@ def _runtime_deploy_self_schedule(
             source_lease_owner_id,
         )
     except grabowski_self_deploy.DeploySchedulePreEffectRefusal as exc:
-        raise RuntimeDeployPreEffectRefusal(str(exc)) from exc
+        raise RuntimeDeployPreEffectRefusal(
+            str(exc),
+            local_mutation_evidence=getattr(
+                exc, "local_mutation_evidence", None
+            ),
+        ) from exc
 
 
 
@@ -15640,8 +15658,13 @@ def _run_captain_runtime_deploy(
         )
         execution_result["command_returned"] = True
     except RuntimeDeployPreEffectRefusal as exc:
-        execution_result["execution_invoked"] = False
-        execution_result["execution_attempted"] = False
+        local_mutation_evidence = getattr(exc, "local_mutation_evidence", None)
+        if local_mutation_evidence is None:
+            execution_result["execution_invoked"] = False
+            execution_result["execution_attempted"] = False
+        else:
+            execution_result["local_mutation_observed"] = True
+            execution_result["local_mutation_evidence"] = local_mutation_evidence
         execution_result["pre_effect_refusal"] = True
         execution_result["definitely_not_scheduled"] = True
         execution_result["verification_error"] = (

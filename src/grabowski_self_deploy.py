@@ -1575,7 +1575,9 @@ def _deploy_index(
     return index
 
 
-def _reconcile_stale_pending_reservation(jobs_root: Path) -> dict[str, Any]:
+def _reconcile_stale_pending_reservation(
+    jobs_root: Path,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Clear one pre-dispatch reservation only when no unit could have started.
 
     Callers must already hold the deploy schedule lock. Lock-free readers keep
@@ -1583,19 +1585,23 @@ def _reconcile_stale_pending_reservation(jobs_root: Path) -> dict[str, Any]:
     durable job directory and metadata before it invokes systemd-run, so a
     missing directory plus an authoritative not_started unit readback is the
     narrow proof that this reservation never crossed the dispatch boundary.
+
+    The second return value is present only after both the index update and its
+    audit append succeeded, so later refusal receipts can expose that exact
+    local reconciliation effect without weakening no-job-registration proof.
     """
     index = _deploy_index(jobs_root)
     pending = index["pending_unit"]
     if pending is None:
-        return index
+        return index, None
     entry = jobs_root / pending
     if entry.is_symlink():
         raise RuntimeError("pending runtime deploy job path is a symlink")
     if entry.exists():
-        return index
+        return index, None
     readback = operator._unit_dispatch_readback(pending)
     if not isinstance(readback, dict) or readback.get("outcome") != "not_started":
-        return index
+        return index, None
     reconciled = _write_deploy_index(
         jobs_root,
         units=list(index["units"]),
@@ -1609,7 +1615,20 @@ def _reconcile_stale_pending_reservation(jobs_root: Path) -> dict[str, Any]:
             "dispatch_readback": readback,
         }
     )
-    return reconciled
+    effect_material = {
+        "schema_version": 1,
+        "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+        "unit": pending,
+        "dispatch_outcome": "not_started",
+        "deploy_index_updated": True,
+        "audit_recorded": True,
+        "index_updated_at_unix": reconciled["updated_at_unix"],
+    }
+    effect = {
+        **effect_material,
+        "evidence_sha256": _source_identity_sha256(effect_material),
+    }
+    return reconciled, effect
 
 
 def _validated_deploy_job_receipt(entry: Path, metadata: dict[str, Any]) -> dict[str, str]:
@@ -1635,7 +1654,20 @@ def _validated_deploy_job_receipt(entry: Path, metadata: dict[str, Any]) -> dict
 
 
 class DeploySchedulePreEffectRefusal(RuntimeError):
-    """Scheduling was refused before any deployment or Git-ref effect began."""
+    """Scheduling was refused before job registration or a Git-ref effect began."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        local_mutation_evidence: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.local_mutation_evidence = (
+            None
+            if local_mutation_evidence is None
+            else dict(local_mutation_evidence)
+        )
 
 
 class IndexedRuntimeJobConflict(RuntimeError):
@@ -2279,16 +2311,17 @@ def inflight_runtime_job_evidence(
         "idempotent_match": None,
         "ambiguous_identical_units": [],
         "pruned_units": [],
+        "stale_pending_reconciliation": None,
         "error": None,
     }
     expected_sha256 = _deploy_command_sha256(command) if command else None
     try:
         jobs_root = operator._jobs_root()
-        index = (
-            _reconcile_stale_pending_reservation(jobs_root)
-            if reconcile_stale_pending
-            else _deploy_index(jobs_root)
-        )
+        if reconcile_stale_pending:
+            index, reconciliation = _reconcile_stale_pending_reservation(jobs_root)
+            evidence["stale_pending_reconciliation"] = reconciliation
+        else:
+            index = _deploy_index(jobs_root)
     except (OSError, RuntimeError, ValueError) as exc:
         evidence["error"] = f"deployment job index is unreadable: {exc}"
         return evidence
@@ -4217,16 +4250,6 @@ def _deployment_schedule_preflight(
     except RuntimeError as canonical_error:
         try:
             canonical_state = _canonical_main_refresh_candidate(expected_head)
-            root = AUTO_DEPLOY_SOURCE_ROOT
-            if root.is_symlink() or not root.is_dir():
-                raise RuntimeError(
-                    f"automatic deployment source root is unavailable: {root}"
-                )
-            resolved_root = root.resolve(strict=True)
-            if resolved_root != root or not resolved_root.is_dir():
-                raise RuntimeError(
-                    "automatic deployment source root must be an exact real directory"
-                )
         except Exception as fallback_error:
             raise canonical_error from fallback_error
         if (
@@ -4245,6 +4268,24 @@ def _deployment_schedule_preflight(
                     "automatic deployment source requires current canonical main to be an "
                     "ancestor of the deployment target"
                 )
+        materialization_required = (
+            canonical_state["current_head"] != expected_head
+            or canonical_state["current_branch"] != "main"
+        )
+        if materialization_required:
+            try:
+                root = AUTO_DEPLOY_SOURCE_ROOT
+                if root.is_symlink() or not root.is_dir():
+                    raise RuntimeError(
+                        f"automatic deployment source root is unavailable: {root}"
+                    )
+                resolved_root = root.resolve(strict=True)
+                if resolved_root != root or not resolved_root.is_dir():
+                    raise RuntimeError(
+                        "automatic deployment source root must be an exact real directory"
+                    )
+            except Exception as fallback_error:
+                raise canonical_error from fallback_error
         return {
             "schema_version": 1,
             "kind": "grabowski_runtime_deploy_schedule_preflight",
@@ -4494,9 +4535,24 @@ def grabowski_runtime_deploy_schedule(
                 )
 
         if canonical_refresh_snapshot is not None:
-            origin_main_refresh = _refresh_canonical_origin_main(
-                expected_head, canonical_refresh_snapshot
-            )
+            try:
+                origin_main_refresh = _refresh_canonical_origin_main(
+                    expected_head, canonical_refresh_snapshot
+                )
+            except DeploySchedulePreEffectRefusal as exc:
+                reconciliation = inflight_before_resolution.get(
+                    "stale_pending_reconciliation"
+                )
+                if reconciliation is None:
+                    raise
+                if not isinstance(reconciliation, dict):
+                    raise RuntimeError(
+                        "stale pending reconciliation evidence is malformed"
+                    ) from exc
+                raise DeploySchedulePreEffectRefusal(
+                    str(exc),
+                    local_mutation_evidence=reconciliation,
+                ) from exc
             if not automatic_source_needed:
                 repository, runner, source_identity = _deployment_source_preflight(
                     expected_head,

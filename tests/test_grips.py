@@ -14895,6 +14895,97 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertNotIn("local_mutation_outcome_unknown", execution)
         self.assertIn("before job registration", execution["verification_error"])
 
+    def test_runtime_deploy_pre_effect_adapter_preserves_local_mutation_evidence(self) -> None:
+        import grabowski_self_deploy as self_deploy
+
+        reconciliation = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-stale000001",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 1,
+            "evidence_sha256": "a" * 64,
+        }
+        with patch.object(
+            self_deploy,
+            "grabowski_runtime_deploy_schedule",
+            side_effect=self_deploy.DeploySchedulePreEffectRefusal(
+                "common-dir lease busy",
+                local_mutation_evidence=reconciliation,
+            ),
+        ):
+            with self.assertRaises(grips.RuntimeDeployPreEffectRefusal) as blocked:
+                grips._runtime_deploy_self_schedule(CAPTAIN_HEAD, 8)
+        self.assertEqual(
+            blocked.exception.local_mutation_evidence,
+            reconciliation,
+        )
+
+    def test_captain_runtime_deploy_pre_effect_refusal_preserves_known_local_reconciliation(
+        self,
+    ) -> None:
+        action = captain_action(
+            action="runtime-deploy",
+            target={
+                "service": "grabowski-mcp",
+                "runtime_target": "heim-pc",
+                "adapter": "grabowski-self",
+            },
+            risk={
+                "risk_level": "high",
+                "irreversibility": "reversible",
+                "recovery_path": "retry after the conflicting precondition clears",
+            },
+            receipt_path="receipts/captain/runtime-deploy.json",
+        )
+        preflight = {
+            "adapter": "grabowski-self",
+            "repository": "/home/alex/repos/grabowski",
+            "runner": "/home/alex/repos/grabowski/tools/run_scheduled_deploy.py",
+            "job_root": str(Path.home() / ".local/state/grabowski/jobs"),
+            "job_prefix": "grabowski-job-",
+            "expected_head": CAPTAIN_HEAD,
+            "source_kind": "canonical-main",
+            "source_identity_sha256": "e" * 64,
+            "target": {"service": "grabowski-mcp", "runtime_target": "heim-pc"},
+            "ready": True,
+        }
+        reconciliation = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-stale000001",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 1,
+            "evidence_sha256": "a" * 64,
+        }
+        with patch.object(
+            grips, "_runtime_deploy_self_preflight", return_value=preflight
+        ), patch.object(
+            grips,
+            "_runtime_deploy_self_schedule",
+            side_effect=grips.RuntimeDeployPreEffectRefusal(
+                "common-dir lease busy",
+                local_mutation_evidence=reconciliation,
+            ),
+        ):
+            execution = grips._run_captain_runtime_deploy(
+                action, {"expected_head": CAPTAIN_HEAD, "delay_seconds": 8}
+            )
+        self.assertTrue(execution["preflight_passed"])
+        self.assertTrue(execution["execution_invoked"])
+        self.assertTrue(execution["execution_attempted"])
+        self.assertTrue(execution["pre_effect_refusal"])
+        self.assertTrue(execution["definitely_not_scheduled"])
+        self.assertTrue(execution["local_mutation_observed"])
+        self.assertEqual(execution["local_mutation_evidence"], reconciliation)
+        self.assertNotIn("mutation_outcome_unknown", execution)
+        self.assertNotIn("local_mutation_outcome_unknown", execution)
+        self.assertIn("before job registration", execution["verification_error"])
+
     def test_runtime_deploy_schedule_validation_binds_delay_and_unit_namespace(self) -> None:
         unit = "grabowski-job-abcdef012345"
         job_root = Path.home() / ".local/state/grabowski/jobs"
