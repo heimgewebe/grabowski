@@ -3723,6 +3723,7 @@ class CaptainMergeGuardRunner:
         seen_cursors: set[str] = set()
         after: str | None = None
         pages = 0
+        first_payload: dict[str, Any] | None = None
 
         while True:
             if pages >= _CODEX_THREAD_MAX_PAGES:
@@ -3750,6 +3751,8 @@ class CaptainMergeGuardRunner:
             )
             if not isinstance(payload, dict):
                 return None
+            if first_payload is None:
+                first_payload = payload
             try:
                 connection = payload["data"]["repository"]["pullRequest"][
                     "reviewThreads"
@@ -3800,21 +3803,15 @@ class CaptainMergeGuardRunner:
             seen_cursors.add(cursor)
             after = cursor
 
-        return {
-            "data": {
-                "repository": {
-                    "pullRequest": {
-                        "reviewThreads": {
-                            "nodes": nodes,
-                            "pageInfo": {
-                                "hasNextPage": False,
-                                "pages_loaded": pages,
-                            },
-                        }
-                    }
-                }
-            }
+        assert first_payload is not None
+        first_payload["data"]["repository"]["pullRequest"]["reviewThreads"] = {
+            "nodes": nodes,
+            "pageInfo": {
+                "hasNextPage": False,
+                "pages_loaded": pages,
+            },
         }
+        return first_payload
 
     def _review_thread_sets(
         self,
