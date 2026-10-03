@@ -15570,6 +15570,49 @@ def _runtime_deploy_schedule_errors(
         errors.append("runtime_deploy_status_tool_missing")
     if schedule.get("logs_tool") != "grabowski_job_logs":
         errors.append("runtime_deploy_logs_tool_missing")
+    local_mutation_evidence = schedule.get("local_mutation_evidence")
+    if local_mutation_evidence is not None:
+        evidence_fields = {
+            "schema_version",
+            "kind",
+            "unit",
+            "dispatch_outcome",
+            "deploy_index_updated",
+            "audit_recorded",
+            "index_updated_at_unix",
+            "evidence_sha256",
+        }
+        evidence_material = (
+            {
+                key: value
+                for key, value in local_mutation_evidence.items()
+                if key != "evidence_sha256"
+            }
+            if isinstance(local_mutation_evidence, dict)
+            else {}
+        )
+        if (
+            not isinstance(local_mutation_evidence, dict)
+            or set(local_mutation_evidence) != evidence_fields
+            or local_mutation_evidence.get("schema_version") != 1
+            or local_mutation_evidence.get("kind")
+            != "grabowski_runtime_deploy_stale_pending_reconciliation"
+            or local_mutation_evidence.get("dispatch_outcome") != "not_started"
+            or local_mutation_evidence.get("deploy_index_updated") is not True
+            or local_mutation_evidence.get("audit_recorded") is not True
+            or isinstance(local_mutation_evidence.get("index_updated_at_unix"), bool)
+            or not isinstance(local_mutation_evidence.get("index_updated_at_unix"), int)
+            or local_mutation_evidence.get("index_updated_at_unix", -1) < 0
+            or not isinstance(local_mutation_evidence.get("unit"), str)
+            or re.fullmatch(
+                rf"{re.escape(expected_job_prefix)}[0-9a-f]{{12}}",
+                local_mutation_evidence.get("unit", ""),
+            )
+            is None
+            or local_mutation_evidence.get("evidence_sha256")
+            != sha256_json(evidence_material)
+        ):
+            errors.append("runtime_deploy_schedule_local_mutation_evidence_invalid")
     path_values: dict[str, Path] = {}
     for key in ("metadata_path", "stdout_path", "stderr_path"):
         value = schedule.get(key)
@@ -15730,7 +15773,12 @@ def _run_captain_runtime_deploy(
     execution_result["scheduled_unit"] = schedule["unit"]
     execution_result["already_scheduled"] = schedule["already_scheduled"]
     execution_result["new_job_registered"] = not schedule["already_scheduled"]
-    execution_result["local_mutation_observed"] = not schedule["already_scheduled"]
+    local_mutation_evidence = schedule.get("local_mutation_evidence")
+    execution_result["local_mutation_observed"] = (
+        not schedule["already_scheduled"] or local_mutation_evidence is not None
+    )
+    if local_mutation_evidence is not None:
+        execution_result["local_mutation_evidence"] = dict(local_mutation_evidence)
     execution_result["verification_passed"] = True
     execution_result["next_verification"] = {
         "status_tool": schedule["status_tool"],

@@ -2541,6 +2541,7 @@ def _schedule_result(
     already_scheduled: bool,
     source_identity: dict[str, Any],
     automatic_source: dict[str, Any] | None = None,
+    local_mutation_evidence: dict[str, Any] | None = None,
     deployment_observer_capability: str | None = None,
 ) -> dict[str, Any]:
     contract = job.get("deployment_observer_contract")
@@ -2557,6 +2558,11 @@ def _schedule_result(
         "source_identity": source_identity,
         "source_identity_sha256": source_identity["identity_sha256"],
         "automatic_source": automatic_source,
+        "local_mutation_evidence": (
+            None
+            if local_mutation_evidence is None
+            else dict(local_mutation_evidence)
+        ),
         "effective_source_identity_sha256": job.get(
             "source_identity_sha256", source_identity["identity_sha256"]
         ),
@@ -4562,6 +4568,15 @@ def grabowski_runtime_deploy_schedule(
             raise RuntimeError(
                 "deployment source preflight returned malformed in-flight runtime evidence"
             )
+        local_mutation_evidence = inflight_before_resolution.get(
+            "stale_pending_reconciliation"
+        )
+        if local_mutation_evidence is not None and not isinstance(
+            local_mutation_evidence, dict
+        ):
+            raise RuntimeError(
+                "deployment source preflight returned malformed local mutation evidence"
+            )
         if source_repository is None and inflight_units:
             recovered_source = _reconcile_inflight_auto_deploy_source(
                 expected_head,
@@ -4785,6 +4800,7 @@ def grabowski_runtime_deploy_schedule(
                 already_scheduled=True,
                 source_identity=source_identity,
                 automatic_source=automatic_source_binding,
+                local_mutation_evidence=local_mutation_evidence,
             )
 
         intent = {
@@ -4924,5 +4940,6 @@ def grabowski_runtime_deploy_schedule(
             already_scheduled=False,
             source_identity=source_identity,
             automatic_source=automatic_source_binding,
+            local_mutation_evidence=local_mutation_evidence,
             deployment_observer_capability=observer_capability,
         )

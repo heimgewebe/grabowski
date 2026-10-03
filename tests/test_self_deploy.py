@@ -4725,6 +4725,21 @@ class SelfDeployToolTests(unittest.TestCase):
             "stderr_path": "/state/err",
             "final_status": "running",
         }
+        reconciliation_material = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-123456abcdef",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 1,
+        }
+        reconciliation = {
+            **reconciliation_material,
+            "evidence_sha256": SELF_DEPLOY._source_identity_sha256(
+                reconciliation_material
+            ),
+        }
         SELF_DEPLOY.operator.grabowski_job_start.reset_mock()
         SELF_DEPLOY.base._append_audit.reset_mock()
         command = SELF_DEPLOY._deploy_command(
@@ -4745,7 +4760,15 @@ class SelfDeployToolTests(unittest.TestCase):
         ), patch.object(
             SELF_DEPLOY,
             "inflight_runtime_job_evidence",
-            return_value={"error": None, "inflight_units": []},
+            return_value={
+                "error": None,
+                "inflight_units": [existing["unit"]],
+                "stale_pending_reconciliation": reconciliation,
+            },
+        ), patch.object(
+            SELF_DEPLOY,
+            "_reconcile_inflight_auto_deploy_source",
+            return_value=None,
         ), patch.object(
             SELF_DEPLOY, "_matching_inflight_deploy_job", return_value=existing
         ) as lookup:
@@ -4754,6 +4777,7 @@ class SelfDeployToolTests(unittest.TestCase):
         SELF_DEPLOY.operator.grabowski_job_start.assert_not_called()
         self.assertTrue(result["already_scheduled"])
         self.assertEqual(result["source_identity_sha256"], identity["identity_sha256"])
+        self.assertEqual(result["local_mutation_evidence"], reconciliation)
         self.assertEqual(1, SELF_DEPLOY.base._append_audit.call_count)
 
     def test_matching_inflight_job_blocks_pending_dispatch_without_clearing_it(self) -> None:
