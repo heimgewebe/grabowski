@@ -659,27 +659,34 @@ def _unsafe_flowlines_export_overrides() -> list[str]:
 
 
 def _endpoint_is_flowlines() -> bool:
-    endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip().rstrip("/")
+    endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
     traces_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "").strip()
-    candidate = traces_endpoint or endpoint
-    if not candidate:
-        # Production uses the internally pinned Flowlines origin. Ambient OTLP
-        # endpoint variables are optional overrides and never carry authority.
-        return True
-    try:
-        parsed = urlsplit(candidate)
-        port = parsed.port
-    except ValueError:
-        return False
-    return (
-        parsed.scheme == "https"
-        and parsed.hostname == "api.flowlines.ai"
-        and parsed.username is None
-        and parsed.password is None
-        and not parsed.query
-        and not parsed.fragment
-        and port in (None, 443)
-        and (not traces_endpoint or parsed.path in ("", "/", "/v1/traces", "/traces"))
+
+    def matches(candidate: str, *, allowed_paths: tuple[str, ...]) -> bool:
+        if not candidate:
+            return True
+        try:
+            parsed = urlsplit(candidate)
+            port = parsed.port
+        except ValueError:
+            return False
+        return (
+            parsed.scheme == "https"
+            and parsed.hostname == "api.flowlines.ai"
+            and parsed.username is None
+            and parsed.password is None
+            and not parsed.query
+            and not parsed.fragment
+            and port in (None, 443)
+            and parsed.path in allowed_paths
+        )
+
+    # Production uses the internally pinned Flowlines trace endpoint. Ambient
+    # OTLP endpoint variables are optional assertions only; if present, both
+    # must independently match their canonical Flowlines endpoint shape.
+    return matches(endpoint, allowed_paths=("", "/")) and matches(
+        traces_endpoint,
+        allowed_paths=("/v1/traces",),
     )
 
 

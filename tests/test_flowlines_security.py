@@ -156,11 +156,12 @@ class FlowlinesSecurityRegressionTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertTrue(flowlines._endpoint_is_flowlines())
 
-    def test_flowlines_endpoint_rejects_userinfo_query_and_fragment(self) -> None:
+    def test_flowlines_endpoint_rejects_userinfo_query_fragment_and_wrong_path(self) -> None:
         cases = (
             ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://u:p@api.flowlines.ai"),
             ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://api.flowlines.ai?a=b"),
             ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://api.flowlines.ai#x"),
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://api.flowlines.ai/v1/traces"),
             (
                 "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
                 "https://u:p@api.flowlines.ai/v1/traces",
@@ -172,6 +173,10 @@ class FlowlinesSecurityRegressionTests(unittest.TestCase):
             (
                 "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
                 "https://api.flowlines.ai/v1/traces#x",
+            ),
+            (
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                "https://api.flowlines.ai/traces",
             ),
         )
         for name, value in cases:
@@ -185,6 +190,17 @@ class FlowlinesSecurityRegressionTests(unittest.TestCase):
                 clear=True,
             ):
                 self.assertFalse(flowlines._endpoint_is_flowlines())
+
+    def test_safe_trace_endpoint_does_not_mask_unsafe_generic_endpoint(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "OTEL_EXPORTER_OTLP_ENDPOINT": "https://u:p@api.flowlines.ai",
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "https://api.flowlines.ai/v1/traces",
+            },
+            clear=True,
+        ):
+            self.assertFalse(flowlines._endpoint_is_flowlines())
 
     def test_flowlines_endpoint_variables_are_consumed_when_export_is_rejected(self) -> None:
         with mock.patch.dict(
