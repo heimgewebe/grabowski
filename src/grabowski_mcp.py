@@ -74,9 +74,9 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "narrowest-typed-read-first",
-        "Cross-repo stable truth/role/boundary/entrypoint/relation:grabowski_systemkatalog_query. "
-        "If result changes/confirms decision: hash-bound tools/systemkatalog_usage_receipt.py; "
-        "fixed categories/no chat/free prose. Narrowest typed read; no extra health ping when read probes.",
+        "grabowski_systemkatalog_query: system=system; repo=repository; domain=truth-owner; "
+        "relation=relations; entrypoint=entrypoints; else=authority-matrix. Decision=>hash-bound "
+        "receipt:tools/systemkatalog_usage_receipt.py; fixed fields/no prose. Narrowest read; no health ping.",
     ),
     (
         "host-capability-resolution",

@@ -85,17 +85,19 @@ class AgentInstructionsTests(unittest.TestCase):
         self.assertEqual(len(rules), len(grabowski_mcp.AGENT_INSTRUCTION_RULES))
         self.assertIn("live runtime state", rules["truth-hierarchy"].lower())
         narrow = rules["narrowest-typed-read-first"].lower()
-        self.assertIn("narrowest typed read", narrow)
+        self.assertIn("narrowest read", narrow)
         self.assertIn("health ping", narrow)
-        self.assertIn("read probes", narrow)
         for phrase in (
-            "cross-repo stable",
-            "truth/role/boundary/entrypoint/relation",
             "grabowski_systemkatalog_query",
-            "if result changes/confirms decision",
-            "hash-bound",
+            "system=system",
+            "repo=repository",
+            "domain=truth-owner",
+            "relation=relations",
+            "entrypoint=entrypoints",
+            "else=authority-matrix",
+            "decision=>hash-bound",
             "tools/systemkatalog_usage_receipt.py",
-            "fixed categories/no chat/free prose",
+            "fixed fields/no prose",
         ):
             self.assertIn(phrase, narrow)
         host_resolution = rules["host-capability-resolution"].lower()
