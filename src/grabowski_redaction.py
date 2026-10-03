@@ -22,8 +22,9 @@ _GITHUB_SECRET_PATTERN = re.compile(
 )
 _GITLAB_SECRET_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_])"
-    r"glpat-[A-Za-z0-9_-]{20,}"
-    r"(?![A-Za-z0-9_-])"
+    r"(?:glpat|gloas|gldt|glrt|glrtr|glcbt|glptt|glft|glimt|glagent|glwt|glsoat|glffct)-"
+    r"[A-Za-z0-9._~+/-]{12,}=*(?![A-Za-z0-9._~+/-])",
+    re.I,
 )
 SECRET_REDACTIONS = (
     (_OPENAI_SECRET_PATTERN, "<REDACTED_OPENAI_KEY>"),

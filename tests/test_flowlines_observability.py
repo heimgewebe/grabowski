@@ -296,31 +296,37 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("<REDACTED_GITHUB_TOKEN>", serialized)
 
     async def test_bare_gitlab_tokens_are_scrubbed_from_text_and_identifiers(self) -> None:
-        gitlab_token = "glpat-" + ("L" * 32)
+        personal_token = "glpat-" + ("L" * 26)
+        deploy_token = "gldt-" + ("M" * 26)
         mcp = self.server()
         result = await self.call(
             mcp,
             arguments={
                 "value": "hello",
-                "reason": f"Rotate {gitlab_token}",
-                "user_intent": "Keep GitLab credentials private",
+                "reason": f"Rotate {personal_token}",
+                "user_intent": f"Keep {deploy_token} private",
             },
             meta=self.meta(
                 **{
-                    "user.id": gitlab_token,
-                    "session.id": f"session-{gitlab_token}",
+                    "user.id": personal_token,
+                    "session.id": f"session-{deploy_token}",
                 }
             ),
-            request_id=f"req-{gitlab_token}",
+            request_id=f"req-{personal_token}",
         )
 
         self.assertFalse(result.root.isError)
         attrs = self.exporter.get_finished_spans()[0].attributes
         serialized = json.dumps(dict(attrs), sort_keys=True)
-        self.assertNotIn(gitlab_token, serialized)
+        self.assertNotIn(personal_token, serialized)
+        self.assertNotIn(deploy_token, serialized)
         self.assertEqual(
             attrs["gen_ai.tool.call.reason"],
             "Rotate <REDACTED_GITLAB_TOKEN>",
+        )
+        self.assertEqual(
+            attrs["session.user_intent"],
+            "Keep <REDACTED_GITLAB_TOKEN> private",
         )
         self.assertEqual(attrs["user.id"], "<REDACTED_GITLAB_TOKEN>")
         self.assertEqual(
@@ -334,6 +340,7 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_report_outcome_scrubs_sensitive_free_text_recursively(self) -> None:
         provider_key = "s" + "k-ant-" + ("x" * 24)
+        gitlab_token = "glpat-" + ("N" * 26)
         password = "synthetic-password-value"
         mcp = FastMCP("grabowski-test", instructions="fixture")
         flowlines.configure_flowlines_observability(mcp, READ_ONLY, tracer=self.tracer)
@@ -345,7 +352,10 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
                 "user_intent": "Keep the outcome telemetry safe",
                 "status": "partial",
                 "outcome_summary": f"Credential {provider_key} was rotated.",
-                "unmet_needs": [f"Reset password={password}"],
+                "unmet_needs": [
+                    f"Reset password={password}",
+                    f"Rotate GitLab token {gitlab_token}",
+                ],
             },
             meta=self.meta(),
         )
@@ -353,6 +363,7 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         attrs = self.exporter.get_finished_spans()[0].attributes
         serialized = json.dumps(dict(attrs), sort_keys=True)
         self.assertNotIn(provider_key, serialized)
+        self.assertNotIn(gitlab_token, serialized)
         self.assertNotIn(password, serialized)
         public_arguments = json.loads(attrs["gen_ai.tool.call.arguments"])
         self.assertEqual(
@@ -370,7 +381,10 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             public_arguments["unmet_needs"],
-            ["Reset password=<REDACTED>"],
+            [
+                "Reset password=<REDACTED>",
+                "Rotate GitLab token <REDACTED_GITLAB_TOKEN>",
+            ],
         )
 
     def test_established_secret_classes_are_scrubbed(self) -> None:
@@ -384,12 +398,29 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         )
         github_classic = "ghp_" + ("C" * 32)
         github_fine_grained = "github_pat_" + ("D" * 32)
-        gitlab_pat = "glpat-" + ("E" * 32)
+        gitlab_tokens = [
+            f"{prefix}-" + ("E" * 26)
+            for prefix in (
+                "glpat",
+                "gloas",
+                "gldt",
+                "glrt",
+                "glrtr",
+                "glcbt",
+                "glptt",
+                "glft",
+                "glimt",
+                "glagent",
+                "glwt",
+                "glsoat",
+                "glffct",
+            )
+        ]
         cases = [
             (f"provider {provider_key}", provider_key),
             (f"github {github_classic}", github_classic),
             (f"github {github_fine_grained}", github_fine_grained),
-            (f"gitlab {gitlab_pat}", gitlab_pat),
+            *((f"gitlab {token}", token) for token in gitlab_tokens),
             (f"aws {aws_access_key}", aws_access_key),
             (private_key, "synthetic-private-material"),
             (
