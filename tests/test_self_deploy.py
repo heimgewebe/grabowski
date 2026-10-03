@@ -1102,6 +1102,39 @@ class SelfDeployToolTests(unittest.TestCase):
         self.assertIsNone(result["source_identity_sha256"])
 
 
+    def test_origin_main_refresh_acquires_checkout_common_dir_serialization_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary).resolve()
+            common = repo / ".git"
+            expected = "c" * 40
+            owner = "runtime-deploy-ref:cccccccccccc:abc123def456"
+            operation_key = (
+                f"repo:{repo}:operation:{SELF_DEPLOY.ORIGIN_MAIN_REFRESH_OPERATION}"
+            )
+            common_dir_key = f"path:{common}"
+            objects_key = f"path:{common / 'objects'}"
+            origin_ref_key = f"path:{common / 'refs/remotes/origin/main'}"
+            plan = {
+                "canonical_repository": repo,
+                "git_common_directory": common,
+                "generation": "abc123def456",
+                "owner_id": owner,
+                "operation_key": operation_key,
+                "common_dir_key": common_dir_key,
+                "objects_key": objects_key,
+                "origin_main_ref_key": origin_ref_key,
+            }
+            resources = types.ModuleType("grabowski_resources")
+            resources.operation_scope_contract = Mock(return_value={"scope": "deploy"})
+            resources.acquire_resources = Mock(return_value={"leases": []})
+            with patch.dict(sys.modules, {"grabowski_resources": resources}):
+                SELF_DEPLOY._acquire_origin_main_refresh_resources(plan, expected)
+            resources.acquire_resources.assert_called_once()
+            self.assertEqual(
+                resources.acquire_resources.call_args.args[1],
+                [operation_key, common_dir_key, objects_key, origin_ref_key],
+            )
+
     def test_origin_main_refresh_rejects_divergent_canonical_main_before_ref_update(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary).resolve()
@@ -1111,6 +1144,7 @@ class SelfDeployToolTests(unittest.TestCase):
             origin = "b" * 40
             owner = "runtime-deploy-ref:cccccccccccc:abc123def456"
             operation_key = f"repo:{repo}:operation:{SELF_DEPLOY.ORIGIN_MAIN_REFRESH_OPERATION}"
+            common_dir_key = f"path:{common}"
             objects_key = f"path:{common / 'objects'}"
             origin_ref_key = f"path:{common / 'refs/remotes/origin/main'}"
             plan = {
@@ -1119,12 +1153,13 @@ class SelfDeployToolTests(unittest.TestCase):
                 "generation": "abc123def456",
                 "owner_id": owner,
                 "operation_key": operation_key,
+                "common_dir_key": common_dir_key,
                 "objects_key": objects_key,
                 "origin_main_ref_key": origin_ref_key,
             }
             leases = [
                 {"resource_key": key, "owner_id": owner}
-                for key in [operation_key, objects_key, origin_ref_key]
+                for key in [operation_key, common_dir_key, objects_key, origin_ref_key]
             ]
             initial = {
                 "canonical_repository": str(repo),
@@ -1180,6 +1215,7 @@ class SelfDeployToolTests(unittest.TestCase):
             origin = "b" * 40
             owner = "runtime-deploy-ref:cccccccccccc:abc123def456"
             operation_key = f"repo:{repo}:operation:{SELF_DEPLOY.ORIGIN_MAIN_REFRESH_OPERATION}"
+            common_dir_key = f"path:{common}"
             objects_key = f"path:{common / 'objects'}"
             origin_ref_key = f"path:{common / 'refs/remotes/origin/main'}"
             plan = {
@@ -1188,6 +1224,7 @@ class SelfDeployToolTests(unittest.TestCase):
                 "generation": "abc123def456",
                 "owner_id": owner,
                 "operation_key": operation_key,
+                "common_dir_key": common_dir_key,
                 "objects_key": objects_key,
                 "origin_main_ref_key": origin_ref_key,
             }
@@ -1201,7 +1238,7 @@ class SelfDeployToolTests(unittest.TestCase):
                     "metadata_sha256": str(index) * 64,
                 }
                 for index, key in enumerate(
-                    [operation_key, objects_key, origin_ref_key], start=1
+                    [operation_key, common_dir_key, objects_key, origin_ref_key], start=1
                 )
             ]
             initial = {
@@ -1251,6 +1288,7 @@ class SelfDeployToolTests(unittest.TestCase):
             self.assertEqual(receipt["previous_origin_main"], origin)
             self.assertEqual(receipt["previous_branch"], "feature/active-work")
             self.assertEqual(receipt["observed_origin_main"], expected)
+            self.assertEqual(receipt["common_dir_resource_key"], common_dir_key)
             self.assertEqual(receipt["objects_resource_key"], objects_key)
             self.assertEqual(receipt["origin_main_ref_resource_key"], origin_ref_key)
             self.assertRegex(receipt["receipt_sha256"], r"[0-9a-f]{64}")
@@ -1259,7 +1297,7 @@ class SelfDeployToolTests(unittest.TestCase):
             self.assertEqual(mutate.call_args_list[1].args[1], "update-ref")
             release.assert_called_once_with(
                 plan,
-                [operation_key, objects_key, origin_ref_key],
+                [operation_key, common_dir_key, objects_key, origin_ref_key],
                 leases,
             )
 
@@ -1271,17 +1309,20 @@ class SelfDeployToolTests(unittest.TestCase):
             expected = "c" * 40
             owner = "runtime-deploy-ref:cccccccccccc:abc123def456"
             operation_key = f"repo:{repo}:operation:{SELF_DEPLOY.ORIGIN_MAIN_REFRESH_OPERATION}"
+            common_dir_key = f"path:{common}"
             objects_key = f"path:{common / 'objects'}"
             origin_ref_key = f"path:{common / 'refs/remotes/origin/main'}"
             plan = {
                 "canonical_repository": repo,
                 "owner_id": owner,
                 "operation_key": operation_key,
+                "common_dir_key": common_dir_key,
                 "objects_key": objects_key,
                 "origin_main_ref_key": origin_ref_key,
             }
             leases = [
                 {"resource_key": operation_key, "owner_id": owner},
+                {"resource_key": common_dir_key, "owner_id": owner},
                 {"resource_key": objects_key, "owner_id": owner},
                 {"resource_key": origin_ref_key, "owner_id": owner},
             ]
@@ -1313,10 +1354,10 @@ class SelfDeployToolTests(unittest.TestCase):
             ) as candidate:
                 with self.assertRaisesRegex(RuntimeError, "lease receipt omitted"):
                     SELF_DEPLOY._refresh_canonical_origin_main(expected, initial)
-            self.assertEqual(live_snapshot.call_count, 2)
+            self.assertEqual(live_snapshot.call_count, 3)
             release.assert_called_once_with(
                 plan,
-                [operation_key, objects_key, origin_ref_key],
+                [operation_key, common_dir_key, objects_key, origin_ref_key],
                 leases,
             )
             candidate.assert_not_called()
@@ -1329,17 +1370,20 @@ class SelfDeployToolTests(unittest.TestCase):
             expected = "c" * 40
             owner = "runtime-deploy-ref:cccccccccccc:abc123def456"
             operation_key = f"repo:{repo}:operation:{SELF_DEPLOY.ORIGIN_MAIN_REFRESH_OPERATION}"
+            common_dir_key = f"path:{common}"
             objects_key = f"path:{common / 'objects'}"
             origin_ref_key = f"path:{common / 'refs/remotes/origin/main'}"
             plan = {
                 "canonical_repository": repo,
                 "owner_id": owner,
                 "operation_key": operation_key,
+                "common_dir_key": common_dir_key,
                 "objects_key": objects_key,
                 "origin_main_ref_key": origin_ref_key,
             }
             leases = [
                 {"resource_key": operation_key, "owner_id": owner},
+                {"resource_key": common_dir_key, "owner_id": owner},
                 {"resource_key": objects_key, "owner_id": owner},
                 {"resource_key": origin_ref_key, "owner_id": owner},
             ]
@@ -1373,7 +1417,7 @@ class SelfDeployToolTests(unittest.TestCase):
                     SELF_DEPLOY._refresh_canonical_origin_main(expected, initial)
             release.assert_called_once_with(
                 plan,
-                [operation_key, objects_key, origin_ref_key],
+                [operation_key, common_dir_key, objects_key, origin_ref_key],
                 leases,
             )
 
@@ -1387,6 +1431,7 @@ class SelfDeployToolTests(unittest.TestCase):
             origin = "b" * 40
             owner = "runtime-deploy-ref:cccccccccccc:abc123def456"
             operation_key = f"repo:{repo}:operation:{SELF_DEPLOY.ORIGIN_MAIN_REFRESH_OPERATION}"
+            common_dir_key = f"path:{common}"
             objects_key = f"path:{common / 'objects'}"
             origin_ref_key = f"path:{common / 'refs/remotes/origin/main'}"
             plan = {
@@ -1394,11 +1439,13 @@ class SelfDeployToolTests(unittest.TestCase):
                 "generation": "abc123def456",
                 "owner_id": owner,
                 "operation_key": operation_key,
+                "common_dir_key": common_dir_key,
                 "objects_key": objects_key,
                 "origin_main_ref_key": origin_ref_key,
             }
             leases = [
                 {"resource_key": operation_key, "owner_id": owner},
+                {"resource_key": common_dir_key, "owner_id": owner},
                 {"resource_key": objects_key, "owner_id": owner},
                 {"resource_key": origin_ref_key, "owner_id": owner},
             ]

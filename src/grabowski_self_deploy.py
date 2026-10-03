@@ -2739,6 +2739,7 @@ def _origin_main_refresh_plan(expected_head: str) -> dict[str, Any]:
         "generation": generation,
         "owner_id": f"runtime-deploy-ref:{expected_head[:12]}:{generation}",
         "operation_key": f"repo:{canonical}:operation:{ORIGIN_MAIN_REFRESH_OPERATION}",
+        "common_dir_key": f"path:{common_dir}",
         "objects_key": f"path:{common_dir / 'objects'}",
         "origin_main_ref_key": f"path:{common_dir / 'refs/remotes/origin/main'}",
     }
@@ -2760,6 +2761,7 @@ def _acquire_origin_main_refresh_resources(
         plan["owner_id"],
         [
             plan["operation_key"],
+            plan["common_dir_key"],
             plan["objects_key"],
             plan["origin_main_ref_key"],
         ],
@@ -2794,11 +2796,13 @@ def _refresh_canonical_origin_main(
     if initial_snapshot.get("canonical_repository") != str(canonical):
         raise RuntimeError("protected-main ref refresh snapshot repository mismatch")
     operation_lease: dict[str, Any] | None = None
+    common_dir_lease: dict[str, Any] | None = None
     objects_lease: dict[str, Any] | None = None
     origin_main_ref_lease: dict[str, Any] | None = None
     try:
         acquisition = _acquire_origin_main_refresh_resources(plan, expected_head)
         operation_lease = _lease_for_key(acquisition, plan["operation_key"])
+        common_dir_lease = _lease_for_key(acquisition, plan["common_dir_key"])
         objects_lease = _lease_for_key(acquisition, plan["objects_key"])
         origin_main_ref_lease = _lease_for_key(
             acquisition, plan["origin_main_ref_key"]
@@ -2939,6 +2943,7 @@ def _refresh_canonical_origin_main(
             "observed_origin_main": observed_origin_main,
             "owner_id": plan["owner_id"],
             "operation_resource_key": plan["operation_key"],
+            "common_dir_resource_key": plan["common_dir_key"],
             "objects_resource_key": plan["objects_key"],
             "origin_main_ref_resource_key": plan["origin_main_ref_key"],
             "fetch": {
@@ -2981,6 +2986,7 @@ def _refresh_canonical_origin_main(
         release_leases: list[dict[str, Any]] = []
         for label, resource_key, candidate_lease in (
             ("operation", plan["operation_key"], operation_lease),
+            ("git-common-directory", plan["common_dir_key"], common_dir_lease),
             ("objects", plan["objects_key"], objects_lease),
             (
                 "origin-main-ref",
@@ -3026,16 +3032,22 @@ def _refresh_canonical_origin_main(
         raise
     assert (
         operation_lease is not None
+        and common_dir_lease is not None
         and objects_lease is not None
         and origin_main_ref_lease is not None
     )
     release = _release_origin_main_refresh_resources(
         plan,
-        [plan["operation_key"], plan["objects_key"], plan["origin_main_ref_key"]],
-        [operation_lease, objects_lease, origin_main_ref_lease],
+        [
+            plan["operation_key"],
+            plan["common_dir_key"],
+            plan["objects_key"],
+            plan["origin_main_ref_key"],
+        ],
+        [operation_lease, common_dir_lease, objects_lease, origin_main_ref_lease],
     )
     released = release.get("released")
-    if not isinstance(released, list) or len(released) != 3:
+    if not isinstance(released, list) or len(released) != 4:
         raise RuntimeError("protected-main ref refresh resource release was incomplete")
     return receipt
 
