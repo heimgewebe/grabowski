@@ -1143,6 +1143,95 @@ class SelfDeployToolTests(unittest.TestCase):
         self.assertTrue(result["origin_main_refresh_required"])
         self.assertIsNone(result["source_identity_sha256"])
 
+    def test_schedule_preflight_rejects_divergent_canonical_main(self) -> None:
+        expected = "d" * 40
+        canonical_state = {
+            "canonical_repository": "/home/alex/repos/grabowski",
+            "current_head": "a" * 40,
+            "current_branch": "main",
+            "target_head": expected,
+            "origin_main": expected,
+            "clean": True,
+            "shallow": False,
+            "lease_evidence": {
+                "resource_key": "path:/home/alex/repos/grabowski",
+                "lease": None,
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            with patch.object(
+                SELF_DEPLOY, "_fresh_public_github_main", return_value=expected
+            ), patch.object(
+                SELF_DEPLOY,
+                "_deployment_source_preflight",
+                side_effect=RuntimeError("HEAD drift"),
+            ), patch.object(
+                SELF_DEPLOY,
+                "_canonical_main_refresh_candidate",
+                return_value=canonical_state,
+            ), patch.object(
+                SELF_DEPLOY, "AUTO_DEPLOY_SOURCE_ROOT", root
+            ), patch.object(
+                SELF_DEPLOY, "_git_result", return_value=_result(returncode=1)
+            ) as git_result:
+                with self.assertRaisesRegex(RuntimeError, "ancestor"):
+                    SELF_DEPLOY._deployment_schedule_preflight(
+                        expected, None, None
+                    )
+        git_result.assert_called_once_with(
+            Path(canonical_state["canonical_repository"]),
+            "merge-base",
+            "--is-ancestor",
+            canonical_state["current_head"],
+            expected,
+        )
+
+    def test_schedule_preflight_allows_ancestor_canonical_main(self) -> None:
+        expected = "d" * 40
+        canonical_state = {
+            "canonical_repository": "/home/alex/repos/grabowski",
+            "current_head": "a" * 40,
+            "current_branch": "main",
+            "target_head": expected,
+            "origin_main": expected,
+            "clean": True,
+            "shallow": False,
+            "lease_evidence": {
+                "resource_key": "path:/home/alex/repos/grabowski",
+                "lease": None,
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            with patch.object(
+                SELF_DEPLOY, "_fresh_public_github_main", return_value=expected
+            ), patch.object(
+                SELF_DEPLOY,
+                "_deployment_source_preflight",
+                side_effect=RuntimeError("HEAD drift"),
+            ), patch.object(
+                SELF_DEPLOY,
+                "_canonical_main_refresh_candidate",
+                return_value=canonical_state,
+            ), patch.object(
+                SELF_DEPLOY, "AUTO_DEPLOY_SOURCE_ROOT", root
+            ), patch.object(
+                SELF_DEPLOY, "_git_result", return_value=_result()
+            ) as git_result:
+                result = SELF_DEPLOY._deployment_schedule_preflight(
+                    expected, None, None
+                )
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["resolution_mode"], "scheduler-auto-source")
+        self.assertFalse(result["origin_main_refresh_required"])
+        git_result.assert_called_once_with(
+            Path(canonical_state["canonical_repository"]),
+            "merge-base",
+            "--is-ancestor",
+            canonical_state["current_head"],
+            expected,
+        )
 
     def test_origin_main_refresh_acquires_checkout_common_dir_serialization_key(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

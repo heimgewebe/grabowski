@@ -4215,6 +4215,22 @@ def _deployment_schedule_preflight(
                 )
         except Exception as fallback_error:
             raise canonical_error from fallback_error
+        if (
+            canonical_state["current_branch"] == "main"
+            and canonical_state["origin_main"] == expected_head
+        ):
+            ancestor = _git_result(
+                Path(str(canonical_state["canonical_repository"])),
+                "merge-base",
+                "--is-ancestor",
+                str(canonical_state["current_head"]),
+                expected_head,
+            )
+            if ancestor.get("timed_out") or ancestor.get("returncode") != 0:
+                raise RuntimeError(
+                    "automatic deployment source requires current canonical main to be an "
+                    "ancestor of the deployment target"
+                )
         return {
             "schema_version": 1,
             "kind": "grabowski_runtime_deploy_schedule_preflight",
