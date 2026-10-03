@@ -268,6 +268,33 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             "Authorization: <REDACTED>",
         )
 
+    async def test_bare_github_tokens_are_scrubbed_from_text_and_identifiers(self) -> None:
+        classic_token = "ghp_" + ("G" * 32)
+        fine_grained_token = "github_pat_" + ("H" * 32)
+        mcp = self.server()
+        result = await self.call(
+            mcp,
+            arguments={
+                "value": "hello",
+                "reason": f"Rotate {classic_token}",
+                "user_intent": f"Keep {fine_grained_token} private",
+            },
+            meta=self.meta(
+                **{
+                    "user.id": classic_token,
+                    "session.id": f"session-{fine_grained_token}",
+                }
+            ),
+            request_id=f"req-{classic_token}",
+        )
+
+        self.assertFalse(result.root.isError)
+        attrs = self.exporter.get_finished_spans()[0].attributes
+        serialized = json.dumps(dict(attrs), sort_keys=True)
+        self.assertNotIn(classic_token, serialized)
+        self.assertNotIn(fine_grained_token, serialized)
+        self.assertIn("<REDACTED_GITHUB_TOKEN>", serialized)
+
     async def test_report_outcome_scrubs_sensitive_free_text_recursively(self) -> None:
         provider_key = "s" + "k-ant-" + ("x" * 24)
         password = "synthetic-password-value"
@@ -318,8 +345,12 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             "synthetic-private-material\n"
             f"-----END {private_key_label}-----"
         )
+        github_classic = "ghp_" + ("C" * 32)
+        github_fine_grained = "github_pat_" + ("D" * 32)
         cases = [
             (f"provider {provider_key}", provider_key),
+            (f"github {github_classic}", github_classic),
+            (f"github {github_fine_grained}", github_fine_grained),
             (f"aws {aws_access_key}", aws_access_key),
             (private_key, "synthetic-private-material"),
             (

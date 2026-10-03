@@ -14,9 +14,16 @@ _ANTHROPIC_SECRET_PATTERN = re.compile(
     + re.escape(_SECRET_KEY_PREFIX)
     + r"ant-[A-Za-z0-9._-]{20,}(?![A-Za-z0-9._-])"
 )
+_GITHUB_SECRET_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_])"
+    r"(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{20,})"
+    r"(?![A-Za-z0-9_])",
+    re.I,
+)
 SECRET_REDACTIONS = (
     (_OPENAI_SECRET_PATTERN, "<REDACTED_OPENAI_KEY>"),
     (_ANTHROPIC_SECRET_PATTERN, "<REDACTED_ANTHROPIC_KEY>"),
+    (_GITHUB_SECRET_PATTERN, "<REDACTED_GITHUB_TOKEN>"),
     (
         re.compile(r"Bearer\s+[A-Za-z0-9._~+/-]{12,}=*", re.I),
         "Bearer <REDACTED>",
