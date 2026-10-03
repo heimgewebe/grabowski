@@ -433,6 +433,12 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             ),
             ("Reset password=short", "short"),
             ("Use credential: abc123", "abc123"),
+            ("authorization is abc123", "abc123"),
+            (
+                "authorization is syntheticBareToken123456",
+                "syntheticBareToken123456",
+            ),
+            ("authorization Bearer abc123", "abc123"),
         ]
         for value, secret in cases:
             with self.subTest(value=value.splitlines()[0][:48]):
@@ -449,6 +455,9 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             "Review secret authentication requirements",
             "Review password authentication requirements",
             "Inspect credential requirements for the operator",
+            "Authorization is required for this operation",
+            "Authorization is OpenID metadata",
+            "Review authorization authentication requirements",
             "Discuss glpat-prefix handling without a token",
             "Record the partial outcome and remaining operator gate",
         ]

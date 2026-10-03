@@ -110,8 +110,8 @@ _SENSITIVE_TEXT_ASSIGNMENT = re.compile(
     r"(\s*[:=]\s*)(?:Bearer\s+)?[^\s,;]+"
 )
 _SENSITIVE_TEXT_LABEL_VALUE = re.compile(
-    r"(?i)\b(api[_ -]?key|token|secret|password|passwd|credential)s?\b"
-    r"(\s+(?:is\s+)?)([A-Za-z0-9._~+/-]{12,}=*)"
+    r"(?i)\b(authorization|api[_ -]?key|token|secret|password|passwd|credential)s?\b"
+    r"(\s+(?:is\s+)?(?:Bearer\s+)?)([A-Za-z0-9._~+/-]{6,}=*)"
 )
 
 
@@ -289,9 +289,28 @@ def _looks_sensitive_text_value(value: str) -> bool:
     return len(candidate) >= 32
 
 
+def _looks_sensitive_authorization_value(value: str) -> bool:
+    candidate = value.rstrip("=")
+    if len(candidate) < 6:
+        return False
+    if any(character.isdigit() or not character.isalnum() for character in candidate):
+        return True
+    if len(candidate) >= 12 and any(
+        character.isupper() for character in candidate[1:]
+    ):
+        return True
+    return len(candidate) >= 32
+
+
 def _redact_labeled_sensitive_text(match: re.Match[str]) -> str:
     candidate = match.group(3)
-    if not _looks_sensitive_text_value(candidate):
+    label = match.group(1).casefold()
+    sensitive = (
+        _looks_sensitive_authorization_value(candidate)
+        if label == "authorization"
+        else _looks_sensitive_text_value(candidate)
+    )
+    if not sensitive:
         return match.group(0)
     return f"{match.group(1)}{match.group(2)}<REDACTED>"
 
