@@ -4253,6 +4253,12 @@ def _deployment_schedule_preflight(
         except Exception as fallback_error:
             raise canonical_error from fallback_error
         if (
+            canonical_state["current_head"] == expected_head
+            and canonical_state["current_branch"] == "main"
+            and canonical_state["origin_main"] == expected_head
+        ):
+            raise canonical_error
+        if (
             canonical_state["current_branch"] == "main"
             and canonical_state["origin_main"] == expected_head
         ):

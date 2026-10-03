@@ -358,6 +358,7 @@ def _competing_deployment_evidence(
         "inflight_deploy_jobs": [],
         "idempotent_match": None,
         "pruned_units": [],
+        "stale_pending_reconciliation": None,
         "error": None,
     }
     lock_path = Path.home() / ".local/state/grabowski/deploy.lock"
@@ -385,6 +386,9 @@ def _competing_deployment_evidence(
     evidence["inflight_units"] = list(indexed["inflight_units"])
     evidence["idempotent_match"] = indexed["idempotent_match"]
     evidence["pruned_units"] = list(indexed["pruned_units"])
+    evidence["stale_pending_reconciliation"] = indexed.get(
+        "stale_pending_reconciliation"
+    )
     if indexed["error"] is not None:
         evidence["error"] = indexed["error"]
     return evidence
@@ -1051,6 +1055,11 @@ def _resume_under_schedule_lock(
                 "expected_head": expected_head,
                 "reasons": volatile["reasons"],
                 "intent_sha256": intent_sha256,
+                "stale_pending_reconciliation": (
+                    (volatile.get("competing_deployment") or {}).get(
+                        "stale_pending_reconciliation"
+                    )
+                ),
             }
         )
         raise ProvenanceRecoveryDenied(
@@ -1267,6 +1276,11 @@ def _repair_under_schedule_lock(
                 "expected_head": expected_head,
                 "reasons": volatile["reasons"],
                 "intent_sha256": intent_sha256,
+                "stale_pending_reconciliation": (
+                    (volatile.get("competing_deployment") or {}).get(
+                        "stale_pending_reconciliation"
+                    )
+                ),
             }
         )
         raise ProvenanceRecoveryDenied(volatile["reasons"], {**gate, "recheck": volatile})

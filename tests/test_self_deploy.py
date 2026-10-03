@@ -1197,6 +1197,37 @@ class SelfDeployToolTests(unittest.TestCase):
         self.assertEqual(result["canonical_state"]["current_head"], expected)
         self.assertIsNone(result["source_identity_sha256"])
 
+    def test_schedule_preflight_preserves_exact_source_failure_without_fallback_work(self) -> None:
+        expected = "d" * 40
+        canonical_state = {
+            "canonical_repository": "/home/alex/repos/grabowski",
+            "current_head": expected,
+            "current_branch": "main",
+            "target_head": expected,
+            "origin_main": expected,
+            "clean": True,
+            "shallow": False,
+            "lease_evidence": {
+                "resource_key": "path:/home/alex/repos/grabowski",
+                "lease": None,
+            },
+        }
+        with patch.object(
+            SELF_DEPLOY, "_fresh_public_github_main", return_value=expected
+        ), patch.object(
+            SELF_DEPLOY,
+            "_deployment_source_preflight",
+            side_effect=RuntimeError("scheduled deployment runner is unavailable"),
+        ), patch.object(
+            SELF_DEPLOY,
+            "_canonical_main_refresh_candidate",
+            return_value=canonical_state,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "scheduled deployment runner is unavailable"
+            ):
+                SELF_DEPLOY._deployment_schedule_preflight(expected, None, None)
+
     def test_schedule_preflight_materialization_still_requires_auto_source_root(self) -> None:
         expected = "d" * 40
         canonical_state = {
