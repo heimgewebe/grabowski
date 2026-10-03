@@ -195,10 +195,13 @@ class SystemkatalogSurfaceTests(unittest.TestCase):
     def test_tool_description_binds_operation_names_and_authority_boundaries(self) -> None:
         description = surface.grabowski_systemkatalog_query.__doc__ or ""
         for phrase in (
-            "operation=authority-matrix",
+            "operation=system",
+            "operation=repository",
             "operation=truth-owner",
             "operation=relations",
             "operation=entrypoints",
+            "operation=authority-matrix",
+            "only when no targeted identifier",
             "RepoGround",
             "current runtime, PR and CI truth",
             "tools/systemkatalog_usage_receipt.py",
