@@ -454,6 +454,20 @@ class SelfDeployToolTests(unittest.TestCase):
                 )
             )
 
+    def test_missing_pending_deploy_index_unit_remains_reserved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            unit = "grabowski-job-abcdef012345"
+            SELF_DEPLOY._write_deploy_index(
+                jobs,
+                units=[],
+                pending_unit=unit,
+            )
+            index = SELF_DEPLOY._deploy_index(jobs, Path(temporary))
+            self.assertEqual(index["units"], [])
+            self.assertEqual(index["pending_unit"], unit)
+
     def test_pending_deploy_index_unit_is_recovered_from_exact_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             jobs = Path(temporary) / "jobs"
@@ -4040,6 +4054,10 @@ class SelfDeployToolTests(unittest.TestCase):
                 "effect_started": True,
             },
         ), patch.object(
+            SELF_DEPLOY,
+            "inflight_runtime_job_evidence",
+            return_value={"error": None, "inflight_units": []},
+        ), patch.object(
             SELF_DEPLOY, "_matching_inflight_deploy_job"
         ) as lookup:
             with self.assertRaisesRegex(RuntimeError, "source identity drifted"):
@@ -4078,13 +4096,40 @@ class SelfDeployToolTests(unittest.TestCase):
             return_value=(repo, runner, identity),
         ), patch.object(
             SELF_DEPLOY, "_deploy_schedule_lock", return_value=nullcontext()
-        ), patch.object(SELF_DEPLOY, "_matching_inflight_deploy_job", return_value=existing) as lookup:
+        ), patch.object(
+            SELF_DEPLOY,
+            "inflight_runtime_job_evidence",
+            return_value={"error": None, "inflight_units": []},
+        ), patch.object(
+            SELF_DEPLOY, "_matching_inflight_deploy_job", return_value=existing
+        ) as lookup:
             result = SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
         lookup.assert_called_once_with(command, repo)
         SELF_DEPLOY.operator.grabowski_job_start.assert_not_called()
         self.assertTrue(result["already_scheduled"])
         self.assertEqual(result["source_identity_sha256"], identity["identity_sha256"])
         self.assertEqual(1, SELF_DEPLOY.base._append_audit.call_count)
+
+    def test_matching_inflight_job_blocks_pending_dispatch_without_clearing_it(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        command = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
+        pending = "grabowski-job-abcdef012345"
+        write_index = Mock()
+        with patch.object(
+            SELF_DEPLOY.operator, "_jobs_root", return_value=Path("/state")
+        ), patch.object(
+            SELF_DEPLOY,
+            "_deploy_index",
+            return_value={"units": [], "pending_unit": pending},
+        ), patch.object(
+            SELF_DEPLOY, "_write_deploy_index", write_index
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "dispatch outcome is still pending"
+            ):
+                SELF_DEPLOY._matching_inflight_deploy_job(command, repo)
+        write_index.assert_not_called()
 
     def test_schedule_reports_effective_source_when_reusing_same_target(self) -> None:
         canonical = Path("/home/alex/repos/grabowski")

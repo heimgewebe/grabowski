@@ -1571,9 +1571,7 @@ def _deploy_index(
             if not pending_entry.is_dir():
                 raise RuntimeError("pending runtime deploy job path is not a directory")
             units = sorted(set(index["units"]) | {pending})
-        else:
-            units = list(index["units"])
-        index = _write_deploy_index(jobs_root, units=units, pending_unit=None)
+            index = _write_deploy_index(jobs_root, units=units, pending_unit=None)
     return index
 
 
@@ -2323,6 +2321,12 @@ def _matching_inflight_deploy_job(command: list[str], _repository: Path) -> dict
     )
     jobs_root = operator._jobs_root()
     index = _deploy_index(jobs_root)
+    pending = index["pending_unit"]
+    if pending is not None:
+        raise RuntimeError(
+            "runtime deploy dispatch outcome is still pending; refusing a blind retry: "
+            f"{pending}"
+        )
     entries = [jobs_root / unit for unit in index["units"]]
 
     matches: list[dict[str, Any]] = []
