@@ -278,6 +278,37 @@ class OperatorContractTests(unittest.TestCase):
             environment["UV_CACHE_DIR"],
         )
 
+    def test_safe_environment_never_exports_flowlines_headers(self) -> None:
+        operator = _load_operator_module()
+        for trusted in (False, True):
+            with (
+                self.subTest(trusted=trusted),
+                patch.dict(
+                    operator.os.environ,
+                    {
+                        "XDG_RUNTIME_DIR": "/run/user/1000",
+                        "OTEL_EXPORTER_OTLP_HEADERS": "x-flowlines-api-key=fixture-secret",
+                    },
+                    clear=True,
+                ),
+                patch.object(operator, "_trusted_owner_mode", return_value=trusted),
+            ):
+                environment = operator._safe_environment()
+            self.assertNotIn("OTEL_EXPORTER_OTLP_HEADERS", environment)
+
+        self.assertEqual(
+            operator._redact(
+                "OTEL_EXPORTER_OTLP_HEADERS=x-flowlines-api-key=fixture-secret"
+            ),
+            "OTEL_EXPORTER_OTLP_HEADERS=<REDACTED>",
+        )
+        self.assertEqual(
+            operator._redact_argv(
+                ["OTEL_EXPORTER_OTLP_HEADERS=x-flowlines-api-key=fixture-secret"]
+            ),
+            ["OTEL_EXPORTER_OTLP_HEADERS=<REDACTED>"],
+        )
+
     def test_http_recovery_contract_is_loopback_bound(self) -> None:
         operator = _load_operator_module()
         metadata = operator._protected_resource_metadata(

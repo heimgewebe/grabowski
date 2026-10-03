@@ -316,6 +316,7 @@ SENSITIVE_ENV_PARTS = (
     "API_KEY",
     "APIKEY",
 )
+SENSITIVE_ENV_KEYS = frozenset({"OTEL_EXPORTER_OTLP_HEADERS"})
 PRIVILEGE_ESCALATORS = {"sudo", "su", "pkexec", "doas"}
 PROTECTED_BRANCHES = {"main", "master"}
 GIT_BRANCH_ATTEMPT_SCHEMA_VERSION = 1
@@ -454,6 +455,10 @@ PRIVILEGED_REFERENCE_ACTIONS = {
 REDACTIONS = (
     (_OPENAI_SECRET_PATTERN, "<REDACTED_OPENAI_KEY>"),
     (_ANTHROPIC_SECRET_PATTERN, "<REDACTED_ANTHROPIC_KEY>"),
+    (
+        re.compile(r"(?im)^(\s*OTEL_EXPORTER_OTLP_HEADERS\s*[:=]\s*).+$"),
+        r"\1<REDACTED>",
+    ),
     (
         re.compile(r"Bearer\s+[A-Za-z0-9._~+/-]{12,}=*", re.I),
         "Bearer <REDACTED>",
@@ -3664,7 +3669,7 @@ def _argv_hash(argv: list[str]) -> str:
 
 def _sensitive_argv_name(name: str) -> bool:
     key = name.lstrip("-").replace("-", "_").upper()
-    return any(part in key for part in SENSITIVE_ENV_PARTS)
+    return key in SENSITIVE_ENV_KEYS or any(part in key for part in SENSITIVE_ENV_PARTS)
 
 
 def _argv_inline_secret_spans(item: str) -> list[tuple[int, int, str]]:
@@ -3905,9 +3910,11 @@ def _safe_environment() -> dict[str, str]:
         environment = {}
         for key, value in os.environ.items():
             upper = key.upper()
-            if any(part in upper for part in SENSITIVE_ENV_PARTS):
+            if upper in SENSITIVE_ENV_KEYS or any(part in upper for part in SENSITIVE_ENV_PARTS):
                 continue
             environment[key] = value
+    for key in SENSITIVE_ENV_KEYS:
+        environment.pop(key, None)
     environment.update(_managed_runtime_environment(environment))
     environment["GRABOWSKI_EVIDENCE_ROOT"] = str(EVIDENCE_ROOT)
     environment["GRABOWSKI_TRUSTED_OWNER"] = "1" if _trusted_owner_mode() else "0"
