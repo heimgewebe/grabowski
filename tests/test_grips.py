@@ -17540,6 +17540,10 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 "data": {
                     "repository": {
                         "pullRequest": {
+                            "reviews": {
+                                "nodes": [{"databaseId": 404}],
+                                "pageInfo": {"hasPreviousPage": False},
+                            },
                             "reviewThreads": connection,
                         }
                     }
@@ -17571,6 +17575,13 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         )
         self.assertEqual(2, len(calls))
         self.assertTrue(any("after=cursor-1" in call for call in calls))
+        self.assertEqual(
+            {
+                "nodes": [{"databaseId": 404}],
+                "pageInfo": {"hasPreviousPage": False},
+            },
+            payload["data"]["repository"]["pullRequest"]["reviews"],
+        )
 
     def test_codex_review_threads_fail_closed_above_page_bound(self) -> None:
         calls: list[tuple[str, ...]] = []
