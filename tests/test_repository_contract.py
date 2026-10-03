@@ -555,6 +555,7 @@ class RepositoryContractTests(unittest.TestCase):
             "opentelemetry-api==1.45.0",
             "opentelemetry-sdk==1.45.0",
             "opentelemetry-exporter-otlp-proto-http==1.45.0",
+            "posthog==7.62.0",
             "pyyaml==6.0.3",
         ):
             self.assertIn(requirement, runtime_lines)
@@ -567,6 +568,7 @@ class RepositoryContractTests(unittest.TestCase):
             "opentelemetry-api",
             "opentelemetry-sdk",
             "opentelemetry-exporter-otlp-proto-http",
+            "posthog",
             "pyyaml",
         ):
             self.assertIn(f"{package}==", lock_text)
