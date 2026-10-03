@@ -74,9 +74,10 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "narrowest-typed-read-first",
-        "grabowski_systemkatalog_query: system=system; repo=repository; domain=truth-owner; "
-        "relation=relations; entrypoint=entrypoints; else=authority-matrix. Decision=>hash-bound "
-        "receipt:tools/systemkatalog_usage_receipt.py; fixed fields/no prose. Narrowest read; no health ping.",
+        "grabowski_systemkatalog_query: system=system;repo=repository;domain=truth-owner;"
+        "relation=relations;entry=entrypoints;else=authority-matrix;Decision=>hash-bound "
+        "tools/systemkatalog_usage_receipt.py; fixed fields/no prose. Narrowest read; "
+        "no extra health ping if read probes.",
     ),
     (
         "host-capability-resolution",

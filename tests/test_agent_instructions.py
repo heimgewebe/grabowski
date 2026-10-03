@@ -86,14 +86,15 @@ class AgentInstructionsTests(unittest.TestCase):
         self.assertIn("live runtime state", rules["truth-hierarchy"].lower())
         narrow = rules["narrowest-typed-read-first"].lower()
         self.assertIn("narrowest read", narrow)
-        self.assertIn("health ping", narrow)
+        self.assertIn("no extra health ping if read probes", narrow)
+        self.assertNotIn("no health ping.", narrow)
         for phrase in (
             "grabowski_systemkatalog_query",
             "system=system",
             "repo=repository",
             "domain=truth-owner",
             "relation=relations",
-            "entrypoint=entrypoints",
+            "entry=entrypoints",
             "else=authority-matrix",
             "decision=>hash-bound",
             "tools/systemkatalog_usage_receipt.py",
